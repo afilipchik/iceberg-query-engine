@@ -3,7 +3,7 @@
 use crate::error::{QueryError, Result};
 use crate::physical::operators::{
     FilterExec, HashAggregateExec, HashJoinExec, LimitExec, MemoryTableExec, ProjectExec,
-    SortExec, TableProvider, AggregateExpr, SubqueryExecutor,
+    SortExec, TableProvider, AggregateExpr, SubqueryExecutor, UnionExec,
 };
 use crate::physical::PhysicalOperator;
 use crate::planner::{
@@ -172,14 +172,37 @@ impl PhysicalPlanner {
             }
 
             LogicalPlan::Union(node) => {
-                // Simple implementation: concatenate results
-                // For proper implementation, would need a UnionExec operator
                 if node.inputs.is_empty() {
                     return Err(QueryError::Plan("Union with no inputs".to_string()));
                 }
 
-                // For now, just return first input (proper union needs dedicated operator)
-                self.create_physical_plan(&node.inputs[0])
+                let physical_inputs: Result<Vec<_>> = node
+                    .inputs
+                    .iter()
+                    .map(|input| self.create_physical_plan(input))
+                    .collect();
+                let physical_inputs = physical_inputs?;
+
+                let union_exec: Arc<dyn PhysicalOperator> = Arc::new(UnionExec::new(physical_inputs));
+
+                // If not UNION ALL, we need to remove duplicates using GROUP BY on all columns
+                if !node.all {
+                    // Create aggregate for distinct - group by all columns with no aggregates
+                    let schema = plan_schema_to_arrow(&node.schema);
+                    let group_by: Vec<Expr> = node.schema.fields().iter()
+                        .map(|f| Expr::Column(crate::planner::Column::new(f.name.clone())))
+                        .collect();
+
+                    let agg = HashAggregateExec::new(
+                        union_exec,
+                        group_by,
+                        vec![],  // No aggregates, just grouping for distinct
+                        schema,
+                    );
+                    Ok(Arc::new(agg))
+                } else {
+                    Ok(union_exec)
+                }
             }
 
             LogicalPlan::SubqueryAlias(node) => {

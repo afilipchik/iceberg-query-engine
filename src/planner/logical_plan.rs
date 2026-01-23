@@ -141,6 +141,7 @@ impl LogicalPlan {
             LogicalPlan::Union(node) => LogicalPlan::Union(UnionNode {
                 inputs: children,
                 schema: node.schema.clone(),
+                all: node.all,
             }),
             LogicalPlan::SubqueryAlias(node) => LogicalPlan::SubqueryAlias(SubqueryAliasNode {
                 input: children.into_iter().next().unwrap(),
@@ -350,6 +351,8 @@ pub struct DistinctNode {
 pub struct UnionNode {
     pub inputs: Vec<Arc<LogicalPlan>>,
     pub schema: PlanSchema,
+    /// If true, this is UNION ALL (keep duplicates); if false, UNION (remove duplicates)
+    pub all: bool,
 }
 
 /// Subquery alias node

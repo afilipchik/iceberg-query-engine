@@ -174,22 +174,89 @@ impl<'a> Binder<'a> {
         match set_expr {
             SetExpr::Select(select) => self.bind_select(select),
             SetExpr::Query(query) => self.bind_query(query),
-            SetExpr::SetOperation { op, left, right, .. } => {
+            SetExpr::SetOperation { op, left, right, set_quantifier, .. } => {
                 let left_plan = self.bind_set_expr(left)?;
                 let right_plan = self.bind_set_expr(right)?;
 
                 match op {
                     ast::SetOperator::Union => {
                         let schema = left_plan.schema();
+                        // UNION ALL keeps duplicates, plain UNION removes them
+                        let all = matches!(set_quantifier, ast::SetQuantifier::All);
                         Ok(LogicalPlan::Union(crate::planner::UnionNode {
                             inputs: vec![Arc::new(left_plan), Arc::new(right_plan)],
                             schema,
+                            all,
                         }))
                     }
-                    _ => Err(QueryError::NotImplemented(format!(
-                        "Set operation not supported: {:?}",
-                        op
-                    ))),
+                    ast::SetOperator::Intersect => {
+                        // INTERSECT is implemented as a semi-join on all columns
+                        let left_schema = left_plan.schema();
+                        let right_schema = right_plan.schema();
+
+                        // Create join conditions on all columns
+                        let on: Vec<(Expr, Expr)> = left_schema.fields().iter().zip(right_schema.fields().iter())
+                            .map(|(l, r)| {
+                                (
+                                    Expr::Column(Column::new(l.name.clone())),
+                                    Expr::Column(Column::new(r.name.clone())),
+                                )
+                            })
+                            .collect();
+
+                        let join = LogicalPlan::Join(crate::planner::JoinNode {
+                            left: Arc::new(left_plan),
+                            right: Arc::new(right_plan),
+                            join_type: crate::planner::JoinType::Semi,
+                            on,
+                            filter: None,
+                            schema: left_schema.clone(),
+                        });
+
+                        // INTERSECT removes duplicates by default (unless INTERSECT ALL)
+                        let all = matches!(set_quantifier, ast::SetQuantifier::All);
+                        if !all {
+                            Ok(LogicalPlan::Distinct(crate::planner::DistinctNode {
+                                input: Arc::new(join),
+                            }))
+                        } else {
+                            Ok(join)
+                        }
+                    }
+                    ast::SetOperator::Except => {
+                        // EXCEPT is implemented as an anti-join on all columns
+                        let left_schema = left_plan.schema();
+                        let right_schema = right_plan.schema();
+
+                        // Create join conditions on all columns
+                        let on: Vec<(Expr, Expr)> = left_schema.fields().iter().zip(right_schema.fields().iter())
+                            .map(|(l, r)| {
+                                (
+                                    Expr::Column(Column::new(l.name.clone())),
+                                    Expr::Column(Column::new(r.name.clone())),
+                                )
+                            })
+                            .collect();
+
+                        let join = LogicalPlan::Join(crate::planner::JoinNode {
+                            left: Arc::new(left_plan),
+                            right: Arc::new(right_plan),
+                            join_type: crate::planner::JoinType::Anti,
+                            on,
+                            filter: None,
+                            schema: left_schema.clone(),
+                        });
+
+                        // EXCEPT removes duplicates by default (unless EXCEPT ALL)
+                        let all = matches!(set_quantifier, ast::SetQuantifier::All);
+                        if !all {
+                            Ok(LogicalPlan::Distinct(crate::planner::DistinctNode {
+                                input: Arc::new(join),
+                            }))
+                        } else {
+                            Ok(join)
+                        }
+                    }
                 }
             }
             SetExpr::Values(values) => {
@@ -267,8 +334,22 @@ impl<'a> Binder<'a> {
 
         // 4. HAVING clause
         if let Some(having) = &select.having {
-            let having_schema = plan.schema();
-            let predicate = self.bind_expr(having, &having_schema)?;
+            // Bind against original input schema to get the full expression
+            let predicate = self.bind_expr(having, &input_schema)?;
+
+            // If we have aggregates, convert the HAVING expression to reference aggregate outputs
+            let predicate = if has_aggregates || !group_by.is_empty() {
+                self.convert_expr_with_aggregates(
+                    &predicate,
+                    &plan.schema(),
+                    &group_by,
+                    &aggregates,
+                    &input_schema,
+                )?
+            } else {
+                predicate
+            };
+
             plan = LogicalPlan::Filter(FilterNode {
                 input: Arc::new(plan),
                 predicate,
@@ -956,7 +1037,27 @@ impl<'a> Binder<'a> {
         order_by
             .iter()
             .map(|o| {
-                let expr = self.bind_expr(&o.expr, schema)?;
+                // Handle column number references (e.g., ORDER BY 2)
+                let expr = match &o.expr {
+                    SqlExpr::Value(ast::Value::Number(n, _)) => {
+                        if let Ok(col_num) = n.parse::<usize>() {
+                            if col_num > 0 && col_num <= schema.fields().len() {
+                                // Column numbers are 1-indexed
+                                let field = &schema.fields()[col_num - 1];
+                                Expr::Column(Column::new(field.name.clone()))
+                            } else {
+                                return Err(QueryError::Bind(format!(
+                                    "ORDER BY column {} is out of range (1-{})",
+                                    col_num,
+                                    schema.fields().len()
+                                )));
+                            }
+                        } else {
+                            self.bind_expr(&o.expr, schema)?
+                        }
+                    }
+                    _ => self.bind_expr(&o.expr, schema)?
+                };
                 let direction = if o.asc.unwrap_or(true) {
                     SortDirection::Asc
                 } else {
@@ -1236,6 +1337,53 @@ impl<'a> Binder<'a> {
                 }
                 Ok(Expr::Literal(ScalarValue::Utf8(value.clone())))
             }
+            SqlExpr::Ceil { expr, .. } => {
+                let arg = self.bind_expr(expr, schema)?;
+                Ok(Expr::ScalarFunc {
+                    func: ScalarFunction::Ceil,
+                    args: vec![arg],
+                })
+            }
+            SqlExpr::Floor { expr, .. } => {
+                let arg = self.bind_expr(expr, schema)?;
+                Ok(Expr::ScalarFunc {
+                    func: ScalarFunction::Floor,
+                    args: vec![arg],
+                })
+            }
+            SqlExpr::Substring { expr, substring_from, substring_for, .. } => {
+                let mut args = vec![self.bind_expr(expr, schema)?];
+                if let Some(from_expr) = substring_from {
+                    args.push(self.bind_expr(from_expr, schema)?);
+                } else {
+                    args.push(Expr::Literal(ScalarValue::Int64(1)));
+                }
+                if let Some(for_expr) = substring_for {
+                    args.push(self.bind_expr(for_expr, schema)?);
+                }
+                Ok(Expr::ScalarFunc {
+                    func: ScalarFunction::Substring,
+                    args,
+                })
+            }
+            SqlExpr::Trim { expr, trim_where, trim_what, .. } => {
+                // For now, simple trim without specific characters
+                let arg = self.bind_expr(expr, schema)?;
+                match trim_where {
+                    Some(ast::TrimWhereField::Leading) => Ok(Expr::ScalarFunc {
+                        func: ScalarFunction::Ltrim,
+                        args: vec![arg],
+                    }),
+                    Some(ast::TrimWhereField::Trailing) => Ok(Expr::ScalarFunc {
+                        func: ScalarFunction::Rtrim,
+                        args: vec![arg],
+                    }),
+                    Some(ast::TrimWhereField::Both) | None => Ok(Expr::ScalarFunc {
+                        func: ScalarFunction::Trim,
+                        args: vec![arg],
+                    }),
+                }
+            }
             _ => Err(QueryError::NotImplemented(format!(
                 "Expression not supported: {:?}",
                 expr
@@ -1396,6 +1544,14 @@ impl<'a> Binder<'a> {
             }),
             "ROUND" => Ok(Expr::ScalarFunc {
                 func: ScalarFunction::Round,
+                args,
+            }),
+            "POWER" | "POW" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Power,
+                args,
+            }),
+            "SQRT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Sqrt,
                 args,
             }),
             "YEAR" => Ok(Expr::ScalarFunc {
