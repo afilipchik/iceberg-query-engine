@@ -618,6 +618,12 @@ Based on the codebase structure, these appear to be planned but not fully implem
 
 ## Recently Implemented Features
 
+- **HashAggregateExec Partition Handling Fix** (Critical bug fix)
+  - Fixed issue where `HashAggregateExec` only collected data from partition 0
+  - The operator now correctly collects from ALL input partitions before aggregating
+  - This was causing incorrect row counts (e.g., 1.8M instead of 30M rows)
+  - See `src/physical/operators/hash_agg.rs:129-137` for the fix
+
 - **Correlated Subquery Support** (Full implementation)
   - `EXISTS`, `NOT EXISTS` subqueries with outer column references
   - `IN`, `NOT IN` subqueries (correlated and uncorrelated)
