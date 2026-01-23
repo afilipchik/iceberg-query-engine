@@ -3,10 +3,9 @@
 //! Re-exports sqlparser types with convenience methods
 
 pub use sqlparser::ast::{
-    BinaryOperator, DataType, Expr as SqlExpr, FunctionArg, FunctionArgExpr,
-    GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName, OrderByExpr,
-    Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
-    UnaryOperator, Value,
+    BinaryOperator, DataType, Expr as SqlExpr, FunctionArg, FunctionArgExpr, GroupByExpr, Ident,
+    JoinConstraint, JoinOperator, ObjectName, OrderByExpr, Query, Select, SelectItem, SetExpr,
+    Statement, TableFactor, TableWithJoins, UnaryOperator, Value,
 };
 
 /// Extension trait for Ident
@@ -27,7 +26,11 @@ pub trait ObjectNameExt {
 
 impl ObjectNameExt for ObjectName {
     fn table_name(&self) -> String {
-        self.0.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join(".")
+        self.0
+            .iter()
+            .map(|i| i.value.clone())
+            .collect::<Vec<_>>()
+            .join(".")
     }
 }
 

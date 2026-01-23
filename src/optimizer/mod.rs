@@ -79,7 +79,12 @@ impl Optimizer {
         Ok(current)
     }
 
-    fn find_first_join(plan: &LogicalPlan) -> Option<(crate::planner::JoinType, Vec<(crate::planner::Expr, crate::planner::Expr)>)> {
+    fn find_first_join(
+        plan: &LogicalPlan,
+    ) -> Option<(
+        crate::planner::JoinType,
+        Vec<(crate::planner::Expr, crate::planner::Expr)>,
+    )> {
         match plan {
             LogicalPlan::Join(node) => Some((node.join_type, node.on.clone())),
             LogicalPlan::Filter(node) => Self::find_first_join(&node.input),

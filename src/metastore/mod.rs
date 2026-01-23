@@ -83,11 +83,7 @@ impl BranchingMetastoreClient {
     }
 
     /// Execute an HTTP request with retry logic
-    async fn execute_with_retry<T, F, Fut>(
-        &self,
-        mut request_fn: F,
-        context: &str,
-    ) -> Result<T>
+    async fn execute_with_retry<T, F, Fut>(&self, mut request_fn: F, context: &str) -> Result<T>
     where
         T: for<'de> serde::Deserialize<'de>,
         F: FnMut() -> Fut,
@@ -106,13 +102,12 @@ impl BranchingMetastoreClient {
 
                     // Check if response is successful
                     if status.is_success() {
-                        return response
-                            .json()
-                            .await
-                            .map_err(|e| QueryError::Execution(format!(
+                        return response.json().await.map_err(|e| {
+                            QueryError::Execution(format!(
                                 "{}: Failed to parse response: {}",
                                 context, e
-                            )));
+                            ))
+                        });
                     }
 
                     // Don't retry client errors (4xx) except 429 (rate limit)
@@ -144,10 +139,7 @@ impl BranchingMetastoreClient {
                         )));
                     }
 
-                    last_error = Some(QueryError::Execution(format!(
-                        "{}: {}",
-                        context, e
-                    )));
+                    last_error = Some(QueryError::Execution(format!("{}: {}", context, e)));
                 }
             }
 
@@ -164,16 +156,16 @@ impl BranchingMetastoreClient {
                     (std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
-                        .subsec_millis() % 100) as u64
+                        .subsec_millis()
+                        % 100) as u64,
                 );
                 delay = delay.saturating_add(jitter);
             }
         }
 
         // All retries exhausted
-        Err(last_error.unwrap_or_else(|| {
-            QueryError::Execution(format!("{}: Max retries exceeded", context))
-        }))
+        Err(last_error
+            .unwrap_or_else(|| QueryError::Execution(format!("{}: Max retries exceeded", context))))
     }
 
     /// Get all databases in the current branch
@@ -181,10 +173,9 @@ impl BranchingMetastoreClient {
         let url = format!("{}/branch/{}/databases", self.base_url, self.branch_id);
         let client = self.client.clone();
 
-        let response: DatabasesResponse = self.execute_with_retry(
-            || client.get(&url).send(),
-            "list_databases",
-        ).await?;
+        let response: DatabasesResponse = self
+            .execute_with_retry(|| client.get(&url).send(), "list_databases")
+            .await?;
 
         Ok(response.databases)
     }
@@ -197,10 +188,8 @@ impl BranchingMetastoreClient {
         );
         let client = self.client.clone();
 
-        self.execute_with_retry(
-            || client.get(&url).send(),
-            "get_database",
-        ).await
+        self.execute_with_retry(|| client.get(&url).send(), "get_database")
+            .await
     }
 
     /// List tables in a database
@@ -211,10 +200,9 @@ impl BranchingMetastoreClient {
         );
         let client = self.client.clone();
 
-        let response: TablesResponse = self.execute_with_retry(
-            || client.get(&url).send(),
-            "list_tables",
-        ).await?;
+        let response: TablesResponse = self
+            .execute_with_retry(|| client.get(&url).send(), "list_tables")
+            .await?;
 
         Ok(response.tables)
     }
@@ -238,10 +226,9 @@ impl BranchingMetastoreClient {
                     let status = response.status();
 
                     if status.is_success() {
-                        return response
-                            .json()
-                            .await
-                            .map_err(|e| QueryError::Execution(format!("Failed to parse table response: {}", e)));
+                        return response.json().await.map_err(|e| {
+                            QueryError::Execution(format!("Failed to parse table response: {}", e))
+                        });
                     }
 
                     if status.as_u16() == 404 {
@@ -316,9 +303,16 @@ fn parse_data_type(data_type: &str) -> Result<DataType> {
         "DOUBLE" | "FLOAT8" => Ok(DataType::Float64),
         "VARCHAR" | "STRING" | "TEXT" => Ok(DataType::Utf8),
         "DATE" => Ok(DataType::Date32),
-        "TIMESTAMP" => Ok(DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None)),
+        "TIMESTAMP" => Ok(DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Millisecond,
+            None,
+        )),
         "DECIMAL" | "NUMERIC" => Ok(DataType::Decimal128(38, 10)),
-        "ARRAY" => Ok(DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))),
+        "ARRAY" => Ok(DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        )))),
         "MAP" => Ok(DataType::Map(
             Arc::new(Field::new("entries".to_string(), DataType::Utf8, true)),
             false,
@@ -402,9 +396,7 @@ impl MetastoreTableProvider {
         let database_name = database_name.into();
         let table_name = table_name.into();
 
-        let metadata = client
-            .get_table(&database_name, &table_name)
-            .await?;
+        let metadata = client.get_table(&database_name, &table_name).await?;
 
         Ok(Self {
             client,
@@ -455,10 +447,11 @@ impl MetastoreCatalog {
 
         // Fetch schema from metastore
         let metadata = tokio::task::block_in_place(|| {
-            tokio::runtime::Runtime::new().unwrap().block_on(async {
-                self.client.get_table(database_name, table_name).await
-            })
-        }).map_err(|e| QueryError::Execution(format!("Failed to get table schema: {}", e)))?;
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(async { self.client.get_table(database_name, table_name).await })
+        })
+        .map_err(|e| QueryError::Execution(format!("Failed to get table schema: {}", e)))?;
 
         let schema = BranchingMetastoreClient::table_to_arrow_schema(&metadata)?;
         self.cached_schemas.insert(key, schema.clone());

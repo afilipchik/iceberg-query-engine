@@ -252,15 +252,9 @@ impl ConstantArray {
             _ => {
                 // Fallback: create array with default values
                 match data_type {
-                    DataType::Int64 => {
-                        Arc::new(Int64Array::from(vec![0i64; self.len]))
-                    }
-                    DataType::Float64 => {
-                        Arc::new(Float64Array::from(vec![0.0f64; self.len]))
-                    }
-                    DataType::Utf8 => {
-                        Arc::new(StringArray::from(vec![String::new(); self.len]))
-                    }
+                    DataType::Int64 => Arc::new(Int64Array::from(vec![0i64; self.len])),
+                    DataType::Float64 => Arc::new(Float64Array::from(vec![0.0f64; self.len])),
+                    DataType::Utf8 => Arc::new(StringArray::from(vec![String::new(); self.len])),
                     _ => panic!("Unsupported data type for constant array: {:?}", data_type),
                 }
             }
@@ -345,16 +339,19 @@ fn extract_scalar_value(array: &ArrayRef, index: usize) -> Result<ScalarValue> {
     }
 
     if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
-        return Ok(ScalarValue::Utf8(Some(string_array.value(index).to_string())));
+        return Ok(ScalarValue::Utf8(Some(
+            string_array.value(index).to_string(),
+        )));
     }
 
     if let Some(boolean_array) = array.as_any().downcast_ref::<BooleanArray>() {
         return Ok(ScalarValue::Boolean(Some(boolean_array.value(index))));
     }
 
-    Err(crate::error::QueryError::Execution(
-        format!("Unsupported array type for scalar extraction: {:?}", array.data_type()),
-    ))
+    Err(crate::error::QueryError::Execution(format!(
+        "Unsupported array type for scalar extraction: {:?}",
+        array.data_type()
+    )))
 }
 
 /// Scalar value representation
@@ -392,9 +389,7 @@ mod tests {
     #[test]
     fn test_dictionary_encoding() {
         // String array with few unique values
-        let array = StringArray::from(vec![
-            "apple", "banana", "apple", "apple", "banana", "apple",
-        ]);
+        let array = StringArray::from(vec!["apple", "banana", "apple", "apple", "banana", "apple"]);
         let encoding = analyze_encoding(&array);
         assert_eq!(encoding, VectorEncoding::Dictionary);
     }

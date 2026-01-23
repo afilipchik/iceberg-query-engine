@@ -10,7 +10,6 @@ use crate::storage::ParquetTable;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
-use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -127,7 +126,11 @@ impl ExecutionContext {
     ///
     /// If path points to a file, loads that single Parquet file.
     /// If path points to a directory, loads all .parquet files in it.
-    pub fn register_parquet(&mut self, name: impl Into<String>, path: impl AsRef<Path>) -> Result<()> {
+    pub fn register_parquet(
+        &mut self,
+        name: impl Into<String>,
+        path: impl AsRef<Path>,
+    ) -> Result<()> {
         let table = ParquetTable::try_new(path)?;
         self.register_table_provider(name, Arc::new(table));
         Ok(())
@@ -177,16 +180,25 @@ impl ExecutionContext {
             .map(|partition_id| {
                 let physical = physical.clone();
                 async move {
-                    let stream = physical.execute(partition_id).await
-                        .map_err(|e| crate::error::QueryError::Execution(format!("Partition {} execution failed: {}", partition_id, e)))?;
-                    stream.try_collect().await
-                        .map_err(|e| crate::error::QueryError::Execution(format!("Partition {} collection failed: {}", partition_id, e)))
+                    let stream = physical.execute(partition_id).await.map_err(|e| {
+                        crate::error::QueryError::Execution(format!(
+                            "Partition {} execution failed: {}",
+                            partition_id, e
+                        ))
+                    })?;
+                    stream.try_collect().await.map_err(|e| {
+                        crate::error::QueryError::Execution(format!(
+                            "Partition {} collection failed: {}",
+                            partition_id, e
+                        ))
+                    })
                 }
             })
             .collect();
 
         // Execute all partitions concurrently and collect results
-        let partition_results: Vec<Result<Vec<RecordBatch>>> = futures::future::join_all(partition_futures).await;
+        let partition_results: Vec<Result<Vec<RecordBatch>>> =
+            futures::future::join_all(partition_futures).await;
 
         // Check for errors in any partition
         let mut all_batches = Vec::new();
@@ -252,8 +264,7 @@ fn arrow_schema_to_plan_schema(schema: &Schema) -> PlanSchema {
         .fields()
         .iter()
         .map(|f| {
-            SchemaField::new(f.name().clone(), f.data_type().clone())
-                .with_nullable(f.is_nullable())
+            SchemaField::new(f.name().clone(), f.data_type().clone()).with_nullable(f.is_nullable())
         })
         .collect();
     PlanSchema::new(fields)
@@ -327,7 +338,10 @@ mod tests {
     #[tokio::test]
     async fn test_filter_query() {
         let ctx = create_test_context();
-        let result = ctx.sql("SELECT id FROM test WHERE value > 25").await.unwrap();
+        let result = ctx
+            .sql("SELECT id FROM test WHERE value > 25")
+            .await
+            .unwrap();
 
         assert_eq!(result.row_count, 3);
     }
@@ -335,7 +349,10 @@ mod tests {
     #[tokio::test]
     async fn test_aggregate_query() {
         let ctx = create_test_context();
-        let result = ctx.sql("SELECT SUM(value), COUNT(*) FROM test").await.unwrap();
+        let result = ctx
+            .sql("SELECT SUM(value), COUNT(*) FROM test")
+            .await
+            .unwrap();
 
         assert_eq!(result.row_count, 1);
 
@@ -352,7 +369,10 @@ mod tests {
     async fn test_sort_query() {
         let ctx = create_test_context();
         // Note: ORDER BY columns must be in SELECT (planner limitation)
-        let result = ctx.sql("SELECT id, value FROM test ORDER BY value DESC").await.unwrap();
+        let result = ctx
+            .sql("SELECT id, value FROM test ORDER BY value DESC")
+            .await
+            .unwrap();
 
         assert_eq!(result.row_count, 5);
 

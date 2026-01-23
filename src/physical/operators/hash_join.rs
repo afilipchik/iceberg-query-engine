@@ -1,10 +1,10 @@
 //! Hash join operator
 
-use crate::error::{QueryError, Result};
+use crate::error::Result;
 use crate::physical::operators::filter::evaluate_expr;
 use crate::physical::{PhysicalOperator, RecordBatchStream};
 use crate::planner::{Expr, JoinType};
-use arrow::array::{ArrayRef, BooleanArray, Int64Array, UInt32Array, UInt32Builder, UInt64Array};
+use arrow::array::{ArrayRef, Int64Array, UInt32Array, UInt64Array};
 use arrow::compute;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -203,10 +203,8 @@ fn build_hash_table(
     let mut table: HashMap<JoinKey, Vec<HashEntry>> = HashMap::new();
 
     for (batch_idx, batch) in batches.iter().enumerate() {
-        let key_arrays: Result<Vec<ArrayRef>> = key_exprs
-            .iter()
-            .map(|e| evaluate_expr(batch, e))
-            .collect();
+        let key_arrays: Result<Vec<ArrayRef>> =
+            key_exprs.iter().map(|e| evaluate_expr(batch, e)).collect();
         let key_arrays = key_arrays?;
 
         for row_idx in 0..batch.num_rows() {
@@ -388,12 +386,8 @@ fn probe_hash_table(
     if matches!(join_type, JoinType::Right | JoinType::Full) && !swapped {
         let unmatched_build = collect_unmatched_build(&build_matched);
         if !unmatched_build.is_empty() {
-            let batch = create_build_only_batch(
-                build_batches,
-                &unmatched_build,
-                output_schema,
-                swapped,
-            )?;
+            let batch =
+                create_build_only_batch(build_batches, &unmatched_build, output_schema, swapped)?;
             results.push(batch);
         }
     }
@@ -401,12 +395,8 @@ fn probe_hash_table(
     if matches!(join_type, JoinType::Left | JoinType::Full) && swapped {
         let unmatched_build = collect_unmatched_build(&build_matched);
         if !unmatched_build.is_empty() {
-            let batch = create_build_only_batch(
-                build_batches,
-                &unmatched_build,
-                output_schema,
-                swapped,
-            )?;
+            let batch =
+                create_build_only_batch(build_batches, &unmatched_build, output_schema, swapped)?;
             results.push(batch);
         }
     }
@@ -500,7 +490,7 @@ fn create_joined_batch(
     swapped: bool,
     output_schema: &SchemaRef,
 ) -> Result<RecordBatch> {
-    let num_rows = build_indices.len();
+    let _num_rows = build_indices.len();
 
     // Gather build columns
     let build_columns: Result<Vec<ArrayRef>> = if build_batches.is_empty() {
@@ -541,11 +531,18 @@ fn create_joined_batch_with_nulls(
     _probe_matched: &[bool],
     swapped: bool,
     output_schema: &SchemaRef,
-    null_build: bool,
+    _null_build: bool,
 ) -> Result<RecordBatch> {
     // For now, just use the regular join
     // A proper implementation would handle nulls for unmatched rows
-    create_joined_batch(build_batches, probe_batch, build_indices, probe_indices, swapped, output_schema)
+    create_joined_batch(
+        build_batches,
+        probe_batch,
+        build_indices,
+        probe_indices,
+        swapped,
+        output_schema,
+    )
 }
 
 fn create_build_only_batch(
@@ -569,7 +566,11 @@ fn create_build_only_batch(
 
     let null_columns: Vec<ArrayRef> = (0..probe_num_cols)
         .map(|i| {
-            let field_idx = if swapped { i } else { build_batches[0].num_columns() + i };
+            let field_idx = if swapped {
+                i
+            } else {
+                build_batches[0].num_columns() + i
+            };
             let dt = output_schema.field(field_idx).data_type();
             arrow::array::new_null_array(dt, num_rows)
         })
@@ -617,7 +618,10 @@ fn gather_column(
         let taken = compute::take(col.as_ref(), &take_arr, None)?;
 
         for (i, (out_idx, _)) in idx_list.iter().enumerate() {
-            builders_data.push((*out_idx, arrow::compute::take(&taken, &UInt32Array::from(vec![i as u32]), None)?));
+            builders_data.push((
+                *out_idx,
+                arrow::compute::take(&taken, &UInt32Array::from(vec![i as u32]), None)?,
+            ));
         }
     }
 
@@ -629,11 +633,8 @@ fn gather_column(
     }
 
     // Simple approach: gather one at a time
-    let mut result_builder = arrow::array::new_empty_array(dt);
-    let arrays: Vec<&dyn arrow::array::Array> = builders_data
-        .iter()
-        .map(|(_, arr)| arr.as_ref())
-        .collect();
+    let arrays: Vec<&dyn arrow::array::Array> =
+        builders_data.iter().map(|(_, arr)| arr.as_ref()).collect();
 
     if arrays.is_empty() {
         Ok(arrow::array::new_null_array(dt, total_len))
@@ -699,8 +700,18 @@ mod tests {
         let left = create_left_batch();
         let right = create_right_batch();
 
-        let left_scan = Arc::new(MemoryTableExec::new("left", left.schema(), vec![left], None));
-        let right_scan = Arc::new(MemoryTableExec::new("right", right.schema(), vec![right], None));
+        let left_scan = Arc::new(MemoryTableExec::new(
+            "left",
+            left.schema(),
+            vec![left],
+            None,
+        ));
+        let right_scan = Arc::new(MemoryTableExec::new(
+            "right",
+            right.schema(),
+            vec![right],
+            None,
+        ));
 
         let join = HashJoinExec::new(
             left_scan,
@@ -721,8 +732,18 @@ mod tests {
         let left = create_left_batch();
         let right = create_right_batch();
 
-        let left_scan = Arc::new(MemoryTableExec::new("left", left.schema(), vec![left], None));
-        let right_scan = Arc::new(MemoryTableExec::new("right", right.schema(), vec![right], None));
+        let left_scan = Arc::new(MemoryTableExec::new(
+            "left",
+            left.schema(),
+            vec![left],
+            None,
+        ));
+        let right_scan = Arc::new(MemoryTableExec::new(
+            "right",
+            right.schema(),
+            vec![right],
+            None,
+        ));
 
         let join = HashJoinExec::new(
             left_scan,
@@ -743,8 +764,18 @@ mod tests {
         let left = create_left_batch();
         let right = create_right_batch();
 
-        let left_scan = Arc::new(MemoryTableExec::new("left", left.schema(), vec![left], None));
-        let right_scan = Arc::new(MemoryTableExec::new("right", right.schema(), vec![right], None));
+        let left_scan = Arc::new(MemoryTableExec::new(
+            "left",
+            left.schema(),
+            vec![left],
+            None,
+        ));
+        let right_scan = Arc::new(MemoryTableExec::new(
+            "right",
+            right.schema(),
+            vec![right],
+            None,
+        ));
 
         let join = HashJoinExec::new(
             left_scan,

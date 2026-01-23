@@ -2,13 +2,12 @@
 
 use crate::error::{QueryError, Result};
 use crate::physical::operators::TableProvider;
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::fmt;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 /// Table provider that reads from Parquet files
 pub struct ParquetTable {

@@ -1,6 +1,6 @@
 //! TPC-H benchmarks
 
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use query_engine::execution::ExecutionContext;
 use query_engine::tpch::{self, TpchGenerator};
 use tokio::runtime::Runtime;
@@ -24,15 +24,10 @@ fn benchmark_queries(c: &mut Criterion) {
     // Benchmark Q1 and Q6 as they are simpler aggregation queries
     for q in [1, 6] {
         if let Some(sql) = tpch::get_query(q) {
-            group.bench_with_input(
-                BenchmarkId::new("query", q),
-                &sql,
-                |b, sql| {
-                    b.to_async(&rt).iter(|| async {
-                        ctx.sql(sql).await.unwrap()
-                    });
-                },
-            );
+            group.bench_with_input(BenchmarkId::new("query", q), &sql, |b, sql| {
+                b.to_async(&rt)
+                    .iter(|| async { ctx.sql(sql).await.unwrap() });
+            });
         }
     }
 

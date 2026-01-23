@@ -74,7 +74,11 @@ impl SchemaField {
 
     pub fn to_arrow_field(&self) -> Field {
         // Use qualified name to handle self-joins and ambiguous column names
-        Field::new(&self.qualified_name(), self.data_type.clone(), self.nullable)
+        Field::new(
+            &self.qualified_name(),
+            self.data_type.clone(),
+            self.nullable,
+        )
     }
 
     pub fn qualified_name(&self) -> String {
@@ -107,10 +111,7 @@ impl PlanSchema {
         let mut qualified_index = HashMap::new();
 
         for (i, field) in fields.iter().enumerate() {
-            name_index
-                .entry(field.name.clone())
-                .or_default()
-                .push(i);
+            name_index.entry(field.name.clone()).or_default().push(i);
 
             qualified_index.insert(field.qualified_name(), i);
         }
@@ -203,7 +204,10 @@ impl From<&ArrowSchema> for PlanSchema {
         let fields: Vec<SchemaField> = schema
             .fields()
             .iter()
-            .map(|f| SchemaField::new(f.name().clone(), f.data_type().clone()).with_nullable(f.is_nullable()))
+            .map(|f| {
+                SchemaField::new(f.name().clone(), f.data_type().clone())
+                    .with_nullable(f.is_nullable())
+            })
             .collect();
         Self::new(fields)
     }

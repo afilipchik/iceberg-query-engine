@@ -152,9 +152,7 @@ mod tests {
         let scan = Arc::new(MemoryTableExec::new("test", schema, vec![batch], None));
 
         // Project: value * 2
-        let exprs = vec![
-            Expr::column("value").multiply(Expr::literal(ScalarValue::Int64(2)))
-        ];
+        let exprs = vec![Expr::column("value").multiply(Expr::literal(ScalarValue::Int64(2)))];
 
         let project = ProjectExec::try_new(scan, exprs).unwrap();
 

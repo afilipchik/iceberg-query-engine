@@ -14,7 +14,18 @@ pub mod codec;
 pub mod export;
 pub mod import;
 
-pub use array::*;
-pub use codec::*;
-pub use export::*;
-pub use import::*;
+// Re-export from array module
+pub use array::{
+    analyze_encoding, encode_optimal, ConstantArray, EncodedArray, ScalarValue as ArrayScalarValue,
+    VectorEncoding,
+};
+
+// Re-export from codec module
+pub use codec::{
+    add_simd, compare_simd, count_simd, detect_cpu_features, filter_simd, multiply_simd, sum_simd,
+    CompareOp, ScalarValue as CodecScalarValue, SimdMode,
+};
+
+// Re-export from export/import modules
+pub use export::{ArrayMetadata as ExportArrayMetadata, ArrowExporter};
+pub use import::{ArrayMetadata as ImportArrayMetadata, ArrowImporter};

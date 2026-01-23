@@ -244,22 +244,12 @@ impl CostEstimator {
 
             LogicalPlan::Filter(node) => {
                 let input_cost = self.estimate(&node.input);
-                input_cost
-                    + Cost::new(
-                        row_count * self.filter_cost_per_row,
-                        0.0,
-                        0.0,
-                    )
+                input_cost + Cost::new(row_count * self.filter_cost_per_row, 0.0, 0.0)
             }
 
             LogicalPlan::Project(node) => {
                 let input_cost = self.estimate(&node.input);
-                input_cost
-                    + Cost::new(
-                        row_count * self.project_cost_per_row,
-                        0.0,
-                        0.0,
-                    )
+                input_cost + Cost::new(row_count * self.project_cost_per_row, 0.0, 0.0)
             }
 
             LogicalPlan::Join(node) => {
@@ -323,20 +313,14 @@ impl CostEstimator {
                     .row_count
                     .unwrap_or(self.default_row_count) as f64;
 
-                input_cost
-                    + Cost::new(
-                        input_rows * self.agg_cost_per_row,
-                        0.0,
-                        row_count * 64.0,
-                    )
+                input_cost + Cost::new(input_rows * self.agg_cost_per_row, 0.0, row_count * 64.0)
             }
 
-            LogicalPlan::Union(node) => {
-                node.inputs.iter().map(|i| self.estimate(i)).fold(
-                    Cost::default(),
-                    |acc, c| acc + c,
-                )
-            }
+            LogicalPlan::Union(node) => node
+                .inputs
+                .iter()
+                .map(|i| self.estimate(i))
+                .fold(Cost::default(), |acc, c| acc + c),
 
             LogicalPlan::SubqueryAlias(node) => self.estimate(&node.input),
 

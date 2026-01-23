@@ -135,7 +135,7 @@ impl LogicalPlan {
                 skip: node.skip,
                 fetch: node.fetch,
             }),
-            LogicalPlan::Distinct(node) => LogicalPlan::Distinct(DistinctNode {
+            LogicalPlan::Distinct(_node) => LogicalPlan::Distinct(DistinctNode {
                 input: children.into_iter().next().unwrap(),
             }),
             LogicalPlan::Union(node) => LogicalPlan::Union(UnionNode {
@@ -164,10 +164,8 @@ impl LogicalPlan {
         let input = Arc::new(self);
         let input_schema = input.schema();
 
-        let fields: crate::error::Result<Vec<SchemaField>> = exprs
-            .iter()
-            .map(|e| e.to_field(&input_schema))
-            .collect();
+        let fields: crate::error::Result<Vec<SchemaField>> =
+            exprs.iter().map(|e| e.to_field(&input_schema)).collect();
 
         Ok(LogicalPlan::Project(ProjectNode {
             input,
@@ -206,8 +204,18 @@ impl LogicalPlan {
 
         match self {
             LogicalPlan::Scan(node) => {
-                writeln!(f, "{}Scan: {} [{}]", prefix, node.table_name,
-                    node.schema.fields().iter().map(|f| f.name.as_str()).collect::<Vec<_>>().join(", "))?;
+                writeln!(
+                    f,
+                    "{}Scan: {} [{}]",
+                    prefix,
+                    node.table_name,
+                    node.schema
+                        .fields()
+                        .iter()
+                        .map(|f| f.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )?;
                 if let Some(filter) = &node.filter {
                     writeln!(f, "{}  filter: {}", prefix, filter)?;
                 }
@@ -224,7 +232,9 @@ impl LogicalPlan {
             LogicalPlan::Join(node) => {
                 writeln!(f, "{}{} Join", prefix, node.join_type)?;
                 if !node.on.is_empty() {
-                    let on_str: Vec<String> = node.on.iter()
+                    let on_str: Vec<String> = node
+                        .on
+                        .iter()
                         .map(|(l, r)| format!("{} = {}", l, r))
                         .collect();
                     writeln!(f, "{}  on: {}", prefix, on_str.join(" AND "))?;
@@ -238,18 +248,30 @@ impl LogicalPlan {
             LogicalPlan::Aggregate(node) => {
                 let group_by: Vec<String> = node.group_by.iter().map(|e| e.to_string()).collect();
                 let aggs: Vec<String> = node.aggregates.iter().map(|e| e.to_string()).collect();
-                writeln!(f, "{}Aggregate: group_by=[{}], aggs=[{}]", prefix, group_by.join(", "), aggs.join(", "))?;
+                writeln!(
+                    f,
+                    "{}Aggregate: group_by=[{}], aggs=[{}]",
+                    prefix,
+                    group_by.join(", "),
+                    aggs.join(", ")
+                )?;
                 node.input.fmt_indent(f, indent + 1)?;
             }
             LogicalPlan::Sort(node) => {
-                let order: Vec<String> = node.order_by.iter()
+                let order: Vec<String> = node
+                    .order_by
+                    .iter()
                     .map(|s| format!("{} {:?}", s.expr, s.direction))
                     .collect();
                 writeln!(f, "{}Sort: [{}]", prefix, order.join(", "))?;
                 node.input.fmt_indent(f, indent + 1)?;
             }
             LogicalPlan::Limit(node) => {
-                writeln!(f, "{}Limit: skip={}, fetch={:?}", prefix, node.skip, node.fetch)?;
+                writeln!(
+                    f,
+                    "{}Limit: skip={}, fetch={:?}",
+                    prefix, node.skip, node.fetch
+                )?;
                 node.input.fmt_indent(f, indent + 1)?;
             }
             LogicalPlan::Distinct(node) => {
@@ -267,7 +289,11 @@ impl LogicalPlan {
                 node.input.fmt_indent(f, indent + 1)?;
             }
             LogicalPlan::EmptyRelation(node) => {
-                writeln!(f, "{}EmptyRelation: produce_one_row={}", prefix, node.produce_one_row)?;
+                writeln!(
+                    f,
+                    "{}EmptyRelation: produce_one_row={}",
+                    prefix, node.produce_one_row
+                )?;
             }
             LogicalPlan::Values(node) => {
                 writeln!(f, "{}Values: {} rows", prefix, node.values.len())?;
@@ -497,18 +523,24 @@ mod tests {
 
     #[test]
     fn test_filter_builder() {
-        let plan = LogicalPlanBuilder::scan("orders", sample_schema())
-            .filter(Expr::column("amount").gt(Expr::literal(crate::planner::ScalarValue::Float64(100.0.into()))))
-            .build();
+        let plan =
+            LogicalPlanBuilder::scan("orders", sample_schema())
+                .filter(Expr::column("amount").gt(Expr::literal(
+                    crate::planner::ScalarValue::Float64(100.0.into()),
+                )))
+                .build();
 
         assert!(matches!(plan, LogicalPlan::Filter(_)));
     }
 
     #[test]
     fn test_plan_display() {
-        let plan = LogicalPlanBuilder::scan("orders", sample_schema())
-            .filter(Expr::column("amount").gt(Expr::literal(crate::planner::ScalarValue::Float64(100.0.into()))))
-            .build();
+        let plan =
+            LogicalPlanBuilder::scan("orders", sample_schema())
+                .filter(Expr::column("amount").gt(Expr::literal(
+                    crate::planner::ScalarValue::Float64(100.0.into()),
+                )))
+                .build();
 
         let display = format!("{}", plan);
         assert!(display.contains("Filter"));

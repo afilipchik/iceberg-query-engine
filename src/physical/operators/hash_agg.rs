@@ -5,8 +5,8 @@ use crate::physical::operators::filter::evaluate_expr;
 use crate::physical::{PhysicalOperator, RecordBatchStream};
 use crate::planner::{AggregateFunction, Expr};
 use arrow::array::{
-    Array, ArrayRef, Float64Array, Float64Builder, Int64Array, Int64Builder, StringBuilder,
-    StringArray, Date32Array, BooleanArray, UInt64Builder, Decimal128Builder,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Builder, Float64Array, Float64Builder,
+    Int64Array, Int64Builder, StringArray, StringBuilder, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -101,7 +101,9 @@ impl AggregateExpr {
 fn promote_sum_type(input: &DataType) -> DataType {
     match input {
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => DataType::Int64,
-        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => DataType::UInt64,
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+            DataType::UInt64
+        }
         DataType::Float32 | DataType::Float64 => DataType::Float64,
         DataType::Decimal128(p, s) => DataType::Decimal128(*p, *s),
         _ => DataType::Float64,
@@ -259,7 +261,9 @@ fn aggregate_batches(
 ) -> Result<RecordBatch> {
     // Special case: scalar aggregate (no GROUP BY) - use Arrow's SIMD kernels
     // Note: COUNT DISTINCT requires the hash-based path for tracking distinct values
-    let has_count_distinct = aggregates.iter().any(|a| a.func == AggregateFunction::CountDistinct);
+    let has_count_distinct = aggregates
+        .iter()
+        .any(|a| a.func == AggregateFunction::CountDistinct);
     if group_by.is_empty() && batches.len() == 1 && aggregates.len() == 1 && !has_count_distinct {
         return aggregate_scalar_simd(&batches[0], &aggregates[0], schema);
     }
@@ -284,13 +288,19 @@ fn aggregate_scalar_simd(
         AggregateFunction::Sum => {
             if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
                 // Use values() for iterator over non-null values
-                let sum = a.values().iter().fold(0i64, |acc, &x| acc.saturating_add(x));
+                let sum = a
+                    .values()
+                    .iter()
+                    .fold(0i64, |acc, &x| acc.saturating_add(x));
                 Arc::new(Int64Array::from(vec![sum]))
             } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
                 let sum = a.values().iter().fold(0.0f64, |acc, &x| acc + x);
                 Arc::new(Float64Array::from(vec![sum]))
             } else if let Some(a) = input.as_any().downcast_ref::<arrow::array::Int32Array>() {
-                let sum = a.values().iter().fold(0i64, |acc, &x| acc.saturating_add(x as i64));
+                let sum = a
+                    .values()
+                    .iter()
+                    .fold(0i64, |acc, &x| acc.saturating_add(x as i64));
                 Arc::new(Int64Array::from(vec![sum]))
             } else {
                 return Err(QueryError::NotImplemented(format!(
@@ -301,7 +311,10 @@ fn aggregate_scalar_simd(
         }
         AggregateFunction::Avg => {
             if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
-                let sum = a.values().iter().fold(0i64, |acc, &x| acc.saturating_add(x));
+                let sum = a
+                    .values()
+                    .iter()
+                    .fold(0i64, |acc, &x| acc.saturating_add(x));
                 let count = (a.len() - a.null_count()) as f64;
                 Arc::new(Float64Array::from(vec![sum as f64 / count.max(1.0)]))
             } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
@@ -320,7 +333,11 @@ fn aggregate_scalar_simd(
                 let min = a.iter().filter_map(|x| x).min().unwrap_or(i64::MAX);
                 Arc::new(Int64Array::from(vec![min]))
             } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
-                let min = a.iter().filter_map(|x| x).min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(f64::MAX);
+                let min = a
+                    .iter()
+                    .filter_map(|x| x)
+                    .min_by(|a, b| a.partial_cmp(b).unwrap())
+                    .unwrap_or(f64::MAX);
                 Arc::new(Float64Array::from(vec![min]))
             } else if let Some(a) = input.as_any().downcast_ref::<StringArray>() {
                 let min = a.iter().filter_map(|x| x).min();
@@ -343,7 +360,11 @@ fn aggregate_scalar_simd(
                 let max = a.iter().filter_map(|x| x).max().unwrap_or(i64::MIN);
                 Arc::new(Int64Array::from(vec![max]))
             } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
-                let max = a.iter().filter_map(|x| x).max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(f64::MIN);
+                let max = a
+                    .iter()
+                    .filter_map(|x| x)
+                    .max_by(|a, b| a.partial_cmp(b).unwrap())
+                    .unwrap_or(f64::MIN);
                 Arc::new(Float64Array::from(vec![max]))
             } else if let Some(a) = input.as_any().downcast_ref::<StringArray>() {
                 let max = a.iter().filter_map(|x| x).max();
@@ -363,7 +384,7 @@ fn aggregate_scalar_simd(
         }
         AggregateFunction::CountDistinct => {
             return Err(QueryError::NotImplemented(
-                "COUNT DISTINCT not implemented for SIMD aggregation".into()
+                "COUNT DISTINCT not implemented for SIMD aggregation".into(),
             ));
         }
     };
@@ -383,10 +404,8 @@ fn aggregate_batches_hash(
 
     for batch in batches {
         // Evaluate group by expressions
-        let group_arrays: Result<Vec<ArrayRef>> = group_by
-            .iter()
-            .map(|e| evaluate_expr(batch, e))
-            .collect();
+        let group_arrays: Result<Vec<ArrayRef>> =
+            group_by.iter().map(|e| evaluate_expr(batch, e)).collect();
         let group_arrays = group_arrays?;
 
         // Evaluate aggregate inputs
@@ -498,7 +517,9 @@ fn update_accumulator(
         AggregateFunction::CountDistinct => {
             if !input.is_null(row) {
                 let value = extract_group_value(input, row);
-                let set = state.distinct_set.get_or_insert_with(std::collections::HashSet::new);
+                let set = state
+                    .distinct_set
+                    .get_or_insert_with(std::collections::HashSet::new);
                 set.insert(value);
             }
         }
@@ -513,7 +534,10 @@ fn update_accumulator(
                 } else if let Some(a) = input.as_any().downcast_ref::<arrow::array::Int32Array>() {
                     state.sum_i64 += a.value(row) as i64;
                     state.sum += a.value(row) as f64;
-                } else if let Some(a) = input.as_any().downcast_ref::<arrow::array::Decimal128Array>() {
+                } else if let Some(a) = input
+                    .as_any()
+                    .downcast_ref::<arrow::array::Decimal128Array>()
+                {
                     state.sum_i64 += a.value(row) as i64;
                     state.sum += a.value(row) as f64;
                 }
@@ -542,7 +566,11 @@ fn update_accumulator(
                 } else if let Some(a) = input.as_any().downcast_ref::<arrow::array::StringArray>() {
                     let val = a.value(row).to_string();
                     state.min_str = Some(state.min_str.as_ref().map_or(val.clone(), |m| {
-                        if val < *m { val } else { m.clone() }
+                        if val < *m {
+                            val
+                        } else {
+                            m.clone()
+                        }
                     }));
                 } else if let Some(a) = input.as_any().downcast_ref::<Date32Array>() {
                     let val = a.value(row) as i64;
@@ -561,7 +589,11 @@ fn update_accumulator(
                 } else if let Some(a) = input.as_any().downcast_ref::<arrow::array::StringArray>() {
                     let val = a.value(row).to_string();
                     state.max_str = Some(state.max_str.as_ref().map_or(val.clone(), |m| {
-                        if val > *m { val } else { m.clone() }
+                        if val > *m {
+                            val
+                        } else {
+                            m.clone()
+                        }
                     }));
                 } else if let Some(a) = input.as_any().downcast_ref::<Date32Array>() {
                     let val = a.value(row) as i64;
@@ -660,7 +692,9 @@ fn build_agg_array(
         (AggregateFunction::CountDistinct, DataType::Int64) => {
             let mut builder = Int64Builder::with_capacity(num_groups);
             for states in groups.values() {
-                let count = states[agg_idx].distinct_set.as_ref()
+                let count = states[agg_idx]
+                    .distinct_set
+                    .as_ref()
                     .map(|s| s.len() as i64)
                     .unwrap_or(0);
                 builder.append_value(count);

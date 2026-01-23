@@ -4,7 +4,7 @@ use crate::error::Result;
 use crate::physical::operators::filter::evaluate_expr;
 use crate::physical::{PhysicalOperator, RecordBatchStream};
 use crate::planner::{SortDirection, SortExpr};
-use arrow::array::{ArrayRef, UInt32Array};
+use arrow::array::ArrayRef;
 use arrow::compute::{self, SortColumn, SortOptions};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;

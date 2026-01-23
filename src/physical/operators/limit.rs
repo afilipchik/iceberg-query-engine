@@ -3,9 +3,8 @@
 use crate::error::Result;
 use crate::physical::{PhysicalOperator, RecordBatchStream};
 use arrow::datatypes::SchemaRef;
-use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use futures::stream::{self, StreamExt};
+use futures::stream::StreamExt;
 use std::fmt;
 use std::sync::Arc;
 
@@ -50,7 +49,7 @@ impl PhysicalOperator for LimitExec {
         let mut fetched = 0usize;
 
         let limited = input_stream.filter_map(move |result| {
-            let schema = schema.clone();
+            let _schema = schema.clone();
             async move {
                 match result {
                     Ok(batch) => {
@@ -124,13 +123,18 @@ mod tests {
     use crate::physical::MemoryTableExec;
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
     use futures::TryStreamExt;
+    use std::sync::Arc;
 
     fn create_test_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 
-        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5]))])
-            .unwrap()
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5]))],
+        )
+        .unwrap()
     }
 
     #[tokio::test]

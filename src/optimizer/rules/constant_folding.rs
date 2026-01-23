@@ -57,8 +57,16 @@ impl ConstantFolding {
                 Ok(LogicalPlan::Join(node))
             }
             LogicalPlan::Aggregate(mut node) => {
-                node.group_by = node.group_by.into_iter().map(|e| self.fold_expr(&e)).collect();
-                node.aggregates = node.aggregates.into_iter().map(|e| self.fold_expr(&e)).collect();
+                node.group_by = node
+                    .group_by
+                    .into_iter()
+                    .map(|e| self.fold_expr(&e))
+                    .collect();
+                node.aggregates = node
+                    .aggregates
+                    .into_iter()
+                    .map(|e| self.fold_expr(&e))
+                    .collect();
                 Ok(LogicalPlan::Aggregate(node))
             }
             _ => Ok(plan),
@@ -143,7 +151,11 @@ impl ConstantFolding {
                 func: func.clone(),
                 args: args.iter().map(|a| self.fold_expr(a)).collect(),
             },
-            Expr::Aggregate { func, args, distinct } => Expr::Aggregate {
+            Expr::Aggregate {
+                func,
+                args,
+                distinct,
+            } => Expr::Aggregate {
                 func: *func,
                 args: args.iter().map(|a| self.fold_expr(a)).collect(),
                 distinct: *distinct,
@@ -164,7 +176,12 @@ impl ConstantFolding {
         }
     }
 
-    fn eval_binary(&self, left: &ScalarValue, op: BinaryOp, right: &ScalarValue) -> Option<ScalarValue> {
+    fn eval_binary(
+        &self,
+        left: &ScalarValue,
+        op: BinaryOp,
+        right: &ScalarValue,
+    ) -> Option<ScalarValue> {
         match (left, right) {
             (ScalarValue::Int64(l), ScalarValue::Int64(r)) => self.eval_int64(*l, op, *r),
             (ScalarValue::Float64(l), ScalarValue::Float64(r)) => self.eval_float64(l.0, op, r.0),

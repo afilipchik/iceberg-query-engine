@@ -2,9 +2,7 @@
 
 use crate::execution::ExecutionContext;
 use crate::tpch::schema::*;
-use arrow::array::{
-    ArrayRef, Date32Array, Float64Array, Int32Array, Int64Array, StringBuilder,
-};
+use arrow::array::{Date32Array, Float64Array, Int32Array, Int64Array, StringBuilder};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -53,7 +51,8 @@ impl TpchGenerator {
         let supplier_batch = self.generate_supplier(row_counts.supplier);
         ctx.register_table("supplier", supplier_schema(), vec![supplier_batch]);
 
-        let partsupp_batch = self.generate_partsupp(row_counts.partsupp, row_counts.part, row_counts.supplier);
+        let partsupp_batch =
+            self.generate_partsupp(row_counts.partsupp, row_counts.part, row_counts.supplier);
         ctx.register_table("partsupp", partsupp_schema(), vec![partsupp_batch]);
 
         let customer_batch = self.generate_customer(row_counts.customer);
@@ -62,7 +61,12 @@ impl TpchGenerator {
         let orders_batch = self.generate_orders(row_counts.orders, row_counts.customer);
         ctx.register_table("orders", orders_schema(), vec![orders_batch]);
 
-        let lineitem_batch = self.generate_lineitem(row_counts.lineitem, row_counts.orders, row_counts.part, row_counts.supplier);
+        let lineitem_batch = self.generate_lineitem(
+            row_counts.lineitem,
+            row_counts.orders,
+            row_counts.part,
+            row_counts.supplier,
+        );
         ctx.register_table("lineitem", lineitem_schema(), vec![lineitem_batch]);
     }
 
@@ -75,7 +79,10 @@ impl TpchGenerator {
             .set_compression(Compression::SNAPPY)
             .build();
 
-        println!("Generating TPC-H data with scale factor {}", self.scale_factor);
+        println!(
+            "Generating TPC-H data with scale factor {}",
+            self.scale_factor
+        );
         println!("Output directory: {}", output_dir.display());
         println!();
 
@@ -84,20 +91,50 @@ impl TpchGenerator {
         let region_batch = self.generate_region();
         let part_batch = self.generate_part(row_counts.part);
         let supplier_batch = self.generate_supplier(row_counts.supplier);
-        let partsupp_batch = self.generate_partsupp(row_counts.partsupp, row_counts.part, row_counts.supplier);
+        let partsupp_batch =
+            self.generate_partsupp(row_counts.partsupp, row_counts.part, row_counts.supplier);
         let customer_batch = self.generate_customer(row_counts.customer);
         let orders_batch = self.generate_orders(row_counts.orders, row_counts.customer);
-        let lineitem_batch = self.generate_lineitem(row_counts.lineitem, row_counts.orders, row_counts.part, row_counts.supplier);
+        let lineitem_batch = self.generate_lineitem(
+            row_counts.lineitem,
+            row_counts.orders,
+            row_counts.part,
+            row_counts.supplier,
+        );
 
         // Write each table
         Self::write_parquet_file(output_dir, "nation", nation_schema(), nation_batch, &props)?;
         Self::write_parquet_file(output_dir, "region", region_schema(), region_batch, &props)?;
         Self::write_parquet_file(output_dir, "part", part_schema(), part_batch, &props)?;
-        Self::write_parquet_file(output_dir, "supplier", supplier_schema(), supplier_batch, &props)?;
-        Self::write_parquet_file(output_dir, "partsupp", partsupp_schema(), partsupp_batch, &props)?;
-        Self::write_parquet_file(output_dir, "customer", customer_schema(), customer_batch, &props)?;
+        Self::write_parquet_file(
+            output_dir,
+            "supplier",
+            supplier_schema(),
+            supplier_batch,
+            &props,
+        )?;
+        Self::write_parquet_file(
+            output_dir,
+            "partsupp",
+            partsupp_schema(),
+            partsupp_batch,
+            &props,
+        )?;
+        Self::write_parquet_file(
+            output_dir,
+            "customer",
+            customer_schema(),
+            customer_batch,
+            &props,
+        )?;
         Self::write_parquet_file(output_dir, "orders", orders_schema(), orders_batch, &props)?;
-        Self::write_parquet_file(output_dir, "lineitem", lineitem_schema(), lineitem_batch, &props)?;
+        Self::write_parquet_file(
+            output_dir,
+            "lineitem",
+            lineitem_schema(),
+            lineitem_batch,
+            &props,
+        )?;
 
         println!("\nDone!");
         Ok(())
@@ -113,16 +150,18 @@ impl TpchGenerator {
         let path = output_dir.join(format!("{}.parquet", table_name));
         let file = File::create(&path)?;
         let mut writer = ArrowWriter::try_new(file, schema, Some(props.clone()))
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        writer
-            .write(&batch)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        writer
-            .close()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
+        writer.write(&batch).map_err(std::io::Error::other)?;
+        writer.close().map_err(std::io::Error::other)?;
 
         let file_size = fs::metadata(&path)?.len();
-        println!("  {}: {} rows -> {} ({} bytes)", table_name, batch.num_rows(), path.display(), file_size);
+        println!(
+            "  {}: {} rows -> {} ({} bytes)",
+            table_name,
+            batch.num_rows(),
+            path.display(),
+            file_size
+        );
         Ok(())
     }
 
@@ -197,15 +236,24 @@ impl TpchGenerator {
     }
 
     fn generate_part(&mut self, count: usize) -> RecordBatch {
-        let brands = ["Brand#11", "Brand#12", "Brand#13", "Brand#14", "Brand#15",
-                      "Brand#21", "Brand#22", "Brand#23", "Brand#24", "Brand#25"];
-        let containers = ["SM CASE", "SM BOX", "SM PACK", "SM PKG",
-                          "MED BAG", "MED BOX", "MED PKG", "MED PACK",
-                          "LG CASE", "LG BOX", "LG PACK", "LG PKG"];
-        let types = ["STANDARD ANODIZED TIN", "STANDARD ANODIZED NICKEL",
-                     "STANDARD ANODIZED BRASS", "STANDARD ANODIZED STEEL",
-                     "SMALL PLATED TIN", "SMALL PLATED NICKEL",
-                     "PROMO BURNISHED BRASS", "PROMO BURNISHED STEEL"];
+        let brands = [
+            "Brand#11", "Brand#12", "Brand#13", "Brand#14", "Brand#15", "Brand#21", "Brand#22",
+            "Brand#23", "Brand#24", "Brand#25",
+        ];
+        let containers = [
+            "SM CASE", "SM BOX", "SM PACK", "SM PKG", "MED BAG", "MED BOX", "MED PKG", "MED PACK",
+            "LG CASE", "LG BOX", "LG PACK", "LG PKG",
+        ];
+        let types = [
+            "STANDARD ANODIZED TIN",
+            "STANDARD ANODIZED NICKEL",
+            "STANDARD ANODIZED BRASS",
+            "STANDARD ANODIZED STEEL",
+            "SMALL PLATED TIN",
+            "SMALL PLATED NICKEL",
+            "PROMO BURNISHED BRASS",
+            "PROMO BURNISHED STEEL",
+        ];
 
         let mut p_partkey = Vec::with_capacity(count);
         let mut p_name = StringBuilder::new();
@@ -260,11 +308,13 @@ impl TpchGenerator {
             s_name.append_value(format!("Supplier#{:09}", i + 1));
             s_address.append_value(format!("Address {}", i + 1));
             s_nationkey.push(self.rng.gen_range(0..25) as i64);
-            s_phone.append_value(format!("{}-{}-{}-{}",
+            s_phone.append_value(format!(
+                "{}-{}-{}-{}",
                 self.rng.gen_range(10..34),
                 self.rng.gen_range(100..999),
                 self.rng.gen_range(100..999),
-                self.rng.gen_range(1000..9999)));
+                self.rng.gen_range(1000..9999)
+            ));
             s_acctbal.push(self.rng.gen_range(-999.99..9999.99));
             s_comment.append_value("supplier comment");
         }
@@ -284,7 +334,12 @@ impl TpchGenerator {
         .unwrap()
     }
 
-    fn generate_partsupp(&mut self, count: usize, part_count: usize, supp_count: usize) -> RecordBatch {
+    fn generate_partsupp(
+        &mut self,
+        count: usize,
+        part_count: usize,
+        supp_count: usize,
+    ) -> RecordBatch {
         let mut ps_partkey = Vec::with_capacity(count);
         let mut ps_suppkey = Vec::with_capacity(count);
         let mut ps_availqty = Vec::with_capacity(count);
@@ -313,7 +368,13 @@ impl TpchGenerator {
     }
 
     fn generate_customer(&mut self, count: usize) -> RecordBatch {
-        let segments = ["AUTOMOBILE", "BUILDING", "FURNITURE", "HOUSEHOLD", "MACHINERY"];
+        let segments = [
+            "AUTOMOBILE",
+            "BUILDING",
+            "FURNITURE",
+            "HOUSEHOLD",
+            "MACHINERY",
+        ];
 
         let mut c_custkey = Vec::with_capacity(count);
         let mut c_name = StringBuilder::new();
@@ -329,11 +390,13 @@ impl TpchGenerator {
             c_name.append_value(format!("Customer#{:09}", i + 1));
             c_address.append_value(format!("Address {}", i + 1));
             c_nationkey.push(self.rng.gen_range(0..25) as i64);
-            c_phone.append_value(format!("{}-{}-{}-{}",
+            c_phone.append_value(format!(
+                "{}-{}-{}-{}",
                 self.rng.gen_range(10..34),
                 self.rng.gen_range(100..999),
                 self.rng.gen_range(100..999),
-                self.rng.gen_range(1000..9999)));
+                self.rng.gen_range(1000..9999)
+            ));
             c_acctbal.push(self.rng.gen_range(-999.99..9999.99));
             c_mktsegment.append_value(segments[i % segments.len()]);
             c_comment.append_value("customer comment");
@@ -376,7 +439,7 @@ impl TpchGenerator {
         for i in 0..count {
             o_orderkey.push((i + 1) as i64);
             o_custkey.push(((i % cust_count) + 1) as i64);
-            o_orderstatus.append_value(&status[i % 3].to_string());
+            o_orderstatus.append_value(status[i % 3].to_string());
             o_totalprice.push(self.rng.gen_range(1000.0..500000.0));
             o_orderdate.push(base_date + self.rng.gen_range(0..date_range));
             o_orderpriority.append_value(priorities[i % priorities.len()]);
@@ -402,10 +465,21 @@ impl TpchGenerator {
         .unwrap()
     }
 
-    fn generate_lineitem(&mut self, count: usize, order_count: usize, part_count: usize, supp_count: usize) -> RecordBatch {
+    fn generate_lineitem(
+        &mut self,
+        count: usize,
+        order_count: usize,
+        part_count: usize,
+        supp_count: usize,
+    ) -> RecordBatch {
         let returnflags = ['N', 'R', 'A'];
         let linestatus = ['O', 'F'];
-        let shipinstruct = ["DELIVER IN PERSON", "COLLECT COD", "NONE", "TAKE BACK RETURN"];
+        let shipinstruct = [
+            "DELIVER IN PERSON",
+            "COLLECT COD",
+            "NONE",
+            "TAKE BACK RETURN",
+        ];
         let shipmode = ["REG AIR", "AIR", "RAIL", "SHIP", "TRUCK", "MAIL", "FOB"];
 
         let mut l_orderkey: Vec<i64> = Vec::with_capacity(count);
@@ -455,8 +529,8 @@ impl TpchGenerator {
             l_discount.push(disc);
             l_tax.push(tax);
 
-            l_returnflag.append_value(&returnflags[i % 3].to_string());
-            l_linestatus.append_value(&linestatus[i % 2].to_string());
+            l_returnflag.append_value(returnflags[i % 3].to_string());
+            l_linestatus.append_value(linestatus[i % 2].to_string());
 
             let ship_date = base_date + self.rng.gen_range(0..date_range);
             l_shipdate.push(ship_date);

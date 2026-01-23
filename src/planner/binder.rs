@@ -4,9 +4,9 @@ use crate::error::{QueryError, Result};
 use crate::parser::{self, ObjectNameExt};
 use crate::planner::{
     AggregateFunction, AggregateNode, BinaryOp, Column, DistinctNode, Expr, FilterNode, JoinNode,
-    JoinType, LimitNode, LogicalPlan, PlanSchema, ProjectNode, ScalarFunction, ScalarValue,
-    ScanNode, SchemaField, SortDirection, SortExpr, SortNode, SubqueryAliasNode, UnaryOp,
-    NullOrdering,
+    JoinType, LimitNode, LogicalPlan, NullOrdering, PlanSchema, ProjectNode, ScalarFunction,
+    ScalarValue, ScanNode, SchemaField, SortDirection, SortExpr, SortNode, SubqueryAliasNode,
+    UnaryOp,
 };
 use arrow::datatypes::DataType as ArrowDataType;
 use ordered_float::OrderedFloat;
@@ -88,7 +88,9 @@ impl<'a> Binder<'a> {
     }
 
     /// Collect outer scope columns from a schema
-    fn collect_outer_scope(schema: &PlanSchema) -> HashMap<String, (ArrowDataType, Option<String>)> {
+    fn collect_outer_scope(
+        schema: &PlanSchema,
+    ) -> HashMap<String, (ArrowDataType, Option<String>)> {
         let mut scope = HashMap::new();
         for field in schema.fields() {
             scope.insert(
@@ -174,7 +176,13 @@ impl<'a> Binder<'a> {
         match set_expr {
             SetExpr::Select(select) => self.bind_select(select),
             SetExpr::Query(query) => self.bind_query(query),
-            SetExpr::SetOperation { op, left, right, set_quantifier, .. } => {
+            SetExpr::SetOperation {
+                op,
+                left,
+                right,
+                set_quantifier,
+                ..
+            } => {
                 let left_plan = self.bind_set_expr(left)?;
                 let right_plan = self.bind_set_expr(right)?;
 
@@ -195,7 +203,10 @@ impl<'a> Binder<'a> {
                         let right_schema = right_plan.schema();
 
                         // Create join conditions on all columns
-                        let on: Vec<(Expr, Expr)> = left_schema.fields().iter().zip(right_schema.fields().iter())
+                        let on: Vec<(Expr, Expr)> = left_schema
+                            .fields()
+                            .iter()
+                            .zip(right_schema.fields().iter())
                             .map(|(l, r)| {
                                 (
                                     Expr::Column(Column::new(l.name.clone())),
@@ -229,7 +240,10 @@ impl<'a> Binder<'a> {
                         let right_schema = right_plan.schema();
 
                         // Create join conditions on all columns
-                        let on: Vec<(Expr, Expr)> = left_schema.fields().iter().zip(right_schema.fields().iter())
+                        let on: Vec<(Expr, Expr)> = left_schema
+                            .fields()
+                            .iter()
+                            .zip(right_schema.fields().iter())
                             .map(|(l, r)| {
                                 (
                                     Expr::Column(Column::new(l.name.clone())),
@@ -263,7 +277,10 @@ impl<'a> Binder<'a> {
                 // VALUES clause
                 let mut rows = Vec::new();
                 for row in &values.rows {
-                    let exprs: Result<Vec<Expr>> = row.iter().map(|e| self.bind_expr(e, &PlanSchema::empty())).collect();
+                    let exprs: Result<Vec<Expr>> = row
+                        .iter()
+                        .map(|e| self.bind_expr(e, &PlanSchema::empty()))
+                        .collect();
                     rows.push(exprs?);
                 }
 
@@ -273,7 +290,9 @@ impl<'a> Binder<'a> {
                         .iter()
                         .enumerate()
                         .map(|(i, e)| {
-                            let dt = e.data_type(&PlanSchema::empty()).unwrap_or(ArrowDataType::Utf8);
+                            let dt = e
+                                .data_type(&PlanSchema::empty())
+                                .unwrap_or(ArrowDataType::Utf8);
                             SchemaField::new(format!("column{}", i), dt)
                         })
                         .collect();
@@ -282,7 +301,10 @@ impl<'a> Binder<'a> {
                     PlanSchema::empty()
                 };
 
-                Ok(LogicalPlan::Values(crate::planner::ValuesNode { values: rows, schema }))
+                Ok(LogicalPlan::Values(crate::planner::ValuesNode {
+                    values: rows,
+                    schema,
+                }))
             }
             _ => Err(QueryError::NotImplemented(format!(
                 "Set expression not supported: {:?}",
@@ -317,7 +339,8 @@ impl<'a> Binder<'a> {
             }
             for (i, expr) in aggregates.iter().enumerate() {
                 // Use the alias if available, otherwise use the expression's output name
-                let field_name = aggregate_aliases.get(i)
+                let field_name = aggregate_aliases
+                    .get(i)
                     .and_then(|a| a.as_ref().cloned())
                     .unwrap_or_else(|| expr.output_name());
                 let data_type = expr.data_type(&input_schema)?;
@@ -389,7 +412,9 @@ impl<'a> Binder<'a> {
                     });
                 }
                 ast::Distinct::On(_) => {
-                    return Err(QueryError::NotImplemented("DISTINCT ON not supported".to_string()));
+                    return Err(QueryError::NotImplemented(
+                        "DISTINCT ON not supported".to_string(),
+                    ));
                 }
             }
         }
@@ -400,10 +425,12 @@ impl<'a> Binder<'a> {
     fn bind_from(&mut self, from: &[ast::TableWithJoins]) -> Result<LogicalPlan> {
         if from.is_empty() {
             // No FROM clause - return empty relation that produces one row
-            return Ok(LogicalPlan::EmptyRelation(crate::planner::EmptyRelationNode {
-                produce_one_row: true,
-                schema: PlanSchema::empty(),
-            }));
+            return Ok(LogicalPlan::EmptyRelation(
+                crate::planner::EmptyRelationNode {
+                    produce_one_row: true,
+                    schema: PlanSchema::empty(),
+                },
+            ));
         }
 
         let mut plan = self.bind_table_with_joins(&from[0])?;
@@ -526,9 +553,9 @@ impl<'a> Binder<'a> {
                     schema: aliased_schema,
                 }))
             }
-            TableFactor::NestedJoin { table_with_joins, .. } => {
-                self.bind_table_with_joins(table_with_joins)
-            }
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => self.bind_table_with_joins(table_with_joins),
             _ => Err(QueryError::NotImplemented(format!(
                 "Table factor not supported: {:?}",
                 factor
@@ -611,9 +638,9 @@ impl<'a> Binder<'a> {
                     .collect();
                 Ok((on, None))
             }
-            ast::JoinConstraint::Natural => {
-                Err(QueryError::NotImplemented("NATURAL JOIN not supported".to_string()))
-            }
+            ast::JoinConstraint::Natural => Err(QueryError::NotImplemented(
+                "NATURAL JOIN not supported".to_string(),
+            )),
             ast::JoinConstraint::None => Ok((vec![], None)),
         }
     }
@@ -691,10 +718,7 @@ impl<'a> Binder<'a> {
                 SelectItem::ExprWithAlias { expr, alias } => {
                     let bound = self.bind_expr(expr, schema)?;
                     let aliased = bound.alias(alias.value.clone());
-                    let field = SchemaField::new(
-                        alias.value.clone(),
-                        aliased.data_type(schema)?,
-                    );
+                    let field = SchemaField::new(alias.value.clone(), aliased.data_type(schema)?);
                     fields.push(field);
                     exprs.push(aliased);
                 }
@@ -745,7 +769,11 @@ impl<'a> Binder<'a> {
                     let bound = self.bind_expr(expr, input_schema)?;
                     // Convert to a reference to the aggregate output
                     let (converted, field) = self.convert_to_agg_output(
-                        &bound, agg_schema, group_by, aggregates, input_schema,
+                        &bound,
+                        agg_schema,
+                        group_by,
+                        aggregates,
+                        input_schema,
                     )?;
                     exprs.push(converted);
                     fields.push(field);
@@ -753,7 +781,11 @@ impl<'a> Binder<'a> {
                 SelectItem::ExprWithAlias { expr, alias } => {
                     let bound = self.bind_expr(expr, input_schema)?;
                     let (converted, mut field) = self.convert_to_agg_output(
-                        &bound, agg_schema, group_by, aggregates, input_schema,
+                        &bound,
+                        agg_schema,
+                        group_by,
+                        aggregates,
+                        input_schema,
                     )?;
                     let aliased = converted.alias(alias.value.clone());
                     field.name = alias.value.clone();
@@ -800,10 +832,7 @@ impl<'a> Binder<'a> {
         for (i, gb) in group_by.iter().enumerate() {
             if expr == gb {
                 let field = &agg_schema.fields()[i];
-                return Ok((
-                    Expr::Column(Column::new(field.name.clone())),
-                    field.clone(),
-                ));
+                return Ok((Expr::Column(Column::new(field.name.clone())), field.clone()));
             }
         }
 
@@ -812,10 +841,7 @@ impl<'a> Binder<'a> {
         for (i, agg) in aggregates.iter().enumerate() {
             if expr == agg {
                 let field = &agg_schema.fields()[group_by_len + i];
-                return Ok((
-                    Expr::Column(Column::new(field.name.clone())),
-                    field.clone(),
-                ));
+                return Ok((Expr::Column(Column::new(field.name.clone())), field.clone()));
             }
         }
 
@@ -826,16 +852,17 @@ impl<'a> Binder<'a> {
             for (i, agg) in aggregates.iter().enumerate() {
                 if agg.output_name() == output_name || expr == agg {
                     let field = &agg_schema.fields()[group_by_len + i];
-                    return Ok((
-                        Expr::Column(Column::new(field.name.clone())),
-                        field.clone(),
-                    ));
+                    return Ok((Expr::Column(Column::new(field.name.clone())), field.clone()));
                 }
             }
             // If it's an expression containing an aggregate (like SUM(x) + 1),
             // we need to recursively convert
             let converted = self.convert_expr_with_aggregates(
-                expr, agg_schema, group_by, aggregates, input_schema,
+                expr,
+                agg_schema,
+                group_by,
+                aggregates,
+                input_schema,
             )?;
             let field = converted.to_field(agg_schema)?;
             return Ok((converted, field));
@@ -843,7 +870,11 @@ impl<'a> Binder<'a> {
 
         // For non-aggregate expressions that reference group by columns
         let converted = self.convert_expr_with_aggregates(
-            expr, agg_schema, group_by, aggregates, input_schema,
+            expr,
+            agg_schema,
+            group_by,
+            aggregates,
+            input_schema,
         )?;
         let field = converted.to_field(agg_schema)?;
         Ok((converted, field))
@@ -879,10 +910,18 @@ impl<'a> Binder<'a> {
         match expr {
             Expr::BinaryExpr { left, op, right } => {
                 let left_conv = self.convert_expr_with_aggregates(
-                    left, agg_schema, group_by, aggregates, input_schema,
+                    left,
+                    agg_schema,
+                    group_by,
+                    aggregates,
+                    input_schema,
                 )?;
                 let right_conv = self.convert_expr_with_aggregates(
-                    right, agg_schema, group_by, aggregates, input_schema,
+                    right,
+                    agg_schema,
+                    group_by,
+                    aggregates,
+                    input_schema,
                 )?;
                 Ok(Expr::BinaryExpr {
                     left: Box::new(left_conv),
@@ -892,7 +931,11 @@ impl<'a> Binder<'a> {
             }
             Expr::UnaryExpr { op, expr: inner } => {
                 let inner_conv = self.convert_expr_with_aggregates(
-                    inner, agg_schema, group_by, aggregates, input_schema,
+                    inner,
+                    agg_schema,
+                    group_by,
+                    aggregates,
+                    input_schema,
                 )?;
                 Ok(Expr::UnaryExpr {
                     op: *op,
@@ -901,16 +944,27 @@ impl<'a> Binder<'a> {
             }
             Expr::Alias { expr: inner, name } => {
                 let inner_conv = self.convert_expr_with_aggregates(
-                    inner, agg_schema, group_by, aggregates, input_schema,
+                    inner,
+                    agg_schema,
+                    group_by,
+                    aggregates,
+                    input_schema,
                 )?;
                 Ok(Expr::Alias {
                     expr: Box::new(inner_conv),
                     name: name.clone(),
                 })
             }
-            Expr::Cast { expr: inner, data_type } => {
+            Expr::Cast {
+                expr: inner,
+                data_type,
+            } => {
                 let inner_conv = self.convert_expr_with_aggregates(
-                    inner, agg_schema, group_by, aggregates, input_schema,
+                    inner,
+                    agg_schema,
+                    group_by,
+                    aggregates,
+                    input_schema,
                 )?;
                 Ok(Expr::Cast {
                     expr: Box::new(inner_conv),
@@ -981,7 +1035,12 @@ impl<'a> Binder<'a> {
             }
         }
 
-        Ok((group_by_exprs, aggregate_exprs, aggregate_aliases, has_aggregates))
+        Ok((
+            group_by_exprs,
+            aggregate_exprs,
+            aggregate_aliases,
+            has_aggregates,
+        ))
     }
 
     fn collect_aggregates(&self, expr: &Expr, aggregates: &mut Vec<Expr>) {
@@ -1056,7 +1115,7 @@ impl<'a> Binder<'a> {
                             self.bind_expr(&o.expr, schema)?
                         }
                     }
-                    _ => self.bind_expr(&o.expr, schema)?
+                    _ => self.bind_expr(&o.expr, schema)?,
                 };
                 let direction = if o.asc.unwrap_or(true) {
                     SortDirection::Asc
@@ -1091,7 +1150,10 @@ impl<'a> Binder<'a> {
                 if idents.len() == 2 {
                     let table = &idents[0].value;
                     let column = &idents[1].value;
-                    Ok(Expr::Column(Column::new_qualified(table.clone(), column.clone())))
+                    Ok(Expr::Column(Column::new_qualified(
+                        table.clone(),
+                        column.clone(),
+                    )))
                 } else {
                     Err(QueryError::Bind(format!(
                         "Unsupported compound identifier: {:?}",
@@ -1231,7 +1293,9 @@ impl<'a> Binder<'a> {
                     else_expr: bound_else,
                 })
             }
-            SqlExpr::Cast { expr, data_type, .. } => {
+            SqlExpr::Cast {
+                expr, data_type, ..
+            } => {
                 let bound_expr = self.bind_expr(expr, schema)?;
                 let arrow_type = self.convert_data_type(data_type)?;
                 Ok(Expr::Cast {
@@ -1247,7 +1311,12 @@ impl<'a> Binder<'a> {
                     args: vec![Expr::Literal(ScalarValue::Utf8(field_name)), bound_expr],
                 })
             }
-            SqlExpr::Substring { expr, substring_from, substring_for, .. } => {
+            SqlExpr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                ..
+            } => {
                 let bound_expr = self.bind_expr(expr, schema)?;
                 let mut args = vec![bound_expr];
 
@@ -1329,7 +1398,11 @@ impl<'a> Binder<'a> {
                     ast::DataType::Date => {
                         // Parse date string
                         if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
-                            let days = date.signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days() as i32;
+                            let days = date
+                                .signed_duration_since(
+                                    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
+                                )
+                                .num_days() as i32;
                             return Ok(Expr::Literal(ScalarValue::Date32(days)));
                         }
                     }
@@ -1351,22 +1424,12 @@ impl<'a> Binder<'a> {
                     args: vec![arg],
                 })
             }
-            SqlExpr::Substring { expr, substring_from, substring_for, .. } => {
-                let mut args = vec![self.bind_expr(expr, schema)?];
-                if let Some(from_expr) = substring_from {
-                    args.push(self.bind_expr(from_expr, schema)?);
-                } else {
-                    args.push(Expr::Literal(ScalarValue::Int64(1)));
-                }
-                if let Some(for_expr) = substring_for {
-                    args.push(self.bind_expr(for_expr, schema)?);
-                }
-                Ok(Expr::ScalarFunc {
-                    func: ScalarFunction::Substring,
-                    args,
-                })
-            }
-            SqlExpr::Trim { expr, trim_where, trim_what, .. } => {
+            SqlExpr::Trim {
+                expr,
+                trim_where,
+                trim_what: _,
+                ..
+            } => {
                 // For now, simple trim without specific characters
                 let arg = self.bind_expr(expr, schema)?;
                 match trim_where {
@@ -1425,7 +1488,9 @@ impl<'a> Binder<'a> {
         let func_args: Vec<&ast::FunctionArg> = match &func.args {
             ast::FunctionArguments::None => vec![],
             ast::FunctionArguments::Subquery(_) => {
-                return Err(QueryError::NotImplemented("Subquery function arguments".into()));
+                return Err(QueryError::NotImplemented(
+                    "Subquery function arguments".into(),
+                ));
             }
             ast::FunctionArguments::List(arg_list) => arg_list.args.iter().collect(),
         };
@@ -1454,7 +1519,10 @@ impl<'a> Binder<'a> {
         // Check for DISTINCT in function args
         let distinct = match &func.args {
             ast::FunctionArguments::List(arg_list) => {
-                matches!(arg_list.duplicate_treatment, Some(ast::DuplicateTreatment::Distinct))
+                matches!(
+                    arg_list.duplicate_treatment,
+                    Some(ast::DuplicateTreatment::Distinct)
+                )
             }
             _ => false,
         };
@@ -1627,19 +1695,13 @@ impl<'a> Binder<'a> {
             ast::DataType::Float(_) | ast::DataType::Double | ast::DataType::DoublePrecision => {
                 Ok(ArrowDataType::Float64)
             }
-            ast::DataType::Decimal(info) | ast::DataType::Numeric(info) => {
-                match info {
-                    ast::ExactNumberInfo::PrecisionAndScale(p, s) => {
-                        Ok(ArrowDataType::Decimal128(*p as u8, *s as i8))
-                    }
-                    ast::ExactNumberInfo::Precision(p) => {
-                        Ok(ArrowDataType::Decimal128(*p as u8, 0))
-                    }
-                    ast::ExactNumberInfo::None => {
-                        Ok(ArrowDataType::Decimal128(38, 10))
-                    }
+            ast::DataType::Decimal(info) | ast::DataType::Numeric(info) => match info {
+                ast::ExactNumberInfo::PrecisionAndScale(p, s) => {
+                    Ok(ArrowDataType::Decimal128(*p as u8, *s as i8))
                 }
-            }
+                ast::ExactNumberInfo::Precision(p) => Ok(ArrowDataType::Decimal128(*p as u8, 0)),
+                ast::ExactNumberInfo::None => Ok(ArrowDataType::Decimal128(38, 10)),
+            },
             ast::DataType::Char(_) | ast::DataType::Varchar(_) | ast::DataType::Text => {
                 Ok(ArrowDataType::Utf8)
             }
@@ -1719,7 +1781,9 @@ mod tests {
         let catalog = create_test_catalog();
         let mut binder = Binder::new(&catalog);
 
-        let plan = binder.bind_sql("SELECT o_orderkey, o_totalprice FROM orders").unwrap();
+        let plan = binder
+            .bind_sql("SELECT o_orderkey, o_totalprice FROM orders")
+            .unwrap();
         assert!(matches!(plan, LogicalPlan::Project(_)));
     }
 

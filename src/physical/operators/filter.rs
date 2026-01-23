@@ -1,22 +1,21 @@
 //! Filter operator
 
 use crate::error::{QueryError, Result};
+use crate::physical::operators::subquery::{evaluate_subquery_expr, SubqueryExecutor};
 use crate::physical::{PhysicalOperator, RecordBatchStream};
-use crate::physical::operators::subquery::{SubqueryExecutor, evaluate_subquery_expr};
 use crate::planner::{BinaryOp, Column, Expr, ScalarValue, UnaryOp};
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Datum,
-    Int32Array, Int64Array, StringArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Datum, Int32Array, Int64Array, StringArray,
 };
 use arrow::compute;
-use arrow::compute::kernels::cmp;
 use arrow::compute::kernels::boolean;
+use arrow::compute::kernels::cmp;
 use arrow::compute::kernels::numeric;
 use arrow::datatypes::{DataType, IntervalDayTime, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_select::zip::zip;
 use async_trait::async_trait;
-use futures::stream::{StreamExt, TryStreamExt};
+use futures::stream::TryStreamExt;
 use std::fmt;
 use std::sync::Arc;
 
@@ -87,7 +86,9 @@ impl PhysicalOperator for FilterExec {
                     if let Some(exec) = subquery_exec {
                         evaluate_filter_with_subquery(&batch, &pred, &schema, &exec)
                     } else {
-                        Err(QueryError::Execution("Subquery in filter but no executor available".into()))
+                        Err(QueryError::Execution(
+                            "Subquery in filter but no executor available".into(),
+                        ))
                     }
                 } else {
                     evaluate_filter(&batch, &pred, &schema)
@@ -110,7 +111,11 @@ impl fmt::Display for FilterExec {
 }
 
 /// Evaluate a filter predicate on a batch
-fn evaluate_filter(batch: &RecordBatch, predicate: &Expr, _schema: &SchemaRef) -> Result<RecordBatch> {
+fn evaluate_filter(
+    batch: &RecordBatch,
+    predicate: &Expr,
+    _schema: &SchemaRef,
+) -> Result<RecordBatch> {
     let mask = evaluate_expr_internal(batch, predicate, None)?;
 
     let boolean_array = mask
@@ -121,10 +126,7 @@ fn evaluate_filter(batch: &RecordBatch, predicate: &Expr, _schema: &SchemaRef) -
     let filtered_columns: Result<Vec<ArrayRef>> = batch
         .columns()
         .iter()
-        .map(|col| {
-            compute::filter(col.as_ref(), boolean_array)
-                .map_err(Into::into)
-        })
+        .map(|col| compute::filter(col.as_ref(), boolean_array).map_err(Into::into))
         .collect();
 
     RecordBatch::try_new(batch.schema(), filtered_columns?).map_err(Into::into)
@@ -147,10 +149,7 @@ fn evaluate_filter_with_subquery(
     let filtered_columns: Result<Vec<ArrayRef>> = batch
         .columns()
         .iter()
-        .map(|col| {
-            compute::filter(col.as_ref(), boolean_array)
-                .map_err(Into::into)
-        })
+        .map(|col| compute::filter(col.as_ref(), boolean_array).map_err(Into::into))
         .collect();
 
     RecordBatch::try_new(batch.schema(), filtered_columns?).map_err(Into::into)
@@ -173,9 +172,7 @@ fn evaluate_expr_internal(
             Ok(batch.column(idx).clone())
         }
 
-        Expr::Literal(value) => {
-            Ok(scalar_to_array(value, batch.num_rows()))
-        }
+        Expr::Literal(value) => Ok(scalar_to_array(value, batch.num_rows())),
 
         Expr::BinaryExpr { left, op, right } => {
             let left_arr = evaluate_expr_internal(batch, left, subquery_executor)?;
@@ -195,11 +192,23 @@ fn evaluate_expr_internal(
 
         Expr::Alias { expr, .. } => evaluate_expr_internal(batch, expr, subquery_executor),
 
-        Expr::Case { operand, when_then, else_expr } => {
-            evaluate_case(batch, operand.as_deref(), when_then, else_expr.as_deref(), subquery_executor)
-        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => evaluate_case(
+            batch,
+            operand.as_deref(),
+            when_then,
+            else_expr.as_deref(),
+            subquery_executor,
+        ),
 
-        Expr::InList { expr, list, negated } => {
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
             let value = evaluate_expr_internal(batch, expr, subquery_executor)?;
             let list_values: Result<Vec<ArrayRef>> = list
                 .iter()
@@ -209,7 +218,12 @@ fn evaluate_expr_internal(
             evaluate_in_list(&value, &list_values, *negated)
         }
 
-        Expr::Between { expr, low, high, negated } => {
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
             let value = evaluate_expr_internal(batch, expr, subquery_executor)?;
             let low_val = evaluate_expr_internal(batch, low, subquery_executor)?;
             let high_val = evaluate_expr_internal(batch, high, subquery_executor)?;
@@ -249,7 +263,9 @@ fn evaluate_expr_internal(
             if let Some(exec) = subquery_executor {
                 evaluate_subquery_expr(batch, expr, exec)
             } else {
-                Err(QueryError::Execution("Subquery expression but no executor available".into()))
+                Err(QueryError::Execution(
+                    "Subquery expression but no executor available".into(),
+                ))
             }
         }
 
@@ -306,21 +322,24 @@ fn scalar_to_array(value: &ScalarValue, num_rows: usize) -> ArrayRef {
         ScalarValue::Utf8(v) => Arc::new(StringArray::from(vec![v.as_str(); num_rows])),
         ScalarValue::Date32(v) => Arc::new(Date32Array::from(vec![*v; num_rows])),
         ScalarValue::Date64(v) => Arc::new(arrow::array::Date64Array::from(vec![*v; num_rows])),
-        ScalarValue::Timestamp(v) => Arc::new(
-            arrow::array::TimestampMicrosecondArray::from(vec![*v; num_rows])
-        ),
+        ScalarValue::Timestamp(v) => Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                *v;
+                num_rows
+            ])),
         ScalarValue::Decimal128(d) => {
-            use rust_decimal::prelude::ToPrimitive;
             let scaled = d.mantissa();
             Arc::new(
                 arrow::array::Decimal128Array::from(vec![scaled; num_rows])
                     .with_precision_and_scale(38, 10)
-                    .unwrap()
+                    .unwrap(),
             )
         }
         ScalarValue::Interval(v) => {
             let interval = IntervalDayTime::new(*v as i32, (*v >> 32) as i32);
-            Arc::new(arrow::array::IntervalDayTimeArray::from(vec![interval; num_rows]))
+            Arc::new(arrow::array::IntervalDayTimeArray::from(vec![
+                interval;
+                num_rows
+            ]))
         }
     }
 }
@@ -337,16 +356,24 @@ fn evaluate_binary_op(left: &ArrayRef, op: BinaryOp, right: &ArrayRef) -> Result
         BinaryOp::Gt => compare_arrays(&left, &right, |l, r| cmp::gt(l, r)),
         BinaryOp::GtEq => compare_arrays(&left, &right, |l, r| cmp::gt_eq(l, r)),
         BinaryOp::And => {
-            let l = left.as_any().downcast_ref::<BooleanArray>()
+            let l = left
+                .as_any()
+                .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| QueryError::Type("AND requires boolean operands".into()))?;
-            let r = right.as_any().downcast_ref::<BooleanArray>()
+            let r = right
+                .as_any()
+                .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| QueryError::Type("AND requires boolean operands".into()))?;
             Ok(Arc::new(boolean::and(l, r)?))
         }
         BinaryOp::Or => {
-            let l = left.as_any().downcast_ref::<BooleanArray>()
+            let l = left
+                .as_any()
+                .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| QueryError::Type("OR requires boolean operands".into()))?;
-            let r = right.as_any().downcast_ref::<BooleanArray>()
+            let r = right
+                .as_any()
+                .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| QueryError::Type("OR requires boolean operands".into()))?;
             Ok(Arc::new(boolean::or(l, r)?))
         }
@@ -356,9 +383,13 @@ fn evaluate_binary_op(left: &ArrayRef, op: BinaryOp, right: &ArrayRef) -> Result
         BinaryOp::Divide => arithmetic_op(&left, &right, |a, b| numeric::div(a, b)),
         BinaryOp::Modulo => arithmetic_op(&left, &right, |a, b| numeric::rem(a, b)),
         BinaryOp::Like => {
-            let l = left.as_any().downcast_ref::<StringArray>()
+            let l = left
+                .as_any()
+                .downcast_ref::<StringArray>()
                 .ok_or_else(|| QueryError::Type("LIKE requires string operands".into()))?;
-            let r = right.as_any().downcast_ref::<StringArray>()
+            let r = right
+                .as_any()
+                .downcast_ref::<StringArray>()
                 .ok_or_else(|| QueryError::Type("LIKE requires string operands".into()))?;
             // Implement proper LIKE pattern matching with % and _
             let result: BooleanArray = (0..l.len())
@@ -373,9 +404,13 @@ fn evaluate_binary_op(left: &ArrayRef, op: BinaryOp, right: &ArrayRef) -> Result
             Ok(Arc::new(result))
         }
         BinaryOp::NotLike => {
-            let l = left.as_any().downcast_ref::<StringArray>()
+            let l = left
+                .as_any()
+                .downcast_ref::<StringArray>()
                 .ok_or_else(|| QueryError::Type("NOT LIKE requires string operands".into()))?;
-            let r = right.as_any().downcast_ref::<StringArray>()
+            let r = right
+                .as_any()
+                .downcast_ref::<StringArray>()
                 .ok_or_else(|| QueryError::Type("NOT LIKE requires string operands".into()))?;
             // Implement NOT LIKE as negation of LIKE
             let result: BooleanArray = (0..l.len())
@@ -390,9 +425,13 @@ fn evaluate_binary_op(left: &ArrayRef, op: BinaryOp, right: &ArrayRef) -> Result
             Ok(Arc::new(result))
         }
         BinaryOp::StringConcat => {
-            let l = left.as_any().downcast_ref::<StringArray>()
+            let l = left
+                .as_any()
+                .downcast_ref::<StringArray>()
                 .ok_or_else(|| QueryError::Type("|| requires string operands".into()))?;
-            let r = right.as_any().downcast_ref::<StringArray>()
+            let r = right
+                .as_any()
+                .downcast_ref::<StringArray>()
                 .ok_or_else(|| QueryError::Type("|| requires string operands".into()))?;
             // Manually concatenate strings
             let result: StringArray = (0..l.len())
@@ -493,15 +532,9 @@ fn evaluate_unary_op(op: UnaryOp, arr: &ArrayRef) -> Result<ArrayRef> {
                 .ok_or_else(|| QueryError::Type("NOT requires boolean operand".into()))?;
             Ok(Arc::new(boolean::not(bool_arr)?))
         }
-        UnaryOp::Negate => {
-            Ok(Arc::new(numeric::neg(arr.as_ref())?))
-        }
-        UnaryOp::IsNull => {
-            Ok(Arc::new(compute::is_null(arr.as_ref())?))
-        }
-        UnaryOp::IsNotNull => {
-            Ok(Arc::new(compute::is_not_null(arr.as_ref())?))
-        }
+        UnaryOp::Negate => Ok(Arc::new(numeric::neg(arr.as_ref())?)),
+        UnaryOp::IsNull => Ok(Arc::new(compute::is_null(arr.as_ref())?)),
+        UnaryOp::IsNotNull => Ok(Arc::new(compute::is_not_null(arr.as_ref())?)),
     }
 }
 
@@ -593,36 +626,48 @@ fn evaluate_scalar_func(
 
     match func {
         ScalarFunction::Upper => {
-            let arr = evaluated_args.first()
+            let arr = evaluated_args
+                .first()
                 .ok_or_else(|| QueryError::InvalidArgument("UPPER requires 1 argument".into()))?;
-            let str_arr = arr.as_any().downcast_ref::<StringArray>()
+            let str_arr = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
                 .ok_or_else(|| QueryError::Type("UPPER requires string argument".into()))?;
 
-            let result: StringArray = str_arr.iter()
+            let result: StringArray = str_arr
+                .iter()
                 .map(|opt| opt.map(|s| s.to_uppercase()))
                 .collect();
             Ok(Arc::new(result))
         }
 
         ScalarFunction::Lower => {
-            let arr = evaluated_args.first()
+            let arr = evaluated_args
+                .first()
                 .ok_or_else(|| QueryError::InvalidArgument("LOWER requires 1 argument".into()))?;
-            let str_arr = arr.as_any().downcast_ref::<StringArray>()
+            let str_arr = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
                 .ok_or_else(|| QueryError::Type("LOWER requires string argument".into()))?;
 
-            let result: StringArray = str_arr.iter()
+            let result: StringArray = str_arr
+                .iter()
                 .map(|opt| opt.map(|s| s.to_lowercase()))
                 .collect();
             Ok(Arc::new(result))
         }
 
         ScalarFunction::Length => {
-            let arr = evaluated_args.first()
+            let arr = evaluated_args
+                .first()
                 .ok_or_else(|| QueryError::InvalidArgument("LENGTH requires 1 argument".into()))?;
-            let str_arr = arr.as_any().downcast_ref::<StringArray>()
+            let str_arr = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
                 .ok_or_else(|| QueryError::Type("LENGTH requires string argument".into()))?;
 
-            let result: Int64Array = str_arr.iter()
+            let result: Int64Array = str_arr
+                .iter()
                 .map(|opt| opt.map(|s| s.len() as i64))
                 .collect();
             Ok(Arc::new(result))
@@ -630,10 +675,14 @@ fn evaluate_scalar_func(
 
         ScalarFunction::Substring => {
             if evaluated_args.len() < 2 {
-                return Err(QueryError::InvalidArgument("SUBSTRING requires at least 2 arguments".into()));
+                return Err(QueryError::InvalidArgument(
+                    "SUBSTRING requires at least 2 arguments".into(),
+                ));
             }
 
-            let str_arr = evaluated_args[0].as_any().downcast_ref::<StringArray>()
+            let str_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
                 .ok_or_else(|| QueryError::Type("SUBSTRING requires string argument".into()))?;
 
             let start_arr = &evaluated_args[1];
@@ -650,7 +699,7 @@ fn evaluate_scalar_func(
                             let len = get_int_value(len, i).unwrap_or(s.len() as i64) as usize;
                             Some(s.chars().skip(start).take(len).collect::<String>())
                         }
-                        None => Some(s.chars().skip(start).collect::<String>())
+                        None => Some(s.chars().skip(start).collect::<String>()),
                     }
                 })
                 .collect();
@@ -660,7 +709,9 @@ fn evaluate_scalar_func(
 
         ScalarFunction::Coalesce => {
             if evaluated_args.is_empty() {
-                return Err(QueryError::InvalidArgument("COALESCE requires at least 1 argument".into()));
+                return Err(QueryError::InvalidArgument(
+                    "COALESCE requires at least 1 argument".into(),
+                ));
             }
 
             // Start with the last argument
@@ -678,17 +729,22 @@ fn evaluate_scalar_func(
         ScalarFunction::Extract => {
             // EXTRACT(field FROM date)
             if evaluated_args.len() != 2 {
-                return Err(QueryError::InvalidArgument("EXTRACT requires 2 arguments".into()));
+                return Err(QueryError::InvalidArgument(
+                    "EXTRACT requires 2 arguments".into(),
+                ));
             }
 
-            let field = evaluated_args[0].as_any().downcast_ref::<StringArray>()
+            let field = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
                 .ok_or_else(|| QueryError::Type("EXTRACT field must be string".into()))?;
 
             let date_arr = &evaluated_args[1];
 
             if let Some(date32) = date_arr.as_any().downcast_ref::<Date32Array>() {
                 let field_name = field.value(0).to_uppercase();
-                let result: Int32Array = date32.iter()
+                let result: Int32Array = date32
+                    .iter()
                     .map(|opt| {
                         opt.map(|days| {
                             let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719163)
@@ -705,16 +761,20 @@ fn evaluate_scalar_func(
                 return Ok(Arc::new(result));
             }
 
-            Err(QueryError::NotImplemented("EXTRACT for this type not implemented".into()))
+            Err(QueryError::NotImplemented(
+                "EXTRACT for this type not implemented".into(),
+            ))
         }
 
         ScalarFunction::Year | ScalarFunction::Month | ScalarFunction::Day => {
-            let date_arr = evaluated_args.first()
-                .ok_or_else(|| QueryError::InvalidArgument("Date function requires 1 argument".into()))?;
+            let date_arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("Date function requires 1 argument".into())
+            })?;
 
             if let Some(date32) = date_arr.as_any().downcast_ref::<Date32Array>() {
                 use chrono::Datelike;
-                let result: Int32Array = date32.iter()
+                let result: Int32Array = date32
+                    .iter()
                     .map(|opt| {
                         opt.map(|days| {
                             let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719163)
@@ -731,31 +791,37 @@ fn evaluate_scalar_func(
                 return Ok(Arc::new(result));
             }
 
-            Err(QueryError::NotImplemented("Date function for this type not implemented".into()))
+            Err(QueryError::NotImplemented(
+                "Date function for this type not implemented".into(),
+            ))
         }
 
         ScalarFunction::Abs => {
-            let arr = evaluated_args.first()
+            let arr = evaluated_args
+                .first()
                 .ok_or_else(|| QueryError::InvalidArgument("ABS requires 1 argument".into()))?;
             apply_math_unary_preserve_int(arr, |x| x.abs(), |x| x.abs())
         }
 
         ScalarFunction::Ceil => {
-            let arr = evaluated_args.first()
+            let arr = evaluated_args
+                .first()
                 .ok_or_else(|| QueryError::InvalidArgument("CEIL requires 1 argument".into()))?;
             // For integers, ceil is identity; for floats, use ceil
             apply_math_unary_preserve_int(arr, |x| x.ceil(), |x| x)
         }
 
         ScalarFunction::Floor => {
-            let arr = evaluated_args.first()
+            let arr = evaluated_args
+                .first()
                 .ok_or_else(|| QueryError::InvalidArgument("FLOOR requires 1 argument".into()))?;
             // For integers, floor is identity; for floats, use floor
             apply_math_unary_preserve_int(arr, |x| x.floor(), |x| x)
         }
 
         ScalarFunction::Round => {
-            let arr = evaluated_args.first()
+            let arr = evaluated_args
+                .first()
                 .ok_or_else(|| QueryError::InvalidArgument("ROUND requires 1 argument".into()))?;
             // For integers, round is identity; for floats, use round
             apply_math_unary_preserve_int(arr, |x| x.round(), |x| x)
@@ -763,48 +829,63 @@ fn evaluate_scalar_func(
 
         ScalarFunction::Power => {
             if evaluated_args.len() != 2 {
-                return Err(QueryError::InvalidArgument("POWER requires 2 arguments".into()));
+                return Err(QueryError::InvalidArgument(
+                    "POWER requires 2 arguments".into(),
+                ));
             }
             apply_math_binary(&evaluated_args[0], &evaluated_args[1], |a, b| a.powf(b))
         }
 
         ScalarFunction::Sqrt => {
-            let arr = evaluated_args.first()
+            let arr = evaluated_args
+                .first()
                 .ok_or_else(|| QueryError::InvalidArgument("SQRT requires 1 argument".into()))?;
             apply_math_unary(arr, |x| x.sqrt())
         }
 
         ScalarFunction::Trim => {
-            let arr = evaluated_args.first()
+            let arr = evaluated_args
+                .first()
                 .ok_or_else(|| QueryError::InvalidArgument("TRIM requires 1 argument".into()))?;
-            let str_arr = arr.as_any().downcast_ref::<StringArray>()
+            let str_arr = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
                 .ok_or_else(|| QueryError::Type("TRIM requires string argument".into()))?;
 
-            let result: StringArray = str_arr.iter()
+            let result: StringArray = str_arr
+                .iter()
                 .map(|opt| opt.map(|s| s.trim().to_string()))
                 .collect();
             Ok(Arc::new(result))
         }
 
         ScalarFunction::Ltrim => {
-            let arr = evaluated_args.first()
+            let arr = evaluated_args
+                .first()
                 .ok_or_else(|| QueryError::InvalidArgument("LTRIM requires 1 argument".into()))?;
-            let str_arr = arr.as_any().downcast_ref::<StringArray>()
+            let str_arr = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
                 .ok_or_else(|| QueryError::Type("LTRIM requires string argument".into()))?;
 
-            let result: StringArray = str_arr.iter()
+            let result: StringArray = str_arr
+                .iter()
                 .map(|opt| opt.map(|s| s.trim_start().to_string()))
                 .collect();
             Ok(Arc::new(result))
         }
 
         ScalarFunction::Rtrim => {
-            let arr = evaluated_args.first()
+            let arr = evaluated_args
+                .first()
                 .ok_or_else(|| QueryError::InvalidArgument("RTRIM requires 1 argument".into()))?;
-            let str_arr = arr.as_any().downcast_ref::<StringArray>()
+            let str_arr = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
                 .ok_or_else(|| QueryError::Type("RTRIM requires string argument".into()))?;
 
-            let result: StringArray = str_arr.iter()
+            let result: StringArray = str_arr
+                .iter()
                 .map(|opt| opt.map(|s| s.trim_end().to_string()))
                 .collect();
             Ok(Arc::new(result))
@@ -812,14 +893,26 @@ fn evaluate_scalar_func(
 
         ScalarFunction::Replace => {
             if evaluated_args.len() != 3 {
-                return Err(QueryError::InvalidArgument("REPLACE requires 3 arguments".into()));
+                return Err(QueryError::InvalidArgument(
+                    "REPLACE requires 3 arguments".into(),
+                ));
             }
-            let str_arr = evaluated_args[0].as_any().downcast_ref::<StringArray>()
+            let str_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
                 .ok_or_else(|| QueryError::Type("REPLACE requires string argument".into()))?;
-            let from_arr = evaluated_args[1].as_any().downcast_ref::<StringArray>()
-                .ok_or_else(|| QueryError::Type("REPLACE requires string argument for pattern".into()))?;
-            let to_arr = evaluated_args[2].as_any().downcast_ref::<StringArray>()
-                .ok_or_else(|| QueryError::Type("REPLACE requires string argument for replacement".into()))?;
+            let from_arr = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    QueryError::Type("REPLACE requires string argument for pattern".into())
+                })?;
+            let to_arr = evaluated_args[2]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    QueryError::Type("REPLACE requires string argument for replacement".into())
+                })?;
 
             let result: StringArray = (0..str_arr.len())
                 .map(|i| {
@@ -835,22 +928,32 @@ fn evaluate_scalar_func(
 
         ScalarFunction::NullIf => {
             if evaluated_args.len() != 2 {
-                return Err(QueryError::InvalidArgument("NULLIF requires 2 arguments".into()));
+                return Err(QueryError::InvalidArgument(
+                    "NULLIF requires 2 arguments".into(),
+                ));
             }
             // NULLIF(a, b) returns NULL if a = b, otherwise returns a
-            let eq_result = evaluate_binary_op(&evaluated_args[0], BinaryOp::Eq, &evaluated_args[1])?;
-            let is_equal = eq_result.as_any().downcast_ref::<BooleanArray>()
+            let eq_result =
+                evaluate_binary_op(&evaluated_args[0], BinaryOp::Eq, &evaluated_args[1])?;
+            let is_equal = eq_result
+                .as_any()
+                .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| QueryError::Type("NULLIF comparison must return boolean".into()))?;
 
             // Create null array of same type
-            let null_arr = arrow::array::new_null_array(evaluated_args[0].data_type(), evaluated_args[0].len());
+            let null_arr = arrow::array::new_null_array(
+                evaluated_args[0].data_type(),
+                evaluated_args[0].len(),
+            );
             // Use zip: if equal, return null; otherwise return first arg
             Ok(zip(is_equal, &null_arr, &evaluated_args[0])?)
         }
 
         ScalarFunction::Concat => {
             if evaluated_args.is_empty() {
-                return Err(QueryError::InvalidArgument("CONCAT requires at least 1 argument".into()));
+                return Err(QueryError::InvalidArgument(
+                    "CONCAT requires at least 1 argument".into(),
+                ));
             }
             let num_rows = evaluated_args[0].len();
             let result: StringArray = (0..num_rows)
@@ -885,27 +988,29 @@ where
 
     // Preserve int types for functions like ABS
     if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
-        let result: Int64Array = int_arr.iter()
-            .map(|opt| opt.map(|v| f_int(v)))
-            .collect();
+        let result: Int64Array = int_arr.iter().map(|opt| opt.map(|v| f_int(v))).collect();
         return Ok(Arc::new(result));
     }
 
     if let Some(int_arr) = arr.as_any().downcast_ref::<Int32Array>() {
-        let result: Int32Array = int_arr.iter()
+        let result: Int32Array = int_arr
+            .iter()
             .map(|opt| opt.map(|v| f_int(v as i64) as i32))
             .collect();
         return Ok(Arc::new(result));
     }
 
     if let Some(float_arr) = arr.as_any().downcast_ref::<Float64Array>() {
-        let result: Float64Array = float_arr.iter()
+        let result: Float64Array = float_arr
+            .iter()
             .map(|opt| opt.map(|v| f_float(v)))
             .collect();
         return Ok(Arc::new(result));
     }
 
-    Err(QueryError::Type("Math function requires numeric argument".into()))
+    Err(QueryError::Type(
+        "Math function requires numeric argument".into(),
+    ))
 }
 
 fn apply_math_unary<F>(arr: &ArrayRef, f: F) -> Result<ArrayRef>
@@ -916,27 +1021,23 @@ where
 
     // Always return Float64 for functions like SQRT, CEIL, FLOOR, ROUND
     if let Some(float_arr) = arr.as_any().downcast_ref::<Float64Array>() {
-        let result: Float64Array = float_arr.iter()
-            .map(|opt| opt.map(|v| f(v)))
-            .collect();
+        let result: Float64Array = float_arr.iter().map(|opt| opt.map(|v| f(v))).collect();
         return Ok(Arc::new(result));
     }
 
     if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
-        let result: Float64Array = int_arr.iter()
-            .map(|opt| opt.map(|v| f(v as f64)))
-            .collect();
+        let result: Float64Array = int_arr.iter().map(|opt| opt.map(|v| f(v as f64))).collect();
         return Ok(Arc::new(result));
     }
 
     if let Some(int_arr) = arr.as_any().downcast_ref::<Int32Array>() {
-        let result: Float64Array = int_arr.iter()
-            .map(|opt| opt.map(|v| f(v as f64)))
-            .collect();
+        let result: Float64Array = int_arr.iter().map(|opt| opt.map(|v| f(v as f64))).collect();
         return Ok(Arc::new(result));
     }
 
-    Err(QueryError::Type("Math function requires numeric argument".into()))
+    Err(QueryError::Type(
+        "Math function requires numeric argument".into(),
+    ))
 }
 
 fn apply_math_binary<F>(left: &ArrayRef, right: &ArrayRef, f: F) -> Result<ArrayRef>
@@ -948,12 +1049,12 @@ where
     let left_vals = get_float_array(left)?;
     let right_vals = get_float_array(right)?;
 
-    let result: Float64Array = left_vals.iter().zip(right_vals.iter())
-        .map(|(l, r)| {
-            match (l, r) {
-                (Some(lv), Some(rv)) => Some(f(*lv, *rv)),
-                _ => None,
-            }
+    let result: Float64Array = left_vals
+        .iter()
+        .zip(right_vals.iter())
+        .map(|(l, r)| match (l, r) {
+            (Some(lv), Some(rv)) => Some(f(*lv, *rv)),
+            _ => None,
         })
         .collect();
 
@@ -992,8 +1093,8 @@ fn get_int_value(arr: &ArrayRef, idx: usize) -> Option<i64> {
 /// `%` matches any sequence of characters (including empty)
 /// `_` matches exactly one character
 fn like_match(text: &str, pattern: &str) -> bool {
-    let mut t_chars: Vec<char> = text.chars().collect();
-    let mut p_chars: Vec<char> = pattern.chars().collect();
+    let t_chars: Vec<char> = text.chars().collect();
+    let p_chars: Vec<char> = pattern.chars().collect();
 
     like_match_recursive(&t_chars, &p_chars)
 }
@@ -1069,8 +1170,7 @@ mod tests {
         let scan = Arc::new(MemoryTableExec::new("test", schema, vec![batch], None));
 
         // Filter: value > 25
-        let predicate = Expr::column("value")
-            .gt(Expr::literal(ScalarValue::Int64(25)));
+        let predicate = Expr::column("value").gt(Expr::literal(ScalarValue::Int64(25)));
 
         let filter = FilterExec::new(scan, predicate);
 
@@ -1091,9 +1191,7 @@ mod tests {
         // Filter: value > 15 AND value < 45
         let predicate = Expr::column("value")
             .gt(Expr::literal(ScalarValue::Int64(15)))
-            .and(
-                Expr::column("value").lt(Expr::literal(ScalarValue::Int64(45)))
-            );
+            .and(Expr::column("value").lt(Expr::literal(ScalarValue::Int64(45))));
 
         let filter = FilterExec::new(scan, predicate);
 

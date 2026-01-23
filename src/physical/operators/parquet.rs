@@ -11,8 +11,8 @@ use crate::physical::{PhysicalOperator, RecordBatchStream};
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use futures::stream::{self, StreamExt};
-use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
+use futures::stream;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use std::fmt;
 use std::fs::File;
@@ -68,11 +68,7 @@ pub struct ParquetScanExec {
 
 impl ParquetScanExec {
     /// Create a new Parquet scan operator
-    pub fn new(
-        path: PathBuf,
-        schema: SchemaRef,
-        projection: Option<Vec<usize>>,
-    ) -> Self {
+    pub fn new(path: PathBuf, schema: SchemaRef, projection: Option<Vec<usize>>) -> Self {
         Self {
             path,
             schema,
@@ -93,10 +89,13 @@ impl PhysicalOperator for ParquetScanExec {
 
     async fn execute(&self, _partition: usize) -> Result<RecordBatchStream> {
         let file = File::open(&self.path).map_err(|e| {
-            QueryError::Execution(format!("Failed to open Parquet file {:?}: {}", self.path, e))
+            QueryError::Execution(format!(
+                "Failed to open Parquet file {:?}: {}",
+                self.path, e
+            ))
         })?;
 
-        let mut builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
             QueryError::Execution(format!("Failed to create Parquet reader builder: {}", e))
         })?;
 
@@ -104,9 +103,9 @@ impl PhysicalOperator for ParquetScanExec {
         // For now, we read all columns and project later
         // TODO: Implement proper ProjectionMask using SchemaDescriptor
 
-        let mut reader = builder.build().map_err(|e| {
-            QueryError::Execution(format!("Failed to build Parquet reader: {}", e))
-        })?;
+        let mut reader = builder
+            .build()
+            .map_err(|e| QueryError::Execution(format!("Failed to build Parquet reader: {}", e)))?;
 
         let mut batches = Vec::new();
 
@@ -118,7 +117,10 @@ impl PhysicalOperator for ParquetScanExec {
                     batches.push(batch);
                 }
                 Some(Err(e)) => {
-                    return Err(QueryError::Execution(format!("Failed to read Parquet batch: {}", e)));
+                    return Err(QueryError::Execution(format!(
+                        "Failed to read Parquet batch: {}",
+                        e
+                    )));
                 }
                 None => break,
             }
@@ -169,13 +171,14 @@ impl ParquetWriter {
 
     /// Write a single record batch
     pub fn write(&mut self, batch: &RecordBatch) -> Result<()> {
-        let writer = self.writer.as_mut().ok_or_else(|| {
-            QueryError::Execution("Parquet writer already closed".to_string())
-        })?;
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| QueryError::Execution("Parquet writer already closed".to_string()))?;
 
-        writer.write(batch).map_err(|e| {
-            QueryError::Execution(format!("Failed to write Parquet batch: {}", e))
-        })?;
+        writer
+            .write(batch)
+            .map_err(|e| QueryError::Execution(format!("Failed to write Parquet batch: {}", e)))?;
 
         Ok(())
     }

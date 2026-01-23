@@ -4,8 +4,7 @@ use crate::error::Result;
 use crate::physical::{PhysicalOperator, RecordBatchStream};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use futures::stream::{self, StreamExt, TryStreamExt};
-use std::fmt;
+use futures::stream::{self, StreamExt};
 use std::sync::Arc;
 
 /// Union execution operator
@@ -51,8 +50,7 @@ impl PhysicalOperator for UnionExec {
         }
 
         // Create a stream that yields from each input in sequence
-        let chained = stream::iter(streams)
-            .flat_map(|s| s);
+        let chained = stream::iter(streams).flat_map(|s| s);
 
         Ok(Box::pin(chained))
     }

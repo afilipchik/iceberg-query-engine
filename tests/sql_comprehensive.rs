@@ -3,9 +3,7 @@
 //! This test suite covers all SQL features to ensure correctness.
 //! Run with: cargo test --test sql_comprehensive
 
-use arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray,
-};
+use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use query_engine::ExecutionContext;
@@ -79,7 +77,9 @@ fn create_test_context() -> ExecutionContext {
         vec![
             Arc::new(Int64Array::from(vec![101, 102, 103, 104, 105, 106])) as ArrayRef,
             Arc::new(Int64Array::from(vec![1, 1, 2, 3, 4, 1])) as ArrayRef,
-            Arc::new(Float64Array::from(vec![100.0, 200.0, 150.0, 300.0, 250.0, 175.0])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![
+                100.0, 200.0, 150.0, 300.0, 250.0, 175.0,
+            ])) as ArrayRef,
             Arc::new(StringArray::from(vec![
                 Some("completed"),
                 Some("pending"),
@@ -106,7 +106,13 @@ fn create_test_context() -> ExecutionContext {
         products_schema.clone(),
         vec![
             Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])) as ArrayRef,
-            Arc::new(StringArray::from(vec!["Widget", "Gadget", "Gizmo", "Doohickey", "Thingamabob"])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                "Widget",
+                "Gadget",
+                "Gizmo",
+                "Doohickey",
+                "Thingamabob",
+            ])) as ArrayRef,
             Arc::new(Float64Array::from(vec![10.0, 25.0, 15.0, 30.0, 20.0])) as ArrayRef,
             Arc::new(StringArray::from(vec![
                 Some("A"),
@@ -139,15 +145,11 @@ fn create_test_context() -> ExecutionContext {
     ctx.register_table("empty_table", empty_schema, vec![empty_batch]);
 
     // Table: numbers (n) - for testing sequences
-    let numbers_schema = Arc::new(Schema::new(vec![
-        Field::new("n", DataType::Int64, false),
-    ]));
+    let numbers_schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
 
     let numbers_batch = RecordBatch::try_new(
         numbers_schema.clone(),
-        vec![
-            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10])) as ArrayRef,
-        ],
+        vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10])) as ArrayRef],
     )
     .unwrap();
 
@@ -171,10 +173,19 @@ async fn query_i64_column(ctx: &ExecutionContext, sql: &str) -> Vec<Option<i64>>
         return vec![];
     }
     let col = result.batches[0].column(0);
-    let arr = col.as_any().downcast_ref::<Int64Array>().expect("Expected Int64Array");
-    (0..arr.len()).map(|i| {
-        if arr.is_null(i) { None } else { Some(arr.value(i)) }
-    }).collect()
+    let arr = col
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Expected Int64Array");
+    (0..arr.len())
+        .map(|i| {
+            if arr.is_null(i) {
+                None
+            } else {
+                Some(arr.value(i))
+            }
+        })
+        .collect()
 }
 
 /// Helper to run a query and get first column as f64 values
@@ -184,10 +195,19 @@ async fn query_f64_column(ctx: &ExecutionContext, sql: &str) -> Vec<Option<f64>>
         return vec![];
     }
     let col = result.batches[0].column(0);
-    let arr = col.as_any().downcast_ref::<Float64Array>().expect("Expected Float64Array");
-    (0..arr.len()).map(|i| {
-        if arr.is_null(i) { None } else { Some(arr.value(i)) }
-    }).collect()
+    let arr = col
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("Expected Float64Array");
+    (0..arr.len())
+        .map(|i| {
+            if arr.is_null(i) {
+                None
+            } else {
+                Some(arr.value(i))
+            }
+        })
+        .collect()
 }
 
 /// Helper to run a query and check if it succeeds
@@ -217,7 +237,10 @@ mod basic_select {
     #[tokio::test]
     async fn test_select_with_alias() {
         let ctx = create_test_context();
-        let result = ctx.sql("SELECT id AS user_id, name AS user_name FROM users").await.unwrap();
+        let result = ctx
+            .sql("SELECT id AS user_id, name AS user_name FROM users")
+            .await
+            .unwrap();
         assert_eq!(result.schema.field(0).name(), "user_id");
         assert_eq!(result.schema.field(1).name(), "user_name");
     }
@@ -254,107 +277,170 @@ mod where_clause {
     #[tokio::test]
     async fn test_where_equals() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users WHERE id = 1").await, 1);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users WHERE id = 1").await,
+            1
+        );
     }
 
     #[tokio::test]
     async fn test_where_not_equals() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users WHERE id != 1").await, 4);
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users WHERE id <> 1").await, 4);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users WHERE id != 1").await,
+            4
+        );
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users WHERE id <> 1").await,
+            4
+        );
     }
 
     #[tokio::test]
     async fn test_where_greater_than() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users WHERE age > 30").await, 2);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users WHERE age > 30").await,
+            2
+        );
     }
 
     #[tokio::test]
     async fn test_where_less_than() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users WHERE age < 30").await, 2);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users WHERE age < 30").await,
+            2
+        );
     }
 
     #[tokio::test]
     async fn test_where_greater_equals() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users WHERE age >= 30").await, 3);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users WHERE age >= 30").await,
+            3
+        );
     }
 
     #[tokio::test]
     async fn test_where_less_equals() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users WHERE age <= 30").await, 3);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users WHERE age <= 30").await,
+            3
+        );
     }
 
     #[tokio::test]
     async fn test_where_and() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users WHERE age > 25 AND active = true").await, 2);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users WHERE age > 25 AND active = true").await,
+            2
+        );
     }
 
     #[tokio::test]
     async fn test_where_or() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users WHERE age < 26 OR age > 35").await, 2);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users WHERE age < 26 OR age > 35").await,
+            2
+        );
     }
 
     #[tokio::test]
     async fn test_where_not() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users WHERE NOT active").await, 2);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users WHERE NOT active").await,
+            2
+        );
     }
 
     #[tokio::test]
     async fn test_where_in() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users WHERE id IN (1, 2, 3)").await, 3);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users WHERE id IN (1, 2, 3)").await,
+            3
+        );
     }
 
     #[tokio::test]
     async fn test_where_not_in() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users WHERE id NOT IN (1, 2)").await, 3);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users WHERE id NOT IN (1, 2)").await,
+            3
+        );
     }
 
     #[tokio::test]
     async fn test_where_between() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users WHERE age BETWEEN 25 AND 35").await, 4);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users WHERE age BETWEEN 25 AND 35").await,
+            4
+        );
     }
 
     #[tokio::test]
     async fn test_where_like() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users WHERE name LIKE 'A%'").await, 1);
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users WHERE name LIKE '%a%'").await, 2); // Diana, Charlie
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users WHERE name LIKE 'A%'").await,
+            1
+        );
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users WHERE name LIKE '%a%'").await,
+            2
+        ); // Diana, Charlie
     }
 
     #[tokio::test]
     async fn test_where_is_null() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users WHERE name IS NULL").await, 1);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users WHERE name IS NULL").await,
+            1
+        );
     }
 
     #[tokio::test]
     async fn test_where_is_not_null() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users WHERE name IS NOT NULL").await, 4);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users WHERE name IS NOT NULL").await,
+            4
+        );
     }
 
     #[tokio::test]
     async fn test_where_string_equals() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users WHERE name = 'Alice'").await, 1);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users WHERE name = 'Alice'").await,
+            1
+        );
     }
 
     #[tokio::test]
     async fn test_where_boolean() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users WHERE active").await, 3);
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users WHERE active = true").await, 3);
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users WHERE active = false").await, 2);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users WHERE active").await,
+            3
+        );
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users WHERE active = true").await,
+            3
+        );
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users WHERE active = false").await,
+            2
+        );
     }
 
     #[tokio::test]
@@ -408,7 +494,8 @@ mod order_by {
     #[tokio::test]
     async fn test_order_by_expression() {
         let ctx = create_test_context();
-        let values = query_i64_column(&ctx, "SELECT id, age FROM users ORDER BY age * 2 DESC").await;
+        let values =
+            query_i64_column(&ctx, "SELECT id, age FROM users ORDER BY age * 2 DESC").await;
         assert_eq!(values, vec![Some(5), Some(3), Some(1), Some(4), Some(2)]);
     }
 
@@ -438,31 +525,46 @@ mod limit_offset {
     #[tokio::test]
     async fn test_limit() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users LIMIT 3").await, 3);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users LIMIT 3").await,
+            3
+        );
     }
 
     #[tokio::test]
     async fn test_limit_zero() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users LIMIT 0").await, 0);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users LIMIT 0").await,
+            0
+        );
     }
 
     #[tokio::test]
     async fn test_limit_exceeds_rows() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users LIMIT 100").await, 5);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users LIMIT 100").await,
+            5
+        );
     }
 
     #[tokio::test]
     async fn test_offset() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users LIMIT 10 OFFSET 2").await, 3);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users LIMIT 10 OFFSET 2").await,
+            3
+        );
     }
 
     #[tokio::test]
     async fn test_offset_exceeds_rows() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users LIMIT 10 OFFSET 100").await, 0);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users LIMIT 10 OFFSET 100").await,
+            0
+        );
     }
 
     #[tokio::test]
@@ -494,7 +596,10 @@ mod limit_offset {
     async fn test_offset_only() {
         let ctx = create_test_context();
         // OFFSET without LIMIT should still work
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM numbers OFFSET 5").await, 5);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM numbers OFFSET 5").await,
+            5
+        );
     }
 }
 
@@ -574,7 +679,10 @@ mod aggregates {
     #[tokio::test]
     async fn test_multiple_aggregates() {
         let ctx = create_test_context();
-        let result = ctx.sql("SELECT COUNT(*), SUM(age), AVG(age), MIN(age), MAX(age) FROM users").await.unwrap();
+        let result = ctx
+            .sql("SELECT COUNT(*), SUM(age), AVG(age), MIN(age), MAX(age) FROM users")
+            .await
+            .unwrap();
         assert_eq!(result.row_count, 1);
         assert_eq!(result.schema.fields().len(), 5);
     }
@@ -614,7 +722,8 @@ mod group_by {
     #[tokio::test]
     async fn test_group_by_with_having() {
         let ctx = create_test_context();
-        let sql = "SELECT user_id, COUNT(*) as cnt FROM orders GROUP BY user_id HAVING COUNT(*) > 1";
+        let sql =
+            "SELECT user_id, COUNT(*) as cnt FROM orders GROUP BY user_id HAVING COUNT(*) > 1";
         let result = ctx.sql(sql).await.unwrap();
         assert_eq!(result.row_count, 1); // Only user 1 has multiple orders
     }
@@ -622,7 +731,8 @@ mod group_by {
     #[tokio::test]
     async fn test_group_by_with_order_by() {
         let ctx = create_test_context();
-        let sql = "SELECT user_id, SUM(amount) as total FROM orders GROUP BY user_id ORDER BY total DESC";
+        let sql =
+            "SELECT user_id, SUM(amount) as total FROM orders GROUP BY user_id ORDER BY total DESC";
         let result = ctx.sql(sql).await.unwrap();
         assert_eq!(result.row_count, 4);
     }
@@ -688,7 +798,8 @@ mod joins {
     #[tokio::test]
     async fn test_full_outer_join() {
         let ctx = create_test_context();
-        let sql = "SELECT u.name, o.amount FROM users u FULL OUTER JOIN orders o ON u.id = o.user_id";
+        let sql =
+            "SELECT u.name, o.amount FROM users u FULL OUTER JOIN orders o ON u.id = o.user_id";
         let result = ctx.sql(sql).await.unwrap();
         assert!(result.row_count >= 6);
     }
@@ -815,7 +926,8 @@ mod subqueries {
     #[tokio::test]
     async fn test_subquery_exists() {
         let ctx = create_test_context();
-        let sql = "SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id)";
+        let sql =
+            "SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id)";
         assert_eq!(query_row_count(&ctx, sql).await, 4);
     }
 
@@ -923,14 +1035,17 @@ mod expressions {
     async fn test_concatenation() {
         let ctx = create_test_context();
         // String concatenation with ||
-        let result = ctx.sql("SELECT name || ' test' FROM users WHERE id = 1").await;
+        let result = ctx
+            .sql("SELECT name || ' test' FROM users WHERE id = 1")
+            .await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_case_when() {
         let ctx = create_test_context();
-        let sql = "SELECT CASE WHEN age >= 30 THEN 'senior' ELSE 'junior' END FROM users WHERE id = 1";
+        let sql =
+            "SELECT CASE WHEN age >= 30 THEN 'senior' ELSE 'junior' END FROM users WHERE id = 1";
         let result = ctx.sql(sql).await.unwrap();
         assert_eq!(result.row_count, 1);
     }
@@ -1130,19 +1245,28 @@ mod edge_cases {
     #[tokio::test]
     async fn test_empty_result() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users WHERE 1 = 0").await, 0);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users WHERE 1 = 0").await,
+            0
+        );
     }
 
     #[tokio::test]
     async fn test_always_true() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users WHERE 1 = 1").await, 5);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users WHERE 1 = 1").await,
+            5
+        );
     }
 
     #[tokio::test]
     async fn test_double_negative() {
         let ctx = create_test_context();
-        assert_eq!(query_row_count(&ctx, "SELECT * FROM users WHERE NOT NOT active").await, 3);
+        assert_eq!(
+            query_row_count(&ctx, "SELECT * FROM users WHERE NOT NOT active").await,
+            3
+        );
     }
 
     #[tokio::test]
@@ -1209,7 +1333,9 @@ mod error_handling {
     async fn test_ambiguous_column() {
         let ctx = create_test_context();
         // When joining tables with same column name without qualifier
-        let result = ctx.sql("SELECT order_id FROM users JOIN orders ON users.id = orders.user_id").await;
+        let result = ctx
+            .sql("SELECT order_id FROM users JOIN orders ON users.id = orders.user_id")
+            .await;
         // This might work or error depending on implementation
         let _ = result;
     }
@@ -1224,7 +1350,9 @@ mod error_handling {
     #[tokio::test]
     async fn test_type_mismatch() {
         let ctx = create_test_context();
-        let result = ctx.sql("SELECT * FROM users WHERE age = 'not a number'").await;
+        let result = ctx
+            .sql("SELECT * FROM users WHERE age = 'not a number'")
+            .await;
         // Might error or do implicit conversion
         let _ = result;
     }

@@ -186,7 +186,10 @@ async fn main() {
         }
 
         Commands::Benchmark { sf, iterations } => {
-            println!("Running TPC-H benchmark (SF={}, iterations={})", sf, iterations);
+            println!(
+                "Running TPC-H benchmark (SF={}, iterations={})",
+                sf, iterations
+            );
             println!();
 
             let mut ctx = ExecutionContext::new();
@@ -315,7 +318,10 @@ async fn main() {
             let mut ctx = ExecutionContext::new();
 
             // Load all TPC-H tables from Parquet files
-            let tables = ["nation", "region", "part", "supplier", "partsupp", "customer", "orders", "lineitem"];
+            let tables = [
+                "nation", "region", "part", "supplier", "partsupp", "customer", "orders",
+                "lineitem",
+            ];
 
             for table in &tables {
                 let file_path = path.join(format!("{}.parquet", table));
@@ -332,7 +338,10 @@ async fn main() {
                 }
             }
 
-            println!("\nData loaded in {:?}. Running queries...\n", start.elapsed());
+            println!(
+                "\nData loaded in {:?}. Running queries...\n",
+                start.elapsed()
+            );
 
             let mut total_time = std::time::Duration::ZERO;
             let mut results = Vec::new();
@@ -461,7 +470,11 @@ async fn run_repl(tpch_path: Option<PathBuf>) {
                 match ctx.sql(line).await {
                     Ok(result) => {
                         print_results(&result);
-                        println!("({} rows in {:.3}ms)\n", result.row_count, start.elapsed().as_secs_f64() * 1000.0);
+                        println!(
+                            "({} rows in {:.3}ms)\n",
+                            result.row_count,
+                            start.elapsed().as_secs_f64() * 1000.0
+                        );
                     }
                     Err(e) => {
                         eprintln!("Error: {}\n", e);
@@ -535,7 +548,11 @@ async fn handle_dot_command(ctx: &mut ExecutionContext, line: &str) -> bool {
                             "  {}: {:?}{}",
                             field.name(),
                             field.data_type(),
-                            if field.is_nullable() { " (nullable)" } else { "" }
+                            if field.is_nullable() {
+                                " (nullable)"
+                            } else {
+                                ""
+                            }
                         );
                     }
                     println!();
@@ -595,7 +612,10 @@ async fn handle_dot_command(ctx: &mut ExecutionContext, line: &str) -> bool {
             }
         }
         _ => {
-            eprintln!("Unknown command: {}. Type .help for available commands.\n", cmd);
+            eprintln!(
+                "Unknown command: {}. Type .help for available commands.\n",
+                cmd
+            );
         }
     }
     true

@@ -49,8 +49,12 @@ impl ScalarValue {
             ScalarValue::Utf8(_) => ArrowDataType::Utf8,
             ScalarValue::Date32(_) => ArrowDataType::Date32,
             ScalarValue::Date64(_) => ArrowDataType::Date64,
-            ScalarValue::Timestamp(_) => ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-            ScalarValue::Interval(_) => ArrowDataType::Interval(arrow::datatypes::IntervalUnit::DayTime),
+            ScalarValue::Timestamp(_) => {
+                ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+            }
+            ScalarValue::Interval(_) => {
+                ArrowDataType::Interval(arrow::datatypes::IntervalUnit::DayTime)
+            }
         }
     }
 
@@ -316,10 +320,7 @@ pub enum Expr {
     },
 
     /// Unary operation
-    UnaryExpr {
-        op: UnaryOp,
-        expr: Box<Expr>,
-    },
+    UnaryExpr { op: UnaryOp, expr: Box<Expr> },
 
     /// Aggregate function
     Aggregate {
@@ -379,10 +380,7 @@ pub enum Expr {
     },
 
     /// Alias
-    Alias {
-        expr: Box<Expr>,
-        name: String,
-    },
+    Alias { expr: Box<Expr>, name: String },
 
     /// Wildcard (*)
     Wildcard,
@@ -530,7 +528,9 @@ impl Expr {
                 let arg_names: Vec<_> = args.iter().map(|a| a.output_name()).collect();
                 format!("{}({})", func, arg_names.join(", "))
             }
-            Expr::Cast { expr, data_type } => format!("CAST({} AS {:?})", expr.output_name(), data_type),
+            Expr::Cast { expr, data_type } => {
+                format!("CAST({} AS {:?})", expr.output_name(), data_type)
+            }
             Expr::Case { .. } => "CASE".to_string(),
             Expr::InList { expr, .. } => format!("{} IN (...)", expr.output_name()),
             Expr::Between { expr, .. } => format!("{} BETWEEN ...", expr.output_name()),
@@ -547,12 +547,10 @@ impl Expr {
         use crate::error::QueryError;
 
         match self {
-            Expr::Column(col) => {
-                schema
-                    .resolve_column(col)
-                    .map(|(_, field)| field.data_type.clone())
-                    .ok_or_else(|| QueryError::ColumnNotFound(col.qualified_name()))
-            }
+            Expr::Column(col) => schema
+                .resolve_column(col)
+                .map(|(_, field)| field.data_type.clone())
+                .ok_or_else(|| QueryError::ColumnNotFound(col.qualified_name())),
             Expr::Literal(v) => Ok(v.data_type()),
             Expr::BinaryExpr { left, op, right } => {
                 let left_type = left.data_type(schema)?;
@@ -560,65 +558,82 @@ impl Expr {
 
                 match op {
                     BinaryOp::And | BinaryOp::Or => Ok(ArrowDataType::Boolean),
-                    BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq |
-                    BinaryOp::Gt | BinaryOp::GtEq | BinaryOp::Like | BinaryOp::NotLike => {
-                        Ok(ArrowDataType::Boolean)
-                    }
-                    BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide | BinaryOp::Modulo => {
+                    BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq
+                    | BinaryOp::Like
+                    | BinaryOp::NotLike => Ok(ArrowDataType::Boolean),
+                    BinaryOp::Add
+                    | BinaryOp::Subtract
+                    | BinaryOp::Multiply
+                    | BinaryOp::Divide
+                    | BinaryOp::Modulo => {
                         // Return the wider type
                         Ok(coerce_numeric_types(&left_type, &right_type))
                     }
                     BinaryOp::StringConcat => Ok(ArrowDataType::Utf8),
                 }
             }
-            Expr::UnaryExpr { op, expr } => {
-                match op {
-                    UnaryOp::Not | UnaryOp::IsNull | UnaryOp::IsNotNull => Ok(ArrowDataType::Boolean),
-                    UnaryOp::Negate => expr.data_type(schema),
+            Expr::UnaryExpr { op, expr } => match op {
+                UnaryOp::Not | UnaryOp::IsNull | UnaryOp::IsNotNull => Ok(ArrowDataType::Boolean),
+                UnaryOp::Negate => expr.data_type(schema),
+            },
+            Expr::Aggregate { func, args, .. } => match func {
+                AggregateFunction::Count | AggregateFunction::CountDistinct => {
+                    Ok(ArrowDataType::Int64)
                 }
-            }
-            Expr::Aggregate { func, args, .. } => {
-                match func {
-                    AggregateFunction::Count | AggregateFunction::CountDistinct => Ok(ArrowDataType::Int64),
-                    AggregateFunction::Sum => {
-                        if let Some(arg) = args.first() {
-                            let arg_type = arg.data_type(schema)?;
-                            Ok(promote_sum_type(&arg_type))
-                        } else {
-                            Ok(ArrowDataType::Int64)
-                        }
-                    }
-                    AggregateFunction::Avg => Ok(ArrowDataType::Float64),
-                    AggregateFunction::Min | AggregateFunction::Max => {
-                        args.first()
-                            .map(|a| a.data_type(schema))
-                            .unwrap_or(Ok(ArrowDataType::Null))
+                AggregateFunction::Sum => {
+                    if let Some(arg) = args.first() {
+                        let arg_type = arg.data_type(schema)?;
+                        Ok(promote_sum_type(&arg_type))
+                    } else {
+                        Ok(ArrowDataType::Int64)
                     }
                 }
-            }
+                AggregateFunction::Avg => Ok(ArrowDataType::Float64),
+                AggregateFunction::Min | AggregateFunction::Max => args
+                    .first()
+                    .map(|a| a.data_type(schema))
+                    .unwrap_or(Ok(ArrowDataType::Null)),
+            },
             Expr::ScalarFunc { func, args } => {
                 match func {
                     ScalarFunction::Length => Ok(ArrowDataType::Int64),
-                    ScalarFunction::Upper | ScalarFunction::Lower | ScalarFunction::Trim |
-                    ScalarFunction::Ltrim | ScalarFunction::Rtrim | ScalarFunction::Substring |
-                    ScalarFunction::Concat | ScalarFunction::Replace => Ok(ArrowDataType::Utf8),
-                    ScalarFunction::Year | ScalarFunction::Month | ScalarFunction::Day => Ok(ArrowDataType::Int32),
-                    ScalarFunction::Abs | ScalarFunction::Ceil | ScalarFunction::Floor | ScalarFunction::Round => {
-                        args.first()
-                            .map(|a| a.data_type(schema))
-                            .unwrap_or(Ok(ArrowDataType::Float64))
+                    ScalarFunction::Upper
+                    | ScalarFunction::Lower
+                    | ScalarFunction::Trim
+                    | ScalarFunction::Ltrim
+                    | ScalarFunction::Rtrim
+                    | ScalarFunction::Substring
+                    | ScalarFunction::Concat
+                    | ScalarFunction::Replace => Ok(ArrowDataType::Utf8),
+                    ScalarFunction::Year | ScalarFunction::Month | ScalarFunction::Day => {
+                        Ok(ArrowDataType::Int32)
                     }
+                    ScalarFunction::Abs
+                    | ScalarFunction::Ceil
+                    | ScalarFunction::Floor
+                    | ScalarFunction::Round => args
+                        .first()
+                        .map(|a| a.data_type(schema))
+                        .unwrap_or(Ok(ArrowDataType::Float64)),
                     ScalarFunction::Power | ScalarFunction::Sqrt => Ok(ArrowDataType::Float64),
-                    ScalarFunction::Coalesce | ScalarFunction::NullIf => {
-                        args.first()
-                            .map(|a| a.data_type(schema))
-                            .unwrap_or(Ok(ArrowDataType::Null))
-                    }
+                    ScalarFunction::Coalesce | ScalarFunction::NullIf => args
+                        .first()
+                        .map(|a| a.data_type(schema))
+                        .unwrap_or(Ok(ArrowDataType::Null)),
                     _ => Ok(ArrowDataType::Utf8), // Default
                 }
             }
             Expr::Cast { data_type, .. } => Ok(data_type.clone()),
-            Expr::Case { when_then, else_expr, .. } => {
+            Expr::Case {
+                when_then,
+                else_expr,
+                ..
+            } => {
                 if let Some((_, then_expr)) = when_then.first() {
                     then_expr.data_type(schema)
                 } else if let Some(else_expr) = else_expr {
@@ -627,9 +642,10 @@ impl Expr {
                     Ok(ArrowDataType::Null)
                 }
             }
-            Expr::InList { .. } | Expr::Between { .. } | Expr::Exists { .. } | Expr::InSubquery { .. } => {
-                Ok(ArrowDataType::Boolean)
-            }
+            Expr::InList { .. }
+            | Expr::Between { .. }
+            | Expr::Exists { .. }
+            | Expr::InSubquery { .. } => Ok(ArrowDataType::Boolean),
             Expr::ScalarSubquery(plan) => {
                 let subquery_schema = plan.schema();
                 if let Some(field) = subquery_schema.fields().first() {
@@ -639,9 +655,9 @@ impl Expr {
                 }
             }
             Expr::Alias { expr, .. } => expr.data_type(schema),
-            Expr::Wildcard | Expr::QualifiedWildcard(_) => {
-                Err(QueryError::Internal("Cannot determine type of wildcard".to_string()))
-            }
+            Expr::Wildcard | Expr::QualifiedWildcard(_) => Err(QueryError::Internal(
+                "Cannot determine type of wildcard".to_string(),
+            )),
         }
     }
 
@@ -662,10 +678,16 @@ impl Expr {
             Expr::UnaryExpr { expr, .. } => expr.contains_aggregate(),
             Expr::ScalarFunc { args, .. } => args.iter().any(|a| a.contains_aggregate()),
             Expr::Cast { expr, .. } => expr.contains_aggregate(),
-            Expr::Case { operand, when_then, else_expr } => {
-                operand.as_ref().is_some_and(|e| e.contains_aggregate()) ||
-                when_then.iter().any(|(w, t)| w.contains_aggregate() || t.contains_aggregate()) ||
-                else_expr.as_ref().is_some_and(|e| e.contains_aggregate())
+            Expr::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
+                operand.as_ref().is_some_and(|e| e.contains_aggregate())
+                    || when_then
+                        .iter()
+                        .any(|(w, t)| w.contains_aggregate() || t.contains_aggregate())
+                    || else_expr.as_ref().is_some_and(|e| e.contains_aggregate())
             }
             Expr::Alias { expr, .. } => expr.contains_aggregate(),
             _ => false,
@@ -682,18 +704,24 @@ impl Expr {
             Expr::UnaryExpr { expr, .. } => expr.contains_subquery(),
             Expr::ScalarFunc { args, .. } => args.iter().any(|a| a.contains_subquery()),
             Expr::Cast { expr, .. } => expr.contains_subquery(),
-            Expr::Case { operand, when_then, else_expr } => {
-                operand.as_ref().is_some_and(|e| e.contains_subquery()) ||
-                when_then.iter().any(|(w, t)| w.contains_subquery() || t.contains_subquery()) ||
-                else_expr.as_ref().is_some_and(|e| e.contains_subquery())
+            Expr::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
+                operand.as_ref().is_some_and(|e| e.contains_subquery())
+                    || when_then
+                        .iter()
+                        .any(|(w, t)| w.contains_subquery() || t.contains_subquery())
+                    || else_expr.as_ref().is_some_and(|e| e.contains_subquery())
             }
             Expr::Alias { expr, .. } => expr.contains_subquery(),
             Expr::InList { expr, list, .. } => {
                 expr.contains_subquery() || list.iter().any(|e| e.contains_subquery())
             }
-            Expr::Between { expr, low, high, .. } => {
-                expr.contains_subquery() || low.contains_subquery() || high.contains_subquery()
-            }
+            Expr::Between {
+                expr, low, high, ..
+            } => expr.contains_subquery() || low.contains_subquery() || high.contains_subquery(),
             _ => false,
         }
     }
@@ -706,7 +734,11 @@ impl fmt::Display for Expr {
             Expr::Literal(v) => write!(f, "{}", v),
             Expr::BinaryExpr { left, op, right } => write!(f, "({} {} {})", left, op, right),
             Expr::UnaryExpr { op, expr } => write!(f, "({} {})", op, expr),
-            Expr::Aggregate { func, args, distinct } => {
+            Expr::Aggregate {
+                func,
+                args,
+                distinct,
+            } => {
                 let distinct_str = if *distinct { "DISTINCT " } else { "" };
                 let args_str: Vec<String> = args.iter().map(|a| a.to_string()).collect();
                 write!(f, "{}({}{})", func, distinct_str, args_str.join(", "))
@@ -716,7 +748,11 @@ impl fmt::Display for Expr {
                 write!(f, "{}({})", func, args_str.join(", "))
             }
             Expr::Cast { expr, data_type } => write!(f, "CAST({} AS {:?})", expr, data_type),
-            Expr::Case { operand, when_then, else_expr } => {
+            Expr::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
                 write!(f, "CASE ")?;
                 if let Some(op) = operand {
                     write!(f, "{} ", op)?;
@@ -729,12 +765,21 @@ impl fmt::Display for Expr {
                 }
                 write!(f, "END")
             }
-            Expr::InList { expr, list, negated } => {
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => {
                 let not_str = if *negated { "NOT " } else { "" };
                 let list_str: Vec<String> = list.iter().map(|e| e.to_string()).collect();
                 write!(f, "{} {}IN ({})", expr, not_str, list_str.join(", "))
             }
-            Expr::Between { expr, low, high, negated } => {
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
                 let not_str = if *negated { "NOT " } else { "" };
                 write!(f, "{} {}BETWEEN {} AND {}", expr, not_str, low, high)
             }
@@ -793,7 +838,13 @@ mod tests {
         let lit = Expr::literal(ScalarValue::Int64(10));
         let expr = col.clone().eq(lit);
 
-        assert!(matches!(expr, Expr::BinaryExpr { op: BinaryOp::Eq, .. }));
+        assert!(matches!(
+            expr,
+            Expr::BinaryExpr {
+                op: BinaryOp::Eq,
+                ..
+            }
+        ));
     }
 
     #[test]

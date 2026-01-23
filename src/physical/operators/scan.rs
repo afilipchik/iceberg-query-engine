@@ -5,7 +5,7 @@ use crate::physical::{PhysicalOperator, RecordBatchStream};
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use futures::stream::{self, StreamExt};
+use futures::stream;
 use std::fmt;
 use std::sync::Arc;
 
@@ -47,23 +47,20 @@ impl TableProvider for MemoryTable {
 
     fn scan(&self, projection: Option<&[usize]>) -> Result<Vec<RecordBatch>> {
         match projection {
-            Some(indices) => {
-                self.batches
-                    .iter()
-                    .map(|batch| {
-                        let columns: Vec<_> = indices
-                            .iter()
-                            .map(|&i| batch.column(i).clone())
-                            .collect();
-                        let fields: Vec<_> = indices
-                            .iter()
-                            .map(|&i| self.schema.field(i).clone())
-                            .collect();
-                        let schema = Arc::new(arrow::datatypes::Schema::new(fields));
-                        RecordBatch::try_new(schema, columns).map_err(Into::into)
-                    })
-                    .collect()
-            }
+            Some(indices) => self
+                .batches
+                .iter()
+                .map(|batch| {
+                    let columns: Vec<_> =
+                        indices.iter().map(|&i| batch.column(i).clone()).collect();
+                    let fields: Vec<_> = indices
+                        .iter()
+                        .map(|&i| self.schema.field(i).clone())
+                        .collect();
+                    let schema = Arc::new(arrow::datatypes::Schema::new(fields));
+                    RecordBatch::try_new(schema, columns).map_err(Into::into)
+                })
+                .collect(),
             None => Ok(self.batches.clone()),
         }
     }
@@ -87,10 +84,7 @@ impl MemoryTableExec {
     ) -> Self {
         let projected_schema = match &projection {
             Some(indices) => {
-                let fields: Vec<_> = indices
-                    .iter()
-                    .map(|&i| schema.field(i).clone())
-                    .collect();
+                let fields: Vec<_> = indices.iter().map(|&i| schema.field(i).clone()).collect();
                 Arc::new(arrow::datatypes::Schema::new(fields))
             }
             None => schema.clone(),
@@ -175,7 +169,8 @@ impl PhysicalOperator for MemoryTableExec {
         let num_partitions = self.output_partitions().max(1);
 
         // Split batches across partitions
-        let partition_batches: Vec<RecordBatch> = self.batches
+        let partition_batches: Vec<RecordBatch> = self
+            .batches
             .iter()
             .enumerate()
             .filter(|(i, _)| i % num_partitions == partition)
@@ -183,19 +178,14 @@ impl PhysicalOperator for MemoryTableExec {
             .collect();
 
         let batches = match &self.projection {
-            Some(indices) => {
-                partition_batches
-                    .iter()
-                    .map(|batch| {
-                        let columns: Vec<_> = indices
-                            .iter()
-                            .map(|&i| batch.column(i).clone())
-                            .collect();
-                        RecordBatch::try_new(self.schema.clone(), columns)
-                            .map_err(Into::into)
-                    })
-                    .collect::<Result<Vec<_>>>()?
-            }
+            Some(indices) => partition_batches
+                .iter()
+                .map(|batch| {
+                    let columns: Vec<_> =
+                        indices.iter().map(|&i| batch.column(i).clone()).collect();
+                    RecordBatch::try_new(self.schema.clone(), columns).map_err(Into::into)
+                })
+                .collect::<Result<Vec<_>>>()?,
             None => partition_batches,
         };
 

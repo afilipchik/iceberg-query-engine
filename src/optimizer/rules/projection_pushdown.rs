@@ -132,7 +132,9 @@ impl ProjectionPushdown {
                     self.extract_columns_from_expr(item, required);
                 }
             }
-            Expr::Between { expr, low, high, .. } => {
+            Expr::Between {
+                expr, low, high, ..
+            } => {
                 self.extract_columns_from_expr(expr, required);
                 self.extract_columns_from_expr(low, required);
                 self.extract_columns_from_expr(high, required);
@@ -163,7 +165,11 @@ impl ProjectionPushdown {
 
     /// Extract outer column references from a subquery
     /// These are columns that reference tables NOT defined within the subquery
-    fn extract_outer_columns_from_subquery(&self, subquery: &LogicalPlan, required: &mut HashSet<Column>) {
+    fn extract_outer_columns_from_subquery(
+        &self,
+        subquery: &LogicalPlan,
+        required: &mut HashSet<Column>,
+    ) {
         // Collect table aliases defined in the subquery
         let local_tables = self.collect_subquery_tables(subquery);
         // Extract columns from the subquery that reference outer tables
@@ -213,7 +219,12 @@ impl ProjectionPushdown {
     }
 
     /// Extract columns from a plan that reference tables NOT in local_tables (i.e., outer references)
-    fn extract_outer_columns_recursive(&self, plan: &LogicalPlan, local_tables: &HashSet<String>, required: &mut HashSet<Column>) {
+    fn extract_outer_columns_recursive(
+        &self,
+        plan: &LogicalPlan,
+        local_tables: &HashSet<String>,
+        required: &mut HashSet<Column>,
+    ) {
         match plan {
             LogicalPlan::Filter(node) => {
                 self.extract_outer_columns_from_expr(&node.predicate, local_tables, required);
@@ -270,7 +281,12 @@ impl ProjectionPushdown {
     }
 
     /// Extract columns from an expression that reference tables NOT in local_tables
-    fn extract_outer_columns_from_expr(&self, expr: &Expr, local_tables: &HashSet<String>, required: &mut HashSet<Column>) {
+    fn extract_outer_columns_from_expr(
+        &self,
+        expr: &Expr,
+        local_tables: &HashSet<String>,
+        required: &mut HashSet<Column>,
+    ) {
         match expr {
             Expr::Column(col) => {
                 // Only add if this column references an outer table
@@ -297,7 +313,11 @@ impl ProjectionPushdown {
             Expr::Cast { expr, .. } | Expr::Alias { expr, .. } => {
                 self.extract_outer_columns_from_expr(expr, local_tables, required);
             }
-            Expr::Case { operand, when_then, else_expr } => {
+            Expr::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
                 if let Some(op) = operand {
                     self.extract_outer_columns_from_expr(op, local_tables, required);
                 }
@@ -315,7 +335,9 @@ impl ProjectionPushdown {
                     self.extract_outer_columns_from_expr(item, local_tables, required);
                 }
             }
-            Expr::Between { expr, low, high, .. } => {
+            Expr::Between {
+                expr, low, high, ..
+            } => {
                 self.extract_outer_columns_from_expr(expr, local_tables, required);
                 self.extract_outer_columns_from_expr(low, local_tables, required);
                 self.extract_outer_columns_from_expr(high, local_tables, required);
@@ -343,7 +365,9 @@ impl ProjectionPushdown {
                     };
 
                     // Check for exact match or unqualified match
-                    let mut is_required = required.contains(&col) || required.contains(&unqualified) || required.is_empty();
+                    let mut is_required = required.contains(&col)
+                        || required.contains(&unqualified)
+                        || required.is_empty();
 
                     // Also check if any required column has the same name (handles table aliases)
                     // e.g., required has "l1.l_orderkey" but schema has "lineitem.l_orderkey"
@@ -458,11 +482,13 @@ impl ProjectionPushdown {
 
             LogicalPlan::SubqueryAlias(node) => {
                 let input = self.pushdown(&node.input, required)?;
-                Ok(LogicalPlan::SubqueryAlias(crate::planner::SubqueryAliasNode {
-                    input: Arc::new(input),
-                    alias: node.alias.clone(),
-                    schema: node.schema.clone(),
-                }))
+                Ok(LogicalPlan::SubqueryAlias(
+                    crate::planner::SubqueryAliasNode {
+                        input: Arc::new(input),
+                        alias: node.alias.clone(),
+                        schema: node.schema.clone(),
+                    },
+                ))
             }
 
             LogicalPlan::EmptyRelation(_) | LogicalPlan::Values(_) => Ok(plan.clone()),

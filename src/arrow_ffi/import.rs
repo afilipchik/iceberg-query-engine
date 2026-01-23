@@ -5,10 +5,9 @@
 //! Note: This is a simplified implementation that demonstrates the architecture.
 //! Full Arrow C Data Interface support would require more complex FFI bindings.
 
-use crate::error::{QueryError, Result};
+use crate::error::Result;
 use arrow::array::*;
 use arrow::datatypes::*;
-use std::sync::Arc;
 
 /// Simple importer for Arrow arrays
 pub struct ArrowImporter;
@@ -42,6 +41,7 @@ pub struct ArrayMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_import_metadata() {

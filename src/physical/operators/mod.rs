@@ -12,8 +12,8 @@ mod sort;
 mod subquery;
 mod union;
 
-pub use filter::{FilterExec, evaluate_expr};
-pub use hash_agg::{HashAggregateExec, AggregateExpr};
+pub use filter::{evaluate_expr, FilterExec};
+pub use hash_agg::{AggregateExpr, HashAggregateExec};
 pub use hash_join::HashJoinExec;
 pub use iceberg::{IcebergScanExec, PartitionFilter};
 pub use limit::LimitExec;
@@ -21,5 +21,5 @@ pub use parquet::{ParquetScanExec, ParquetTable, ParquetWriter};
 pub use project::ProjectExec;
 pub use scan::{MemoryTable, MemoryTableExec, TableProvider};
 pub use sort::SortExec;
-pub use subquery::{SubqueryExecutor, evaluate_subquery_expr};
+pub use subquery::{evaluate_subquery_expr, SubqueryExecutor};
 pub use union::UnionExec;

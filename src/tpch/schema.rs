@@ -114,14 +114,7 @@ pub fn lineitem_schema() -> SchemaRef {
 
 /// All TPC-H table names
 pub const TPCH_TABLES: &[&str] = &[
-    "nation",
-    "region",
-    "part",
-    "supplier",
-    "partsupp",
-    "customer",
-    "orders",
-    "lineitem",
+    "nation", "region", "part", "supplier", "partsupp", "customer", "orders", "lineitem",
 ];
 
 /// Get schema for a table by name

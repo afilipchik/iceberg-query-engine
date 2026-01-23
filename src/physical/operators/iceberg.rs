@@ -8,10 +8,9 @@
 
 use crate::error::{QueryError, Result};
 use crate::physical::{PhysicalOperator, RecordBatchStream};
-use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use futures::stream::{self, StreamExt};
+use futures::stream;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt;
@@ -116,10 +115,7 @@ pub struct IcebergScanExec {
 
 impl IcebergScanExec {
     /// Create a new Iceberg scan operator
-    pub fn new(
-        table_path: PathBuf,
-        schema: SchemaRef,
-    ) -> Self {
+    pub fn new(table_path: PathBuf, schema: SchemaRef) -> Self {
         Self {
             table_path,
             schema,
@@ -145,25 +141,31 @@ impl IcebergScanExec {
         let metadata_path = self.table_path.join("metadata/v0.metadata.json");
 
         let metadata_content = fs::read_to_string(&metadata_path).map_err(|e| {
-            QueryError::Execution(format!("Failed to read Iceberg metadata from {:?}: {}", metadata_path, e))
+            QueryError::Execution(format!(
+                "Failed to read Iceberg metadata from {:?}: {}",
+                metadata_path, e
+            ))
         })?;
 
-        serde_json::from_str(&metadata_content).map_err(|e| {
-            QueryError::Execution(format!("Failed to parse Iceberg metadata: {}", e))
-        })
+        serde_json::from_str(&metadata_content)
+            .map_err(|e| QueryError::Execution(format!("Failed to parse Iceberg metadata: {}", e)))
     }
 
     /// Load snapshot
     fn load_snapshot(&self, snapshot_id: i64) -> Result<IcebergSnapshot> {
-        let snapshot_path = self.table_path.join(format!("metadata/snap-{}.snapshot.json", snapshot_id));
+        let snapshot_path = self
+            .table_path
+            .join(format!("metadata/snap-{}.snapshot.json", snapshot_id));
 
         let snapshot_content = fs::read_to_string(&snapshot_path).map_err(|e| {
-            QueryError::Execution(format!("Failed to read Iceberg snapshot from {:?}: {}", snapshot_path, e))
+            QueryError::Execution(format!(
+                "Failed to read Iceberg snapshot from {:?}: {}",
+                snapshot_path, e
+            ))
         })?;
 
-        serde_json::from_str(&snapshot_content).map_err(|e| {
-            QueryError::Execution(format!("Failed to parse Iceberg snapshot: {}", e))
-        })
+        serde_json::from_str(&snapshot_content)
+            .map_err(|e| QueryError::Execution(format!("Failed to parse Iceberg snapshot: {}", e)))
     }
 
     /// Collect data files from manifests
@@ -171,12 +173,14 @@ impl IcebergScanExec {
         let manifest_list_path = self.table_path.join(&snapshot.manifest_list);
 
         let manifest_list_content = fs::read_to_string(&manifest_list_path).map_err(|e| {
-            QueryError::Execution(format!("Failed to read manifest list from {:?}: {}", manifest_list_path, e))
+            QueryError::Execution(format!(
+                "Failed to read manifest list from {:?}: {}",
+                manifest_list_path, e
+            ))
         })?;
 
-        let manifest_list: Vec<IcebergManifest> = serde_json::from_str(&manifest_list_content).map_err(|e| {
-            QueryError::Execution(format!("Failed to parse manifest list: {}", e))
-        })?;
+        let manifest_list: Vec<IcebergManifest> = serde_json::from_str(&manifest_list_content)
+            .map_err(|e| QueryError::Execution(format!("Failed to parse manifest list: {}", e)))?;
 
         let mut data_files = Vec::new();
 
@@ -186,11 +190,15 @@ impl IcebergScanExec {
 
             if let Ok(manifest_content) = fs::read_to_string(&manifest_path) {
                 // Parse manifest entries
-                if let Ok(manifest_entries) = serde_json::from_str::<serde_json::Value>(&manifest_content) {
+                if let Ok(manifest_entries) =
+                    serde_json::from_str::<serde_json::Value>(&manifest_content)
+                {
                     if let Some(entries) = manifest_entries["entries"].as_array() {
                         for entry in entries {
                             if let Some(data_file) = entry["data_file"].as_object() {
-                                if let Ok(file) = serde_json::from_value::<IcebergDataFile>(serde_json::json!(data_file)) {
+                                if let Ok(file) = serde_json::from_value::<IcebergDataFile>(
+                                    serde_json::json!(data_file),
+                                ) {
                                     data_files.push(file);
                                 }
                             }
@@ -205,12 +213,13 @@ impl IcebergScanExec {
 
     /// Apply partition filters to data files
     fn filter_data_files(&self, files: Vec<IcebergDataFile>) -> Vec<IcebergDataFile> {
-        files.into_iter()
+        files
+            .into_iter()
             .filter(|file| {
                 // Check all partition filters
-                self.partition_filters.iter().all(|filter| {
-                    filter.matches(file)
-                })
+                self.partition_filters
+                    .iter()
+                    .all(|filter| filter.matches(file))
             })
             .collect()
     }
@@ -231,9 +240,9 @@ impl PhysicalOperator for IcebergScanExec {
         let metadata = self.load_metadata()?;
 
         // Get snapshot ID
-        let snapshot_id = self.snapshot_id.unwrap_or_else(|| {
-            metadata.current_snapshot_id.expect("No current snapshot")
-        });
+        let snapshot_id = self
+            .snapshot_id
+            .unwrap_or_else(|| metadata.current_snapshot_id.expect("No current snapshot"));
 
         // Load snapshot
         let snapshot = self.load_snapshot(snapshot_id)?;
@@ -242,7 +251,7 @@ impl PhysicalOperator for IcebergScanExec {
         let all_data_files = self.collect_data_files(&snapshot)?;
 
         // Apply partition filters
-        let filtered_files = self.filter_data_files(all_data_files);
+        let _filtered_files = self.filter_data_files(all_data_files);
 
         // For each data file, we would normally read it using the Parquet scanner
         // For now, return empty batches as a placeholder
@@ -301,9 +310,10 @@ impl PartitionFilter {
                     })
                 })
             }
-            PartitionFilter::In { column, values } => {
-                file.partition.get(column).map_or(false, |v| values.contains(v))
-            }
+            PartitionFilter::In { column, values } => file
+                .partition
+                .get(column)
+                .map_or(false, |v| values.contains(v)),
         }
     }
 }
@@ -337,10 +347,12 @@ mod tests {
             sort_order_id: 0,
         };
 
-        file.partition.insert("year".to_string(), "2024".to_string());
+        file.partition
+            .insert("year".to_string(), "2024".to_string());
         assert!(filter.matches(&file));
 
-        file.partition.insert("year".to_string(), "2023".to_string());
+        file.partition
+            .insert("year".to_string(), "2023".to_string());
         assert!(!filter.matches(&file));
     }
 

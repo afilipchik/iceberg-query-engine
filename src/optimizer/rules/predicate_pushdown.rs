@@ -2,9 +2,7 @@
 
 use crate::error::Result;
 use crate::optimizer::OptimizerRule;
-use crate::planner::{
-    BinaryOp, Column, Expr, FilterNode, JoinType, LogicalPlan, ScanNode,
-};
+use crate::planner::{BinaryOp, Column, Expr, FilterNode, JoinType, LogicalPlan, ScanNode};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -80,9 +78,8 @@ impl PredicatePushdown {
                 let input_cols = self.collect_columns(&input_schema);
 
                 // Check if predicates can be pushed (all referenced columns exist in input)
-                let (pushable, remaining): (Vec<Expr>, Vec<Expr>) = predicates
-                    .into_iter()
-                    .partition(|p| {
+                let (pushable, remaining): (Vec<Expr>, Vec<Expr>) =
+                    predicates.into_iter().partition(|p| {
                         let pred_cols = self.extract_columns(p);
                         self.columns_subset(&pred_cols, &input_cols)
                     });
@@ -152,11 +149,12 @@ impl PredicatePushdown {
                         let right = self.pushdown(&node.right, right_predicates)?;
 
                         // Convert Cross join to Inner join if we have join conditions
-                        let new_join_type = if node.join_type == JoinType::Cross && !join_conditions.is_empty() {
-                            JoinType::Inner
-                        } else {
-                            node.join_type
-                        };
+                        let new_join_type =
+                            if node.join_type == JoinType::Cross && !join_conditions.is_empty() {
+                                JoinType::Inner
+                            } else {
+                                node.join_type
+                            };
 
                         let join = LogicalPlan::Join(crate::planner::JoinNode {
                             left: Arc::new(left),
@@ -308,11 +306,13 @@ impl PredicatePushdown {
 
             LogicalPlan::SubqueryAlias(node) => {
                 let input = self.pushdown(&node.input, predicates)?;
-                Ok(LogicalPlan::SubqueryAlias(crate::planner::SubqueryAliasNode {
-                    input: Arc::new(input),
-                    alias: node.alias.clone(),
-                    schema: node.schema.clone(),
-                }))
+                Ok(LogicalPlan::SubqueryAlias(
+                    crate::planner::SubqueryAliasNode {
+                        input: Arc::new(input),
+                        alias: node.alias.clone(),
+                        schema: node.schema.clone(),
+                    },
+                ))
             }
 
             LogicalPlan::Union(node) => {
@@ -443,7 +443,9 @@ impl PredicatePushdown {
                     self.extract_columns_recursive(item, cols);
                 }
             }
-            Expr::Between { expr, low, high, .. } => {
+            Expr::Between {
+                expr, low, high, ..
+            } => {
                 self.extract_columns_recursive(expr, cols);
                 self.extract_columns_recursive(low, cols);
                 self.extract_columns_recursive(high, cols);
@@ -464,7 +466,11 @@ impl PredicatePushdown {
 
     /// Extract outer column references from a subquery
     /// These are columns that reference tables not defined in the subquery
-    fn extract_outer_columns_from_subquery(&self, subquery: &LogicalPlan, cols: &mut HashSet<Column>) {
+    fn extract_outer_columns_from_subquery(
+        &self,
+        subquery: &LogicalPlan,
+        cols: &mut HashSet<Column>,
+    ) {
         let local_tables = self.collect_subquery_tables(subquery);
         self.extract_outer_refs_recursive(subquery, &local_tables, cols);
     }
@@ -499,7 +505,12 @@ impl PredicatePushdown {
     }
 
     /// Extract columns from a plan that reference tables NOT in local_tables
-    fn extract_outer_refs_recursive(&self, plan: &LogicalPlan, local_tables: &HashSet<String>, cols: &mut HashSet<Column>) {
+    fn extract_outer_refs_recursive(
+        &self,
+        plan: &LogicalPlan,
+        local_tables: &HashSet<String>,
+        cols: &mut HashSet<Column>,
+    ) {
         match plan {
             LogicalPlan::Filter(node) => {
                 self.extract_outer_refs_from_expr(&node.predicate, local_tables, cols);
@@ -530,7 +541,12 @@ impl PredicatePushdown {
     }
 
     /// Extract columns from an expression that reference tables NOT in local_tables
-    fn extract_outer_refs_from_expr(&self, expr: &Expr, local_tables: &HashSet<String>, cols: &mut HashSet<Column>) {
+    fn extract_outer_refs_from_expr(
+        &self,
+        expr: &Expr,
+        local_tables: &HashSet<String>,
+        cols: &mut HashSet<Column>,
+    ) {
         match expr {
             Expr::Column(col) => {
                 // Only add if this column references an outer table
@@ -565,8 +581,15 @@ impl PredicatePushdown {
     }
 
     /// Collect columns from schema as (relation, name) pairs for proper qualified matching
-    fn collect_columns(&self, schema: &crate::planner::PlanSchema) -> Vec<(Option<String>, String)> {
-        schema.fields().iter().map(|f| (f.relation.clone(), f.name.clone())).collect()
+    fn collect_columns(
+        &self,
+        schema: &crate::planner::PlanSchema,
+    ) -> Vec<(Option<String>, String)> {
+        schema
+            .fields()
+            .iter()
+            .map(|f| (f.relation.clone(), f.name.clone()))
+            .collect()
     }
 
     /// Check if a column matches any schema column
@@ -576,7 +599,9 @@ impl PredicatePushdown {
         match &col.relation {
             Some(rel) => {
                 // Qualified column - must match both relation and name
-                schema_cols.iter().any(|(r, n)| r.as_ref() == Some(rel) && n == &col.name)
+                schema_cols
+                    .iter()
+                    .any(|(r, n)| r.as_ref() == Some(rel) && n == &col.name)
             }
             None => {
                 // Unqualified column - match by name only

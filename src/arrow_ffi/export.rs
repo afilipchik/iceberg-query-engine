@@ -5,7 +5,7 @@
 //! Note: This is a simplified implementation that demonstrates the architecture.
 //! Full Arrow C Data Interface support would require more complex FFI bindings.
 
-use crate::error::{QueryError, Result};
+use crate::error::Result;
 use arrow::array::*;
 
 /// Simple exporter for Arrow arrays

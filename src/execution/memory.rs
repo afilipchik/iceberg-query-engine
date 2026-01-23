@@ -26,7 +26,7 @@ impl MemoryPool {
     }
 
     /// Try to allocate memory
-    pub fn try_allocate(&self, size: usize) -> Option<MemoryReservation> {
+    pub fn try_allocate(&self, size: usize) -> Option<MemoryReservation<'_>> {
         let mut current = self.used.load(Ordering::Relaxed);
         loop {
             let new_usage = current.checked_add(size)?;
@@ -41,10 +41,7 @@ impl MemoryPool {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    return Some(MemoryReservation {
-                        pool: self,
-                        size,
-                    });
+                    return Some(MemoryReservation { pool: self, size });
                 }
                 Err(actual) => current = actual,
             }
@@ -52,7 +49,7 @@ impl MemoryPool {
     }
 
     /// Force allocate memory (may exceed limit)
-    pub fn allocate(&self, size: usize) -> MemoryReservation {
+    pub fn allocate(&self, size: usize) -> MemoryReservation<'_> {
         self.used.fetch_add(size, Ordering::SeqCst);
         MemoryReservation { pool: self, size }
     }

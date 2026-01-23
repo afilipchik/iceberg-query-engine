@@ -54,9 +54,11 @@ pub fn detect_cpu_features() -> SimdMode {
 /// SIMD-optimized filter operation
 pub fn filter_simd(array: &dyn Array, predicate: &[bool]) -> Result<ArrayRef> {
     if array.len() != predicate.len() {
-        return Err(QueryError::Execution(
-            format!("Array length {} != predicate length {}", array.len(), predicate.len()),
-        ));
+        return Err(QueryError::Execution(format!(
+            "Array length {} != predicate length {}",
+            array.len(),
+            predicate.len()
+        )));
     }
 
     // For simplicity, just use standard Arrow filtering
@@ -107,18 +109,21 @@ pub fn filter_simd(array: &dyn Array, predicate: &[bool]) -> Result<ArrayRef> {
 
             Ok(Arc::new(BooleanArray::from(values)))
         }
-        _ => Err(QueryError::Execution(
-            format!("Unsupported data type for SIMD filter: {:?}", array.data_type()),
-        )),
+        _ => Err(QueryError::Execution(format!(
+            "Unsupported data type for SIMD filter: {:?}",
+            array.data_type()
+        ))),
     }
 }
 
 /// SIMD-optimized comparison operation
 pub fn compare_simd(left: &dyn Array, right: &dyn Array, op: CompareOp) -> Result<BooleanArray> {
     if left.len() != right.len() {
-        return Err(QueryError::Execution(
-            format!("Left length {} != right length {}", left.len(), right.len()),
-        ));
+        return Err(QueryError::Execution(format!(
+            "Left length {} != right length {}",
+            left.len(),
+            right.len()
+        )));
     }
 
     match op {
@@ -178,9 +183,10 @@ fn compare_eq(left: &dyn Array, right: &dyn Array) -> Result<BooleanArray> {
 
             Ok(BooleanArray::from(values))
         }
-        _ => Err(QueryError::Execution(
-            format!("Unsupported type for EQ comparison: {:?}", left.data_type()),
-        )),
+        _ => Err(QueryError::Execution(format!(
+            "Unsupported type for EQ comparison: {:?}",
+            left.data_type()
+        ))),
     }
 }
 
@@ -229,9 +235,10 @@ fn compare_lt(left: &dyn Array, right: &dyn Array) -> Result<BooleanArray> {
 
             Ok(BooleanArray::from(values))
         }
-        _ => Err(QueryError::Execution(
-            format!("Unsupported type for LT comparison: {:?}", left.data_type()),
-        )),
+        _ => Err(QueryError::Execution(format!(
+            "Unsupported type for LT comparison: {:?}",
+            left.data_type()
+        ))),
     }
 }
 
@@ -290,9 +297,10 @@ pub fn add_simd(left: &dyn Array, right: &dyn Array) -> Result<ArrayRef> {
 
             Ok(Arc::new(Float64Array::from(values)))
         }
-        _ => Err(QueryError::Execution(
-            format!("Unsupported type for add: {:?}", left.data_type()),
-        )),
+        _ => Err(QueryError::Execution(format!(
+            "Unsupported type for add: {:?}",
+            left.data_type()
+        ))),
     }
 }
 
@@ -333,9 +341,10 @@ pub fn multiply_simd(left: &dyn Array, right: &dyn Array) -> Result<ArrayRef> {
 
             Ok(Arc::new(Float64Array::from(values)))
         }
-        _ => Err(QueryError::Execution(
-            format!("Unsupported type for multiply: {:?}", left.data_type()),
-        )),
+        _ => Err(QueryError::Execution(format!(
+            "Unsupported type for multiply: {:?}",
+            left.data_type()
+        ))),
     }
 }
 
@@ -372,9 +381,10 @@ pub fn sum_simd(array: &dyn Array) -> Result<ScalarValue> {
 
             Ok(ScalarValue::Float64(Some(sum)))
         }
-        _ => Err(QueryError::Execution(
-            format!("Unsupported type for sum: {:?}", array.data_type()),
-        )),
+        _ => Err(QueryError::Execution(format!(
+            "Unsupported type for sum: {:?}",
+            array.data_type()
+        ))),
     }
 }
 

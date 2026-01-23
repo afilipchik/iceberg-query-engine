@@ -2,13 +2,11 @@
 
 use crate::error::{QueryError, Result};
 use crate::physical::operators::{
-    FilterExec, HashAggregateExec, HashJoinExec, LimitExec, MemoryTableExec, ProjectExec,
-    SortExec, TableProvider, AggregateExpr, SubqueryExecutor, UnionExec,
+    AggregateExpr, FilterExec, HashAggregateExec, HashJoinExec, LimitExec, MemoryTableExec,
+    ProjectExec, SortExec, SubqueryExecutor, TableProvider, UnionExec,
 };
 use crate::physical::PhysicalOperator;
-use crate::planner::{
-    AggregateFunction, Expr, JoinType, LogicalPlan, PlanSchema,
-};
+use crate::planner::{Expr, LogicalPlan, PlanSchema};
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -135,12 +133,7 @@ impl PhysicalPlanner {
 
                 let schema = plan_schema_to_arrow(&node.schema);
 
-                let agg = HashAggregateExec::new(
-                    input,
-                    node.group_by.clone(),
-                    aggregates,
-                    schema,
-                );
+                let agg = HashAggregateExec::new(input, node.group_by.clone(), aggregates, schema);
                 Ok(Arc::new(agg))
             }
 
@@ -183,20 +176,24 @@ impl PhysicalPlanner {
                     .collect();
                 let physical_inputs = physical_inputs?;
 
-                let union_exec: Arc<dyn PhysicalOperator> = Arc::new(UnionExec::new(physical_inputs));
+                let union_exec: Arc<dyn PhysicalOperator> =
+                    Arc::new(UnionExec::new(physical_inputs));
 
                 // If not UNION ALL, we need to remove duplicates using GROUP BY on all columns
                 if !node.all {
                     // Create aggregate for distinct - group by all columns with no aggregates
                     let schema = plan_schema_to_arrow(&node.schema);
-                    let group_by: Vec<Expr> = node.schema.fields().iter()
+                    let group_by: Vec<Expr> = node
+                        .schema
+                        .fields()
+                        .iter()
                         .map(|f| Expr::Column(crate::planner::Column::new(f.name.clone())))
                         .collect();
 
                     let agg = HashAggregateExec::new(
                         union_exec,
                         group_by,
-                        vec![],  // No aggregates, just grouping for distinct
+                        vec![], // No aggregates, just grouping for distinct
                         schema,
                     );
                     Ok(Arc::new(agg))
@@ -256,7 +253,11 @@ fn extract_aggregates(exprs: &[Expr]) -> Vec<AggregateExpr> {
 
 fn collect_aggregates(expr: &Expr, aggregates: &mut Vec<AggregateExpr>) {
     match expr {
-        Expr::Aggregate { func, args, distinct } => {
+        Expr::Aggregate {
+            func,
+            args,
+            distinct,
+        } => {
             let input = args.first().cloned().unwrap_or(Expr::Wildcard);
             aggregates.push(AggregateExpr {
                 func: *func,
@@ -282,7 +283,11 @@ fn collect_aggregates(expr: &Expr, aggregates: &mut Vec<AggregateExpr>) {
                 collect_aggregates(arg, aggregates);
             }
         }
-        Expr::Case { operand, when_then, else_expr } => {
+        Expr::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
             if let Some(op) = operand {
                 collect_aggregates(op, aggregates);
             }
