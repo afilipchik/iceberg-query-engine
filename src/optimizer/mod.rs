@@ -40,6 +40,8 @@ impl Optimizer {
                 Arc::new(rules::ConstantFolding),
                 Arc::new(rules::PredicatePushdown),
                 Arc::new(rules::ProjectionPushdown),
+                Arc::new(rules::JoinReordering::default()),
+                Arc::new(rules::PredicateReordering::default()),
             ],
             max_iterations: 10,
         }

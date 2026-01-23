@@ -2,7 +2,7 @@
 
 use crate::error::Result;
 use crate::physical::{PhysicalOperator, RecordBatchStream};
-use arrow::array::RecordBatch;
+use arrow::array::{RecordBatch, ArrayRef};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use futures::stream;
@@ -131,10 +131,11 @@ impl MemoryTableExec {
         projection: Option<Vec<usize>>,
         logical_schema: SchemaRef,
     ) -> Result<Self> {
-        let batches = provider.scan(projection.as_deref())?;
+        let provider_batches = provider.scan(projection.as_deref())?;
+        let table_name = table_name.into();
 
-        // Use the logical schema which has proper qualified names
-        let schema = match &projection {
+        // Determine the output schema based on projection
+        let output_schema = match &projection {
             Some(indices) => {
                 let fields: Vec<_> = indices
                     .iter()
@@ -142,12 +143,24 @@ impl MemoryTableExec {
                     .collect();
                 Arc::new(arrow::datatypes::Schema::new(fields))
             }
-            None => logical_schema,
+            None => logical_schema.clone(),
         };
 
+        // Recreate batches with the output schema to ensure qualified column names match
+        let batches: Result<Vec<RecordBatch>> = provider_batches
+            .iter()
+            .map(|batch| {
+                // The columns are already in the correct order from the provider
+                // We just need to attach the correct schema
+                RecordBatch::try_new(output_schema.clone(), batch.columns().to_vec())
+                    .map_err(Into::into)
+            })
+            .collect();
+        let batches = batches?;
+
         Ok(Self {
-            table_name: table_name.into(),
-            schema,
+            table_name,
+            schema: output_schema,
             batches,
             projection: None, // Already projected
         })
