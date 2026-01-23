@@ -2,6 +2,7 @@
 
 use crate::error::{QueryError, Result};
 use crate::physical::{PhysicalOperator, RecordBatchStream};
+use crate::physical::operators::subquery::{SubqueryExecutor, evaluate_subquery_expr};
 use crate::planner::{BinaryOp, Column, Expr, ScalarValue, UnaryOp};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Datum,
@@ -20,11 +21,21 @@ use std::fmt;
 use std::sync::Arc;
 
 /// Filter execution operator
-#[derive(Debug)]
 pub struct FilterExec {
     input: Arc<dyn PhysicalOperator>,
     predicate: Expr,
     schema: SchemaRef,
+    /// Optional subquery executor for handling subqueries in predicates
+    subquery_executor: Option<SubqueryExecutor>,
+}
+
+impl fmt::Debug for FilterExec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FilterExec")
+            .field("predicate", &self.predicate)
+            .field("has_subquery_executor", &self.subquery_executor.is_some())
+            .finish()
+    }
 }
 
 impl FilterExec {
@@ -34,7 +45,19 @@ impl FilterExec {
             input,
             predicate,
             schema,
+            subquery_executor: None,
         }
+    }
+
+    /// Set the subquery executor for this filter
+    pub fn with_subquery_executor(mut self, executor: SubqueryExecutor) -> Self {
+        self.subquery_executor = Some(executor);
+        self
+    }
+
+    /// Get a reference to the subquery executor (for nested filters)
+    pub fn subquery_executor(&self) -> Option<&SubqueryExecutor> {
+        self.subquery_executor.as_ref()
     }
 }
 
@@ -52,11 +75,24 @@ impl PhysicalOperator for FilterExec {
         let input_stream = self.input.execute(partition).await?;
         let predicate = self.predicate.clone();
         let schema = self.schema.clone();
+        let has_subqueries = predicate.contains_subquery();
+        let subquery_exec = self.subquery_executor.clone();
 
         let filtered_stream = input_stream.and_then(move |batch| {
             let pred = predicate.clone();
             let schema = schema.clone();
-            async move { evaluate_filter(&batch, &pred, &schema) }
+            let subquery_exec = subquery_exec.clone();
+            async move {
+                if has_subqueries {
+                    if let Some(exec) = subquery_exec {
+                        evaluate_filter_with_subquery(&batch, &pred, &schema, &exec)
+                    } else {
+                        Err(QueryError::Execution("Subquery in filter but no executor available".into()))
+                    }
+                } else {
+                    evaluate_filter(&batch, &pred, &schema)
+                }
+            }
         });
 
         Ok(Box::pin(filtered_stream))
@@ -75,7 +111,7 @@ impl fmt::Display for FilterExec {
 
 /// Evaluate a filter predicate on a batch
 fn evaluate_filter(batch: &RecordBatch, predicate: &Expr, _schema: &SchemaRef) -> Result<RecordBatch> {
-    let mask = evaluate_expr(batch, predicate)?;
+    let mask = evaluate_expr_internal(batch, predicate, None)?;
 
     let boolean_array = mask
         .as_any()
@@ -94,8 +130,43 @@ fn evaluate_filter(batch: &RecordBatch, predicate: &Expr, _schema: &SchemaRef) -
     RecordBatch::try_new(batch.schema(), filtered_columns?).map_err(Into::into)
 }
 
-/// Evaluate an expression on a batch
+/// Evaluate a filter predicate on a batch with subquery support
+fn evaluate_filter_with_subquery(
+    batch: &RecordBatch,
+    predicate: &Expr,
+    _schema: &SchemaRef,
+    executor: &SubqueryExecutor,
+) -> Result<RecordBatch> {
+    let mask = evaluate_expr_internal(batch, predicate, Some(executor))?;
+
+    let boolean_array = mask
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| QueryError::Execution("Filter predicate must evaluate to boolean".into()))?;
+
+    let filtered_columns: Result<Vec<ArrayRef>> = batch
+        .columns()
+        .iter()
+        .map(|col| {
+            compute::filter(col.as_ref(), boolean_array)
+                .map_err(Into::into)
+        })
+        .collect();
+
+    RecordBatch::try_new(batch.schema(), filtered_columns?).map_err(Into::into)
+}
+
+/// Evaluate an expression on a batch (public API, no subquery support)
 pub fn evaluate_expr(batch: &RecordBatch, expr: &Expr) -> Result<ArrayRef> {
+    evaluate_expr_internal(batch, expr, None)
+}
+
+/// Internal expression evaluation with optional subquery support
+fn evaluate_expr_internal(
+    batch: &RecordBatch,
+    expr: &Expr,
+    subquery_executor: Option<&SubqueryExecutor>,
+) -> Result<ArrayRef> {
     match expr {
         Expr::Column(col) => {
             let idx = find_column_index(batch, col)?;
@@ -107,41 +178,41 @@ pub fn evaluate_expr(batch: &RecordBatch, expr: &Expr) -> Result<ArrayRef> {
         }
 
         Expr::BinaryExpr { left, op, right } => {
-            let left_arr = evaluate_expr(batch, left)?;
-            let right_arr = evaluate_expr(batch, right)?;
+            let left_arr = evaluate_expr_internal(batch, left, subquery_executor)?;
+            let right_arr = evaluate_expr_internal(batch, right, subquery_executor)?;
             evaluate_binary_op(&left_arr, *op, &right_arr)
         }
 
         Expr::UnaryExpr { op, expr } => {
-            let arr = evaluate_expr(batch, expr)?;
+            let arr = evaluate_expr_internal(batch, expr, subquery_executor)?;
             evaluate_unary_op(*op, &arr)
         }
 
         Expr::Cast { expr, data_type } => {
-            let arr = evaluate_expr(batch, expr)?;
+            let arr = evaluate_expr_internal(batch, expr, subquery_executor)?;
             arrow::compute::cast(&arr, data_type).map_err(Into::into)
         }
 
-        Expr::Alias { expr, .. } => evaluate_expr(batch, expr),
+        Expr::Alias { expr, .. } => evaluate_expr_internal(batch, expr, subquery_executor),
 
         Expr::Case { operand, when_then, else_expr } => {
-            evaluate_case(batch, operand.as_deref(), when_then, else_expr.as_deref())
+            evaluate_case(batch, operand.as_deref(), when_then, else_expr.as_deref(), subquery_executor)
         }
 
         Expr::InList { expr, list, negated } => {
-            let value = evaluate_expr(batch, expr)?;
+            let value = evaluate_expr_internal(batch, expr, subquery_executor)?;
             let list_values: Result<Vec<ArrayRef>> = list
                 .iter()
-                .map(|e| evaluate_expr(batch, e))
+                .map(|e| evaluate_expr_internal(batch, e, subquery_executor))
                 .collect();
             let list_values = list_values?;
             evaluate_in_list(&value, &list_values, *negated)
         }
 
         Expr::Between { expr, low, high, negated } => {
-            let value = evaluate_expr(batch, expr)?;
-            let low_val = evaluate_expr(batch, low)?;
-            let high_val = evaluate_expr(batch, high)?;
+            let value = evaluate_expr_internal(batch, expr, subquery_executor)?;
+            let low_val = evaluate_expr_internal(batch, low, subquery_executor)?;
+            let high_val = evaluate_expr_internal(batch, high, subquery_executor)?;
 
             let ge_low = evaluate_binary_op(&value, BinaryOp::GtEq, &low_val)?;
             let le_high = evaluate_binary_op(&value, BinaryOp::LtEq, &high_val)?;
@@ -158,7 +229,7 @@ pub fn evaluate_expr(batch: &RecordBatch, expr: &Expr) -> Result<ArrayRef> {
         }
 
         Expr::ScalarFunc { func, args } => {
-            evaluate_scalar_func(batch, func, args)
+            evaluate_scalar_func(batch, func, args, subquery_executor)
         }
 
         Expr::Wildcard => {
@@ -171,6 +242,15 @@ pub fn evaluate_expr(batch: &RecordBatch, expr: &Expr) -> Result<ArrayRef> {
             // Same as Wildcard
             let arr = Int64Array::from(vec![1i64; batch.num_rows()]);
             Ok(Arc::new(arr))
+        }
+
+        Expr::ScalarSubquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => {
+            // Handle subquery expressions
+            if let Some(exec) = subquery_executor {
+                evaluate_subquery_expr(batch, expr, exec)
+            } else {
+                Err(QueryError::Execution("Subquery expression but no executor available".into()))
+            }
         }
 
         _ => Err(QueryError::NotImplemented(format!(
@@ -412,23 +492,24 @@ fn evaluate_case(
     _operand: Option<&Expr>,
     when_then: &[(Expr, Expr)],
     else_expr: Option<&Expr>,
+    subquery_executor: Option<&SubqueryExecutor>,
 ) -> Result<ArrayRef> {
     let num_rows = batch.num_rows();
 
     // Start with else value or null
     let mut result: Option<ArrayRef> = else_expr
-        .map(|e| evaluate_expr(batch, e))
+        .map(|e| evaluate_expr_internal(batch, e, subquery_executor))
         .transpose()?;
 
     // Process WHEN clauses in reverse order
     for (when, then) in when_then.iter().rev() {
-        let condition = evaluate_expr(batch, when)?;
+        let condition = evaluate_expr_internal(batch, when, subquery_executor)?;
         let condition = condition
             .as_any()
             .downcast_ref::<BooleanArray>()
             .ok_or_else(|| QueryError::Type("CASE WHEN requires boolean condition".into()))?;
 
-        let then_value = evaluate_expr(batch, then)?;
+        let then_value = evaluate_expr_internal(batch, then, subquery_executor)?;
 
         result = Some(match result {
             Some(else_val) => {
@@ -478,12 +559,17 @@ fn evaluate_in_list(value: &ArrayRef, list: &[ArrayRef], negated: bool) -> Resul
     }
 }
 
-fn evaluate_scalar_func(batch: &RecordBatch, func: &crate::planner::ScalarFunction, args: &[Expr]) -> Result<ArrayRef> {
+fn evaluate_scalar_func(
+    batch: &RecordBatch,
+    func: &crate::planner::ScalarFunction,
+    args: &[Expr],
+    subquery_executor: Option<&SubqueryExecutor>,
+) -> Result<ArrayRef> {
     use crate::planner::ScalarFunction;
 
     let evaluated_args: Result<Vec<ArrayRef>> = args
         .iter()
-        .map(|a| evaluate_expr(batch, a))
+        .map(|a| evaluate_expr_internal(batch, a, subquery_executor))
         .collect();
     let evaluated_args = evaluated_args?;
 

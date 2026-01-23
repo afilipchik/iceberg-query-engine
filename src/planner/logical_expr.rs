@@ -661,6 +661,32 @@ impl Expr {
             _ => false,
         }
     }
+
+    /// Check if expression contains a subquery
+    pub fn contains_subquery(&self) -> bool {
+        match self {
+            Expr::ScalarSubquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => true,
+            Expr::BinaryExpr { left, right, .. } => {
+                left.contains_subquery() || right.contains_subquery()
+            }
+            Expr::UnaryExpr { expr, .. } => expr.contains_subquery(),
+            Expr::ScalarFunc { args, .. } => args.iter().any(|a| a.contains_subquery()),
+            Expr::Cast { expr, .. } => expr.contains_subquery(),
+            Expr::Case { operand, when_then, else_expr } => {
+                operand.as_ref().is_some_and(|e| e.contains_subquery()) ||
+                when_then.iter().any(|(w, t)| w.contains_subquery() || t.contains_subquery()) ||
+                else_expr.as_ref().is_some_and(|e| e.contains_subquery())
+            }
+            Expr::Alias { expr, .. } => expr.contains_subquery(),
+            Expr::InList { expr, list, .. } => {
+                expr.contains_subquery() || list.iter().any(|e| e.contains_subquery())
+            }
+            Expr::Between { expr, low, high, .. } => {
+                expr.contains_subquery() || low.contains_subquery() || high.contains_subquery()
+            }
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for Expr {

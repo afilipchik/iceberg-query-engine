@@ -365,29 +365,37 @@ WHERE
     AND l_shipdate < DATE '1995-10-01'
 "#;
 
-/// Q15: Top Supplier (Simplified - no CTE)
+/// Q15: Top Supplier
 pub const Q15: &str = r#"
+WITH revenue AS (
+    SELECT
+        l_suppkey,
+        SUM(l_extendedprice * (1 - l_discount)) AS total_revenue
+    FROM
+        lineitem
+    WHERE
+        l_shipdate >= DATE '1996-01-01'
+        AND l_shipdate < DATE '1996-04-01'
+    GROUP BY
+        l_suppkey
+)
 SELECT
     s_suppkey,
     s_name,
     s_address,
     s_phone,
-    SUM(l_extendedprice * (1 - l_discount)) AS total_revenue
+    total_revenue
 FROM
     supplier,
-    lineitem
+    revenue
 WHERE
-    l_suppkey = s_suppkey
-    AND l_shipdate >= DATE '1996-01-01'
-    AND l_shipdate < DATE '1996-04-01'
-GROUP BY
-    s_suppkey,
-    s_name,
-    s_address,
-    s_phone
+    s_suppkey = revenue.l_suppkey
+    AND total_revenue = (
+        SELECT MAX(total_revenue)
+        FROM revenue
+    )
 ORDER BY
     total_revenue DESC
-LIMIT 1
 "#;
 
 /// Q16: Parts/Supplier Relationship
@@ -416,7 +424,7 @@ ORDER BY
 LIMIT 100
 "#;
 
-/// Q17: Small-Quantity-Order Revenue (Simplified)
+/// Q17: Small-Quantity-Order Revenue
 pub const Q17: &str = r#"
 SELECT
     SUM(l_extendedprice) / 7.0 AS avg_yearly
@@ -427,6 +435,11 @@ WHERE
     p_partkey = l_partkey
     AND p_brand = 'Brand#23'
     AND p_container = 'MED BOX'
+    AND l_quantity < (
+        SELECT 0.2 * AVG(l_quantity)
+        FROM lineitem
+        WHERE l_partkey = p_partkey
+    )
 "#;
 
 /// Q18: Large Volume Customer
@@ -457,7 +470,7 @@ ORDER BY
 LIMIT 100
 "#;
 
-/// Q19: Discounted Revenue (Simplified)
+/// Q19: Discounted Revenue
 pub const Q19: &str = r#"
 SELECT
     SUM(l_extendedprice * (1 - l_discount)) AS revenue
@@ -466,11 +479,25 @@ FROM
     part
 WHERE
     p_partkey = l_partkey
-    AND l_quantity >= 1
-    AND l_quantity <= 11
+    AND (
+        (p_brand = 'Brand#12'
+        AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')
+        AND l_quantity >= 1 AND l_quantity <= 11)
+        OR (p_brand = 'Brand#23'
+        AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')
+        AND l_quantity >= 10 AND l_quantity <= 20)
+        OR (p_brand = 'Brand#34'
+        AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')
+        AND l_quantity >= 20 AND l_quantity <= 30)
+    )
+    AND (
+        (p_brand = 'Brand#12' AND l_shipmode IN ('AIR', 'AIR REG'))
+        OR (p_brand = 'Brand#23' AND l_shipmode IN ('AIR', 'AIR REG'))
+        OR (p_brand = 'Brand#34' AND l_shipmode IN ('AIR', 'AIR REG'))
+    )
 "#;
 
-/// Q20: Potential Part Promotion (Simplified)
+/// Q20: Potential Part Promotion
 pub const Q20: &str = r#"
 SELECT
     s_name,
@@ -479,28 +506,57 @@ FROM
     supplier,
     nation
 WHERE
-    s_nationkey = n_nationkey
+    s_suppkey IN (
+        SELECT ps_suppkey
+        FROM partsupp
+        WHERE ps_partkey IN (
+            SELECT p_partkey
+            FROM part
+            WHERE p_name LIKE 'forest%'
+        )
+        AND ps_availqty > (
+            SELECT 0.5 * SUM(l_quantity)
+            FROM lineitem
+            WHERE l_partkey = ps_partkey
+            AND l_suppkey = ps_suppkey
+            AND l_shipdate >= DATE '1994-01-01'
+            AND l_shipdate < DATE '1995-01-01'
+        )
+    )
+    AND s_nationkey = n_nationkey
     AND n_name = 'CANADA'
 ORDER BY
     s_name
-LIMIT 100
 "#;
 
-/// Q21: Suppliers Who Kept Orders Waiting (Simplified)
+/// Q21: Suppliers Who Kept Orders Waiting
 pub const Q21: &str = r#"
 SELECT
     s_name,
     COUNT(*) AS numwait
 FROM
     supplier,
-    lineitem,
+    lineitem l1,
     orders,
     nation
 WHERE
-    s_suppkey = l_suppkey
-    AND o_orderkey = l_orderkey
+    s_suppkey = l1.l_suppkey
+    AND o_orderkey = l1.l_orderkey
     AND o_orderstatus = 'F'
-    AND l_receiptdate > l_commitdate
+    AND l1.l_receiptdate > l1.l_commitdate
+    AND EXISTS (
+        SELECT *
+        FROM lineitem l2
+        WHERE l2.l_orderkey = l1.l_orderkey
+        AND l2.l_suppkey <> l1.l_suppkey
+    )
+    AND NOT EXISTS (
+        SELECT *
+        FROM lineitem l3
+        WHERE l3.l_orderkey = l1.l_orderkey
+        AND l3.l_suppkey <> l1.l_suppkey
+        AND l3.l_receiptdate > l3.l_commitdate
+    )
     AND s_nationkey = n_nationkey
     AND n_name = 'SAUDI ARABIA'
 GROUP BY
@@ -511,18 +567,36 @@ ORDER BY
 LIMIT 100
 "#;
 
-/// Q22: Global Sales Opportunity (Simplified)
+/// Q22: Global Sales Opportunity
 pub const Q22: &str = r#"
 SELECT
-    c_acctbal,
-    c_custkey
-FROM
-    customer
-WHERE
-    c_acctbal > 0
+    cntrycode,
+    COUNT(*) AS numcust,
+    SUM(c_acctbal) AS totacctbal
+FROM (
+    SELECT
+        SUBSTRING(c_phone FROM 1 FOR 3) AS cntrycode,
+        c_acctbal
+    FROM
+        customer
+    WHERE
+        SUBSTRING(c_phone FROM 1 FOR 3) IN ('1', '2', '3', '4', '5', '6', '7')
+        AND c_acctbal > (
+            SELECT AVG(c_acctbal)
+            FROM customer
+            WHERE c_acctbal > 0.00
+            AND SUBSTRING(c_phone FROM 1 FOR 3) IN ('1', '2', '3', '4', '5', '6', '7')
+        )
+        AND NOT EXISTS (
+            SELECT *
+            FROM orders
+            WHERE o_custkey = c_custkey
+        )
+) AS custsale
+GROUP BY
+    cntrycode
 ORDER BY
-    c_acctbal DESC
-LIMIT 100
+    cntrycode
 "#;
 
 /// All query numbers

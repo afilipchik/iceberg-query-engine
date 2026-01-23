@@ -55,6 +55,10 @@ pub struct Binder<'a> {
     aliases: HashMap<String, Expr>,
     /// Table aliases in scope
     table_aliases: HashMap<String, String>,
+    /// CTE definitions (WITH clauses)
+    ctes: HashMap<String, Arc<LogicalPlan>>,
+    /// Outer scope columns for correlated subqueries (name -> (type, relation))
+    outer_scope: HashMap<String, (ArrowDataType, Option<String>)>,
 }
 
 impl<'a> Binder<'a> {
@@ -63,7 +67,36 @@ impl<'a> Binder<'a> {
             catalog,
             aliases: HashMap::new(),
             table_aliases: HashMap::new(),
+            ctes: HashMap::new(),
+            outer_scope: HashMap::new(),
         }
+    }
+
+    /// Create a binder with outer scope for correlated subqueries
+    fn with_outer_scope(
+        catalog: &'a dyn Catalog,
+        outer_scope: HashMap<String, (ArrowDataType, Option<String>)>,
+        ctes: HashMap<String, Arc<LogicalPlan>>,
+    ) -> Self {
+        Self {
+            catalog,
+            aliases: HashMap::new(),
+            table_aliases: HashMap::new(),
+            ctes,
+            outer_scope,
+        }
+    }
+
+    /// Collect outer scope columns from a schema
+    fn collect_outer_scope(schema: &PlanSchema) -> HashMap<String, (ArrowDataType, Option<String>)> {
+        let mut scope = HashMap::new();
+        for field in schema.fields() {
+            scope.insert(
+                field.name.clone(),
+                (field.data_type.clone(), field.relation.clone()),
+            );
+        }
+        scope
     }
 
     /// Bind a SQL statement to a logical plan
@@ -84,6 +117,11 @@ impl<'a> Binder<'a> {
     }
 
     fn bind_query(&mut self, query: &ast::Query) -> Result<LogicalPlan> {
+        // Process CTEs (WITH clause) first
+        if let Some(ref with_clause) = query.with {
+            self.bind_ctes(with_clause)?;
+        }
+
         // Start with the body (SELECT, UNION, etc.)
         let mut plan = self.bind_set_expr(&query.body)?;
 
@@ -118,6 +156,18 @@ impl<'a> Binder<'a> {
         }
 
         Ok(plan)
+    }
+
+    /// Bind CTEs (WITH clause) and register them
+    fn bind_ctes(&mut self, with_clause: &ast::With) -> Result<()> {
+        for cte in &with_clause.cte_tables {
+            let alias_name = cte.alias.name.value.clone();
+            let cte_plan = self.bind_query(&cte.query)?;
+
+            // Store the CTE with its alias
+            self.ctes.insert(alias_name.clone(), Arc::new(cte_plan));
+        }
+        Ok(())
     }
 
     fn bind_set_expr(&mut self, set_expr: &SetExpr) -> Result<LogicalPlan> {
@@ -190,7 +240,7 @@ impl<'a> Binder<'a> {
 
         // 3. GROUP BY and aggregates
         let input_schema = plan.schema();
-        let (group_by, aggregates, has_aggregates) =
+        let (group_by, aggregates, aggregate_aliases, has_aggregates) =
             self.extract_aggregates(&select.projection, &select.group_by, &input_schema)?;
 
         if has_aggregates || !group_by.is_empty() {
@@ -198,8 +248,13 @@ impl<'a> Binder<'a> {
             for expr in &group_by {
                 agg_fields.push(expr.to_field(&input_schema)?);
             }
-            for expr in &aggregates {
-                agg_fields.push(expr.to_field(&input_schema)?);
+            for (i, expr) in aggregates.iter().enumerate() {
+                // Use the alias if available, otherwise use the expression's output name
+                let field_name = aggregate_aliases.get(i)
+                    .and_then(|a| a.as_ref().cloned())
+                    .unwrap_or_else(|| expr.output_name());
+                let data_type = expr.data_type(&input_schema)?;
+                agg_fields.push(SchemaField::new(field_name, data_type));
             }
 
             plan = LogicalPlan::Aggregate(AggregateNode {
@@ -306,10 +361,6 @@ impl<'a> Binder<'a> {
         match factor {
             TableFactor::Table { name, alias, .. } => {
                 let table_name = name.table_name();
-                let schema = self
-                    .catalog
-                    .get_table_schema(&table_name)
-                    .ok_or_else(|| QueryError::TableNotFound(table_name.clone()))?;
 
                 // Apply table alias to schema fields
                 let alias_name = alias
@@ -319,6 +370,31 @@ impl<'a> Binder<'a> {
 
                 self.table_aliases
                     .insert(alias_name.clone(), table_name.clone());
+
+                // Check if this is a CTE reference first
+                if let Some(cte_plan) = self.ctes.get(&table_name) {
+                    // CTEs are full logical plans, clone and apply alias
+                    let schema = cte_plan.schema();
+                    let aliased_schema = PlanSchema::new(
+                        schema
+                            .fields()
+                            .iter()
+                            .map(|f| f.clone().with_relation(alias_name.clone()))
+                            .collect(),
+                    );
+
+                    return Ok(LogicalPlan::SubqueryAlias(SubqueryAliasNode {
+                        input: Arc::clone(cte_plan),
+                        alias: alias_name,
+                        schema: aliased_schema,
+                    }));
+                }
+
+                // Regular table scan
+                let schema = self
+                    .catalog
+                    .get_table_schema(&table_name)
+                    .ok_or_else(|| QueryError::TableNotFound(table_name.clone()))?;
 
                 let aliased_schema = PlanSchema::new(
                     schema
@@ -784,9 +860,10 @@ impl<'a> Binder<'a> {
         projection: &[SelectItem],
         group_by: &ast::GroupByExpr,
         schema: &PlanSchema,
-    ) -> Result<(Vec<Expr>, Vec<Expr>, bool)> {
+    ) -> Result<(Vec<Expr>, Vec<Expr>, Vec<Option<String>>, bool)> {
         let mut group_by_exprs = Vec::new();
         let mut aggregate_exprs = Vec::new();
+        let mut aggregate_aliases = Vec::new();
         let mut has_aggregates = false;
 
         // Parse GROUP BY
@@ -799,10 +876,23 @@ impl<'a> Binder<'a> {
         // Extract aggregates from projection
         for item in projection {
             match item {
-                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                SelectItem::UnnamedExpr(expr) => {
                     let bound = self.bind_expr(expr, schema)?;
-                    self.collect_aggregates(&bound, &mut aggregate_exprs);
+                    // Only add alias if this item contains aggregates
                     if bound.contains_aggregate() {
+                        self.collect_aggregates(&bound, &mut aggregate_exprs);
+                        // No alias for unnamed expressions
+                        aggregate_aliases.push(None);
+                        has_aggregates = true;
+                    }
+                }
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    let bound = self.bind_expr(expr, schema)?;
+                    // Only add alias if this item contains aggregates
+                    if bound.contains_aggregate() {
+                        self.collect_aggregates(&bound, &mut aggregate_exprs);
+                        // Store the alias
+                        aggregate_aliases.push(Some(alias.value.clone()));
                         has_aggregates = true;
                     }
                 }
@@ -810,7 +900,7 @@ impl<'a> Binder<'a> {
             }
         }
 
-        Ok((group_by_exprs, aggregate_exprs, has_aggregates))
+        Ok((group_by_exprs, aggregate_exprs, aggregate_aliases, has_aggregates))
     }
 
     fn collect_aggregates(&self, expr: &Expr, aggregates: &mut Vec<Expr>) {
@@ -1054,6 +1144,28 @@ impl<'a> Binder<'a> {
                 Ok(Expr::ScalarFunc {
                     func: ScalarFunction::Extract,
                     args: vec![Expr::Literal(ScalarValue::Utf8(field_name)), bound_expr],
+                })
+            }
+            SqlExpr::Substring { expr, substring_from, substring_for, .. } => {
+                let bound_expr = self.bind_expr(expr, schema)?;
+                let mut args = vec![bound_expr];
+
+                // Handle FROM clause
+                if let Some(from_expr) = substring_from {
+                    args.push(self.bind_expr(from_expr, schema)?);
+                } else {
+                    // Default to 1 if not specified
+                    args.push(Expr::Literal(ScalarValue::Int64(1)));
+                }
+
+                // Handle FOR clause (optional length)
+                if let Some(for_expr) = substring_for {
+                    args.push(self.bind_expr(for_expr, schema)?);
+                }
+
+                Ok(Expr::ScalarFunc {
+                    func: ScalarFunction::Substring,
+                    args,
                 })
             }
             SqlExpr::Nested(inner) => self.bind_expr(inner, schema),

@@ -10,6 +10,7 @@ use crate::storage::ParquetTable;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -48,6 +49,8 @@ pub struct ExecutionContext {
     catalog: InMemoryCatalog,
     tables: HashMap<String, Arc<dyn TableProvider>>,
     optimizer: Optimizer,
+    /// Number of parallel partitions for execution (defaults to CPU count)
+    parallel_partitions: usize,
 }
 
 impl Default for ExecutionContext {
@@ -62,7 +65,19 @@ impl ExecutionContext {
             catalog: InMemoryCatalog::new(),
             tables: HashMap::new(),
             optimizer: Optimizer::new(),
+            parallel_partitions: rayon::current_num_threads(),
         }
+    }
+
+    /// Set the number of parallel partitions for execution
+    pub fn with_parallel_partitions(mut self, partitions: usize) -> Self {
+        self.parallel_partitions = partitions.max(1);
+        self
+    }
+
+    /// Get the number of parallel partitions
+    pub fn parallel_partitions(&self) -> usize {
+        self.parallel_partitions
     }
 
     /// Register a table from record batches
@@ -145,23 +160,50 @@ impl ExecutionContext {
         for (name, provider) in &self.tables {
             planner.register_table(name.clone(), provider.clone());
         }
+        // Enable subquery execution support
+        planner.enable_subquery_execution();
         let physical = planner.create_physical_plan(&optimized)?;
         metrics.plan_time += physical_start.elapsed();
 
         // Execute
         let execute_start = Instant::now();
-        let stream = physical.execute(0).await?;
-        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+
+        // Determine number of output partitions
+        let num_partitions = physical.output_partitions().max(1);
+
+        // Execute all partitions concurrently
+        // Use futures to execute partitions in parallel
+        let partition_futures: Vec<_> = (0..num_partitions)
+            .map(|partition_id| {
+                let physical = physical.clone();
+                async move {
+                    let stream = physical.execute(partition_id).await
+                        .map_err(|e| crate::error::QueryError::Execution(format!("Partition {} execution failed: {}", partition_id, e)))?;
+                    stream.try_collect().await
+                        .map_err(|e| crate::error::QueryError::Execution(format!("Partition {} collection failed: {}", partition_id, e)))
+                }
+            })
+            .collect();
+
+        // Execute all partitions concurrently and collect results
+        let partition_results: Vec<Result<Vec<RecordBatch>>> = futures::future::join_all(partition_futures).await;
+
+        // Check for errors in any partition
+        let mut all_batches = Vec::new();
+        for partition_result in partition_results {
+            all_batches.extend(partition_result?);
+        }
+
         metrics.execute_time = execute_start.elapsed();
 
         metrics.total_time = start.elapsed();
 
         let schema = physical.schema();
-        let row_count = batches.iter().map(|b| b.num_rows()).sum();
+        let row_count: usize = all_batches.iter().map(|b| b.num_rows()).sum();
 
         Ok(QueryResult {
             schema,
-            batches,
+            batches: all_batches,
             row_count,
             metrics,
         })
@@ -188,6 +230,7 @@ impl ExecutionContext {
         for (name, provider) in &self.tables {
             planner.register_table(name.clone(), provider.clone());
         }
+        planner.enable_subquery_execution();
 
         planner.create_physical_plan(&optimized)
     }

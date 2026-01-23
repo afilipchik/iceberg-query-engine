@@ -170,10 +170,21 @@ impl PhysicalOperator for MemoryTableExec {
         vec![]
     }
 
-    async fn execute(&self, _partition: usize) -> Result<RecordBatchStream> {
+    async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
+        // Determine the number of partitions to use
+        let num_partitions = self.output_partitions().max(1);
+
+        // Split batches across partitions
+        let partition_batches: Vec<RecordBatch> = self.batches
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % num_partitions == partition)
+            .map(|(_, batch)| batch.clone())
+            .collect();
+
         let batches = match &self.projection {
             Some(indices) => {
-                self.batches
+                partition_batches
                     .iter()
                     .map(|batch| {
                         let columns: Vec<_> = indices
@@ -185,11 +196,22 @@ impl PhysicalOperator for MemoryTableExec {
                     })
                     .collect::<Result<Vec<_>>>()?
             }
-            None => self.batches.clone(),
+            None => partition_batches,
         };
 
         let stream = stream::iter(batches.into_iter().map(Ok));
         Ok(Box::pin(stream))
+    }
+
+    fn output_partitions(&self) -> usize {
+        // Use rayon to determine the number of CPU cores for parallel execution
+        // For small tables, use fewer partitions to avoid overhead
+        let total_rows: usize = self.batches.iter().map(|b| b.num_rows()).sum();
+        if total_rows < 1000 {
+            1 // Small table, single partition
+        } else {
+            std::cmp::min(rayon::current_num_threads(), self.batches.len())
+        }
     }
 
     fn name(&self) -> &str {

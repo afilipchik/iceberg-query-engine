@@ -1,0 +1,10 @@
+/Users/elonazoulay/src/trino/otherdirs/branching-metastore/branching-metastore-server/src/main/java/io/branching/metastore/server/BranchingMetastoreImpl.java
+/Users/elonazoulay/src/trino/otherdirs/branching-metastore/branching-metastore-server/src/main/java/io/branching/metastore/server/BranchingMetastoreModule.java
+/Users/elonazoulay/src/trino/otherdirs/branching-metastore/branching-metastore-server/src/main/java/io/branching/metastore/server/BranchingMetastoreServer.java
+/Users/elonazoulay/src/trino/otherdirs/branching-metastore/branching-metastore-server/src/main/java/io/branching/metastore/server/config/MetastoreConfig.java
+/Users/elonazoulay/src/trino/otherdirs/branching-metastore/branching-metastore-server/src/main/java/io/branching/metastore/server/dao/BranchDao.java
+/Users/elonazoulay/src/trino/otherdirs/branching-metastore/branching-metastore-server/src/main/java/io/branching/metastore/server/dao/DatabaseDao.java
+/Users/elonazoulay/src/trino/otherdirs/branching-metastore/branching-metastore-server/src/main/java/io/branching/metastore/server/dao/TableDao.java
+/Users/elonazoulay/src/trino/otherdirs/branching-metastore/branching-metastore-server/src/main/java/io/branching/metastore/server/resource/BranchResource.java
+/Users/elonazoulay/src/trino/otherdirs/branching-metastore/branching-metastore-server/src/main/java/io/branching/metastore/server/resource/DatabaseResource.java
+/Users/elonazoulay/src/trino/otherdirs/branching-metastore/branching-metastore-server/src/main/java/io/branching/metastore/server/resource/TableResource.java

@@ -5,8 +5,8 @@ use crate::physical::operators::filter::evaluate_expr;
 use crate::physical::{PhysicalOperator, RecordBatchStream};
 use crate::planner::{AggregateFunction, Expr};
 use arrow::array::{
-    ArrayRef, Float64Array, Float64Builder, Int64Array, Int64Builder, StringBuilder,
-    Date32Array, BooleanArray, UInt64Builder, Decimal128Builder,
+    Array, ArrayRef, Float64Array, Float64Builder, Int64Array, Int64Builder, StringBuilder,
+    StringArray, Date32Array, BooleanArray, UInt64Builder, Decimal128Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -250,6 +250,125 @@ impl Default for AccumulatorState {
 }
 
 fn aggregate_batches(
+    batches: &[RecordBatch],
+    group_by: &[Expr],
+    aggregates: &[AggregateExpr],
+    schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    // Special case: scalar aggregate (no GROUP BY) - use Arrow's SIMD kernels
+    if group_by.is_empty() && batches.len() == 1 && aggregates.len() == 1 {
+        return aggregate_scalar_simd(&batches[0], &aggregates[0], schema);
+    }
+
+    // Regular hash-based aggregation for grouped queries
+    aggregate_batches_hash(batches, group_by, aggregates, schema)
+}
+
+/// Fast scalar aggregate using optimized iterators (for queries without GROUP BY)
+fn aggregate_scalar_simd(
+    batch: &RecordBatch,
+    aggregate: &AggregateExpr,
+    schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    let input = evaluate_expr(batch, &aggregate.input)?;
+
+    let result: ArrayRef = match aggregate.func {
+        AggregateFunction::Count => {
+            let count = input.len() - input.null_count();
+            Arc::new(Int64Array::from(vec![count as i64]))
+        }
+        AggregateFunction::Sum => {
+            if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                // Use values() for iterator over non-null values
+                let sum = a.values().iter().fold(0i64, |acc, &x| acc.saturating_add(x));
+                Arc::new(Int64Array::from(vec![sum]))
+            } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
+                let sum = a.values().iter().fold(0.0f64, |acc, &x| acc + x);
+                Arc::new(Float64Array::from(vec![sum]))
+            } else if let Some(a) = input.as_any().downcast_ref::<arrow::array::Int32Array>() {
+                let sum = a.values().iter().fold(0i64, |acc, &x| acc.saturating_add(x as i64));
+                Arc::new(Int64Array::from(vec![sum]))
+            } else {
+                return Err(QueryError::NotImplemented(format!(
+                    "SUM not implemented for type {:?}",
+                    input.data_type()
+                )));
+            }
+        }
+        AggregateFunction::Avg => {
+            if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                let sum = a.values().iter().fold(0i64, |acc, &x| acc.saturating_add(x));
+                let count = (a.len() - a.null_count()) as f64;
+                Arc::new(Float64Array::from(vec![sum as f64 / count.max(1.0)]))
+            } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
+                let sum = a.values().iter().fold(0.0f64, |acc, &x| acc + x);
+                let count = (a.len() - a.null_count()) as f64;
+                Arc::new(Float64Array::from(vec![sum / count.max(1.0)]))
+            } else {
+                return Err(QueryError::NotImplemented(format!(
+                    "AVG not implemented for type {:?}",
+                    input.data_type()
+                )));
+            }
+        }
+        AggregateFunction::Min => {
+            if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                let min = a.iter().filter_map(|x| x).min().unwrap_or(i64::MAX);
+                Arc::new(Int64Array::from(vec![min]))
+            } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
+                let min = a.iter().filter_map(|x| x).min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(f64::MAX);
+                Arc::new(Float64Array::from(vec![min]))
+            } else if let Some(a) = input.as_any().downcast_ref::<StringArray>() {
+                let min = a.iter().filter_map(|x| x).min();
+                match min {
+                    Some(val) => Arc::new(StringArray::from(vec![Some(val)])),
+                    None => Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                }
+            } else if let Some(a) = input.as_any().downcast_ref::<Date32Array>() {
+                let min = a.iter().filter_map(|x| x).min().unwrap_or(i32::MAX);
+                Arc::new(Date32Array::from(vec![min]))
+            } else {
+                return Err(QueryError::NotImplemented(format!(
+                    "MIN not implemented for type {:?}",
+                    input.data_type()
+                )));
+            }
+        }
+        AggregateFunction::Max => {
+            if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                let max = a.iter().filter_map(|x| x).max().unwrap_or(i64::MIN);
+                Arc::new(Int64Array::from(vec![max]))
+            } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
+                let max = a.iter().filter_map(|x| x).max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(f64::MIN);
+                Arc::new(Float64Array::from(vec![max]))
+            } else if let Some(a) = input.as_any().downcast_ref::<StringArray>() {
+                let max = a.iter().filter_map(|x| x).max();
+                match max {
+                    Some(val) => Arc::new(StringArray::from(vec![Some(val)])),
+                    None => Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                }
+            } else if let Some(a) = input.as_any().downcast_ref::<Date32Array>() {
+                let max = a.iter().filter_map(|x| x).max().unwrap_or(i32::MIN);
+                Arc::new(Date32Array::from(vec![max]))
+            } else {
+                return Err(QueryError::NotImplemented(format!(
+                    "MAX not implemented for type {:?}",
+                    input.data_type()
+                )));
+            }
+        }
+        AggregateFunction::CountDistinct => {
+            return Err(QueryError::NotImplemented(
+                "COUNT DISTINCT not implemented for SIMD aggregation".into()
+            ));
+        }
+    };
+
+    RecordBatch::try_new(schema.clone(), vec![result]).map_err(Into::into)
+}
+
+/// Hash-based aggregation for grouped queries
+fn aggregate_batches_hash(
     batches: &[RecordBatch],
     group_by: &[Expr],
     aggregates: &[AggregateExpr],
