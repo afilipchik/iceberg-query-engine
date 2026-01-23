@@ -46,6 +46,8 @@ bytes = "1"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+rustyline = "14"
+dirs-next = "2"
 
 # Logging
 tracing = "0.1"

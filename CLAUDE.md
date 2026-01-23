@@ -81,7 +81,8 @@ SQL String
 1. **Streaming Execution**: All operators implement async streaming via `BoxStream<RecordBatch>`
 2. **Hash-based Operations**: Joins and aggregations use hash-based algorithms
 3. **Rule-based Optimization**: Three main rules: predicate pushdown, projection pushdown, constant folding
-4. **In-memory Storage**: Tables stored as Arrow RecordBatches (Iceberg integration planned)
+4. **Pluggable Storage**: `TableProvider` trait enables multiple data sources (memory, Parquet, Iceberg)
+5. **Arrow-native**: All data flows through Arrow RecordBatches for zero-copy operations
 
 ## File Structure
 
@@ -212,6 +213,22 @@ let result = ctx.sql("SELECT * FROM users").await?;
 | `SortExec` | Sort rows | Arrow's sort kernels |
 | `LimitExec` | Limit rows | Stream truncation |
 
+### TableProvider Trait
+
+The `TableProvider` trait (in `src/physical/operators/scan.rs`) enables pluggable data sources:
+
+```rust
+pub trait TableProvider: Send + Sync + std::fmt::Debug {
+    fn schema(&self) -> SchemaRef;
+    fn scan(&self, projection: Option<&[usize]>) -> Result<Vec<RecordBatch>>;
+}
+```
+
+Implementations:
+- `MemoryTable` - In-memory Arrow batches
+- `ParquetTable` - Parquet files (single file or directory)
+- `IcebergTable` - Planned for Phase 2
+
 ### Join Types
 
 ```rust
@@ -299,6 +316,34 @@ pub enum QueryError {
    ```
 3. Add conversion in `src/physical/planner.rs`
 4. Export in `src/physical/operators/mod.rs`
+
+### Adding a New Storage Provider (TableProvider)
+
+1. Create file in `src/storage/` (e.g., `src/storage/iceberg.rs`)
+2. Implement `TableProvider` trait:
+   ```rust
+   pub struct MyTable {
+       schema: SchemaRef,
+       // ... provider-specific fields
+   }
+
+   impl TableProvider for MyTable {
+       fn schema(&self) -> SchemaRef { self.schema.clone() }
+       fn scan(&self, projection: Option<&[usize]>) -> Result<Vec<RecordBatch>> {
+           // Read data, apply projection
+       }
+   }
+   ```
+3. Export in `src/storage/mod.rs`
+4. Optionally add convenience method in `ExecutionContext`:
+   ```rust
+   pub fn register_my_table(&mut self, name: &str, path: &Path) -> Result<()> {
+       let table = MyTable::try_new(path)?;
+       self.register_table_provider(name, Arc::new(table));
+       Ok(())
+   }
+   ```
+5. Add CLI command in `src/main.rs` if needed
 
 ### Running Tests
 
@@ -446,37 +491,93 @@ assert_eq!(result.schema.fields().len(), expected_cols);
 | Crate | Purpose |
 |-------|---------|
 | `arrow` | Columnar data format |
+| `parquet` | Parquet file reading/writing |
 | `sqlparser` | SQL parsing |
 | `tokio` | Async runtime |
 | `futures` | Stream utilities |
 | `async-trait` | Async trait methods |
 | `hashbrown` | Fast hash maps |
 | `thiserror` | Error derive macros |
+| `clap` | CLI argument parsing |
+| `rustyline` | Interactive REPL line editing |
 
 ## CLI Commands
 
 ```bash
-# Generate TPC-H data
+# Generate TPC-H data (in-memory only, for testing)
 query_engine generate --sf 0.01
 
-# Run specific TPC-H query
+# Generate TPC-H data to Parquet files
+query_engine generate-parquet --sf 0.01 --output ./data/tpch-10mb
+
+# Run specific TPC-H query (in-memory data)
 query_engine query --num 1 --sf 0.01 --plan
 
-# Run all TPC-H queries
+# Run all TPC-H queries (in-memory data)
 query_engine benchmark --sf 0.01 --iterations 3
 
-# Execute custom SQL
+# Execute custom SQL (in-memory TPC-H data)
 query_engine sql "SELECT * FROM lineitem LIMIT 10" --sf 0.01
+
+# Load Parquet file and run query
+query_engine load-parquet --path ./data/lineitem.parquet --name lineitem \
+    --query "SELECT COUNT(*) FROM lineitem"
+
+# Load Parquet directory (all .parquet files)
+query_engine load-parquet --path ./data/tpch-10mb --name orders
+
+# Run TPC-H benchmark on Parquet files
+query_engine benchmark-parquet --path ./data/tpch-100mb --iterations 3
+
+# Start interactive SQL shell (REPL)
+query_engine repl
+
+# Start REPL with TPC-H tables preloaded
+query_engine repl --tpch ./data/tpch-10mb
 ```
+
+### Interactive REPL Commands
+
+Once in the REPL, the following dot-commands are available:
+
+| Command | Description |
+|---------|-------------|
+| `.help`, `.h` | Show help message |
+| `.quit`, `.exit`, `.q` | Exit the shell |
+| `.tables` | List registered tables |
+| `.schema <table>` | Show schema for a table |
+| `.load <path> <name>` | Load Parquet file/directory as table |
+| `.tpch <path>` | Load all TPC-H tables from directory |
+
+Any other input is executed as a SQL query.
 
 ## Future/Planned Features
 
 Based on the codebase structure, these appear to be planned but not fully implemented:
-- Full Apache Iceberg integration (currently in-memory only)
+- **Apache Iceberg integration** - Phase 2 of storage plan (see plan file at `.claude/plans/`)
+  - Iceberg metadata.json parsing
+  - Avro manifest file reading
+  - Time travel queries via snapshot IDs
+  - Partition pruning
 - Cost-based optimization (cost.rs exists but is minimal)
 - Parallel execution (partition parameter exists but single-threaded)
 - More scalar functions
 - Window functions
+
+## Recently Implemented Features
+
+- **Interactive SQL REPL**
+  - `query_engine repl` command for interactive SQL sessions
+  - Readline support with history (saved to `~/.query_engine_history`)
+  - Dot-commands: `.tables`, `.schema`, `.load`, `.tpch`, `.help`, `.quit`
+  - Optional `--tpch <path>` flag to preload TPC-H tables
+
+- **Parquet file support** (Phase 1 complete)
+  - `ParquetTable` provider in `src/storage/parquet.rs`
+  - Single file and directory support
+  - Column projection pushdown
+  - CLI commands: `load-parquet`, `benchmark-parquet`, `generate-parquet`
+  - All 22 TPC-H queries passing on Parquet data
 
 ## Quick Reference: Where to Find Things
 
@@ -489,6 +590,10 @@ Based on the codebase structure, these appear to be planned but not fully implem
 | Optimizer rules | `src/optimizer/rules/*.rs` |
 | Physical execution | `src/physical/operators/*.rs` |
 | Main entry point | `src/execution/context.rs` |
+| Parquet table provider | `src/storage/parquet.rs` |
+| TableProvider trait | `src/physical/operators/scan.rs` |
 | TPC-H queries | `src/tpch/queries.rs` |
 | TPC-H schemas | `src/tpch/schema.rs` |
+| TPC-H data generator | `src/tpch/generator.rs` |
 | Error types | `src/error.rs` |
+| Iceberg implementation plan | `.claude/plans/zazzy-kindling-wigderson.md` |
