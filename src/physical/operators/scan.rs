@@ -1,0 +1,262 @@
+//! Table scan operator
+
+use crate::error::Result;
+use crate::physical::{PhysicalOperator, RecordBatchStream};
+use arrow::array::RecordBatch;
+use arrow::datatypes::SchemaRef;
+use async_trait::async_trait;
+use futures::stream::{self, StreamExt};
+use std::fmt;
+use std::sync::Arc;
+
+/// Table provider trait for accessing table data
+pub trait TableProvider: Send + Sync + fmt::Debug {
+    /// Get the schema of the table
+    fn schema(&self) -> SchemaRef;
+
+    /// Get all batches from the table
+    fn scan(&self, projection: Option<&[usize]>) -> Result<Vec<RecordBatch>>;
+}
+
+/// In-memory table provider
+#[derive(Debug, Clone)]
+pub struct MemoryTable {
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+}
+
+impl MemoryTable {
+    pub fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
+        Self { schema, batches }
+    }
+
+    pub fn try_new(batches: Vec<RecordBatch>) -> Result<Self> {
+        let schema = if batches.is_empty() {
+            Arc::new(arrow::datatypes::Schema::empty())
+        } else {
+            batches[0].schema()
+        };
+        Ok(Self { schema, batches })
+    }
+}
+
+impl TableProvider for MemoryTable {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn scan(&self, projection: Option<&[usize]>) -> Result<Vec<RecordBatch>> {
+        match projection {
+            Some(indices) => {
+                self.batches
+                    .iter()
+                    .map(|batch| {
+                        let columns: Vec<_> = indices
+                            .iter()
+                            .map(|&i| batch.column(i).clone())
+                            .collect();
+                        let fields: Vec<_> = indices
+                            .iter()
+                            .map(|&i| self.schema.field(i).clone())
+                            .collect();
+                        let schema = Arc::new(arrow::datatypes::Schema::new(fields));
+                        RecordBatch::try_new(schema, columns).map_err(Into::into)
+                    })
+                    .collect()
+            }
+            None => Ok(self.batches.clone()),
+        }
+    }
+}
+
+/// Memory table scan operator
+#[derive(Debug)]
+pub struct MemoryTableExec {
+    table_name: String,
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+    projection: Option<Vec<usize>>,
+}
+
+impl MemoryTableExec {
+    pub fn new(
+        table_name: impl Into<String>,
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+        projection: Option<Vec<usize>>,
+    ) -> Self {
+        let projected_schema = match &projection {
+            Some(indices) => {
+                let fields: Vec<_> = indices
+                    .iter()
+                    .map(|&i| schema.field(i).clone())
+                    .collect();
+                Arc::new(arrow::datatypes::Schema::new(fields))
+            }
+            None => schema.clone(),
+        };
+
+        Self {
+            table_name: table_name.into(),
+            schema: projected_schema,
+            batches,
+            projection,
+        }
+    }
+
+    pub fn from_provider(
+        table_name: impl Into<String>,
+        provider: &dyn TableProvider,
+        projection: Option<Vec<usize>>,
+    ) -> Result<Self> {
+        let batches = provider.scan(projection.as_deref())?;
+        let schema = match &projection {
+            Some(indices) => {
+                let base_schema = provider.schema();
+                let fields: Vec<_> = indices
+                    .iter()
+                    .map(|&i| base_schema.field(i).clone())
+                    .collect();
+                Arc::new(arrow::datatypes::Schema::new(fields))
+            }
+            None => provider.schema(),
+        };
+
+        Ok(Self {
+            table_name: table_name.into(),
+            schema,
+            batches,
+            projection: None, // Already projected
+        })
+    }
+
+    /// Create from provider with a specified logical schema (preserves table aliases)
+    pub fn from_provider_with_schema(
+        table_name: impl Into<String>,
+        provider: &dyn TableProvider,
+        projection: Option<Vec<usize>>,
+        logical_schema: SchemaRef,
+    ) -> Result<Self> {
+        let batches = provider.scan(projection.as_deref())?;
+
+        // Use the logical schema which has proper qualified names
+        let schema = match &projection {
+            Some(indices) => {
+                let fields: Vec<_> = indices
+                    .iter()
+                    .map(|&i| logical_schema.field(i).clone())
+                    .collect();
+                Arc::new(arrow::datatypes::Schema::new(fields))
+            }
+            None => logical_schema,
+        };
+
+        Ok(Self {
+            table_name: table_name.into(),
+            schema,
+            batches,
+            projection: None, // Already projected
+        })
+    }
+}
+
+#[async_trait]
+impl PhysicalOperator for MemoryTableExec {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn children(&self) -> Vec<Arc<dyn PhysicalOperator>> {
+        vec![]
+    }
+
+    async fn execute(&self, _partition: usize) -> Result<RecordBatchStream> {
+        let batches = match &self.projection {
+            Some(indices) => {
+                self.batches
+                    .iter()
+                    .map(|batch| {
+                        let columns: Vec<_> = indices
+                            .iter()
+                            .map(|&i| batch.column(i).clone())
+                            .collect();
+                        RecordBatch::try_new(self.schema.clone(), columns)
+                            .map_err(Into::into)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+            None => self.batches.clone(),
+        };
+
+        let stream = stream::iter(batches.into_iter().map(Ok));
+        Ok(Box::pin(stream))
+    }
+
+    fn name(&self) -> &str {
+        "MemoryTableScan"
+    }
+}
+
+impl fmt::Display for MemoryTableExec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "MemoryTableScan: {}", self.table_name)?;
+        if let Some(proj) = &self.projection {
+            write!(f, " projection={:?}", proj)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use futures::TryStreamExt;
+
+    fn create_test_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_memory_scan() {
+        let batch = create_test_batch();
+        let schema = batch.schema();
+
+        let exec = MemoryTableExec::new("test", schema, vec![batch.clone()], None);
+
+        let stream = exec.execute(0).await.unwrap();
+        let results: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].num_rows(), 3);
+        assert_eq!(results[0].num_columns(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_memory_scan_with_projection() {
+        let batch = create_test_batch();
+        let schema = batch.schema();
+
+        let exec = MemoryTableExec::new("test", schema, vec![batch], Some(vec![0]));
+
+        let stream = exec.execute(0).await.unwrap();
+        let results: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].num_rows(), 3);
+        assert_eq!(results[0].num_columns(), 1);
+    }
+}

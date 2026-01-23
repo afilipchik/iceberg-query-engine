@@ -1,0 +1,396 @@
+//! Physical planner - converts logical plans to physical plans
+
+use crate::error::{QueryError, Result};
+use crate::physical::operators::{
+    FilterExec, HashAggregateExec, HashJoinExec, LimitExec, MemoryTableExec, ProjectExec,
+    SortExec, TableProvider, AggregateExpr,
+};
+use crate::physical::PhysicalOperator;
+use crate::planner::{
+    AggregateFunction, Expr, JoinType, LogicalPlan, PlanSchema,
+};
+use arrow::datatypes::{Field, Schema, SchemaRef};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Physical planner that converts logical plans to physical execution plans
+pub struct PhysicalPlanner {
+    /// Table providers for accessing table data
+    tables: HashMap<String, Arc<dyn TableProvider>>,
+}
+
+impl Default for PhysicalPlanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PhysicalPlanner {
+    pub fn new() -> Self {
+        Self {
+            tables: HashMap::new(),
+        }
+    }
+
+    /// Register a table provider
+    pub fn register_table(&mut self, name: impl Into<String>, provider: Arc<dyn TableProvider>) {
+        self.tables.insert(name.into(), provider);
+    }
+
+    /// Convert a logical plan to a physical plan
+    pub fn create_physical_plan(&self, logical: &LogicalPlan) -> Result<Arc<dyn PhysicalOperator>> {
+        match logical {
+            LogicalPlan::Scan(node) => {
+                let provider = self
+                    .tables
+                    .get(&node.table_name)
+                    .ok_or_else(|| QueryError::TableNotFound(node.table_name.clone()))?;
+
+                // Use the logical schema (with aliases) instead of the provider schema
+                let logical_schema = plan_schema_to_arrow(&node.schema);
+                let exec = MemoryTableExec::from_provider_with_schema(
+                    &node.table_name,
+                    provider.as_ref(),
+                    node.projection.clone(),
+                    logical_schema,
+                )?;
+
+                // If there's a filter on the scan, wrap with FilterExec
+                match &node.filter {
+                    Some(predicate) => {
+                        let filter = FilterExec::new(Arc::new(exec), predicate.clone());
+                        Ok(Arc::new(filter))
+                    }
+                    None => Ok(Arc::new(exec)),
+                }
+            }
+
+            LogicalPlan::Filter(node) => {
+                let input = self.create_physical_plan(&node.input)?;
+                let filter = FilterExec::new(input, node.predicate.clone());
+                Ok(Arc::new(filter))
+            }
+
+            LogicalPlan::Project(node) => {
+                let input = self.create_physical_plan(&node.input)?;
+                let schema = plan_schema_to_arrow(&node.schema);
+                let project = ProjectExec::new(input, node.exprs.clone(), schema);
+                Ok(Arc::new(project))
+            }
+
+            LogicalPlan::Join(node) => {
+                let left = self.create_physical_plan(&node.left)?;
+                let right = self.create_physical_plan(&node.right)?;
+
+                let join = HashJoinExec::new(left, right, node.on.clone(), node.join_type);
+
+                // Apply additional filter if present
+                match &node.filter {
+                    Some(predicate) => {
+                        let filter = FilterExec::new(Arc::new(join), predicate.clone());
+                        Ok(Arc::new(filter))
+                    }
+                    None => Ok(Arc::new(join)),
+                }
+            }
+
+            LogicalPlan::Aggregate(node) => {
+                let input = self.create_physical_plan(&node.input)?;
+
+                // Convert logical aggregate expressions to physical
+                let aggregates = extract_aggregates(&node.aggregates);
+
+                let schema = plan_schema_to_arrow(&node.schema);
+
+                let agg = HashAggregateExec::new(
+                    input,
+                    node.group_by.clone(),
+                    aggregates,
+                    schema,
+                );
+                Ok(Arc::new(agg))
+            }
+
+            LogicalPlan::Sort(node) => {
+                let input = self.create_physical_plan(&node.input)?;
+                let sort = SortExec::new(input, node.order_by.clone());
+                Ok(Arc::new(sort))
+            }
+
+            LogicalPlan::Limit(node) => {
+                let input = self.create_physical_plan(&node.input)?;
+                let limit = LimitExec::new(input, node.skip, node.fetch);
+                Ok(Arc::new(limit))
+            }
+
+            LogicalPlan::Distinct(node) => {
+                // Implement distinct as group by all columns
+                let input = self.create_physical_plan(&node.input)?;
+                let input_schema = input.schema();
+
+                let group_by: Vec<Expr> = input_schema
+                    .fields()
+                    .iter()
+                    .map(|f| Expr::column(f.name().clone()))
+                    .collect();
+
+                let agg = HashAggregateExec::new(input, group_by, vec![], input_schema);
+                Ok(Arc::new(agg))
+            }
+
+            LogicalPlan::Union(node) => {
+                // Simple implementation: concatenate results
+                // For proper implementation, would need a UnionExec operator
+                if node.inputs.is_empty() {
+                    return Err(QueryError::Plan("Union with no inputs".to_string()));
+                }
+
+                // For now, just return first input (proper union needs dedicated operator)
+                self.create_physical_plan(&node.inputs[0])
+            }
+
+            LogicalPlan::SubqueryAlias(node) => {
+                // Just pass through to input
+                self.create_physical_plan(&node.input)
+            }
+
+            LogicalPlan::EmptyRelation(node) => {
+                let schema = plan_schema_to_arrow(&node.schema);
+                let batches = if node.produce_one_row {
+                    // Create a single empty row
+                    vec![arrow::record_batch::RecordBatch::new_empty(schema.clone())]
+                } else {
+                    vec![]
+                };
+                let exec = MemoryTableExec::new("empty", schema, batches, None);
+                Ok(Arc::new(exec))
+            }
+
+            LogicalPlan::Values(node) => {
+                // Evaluate constant expressions and create a batch
+                let schema = plan_schema_to_arrow(&node.schema);
+                // For now, return empty - proper implementation needs expression evaluation
+                let exec = MemoryTableExec::new("values", schema, vec![], None);
+                Ok(Arc::new(exec))
+            }
+        }
+    }
+}
+
+/// Convert PlanSchema to Arrow Schema
+fn plan_schema_to_arrow(plan_schema: &PlanSchema) -> SchemaRef {
+    let fields: Vec<Field> = plan_schema
+        .fields()
+        .iter()
+        .map(|f| f.to_arrow_field())
+        .collect();
+    Arc::new(Schema::new(fields))
+}
+
+/// Extract aggregate expressions from logical expressions
+fn extract_aggregates(exprs: &[Expr]) -> Vec<AggregateExpr> {
+    let mut aggregates = Vec::new();
+
+    for expr in exprs {
+        collect_aggregates(expr, &mut aggregates);
+    }
+
+    aggregates
+}
+
+fn collect_aggregates(expr: &Expr, aggregates: &mut Vec<AggregateExpr>) {
+    match expr {
+        Expr::Aggregate { func, args, distinct } => {
+            let input = args.first().cloned().unwrap_or(Expr::Wildcard);
+            aggregates.push(AggregateExpr {
+                func: *func,
+                input,
+                distinct: *distinct,
+            });
+        }
+        Expr::BinaryExpr { left, right, .. } => {
+            collect_aggregates(left, aggregates);
+            collect_aggregates(right, aggregates);
+        }
+        Expr::UnaryExpr { expr, .. } => {
+            collect_aggregates(expr, aggregates);
+        }
+        Expr::Cast { expr, .. } => {
+            collect_aggregates(expr, aggregates);
+        }
+        Expr::Alias { expr, .. } => {
+            collect_aggregates(expr, aggregates);
+        }
+        Expr::ScalarFunc { args, .. } => {
+            for arg in args {
+                collect_aggregates(arg, aggregates);
+            }
+        }
+        Expr::Case { operand, when_then, else_expr } => {
+            if let Some(op) = operand {
+                collect_aggregates(op, aggregates);
+            }
+            for (w, t) in when_then {
+                collect_aggregates(w, aggregates);
+                collect_aggregates(t, aggregates);
+            }
+            if let Some(e) = else_expr {
+                collect_aggregates(e, aggregates);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::physical::operators::MemoryTable;
+    use crate::planner::{Binder, InMemoryCatalog, SchemaField};
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::DataType;
+    use arrow::record_batch::RecordBatch;
+    use futures::TryStreamExt;
+
+    fn create_test_table() -> Arc<MemoryTable> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
+                Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50])),
+            ],
+        )
+        .unwrap();
+
+        Arc::new(MemoryTable::new(schema, vec![batch]))
+    }
+
+    fn create_catalog_and_planner() -> (InMemoryCatalog, PhysicalPlanner) {
+        let mut catalog = InMemoryCatalog::new();
+        catalog.register_table(
+            "test",
+            PlanSchema::new(vec![
+                SchemaField::new("id", DataType::Int64),
+                SchemaField::new("name", DataType::Utf8),
+                SchemaField::new("value", DataType::Int64),
+            ]),
+        );
+
+        let mut planner = PhysicalPlanner::new();
+        planner.register_table("test", create_test_table());
+
+        (catalog, planner)
+    }
+
+    #[tokio::test]
+    async fn test_simple_select() {
+        let (catalog, planner) = create_catalog_and_planner();
+        let mut binder = Binder::new(&catalog);
+
+        let logical = binder.bind_sql("SELECT id, value FROM test").unwrap();
+        let physical = planner.create_physical_plan(&logical).unwrap();
+
+        let stream = physical.execute(0).await.unwrap();
+        let results: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        assert!(!results.is_empty());
+        assert_eq!(results[0].num_columns(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_filter() {
+        let (catalog, planner) = create_catalog_and_planner();
+        let mut binder = Binder::new(&catalog);
+
+        let logical = binder
+            .bind_sql("SELECT id FROM test WHERE value > 25")
+            .unwrap();
+        let physical = planner.create_physical_plan(&logical).unwrap();
+
+        let stream = physical.execute(0).await.unwrap();
+        let results: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3); // values 30, 40, 50
+    }
+
+    #[tokio::test]
+    async fn test_aggregate() {
+        let (catalog, planner) = create_catalog_and_planner();
+        let mut binder = Binder::new(&catalog);
+
+        let logical = binder
+            .bind_sql("SELECT SUM(value), COUNT(*) FROM test")
+            .unwrap();
+        let physical = planner.create_physical_plan(&logical).unwrap();
+
+        let stream = physical.execute(0).await.unwrap();
+        let results: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].num_rows(), 1);
+
+        let sum = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(sum, 150);
+
+        let count = results[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(count, 5);
+    }
+
+    #[tokio::test]
+    async fn test_sort() {
+        let (catalog, planner) = create_catalog_and_planner();
+        let mut binder = Binder::new(&catalog);
+
+        // Note: ORDER BY columns must be in SELECT (planner limitation)
+        let logical = binder
+            .bind_sql("SELECT id, value FROM test ORDER BY value DESC")
+            .unwrap();
+        let physical = planner.create_physical_plan(&logical).unwrap();
+
+        let stream = physical.execute(0).await.unwrap();
+        let results: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let ids = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        assert_eq!(ids.value(0), 5);
+        assert_eq!(ids.value(1), 4);
+        assert_eq!(ids.value(2), 3);
+    }
+
+    #[tokio::test]
+    async fn test_limit() {
+        let (catalog, planner) = create_catalog_and_planner();
+        let mut binder = Binder::new(&catalog);
+
+        let logical = binder.bind_sql("SELECT id FROM test LIMIT 3").unwrap();
+        let physical = planner.create_physical_plan(&logical).unwrap();
+
+        let stream = physical.execute(0).await.unwrap();
+        let results: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3);
+    }
+}

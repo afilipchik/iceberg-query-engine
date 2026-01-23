@@ -1,0 +1,76 @@
+[package]
+name = "query_engine"
+version = "0.1.0"
+edition = "2021"
+authors = ["Query Engine Team"]
+description = "High-performance SQL query engine for Apache Iceberg"
+license = "Apache-2.0"
+
+[dependencies]
+# SQL Parsing
+sqlparser = "0.52"
+
+# Arrow ecosystem
+arrow = { version = "53", features = ["ffi", "chrono-tz", "prettyprint"] }
+arrow-array = "53"
+arrow-schema = "53"
+arrow-select = "53"
+arrow-ord = "53"
+arrow-cast = "53"
+parquet = { version = "53", features = ["async"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1"
+
+# Utilities
+chrono = "0.4"
+rust_decimal = { version = "1", features = ["serde"] }
+ordered-float = "4"
+hashbrown = "0.14"
+parking_lot = "0.12"
+rayon = "1"
+num-traits = "0.2"
+itertools = "0.13"
+rand = "0.8"
+bytes = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+pretty_assertions = "1"
+
+[[bin]]
+name = "query_engine"
+path = "src/main.rs"
+
+[[bench]]
+name = "tpch"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+debug = false
+
+[profile.bench]
+lto = true
+codegen-units = 1
+opt-level = 3
