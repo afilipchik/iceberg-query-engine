@@ -3,7 +3,7 @@
 use crate::error::{QueryError, Result};
 use crate::physical::operators::{
     FilterExec, HashAggregateExec, HashJoinExec, LimitExec, MemoryTableExec, ProjectExec,
-    SortExec, TableProvider, AggregateExpr,
+    SortExec, TableProvider, AggregateExpr, SubqueryExecutor,
 };
 use crate::physical::PhysicalOperator;
 use crate::planner::{
@@ -17,6 +17,8 @@ use std::sync::Arc;
 pub struct PhysicalPlanner {
     /// Table providers for accessing table data
     tables: HashMap<String, Arc<dyn TableProvider>>,
+    /// Optional subquery executor for handling subqueries in filters
+    subquery_executor: Option<SubqueryExecutor>,
 }
 
 impl Default for PhysicalPlanner {
@@ -29,12 +31,43 @@ impl PhysicalPlanner {
     pub fn new() -> Self {
         Self {
             tables: HashMap::new(),
+            subquery_executor: None,
         }
+    }
+
+    /// Helper to create a FilterExec with subquery executor if needed
+    fn create_filter(&self, input: Arc<dyn PhysicalOperator>, predicate: Expr) -> FilterExec {
+        let has_subquery = predicate.contains_subquery();
+        let filter = FilterExec::new(input, predicate);
+        if has_subquery {
+            if let Some(ref executor) = self.subquery_executor {
+                return filter.with_subquery_executor(executor.clone());
+            }
+        }
+        filter
     }
 
     /// Register a table provider
     pub fn register_table(&mut self, name: impl Into<String>, provider: Arc<dyn TableProvider>) {
-        self.tables.insert(name.into(), provider);
+        let name = name.into();
+        self.tables.insert(name.clone(), provider.clone());
+
+        // Also register with subquery executor if it exists
+        if let Some(ref executor) = self.subquery_executor {
+            executor.register_table(name, provider);
+        }
+    }
+
+    /// Enable subquery execution support
+    pub fn enable_subquery_execution(&mut self) {
+        // Clone the tables HashMap for the subquery executor
+        let tables = self.tables.clone();
+        self.subquery_executor = Some(SubqueryExecutor::from_tables(tables));
+    }
+
+    /// Set the subquery executor (used by subquery executor to pass itself for nested subqueries)
+    pub fn set_subquery_executor(&mut self, executor: Option<SubqueryExecutor>) {
+        self.subquery_executor = executor;
     }
 
     /// Convert a logical plan to a physical plan
@@ -58,7 +91,7 @@ impl PhysicalPlanner {
                 // If there's a filter on the scan, wrap with FilterExec
                 match &node.filter {
                     Some(predicate) => {
-                        let filter = FilterExec::new(Arc::new(exec), predicate.clone());
+                        let filter = self.create_filter(Arc::new(exec), predicate.clone());
                         Ok(Arc::new(filter))
                     }
                     None => Ok(Arc::new(exec)),
@@ -67,7 +100,7 @@ impl PhysicalPlanner {
 
             LogicalPlan::Filter(node) => {
                 let input = self.create_physical_plan(&node.input)?;
-                let filter = FilterExec::new(input, node.predicate.clone());
+                let filter = self.create_filter(input, node.predicate.clone());
                 Ok(Arc::new(filter))
             }
 
@@ -87,7 +120,7 @@ impl PhysicalPlanner {
                 // Apply additional filter if present
                 match &node.filter {
                     Some(predicate) => {
-                        let filter = FilterExec::new(Arc::new(join), predicate.clone());
+                        let filter = self.create_filter(Arc::new(join), predicate.clone());
                         Ok(Arc::new(filter))
                     }
                     None => Ok(Arc::new(join)),
