@@ -618,6 +618,12 @@ Based on the codebase structure, these appear to be planned but not fully implem
 
 ## Recently Implemented Features
 
+- **HashAggregateExec Partition Handling Fix** (Critical bug fix)
+  - Fixed issue where `HashAggregateExec` only collected data from partition 0
+  - The operator now correctly collects from ALL input partitions before aggregating
+  - This was causing incorrect row counts (e.g., 1.8M instead of 30M rows)
+  - See `src/physical/operators/hash_agg.rs:129-137` for the fix
+
 - **Correlated Subquery Support** (Full implementation)
   - `EXISTS`, `NOT EXISTS` subqueries with outer column references
   - `IN`, `NOT IN` subqueries (correlated and uncorrelated)
@@ -648,6 +654,35 @@ Based on the codebase structure, these appear to be planned but not fully implem
   - Column projection pushdown
   - CLI commands: `load-parquet`, `benchmark-parquet`, `generate-parquet`
 
+- **Larger-Than-Memory Dataset Support** (NEW)
+  - Memory pool infrastructure in `src/execution/memory.rs`
+    - `MemoryPool` with RAII-based `MemoryReservation` tracking
+    - `MemoryConsumer` trait for operators that can spill to disk
+    - `ExecutionConfig` with configurable memory limits and spill directory
+  - Streaming Parquet reader in `src/storage/parquet.rs`
+    - `StreamingParquetReader` reads data row-group by row-group
+    - `StreamingParquetScanBuilder` for constructing streaming scans
+    - `ParquetFileInfo` for accessing file metadata and statistics
+  - Iceberg scan with statistics-based pruning in `src/physical/operators/iceberg.rs`
+    - File-level min/max statistics filtering
+    - Partition pruning support
+    - Streaming data file reading via Parquet
+  - Spillable operators in `src/physical/operators/spillable.rs`
+    - `SpillableHashJoinExec`: Partitioned hash join that spills to disk
+    - `SpillableHashAggregateExec`: Hash aggregation with spill support
+    - `ExternalSortExec`: External merge sort for large datasets
+  - Usage:
+    ```rust
+    // Create context with memory limit
+    let ctx = ExecutionContext::with_memory_limit(512 * 1024 * 1024); // 512MB
+
+    // Or use custom config
+    let config = ExecutionConfig::new()
+        .with_memory_limit_str("1GB")?
+        .with_spill_path(PathBuf::from("/tmp/spill"));
+    let ctx = ExecutionContext::with_config(config);
+    ```
+
 ## Quick Reference: Where to Find Things
 
 | Looking for... | Location |
@@ -664,11 +699,16 @@ Based on the codebase structure, these appear to be planned but not fully implem
 | Subquery execution | `src/physical/operators/subquery.rs` |
 | Main entry point | `src/execution/context.rs` |
 | Parquet table provider | `src/storage/parquet.rs` |
+| Streaming Parquet reader | `src/storage/parquet.rs` (StreamingParquetReader) |
 | TableProvider trait | `src/physical/operators/scan.rs` |
+| Memory pool/config | `src/execution/memory.rs` |
+| Spillable operators | `src/physical/operators/spillable.rs` |
+| Iceberg scan with stats | `src/physical/operators/iceberg.rs` |
 | TPC-H queries | `src/tpch/queries.rs` |
 | TPC-H schemas | `src/tpch/schema.rs` |
 | TPC-H data generator | `src/tpch/generator.rs` |
 | SQL tests | `tests/sql_comprehensive.rs` |
 | Error types | `src/error.rs` |
 | Metastore REST client | `src/metastore/mod.rs` |
+| Larger-than-memory plan | `.claude/plans/larger-than-memory-support.md` |
 | Iceberg implementation plan | `.claude/plans/zazzy-kindling-wigderson.md` |

@@ -1,13 +1,23 @@
 //! Parquet file table provider
+//!
+//! This module provides both batch and streaming access to Parquet files.
+//! The streaming reader (`StreamingParquetReader`) reads data row-group by
+//! row-group, enabling processing of datasets larger than available memory.
 
 use crate::error::{QueryError, Result};
 use crate::physical::operators::TableProvider;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use futures::stream::BoxStream;
+use futures::Stream;
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
+use parquet::file::metadata::ParquetMetaData;
 use std::fmt;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
 /// Table provider that reads from Parquet files
 pub struct ParquetTable {
@@ -135,6 +145,257 @@ impl TableProvider for ParquetTable {
         // If projection was applied, we need to update the schema in the batches
         // The Parquet reader already does this, so batches have correct schema
         Ok(all_batches)
+    }
+}
+
+/// Streaming Parquet reader that reads data row-group by row-group
+///
+/// This reader processes one row group at a time, keeping memory usage
+/// bounded regardless of total file size. Useful for processing datasets
+/// that don't fit in memory.
+pub struct StreamingParquetReader {
+    /// Files to read
+    files: Vec<PathBuf>,
+    /// Projection indices (columns to read)
+    projection: Option<Vec<usize>>,
+    /// Batch size for reading
+    batch_size: usize,
+    /// Schema of the output
+    schema: SchemaRef,
+    /// Current file index
+    current_file_idx: usize,
+    /// Current reader (if any)
+    current_reader: Option<ParquetRecordBatchReader>,
+}
+
+impl fmt::Debug for StreamingParquetReader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StreamingParquetReader")
+            .field("files", &self.files.len())
+            .field("current_file_idx", &self.current_file_idx)
+            .field("batch_size", &self.batch_size)
+            .finish()
+    }
+}
+
+impl StreamingParquetReader {
+    /// Create a new streaming reader for a list of Parquet files
+    pub fn new(
+        files: Vec<PathBuf>,
+        schema: SchemaRef,
+        projection: Option<Vec<usize>>,
+        batch_size: usize,
+    ) -> Self {
+        Self {
+            files,
+            projection,
+            batch_size,
+            schema,
+            current_file_idx: 0,
+            current_reader: None,
+        }
+    }
+
+    /// Create from a ParquetTable
+    pub fn from_table(table: &ParquetTable, projection: Option<Vec<usize>>, batch_size: usize) -> Self {
+        Self::new(
+            table.files.clone(),
+            table.schema.clone(),
+            projection,
+            batch_size,
+        )
+    }
+
+    /// Get the schema
+    pub fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    /// Open the next file and create a reader
+    fn open_next_file(&mut self) -> Result<bool> {
+        if self.current_file_idx >= self.files.len() {
+            return Ok(false);
+        }
+
+        let path = &self.files[self.current_file_idx];
+        let file = File::open(path).map_err(|e| {
+            QueryError::Io(std::io::Error::new(
+                e.kind(),
+                format!("Failed to open {}: {}", path.display(), e),
+            ))
+        })?;
+
+        let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+
+        // Apply projection if specified
+        if let Some(ref indices) = self.projection {
+            let mask = parquet::arrow::ProjectionMask::roots(
+                builder.parquet_schema(),
+                indices.iter().copied(),
+            );
+            builder = builder.with_projection(mask);
+        }
+
+        // Set batch size
+        builder = builder.with_batch_size(self.batch_size);
+
+        self.current_reader = Some(builder.build()?);
+        self.current_file_idx += 1;
+
+        Ok(true)
+    }
+
+    /// Read the next batch
+    pub fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        loop {
+            // If we have a current reader, try to get the next batch
+            if let Some(ref mut reader) = self.current_reader {
+                match reader.next() {
+                    Some(Ok(batch)) => return Ok(Some(batch)),
+                    Some(Err(e)) => return Err(e.into()),
+                    None => {
+                        // Current file exhausted, move to next
+                        self.current_reader = None;
+                    }
+                }
+            }
+
+            // Try to open the next file
+            if !self.open_next_file()? {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Convert to a stream of record batches
+    pub fn into_stream(self) -> BoxStream<'static, Result<RecordBatch>> {
+        Box::pin(StreamingParquetReaderStream { reader: self })
+    }
+}
+
+/// Stream wrapper for StreamingParquetReader
+struct StreamingParquetReaderStream {
+    reader: StreamingParquetReader,
+}
+
+impl Stream for StreamingParquetReaderStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.reader.next_batch() {
+            Ok(Some(batch)) => Poll::Ready(Some(Ok(batch))),
+            Ok(None) => Poll::Ready(None),
+            Err(e) => Poll::Ready(Some(Err(e))),
+        }
+    }
+}
+
+/// Information about a Parquet file
+#[derive(Debug, Clone)]
+pub struct ParquetFileInfo {
+    /// Path to the file
+    pub path: PathBuf,
+    /// Number of row groups in the file
+    pub num_row_groups: usize,
+    /// Total number of rows
+    pub num_rows: i64,
+    /// File size in bytes
+    pub file_size: u64,
+    /// Parquet metadata
+    metadata: Arc<ParquetMetaData>,
+}
+
+impl ParquetFileInfo {
+    /// Read file info from a Parquet file
+    pub fn try_new(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let file = File::open(&path)?;
+        let file_size = file.metadata()?.len();
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let metadata = builder.metadata().clone();
+
+        let num_rows = metadata
+            .row_groups()
+            .iter()
+            .map(|rg| rg.num_rows())
+            .sum();
+
+        Ok(Self {
+            path,
+            num_row_groups: metadata.num_row_groups(),
+            num_rows,
+            file_size,
+            metadata, // Already an Arc<ParquetMetaData>
+        })
+    }
+
+    /// Get row group metadata
+    pub fn row_group(&self, idx: usize) -> Option<&parquet::file::metadata::RowGroupMetaData> {
+        self.metadata.row_groups().get(idx)
+    }
+
+    /// Get column statistics for a row group
+    pub fn column_stats(
+        &self,
+        row_group_idx: usize,
+        column_idx: usize,
+    ) -> Option<&parquet::file::statistics::Statistics> {
+        self.metadata
+            .row_groups()
+            .get(row_group_idx)?
+            .column(column_idx)
+            .statistics()
+    }
+}
+
+/// Builder for creating streaming table scans
+pub struct StreamingParquetScanBuilder {
+    files: Vec<PathBuf>,
+    schema: SchemaRef,
+    projection: Option<Vec<usize>>,
+    batch_size: usize,
+    /// Predicate for row group pruning (column_idx, min, max) -> should_include
+    row_group_filter: Option<Box<dyn Fn(usize, &ParquetFileInfo) -> bool + Send + Sync>>,
+}
+
+impl StreamingParquetScanBuilder {
+    /// Create a new builder from a ParquetTable
+    pub fn new(table: &ParquetTable) -> Self {
+        Self {
+            files: table.files.clone(),
+            schema: table.schema.clone(),
+            projection: None,
+            batch_size: 8192,
+            row_group_filter: None,
+        }
+    }
+
+    /// Set the columns to read
+    pub fn with_projection(mut self, projection: Vec<usize>) -> Self {
+        self.projection = Some(projection);
+        self
+    }
+
+    /// Set the batch size for reading
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = batch_size;
+        self
+    }
+
+    /// Build the streaming reader
+    pub fn build(self) -> StreamingParquetReader {
+        StreamingParquetReader::new(
+            self.files,
+            self.schema,
+            self.projection,
+            self.batch_size,
+        )
+    }
+
+    /// Build and convert to stream
+    pub fn build_stream(self) -> BoxStream<'static, Result<RecordBatch>> {
+        self.build().into_stream()
     }
 }
 

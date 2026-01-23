@@ -121,19 +121,34 @@ impl PhysicalOperator for HashAggregateExec {
     }
 
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
-        let input_stream = self.input.execute(partition).await?;
+        // Aggregation always produces a single partition by collecting from all input partitions
+        if partition != 0 {
+            return Ok(Box::pin(stream::empty()));
+        }
 
-        // Collect all input batches
-        let batches: Vec<RecordBatch> = input_stream.try_collect().await?;
+        // Collect from all input partitions
+        let input_partitions = self.input.output_partitions().max(1);
+        let mut all_batches = Vec::new();
 
-        // Build hash table
-        let result = aggregate_batches(&batches, &self.group_by, &self.aggregates, &self.schema)?;
+        for part in 0..input_partitions {
+            let input_stream = self.input.execute(part).await?;
+            let batches: Vec<RecordBatch> = input_stream.try_collect().await?;
+            all_batches.extend(batches);
+        }
+
+        // Build hash table from all collected batches
+        let result = aggregate_batches(&all_batches, &self.group_by, &self.aggregates, &self.schema)?;
 
         Ok(Box::pin(stream::once(async { Ok(result) })))
     }
 
     fn name(&self) -> &str {
         "HashAggregate"
+    }
+
+    fn output_partitions(&self) -> usize {
+        // Aggregation produces a single partition (all groups combined)
+        1
     }
 }
 
@@ -270,6 +285,16 @@ fn aggregate_batches(
 
     // Regular hash-based aggregation for grouped queries
     aggregate_batches_hash(batches, group_by, aggregates, schema)
+}
+
+/// Public interface for aggregate_batches used by spillable operators
+pub fn aggregate_batches_external(
+    batches: &[RecordBatch],
+    group_by: &[Expr],
+    aggregates: &[AggregateExpr],
+    schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    aggregate_batches(batches, group_by, aggregates, schema)
 }
 
 /// Fast scalar aggregate using optimized iterators (for queries without GROUP BY)

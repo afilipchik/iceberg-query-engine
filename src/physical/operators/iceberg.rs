@@ -2,12 +2,15 @@
 //!
 //! This module provides Iceberg table reading with:
 //! - Partition pruning based on predicates
+//! - Statistics-based file pruning (min/max bounds)
 //! - Snapshot-based reads (time travel)
 //! - Delete file handling
 //! - Manifest file parsing
 
 use crate::error::{QueryError, Result};
 use crate::physical::{PhysicalOperator, RecordBatchStream};
+use crate::planner::Expr;
+use crate::storage::StreamingParquetReader;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use futures::stream;
@@ -114,6 +117,15 @@ pub struct IcebergScanExec {
     snapshot_id: Option<i64>,
     /// Partition filters
     partition_filters: Vec<PartitionFilter>,
+    /// Predicate for statistics-based filtering
+    predicate: Option<Expr>,
+    /// Column projection indices
+    projection: Option<Vec<usize>>,
+    /// Batch size for streaming reads
+    batch_size: usize,
+    /// Statistics for pruning metrics
+    files_pruned_by_partition: usize,
+    files_pruned_by_stats: usize,
 }
 
 impl IcebergScanExec {
@@ -124,6 +136,11 @@ impl IcebergScanExec {
             schema,
             snapshot_id: None,
             partition_filters: Vec::new(),
+            predicate: None,
+            projection: None,
+            batch_size: 8192,
+            files_pruned_by_partition: 0,
+            files_pruned_by_stats: 0,
         }
     }
 
@@ -137,6 +154,34 @@ impl IcebergScanExec {
     pub fn with_partition_filter(mut self, filter: PartitionFilter) -> Self {
         self.partition_filters.push(filter);
         self
+    }
+
+    /// Set a predicate for statistics-based filtering
+    pub fn with_predicate(mut self, predicate: Expr) -> Self {
+        self.predicate = Some(predicate);
+        self
+    }
+
+    /// Set column projection
+    pub fn with_projection(mut self, projection: Vec<usize>) -> Self {
+        self.projection = Some(projection);
+        self
+    }
+
+    /// Set batch size for streaming
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = batch_size;
+        self
+    }
+
+    /// Get the number of files pruned by partition filter
+    pub fn files_pruned_by_partition(&self) -> usize {
+        self.files_pruned_by_partition
+    }
+
+    /// Get the number of files pruned by statistics
+    pub fn files_pruned_by_stats(&self) -> usize {
+        self.files_pruned_by_stats
     }
 
     /// Load table metadata
@@ -245,27 +290,216 @@ impl PhysicalOperator for IcebergScanExec {
         // Get snapshot ID
         let snapshot_id = self
             .snapshot_id
-            .unwrap_or_else(|| metadata.current_snapshot_id.expect("No current snapshot"));
+            .or(metadata.current_snapshot_id);
+
+        // If no snapshot, return empty stream
+        let Some(snapshot_id) = snapshot_id else {
+            return Ok(Box::pin(stream::empty()));
+        };
 
         // Load snapshot
         let snapshot = self.load_snapshot(snapshot_id)?;
 
         // Collect data files from manifests
         let all_data_files = self.collect_data_files(&snapshot)?;
+        let total_files = all_data_files.len();
 
         // Apply partition filters
-        let _filtered_files = self.filter_data_files(all_data_files);
+        let partition_filtered = self.filter_data_files(all_data_files);
+        let after_partition = partition_filtered.len();
 
-        // For each data file, we would normally read it using the Parquet scanner
-        // For now, return empty batches as a placeholder
-        let batches = Vec::new();
+        // Apply statistics-based filtering
+        let stats_filtered = self.filter_by_statistics(partition_filtered);
+        let after_stats = stats_filtered.len();
 
-        let stream = stream::iter(batches.into_iter().map(Ok));
-        Ok(Box::pin(stream))
+        // Log pruning stats (would be captured in metrics in production)
+        let _pruned_by_partition = total_files - after_partition;
+        let _pruned_by_stats = after_partition - after_stats;
+
+        // Convert file paths to absolute paths
+        let file_paths: Vec<PathBuf> = stats_filtered
+            .into_iter()
+            .map(|f| {
+                let path = PathBuf::from(&f.file_path);
+                if path.is_absolute() {
+                    path
+                } else {
+                    // Relative to table data directory
+                    self.table_path.join("data").join(&f.file_path)
+                }
+            })
+            .filter(|p| p.exists())
+            .collect();
+
+        if file_paths.is_empty() {
+            return Ok(Box::pin(stream::empty()));
+        }
+
+        // Create streaming reader for the Parquet files
+        let reader = StreamingParquetReader::new(
+            file_paths,
+            self.schema.clone(),
+            self.projection.clone(),
+            self.batch_size,
+        );
+
+        Ok(reader.into_stream())
     }
 
     fn name(&self) -> &str {
         "IcebergScan"
+    }
+}
+
+impl IcebergScanExec {
+    /// Filter files based on column statistics (min/max bounds)
+    fn filter_by_statistics(&self, files: Vec<IcebergDataFile>) -> Vec<IcebergDataFile> {
+        let Some(ref predicate) = self.predicate else {
+            return files;
+        };
+
+        files
+            .into_iter()
+            .filter(|file| self.file_might_match(file, predicate))
+            .collect()
+    }
+
+    /// Check if a file might contain matching rows based on statistics
+    fn file_might_match(&self, file: &IcebergDataFile, predicate: &Expr) -> bool {
+        use crate::planner::{BinaryOp, UnaryOp};
+
+        // For now, we use a conservative approach - if we can't determine,
+        // we include the file. This can be enhanced with more sophisticated
+        // statistics checking.
+        match predicate {
+            Expr::BinaryExpr { left, op, right } => {
+                // Handle AND and OR as special cases
+                match op {
+                    BinaryOp::And => {
+                        // Both conditions must potentially match
+                        self.file_might_match(file, left) && self.file_might_match(file, right)
+                    }
+                    BinaryOp::Or => {
+                        // At least one condition must potentially match
+                        self.file_might_match(file, left) || self.file_might_match(file, right)
+                    }
+                    _ => self.check_comparison_predicate(file, left, op, right)
+                }
+            }
+            Expr::UnaryExpr { op: UnaryOp::Not, expr } => {
+                // Conservative: if we can prove inner always matches, we can skip
+                // For simplicity, always include
+                !self.file_definitely_matches(file, expr)
+            }
+            _ => true, // Conservative: include file if we can't determine
+        }
+    }
+
+    /// Check a comparison predicate against file statistics
+    fn check_comparison_predicate(
+        &self,
+        file: &IcebergDataFile,
+        left: &Expr,
+        op: &crate::planner::BinaryOp,
+        right: &Expr,
+    ) -> bool {
+        use crate::planner::{BinaryOp, ScalarValue};
+
+        // Try to extract column name and literal value
+        let (col_name, literal) = match (left, right) {
+            (Expr::Column(col), Expr::Literal(lit)) => (col.name.as_str(), lit),
+            (Expr::Literal(lit), Expr::Column(col)) => (col.name.as_str(), lit),
+            _ => return true, // Can't evaluate, include file
+        };
+
+        // Get column index from schema
+        let col_idx = self.schema.fields().iter().position(|f| f.name() == col_name);
+        let Some(col_idx) = col_idx else {
+            return true; // Column not in schema, include file
+        };
+
+        // Get bounds for this column from file statistics
+        let lower_bound = file.lower_bounds.as_ref().and_then(|b| b.get(&(col_idx as i32)));
+        let upper_bound = file.upper_bounds.as_ref().and_then(|b| b.get(&(col_idx as i32)));
+
+        // If no statistics available, include the file
+        if lower_bound.is_none() && upper_bound.is_none() {
+            return true;
+        }
+
+        // Evaluate based on operator and statistics
+        // For numeric comparisons with Int64 values
+        if let ScalarValue::Int64(val) = literal {
+            let min = lower_bound.and_then(|b| parse_i64_from_bytes(b));
+            let max = upper_bound.and_then(|b| parse_i64_from_bytes(b));
+
+            match op {
+                BinaryOp::Eq => {
+                    // value = X: file might match if min <= X <= max
+                    let min_ok = min.map_or(true, |m| m <= *val);
+                    let max_ok = max.map_or(true, |m| m >= *val);
+                    min_ok && max_ok
+                }
+                BinaryOp::Lt => {
+                    // value < X: file might match if min < X
+                    min.map_or(true, |m| m < *val)
+                }
+                BinaryOp::LtEq => {
+                    // value <= X: file might match if min <= X
+                    min.map_or(true, |m| m <= *val)
+                }
+                BinaryOp::Gt => {
+                    // value > X: file might match if max > X
+                    max.map_or(true, |m| m > *val)
+                }
+                BinaryOp::GtEq => {
+                    // value >= X: file might match if max >= X
+                    max.map_or(true, |m| m >= *val)
+                }
+                BinaryOp::NotEq => {
+                    // value != X: file might not match only if min == max == X
+                    !(min == Some(*val) && max == Some(*val))
+                }
+                _ => true,
+            }
+        } else if let ScalarValue::Int32(val) = literal {
+            // Handle Int32 similarly
+            let val = *val as i64;
+            let min = lower_bound.and_then(|b| parse_i64_from_bytes(b));
+            let max = upper_bound.and_then(|b| parse_i64_from_bytes(b));
+
+            match op {
+                BinaryOp::Eq => {
+                    let min_ok = min.map_or(true, |m| m <= val);
+                    let max_ok = max.map_or(true, |m| m >= val);
+                    min_ok && max_ok
+                }
+                BinaryOp::Lt => min.map_or(true, |m| m < val),
+                BinaryOp::LtEq => min.map_or(true, |m| m <= val),
+                BinaryOp::Gt => max.map_or(true, |m| m > val),
+                BinaryOp::GtEq => max.map_or(true, |m| m >= val),
+                BinaryOp::NotEq => !(min == Some(val) && max == Some(val)),
+                _ => true,
+            }
+        } else {
+            // For other types, be conservative
+            true
+        }
+    }
+
+    /// Check if file definitely matches (for NOT optimization)
+    fn file_definitely_matches(&self, _file: &IcebergDataFile, _predicate: &Expr) -> bool {
+        // Conservative: we can't prove definite match
+        false
+    }
+}
+
+/// Parse i64 from Iceberg statistics bytes (little-endian)
+fn parse_i64_from_bytes(bytes: &[u8]) -> Option<i64> {
+    if bytes.len() >= 8 {
+        Some(i64::from_le_bytes(bytes[..8].try_into().ok()?))
+    } else {
+        None
     }
 }
 

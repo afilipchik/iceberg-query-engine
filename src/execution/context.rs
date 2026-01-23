@@ -1,6 +1,9 @@
 //! Execution context - main entry point for query execution
 
 use crate::error::Result;
+use crate::execution::{
+    create_memory_pool, ExecutionConfig, SharedMemoryPool, SpillMetrics,
+};
 use crate::optimizer::Optimizer;
 use crate::parser;
 use crate::physical::operators::{MemoryTable, TableProvider};
@@ -41,6 +44,14 @@ pub struct QueryMetrics {
     pub execute_time: Duration,
     /// Total time
     pub total_time: Duration,
+    /// Peak memory usage during execution (bytes)
+    pub peak_memory_bytes: usize,
+    /// Spill metrics if any spilling occurred
+    pub spill_metrics: Option<SpillMetrics>,
+    /// Number of files pruned by Iceberg statistics
+    pub files_pruned_by_stats: usize,
+    /// Number of files pruned by partition filter
+    pub files_pruned_by_partition: usize,
 }
 
 /// Execution context - manages tables and executes queries
@@ -50,6 +61,10 @@ pub struct ExecutionContext {
     optimizer: Optimizer,
     /// Number of parallel partitions for execution (defaults to CPU count)
     parallel_partitions: usize,
+    /// Memory pool for tracking and limiting memory usage
+    memory_pool: SharedMemoryPool,
+    /// Execution configuration
+    config: ExecutionConfig,
 }
 
 impl Default for ExecutionContext {
@@ -60,12 +75,63 @@ impl Default for ExecutionContext {
 
 impl ExecutionContext {
     pub fn new() -> Self {
+        let config = ExecutionConfig::default();
+        let memory_pool = create_memory_pool(config.memory_limit);
         Self {
             catalog: InMemoryCatalog::new(),
             tables: HashMap::new(),
             optimizer: Optimizer::new(),
             parallel_partitions: rayon::current_num_threads(),
+            memory_pool,
+            config,
         }
+    }
+
+    /// Create a new context with a specific memory limit
+    pub fn with_memory_limit(max_bytes: usize) -> Self {
+        let config = ExecutionConfig::default().with_memory_limit(max_bytes);
+        let memory_pool = create_memory_pool(max_bytes);
+        Self {
+            catalog: InMemoryCatalog::new(),
+            tables: HashMap::new(),
+            optimizer: Optimizer::new(),
+            parallel_partitions: rayon::current_num_threads(),
+            memory_pool,
+            config,
+        }
+    }
+
+    /// Create a new context with custom configuration
+    pub fn with_config(config: ExecutionConfig) -> Self {
+        let memory_pool = create_memory_pool(config.memory_limit);
+        Self {
+            catalog: InMemoryCatalog::new(),
+            tables: HashMap::new(),
+            optimizer: Optimizer::new(),
+            parallel_partitions: rayon::current_num_threads(),
+            memory_pool,
+            config,
+        }
+    }
+
+    /// Get the memory pool
+    pub fn memory_pool(&self) -> &SharedMemoryPool {
+        &self.memory_pool
+    }
+
+    /// Get the execution config
+    pub fn config(&self) -> &ExecutionConfig {
+        &self.config
+    }
+
+    /// Get current memory usage
+    pub fn memory_used(&self) -> usize {
+        self.memory_pool.used()
+    }
+
+    /// Get available memory
+    pub fn memory_available(&self) -> usize {
+        self.memory_pool.available()
     }
 
     /// Set the number of parallel partitions for execution
@@ -210,6 +276,16 @@ impl ExecutionContext {
 
         metrics.total_time = start.elapsed();
 
+        // Capture memory metrics
+        metrics.peak_memory_bytes = self.memory_pool.used();
+        let spilled = self.memory_pool.spilled();
+        if spilled > 0 {
+            metrics.spill_metrics = Some(SpillMetrics {
+                bytes_spilled: spilled,
+                ..Default::default()
+            });
+        }
+
         let schema = physical.schema();
         let row_count: usize = all_batches.iter().map(|b| b.num_rows()).sum();
 
@@ -290,10 +366,55 @@ pub fn print_results(result: &QueryResult) {
         result.metrics.execute_time,
         result.metrics.total_time
     );
+
+    // Print memory metrics
+    if result.metrics.peak_memory_bytes > 0 {
+        println!(
+            "Memory: peak={}",
+            format_bytes(result.metrics.peak_memory_bytes)
+        );
+    }
+
+    // Print spill metrics if any
+    if let Some(ref spill) = result.metrics.spill_metrics {
+        println!(
+            "Spill: {} spilled, {} partitions, {} files",
+            format_bytes(spill.bytes_spilled),
+            spill.partitions_spilled,
+            spill.spill_files_created
+        );
+    }
+
+    // Print pruning stats
+    if result.metrics.files_pruned_by_stats > 0 || result.metrics.files_pruned_by_partition > 0 {
+        println!(
+            "Pruning: {} by stats, {} by partition",
+            result.metrics.files_pruned_by_stats,
+            result.metrics.files_pruned_by_partition
+        );
+    }
+
     println!();
 
     if !result.batches.is_empty() {
         let _ = print_batches(&result.batches);
+    }
+}
+
+/// Format bytes into human-readable string
+fn format_bytes(bytes: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = KB * 1024;
+    const GB: usize = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
     }
 }
 
