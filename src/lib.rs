@@ -9,9 +9,11 @@ pub mod optimizer;
 pub mod parser;
 pub mod physical;
 pub mod planner;
+pub mod storage;
 pub mod tpch;
 
 // Re-export main types
 pub use error::{QueryError, Result};
 pub use execution::{ExecutionContext, QueryResult};
 pub use planner::{Binder, InMemoryCatalog, LogicalPlan};
+pub use storage::ParquetTable;

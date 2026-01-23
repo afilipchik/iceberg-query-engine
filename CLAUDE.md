@@ -124,6 +124,10 @@ src/
 │       ├── sort.rs           # SortExec
 │       └── limit.rs          # LimitExec
 │
+├── storage/                  # External storage providers
+│   ├── mod.rs                # Module exports (ParquetTable)
+│   └── parquet.rs            # ParquetTable - reads Parquet files/directories
+│
 ├── execution/
 │   ├── mod.rs                # Module exports
 │   ├── context.rs            # ExecutionContext (main entry point)
@@ -131,9 +135,14 @@ src/
 │
 └── tpch/
     ├── mod.rs                # TPC-H module exports
-    ├── generator.rs          # TpchGenerator for test data
+    ├── generator.rs          # TpchGenerator for test data + Parquet export
     ├── schema.rs             # TPC-H table schemas
     └── queries.rs            # All 22 TPC-H queries
+
+data/                         # Generated test data (gitignored)
+├── tpch-1mb/                 # SF=0.001 - 8 Parquet files
+├── tpch-10mb/                # SF=0.01 - 8 Parquet files
+└── tpch-100mb/               # SF=0.1 - 8 Parquet files
 ```
 
 ## Core Types Reference
@@ -142,10 +151,20 @@ src/
 
 ```rust
 // Main execution entry point
-use query_engine::ExecutionContext;
+use query_engine::{ExecutionContext, ParquetTable};
 
 let mut ctx = ExecutionContext::new();
+
+// Register in-memory table
 ctx.register_table("users", schema, batches);
+
+// Register Parquet file or directory
+ctx.register_parquet("orders", "/path/to/orders.parquet")?;
+
+// Register custom table provider
+let table = Arc::new(ParquetTable::try_new("/path/to/data")?);
+ctx.register_table_provider("lineitem", table);
+
 let result = ctx.sql("SELECT * FROM users").await?;
 // result.batches: Vec<RecordBatch>
 // result.row_count: usize

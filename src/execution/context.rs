@@ -6,10 +6,12 @@ use crate::parser;
 use crate::physical::operators::{MemoryTable, TableProvider};
 use crate::physical::{PhysicalOperator, PhysicalPlanner};
 use crate::planner::{Binder, InMemoryCatalog, LogicalPlan, PlanSchema, SchemaField};
-use arrow::datatypes::{DataType, Schema, SchemaRef};
+use crate::storage::ParquetTable;
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -85,6 +87,35 @@ impl ExecutionContext {
     pub fn register_batch(&mut self, name: impl Into<String>, batch: RecordBatch) {
         let schema = batch.schema();
         self.register_table(name, schema, vec![batch]);
+    }
+
+    /// Register a custom table provider
+    ///
+    /// This allows registering any type that implements TableProvider,
+    /// such as ParquetTable or IcebergTable.
+    pub fn register_table_provider(
+        &mut self,
+        name: impl Into<String>,
+        provider: Arc<dyn TableProvider>,
+    ) {
+        let name = name.into();
+
+        // Register schema with catalog for planning
+        let plan_schema = arrow_schema_to_plan_schema(&provider.schema());
+        self.catalog.register_table(name.clone(), plan_schema);
+
+        // Store provider for execution
+        self.tables.insert(name, provider);
+    }
+
+    /// Register a table from Parquet file(s)
+    ///
+    /// If path points to a file, loads that single Parquet file.
+    /// If path points to a directory, loads all .parquet files in it.
+    pub fn register_parquet(&mut self, name: impl Into<String>, path: impl AsRef<Path>) -> Result<()> {
+        let table = ParquetTable::try_new(path)?;
+        self.register_table_provider(name, Arc::new(table));
+        Ok(())
     }
 
     /// Execute a SQL query and return results
