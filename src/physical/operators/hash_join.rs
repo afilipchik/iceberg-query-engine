@@ -259,6 +259,7 @@ fn extract_join_key(arrays: &[ArrayRef], row: usize) -> JoinKey {
     JoinKey { values }
 }
 
+#[allow(clippy::needless_range_loop)] // Index needed for parallel array access
 fn probe_hash_table(
     build_batches: &[RecordBatch],
     probe_batches: &[RecordBatch],
@@ -523,6 +524,7 @@ fn create_joined_batch(
     RecordBatch::try_new(output_schema.clone(), columns).map_err(Into::into)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_joined_batch_with_nulls(
     build_batches: &[RecordBatch],
     probe_batch: &RecordBatch,
@@ -643,6 +645,7 @@ fn gather_column(
     }
 }
 
+#[allow(dead_code)] // Reserved for join filter optimization
 fn filter_batch_by_indices(batch: &RecordBatch, indices: &[usize]) -> Result<RecordBatch> {
     let indices_arr = UInt32Array::from(indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
 

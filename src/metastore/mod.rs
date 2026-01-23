@@ -372,6 +372,7 @@ pub struct ColumnMetadata {
 }
 
 /// Table provider backed by branching metastore
+#[allow(dead_code)] // Fields will be used when TableProvider is implemented
 pub struct MetastoreTableProvider {
     /// Metastore client
     client: BranchingMetastoreClient,

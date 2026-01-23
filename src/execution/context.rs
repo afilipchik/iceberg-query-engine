@@ -273,7 +273,7 @@ fn arrow_schema_to_plan_schema(schema: &Schema) -> PlanSchema {
 /// Utility to print a record batch
 pub fn print_batch(batch: &RecordBatch) {
     use arrow::util::pretty::print_batches;
-    let _ = print_batches(&[batch.clone()]);
+    let _ = print_batches(std::slice::from_ref(batch));
 }
 
 /// Utility to print query results

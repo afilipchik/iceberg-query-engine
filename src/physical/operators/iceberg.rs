@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 /// Iceberg table metadata
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)] // Fields populated by serde deserialization
 pub struct IcebergTableMetadata {
     /// Format version
     pub format_version: i32,
@@ -31,6 +32,7 @@ pub struct IcebergTableMetadata {
 
 /// Iceberg snapshot
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)] // Fields populated by serde deserialization
 pub struct IcebergSnapshot {
     /// Snapshot ID
     pub snapshot_id: i64,
@@ -46,6 +48,7 @@ pub struct IcebergSnapshot {
 
 /// Iceberg manifest file
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)] // Fields populated by serde deserialization
 pub struct IcebergManifest {
     /// Manifest path
     pub manifest_path: String,
@@ -293,27 +296,21 @@ impl PartitionFilter {
     /// Check if a data file matches this filter
     pub fn matches(&self, file: &IcebergDataFile) -> bool {
         match self {
-            PartitionFilter::Eq { column, value } => {
-                file.partition.get(column).map_or(false, |v| v == value)
-            }
-            PartitionFilter::Gt { column, value } => {
-                file.partition.get(column).map_or(false, |v| {
-                    v.parse::<i64>().ok().map_or(false, |v_num| {
-                        value.parse::<i64>().ok().map_or(false, |val| v_num > val)
-                    })
-                })
-            }
-            PartitionFilter::Lt { column, value } => {
-                file.partition.get(column).map_or(false, |v| {
-                    v.parse::<i64>().ok().map_or(false, |v_num| {
-                        value.parse::<i64>().ok().map_or(false, |val| v_num < val)
-                    })
-                })
-            }
+            PartitionFilter::Eq { column, value } => file.partition.get(column) == Some(value),
+            PartitionFilter::Gt { column, value } => file.partition.get(column).is_some_and(|v| {
+                v.parse::<i64>()
+                    .ok()
+                    .is_some_and(|v_num| value.parse::<i64>().ok().is_some_and(|val| v_num > val))
+            }),
+            PartitionFilter::Lt { column, value } => file.partition.get(column).is_some_and(|v| {
+                v.parse::<i64>()
+                    .ok()
+                    .is_some_and(|v_num| value.parse::<i64>().ok().is_some_and(|val| v_num < val))
+            }),
             PartitionFilter::In { column, values } => file
                 .partition
                 .get(column)
-                .map_or(false, |v| values.contains(v)),
+                .is_some_and(|v| values.contains(v)),
         }
     }
 }
@@ -321,7 +318,6 @@ impl PartitionFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::Field;
 
     #[test]
     fn test_partition_filter_eq() {

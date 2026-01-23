@@ -58,6 +58,7 @@ pub struct Binder<'a> {
     /// CTE definitions (WITH clauses)
     ctes: HashMap<String, Arc<LogicalPlan>>,
     /// Outer scope columns for correlated subqueries (name -> (type, relation))
+    #[allow(dead_code)] // Reserved for correlated subquery type checking
     outer_scope: HashMap<String, (ArrowDataType, Option<String>)>,
 }
 
@@ -73,6 +74,7 @@ impl<'a> Binder<'a> {
     }
 
     /// Create a binder with outer scope for correlated subqueries
+    #[allow(dead_code)] // Reserved for correlated subquery type checking
     fn with_outer_scope(
         catalog: &'a dyn Catalog,
         outer_scope: HashMap<String, (ArrowDataType, Option<String>)>,
@@ -88,6 +90,7 @@ impl<'a> Binder<'a> {
     }
 
     /// Collect outer scope columns from a schema
+    #[allow(dead_code)] // Reserved for correlated subquery type checking
     fn collect_outer_scope(
         schema: &PlanSchema,
     ) -> HashMap<String, (ArrowDataType, Option<String>)> {
@@ -617,6 +620,7 @@ impl<'a> Binder<'a> {
         }))
     }
 
+    #[allow(clippy::type_complexity)]
     fn bind_join_constraint(
         &mut self,
         constraint: &ast::JoinConstraint,
@@ -887,7 +891,7 @@ impl<'a> Binder<'a> {
         agg_schema: &PlanSchema,
         group_by: &[Expr],
         aggregates: &[Expr],
-        input_schema: &PlanSchema,
+        _input_schema: &PlanSchema,
     ) -> Result<Expr> {
         // Check if this is a group by column
         for (i, gb) in group_by.iter().enumerate() {
@@ -914,14 +918,14 @@ impl<'a> Binder<'a> {
                     agg_schema,
                     group_by,
                     aggregates,
-                    input_schema,
+                    _input_schema,
                 )?;
                 let right_conv = self.convert_expr_with_aggregates(
                     right,
                     agg_schema,
                     group_by,
                     aggregates,
-                    input_schema,
+                    _input_schema,
                 )?;
                 Ok(Expr::BinaryExpr {
                     left: Box::new(left_conv),
@@ -935,7 +939,7 @@ impl<'a> Binder<'a> {
                     agg_schema,
                     group_by,
                     aggregates,
-                    input_schema,
+                    _input_schema,
                 )?;
                 Ok(Expr::UnaryExpr {
                     op: *op,
@@ -948,7 +952,7 @@ impl<'a> Binder<'a> {
                     agg_schema,
                     group_by,
                     aggregates,
-                    input_schema,
+                    _input_schema,
                 )?;
                 Ok(Expr::Alias {
                     expr: Box::new(inner_conv),
@@ -964,7 +968,7 @@ impl<'a> Binder<'a> {
                     agg_schema,
                     group_by,
                     aggregates,
-                    input_schema,
+                    _input_schema,
                 )?;
                 Ok(Expr::Cast {
                     expr: Box::new(inner_conv),
@@ -990,6 +994,7 @@ impl<'a> Binder<'a> {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn extract_aggregates(
         &mut self,
         projection: &[SelectItem],
@@ -1385,7 +1390,7 @@ impl<'a> Binder<'a> {
                 if let Expr::Literal(ScalarValue::Utf8(s)) = &value {
                     // Parse interval string like "1 day" or "3 month"
                     let parts: Vec<&str> = s.split_whitespace().collect();
-                    if parts.len() >= 1 {
+                    if !parts.is_empty() {
                         if let Ok(num) = parts[0].parse::<i64>() {
                             return Ok(Expr::Literal(ScalarValue::Interval(num)));
                         }
@@ -1394,19 +1399,16 @@ impl<'a> Binder<'a> {
                 Ok(value)
             }
             SqlExpr::TypedString { data_type, value } => {
-                match data_type {
-                    ast::DataType::Date => {
-                        // Parse date string
-                        if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
-                            let days = date
-                                .signed_duration_since(
-                                    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-                                )
-                                .num_days() as i32;
-                            return Ok(Expr::Literal(ScalarValue::Date32(days)));
-                        }
+                if data_type == &ast::DataType::Date {
+                    // Parse date string
+                    if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+                        let days = date
+                            .signed_duration_since(
+                                chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
+                            )
+                            .num_days() as i32;
+                        return Ok(Expr::Literal(ScalarValue::Date32(days)));
                     }
-                    _ => {}
                 }
                 Ok(Expr::Literal(ScalarValue::Utf8(value.clone())))
             }

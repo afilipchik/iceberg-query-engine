@@ -988,7 +988,7 @@ where
 
     // Preserve int types for functions like ABS
     if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
-        let result: Int64Array = int_arr.iter().map(|opt| opt.map(|v| f_int(v))).collect();
+        let result: Int64Array = int_arr.iter().map(|opt| opt.map(&f_int)).collect();
         return Ok(Arc::new(result));
     }
 
@@ -1001,10 +1001,7 @@ where
     }
 
     if let Some(float_arr) = arr.as_any().downcast_ref::<Float64Array>() {
-        let result: Float64Array = float_arr
-            .iter()
-            .map(|opt| opt.map(|v| f_float(v)))
-            .collect();
+        let result: Float64Array = float_arr.iter().map(|opt| opt.map(&f_float)).collect();
         return Ok(Arc::new(result));
     }
 
@@ -1021,7 +1018,7 @@ where
 
     // Always return Float64 for functions like SQRT, CEIL, FLOOR, ROUND
     if let Some(float_arr) = arr.as_any().downcast_ref::<Float64Array>() {
-        let result: Float64Array = float_arr.iter().map(|opt| opt.map(|v| f(v))).collect();
+        let result: Float64Array = float_arr.iter().map(|opt| opt.map(&f)).collect();
         return Ok(Arc::new(result));
     }
 

@@ -39,6 +39,7 @@ impl PhysicalOperator for LimitExec {
         vec![self.input.clone()]
     }
 
+    #[allow(unused_assignments)] // Variables are read across multiple closure invocations
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
         let input_stream = self.input.execute(partition).await?;
         let skip = self.skip;

@@ -437,13 +437,13 @@ fn has_outer_references(expr: &Expr, local_tables: &std::collections::HashSet<St
         } => {
             operand
                 .as_ref()
-                .map_or(false, |o| has_outer_references(o, local_tables))
+                .is_some_and(|o| has_outer_references(o, local_tables))
                 || when_then.iter().any(|(w, t)| {
                     has_outer_references(w, local_tables) || has_outer_references(t, local_tables)
                 })
                 || else_expr
                     .as_ref()
-                    .map_or(false, |e| has_outer_references(e, local_tables))
+                    .is_some_and(|e| has_outer_references(e, local_tables))
         }
         Expr::InList { expr, list, .. } => {
             has_outer_references(expr, local_tables)
@@ -483,7 +483,7 @@ fn plan_has_outer_references(
             }) || node
                 .filter
                 .as_ref()
-                .map_or(false, |f| has_outer_references(f, local_tables))
+                .is_some_and(|f| has_outer_references(f, local_tables))
                 || plan_has_outer_references(&node.left, local_tables)
                 || plan_has_outer_references(&node.right, local_tables)
         }
@@ -509,7 +509,7 @@ fn plan_has_outer_references(
         LogicalPlan::Scan(node) => node
             .filter
             .as_ref()
-            .map_or(false, |f| has_outer_references(f, local_tables)),
+            .is_some_and(|f| has_outer_references(f, local_tables)),
         _ => false,
     }
 }
@@ -648,11 +648,10 @@ fn execute_correlated_exists_subquery(
         // Substitute correlated columns with literal values from this row
         let substituted_plan = substitute_correlated_columns(subquery, batch, row)?;
 
-        // Execute the substituted subquery
-        let exists = match executor.execute_exists(&substituted_plan) {
-            Ok(e) => e,
-            Err(_) => false, // On error, treat as not found
-        };
+        // Execute the substituted subquery (false on error)
+        let exists = executor
+            .execute_exists(&substituted_plan)
+            .unwrap_or_default();
 
         results.push(if negated { !exists } else { exists });
     }

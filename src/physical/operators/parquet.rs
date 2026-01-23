@@ -147,6 +147,7 @@ impl fmt::Display for ParquetScanExec {
 
 /// Parquet writer for writing RecordBatches to Parquet files
 pub struct ParquetWriter {
+    #[allow(dead_code)] // Stored for potential future use (error messages, etc.)
     path: PathBuf,
     writer: Option<ArrowWriter<File>>,
 }

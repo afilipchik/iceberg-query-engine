@@ -98,8 +98,7 @@ fn calculate_rle_savings(array: &dyn Array) -> f64 {
         }
     }
 
-    let compression_ratio = 1.0 - (run_count as f64 / array.len() as f64);
-    compression_ratio
+    1.0 - (run_count as f64 / array.len() as f64)
 }
 
 /// Calculate the space savings from dictionary encoding
@@ -264,7 +263,7 @@ impl ConstantArray {
 
 /// Encode an array as constant
 fn encode_constant(array: ArrayRef) -> Result<ArrayRef> {
-    if array.len() == 0 {
+    if array.is_empty() {
         return Ok(array);
     }
 
@@ -297,7 +296,7 @@ fn encode_rle(array: ArrayRef) -> Result<ArrayRef> {
     let mut values: Vec<ScalarValue> = Vec::new();
     let mut run_lengths: Vec<i32> = Vec::new();
 
-    if array.len() == 0 {
+    if array.is_empty() {
         return Ok(array);
     }
 

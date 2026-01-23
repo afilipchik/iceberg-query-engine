@@ -327,7 +327,7 @@ async fn main() {
                 let file_path = path.join(format!("{}.parquet", table));
                 match ctx.register_parquet(*table, &file_path) {
                     Ok(()) => {
-                        if let Some(schema) = ctx.table_schema(*table) {
+                        if let Some(schema) = ctx.table_schema(table) {
                             println!("  Loaded {}: {} columns", table, schema.fields().len());
                         }
                     }
@@ -420,7 +420,7 @@ async fn run_repl(tpch_path: Option<PathBuf>) {
             let file_path = path.join(format!("{}.parquet", table));
             match ctx.register_parquet(*table, &file_path) {
                 Ok(()) => {
-                    if let Some(schema) = ctx.table_schema(*table) {
+                    if let Some(schema) = ctx.table_schema(table) {
                         println!("  Loaded {}: {} columns", table, schema.fields().len());
                     }
                 }
@@ -503,7 +503,7 @@ async fn run_repl(tpch_path: Option<PathBuf>) {
 /// Handle dot commands, returns false if should exit
 async fn handle_dot_command(ctx: &mut ExecutionContext, line: &str) -> bool {
     let parts: Vec<&str> = line.split_whitespace().collect();
-    let cmd = parts.first().map(|s| *s).unwrap_or("");
+    let cmd = parts.first().copied().unwrap_or("");
 
     match cmd {
         ".help" | ".h" => {
@@ -599,7 +599,7 @@ async fn handle_dot_command(ctx: &mut ExecutionContext, line: &str) -> bool {
                     let file_path = path.join(format!("{}.parquet", table));
                     match ctx.register_parquet(*table, &file_path) {
                         Ok(()) => {
-                            if let Some(schema) = ctx.table_schema(*table) {
+                            if let Some(schema) = ctx.table_schema(table) {
                                 println!("  Loaded {}: {} columns", table, schema.fields().len());
                             }
                         }

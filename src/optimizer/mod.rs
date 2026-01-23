@@ -79,6 +79,7 @@ impl Optimizer {
         Ok(current)
     }
 
+    #[allow(dead_code)] // Reserved for future cost-based optimization
     fn find_first_join(
         plan: &LogicalPlan,
     ) -> Option<(

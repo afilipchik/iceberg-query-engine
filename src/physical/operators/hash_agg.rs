@@ -330,23 +330,23 @@ fn aggregate_scalar_simd(
         }
         AggregateFunction::Min => {
             if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
-                let min = a.iter().filter_map(|x| x).min().unwrap_or(i64::MAX);
+                let min = a.iter().flatten().min().unwrap_or(i64::MAX);
                 Arc::new(Int64Array::from(vec![min]))
             } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
                 let min = a
                     .iter()
-                    .filter_map(|x| x)
+                    .flatten()
                     .min_by(|a, b| a.partial_cmp(b).unwrap())
                     .unwrap_or(f64::MAX);
                 Arc::new(Float64Array::from(vec![min]))
             } else if let Some(a) = input.as_any().downcast_ref::<StringArray>() {
-                let min = a.iter().filter_map(|x| x).min();
+                let min = a.iter().flatten().min();
                 match min {
                     Some(val) => Arc::new(StringArray::from(vec![Some(val)])),
                     None => Arc::new(StringArray::from(vec![Option::<&str>::None])),
                 }
             } else if let Some(a) = input.as_any().downcast_ref::<Date32Array>() {
-                let min = a.iter().filter_map(|x| x).min().unwrap_or(i32::MAX);
+                let min = a.iter().flatten().min().unwrap_or(i32::MAX);
                 Arc::new(Date32Array::from(vec![min]))
             } else {
                 return Err(QueryError::NotImplemented(format!(
@@ -357,23 +357,23 @@ fn aggregate_scalar_simd(
         }
         AggregateFunction::Max => {
             if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
-                let max = a.iter().filter_map(|x| x).max().unwrap_or(i64::MIN);
+                let max = a.iter().flatten().max().unwrap_or(i64::MIN);
                 Arc::new(Int64Array::from(vec![max]))
             } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
                 let max = a
                     .iter()
-                    .filter_map(|x| x)
+                    .flatten()
                     .max_by(|a, b| a.partial_cmp(b).unwrap())
                     .unwrap_or(f64::MIN);
                 Arc::new(Float64Array::from(vec![max]))
             } else if let Some(a) = input.as_any().downcast_ref::<StringArray>() {
-                let max = a.iter().filter_map(|x| x).max();
+                let max = a.iter().flatten().max();
                 match max {
                     Some(val) => Arc::new(StringArray::from(vec![Some(val)])),
                     None => Arc::new(StringArray::from(vec![Option::<&str>::None])),
                 }
             } else if let Some(a) = input.as_any().downcast_ref::<Date32Array>() {
-                let max = a.iter().filter_map(|x| x).max().unwrap_or(i32::MIN);
+                let max = a.iter().flatten().max().unwrap_or(i32::MIN);
                 Arc::new(Date32Array::from(vec![max]))
             } else {
                 return Err(QueryError::NotImplemented(format!(
@@ -434,16 +434,16 @@ fn aggregate_batches_hash(
     }
 
     // Handle empty input with no groups (scalar aggregates)
-    if batches.iter().all(|b| b.num_rows() == 0) || (batches.is_empty() && group_by.is_empty()) {
-        if group_by.is_empty() {
-            // Return a single row with default aggregate values
-            groups.insert(
-                GroupKey { values: vec![] },
-                (0..aggregates.len())
-                    .map(|_| AccumulatorState::default())
-                    .collect(),
-            );
-        }
+    if (batches.iter().all(|b| b.num_rows() == 0) || (batches.is_empty() && group_by.is_empty()))
+        && group_by.is_empty()
+    {
+        // Return a single row with default aggregate values
+        groups.insert(
+            GroupKey { values: vec![] },
+            (0..aggregates.len())
+                .map(|_| AccumulatorState::default())
+                .collect(),
+        );
     }
 
     // Build output arrays

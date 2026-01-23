@@ -9,6 +9,9 @@
 //! Note: Full SIMD implementation would use platform-specific intrinsics.
 //! This is a simplified version that demonstrates the architecture.
 
+// Index-based loops are used for parallel array operations (SIMD-style)
+#![allow(clippy::needless_range_loop)]
+
 use crate::error::{QueryError, Result};
 use arrow::array::*;
 use arrow::datatypes::*;

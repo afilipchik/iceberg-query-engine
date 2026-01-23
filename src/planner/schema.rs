@@ -74,11 +74,7 @@ impl SchemaField {
 
     pub fn to_arrow_field(&self) -> Field {
         // Use qualified name to handle self-joins and ambiguous column names
-        Field::new(
-            &self.qualified_name(),
-            self.data_type.clone(),
-            self.nullable,
-        )
+        Field::new(self.qualified_name(), self.data_type.clone(), self.nullable)
     }
 
     pub fn qualified_name(&self) -> String {

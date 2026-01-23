@@ -478,6 +478,7 @@ impl Expr {
         }
     }
 
+    #[allow(clippy::should_implement_trait)] // Different semantics than std::ops::Add
     pub fn add(self, other: Expr) -> Self {
         Expr::BinaryExpr {
             left: Box::new(self),
