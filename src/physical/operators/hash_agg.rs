@@ -272,6 +272,16 @@ fn aggregate_batches(
     aggregate_batches_hash(batches, group_by, aggregates, schema)
 }
 
+/// Public interface for aggregate_batches used by spillable operators
+pub fn aggregate_batches_external(
+    batches: &[RecordBatch],
+    group_by: &[Expr],
+    aggregates: &[AggregateExpr],
+    schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    aggregate_batches(batches, group_by, aggregates, schema)
+}
+
 /// Fast scalar aggregate using optimized iterators (for queries without GROUP BY)
 fn aggregate_scalar_simd(
     batch: &RecordBatch,

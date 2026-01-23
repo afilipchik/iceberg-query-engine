@@ -1,7 +1,7 @@
 //! Physical operators
 
 mod filter;
-mod hash_agg;
+pub mod hash_agg;
 mod hash_join;
 mod iceberg;
 mod limit;
@@ -9,6 +9,7 @@ mod parquet;
 mod project;
 mod scan;
 mod sort;
+pub mod spillable;
 mod subquery;
 mod union;
 
@@ -21,5 +22,6 @@ pub use parquet::{ParquetScanExec, ParquetTable, ParquetWriter};
 pub use project::ProjectExec;
 pub use scan::{MemoryTable, MemoryTableExec, TableProvider};
 pub use sort::SortExec;
+pub use spillable::{ExternalSortExec, SpillableHashAggregateExec, SpillableHashJoinExec};
 pub use subquery::{evaluate_subquery_expr, SubqueryExecutor};
 pub use union::UnionExec;
