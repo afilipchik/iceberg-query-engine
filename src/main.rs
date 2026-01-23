@@ -3,6 +3,8 @@
 use clap::{Parser, Subcommand};
 use query_engine::execution::{print_results, ExecutionContext};
 use query_engine::tpch::{self, TpchGenerator};
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -94,6 +96,13 @@ enum Commands {
         /// Number of iterations
         #[arg(short, long, default_value = "1")]
         iterations: usize,
+    },
+
+    /// Start interactive SQL shell (REPL)
+    Repl {
+        /// Optional: Preload TPC-H tables from Parquet directory
+        #[arg(short, long)]
+        tpch: Option<PathBuf>,
     },
 }
 
@@ -376,5 +385,218 @@ async fn main() {
             let successful = results.iter().filter(|(_, rows, _)| *rows > 0).count();
             println!("Successful queries: {}/{}", successful, results.len());
         }
+
+        Commands::Repl { tpch } => {
+            run_repl(tpch).await;
+        }
     }
+}
+
+/// Run the interactive SQL REPL
+async fn run_repl(tpch_path: Option<PathBuf>) {
+    println!("Query Engine Interactive SQL Shell");
+    println!("Type .help for available commands, or enter SQL queries.");
+    println!();
+
+    let mut ctx = ExecutionContext::new();
+
+    // Preload TPC-H tables if path provided
+    if let Some(path) = tpch_path {
+        println!("Loading TPC-H tables from: {}", path.display());
+        let tables = [
+            "nation", "region", "part", "supplier", "partsupp", "customer", "orders", "lineitem",
+        ];
+
+        for table in &tables {
+            let file_path = path.join(format!("{}.parquet", table));
+            match ctx.register_parquet(*table, &file_path) {
+                Ok(()) => {
+                    if let Some(schema) = ctx.table_schema(*table) {
+                        println!("  Loaded {}: {} columns", table, schema.fields().len());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  Warning: Could not load {}: {}", table, e);
+                }
+            }
+        }
+        println!();
+    }
+
+    let mut rl = match DefaultEditor::new() {
+        Ok(editor) => editor,
+        Err(e) => {
+            eprintln!("Failed to initialize readline: {}", e);
+            return;
+        }
+    };
+
+    // Load history if available
+    let history_path = dirs_next::home_dir()
+        .map(|h| h.join(".query_engine_history"))
+        .unwrap_or_else(|| PathBuf::from(".query_engine_history"));
+    let _ = rl.load_history(&history_path);
+
+    loop {
+        let readline = rl.readline("sql> ");
+        match readline {
+            Ok(line) => {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+
+                let _ = rl.add_history_entry(line);
+
+                // Handle dot commands
+                if line.starts_with('.') {
+                    if !handle_dot_command(&mut ctx, line).await {
+                        break;
+                    }
+                    continue;
+                }
+
+                // Execute SQL query
+                let start = Instant::now();
+                match ctx.sql(line).await {
+                    Ok(result) => {
+                        print_results(&result);
+                        println!("({} rows in {:.3}ms)\n", result.row_count, start.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {}\n", e);
+                    }
+                }
+            }
+            Err(ReadlineError::Interrupted) => {
+                println!("^C");
+                continue;
+            }
+            Err(ReadlineError::Eof) => {
+                println!("Bye!");
+                break;
+            }
+            Err(err) => {
+                eprintln!("Error: {:?}", err);
+                break;
+            }
+        }
+    }
+
+    // Save history
+    let _ = rl.save_history(&history_path);
+}
+
+/// Handle dot commands, returns false if should exit
+async fn handle_dot_command(ctx: &mut ExecutionContext, line: &str) -> bool {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    let cmd = parts.first().map(|s| *s).unwrap_or("");
+
+    match cmd {
+        ".help" | ".h" => {
+            println!("Available commands:");
+            println!("  .help, .h              Show this help message");
+            println!("  .quit, .exit, .q       Exit the shell");
+            println!("  .tables                List registered tables");
+            println!("  .schema <table>        Show schema for a table");
+            println!("  .load <path> <name>    Load Parquet file/directory as table");
+            println!("  .tpch <path>           Load all TPC-H tables from directory");
+            println!();
+            println!("Or enter any SQL query to execute it.");
+            println!();
+        }
+        ".quit" | ".exit" | ".q" => {
+            println!("Bye!");
+            return false;
+        }
+        ".tables" => {
+            let tables = ctx.table_names();
+            if tables.is_empty() {
+                println!("No tables registered.");
+            } else {
+                println!("Registered tables:");
+                for name in tables {
+                    if let Some(schema) = ctx.table_schema(&name) {
+                        println!("  {} ({} columns)", name, schema.fields().len());
+                    }
+                }
+            }
+            println!();
+        }
+        ".schema" => {
+            if parts.len() < 2 {
+                eprintln!("Usage: .schema <table_name>\n");
+            } else {
+                let table_name = parts[1];
+                if let Some(schema) = ctx.table_schema(table_name) {
+                    println!("Schema for '{}':", table_name);
+                    for field in schema.fields() {
+                        println!(
+                            "  {}: {:?}{}",
+                            field.name(),
+                            field.data_type(),
+                            if field.is_nullable() { " (nullable)" } else { "" }
+                        );
+                    }
+                    println!();
+                } else {
+                    eprintln!("Table '{}' not found.\n", table_name);
+                }
+            }
+        }
+        ".load" => {
+            if parts.len() < 3 {
+                eprintln!("Usage: .load <path> <table_name>\n");
+            } else {
+                let path = PathBuf::from(parts[1]);
+                let name = parts[2];
+                let start = Instant::now();
+                match ctx.register_parquet(name, &path) {
+                    Ok(()) => {
+                        if let Some(schema) = ctx.table_schema(name) {
+                            println!(
+                                "Loaded '{}' ({} columns) in {:.3}ms\n",
+                                name,
+                                schema.fields().len(),
+                                start.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error loading '{}': {}\n", path.display(), e);
+                    }
+                }
+            }
+        }
+        ".tpch" => {
+            if parts.len() < 2 {
+                eprintln!("Usage: .tpch <parquet_directory>\n");
+            } else {
+                let path = PathBuf::from(parts[1]);
+                let tables = [
+                    "nation", "region", "part", "supplier", "partsupp", "customer", "orders",
+                    "lineitem",
+                ];
+                println!("Loading TPC-H tables from: {}", path.display());
+                for table in &tables {
+                    let file_path = path.join(format!("{}.parquet", table));
+                    match ctx.register_parquet(*table, &file_path) {
+                        Ok(()) => {
+                            if let Some(schema) = ctx.table_schema(*table) {
+                                println!("  Loaded {}: {} columns", table, schema.fields().len());
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("  Warning: Could not load {}: {}", table, e);
+                        }
+                    }
+                }
+                println!();
+            }
+        }
+        _ => {
+            eprintln!("Unknown command: {}. Type .help for available commands.\n", cmd);
+        }
+    }
+    true
 }
