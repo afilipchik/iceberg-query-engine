@@ -295,6 +295,128 @@ fn new_empty_array(data_type: arrow::datatypes::DataType) -> ArrayRef {
     }
 }
 
+/// Collect all table names/aliases defined in a logical plan's FROM clause
+fn collect_table_aliases(plan: &LogicalPlan) -> std::collections::HashSet<String> {
+    let mut aliases = std::collections::HashSet::new();
+    collect_table_aliases_recursive(plan, &mut aliases);
+    aliases
+}
+
+fn collect_table_aliases_recursive(plan: &LogicalPlan, aliases: &mut std::collections::HashSet<String>) {
+    use crate::planner::*;
+    match plan {
+        LogicalPlan::Scan(node) => {
+            aliases.insert(node.table_name.clone());
+        }
+        LogicalPlan::SubqueryAlias(node) => {
+            aliases.insert(node.alias.clone());
+            // Don't recurse into the aliased input - the alias shadows it
+        }
+        LogicalPlan::Join(node) => {
+            collect_table_aliases_recursive(&node.left, aliases);
+            collect_table_aliases_recursive(&node.right, aliases);
+        }
+        LogicalPlan::Filter(node) => {
+            collect_table_aliases_recursive(&node.input, aliases);
+        }
+        LogicalPlan::Project(node) => {
+            collect_table_aliases_recursive(&node.input, aliases);
+        }
+        LogicalPlan::Aggregate(node) => {
+            collect_table_aliases_recursive(&node.input, aliases);
+        }
+        LogicalPlan::Sort(node) => {
+            collect_table_aliases_recursive(&node.input, aliases);
+        }
+        LogicalPlan::Limit(node) => {
+            collect_table_aliases_recursive(&node.input, aliases);
+        }
+        LogicalPlan::Distinct(node) => {
+            collect_table_aliases_recursive(&node.input, aliases);
+        }
+        _ => {}
+    }
+}
+
+/// Check if an expression contains any column references to tables not in the given set
+fn has_outer_references(expr: &Expr, local_tables: &std::collections::HashSet<String>) -> bool {
+    use crate::planner::*;
+    match expr {
+        Expr::Column(col) => {
+            if let Some(rel) = &col.relation {
+                // This column references a specific table - check if it's local
+                !local_tables.contains(rel)
+            } else {
+                // Unqualified column - assume local
+                false
+            }
+        }
+        Expr::BinaryExpr { left, right, .. } => {
+            has_outer_references(left, local_tables) || has_outer_references(right, local_tables)
+        }
+        Expr::UnaryExpr { expr, .. } => has_outer_references(expr, local_tables),
+        Expr::ScalarFunc { args, .. } | Expr::Aggregate { args, .. } => {
+            args.iter().any(|a| has_outer_references(a, local_tables))
+        }
+        Expr::Cast { expr, .. } | Expr::Alias { expr, .. } => has_outer_references(expr, local_tables),
+        Expr::Case { operand, when_then, else_expr } => {
+            operand.as_ref().map_or(false, |o| has_outer_references(o, local_tables))
+                || when_then.iter().any(|(w, t)| has_outer_references(w, local_tables) || has_outer_references(t, local_tables))
+                || else_expr.as_ref().map_or(false, |e| has_outer_references(e, local_tables))
+        }
+        Expr::InList { expr, list, .. } => {
+            has_outer_references(expr, local_tables) || list.iter().any(|e| has_outer_references(e, local_tables))
+        }
+        Expr::Between { expr, low, high, .. } => {
+            has_outer_references(expr, local_tables) || has_outer_references(low, local_tables) || has_outer_references(high, local_tables)
+        }
+        _ => false,
+    }
+}
+
+/// Check if a plan contains any outer (correlated) column references
+fn plan_has_outer_references(plan: &LogicalPlan, local_tables: &std::collections::HashSet<String>) -> bool {
+    use crate::planner::*;
+    match plan {
+        LogicalPlan::Filter(node) => {
+            has_outer_references(&node.predicate, local_tables)
+                || plan_has_outer_references(&node.input, local_tables)
+        }
+        LogicalPlan::Project(node) => {
+            node.exprs.iter().any(|e| has_outer_references(e, local_tables))
+                || plan_has_outer_references(&node.input, local_tables)
+        }
+        LogicalPlan::Join(node) => {
+            node.on.iter().any(|(l, r)| has_outer_references(l, local_tables) || has_outer_references(r, local_tables))
+                || node.filter.as_ref().map_or(false, |f| has_outer_references(f, local_tables))
+                || plan_has_outer_references(&node.left, local_tables)
+                || plan_has_outer_references(&node.right, local_tables)
+        }
+        LogicalPlan::Aggregate(node) => {
+            node.group_by.iter().any(|e| has_outer_references(e, local_tables))
+                || node.aggregates.iter().any(|e| has_outer_references(e, local_tables))
+                || plan_has_outer_references(&node.input, local_tables)
+        }
+        LogicalPlan::Sort(node) => {
+            node.order_by.iter().any(|s| has_outer_references(&s.expr, local_tables))
+                || plan_has_outer_references(&node.input, local_tables)
+        }
+        LogicalPlan::Limit(node) => plan_has_outer_references(&node.input, local_tables),
+        LogicalPlan::Distinct(node) => plan_has_outer_references(&node.input, local_tables),
+        LogicalPlan::SubqueryAlias(node) => plan_has_outer_references(&node.input, local_tables),
+        LogicalPlan::Scan(node) => {
+            node.filter.as_ref().map_or(false, |f| has_outer_references(f, local_tables))
+        }
+        _ => false,
+    }
+}
+
+/// Check if a subquery is correlated (references columns from outer scope)
+fn is_correlated_subquery(subquery: &LogicalPlan) -> bool {
+    let local_tables = collect_table_aliases(subquery);
+    plan_has_outer_references(subquery, &local_tables)
+}
+
 /// Evaluate a subquery expression during filter execution
 pub fn evaluate_subquery_expr(
     batch: &RecordBatch,
@@ -303,15 +425,21 @@ pub fn evaluate_subquery_expr(
 ) -> Result<ArrayRef> {
     match expr {
         Expr::ScalarSubquery(plan) => {
-            // Check if this is a correlated subquery by trying to execute once
+            // Check if this is a correlated subquery by analyzing the plan structure
+            if is_correlated_subquery(plan) {
+                // Correlated subquery - execute for each row
+                return execute_correlated_scalar_subquery(batch, plan, executor);
+            }
+
+            // Uncorrelated - execute once
             match executor.execute_scalar(plan) {
                 Ok(scalar) => {
-                    // Uncorrelated - use the same value for all rows
+                    // Use the same value for all rows
                     let num_rows = batch.num_rows();
                     Ok(scalar_to_array(&scalar, num_rows))
                 }
                 Err(QueryError::ColumnNotFound(_)) => {
-                    // Correlated subquery - execute for each row
+                    // Fallback: Correlated subquery (shouldn't happen with plan analysis)
                     execute_correlated_scalar_subquery(batch, plan, executor)
                 }
                 Err(e) => Err(e),
@@ -328,16 +456,22 @@ pub fn evaluate_subquery_expr(
             evaluate_in_subquery(&left_array, &in_values, *negated)
         }
         Expr::Exists { subquery, negated } => {
-            // Try executing once - if it fails with ColumnNotFound, it's correlated
+            // Check if this is a correlated subquery by analyzing the plan structure
+            if is_correlated_subquery(subquery) {
+                // Correlated EXISTS subquery - execute row-by-row
+                return execute_correlated_exists_subquery(batch, subquery, *negated, executor);
+            }
+
+            // Uncorrelated - execute once
             match executor.execute_exists(subquery) {
                 Ok(exists) => {
-                    // Uncorrelated - use the same result for all rows
+                    // Use the same result for all rows
                     let result = if *negated { !exists } else { exists };
                     let arr = BooleanArray::from(vec![result; batch.num_rows()]);
                     Ok(Arc::new(arr))
                 }
                 Err(QueryError::ColumnNotFound(_)) => {
-                    // Correlated EXISTS subquery
+                    // Fallback: Correlated EXISTS subquery (shouldn't happen with plan analysis)
                     execute_correlated_exists_subquery(batch, subquery, *negated, executor)
                 }
                 Err(e) => Err(e),
@@ -427,6 +561,10 @@ fn substitute_correlated_columns(
 ) -> Result<LogicalPlan> {
     use crate::planner::*;
 
+    // First, collect which table aliases are local to this subquery
+    // We should ONLY substitute columns that reference OUTER tables (not in this set)
+    let local_tables = collect_table_aliases(plan);
+
     // Create a mapping of column names to their literal values for this row
     let mut column_values: std::collections::HashMap<String, Expr> = std::collections::HashMap::new();
 
@@ -460,45 +598,23 @@ fn substitute_correlated_columns(
     }
 
     // Recursively substitute column references in the plan
-    substitute_columns_in_plan(plan, &column_values)
+    substitute_columns_in_plan(plan, &column_values, &local_tables)
 }
 
 /// Recursively substitute column references with literals in a logical plan
+/// Only substitutes columns that reference tables NOT in local_tables (i.e., outer references)
 fn substitute_columns_in_plan(
     plan: &LogicalPlan,
     column_values: &std::collections::HashMap<String, Expr>,
+    local_tables: &std::collections::HashSet<String>,
 ) -> Result<LogicalPlan> {
     use crate::planner::*;
-
-    // First, check if the column reference exists in our substitution map
-    // If so, substitute it; otherwise, keep it as-is
-    let substituted_expr = |expr: &Expr| -> Expr {
-        match expr {
-            Expr::Column(col) => {
-                // Try to substitute both qualified and unqualified names
-                let qualified_name = if let Some(rel) = &col.relation {
-                    format!("{}.{}", rel, col.name)
-                } else {
-                    col.name.clone()
-                };
-
-                if let Some(substituted) = column_values.get(&qualified_name) {
-                    substituted.clone()
-                } else if let Some(substituted) = column_values.get(&col.name) {
-                    substituted.clone()
-                } else {
-                    expr.clone()
-                }
-            }
-            _ => expr.clone(),
-        }
-    };
 
     // Recursively process the plan
     match plan {
         LogicalPlan::Filter(node) => {
-            let new_predicate = substitute_columns_in_expr(&node.predicate, column_values);
-            let new_input = substitute_columns_in_plan(&node.input, column_values)?;
+            let new_predicate = substitute_columns_in_expr(&node.predicate, column_values, local_tables);
+            let new_input = substitute_columns_in_plan(&node.input, column_values, local_tables)?;
             Ok(LogicalPlan::Filter(FilterNode {
                 input: Arc::new(new_input),
                 predicate: new_predicate,
@@ -507,9 +623,9 @@ fn substitute_columns_in_plan(
         LogicalPlan::Project(node) => {
             let new_exprs: Vec<Expr> = node.exprs
                 .iter()
-                .map(|e| substitute_columns_in_expr(e, column_values))
+                .map(|e| substitute_columns_in_expr(e, column_values, local_tables))
                 .collect();
-            let new_input = substitute_columns_in_plan(&node.input, column_values)?;
+            let new_input = substitute_columns_in_plan(&node.input, column_values, local_tables)?;
             Ok(LogicalPlan::Project(ProjectNode {
                 input: Arc::new(new_input),
                 exprs: new_exprs,
@@ -519,13 +635,13 @@ fn substitute_columns_in_plan(
         LogicalPlan::Aggregate(node) => {
             let new_group_by: Vec<Expr> = node.group_by
                 .iter()
-                .map(|e| substitute_columns_in_expr(e, column_values))
+                .map(|e| substitute_columns_in_expr(e, column_values, local_tables))
                 .collect();
             let new_aggregates: Vec<Expr> = node.aggregates
                 .iter()
-                .map(|e| substitute_columns_in_expr(e, column_values))
+                .map(|e| substitute_columns_in_expr(e, column_values, local_tables))
                 .collect();
-            let new_input = substitute_columns_in_plan(&node.input, column_values)?;
+            let new_input = substitute_columns_in_plan(&node.input, column_values, local_tables)?;
             Ok(LogicalPlan::Aggregate(AggregateNode {
                 input: Arc::new(new_input),
                 group_by: new_group_by,
@@ -536,7 +652,7 @@ fn substitute_columns_in_plan(
         LogicalPlan::Scan(node) => {
             // Substitute in filter expression if present
             let new_filter = node.filter.as_ref()
-                .map(|f| substitute_columns_in_expr(f, column_values));
+                .map(|f| substitute_columns_in_expr(f, column_values, local_tables));
             Ok(LogicalPlan::Scan(ScanNode {
                 table_name: node.table_name.clone(),
                 schema: node.schema.clone(),
@@ -544,69 +660,132 @@ fn substitute_columns_in_plan(
                 filter: new_filter,
             }))
         }
-        // For other plan types, return as-is for now
-        _ => Ok(plan.clone()),
+        LogicalPlan::Join(node) => {
+            let new_on: Vec<(Expr, Expr)> = node.on
+                .iter()
+                .map(|(l, r)| (
+                    substitute_columns_in_expr(l, column_values, local_tables),
+                    substitute_columns_in_expr(r, column_values, local_tables)
+                ))
+                .collect();
+            let new_filter = node.filter.as_ref()
+                .map(|f| substitute_columns_in_expr(f, column_values, local_tables));
+            let new_left = substitute_columns_in_plan(&node.left, column_values, local_tables)?;
+            let new_right = substitute_columns_in_plan(&node.right, column_values, local_tables)?;
+            Ok(LogicalPlan::Join(JoinNode {
+                left: Arc::new(new_left),
+                right: Arc::new(new_right),
+                join_type: node.join_type,
+                on: new_on,
+                filter: new_filter,
+                schema: node.schema.clone(),
+            }))
+        }
+        LogicalPlan::Sort(node) => {
+            let new_order_by: Vec<SortExpr> = node.order_by
+                .iter()
+                .map(|s| SortExpr {
+                    expr: substitute_columns_in_expr(&s.expr, column_values, local_tables),
+                    direction: s.direction,
+                    nulls: s.nulls,
+                })
+                .collect();
+            let new_input = substitute_columns_in_plan(&node.input, column_values, local_tables)?;
+            Ok(LogicalPlan::Sort(SortNode {
+                input: Arc::new(new_input),
+                order_by: new_order_by,
+            }))
+        }
+        LogicalPlan::Limit(node) => {
+            let new_input = substitute_columns_in_plan(&node.input, column_values, local_tables)?;
+            Ok(LogicalPlan::Limit(LimitNode {
+                input: Arc::new(new_input),
+                skip: node.skip,
+                fetch: node.fetch,
+            }))
+        }
+        LogicalPlan::Distinct(node) => {
+            let new_input = substitute_columns_in_plan(&node.input, column_values, local_tables)?;
+            Ok(LogicalPlan::Distinct(DistinctNode {
+                input: Arc::new(new_input),
+            }))
+        }
+        LogicalPlan::SubqueryAlias(node) => {
+            let new_input = substitute_columns_in_plan(&node.input, column_values, local_tables)?;
+            Ok(LogicalPlan::SubqueryAlias(SubqueryAliasNode {
+                input: Arc::new(new_input),
+                alias: node.alias.clone(),
+                schema: node.schema.clone(),
+            }))
+        }
+        LogicalPlan::Union(node) => {
+            let new_inputs: Result<Vec<Arc<LogicalPlan>>> = node.inputs
+                .iter()
+                .map(|i| substitute_columns_in_plan(i, column_values, local_tables).map(Arc::new))
+                .collect();
+            Ok(LogicalPlan::Union(UnionNode {
+                inputs: new_inputs?,
+                schema: node.schema.clone(),
+                all: node.all,
+            }))
+        }
+        // Pass through unchanged for leaf nodes
+        LogicalPlan::EmptyRelation(_) | LogicalPlan::Values(_) => Ok(plan.clone()),
     }
 }
 
 /// Substitute column references in an expression
+/// Only substitutes columns that reference tables NOT in local_tables
 fn substitute_columns_in_expr(
     expr: &Expr,
     column_values: &std::collections::HashMap<String, Expr>,
+    local_tables: &std::collections::HashSet<String>,
 ) -> Expr {
+    use crate::planner::*;
     match expr {
         Expr::Column(col) => {
-            // Try multiple variations of the column name
-            // 1. Qualified with table: "table.column"
-            // 2. Unqualified: "column"
-            // 3. Try exact matches first
-
-            // Try qualified name first (e.g., "supplier.s_suppkey")
+            // Only substitute if the column's relation is NOT a local table
+            // If relation is Some and it's in local_tables, DON'T substitute
             if let Some(rel) = &col.relation {
-                let qualified = format!("{}.{}", rel, col.name);
-                if let Some(substituted) = column_values.get(&qualified) {
-                    return substituted.clone();
+                if local_tables.contains(rel) {
+                    // This is a local table column - don't substitute
+                    return expr.clone();
                 }
             }
 
-            // Try unqualified name (e.g., "s_suppkey")
-            if let Some(substituted) = column_values.get(&col.name) {
-                return substituted.clone();
-            }
+            // Try to substitute both qualified and unqualified names
+            let qualified_name = if let Some(rel) = &col.relation {
+                format!("{}.{}", rel, col.name)
+            } else {
+                col.name.clone()
+            };
 
-            // Try matching with wildcards - if column_values has "table.col", try matching "col"
-            // This handles cases where the subquery uses unqualified names
-            for (key, value) in column_values.iter() {
-                if key.ends_with(&format!(".{}", col.name)) || key == col.name.as_str() {
-                    return value.clone();
-                }
-                // Also try reverse: if subquery has "table.col" and column_values has "col"
-                if col.name.ends_with(&format!(".{}", key)) || col.name.as_str() == *key {
-                    return value.clone();
-                }
+            if let Some(substituted) = column_values.get(&qualified_name) {
+                substituted.clone()
+            } else if let Some(substituted) = column_values.get(&col.name) {
+                substituted.clone()
+            } else {
+                expr.clone()
             }
-
-            // If no match found, return original (will fail later)
-            expr.clone()
         }
         Expr::BinaryExpr { left, op, right } => {
-            let new_left = substitute_columns_in_expr(left, column_values);
-            let new_right = substitute_columns_in_expr(right, column_values);
+            let new_left = substitute_columns_in_expr(left, column_values, local_tables);
+            let new_right = substitute_columns_in_expr(right, column_values, local_tables);
             Expr::BinaryExpr {
                 left: Box::new(new_left),
                 op: *op,
                 right: Box::new(new_right),
             }
         }
-        Expr::UnaryExpr { op, expr } => {
-            let new_expr = substitute_columns_in_expr(expr, column_values);
+        Expr::UnaryExpr { op, expr: inner } => {
+            let new_expr = substitute_columns_in_expr(inner, column_values, local_tables);
             Expr::UnaryExpr {
                 op: *op,
                 expr: Box::new(new_expr),
             }
         }
-        Expr::Alias { expr, name } => {
-            let new_expr = substitute_columns_in_expr(expr, column_values);
+        Expr::Alias { expr: inner, name } => {
+            let new_expr = substitute_columns_in_expr(inner, column_values, local_tables);
             Expr::Alias {
                 expr: Box::new(new_expr),
                 name: name.clone(),
@@ -615,7 +794,7 @@ fn substitute_columns_in_expr(
         Expr::Aggregate { func, args, distinct } => {
             let new_args: Vec<Expr> = args
                 .iter()
-                .map(|a| substitute_columns_in_expr(a, column_values))
+                .map(|a| substitute_columns_in_expr(a, column_values, local_tables))
                 .collect();
             Expr::Aggregate {
                 func: *func,
@@ -626,15 +805,15 @@ fn substitute_columns_in_expr(
         Expr::ScalarFunc { args, func } => {
             let new_args: Vec<Expr> = args
                 .iter()
-                .map(|a| substitute_columns_in_expr(a, column_values))
+                .map(|a| substitute_columns_in_expr(a, column_values, local_tables))
                 .collect();
             Expr::ScalarFunc {
                 args: new_args,
                 func: func.clone(),
             }
         }
-        Expr::Cast { expr, data_type } => {
-            let new_expr = substitute_columns_in_expr(expr, column_values);
+        Expr::Cast { expr: inner, data_type } => {
+            let new_expr = substitute_columns_in_expr(inner, column_values, local_tables);
             Expr::Cast {
                 expr: Box::new(new_expr),
                 data_type: data_type.clone(),
@@ -643,19 +822,19 @@ fn substitute_columns_in_expr(
         Expr::Case { operand, when_then, else_expr } => {
             let new_operand = operand
                 .as_ref()
-                .map(|e| substitute_columns_in_expr(e, column_values));
+                .map(|e| substitute_columns_in_expr(e, column_values, local_tables));
             let new_when_then: Vec<(Expr, Expr)> = when_then
                 .iter()
                 .map(|(w, t)| {
                     (
-                        substitute_columns_in_expr(w, column_values),
-                        substitute_columns_in_expr(t, column_values),
+                        substitute_columns_in_expr(w, column_values, local_tables),
+                        substitute_columns_in_expr(t, column_values, local_tables),
                     )
                 })
                 .collect();
             let new_else = else_expr
                 .as_ref()
-                .map(|e| substitute_columns_in_expr(e, column_values));
+                .map(|e| substitute_columns_in_expr(e, column_values, local_tables));
             Expr::Case {
                 operand: new_operand.map(Box::new),
                 when_then: new_when_then,

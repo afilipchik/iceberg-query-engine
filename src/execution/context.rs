@@ -290,7 +290,7 @@ pub fn print_results(result: &QueryResult) {
 mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
-    use arrow::datatypes::Field;
+    use arrow::datatypes::{DataType, Field};
 
     fn create_test_context() -> ExecutionContext {
         let mut ctx = ExecutionContext::new();

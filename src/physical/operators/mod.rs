@@ -10,6 +10,7 @@ mod project;
 mod scan;
 mod sort;
 mod subquery;
+mod union;
 
 pub use filter::{FilterExec, evaluate_expr};
 pub use hash_agg::{HashAggregateExec, AggregateExpr};
@@ -21,3 +22,4 @@ pub use project::ProjectExec;
 pub use scan::{MemoryTable, MemoryTableExec, TableProvider};
 pub use sort::SortExec;
 pub use subquery::{SubqueryExecutor, evaluate_subquery_expr};
+pub use union::UnionExec;

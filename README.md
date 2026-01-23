@@ -4,8 +4,9 @@ A high-performance SQL query engine built from scratch in Rust, designed for ana
 
 ## Features
 
-- **Full SQL Support**: SELECT, JOIN, GROUP BY, ORDER BY, LIMIT, subqueries, and more
-- **TPC-H Benchmark**: All 22 TPC-H queries supported and tested
+- **Full SQL Support**: SELECT, JOIN, GROUP BY, ORDER BY, LIMIT, UNION, and more
+- **Correlated Subqueries**: EXISTS, NOT EXISTS, IN, NOT IN, scalar subqueries
+- **TPC-H Benchmark**: All 22 TPC-H queries passing (131 SQL tests total)
 - **Parquet Support**: Read Parquet files and directories directly
 - **Interactive REPL**: SQL shell with history and tab completion
 - **Streaming Execution**: Memory-efficient processing via Arrow RecordBatch streams
@@ -195,10 +196,14 @@ src/
 ├── parser/          # SQL parsing (sqlparser-rs)
 ├── planner/         # Query planning and binding
 ├── optimizer/       # Query optimization rules
-├── physical/        # Physical operators (scan, filter, join, etc.)
+├── physical/        # Physical operators (scan, filter, join, aggregate, subquery, etc.)
 ├── storage/         # Table providers (Parquet, Iceberg planned)
 ├── execution/       # Execution context and utilities
+├── metastore/       # Branching metastore REST API client
 └── tpch/            # TPC-H benchmark queries and data generator
+
+tests/
+└── sql_comprehensive.rs  # 131 SQL correctness tests
 ```
 
 ## Dependencies
@@ -211,6 +216,7 @@ src/
 | `tokio` | Async runtime |
 | `clap` | CLI framework |
 | `rustyline` | REPL line editing |
+| `reqwest` | HTTP client for metastore |
 
 ## Performance
 
@@ -227,6 +233,8 @@ Average query time: ~3 seconds
 
 - [x] Parquet file support
 - [x] Interactive SQL REPL
+- [x] Correlated subqueries (EXISTS, IN, scalar)
+- [x] All 22 TPC-H queries passing
 - [ ] Apache Iceberg table support
 - [ ] Parallel execution
 - [ ] Cost-based optimization

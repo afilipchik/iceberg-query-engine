@@ -137,11 +137,188 @@ impl ProjectionPushdown {
                 self.extract_columns_from_expr(low, required);
                 self.extract_columns_from_expr(high, required);
             }
+            Expr::InSubquery { expr, .. } => {
+                // Extract columns from the left side of the IN expression
+                self.extract_columns_from_expr(expr, required);
+                // Don't recurse into the subquery - it has its own scope
+            }
+            Expr::Exists { subquery, .. } => {
+                // For EXISTS, we need to extract outer column references from the subquery
+                // These are columns that reference tables NOT defined in the subquery
+                self.extract_outer_columns_from_subquery(subquery, required);
+            }
+            Expr::ScalarSubquery(subquery) => {
+                // Same for scalar subqueries - extract outer column references
+                self.extract_outer_columns_from_subquery(subquery, required);
+            }
             Expr::Wildcard => {
                 // Wildcard means all columns - we can't push projection
             }
             Expr::QualifiedWildcard(_) => {
                 // Same as wildcard for specific table
+            }
+            _ => {}
+        }
+    }
+
+    /// Extract outer column references from a subquery
+    /// These are columns that reference tables NOT defined within the subquery
+    fn extract_outer_columns_from_subquery(&self, subquery: &LogicalPlan, required: &mut HashSet<Column>) {
+        // Collect table aliases defined in the subquery
+        let local_tables = self.collect_subquery_tables(subquery);
+        // Extract columns from the subquery that reference outer tables
+        self.extract_outer_columns_recursive(subquery, &local_tables, required);
+    }
+
+    /// Collect table names/aliases defined in a subquery
+    fn collect_subquery_tables(&self, plan: &LogicalPlan) -> HashSet<String> {
+        let mut tables = HashSet::new();
+        self.collect_tables_recursive(plan, &mut tables);
+        tables
+    }
+
+    fn collect_tables_recursive(&self, plan: &LogicalPlan, tables: &mut HashSet<String>) {
+        match plan {
+            LogicalPlan::Scan(node) => {
+                tables.insert(node.table_name.clone());
+            }
+            LogicalPlan::SubqueryAlias(node) => {
+                tables.insert(node.alias.clone());
+                // Don't recurse - the alias shadows the input
+            }
+            LogicalPlan::Join(node) => {
+                self.collect_tables_recursive(&node.left, tables);
+                self.collect_tables_recursive(&node.right, tables);
+            }
+            LogicalPlan::Filter(node) => {
+                self.collect_tables_recursive(&node.input, tables);
+            }
+            LogicalPlan::Project(node) => {
+                self.collect_tables_recursive(&node.input, tables);
+            }
+            LogicalPlan::Aggregate(node) => {
+                self.collect_tables_recursive(&node.input, tables);
+            }
+            LogicalPlan::Sort(node) => {
+                self.collect_tables_recursive(&node.input, tables);
+            }
+            LogicalPlan::Limit(node) => {
+                self.collect_tables_recursive(&node.input, tables);
+            }
+            LogicalPlan::Distinct(node) => {
+                self.collect_tables_recursive(&node.input, tables);
+            }
+            _ => {}
+        }
+    }
+
+    /// Extract columns from a plan that reference tables NOT in local_tables (i.e., outer references)
+    fn extract_outer_columns_recursive(&self, plan: &LogicalPlan, local_tables: &HashSet<String>, required: &mut HashSet<Column>) {
+        match plan {
+            LogicalPlan::Filter(node) => {
+                self.extract_outer_columns_from_expr(&node.predicate, local_tables, required);
+                self.extract_outer_columns_recursive(&node.input, local_tables, required);
+            }
+            LogicalPlan::Project(node) => {
+                for expr in &node.exprs {
+                    self.extract_outer_columns_from_expr(expr, local_tables, required);
+                }
+                self.extract_outer_columns_recursive(&node.input, local_tables, required);
+            }
+            LogicalPlan::Aggregate(node) => {
+                for expr in &node.group_by {
+                    self.extract_outer_columns_from_expr(expr, local_tables, required);
+                }
+                for expr in &node.aggregates {
+                    self.extract_outer_columns_from_expr(expr, local_tables, required);
+                }
+                self.extract_outer_columns_recursive(&node.input, local_tables, required);
+            }
+            LogicalPlan::Join(node) => {
+                for (l, r) in &node.on {
+                    self.extract_outer_columns_from_expr(l, local_tables, required);
+                    self.extract_outer_columns_from_expr(r, local_tables, required);
+                }
+                if let Some(filter) = &node.filter {
+                    self.extract_outer_columns_from_expr(filter, local_tables, required);
+                }
+                self.extract_outer_columns_recursive(&node.left, local_tables, required);
+                self.extract_outer_columns_recursive(&node.right, local_tables, required);
+            }
+            LogicalPlan::Sort(node) => {
+                for sort_expr in &node.order_by {
+                    self.extract_outer_columns_from_expr(&sort_expr.expr, local_tables, required);
+                }
+                self.extract_outer_columns_recursive(&node.input, local_tables, required);
+            }
+            LogicalPlan::Limit(node) => {
+                self.extract_outer_columns_recursive(&node.input, local_tables, required);
+            }
+            LogicalPlan::Distinct(node) => {
+                self.extract_outer_columns_recursive(&node.input, local_tables, required);
+            }
+            LogicalPlan::SubqueryAlias(node) => {
+                self.extract_outer_columns_recursive(&node.input, local_tables, required);
+            }
+            LogicalPlan::Scan(node) => {
+                if let Some(filter) = &node.filter {
+                    self.extract_outer_columns_from_expr(filter, local_tables, required);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Extract columns from an expression that reference tables NOT in local_tables
+    fn extract_outer_columns_from_expr(&self, expr: &Expr, local_tables: &HashSet<String>, required: &mut HashSet<Column>) {
+        match expr {
+            Expr::Column(col) => {
+                // Only add if this column references an outer table
+                if let Some(rel) = &col.relation {
+                    if !local_tables.contains(rel) {
+                        // This is an outer reference
+                        required.insert(col.clone());
+                    }
+                }
+                // For unqualified columns, we assume they're local (can't determine definitively)
+            }
+            Expr::BinaryExpr { left, right, .. } => {
+                self.extract_outer_columns_from_expr(left, local_tables, required);
+                self.extract_outer_columns_from_expr(right, local_tables, required);
+            }
+            Expr::UnaryExpr { expr, .. } => {
+                self.extract_outer_columns_from_expr(expr, local_tables, required);
+            }
+            Expr::ScalarFunc { args, .. } | Expr::Aggregate { args, .. } => {
+                for arg in args {
+                    self.extract_outer_columns_from_expr(arg, local_tables, required);
+                }
+            }
+            Expr::Cast { expr, .. } | Expr::Alias { expr, .. } => {
+                self.extract_outer_columns_from_expr(expr, local_tables, required);
+            }
+            Expr::Case { operand, when_then, else_expr } => {
+                if let Some(op) = operand {
+                    self.extract_outer_columns_from_expr(op, local_tables, required);
+                }
+                for (w, t) in when_then {
+                    self.extract_outer_columns_from_expr(w, local_tables, required);
+                    self.extract_outer_columns_from_expr(t, local_tables, required);
+                }
+                if let Some(e) = else_expr {
+                    self.extract_outer_columns_from_expr(e, local_tables, required);
+                }
+            }
+            Expr::InList { expr, list, .. } => {
+                self.extract_outer_columns_from_expr(expr, local_tables, required);
+                for item in list {
+                    self.extract_outer_columns_from_expr(item, local_tables, required);
+                }
+            }
+            Expr::Between { expr, low, high, .. } => {
+                self.extract_outer_columns_from_expr(expr, local_tables, required);
+                self.extract_outer_columns_from_expr(low, local_tables, required);
+                self.extract_outer_columns_from_expr(high, local_tables, required);
             }
             _ => {}
         }
@@ -165,7 +342,21 @@ impl ProjectionPushdown {
                         name: field.name.clone(),
                     };
 
-                    if required.contains(&col) || required.contains(&unqualified) || required.is_empty() {
+                    // Check for exact match or unqualified match
+                    let mut is_required = required.contains(&col) || required.contains(&unqualified) || required.is_empty();
+
+                    // Also check if any required column has the same name (handles table aliases)
+                    // e.g., required has "l1.l_orderkey" but schema has "lineitem.l_orderkey"
+                    if !is_required {
+                        for req_col in required.iter() {
+                            if req_col.name == field.name {
+                                is_required = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if is_required {
                         projection.push(i);
                     }
                 }
@@ -261,6 +452,7 @@ impl ProjectionPushdown {
                 Ok(LogicalPlan::Union(crate::planner::UnionNode {
                     inputs: inputs?,
                     schema: node.schema.clone(),
+                    all: node.all,
                 }))
             }
 

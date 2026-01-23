@@ -38,12 +38,27 @@ impl HashJoinExec {
         let schema = match join_type {
             JoinType::Semi | JoinType::Anti => left_schema,
             _ => {
-                let fields: Vec<_> = left_schema
-                    .fields()
-                    .iter()
-                    .chain(right_schema.fields().iter())
-                    .cloned()
-                    .collect();
+                // For outer joins, columns from the "outer" side can be null
+                let left_nullable = matches!(join_type, JoinType::Right | JoinType::Full);
+                let right_nullable = matches!(join_type, JoinType::Left | JoinType::Full);
+
+                let left_fields = left_schema.fields().iter().map(|f| {
+                    if left_nullable && !f.is_nullable() {
+                        Arc::new(f.as_ref().clone().with_nullable(true))
+                    } else {
+                        f.clone()
+                    }
+                });
+
+                let right_fields = right_schema.fields().iter().map(|f| {
+                    if right_nullable && !f.is_nullable() {
+                        Arc::new(f.as_ref().clone().with_nullable(true))
+                    } else {
+                        f.clone()
+                    }
+                });
+
+                let fields: Vec<_> = left_fields.chain(right_fields).collect();
                 Arc::new(Schema::new(fields))
             }
         };

@@ -158,7 +158,7 @@ struct GroupKey {
     values: Vec<GroupValue>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum GroupValue {
     Null,
     Bool(bool),
@@ -231,6 +231,7 @@ struct AccumulatorState {
     max_i64: Option<i64>,
     min_str: Option<String>,
     max_str: Option<String>,
+    distinct_set: Option<std::collections::HashSet<GroupValue>>,
 }
 
 impl Default for AccumulatorState {
@@ -245,6 +246,7 @@ impl Default for AccumulatorState {
             max_i64: None,
             min_str: None,
             max_str: None,
+            distinct_set: None,
         }
     }
 }
@@ -256,7 +258,9 @@ fn aggregate_batches(
     schema: &SchemaRef,
 ) -> Result<RecordBatch> {
     // Special case: scalar aggregate (no GROUP BY) - use Arrow's SIMD kernels
-    if group_by.is_empty() && batches.len() == 1 && aggregates.len() == 1 {
+    // Note: COUNT DISTINCT requires the hash-based path for tracking distinct values
+    let has_count_distinct = aggregates.iter().any(|a| a.func == AggregateFunction::CountDistinct);
+    if group_by.is_empty() && batches.len() == 1 && aggregates.len() == 1 && !has_count_distinct {
         return aggregate_scalar_simd(&batches[0], &aggregates[0], schema);
     }
 
@@ -492,9 +496,10 @@ fn update_accumulator(
             }
         }
         AggregateFunction::CountDistinct => {
-            // Simplified: just count non-nulls (proper impl needs set)
             if !input.is_null(row) {
-                state.count += 1;
+                let value = extract_group_value(input, row);
+                let set = state.distinct_set.get_or_insert_with(std::collections::HashSet::new);
+                set.insert(value);
             }
         }
         AggregateFunction::Sum => {
@@ -645,10 +650,20 @@ fn build_agg_array(
     data_type: &DataType,
 ) -> Result<ArrayRef> {
     match (func, data_type) {
-        (AggregateFunction::Count | AggregateFunction::CountDistinct, DataType::Int64) => {
+        (AggregateFunction::Count, DataType::Int64) => {
             let mut builder = Int64Builder::with_capacity(num_groups);
             for states in groups.values() {
                 builder.append_value(states[agg_idx].count);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        (AggregateFunction::CountDistinct, DataType::Int64) => {
+            let mut builder = Int64Builder::with_capacity(num_groups);
+            for states in groups.values() {
+                let count = states[agg_idx].distinct_set.as_ref()
+                    .map(|s| s.len() as i64)
+                    .unwrap_or(0);
+                builder.append_value(count);
             }
             Ok(Arc::new(builder.finish()))
         }

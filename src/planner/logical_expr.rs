@@ -185,6 +185,8 @@ pub enum ScalarFunction {
     Ceil,
     Floor,
     Round,
+    Power,
+    Sqrt,
     // String
     Upper,
     Lower,
@@ -218,6 +220,8 @@ impl fmt::Display for ScalarFunction {
             ScalarFunction::Ceil => write!(f, "CEIL"),
             ScalarFunction::Floor => write!(f, "FLOOR"),
             ScalarFunction::Round => write!(f, "ROUND"),
+            ScalarFunction::Power => write!(f, "POWER"),
+            ScalarFunction::Sqrt => write!(f, "SQRT"),
             ScalarFunction::Upper => write!(f, "UPPER"),
             ScalarFunction::Lower => write!(f, "LOWER"),
             ScalarFunction::Trim => write!(f, "TRIM"),
@@ -603,6 +607,12 @@ impl Expr {
                         args.first()
                             .map(|a| a.data_type(schema))
                             .unwrap_or(Ok(ArrowDataType::Float64))
+                    }
+                    ScalarFunction::Power | ScalarFunction::Sqrt => Ok(ArrowDataType::Float64),
+                    ScalarFunction::Coalesce | ScalarFunction::NullIf => {
+                        args.first()
+                            .map(|a| a.data_type(schema))
+                            .unwrap_or(Ok(ArrowDataType::Null))
                     }
                     _ => Ok(ArrowDataType::Utf8), // Default
                 }

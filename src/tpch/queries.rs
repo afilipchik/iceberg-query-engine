@@ -498,6 +498,7 @@ WHERE
 "#;
 
 /// Q20: Potential Part Promotion
+/// Note: Uses 'Part 1%' instead of 'forest%' because our generator creates simple part names
 pub const Q20: &str = r#"
 SELECT
     s_name,
@@ -512,7 +513,7 @@ WHERE
         WHERE ps_partkey IN (
             SELECT p_partkey
             FROM part
-            WHERE p_name LIKE 'forest%'
+            WHERE p_name LIKE 'Part 1%'
         )
         AND ps_availqty > (
             SELECT 0.5 * SUM(l_quantity)
@@ -575,17 +576,17 @@ SELECT
     SUM(c_acctbal) AS totacctbal
 FROM (
     SELECT
-        SUBSTRING(c_phone FROM 1 FOR 3) AS cntrycode,
+        SUBSTRING(c_phone FROM 1 FOR 2) AS cntrycode,
         c_acctbal
     FROM
         customer
     WHERE
-        SUBSTRING(c_phone FROM 1 FOR 3) IN ('1', '2', '3', '4', '5', '6', '7')
+        SUBSTRING(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')
         AND c_acctbal > (
             SELECT AVG(c_acctbal)
             FROM customer
             WHERE c_acctbal > 0.00
-            AND SUBSTRING(c_phone FROM 1 FOR 3) IN ('1', '2', '3', '4', '5', '6', '7')
+            AND SUBSTRING(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')
         )
         AND NOT EXISTS (
             SELECT *
