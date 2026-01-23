@@ -1,0 +1,14 @@
+/Users/elonazoulay/src/trino/otherdirs/branching-metastore/branching-metastore-common/src/main/java/io/branching/metastore/common/BranchingMetastore.java
+/Users/elonazoulay/src/trino/otherdirs/branching-metastore/branching-metastore-common/src/main/java/io/branching/metastore/common/exceptions/BranchAlreadyExistsException.java
+/Users/elonazoulay/src/trino/otherdirs/branching-metastore/branching-metastore-common/src/main/java/io/branching/metastore/common/exceptions/BranchNotFoundException.java
+/Users/elonazoulay/src/trino/otherdirs/branching-metastore/branching-metastore-common/src/main/java/io/branching/metastore/common/exceptions/MergeConflictException.java
+/Users/elonazoulay/src/trino/otherdirs/branching-metastore/branching-metastore-common/src/main/java/io/branching/metastore/common/exceptions/MetastoreException.java
+/Users/elonazoulay/src/trino/otherdirs/branching-metastore/branching-metastore-common/src/main/java/io/branching/metastore/common/exceptions/TableAlreadyExistsException.java
+/Users/elonazoulay/src/trino/otherdirs/branching-metastore/branching-metastore-common/src/main/java/io/branching/metastore/common/exceptions/TableNotFoundException.java
+/Users/elonazoulay/src/trino/otherdirs/branching-metastore/branching-metastore-common/src/main/java/io/branching/metastore/common/model/Branch.java
+/Users/elonazoulay/src/trino/otherdirs/branching-metastore/branching-metastore-common/src/main/java/io/branching/metastore/common/model/BranchType.java
+/Users/elonazoulay/src/trino/otherdirs/branching-metastore/branching-metastore-common/src/main/java/io/branching/metastore/common/model/Column.java
+/Users/elonazoulay/src/trino/otherdirs/branching-metastore/branching-metastore-common/src/main/java/io/branching/metastore/common/model/Database.java
+/Users/elonazoulay/src/trino/otherdirs/branching-metastore/branching-metastore-common/src/main/java/io/branching/metastore/common/model/Storage.java
+/Users/elonazoulay/src/trino/otherdirs/branching-metastore/branching-metastore-common/src/main/java/io/branching/metastore/common/model/Table.java
+/Users/elonazoulay/src/trino/otherdirs/branching-metastore/branching-metastore-common/src/main/java/io/branching/metastore/common/model/TableType.java

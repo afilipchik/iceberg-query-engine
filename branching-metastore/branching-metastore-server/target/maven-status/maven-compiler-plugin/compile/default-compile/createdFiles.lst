@@ -1,0 +1,12 @@
+io/branching/metastore/server/resource/TableResource.class
+io/branching/metastore/server/resource/DatabaseResource.class
+io/branching/metastore/server/resource/TableResource$RenameTableRequest.class
+io/branching/metastore/server/resource/BranchResource.class
+io/branching/metastore/server/dao/TableDao.class
+io/branching/metastore/server/BranchingMetastoreImpl.class
+io/branching/metastore/server/BranchingMetastoreServer.class
+io/branching/metastore/server/dao/BranchDao.class
+io/branching/metastore/server/resource/BranchResource$CreateBranchRequest.class
+io/branching/metastore/server/BranchingMetastoreModule.class
+io/branching/metastore/server/dao/DatabaseDao.class
+io/branching/metastore/server/config/MetastoreConfig.class
