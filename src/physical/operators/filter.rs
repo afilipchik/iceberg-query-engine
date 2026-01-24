@@ -1851,9 +1851,9 @@ fn evaluate_scalar_func(
                             }
                             _ => return None,
                         };
-                        let days_since_epoch = new_date.signed_duration_since(
-                            NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()
-                        ).num_days() as i32;
+                        let days_since_epoch = new_date
+                            .signed_duration_since(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+                            .num_days() as i32;
                         Some(days_since_epoch)
                     })
                     .collect();
@@ -1861,7 +1861,10 @@ fn evaluate_scalar_func(
             }
 
             // Handle Timestamp input
-            if let Some(ts_arr) = date_arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+            if let Some(ts_arr) = date_arr
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+            {
                 use chrono::{Duration, Months, TimeZone, Utc};
                 let result: TimestampMicrosecondArray = (0..ts_arr.len())
                     .map(|i| {
@@ -1874,8 +1877,12 @@ fn evaluate_scalar_func(
                         let value = get_int_value(value_arr, i)? as i64;
 
                         let new_dt = match unit.as_str() {
-                            "second" | "seconds" => dt.checked_add_signed(Duration::seconds(value))?,
-                            "minute" | "minutes" => dt.checked_add_signed(Duration::minutes(value))?,
+                            "second" | "seconds" => {
+                                dt.checked_add_signed(Duration::seconds(value))?
+                            }
+                            "minute" | "minutes" => {
+                                dt.checked_add_signed(Duration::minutes(value))?
+                            }
                             "hour" | "hours" => dt.checked_add_signed(Duration::hours(value))?,
                             "day" | "days" => dt.checked_add_signed(Duration::days(value))?,
                             "week" | "weeks" => dt.checked_add_signed(Duration::weeks(value))?,
@@ -1902,7 +1909,9 @@ fn evaluate_scalar_func(
                 return Ok(Arc::new(result));
             }
 
-            Err(QueryError::Type("DATE_ADD requires date or timestamp argument".into()))
+            Err(QueryError::Type(
+                "DATE_ADD requires date or timestamp argument".into(),
+            ))
         }
 
         ScalarFunction::DateDiff => {
@@ -1955,8 +1964,12 @@ fn evaluate_scalar_func(
 
             // Handle Timestamp inputs
             if let (Some(ts1_arr), Some(ts2_arr)) = (
-                date1_arr.as_any().downcast_ref::<TimestampMicrosecondArray>(),
-                date2_arr.as_any().downcast_ref::<TimestampMicrosecondArray>(),
+                date1_arr
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>(),
+                date2_arr
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>(),
             ) {
                 use chrono::{Datelike, TimeZone, Utc};
                 let result: Int64Array = (0..ts1_arr.len())
@@ -1990,7 +2003,9 @@ fn evaluate_scalar_func(
                 return Ok(Arc::new(result));
             }
 
-            Err(QueryError::Type("DATE_DIFF requires date or timestamp arguments".into()))
+            Err(QueryError::Type(
+                "DATE_DIFF requires date or timestamp arguments".into(),
+            ))
         }
 
         ScalarFunction::DateTrunc => {
@@ -2032,14 +2047,12 @@ fn evaluate_scalar_func(
                                 let quarter_start_month = ((date.month() - 1) / 3) * 3 + 1;
                                 NaiveDate::from_ymd_opt(date.year(), quarter_start_month, 1)?
                             }
-                            "year" | "years" => {
-                                NaiveDate::from_ymd_opt(date.year(), 1, 1)?
-                            }
+                            "year" | "years" => NaiveDate::from_ymd_opt(date.year(), 1, 1)?,
                             _ => return None,
                         };
-                        let days_since_epoch = truncated.signed_duration_since(
-                            NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()
-                        ).num_days() as i32;
+                        let days_since_epoch = truncated
+                            .signed_duration_since(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+                            .num_days() as i32;
                         Some(days_since_epoch)
                     })
                     .collect();
@@ -2047,7 +2060,10 @@ fn evaluate_scalar_func(
             }
 
             // Handle Timestamp input
-            if let Some(ts_arr) = date_arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+            if let Some(ts_arr) = date_arr
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+            {
                 use chrono::{Datelike, TimeZone, Timelike, Utc};
                 let result: TimestampMicrosecondArray = (0..ts_arr.len())
                     .map(|i| {
@@ -2059,29 +2075,32 @@ fn evaluate_scalar_func(
                         let unit = unit_arr.value(i).to_lowercase();
 
                         let truncated = match unit.as_str() {
-                            "second" | "seconds" => {
-                                dt.with_nanosecond(0)?
-                            }
-                            "minute" | "minutes" => {
-                                dt.with_second(0)?.with_nanosecond(0)?
-                            }
+                            "second" | "seconds" => dt.with_nanosecond(0)?,
+                            "minute" | "minutes" => dt.with_second(0)?.with_nanosecond(0)?,
                             "hour" | "hours" => {
                                 dt.with_minute(0)?.with_second(0)?.with_nanosecond(0)?
                             }
-                            "day" | "days" => {
-                                dt.with_hour(0)?.with_minute(0)?.with_second(0)?.with_nanosecond(0)?
-                            }
+                            "day" | "days" => dt
+                                .with_hour(0)?
+                                .with_minute(0)?
+                                .with_second(0)?
+                                .with_nanosecond(0)?,
                             "week" | "weeks" => {
                                 let weekday = dt.weekday().num_days_from_monday();
-                                let day_start = dt.with_hour(0)?.with_minute(0)?.with_second(0)?.with_nanosecond(0)?;
+                                let day_start = dt
+                                    .with_hour(0)?
+                                    .with_minute(0)?
+                                    .with_second(0)?
+                                    .with_nanosecond(0)?;
                                 day_start - chrono::Duration::days(weekday as i64)
                             }
-                            "month" | "months" => {
-                                Utc.with_ymd_and_hms(dt.year(), dt.month(), 1, 0, 0, 0).single()?
-                            }
+                            "month" | "months" => Utc
+                                .with_ymd_and_hms(dt.year(), dt.month(), 1, 0, 0, 0)
+                                .single()?,
                             "quarter" | "quarters" => {
                                 let quarter_start_month = ((dt.month() - 1) / 3) * 3 + 1;
-                                Utc.with_ymd_and_hms(dt.year(), quarter_start_month, 1, 0, 0, 0).single()?
+                                Utc.with_ymd_and_hms(dt.year(), quarter_start_month, 1, 0, 0, 0)
+                                    .single()?
                             }
                             "year" | "years" => {
                                 Utc.with_ymd_and_hms(dt.year(), 1, 1, 0, 0, 0).single()?
@@ -2094,7 +2113,9 @@ fn evaluate_scalar_func(
                 return Ok(Arc::new(result));
             }
 
-            Err(QueryError::Type("DATE_TRUNC requires date or timestamp argument".into()))
+            Err(QueryError::Type(
+                "DATE_TRUNC requires date or timestamp argument".into(),
+            ))
         }
 
         ScalarFunction::DatePart => {
@@ -2129,7 +2150,9 @@ fn evaluate_scalar_func(
                             "day" | "days" => date.day() as f64,
                             "quarter" | "quarters" => ((date.month() - 1) / 3 + 1) as f64,
                             "week" | "weeks" => date.iso_week().week() as f64,
-                            "day_of_week" | "dayofweek" | "dow" => (date.weekday().num_days_from_sunday() + 1) as f64,
+                            "day_of_week" | "dayofweek" | "dow" => {
+                                (date.weekday().num_days_from_sunday() + 1) as f64
+                            }
                             "day_of_year" | "dayofyear" | "doy" => date.ordinal() as f64,
                             _ => return None,
                         })
@@ -2139,7 +2162,10 @@ fn evaluate_scalar_func(
             }
 
             // Handle Timestamp input
-            if let Some(ts_arr) = date_arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+            if let Some(ts_arr) = date_arr
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+            {
                 use chrono::{Datelike, TimeZone, Timelike, Utc};
                 let result: Float64Array = (0..ts_arr.len())
                     .map(|i| {
@@ -2161,7 +2187,9 @@ fn evaluate_scalar_func(
                             "microsecond" | "microseconds" => (dt.nanosecond() / 1_000) as f64,
                             "quarter" | "quarters" => ((dt.month() - 1) / 3 + 1) as f64,
                             "week" | "weeks" => dt.iso_week().week() as f64,
-                            "day_of_week" | "dayofweek" | "dow" => (dt.weekday().num_days_from_sunday() + 1) as f64,
+                            "day_of_week" | "dayofweek" | "dow" => {
+                                (dt.weekday().num_days_from_sunday() + 1) as f64
+                            }
                             "day_of_year" | "dayofyear" | "doy" => dt.ordinal() as f64,
                             _ => return None,
                         })
@@ -2170,7 +2198,9 @@ fn evaluate_scalar_func(
                 return Ok(Arc::new(result));
             }
 
-            Err(QueryError::Type("DATE_PART requires date or timestamp argument".into()))
+            Err(QueryError::Type(
+                "DATE_PART requires date or timestamp argument".into(),
+            ))
         }
 
         // ========== CONDITIONAL FUNCTIONS ==========
@@ -2892,9 +2922,9 @@ fn evaluate_scalar_func(
         }
 
         ScalarFunction::IsFinite => {
-            let arr = evaluated_args
-                .first()
-                .ok_or_else(|| QueryError::InvalidArgument("IS_FINITE requires 1 argument".into()))?;
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("IS_FINITE requires 1 argument".into())
+            })?;
             if let Some(float_arr) = arr.as_any().downcast_ref::<Float64Array>() {
                 let result: BooleanArray = float_arr
                     .iter()
@@ -2924,9 +2954,9 @@ fn evaluate_scalar_func(
         }
 
         ScalarFunction::IsInfinite => {
-            let arr = evaluated_args
-                .first()
-                .ok_or_else(|| QueryError::InvalidArgument("IS_INFINITE requires 1 argument".into()))?;
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("IS_INFINITE requires 1 argument".into())
+            })?;
             if let Some(float_arr) = arr.as_any().downcast_ref::<Float64Array>() {
                 let result: BooleanArray = float_arr
                     .iter()
@@ -2954,9 +2984,7 @@ fn evaluate_scalar_func(
 
             let result: Int64Array = str_arr
                 .iter()
-                .map(|opt| {
-                    opt.and_then(|s| i64::from_str_radix(s, radix).ok())
-                })
+                .map(|opt| opt.and_then(|s| i64::from_str_radix(s, radix).ok()))
                 .collect();
             Ok(Arc::new(result))
         }
@@ -3004,19 +3032,17 @@ fn evaluate_scalar_func(
                 .iter()
                 .zip(low.iter())
                 .zip(high.iter())
-                .map(|((op, lo), hi)| {
-                    match (op, lo, hi) {
-                        (Some(v), Some(l), Some(h)) => {
-                            if v < l {
-                                Some(0)
-                            } else if v >= h {
-                                Some(count as i64 + 1)
-                            } else {
-                                Some(((v - l) / (h - l) * count).floor() as i64 + 1)
-                            }
+                .map(|((op, lo), hi)| match (op, lo, hi) {
+                    (Some(v), Some(l), Some(h)) => {
+                        if v < l {
+                            Some(0)
+                        } else if v >= h {
+                            Some(count as i64 + 1)
+                        } else {
+                            Some(((v - l) / (h - l) * count).floor() as i64 + 1)
                         }
-                        _ => None,
                     }
+                    _ => None,
                 })
                 .collect();
             Ok(Arc::new(result))
@@ -3038,13 +3064,9 @@ fn evaluate_scalar_func(
                 .iter()
                 .zip(std.iter())
                 .zip(value.iter())
-                .map(|((m, s), v)| {
-                    match (m, s, v) {
-                        (Some(m), Some(s), Some(v)) => {
-                            Normal::new(*m, *s).ok().map(|n| n.cdf(*v))
-                        }
-                        _ => None,
-                    }
+                .map(|((m, s), v)| match (m, s, v) {
+                    (Some(m), Some(s), Some(v)) => Normal::new(*m, *s).ok().map(|n| n.cdf(*v)),
+                    _ => None,
                 })
                 .collect();
             Ok(Arc::new(result))
@@ -3065,13 +3087,11 @@ fn evaluate_scalar_func(
                 .iter()
                 .zip(std.iter())
                 .zip(p.iter())
-                .map(|((m, s), prob)| {
-                    match (m, s, prob) {
-                        (Some(m), Some(s), Some(p)) => {
-                            Normal::new(*m, *s).ok().map(|n| n.inverse_cdf(*p))
-                        }
-                        _ => None,
+                .map(|((m, s), prob)| match (m, s, prob) {
+                    (Some(m), Some(s), Some(p)) => {
+                        Normal::new(*m, *s).ok().map(|n| n.inverse_cdf(*p))
                     }
+                    _ => None,
                 })
                 .collect();
             Ok(Arc::new(result))
@@ -3094,13 +3114,9 @@ fn evaluate_scalar_func(
                 .iter()
                 .zip(b.iter())
                 .zip(x.iter())
-                .map(|((a_opt, b_opt), x_opt)| {
-                    match (a_opt, b_opt, x_opt) {
-                        (Some(a), Some(b), Some(x)) => {
-                            Beta::new(*a, *b).ok().map(|dist| dist.cdf(*x))
-                        }
-                        _ => None,
-                    }
+                .map(|((a_opt, b_opt), x_opt)| match (a_opt, b_opt, x_opt) {
+                    (Some(a), Some(b), Some(x)) => Beta::new(*a, *b).ok().map(|dist| dist.cdf(*x)),
+                    _ => None,
                 })
                 .collect();
             Ok(Arc::new(result))
@@ -3123,13 +3139,11 @@ fn evaluate_scalar_func(
                 .iter()
                 .zip(b.iter())
                 .zip(p.iter())
-                .map(|((a_opt, b_opt), p_opt)| {
-                    match (a_opt, b_opt, p_opt) {
-                        (Some(a), Some(b), Some(p)) => {
-                            Beta::new(*a, *b).ok().map(|dist| dist.inverse_cdf(*p))
-                        }
-                        _ => None,
+                .map(|((a_opt, b_opt), p_opt)| match (a_opt, b_opt, p_opt) {
+                    (Some(a), Some(b), Some(p)) => {
+                        Beta::new(*a, *b).ok().map(|dist| dist.inverse_cdf(*p))
                     }
+                    _ => None,
                 })
                 .collect();
             Ok(Arc::new(result))
@@ -3138,7 +3152,7 @@ fn evaluate_scalar_func(
         ScalarFunction::TCdf => {
             // T_CDF(x, df) -> double
             // Cumulative distribution function of Student's t-distribution
-            use statrs::distribution::{StudentsT, ContinuousCDF};
+            use statrs::distribution::{ContinuousCDF, StudentsT};
             if evaluated_args.len() != 2 {
                 return Err(QueryError::InvalidArgument(
                     "T_CDF requires 2 arguments (x, df)".into(),
@@ -3150,13 +3164,11 @@ fn evaluate_scalar_func(
             let result: Float64Array = x
                 .iter()
                 .zip(df.iter())
-                .map(|(x_opt, df_opt)| {
-                    match (x_opt, df_opt) {
-                        (Some(x), Some(df)) => {
-                            StudentsT::new(0.0, 1.0, *df).ok().map(|dist| dist.cdf(*x))
-                        }
-                        _ => None,
+                .map(|(x_opt, df_opt)| match (x_opt, df_opt) {
+                    (Some(x), Some(df)) => {
+                        StudentsT::new(0.0, 1.0, *df).ok().map(|dist| dist.cdf(*x))
                     }
+                    _ => None,
                 })
                 .collect();
             Ok(Arc::new(result))
@@ -3165,7 +3177,7 @@ fn evaluate_scalar_func(
         ScalarFunction::TPdf => {
             // T_PDF(x, df) -> double
             // Probability density function of Student's t-distribution
-            use statrs::distribution::{StudentsT, Continuous};
+            use statrs::distribution::{Continuous, StudentsT};
             if evaluated_args.len() != 2 {
                 return Err(QueryError::InvalidArgument(
                     "T_PDF requires 2 arguments (x, df)".into(),
@@ -3177,13 +3189,11 @@ fn evaluate_scalar_func(
             let result: Float64Array = x
                 .iter()
                 .zip(df.iter())
-                .map(|(x_opt, df_opt)| {
-                    match (x_opt, df_opt) {
-                        (Some(x), Some(df)) => {
-                            StudentsT::new(0.0, 1.0, *df).ok().map(|dist| dist.pdf(*x))
-                        }
-                        _ => None,
+                .map(|(x_opt, df_opt)| match (x_opt, df_opt) {
+                    (Some(x), Some(df)) => {
+                        StudentsT::new(0.0, 1.0, *df).ok().map(|dist| dist.pdf(*x))
                     }
+                    _ => None,
                 })
                 .collect();
             Ok(Arc::new(result))
@@ -3205,18 +3215,16 @@ fn evaluate_scalar_func(
                 .iter()
                 .zip(n.iter())
                 .zip(z.iter())
-                .map(|((s_opt, n_opt), z_opt)| {
-                    match (s_opt, n_opt, z_opt) {
-                        (Some(s), Some(n), Some(z)) if *n > 0.0 => {
-                            let p = s / n;
-                            let z2 = z * z;
-                            let denominator = 1.0 + z2 / n;
-                            let center = p + z2 / (2.0 * n);
-                            let margin = z * ((p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt());
-                            Some((center - margin) / denominator)
-                        }
-                        _ => None,
+                .map(|((s_opt, n_opt), z_opt)| match (s_opt, n_opt, z_opt) {
+                    (Some(s), Some(n), Some(z)) if *n > 0.0 => {
+                        let p = s / n;
+                        let z2 = z * z;
+                        let denominator = 1.0 + z2 / n;
+                        let center = p + z2 / (2.0 * n);
+                        let margin = z * ((p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt());
+                        Some((center - margin) / denominator)
                     }
+                    _ => None,
                 })
                 .collect();
             Ok(Arc::new(result))
@@ -3238,29 +3246,25 @@ fn evaluate_scalar_func(
                 .iter()
                 .zip(n.iter())
                 .zip(z.iter())
-                .map(|((s_opt, n_opt), z_opt)| {
-                    match (s_opt, n_opt, z_opt) {
-                        (Some(s), Some(n), Some(z)) if *n > 0.0 => {
-                            let p = s / n;
-                            let z2 = z * z;
-                            let denominator = 1.0 + z2 / n;
-                            let center = p + z2 / (2.0 * n);
-                            let margin = z * ((p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt());
-                            Some((center + margin) / denominator)
-                        }
-                        _ => None,
+                .map(|((s_opt, n_opt), z_opt)| match (s_opt, n_opt, z_opt) {
+                    (Some(s), Some(n), Some(z)) if *n > 0.0 => {
+                        let p = s / n;
+                        let z2 = z * z;
+                        let denominator = 1.0 + z2 / n;
+                        let center = p + z2 / (2.0 * n);
+                        let margin = z * ((p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt());
+                        Some((center + margin) / denominator)
                     }
+                    _ => None,
                 })
                 .collect();
             Ok(Arc::new(result))
         }
 
         // ========== NEW MATH FUNCTIONS - VECTOR OPERATIONS ==========
-        ScalarFunction::CosineSimilarity | ScalarFunction::CosineDistance => {
-            Err(QueryError::NotImplemented(
-                "Vector operations require array type support".into(),
-            ))
-        }
+        ScalarFunction::CosineSimilarity | ScalarFunction::CosineDistance => Err(
+            QueryError::NotImplemented("Vector operations require array type support".into()),
+        ),
 
         // ========== NEW STRING FUNCTIONS ==========
         ScalarFunction::Split => {
@@ -3295,9 +3299,9 @@ fn evaluate_scalar_func(
         }
 
         ScalarFunction::Codepoint => {
-            let arr = evaluated_args
-                .first()
-                .ok_or_else(|| QueryError::InvalidArgument("CODEPOINT requires 1 argument".into()))?;
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("CODEPOINT requires 1 argument".into())
+            })?;
             let str_arr = arr
                 .as_any()
                 .downcast_ref::<StringArray>()
@@ -3305,9 +3309,7 @@ fn evaluate_scalar_func(
 
             let result: Int64Array = str_arr
                 .iter()
-                .map(|opt| {
-                    opt.and_then(|s| s.chars().next().map(|c| c as i64))
-                })
+                .map(|opt| opt.and_then(|s| s.chars().next().map(|c| c as i64)))
                 .collect();
             Ok(Arc::new(result))
         }
@@ -3321,11 +3323,15 @@ fn evaluate_scalar_func(
             let str1 = evaluated_args[0]
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| QueryError::Type("HAMMING_DISTANCE requires string arguments".into()))?;
+                .ok_or_else(|| {
+                    QueryError::Type("HAMMING_DISTANCE requires string arguments".into())
+                })?;
             let str2 = evaluated_args[1]
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| QueryError::Type("HAMMING_DISTANCE requires string arguments".into()))?;
+                .ok_or_else(|| {
+                    QueryError::Type("HAMMING_DISTANCE requires string arguments".into())
+                })?;
 
             let result: Int64Array = (0..str1.len())
                 .map(|i| {
@@ -3359,11 +3365,15 @@ fn evaluate_scalar_func(
             let str1 = evaluated_args[0]
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| QueryError::Type("LEVENSHTEIN_DISTANCE requires string arguments".into()))?;
+                .ok_or_else(|| {
+                    QueryError::Type("LEVENSHTEIN_DISTANCE requires string arguments".into())
+                })?;
             let str2 = evaluated_args[1]
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| QueryError::Type("LEVENSHTEIN_DISTANCE requires string arguments".into()))?;
+                .ok_or_else(|| {
+                    QueryError::Type("LEVENSHTEIN_DISTANCE requires string arguments".into())
+                })?;
 
             let result: Int64Array = (0..str1.len())
                 .map(|i| {
@@ -3388,10 +3398,7 @@ fn evaluate_scalar_func(
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| QueryError::Type("SOUNDEX requires string argument".into()))?;
 
-            let result: StringArray = str_arr
-                .iter()
-                .map(|opt| opt.map(|s| soundex(s)))
-                .collect();
+            let result: StringArray = str_arr.iter().map(|opt| opt.map(|s| soundex(s))).collect();
             Ok(Arc::new(result))
         }
 
@@ -3408,7 +3415,9 @@ fn evaluate_scalar_func(
             let from_arr = evaluated_args[1]
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| QueryError::Type("TRANSLATE requires string from argument".into()))?;
+                .ok_or_else(|| {
+                    QueryError::Type("TRANSLATE requires string from argument".into())
+                })?;
             let to_arr = evaluated_args[2]
                 .as_any()
                 .downcast_ref::<StringArray>()
@@ -3425,7 +3434,8 @@ fn evaluate_scalar_func(
                         Some(
                             s.chars()
                                 .map(|c| {
-                                    from.iter().position(|&fc| fc == c)
+                                    from.iter()
+                                        .position(|&fc| fc == c)
                                         .and_then(|pos| to.get(pos).copied())
                                         .unwrap_or(c)
                                 })
@@ -3438,9 +3448,9 @@ fn evaluate_scalar_func(
         }
 
         ScalarFunction::LuhnCheck => {
-            let arr = evaluated_args
-                .first()
-                .ok_or_else(|| QueryError::InvalidArgument("LUHN_CHECK requires 1 argument".into()))?;
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("LUHN_CHECK requires 1 argument".into())
+            })?;
             let str_arr = arr
                 .as_any()
                 .downcast_ref::<StringArray>()
@@ -3455,9 +3465,9 @@ fn evaluate_scalar_func(
 
         ScalarFunction::Normalize => {
             use unicode_normalization::UnicodeNormalization;
-            let arr = evaluated_args
-                .first()
-                .ok_or_else(|| QueryError::InvalidArgument("NORMALIZE requires 1 argument".into()))?;
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("NORMALIZE requires 1 argument".into())
+            })?;
             let str_arr = arr
                 .as_any()
                 .downcast_ref::<StringArray>()
@@ -3488,9 +3498,9 @@ fn evaluate_scalar_func(
         }
 
         ScalarFunction::FromUtf8 => {
-            let arr = evaluated_args
-                .first()
-                .ok_or_else(|| QueryError::InvalidArgument("FROM_UTF8 requires 1 argument".into()))?;
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("FROM_UTF8 requires 1 argument".into())
+            })?;
             let bin_arr = arr
                 .as_any()
                 .downcast_ref::<BinaryArray>()
@@ -3505,9 +3515,9 @@ fn evaluate_scalar_func(
 
         ScalarFunction::WordStem => {
             // Simple implementation - just return the word unchanged
-            let arr = evaluated_args
-                .first()
-                .ok_or_else(|| QueryError::InvalidArgument("WORD_STEM requires 1 argument".into()))?;
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("WORD_STEM requires 1 argument".into())
+            })?;
             Ok(arr.clone())
         }
 
@@ -3565,7 +3575,10 @@ fn evaluate_scalar_func(
                 + now.second() as i64 * 1_000_000
                 + now.nanosecond() as i64 / 1000;
             let num_rows = batch.num_rows();
-            Ok(Arc::new(Time64MicrosecondArray::from(vec![micros; num_rows])))
+            Ok(Arc::new(Time64MicrosecondArray::from(vec![
+                micros;
+                num_rows
+            ])))
         }
 
         ScalarFunction::CurrentTimezone => {
@@ -3581,14 +3594,20 @@ fn evaluate_scalar_func(
                 + now.minute() as i64 * 60_000_000
                 + now.second() as i64 * 1_000_000;
             let num_rows = batch.num_rows();
-            Ok(Arc::new(Time64MicrosecondArray::from(vec![micros; num_rows])))
+            Ok(Arc::new(Time64MicrosecondArray::from(vec![
+                micros;
+                num_rows
+            ])))
         }
 
         ScalarFunction::Localtimestamp => {
             let now = chrono::Local::now();
             let micros = now.timestamp_micros();
             let num_rows = batch.num_rows();
-            Ok(Arc::new(TimestampMicrosecondArray::from(vec![micros; num_rows])))
+            Ok(Arc::new(TimestampMicrosecondArray::from(vec![
+                micros;
+                num_rows
+            ])))
         }
 
         ScalarFunction::LastDayOfMonth => {
@@ -3603,16 +3622,13 @@ fn evaluate_scalar_func(
                         opt.map(|days| {
                             let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719163)
                                 .unwrap_or_default();
-                            let last = chrono::NaiveDate::from_ymd_opt(
-                                date.year(),
-                                date.month(),
-                                1,
-                            )
-                            .unwrap()
-                            .with_day(1)
-                            .unwrap()
-                            + chrono::Months::new(1)
-                            - chrono::Duration::days(1);
+                            let last =
+                                chrono::NaiveDate::from_ymd_opt(date.year(), date.month(), 1)
+                                    .unwrap()
+                                    .with_day(1)
+                                    .unwrap()
+                                    + chrono::Months::new(1)
+                                    - chrono::Duration::days(1);
                             last.num_days_from_ce() - 719163
                         })
                     })
@@ -3707,8 +3723,8 @@ fn evaluate_scalar_func(
                     .iter()
                     .map(|opt| {
                         opt.map(|micros| {
-                            let dt = chrono::DateTime::from_timestamp_micros(micros)
-                                .unwrap_or_default();
+                            let dt =
+                                chrono::DateTime::from_timestamp_micros(micros).unwrap_or_default();
                             dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
                         })
                     })
@@ -3753,31 +3769,31 @@ fn evaluate_scalar_func(
                 // MySQL %i = minutes, MySQL %M = month name
                 // Chrono %M = minutes, Chrono %B = month name
                 mysql_fmt
-                    .replace("%M", "{{MONTH_NAME}}")  // Month name -> placeholder first
-                    .replace("%i", "%M")              // Minutes (00-59) - MySQL %i -> Chrono %M
-                    .replace("{{MONTH_NAME}}", "%B")  // Month name -> chrono %B
-                    .replace("%Y", "%Y")     // 4-digit year
-                    .replace("%y", "%y")     // 2-digit year
-                    .replace("%m", "%m")     // Month (01-12)
-                    .replace("%c", "%-m")    // Month (1-12) without leading zero
-                    .replace("%d", "%d")     // Day (01-31)
-                    .replace("%e", "%-d")    // Day (1-31) without leading zero
-                    .replace("%H", "%H")     // Hour 24h (00-23)
-                    .replace("%h", "%I")     // Hour 12h (01-12)
-                    .replace("%I", "%I")     // Hour 12h (01-12)
-                    .replace("%k", "%-H")    // Hour 24h (0-23) without leading zero
-                    .replace("%l", "%-I")    // Hour 12h (1-12) without leading zero
-                    .replace("%s", "%S")     // Seconds (00-59)
-                    .replace("%S", "%S")     // Seconds (00-59)
-                    .replace("%p", "%p")     // AM/PM
-                    .replace("%W", "%A")     // Weekday name
-                    .replace("%w", "%u")     // Day of week (0-6)
-                    .replace("%a", "%a")     // Abbreviated weekday
-                    .replace("%b", "%b")     // Abbreviated month name
-                    .replace("%j", "%j")     // Day of year
-                    .replace("%U", "%U")     // Week number (Sunday start)
-                    .replace("%u", "%W")     // Week number (Monday start)
-                    .replace("%f", "%6f")    // Microseconds
+                    .replace("%M", "{{MONTH_NAME}}") // Month name -> placeholder first
+                    .replace("%i", "%M") // Minutes (00-59) - MySQL %i -> Chrono %M
+                    .replace("{{MONTH_NAME}}", "%B") // Month name -> chrono %B
+                    .replace("%Y", "%Y") // 4-digit year
+                    .replace("%y", "%y") // 2-digit year
+                    .replace("%m", "%m") // Month (01-12)
+                    .replace("%c", "%-m") // Month (1-12) without leading zero
+                    .replace("%d", "%d") // Day (01-31)
+                    .replace("%e", "%-d") // Day (1-31) without leading zero
+                    .replace("%H", "%H") // Hour 24h (00-23)
+                    .replace("%h", "%I") // Hour 12h (01-12)
+                    .replace("%I", "%I") // Hour 12h (01-12)
+                    .replace("%k", "%-H") // Hour 24h (0-23) without leading zero
+                    .replace("%l", "%-I") // Hour 12h (1-12) without leading zero
+                    .replace("%s", "%S") // Seconds (00-59)
+                    .replace("%S", "%S") // Seconds (00-59)
+                    .replace("%p", "%p") // AM/PM
+                    .replace("%W", "%A") // Weekday name
+                    .replace("%w", "%u") // Day of week (0-6)
+                    .replace("%a", "%a") // Abbreviated weekday
+                    .replace("%b", "%b") // Abbreviated month name
+                    .replace("%j", "%j") // Day of year
+                    .replace("%U", "%U") // Week number (Sunday start)
+                    .replace("%u", "%W") // Week number (Monday start)
+                    .replace("%f", "%6f") // Microseconds
             }
 
             if let Some(ts_arr) = ts_arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
@@ -3812,7 +3828,9 @@ fn evaluate_scalar_func(
                 return Ok(Arc::new(result));
             }
 
-            Err(QueryError::Type("DATE_FORMAT requires timestamp or date argument".into()))
+            Err(QueryError::Type(
+                "DATE_FORMAT requires timestamp or date argument".into(),
+            ))
         }
 
         ScalarFunction::DateParse => {
@@ -3835,22 +3853,22 @@ fn evaluate_scalar_func(
             // Convert Trino/MySQL format to chrono format for parsing
             fn convert_parse_format(mysql_fmt: &str) -> String {
                 mysql_fmt
-                    .replace("%Y", "%Y")     // 4-digit year
-                    .replace("%y", "%y")     // 2-digit year
-                    .replace("%m", "%m")     // Month (01-12)
-                    .replace("%c", "%m")     // Month (1-12) - chrono uses %m for both
-                    .replace("%d", "%d")     // Day (01-31)
-                    .replace("%e", "%d")     // Day (1-31) - chrono handles both
-                    .replace("%H", "%H")     // Hour 24h (00-23)
-                    .replace("%h", "%I")     // Hour 12h (01-12)
-                    .replace("%I", "%I")     // Hour 12h (01-12)
-                    .replace("%k", "%H")     // Hour 24h (0-23)
-                    .replace("%l", "%I")     // Hour 12h (1-12)
-                    .replace("%i", "%M")     // Minutes (00-59)
-                    .replace("%s", "%S")     // Seconds (00-59)
-                    .replace("%S", "%S")     // Seconds (00-59)
-                    .replace("%p", "%p")     // AM/PM
-                    .replace("%f", "%6f")    // Microseconds
+                    .replace("%Y", "%Y") // 4-digit year
+                    .replace("%y", "%y") // 2-digit year
+                    .replace("%m", "%m") // Month (01-12)
+                    .replace("%c", "%m") // Month (1-12) - chrono uses %m for both
+                    .replace("%d", "%d") // Day (01-31)
+                    .replace("%e", "%d") // Day (1-31) - chrono handles both
+                    .replace("%H", "%H") // Hour 24h (00-23)
+                    .replace("%h", "%I") // Hour 12h (01-12)
+                    .replace("%I", "%I") // Hour 12h (01-12)
+                    .replace("%k", "%H") // Hour 24h (0-23)
+                    .replace("%l", "%I") // Hour 12h (1-12)
+                    .replace("%i", "%M") // Minutes (00-59)
+                    .replace("%s", "%S") // Seconds (00-59)
+                    .replace("%S", "%S") // Seconds (00-59)
+                    .replace("%p", "%p") // AM/PM
+                    .replace("%f", "%6f") // Microseconds
             }
 
             let result: TimestampMicrosecondArray = (0..str_arr.len())
@@ -3887,7 +3905,9 @@ fn evaluate_scalar_func(
             let str_arr = evaluated_args[0]
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| QueryError::Type("PARSE_DATETIME requires string argument".into()))?;
+                .ok_or_else(|| {
+                    QueryError::Type("PARSE_DATETIME requires string argument".into())
+                })?;
             let fmt_arr = evaluated_args[1]
                 .as_any()
                 .downcast_ref::<StringArray>()
@@ -3896,20 +3916,20 @@ fn evaluate_scalar_func(
             // Convert Joda-style format to chrono format
             fn convert_joda_format(joda_fmt: &str) -> String {
                 joda_fmt
-                    .replace("yyyy", "%Y")   // 4-digit year
-                    .replace("yy", "%y")     // 2-digit year
-                    .replace("MM", "%m")     // Month (01-12)
-                    .replace("M", "%-m")     // Month (1-12)
-                    .replace("dd", "%d")     // Day (01-31)
-                    .replace("d", "%-d")     // Day (1-31)
-                    .replace("HH", "%H")     // Hour 24h (00-23)
-                    .replace("H", "%-H")     // Hour 24h (0-23)
-                    .replace("hh", "%I")     // Hour 12h (01-12)
-                    .replace("h", "%-I")     // Hour 12h (1-12)
-                    .replace("mm", "%M")     // Minutes (00-59)
-                    .replace("ss", "%S")     // Seconds (00-59)
-                    .replace("SSS", "%3f")   // Milliseconds
-                    .replace("a", "%p")      // AM/PM
+                    .replace("yyyy", "%Y") // 4-digit year
+                    .replace("yy", "%y") // 2-digit year
+                    .replace("MM", "%m") // Month (01-12)
+                    .replace("M", "%-m") // Month (1-12)
+                    .replace("dd", "%d") // Day (01-31)
+                    .replace("d", "%-d") // Day (1-31)
+                    .replace("HH", "%H") // Hour 24h (00-23)
+                    .replace("H", "%-H") // Hour 24h (0-23)
+                    .replace("hh", "%I") // Hour 12h (01-12)
+                    .replace("h", "%-I") // Hour 12h (1-12)
+                    .replace("mm", "%M") // Minutes (00-59)
+                    .replace("ss", "%S") // Seconds (00-59)
+                    .replace("SSS", "%3f") // Milliseconds
+                    .replace("a", "%p") // AM/PM
             }
 
             let result: TimestampMicrosecondArray = (0..str_arr.len())
@@ -3935,11 +3955,9 @@ fn evaluate_scalar_func(
             Ok(Arc::new(result))
         }
 
-        ScalarFunction::ParseDuration => {
-            Err(QueryError::NotImplemented(
-                "PARSE_DURATION not fully implemented".into(),
-            ))
-        }
+        ScalarFunction::ParseDuration => Err(QueryError::NotImplemented(
+            "PARSE_DURATION not fully implemented".into(),
+        )),
 
         ScalarFunction::HumanReadableSeconds => {
             let arr = evaluated_args.first().ok_or_else(|| {
@@ -3949,22 +3967,20 @@ fn evaluate_scalar_func(
 
             let result: StringArray = float_arr
                 .iter()
-                .map(|opt| {
-                    match opt {
-                        Some(secs) => {
-                            let s = *secs;
-                            if s < 60.0 {
-                                Some(format!("{:.2} seconds", s))
-                            } else if s < 3600.0 {
-                                Some(format!("{:.2} minutes", s / 60.0))
-                            } else if s < 86400.0 {
-                                Some(format!("{:.2} hours", s / 3600.0))
-                            } else {
-                                Some(format!("{:.2} days", s / 86400.0))
-                            }
+                .map(|opt| match opt {
+                    Some(secs) => {
+                        let s = *secs;
+                        if s < 60.0 {
+                            Some(format!("{:.2} seconds", s))
+                        } else if s < 3600.0 {
+                            Some(format!("{:.2} minutes", s / 60.0))
+                        } else if s < 86400.0 {
+                            Some(format!("{:.2} hours", s / 3600.0))
+                        } else {
+                            Some(format!("{:.2} days", s / 86400.0))
                         }
-                        None => None,
                     }
+                    None => None,
                 })
                 .collect();
             Ok(Arc::new(result))
@@ -3981,7 +3997,9 @@ fn evaluate_scalar_func(
             let ts_arr = evaluated_args[0]
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
-                .ok_or_else(|| QueryError::Type("AT_TIMEZONE requires timestamp argument".into()))?;
+                .ok_or_else(|| {
+                    QueryError::Type("AT_TIMEZONE requires timestamp argument".into())
+                })?;
             let tz_arr = evaluated_args[1]
                 .as_any()
                 .downcast_ref::<StringArray>()
@@ -4026,7 +4044,9 @@ fn evaluate_scalar_func(
             let ts_arr = evaluated_args[0]
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
-                .ok_or_else(|| QueryError::Type("WITH_TIMEZONE requires timestamp argument".into()))?;
+                .ok_or_else(|| {
+                    QueryError::Type("WITH_TIMEZONE requires timestamp argument".into())
+                })?;
 
             // For simplicity, just return the timestamp unchanged
             // The timezone would be associated as metadata in a full implementation
@@ -4044,16 +4064,18 @@ fn evaluate_scalar_func(
         // ========== NEW CONDITIONAL/FORMATTING FUNCTIONS ==========
         ScalarFunction::TryCast => {
             // For now, just return the input (actual casting requires type info)
-            evaluated_args.first().cloned().ok_or_else(|| {
-                QueryError::InvalidArgument("TRY_CAST requires 1 argument".into())
-            })
+            evaluated_args
+                .first()
+                .cloned()
+                .ok_or_else(|| QueryError::InvalidArgument("TRY_CAST requires 1 argument".into()))
         }
 
         ScalarFunction::Try => {
             // For now, just return the input
-            evaluated_args.first().cloned().ok_or_else(|| {
-                QueryError::InvalidArgument("TRY requires 1 argument".into())
-            })
+            evaluated_args
+                .first()
+                .cloned()
+                .ok_or_else(|| QueryError::InvalidArgument("TRY requires 1 argument".into()))
         }
 
         ScalarFunction::Format => {
@@ -4080,12 +4102,25 @@ fn evaluate_scalar_func(
 
                     // Replace %s, %d, %f with corresponding arguments
                     for (arg_idx, arg) in evaluated_args.iter().skip(1).enumerate() {
-                        let value = if let Some(s_arr) = arg.as_any().downcast_ref::<StringArray>() {
-                            if s_arr.is_null(i) { "null".to_string() } else { s_arr.value(i).to_string() }
+                        let value = if let Some(s_arr) = arg.as_any().downcast_ref::<StringArray>()
+                        {
+                            if s_arr.is_null(i) {
+                                "null".to_string()
+                            } else {
+                                s_arr.value(i).to_string()
+                            }
                         } else if let Some(i_arr) = arg.as_any().downcast_ref::<Int64Array>() {
-                            if i_arr.is_null(i) { "null".to_string() } else { i_arr.value(i).to_string() }
+                            if i_arr.is_null(i) {
+                                "null".to_string()
+                            } else {
+                                i_arr.value(i).to_string()
+                            }
                         } else if let Some(f_arr) = arg.as_any().downcast_ref::<Float64Array>() {
-                            if f_arr.is_null(i) { "null".to_string() } else { format!("{}", f_arr.value(i)) }
+                            if f_arr.is_null(i) {
+                                "null".to_string()
+                            } else {
+                                format!("{}", f_arr.value(i))
+                            }
                         } else {
                             "?".to_string()
                         };
@@ -4125,7 +4160,11 @@ fn evaluate_scalar_func(
 
                 // Add thousands separators
                 let negative = int_part.starts_with('-');
-                let digits: String = if negative { int_part[1..].to_string() } else { int_part.to_string() };
+                let digits: String = if negative {
+                    int_part[1..].to_string()
+                } else {
+                    int_part.to_string()
+                };
                 let mut with_sep = String::new();
                 for (i, c) in digits.chars().rev().enumerate() {
                     if i > 0 && i % 3 == 0 {
@@ -4157,9 +4196,7 @@ fn evaluate_scalar_func(
                             return None;
                         }
                         let n = f_arr.value(i);
-                        let dec = decimals
-                            .and_then(|d| get_int_value(d, i))
-                            .unwrap_or(0) as usize;
+                        let dec = decimals.and_then(|d| get_int_value(d, i)).unwrap_or(0) as usize;
                         Some(format_with_separators(n, dec))
                     })
                     .collect();
@@ -4173,16 +4210,16 @@ fn evaluate_scalar_func(
                             return None;
                         }
                         let n = i_arr.value(i) as f64;
-                        let dec = decimals
-                            .and_then(|d| get_int_value(d, i))
-                            .unwrap_or(0) as usize;
+                        let dec = decimals.and_then(|d| get_int_value(d, i)).unwrap_or(0) as usize;
                         Some(format_with_separators(n, dec))
                     })
                     .collect();
                 return Ok(Arc::new(result));
             }
 
-            Err(QueryError::Type("FORMAT_NUMBER requires numeric argument".into()))
+            Err(QueryError::Type(
+                "FORMAT_NUMBER requires numeric argument".into(),
+            ))
         }
 
         ScalarFunction::ParseDataSize => {
@@ -4199,15 +4236,31 @@ fn evaluate_scalar_func(
                     opt.and_then(|s| {
                         let s = s.trim().to_uppercase();
                         if s.ends_with("TB") {
-                            s[..s.len()-2].trim().parse::<f64>().ok().map(|v| (v * 1024.0 * 1024.0 * 1024.0 * 1024.0) as i64)
+                            s[..s.len() - 2]
+                                .trim()
+                                .parse::<f64>()
+                                .ok()
+                                .map(|v| (v * 1024.0 * 1024.0 * 1024.0 * 1024.0) as i64)
                         } else if s.ends_with("GB") {
-                            s[..s.len()-2].trim().parse::<f64>().ok().map(|v| (v * 1024.0 * 1024.0 * 1024.0) as i64)
+                            s[..s.len() - 2]
+                                .trim()
+                                .parse::<f64>()
+                                .ok()
+                                .map(|v| (v * 1024.0 * 1024.0 * 1024.0) as i64)
                         } else if s.ends_with("MB") {
-                            s[..s.len()-2].trim().parse::<f64>().ok().map(|v| (v * 1024.0 * 1024.0) as i64)
+                            s[..s.len() - 2]
+                                .trim()
+                                .parse::<f64>()
+                                .ok()
+                                .map(|v| (v * 1024.0 * 1024.0) as i64)
                         } else if s.ends_with("KB") {
-                            s[..s.len()-2].trim().parse::<f64>().ok().map(|v| (v * 1024.0) as i64)
+                            s[..s.len() - 2]
+                                .trim()
+                                .parse::<f64>()
+                                .ok()
+                                .map(|v| (v * 1024.0) as i64)
                         } else if s.ends_with("B") {
-                            s[..s.len()-1].trim().parse::<i64>().ok()
+                            s[..s.len() - 1].trim().parse::<i64>().ok()
                         } else {
                             s.parse::<i64>().ok()
                         }
@@ -4234,7 +4287,9 @@ fn evaluate_scalar_func(
             let pattern_arr = evaluated_args[1]
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| QueryError::Type("REGEXP_EXTRACT_ALL requires string pattern".into()))?;
+                .ok_or_else(|| {
+                    QueryError::Type("REGEXP_EXTRACT_ALL requires string pattern".into())
+                })?;
 
             let result: StringArray = (0..str_arr.len())
                 .map(|i| {
@@ -4245,7 +4300,8 @@ fn evaluate_scalar_func(
                         let pattern = pattern_arr.value(i);
                         match regex::Regex::new(pattern) {
                             Ok(re) => {
-                                let matches: Vec<&str> = re.find_iter(s).map(|m| m.as_str()).collect();
+                                let matches: Vec<&str> =
+                                    re.find_iter(s).map(|m| m.as_str()).collect();
                                 Some(matches.join(","))
                             }
                             Err(_) => None,
@@ -4271,7 +4327,9 @@ fn evaluate_scalar_func(
             let pattern_arr = evaluated_args[1]
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| QueryError::Type("REGEXP_POSITION requires string pattern".into()))?;
+                .ok_or_else(|| {
+                    QueryError::Type("REGEXP_POSITION requires string pattern".into())
+                })?;
 
             let result: Int64Array = (0..str_arr.len())
                 .map(|i| {
@@ -4366,9 +4424,10 @@ fn evaluate_scalar_func(
             let arr = evaluated_args.first().ok_or_else(|| {
                 QueryError::InvalidArgument("FROM_BASE32 requires 1 argument".into())
             })?;
-            let str_arr = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                QueryError::Type("FROM_BASE32 requires string argument".into())
-            })?;
+            let str_arr = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("FROM_BASE32 requires string argument".into()))?;
 
             let result: BinaryArray = str_arr
                 .iter()
@@ -4403,9 +4462,9 @@ fn evaluate_scalar_func(
 
         ScalarFunction::Xxhash64 => {
             use xxhash_rust::xxh64::xxh64;
-            let arr = evaluated_args
-                .first()
-                .ok_or_else(|| QueryError::InvalidArgument("XXHASH64 requires 1 argument".into()))?;
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("XXHASH64 requires 1 argument".into())
+            })?;
 
             if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
                 let result: Int64Array = str_arr
@@ -4426,14 +4485,17 @@ fn evaluate_scalar_func(
             ))
         }
 
-        ScalarFunction::Murmur3 | ScalarFunction::SpookyHashV2_32 | ScalarFunction::SpookyHashV2_64 => {
-            Err(QueryError::NotImplemented(format!(
-                "Hash function {:?} not implemented",
-                func
-            )))
-        }
+        ScalarFunction::Murmur3
+        | ScalarFunction::SpookyHashV2_32
+        | ScalarFunction::SpookyHashV2_64 => Err(QueryError::NotImplemented(format!(
+            "Hash function {:?} not implemented",
+            func
+        ))),
 
-        ScalarFunction::HmacMd5 | ScalarFunction::HmacSha1 | ScalarFunction::HmacSha256 | ScalarFunction::HmacSha512 => {
+        ScalarFunction::HmacMd5
+        | ScalarFunction::HmacSha1
+        | ScalarFunction::HmacSha256
+        | ScalarFunction::HmacSha512 => {
             use hmac::{Hmac, Mac};
 
             if evaluated_args.len() < 2 {
@@ -4544,7 +4606,9 @@ fn evaluate_scalar_func(
                 .map(|opt| {
                     opt.and_then(|b| {
                         if b.len() >= 8 {
-                            Some(i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+                            Some(i64::from_be_bytes([
+                                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                            ]))
                         } else {
                             None
                         }
@@ -4596,9 +4660,10 @@ fn evaluate_scalar_func(
             let arr = evaluated_args.first().ok_or_else(|| {
                 QueryError::InvalidArgument("TO_IEEE754_32 requires 1 argument".into())
             })?;
-            let float_arr = arr.as_any().downcast_ref::<Float32Array>().ok_or_else(|| {
-                QueryError::Type("TO_IEEE754_32 requires float argument".into())
-            })?;
+            let float_arr = arr
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| QueryError::Type("TO_IEEE754_32 requires float argument".into()))?;
 
             let result: BinaryArray = float_arr
                 .iter()
@@ -4620,7 +4685,9 @@ fn evaluate_scalar_func(
                 .map(|opt| {
                     opt.and_then(|b| {
                         if b.len() >= 8 {
-                            Some(f64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+                            Some(f64::from_be_bytes([
+                                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                            ]))
                         } else {
                             None
                         }
@@ -4634,9 +4701,10 @@ fn evaluate_scalar_func(
             let arr = evaluated_args.first().ok_or_else(|| {
                 QueryError::InvalidArgument("TO_IEEE754_64 requires 1 argument".into())
             })?;
-            let float_arr = arr.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
-                QueryError::Type("TO_IEEE754_64 requires float argument".into())
-            })?;
+            let float_arr = arr
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| QueryError::Type("TO_IEEE754_64 requires float argument".into()))?;
 
             let result: BinaryArray = float_arr
                 .iter()
@@ -4655,11 +4723,15 @@ fn evaluate_scalar_func(
             let left = evaluated_args[0]
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| QueryError::Type("BITWISE_LEFT_SHIFT requires integer arguments".into()))?;
+                .ok_or_else(|| {
+                    QueryError::Type("BITWISE_LEFT_SHIFT requires integer arguments".into())
+                })?;
             let right = evaluated_args[1]
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| QueryError::Type("BITWISE_LEFT_SHIFT requires integer arguments".into()))?;
+                .ok_or_else(|| {
+                    QueryError::Type("BITWISE_LEFT_SHIFT requires integer arguments".into())
+                })?;
 
             let result: Int64Array = left
                 .iter()
@@ -4681,11 +4753,15 @@ fn evaluate_scalar_func(
             let left = evaluated_args[0]
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| QueryError::Type("BITWISE_RIGHT_SHIFT requires integer arguments".into()))?;
+                .ok_or_else(|| {
+                    QueryError::Type("BITWISE_RIGHT_SHIFT requires integer arguments".into())
+                })?;
             let right = evaluated_args[1]
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| QueryError::Type("BITWISE_RIGHT_SHIFT requires integer arguments".into()))?;
+                .ok_or_else(|| {
+                    QueryError::Type("BITWISE_RIGHT_SHIFT requires integer arguments".into())
+                })?;
 
             let result: Int64Array = left
                 .iter()
@@ -4707,11 +4783,19 @@ fn evaluate_scalar_func(
             let left = evaluated_args[0]
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| QueryError::Type("BITWISE_RIGHT_SHIFT_ARITHMETIC requires integer arguments".into()))?;
+                .ok_or_else(|| {
+                    QueryError::Type(
+                        "BITWISE_RIGHT_SHIFT_ARITHMETIC requires integer arguments".into(),
+                    )
+                })?;
             let right = evaluated_args[1]
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| QueryError::Type("BITWISE_RIGHT_SHIFT_ARITHMETIC requires integer arguments".into()))?;
+                .ok_or_else(|| {
+                    QueryError::Type(
+                        "BITWISE_RIGHT_SHIFT_ARITHMETIC requires integer arguments".into(),
+                    )
+                })?;
 
             let result: Int64Array = left
                 .iter()
@@ -4755,11 +4839,15 @@ fn evaluate_scalar_func(
             let url_arr = evaluated_args[0]
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| QueryError::Type("URL_EXTRACT_PARAMETER requires string URL".into()))?;
+                .ok_or_else(|| {
+                    QueryError::Type("URL_EXTRACT_PARAMETER requires string URL".into())
+                })?;
             let param_arr = evaluated_args[1]
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| QueryError::Type("URL_EXTRACT_PARAMETER requires string parameter name".into()))?;
+                .ok_or_else(|| {
+                    QueryError::Type("URL_EXTRACT_PARAMETER requires string parameter name".into())
+                })?;
 
             let result: StringArray = (0..url_arr.len())
                 .map(|i| {
@@ -4791,9 +4879,7 @@ fn evaluate_scalar_func(
 
         ScalarFunction::Rand => {
             let num_rows = batch.num_rows();
-            let result: Float64Array = (0..num_rows)
-                .map(|_| Some(rand::random::<f64>()))
-                .collect();
+            let result: Float64Array = (0..num_rows).map(|_| Some(rand::random::<f64>())).collect();
             Ok(Arc::new(result))
         }
 
@@ -4836,11 +4922,15 @@ fn evaluate_scalar_func(
             let json_arr = evaluated_args[0]
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| QueryError::Type("JSON_EXTRACT_SCALAR requires string JSON".into()))?;
+                .ok_or_else(|| {
+                    QueryError::Type("JSON_EXTRACT_SCALAR requires string JSON".into())
+                })?;
             let path_arr = evaluated_args[1]
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| QueryError::Type("JSON_EXTRACT_SCALAR requires string path".into()))?;
+                .ok_or_else(|| {
+                    QueryError::Type("JSON_EXTRACT_SCALAR requires string path".into())
+                })?;
 
             let result: StringArray = (0..json_arr.len())
                 .map(|i| {
@@ -4888,7 +4978,9 @@ fn evaluate_scalar_func(
         ScalarFunction::JsonArrayLength => {
             let json_arr = evaluated_args
                 .first()
-                .ok_or_else(|| QueryError::InvalidArgument("JSON_ARRAY_LENGTH requires 1 argument".into()))?
+                .ok_or_else(|| {
+                    QueryError::InvalidArgument("JSON_ARRAY_LENGTH requires 1 argument".into())
+                })?
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| QueryError::Type("JSON_ARRAY_LENGTH requires string JSON".into()))?;
@@ -4927,7 +5019,9 @@ fn evaluate_scalar_func(
                         let idx = get_int_value(idx_arr, i).unwrap_or(0) as usize;
                         serde_json::from_str::<serde_json::Value>(json_str)
                             .ok()
-                            .and_then(|v| v.as_array().and_then(|a| a.get(idx).map(|e| e.to_string())))
+                            .and_then(|v| {
+                                v.as_array().and_then(|a| a.get(idx).map(|e| e.to_string()))
+                            })
                     }
                 })
                 .collect();
@@ -4943,7 +5037,9 @@ fn evaluate_scalar_func(
             let json_arr = evaluated_args[0]
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| QueryError::Type("JSON_ARRAY_CONTAINS requires string JSON".into()))?;
+                .ok_or_else(|| {
+                    QueryError::Type("JSON_ARRAY_CONTAINS requires string JSON".into())
+                })?;
             let value_arr = &evaluated_args[1];
 
             let result: BooleanArray = (0..json_arr.len())
@@ -4963,7 +5059,9 @@ fn evaluate_scalar_func(
         ScalarFunction::IsJsonScalar => {
             let json_arr = evaluated_args
                 .first()
-                .ok_or_else(|| QueryError::InvalidArgument("IS_JSON_SCALAR requires 1 argument".into()))?
+                .ok_or_else(|| {
+                    QueryError::InvalidArgument("IS_JSON_SCALAR requires 1 argument".into())
+                })?
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| QueryError::Type("IS_JSON_SCALAR requires string JSON".into()))?;
@@ -4985,7 +5083,9 @@ fn evaluate_scalar_func(
         ScalarFunction::JsonFormat => {
             let json_arr = evaluated_args
                 .first()
-                .ok_or_else(|| QueryError::InvalidArgument("JSON_FORMAT requires 1 argument".into()))?
+                .ok_or_else(|| {
+                    QueryError::InvalidArgument("JSON_FORMAT requires 1 argument".into())
+                })?
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| QueryError::Type("JSON_FORMAT requires string JSON".into()))?;
@@ -4996,7 +5096,10 @@ fn evaluate_scalar_func(
                     opt.and_then(|json_str| {
                         serde_json::from_str::<serde_json::Value>(json_str)
                             .ok()
-                            .map(|v| serde_json::to_string_pretty(&v).unwrap_or_else(|_| json_str.to_string()))
+                            .map(|v| {
+                                serde_json::to_string_pretty(&v)
+                                    .unwrap_or_else(|_| json_str.to_string())
+                            })
                     })
                 })
                 .collect();
@@ -5007,7 +5110,9 @@ fn evaluate_scalar_func(
             // JSON_PARSE validates and returns the JSON string
             let str_arr = evaluated_args
                 .first()
-                .ok_or_else(|| QueryError::InvalidArgument("JSON_PARSE requires 1 argument".into()))?
+                .ok_or_else(|| {
+                    QueryError::InvalidArgument("JSON_PARSE requires 1 argument".into())
+                })?
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| QueryError::Type("JSON_PARSE requires string argument".into()))?;
@@ -5376,9 +5481,7 @@ fn levenshtein_distance(s1: &str, s2: &str) -> usize {
             } else {
                 1
             };
-            curr[j] = (prev[j] + 1)
-                .min(curr[j - 1] + 1)
-                .min(prev[j - 1] + cost);
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -5537,7 +5640,10 @@ fn json_exists_impl(json_str: &str, path: &str) -> bool {
 }
 
 /// Navigate a JSON path like "$.key[0].nested"
-fn navigate_json_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+fn navigate_json_path<'a>(
+    value: &'a serde_json::Value,
+    path: &str,
+) -> Option<&'a serde_json::Value> {
     let path = path.trim();
 
     // Handle root reference

@@ -175,7 +175,8 @@ impl PhysicalOperator for HashAggregateExec {
         }
 
         // Build hash table from all collected batches
-        let result = aggregate_batches(&all_batches, &self.group_by, &self.aggregates, &self.schema)?;
+        let result =
+            aggregate_batches(&all_batches, &self.group_by, &self.aggregates, &self.schema)?;
 
         Ok(Box::pin(stream::once(async { Ok(result) })))
     }
@@ -292,27 +293,27 @@ struct AccumulatorState {
     bool_and: Option<bool>,
     bool_or: Option<bool>,
     // New aggregate states
-    count_if: i64,                    // For COUNT_IF
-    any_value: Option<GroupValue>,    // For ANY_VALUE/ARBITRARY
-    log_sum: f64,                     // For GEOMETRIC_MEAN (sum of logs)
-    log_count: i64,                   // For GEOMETRIC_MEAN (count for log)
-    bitwise_and: Option<i64>,         // For BITWISE_AND_AGG
-    bitwise_or: Option<i64>,          // For BITWISE_OR_AGG
-    bitwise_xor: i64,                 // For BITWISE_XOR_AGG
-    string_list: Vec<String>,         // For LISTAGG
+    count_if: i64,                 // For COUNT_IF
+    any_value: Option<GroupValue>, // For ANY_VALUE/ARBITRARY
+    log_sum: f64,                  // For GEOMETRIC_MEAN (sum of logs)
+    log_count: i64,                // For GEOMETRIC_MEAN (count for log)
+    bitwise_and: Option<i64>,      // For BITWISE_AND_AGG
+    bitwise_or: Option<i64>,       // For BITWISE_OR_AGG
+    bitwise_xor: i64,              // For BITWISE_XOR_AGG
+    string_list: Vec<String>,      // For LISTAGG
     // Correlation/covariance states
-    sum_x: f64,                       // For correlation
-    sum_y: f64,                       // For correlation
-    sum_xy: f64,                      // For correlation
-    sum_x_squares: f64,               // For correlation
-    sum_y_squares: f64,               // For correlation
+    sum_x: f64,         // For correlation
+    sum_y: f64,         // For correlation
+    sum_xy: f64,        // For correlation
+    sum_x_squares: f64, // For correlation
+    sum_y_squares: f64, // For correlation
     // For kurtosis/skewness
-    sum_cubes: f64,                   // Sum of (x - mean)^3
-    sum_fourth: f64,                  // Sum of (x - mean)^4
+    sum_cubes: f64,  // Sum of (x - mean)^3
+    sum_fourth: f64, // Sum of (x - mean)^4
     // For max_by/min_by
-    max_by_value: Option<f64>,        // The max value of the second arg
+    max_by_value: Option<f64>,         // The max value of the second arg
     max_by_result: Option<GroupValue>, // The value to return
-    min_by_value: Option<f64>,        // The min value of the second arg
+    min_by_value: Option<f64>,         // The min value of the second arg
     min_by_result: Option<GroupValue>, // The value to return
     // Approximate percentile - stores values for sorting
     approx_values: Vec<f64>,
@@ -595,7 +596,9 @@ fn aggregate_scalar_simd(
                 let count = a.iter().flatten().filter(|v| *v).count();
                 Arc::new(Int64Array::from(vec![count as i64]))
             } else {
-                return Err(QueryError::Type("COUNT_IF requires boolean argument".into()));
+                return Err(QueryError::Type(
+                    "COUNT_IF requires boolean argument".into(),
+                ));
             }
         }
         AggregateFunction::AnyValue | AggregateFunction::Arbitrary => {
@@ -636,7 +639,12 @@ fn aggregate_scalar_simd(
                     Arc::new(Float64Array::from(vec![geom_mean]))
                 }
             } else if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
-                let values: Vec<f64> = a.iter().flatten().map(|v| v as f64).filter(|v| *v > 0.0).collect();
+                let values: Vec<f64> = a
+                    .iter()
+                    .flatten()
+                    .map(|v| v as f64)
+                    .filter(|v| *v > 0.0)
+                    .collect();
                 if values.is_empty() {
                     Arc::new(Float64Array::from(vec![Option::<f64>::None]))
                 } else {
@@ -667,9 +675,10 @@ fn aggregate_scalar_simd(
         }
         AggregateFunction::BitwiseAndAgg => {
             if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
-                let result = a.iter().flatten().fold(None, |acc: Option<i64>, v| {
-                    Some(acc.map_or(v, |a| a & v))
-                });
+                let result = a
+                    .iter()
+                    .flatten()
+                    .fold(None, |acc: Option<i64>, v| Some(acc.map_or(v, |a| a & v)));
                 match result {
                     Some(v) => Arc::new(Int64Array::from(vec![v])),
                     None => Arc::new(Int64Array::from(vec![Option::<i64>::None])),
@@ -683,9 +692,10 @@ fn aggregate_scalar_simd(
         }
         AggregateFunction::BitwiseOrAgg => {
             if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
-                let result = a.iter().flatten().fold(None, |acc: Option<i64>, v| {
-                    Some(acc.map_or(v, |a| a | v))
-                });
+                let result = a
+                    .iter()
+                    .flatten()
+                    .fold(None, |acc: Option<i64>, v| Some(acc.map_or(v, |a| a | v)));
                 match result {
                     Some(v) => Arc::new(Int64Array::from(vec![v])),
                     None => Arc::new(Int64Array::from(vec![Option::<i64>::None])),
@@ -814,7 +824,11 @@ fn aggregate_scalar_simd(
                 let set: std::collections::HashSet<_> = a.iter().flatten().collect();
                 set.len() as i64
             } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
-                let set: std::collections::HashSet<_> = a.iter().flatten().map(|v| ordered_float::OrderedFloat(v)).collect();
+                let set: std::collections::HashSet<_> = a
+                    .iter()
+                    .flatten()
+                    .map(|v| ordered_float::OrderedFloat(v))
+                    .collect();
                 set.len() as i64
             } else {
                 return Err(QueryError::NotImplemented(format!(
@@ -835,9 +849,10 @@ fn aggregate_scalar_simd(
         | AggregateFunction::RegrAvgy
         | AggregateFunction::MaxBy
         | AggregateFunction::MinBy => {
-            return Err(QueryError::NotImplemented(
-                format!("{:?} requires two arguments and is not supported in SIMD aggregation", aggregate.func)
-            ));
+            return Err(QueryError::NotImplemented(format!(
+                "{:?} requires two arguments and is not supported in SIMD aggregation",
+                aggregate.func
+            )));
         }
     };
 

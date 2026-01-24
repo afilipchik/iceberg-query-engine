@@ -197,7 +197,11 @@ impl StreamingParquetReader {
     }
 
     /// Create from a ParquetTable
-    pub fn from_table(table: &ParquetTable, projection: Option<Vec<usize>>, batch_size: usize) -> Self {
+    pub fn from_table(
+        table: &ParquetTable,
+        projection: Option<Vec<usize>>,
+        batch_size: usize,
+    ) -> Self {
         Self::new(
             table.files.clone(),
             table.schema.clone(),
@@ -315,11 +319,7 @@ impl ParquetFileInfo {
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
         let metadata = builder.metadata().clone();
 
-        let num_rows = metadata
-            .row_groups()
-            .iter()
-            .map(|rg| rg.num_rows())
-            .sum();
+        let num_rows = metadata.row_groups().iter().map(|rg| rg.num_rows()).sum();
 
         Ok(Self {
             path,
@@ -385,12 +385,7 @@ impl StreamingParquetScanBuilder {
 
     /// Build the streaming reader
     pub fn build(self) -> StreamingParquetReader {
-        StreamingParquetReader::new(
-            self.files,
-            self.schema,
-            self.projection,
-            self.batch_size,
-        )
+        StreamingParquetReader::new(self.files, self.schema, self.projection, self.batch_size)
     }
 
     /// Build and convert to stream

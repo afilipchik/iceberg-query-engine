@@ -30,13 +30,8 @@ fn create_sample_batch() -> RecordBatch {
         Some("Eve"),
     ]);
     let amount_array = Float64Array::from(vec![100.50, 200.75, 50.25, 1000.00, 75.50]);
-    let active_array = BooleanArray::from(vec![
-        Some(true),
-        Some(false),
-        Some(true),
-        None,
-        Some(true),
-    ]);
+    let active_array =
+        BooleanArray::from(vec![Some(true), Some(false), Some(true), None, Some(true)]);
 
     RecordBatch::try_new(
         schema,
@@ -63,11 +58,47 @@ fn test_batch_creation() {
 fn test_sql_keywords_comprehensive() {
     // Common SQL keywords that should be supported
     let expected_keywords = vec![
-        "SELECT", "FROM", "WHERE", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER",
-        "GROUP", "BY", "HAVING", "ORDER", "ASC", "DESC", "LIMIT", "OFFSET",
-        "AND", "OR", "NOT", "IN", "EXISTS", "BETWEEN", "LIKE", "IS", "NULL",
-        "COUNT", "SUM", "AVG", "MIN", "MAX", "DISTINCT", "AS", "ON",
-        "UNION", "INTERSECT", "EXCEPT", "CASE", "WHEN", "THEN", "ELSE", "END",
+        "SELECT",
+        "FROM",
+        "WHERE",
+        "JOIN",
+        "LEFT",
+        "RIGHT",
+        "INNER",
+        "OUTER",
+        "GROUP",
+        "BY",
+        "HAVING",
+        "ORDER",
+        "ASC",
+        "DESC",
+        "LIMIT",
+        "OFFSET",
+        "AND",
+        "OR",
+        "NOT",
+        "IN",
+        "EXISTS",
+        "BETWEEN",
+        "LIKE",
+        "IS",
+        "NULL",
+        "COUNT",
+        "SUM",
+        "AVG",
+        "MIN",
+        "MAX",
+        "DISTINCT",
+        "AS",
+        "ON",
+        "UNION",
+        "INTERSECT",
+        "EXCEPT",
+        "CASE",
+        "WHEN",
+        "THEN",
+        "ELSE",
+        "END",
     ];
 
     // These keywords are defined in cli/helper.rs - this test ensures they exist
@@ -79,9 +110,11 @@ fn test_sql_keywords_comprehensive() {
             "FROM" => "SELECT 1 FROM t".to_string(),
             "WHERE" => "SELECT 1 FROM t WHERE 1=1".to_string(),
             "JOIN" | "INNER" | "LEFT" | "RIGHT" | "OUTER" => {
-                format!("SELECT 1 FROM t {} JOIN s ON t.id = s.id",
-                    if keyword == "JOIN" { "" } else { keyword })
-            },
+                format!(
+                    "SELECT 1 FROM t {} JOIN s ON t.id = s.id",
+                    if keyword == "JOIN" { "" } else { keyword }
+                )
+            }
             "GROUP" | "BY" => "SELECT 1 FROM t GROUP BY id".to_string(),
             "HAVING" => "SELECT COUNT(*) FROM t GROUP BY id HAVING COUNT(*) > 1".to_string(),
             "ORDER" => "SELECT 1 FROM t ORDER BY id".to_string(),
@@ -97,7 +130,7 @@ fn test_sql_keywords_comprehensive() {
             "IS" | "NULL" => "SELECT 1 FROM t WHERE name IS NULL".to_string(),
             "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" => {
                 format!("SELECT {}(id) FROM t", keyword)
-            },
+            }
             "DISTINCT" => "SELECT DISTINCT id FROM t".to_string(),
             "AS" => "SELECT id AS my_id FROM t".to_string(),
             "ON" => "SELECT 1 FROM t JOIN s ON t.id = s.id".to_string(),
@@ -106,12 +139,16 @@ fn test_sql_keywords_comprehensive() {
             "EXCEPT" => "SELECT 1 EXCEPT SELECT 2".to_string(),
             "CASE" | "WHEN" | "THEN" | "ELSE" | "END" => {
                 "SELECT CASE WHEN 1=1 THEN 'yes' ELSE 'no' END".to_string()
-            },
+            }
             _ => format!("SELECT 1 -- {}", keyword),
         };
 
         // Just verify the query string is valid (non-empty)
-        assert!(!query.is_empty(), "No query generated for keyword: {}", keyword);
+        assert!(
+            !query.is_empty(),
+            "No query generated for keyword: {}",
+            keyword
+        );
     }
 }
 
@@ -119,22 +156,23 @@ fn test_sql_keywords_comprehensive() {
 #[test]
 fn test_dot_commands() {
     let dot_commands = vec![
-        ".help", ".h",
-        ".quit", ".exit", ".q",
-        ".tables",
-        ".schema",
-        ".load",
-        ".tpch",
-        ".mode",
+        ".help", ".h", ".quit", ".exit", ".q", ".tables", ".schema", ".load", ".tpch", ".mode",
         ".format",
     ];
 
     for cmd in &dot_commands {
-        assert!(cmd.starts_with('.'), "Dot command should start with '.': {}", cmd);
+        assert!(
+            cmd.starts_with('.'),
+            "Dot command should start with '.': {}",
+            cmd
+        );
     }
 
     // Verify we have the minimum expected commands
-    assert!(dot_commands.len() >= 10, "Should have at least 10 dot commands");
+    assert!(
+        dot_commands.len() >= 10,
+        "Should have at least 10 dot commands"
+    );
 }
 
 /// Test output format names
@@ -153,29 +191,26 @@ fn test_output_format_names() {
 fn test_csv_escaping_rules() {
     // Values that need escaping in CSV
     let needs_quoting = vec![
-        "hello, world",     // Contains comma
-        "say \"hi\"",       // Contains quote
-        "line1\nline2",     // Contains newline
+        "hello, world", // Contains comma
+        "say \"hi\"",   // Contains quote
+        "line1\nline2", // Contains newline
     ];
 
-    let no_quoting = vec![
-        "hello",
-        "world",
-        "123",
-        "test_value",
-    ];
+    let no_quoting = vec!["hello", "world", "123", "test_value"];
 
     for value in &needs_quoting {
         assert!(
             value.contains(',') || value.contains('"') || value.contains('\n'),
-            "Value should contain special char: {}", value
+            "Value should contain special char: {}",
+            value
         );
     }
 
     for value in &no_quoting {
         assert!(
             !value.contains(',') && !value.contains('"') && !value.contains('\n'),
-            "Value should not contain special char: {}", value
+            "Value should not contain special char: {}",
+            value
         );
     }
 }
@@ -199,7 +234,7 @@ fn test_json_value_types() {
             "string" => assert!(expected.starts_with('"') && expected.ends_with('"')),
             "number_int" | "number_float" => {
                 assert!(expected.chars().next().unwrap().is_ascii_digit() || *expected == "-")
-            },
+            }
             "boolean_true" => assert_eq!(*expected, "true"),
             "boolean_false" => assert_eq!(*expected, "false"),
             "null" => assert_eq!(*expected, "null"),
@@ -216,7 +251,10 @@ fn test_vertical_format_structure() {
 
     // The pattern should contain asterisks
     assert!(separator_pattern.contains('*'));
-    assert!(separator_pattern.len() > 20, "Separator should be visually distinct");
+    assert!(
+        separator_pattern.len() > 20,
+        "Separator should be visually distinct"
+    );
 }
 
 /// Test syntax highlighting ANSI codes
@@ -225,18 +263,26 @@ fn test_ansi_escape_codes() {
     // Standard ANSI escape codes used for highlighting
     let codes = vec![
         ("\x1b[0m", "reset"),
-        ("\x1b[1;34m", "bold blue"),   // keywords
-        ("\x1b[32m", "green"),          // strings
-        ("\x1b[35m", "magenta"),        // numbers
-        ("\x1b[36m", "cyan"),           // dot commands
-        ("\x1b[33m", "yellow"),         // functions
-        ("\x1b[2;37m", "dim gray"),     // hints
-        ("\x1b[1;36m", "bold cyan"),    // prompt
+        ("\x1b[1;34m", "bold blue"), // keywords
+        ("\x1b[32m", "green"),       // strings
+        ("\x1b[35m", "magenta"),     // numbers
+        ("\x1b[36m", "cyan"),        // dot commands
+        ("\x1b[33m", "yellow"),      // functions
+        ("\x1b[2;37m", "dim gray"),  // hints
+        ("\x1b[1;36m", "bold cyan"), // prompt
     ];
 
     for (code, name) in &codes {
-        assert!(code.starts_with("\x1b["), "ANSI code should start with ESC[: {}", name);
-        assert!(code.ends_with('m'), "ANSI code should end with 'm': {}", name);
+        assert!(
+            code.starts_with("\x1b["),
+            "ANSI code should start with ESC[: {}",
+            name
+        );
+        assert!(
+            code.ends_with('m'),
+            "ANSI code should end with 'm': {}",
+            name
+        );
     }
 }
 
@@ -254,7 +300,11 @@ fn test_completion_contexts() {
 
     for (prefix, expected_context) in &contexts {
         // Just verify the context description is non-empty
-        assert!(!expected_context.is_empty(), "Context should be described for: {}", prefix);
+        assert!(
+            !expected_context.is_empty(),
+            "Context should be described for: {}",
+            prefix
+        );
     }
 }
 
@@ -262,8 +312,7 @@ fn test_completion_contexts() {
 #[test]
 fn test_tpch_table_names() {
     let tpch_tables = vec![
-        "nation", "region", "part", "supplier",
-        "partsupp", "customer", "orders", "lineitem",
+        "nation", "region", "part", "supplier", "partsupp", "customer", "orders", "lineitem",
     ];
 
     for table in &tpch_tables {
@@ -296,9 +345,11 @@ fn test_history_file_path() {
 /// Test that batch with NULL values handles correctly
 #[test]
 fn test_null_handling() {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("nullable_col", DataType::Utf8, true),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "nullable_col",
+        DataType::Utf8,
+        true,
+    )]));
 
     let array = StringArray::from(vec![Some("value"), None, Some("another")]);
     let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
@@ -332,7 +383,8 @@ fn test_numeric_types() {
             Arc::new(Float32Array::from(vec![5.0f32])),
             Arc::new(Float64Array::from(vec![6.0f64])),
         ],
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(batch.num_columns(), 6);
     assert_eq!(batch.num_rows(), 1);
@@ -352,7 +404,8 @@ fn test_column_name_preservation() {
             Arc::new(Int32Array::from(vec![1])),
             Arc::new(StringArray::from(vec!["test"])),
         ],
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(batch.schema().field(0).name(), "my_column");
     assert_eq!(batch.schema().field(1).name(), "another_column");
@@ -361,14 +414,10 @@ fn test_column_name_preservation() {
 /// Test empty batch handling
 #[test]
 fn test_empty_batch() {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
 
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![Arc::new(Int32Array::from(Vec::<i32>::new()))],
-    ).unwrap();
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(Vec::<i32>::new()))]).unwrap();
 
     assert_eq!(batch.num_rows(), 0);
     assert_eq!(batch.num_columns(), 1);
@@ -378,15 +427,10 @@ fn test_empty_batch() {
 #[test]
 fn test_large_batch() {
     let size: usize = 10_000;
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 
     let ids: Vec<i64> = (0..size as i64).collect();
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![Arc::new(Int64Array::from(ids))],
-    ).unwrap();
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(ids))]).unwrap();
 
     assert_eq!(batch.num_rows(), size);
 }
@@ -394,25 +438,24 @@ fn test_large_batch() {
 /// Test special string values in output
 #[test]
 fn test_special_string_values() {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("text", DataType::Utf8, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
 
     let special_values = vec![
-        "",                    // empty string
-        " ",                   // space
-        "\t",                  // tab
-        "hello\nworld",        // newline
-        "say \"hello\"",       // quotes
-        "a,b,c",              // commas
-        "<script>",           // HTML-like
-        "foo\\bar",           // backslash
+        "",              // empty string
+        " ",             // space
+        "\t",            // tab
+        "hello\nworld",  // newline
+        "say \"hello\"", // quotes
+        "a,b,c",         // commas
+        "<script>",      // HTML-like
+        "foo\\bar",      // backslash
     ];
 
     let batch = RecordBatch::try_new(
         schema,
         vec![Arc::new(StringArray::from(special_values.clone()))],
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(batch.num_rows(), special_values.len());
 }
@@ -420,19 +463,19 @@ fn test_special_string_values() {
 /// Test multiple batches handling
 #[test]
 fn test_multiple_batches() {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
 
     let batch1 = RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-    ).unwrap();
+    )
+    .unwrap();
 
     let batch2 = RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
-    ).unwrap();
+    )
+    .unwrap();
 
     let batches = vec![batch1, batch2];
 

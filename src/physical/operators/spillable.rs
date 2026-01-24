@@ -226,12 +226,14 @@ impl SpillableHashJoinExec {
         build_keys: &[Expr],
         spill_dir: &PathBuf,
     ) -> Result<(Vec<Option<BuildPartition>>, Vec<Option<SpilledPartition>>)> {
-        let mut partitions: Vec<Option<BuildPartition>> =
-            (0..NUM_PARTITIONS).map(|_| Some(BuildPartition::new())).collect();
+        let mut partitions: Vec<Option<BuildPartition>> = (0..NUM_PARTITIONS)
+            .map(|_| Some(BuildPartition::new()))
+            .collect();
         let mut spilled: Vec<Option<SpilledPartition>> =
             (0..NUM_PARTITIONS).map(|_| None).collect();
         let mut total_memory: usize = 0;
-        let memory_threshold = (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
+        let memory_threshold =
+            (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
 
         while let Some(batch) = build_stream.try_next().await? {
             let batch_size = estimate_batch_size(&batch);
@@ -368,7 +370,12 @@ impl fmt::Display for SpillableHashJoinExec {
             .iter()
             .map(|(l, r)| format!("{} = {}", l, r))
             .collect();
-        write!(f, "SpillableHashJoin: {} on [{}]", self.join_type, on_str.join(", "))
+        write!(
+            f,
+            "SpillableHashJoin: {} on [{}]",
+            self.join_type,
+            on_str.join(", ")
+        )
     }
 }
 
@@ -444,7 +451,8 @@ impl PhysicalOperator for SpillableHashAggregateExec {
         let result = crate::physical::operators::hash_agg::aggregate_batches_external(
             &batches,
             &self.group_by,
-            &self.aggregates
+            &self
+                .aggregates
                 .iter()
                 .map(|a| crate::physical::operators::hash_agg::AggregateExpr {
                     func: a.func,
@@ -568,7 +576,8 @@ impl ExternalSortExec {
         let mut runs = Vec::new();
         let mut buffer: Vec<RecordBatch> = Vec::new();
         let mut buffer_size: usize = 0;
-        let memory_threshold = (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
+        let memory_threshold =
+            (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
 
         while let Some(batch) = input_stream.try_next().await? {
             let batch_size = estimate_batch_size(&batch);
@@ -673,10 +682,8 @@ fn partition_batch_by_hash(
     key_exprs: &[Expr],
     num_partitions: usize,
 ) -> Result<Vec<Option<RecordBatch>>> {
-    let key_arrays: Result<Vec<ArrayRef>> = key_exprs
-        .iter()
-        .map(|e| evaluate_expr(batch, e))
-        .collect();
+    let key_arrays: Result<Vec<ArrayRef>> =
+        key_exprs.iter().map(|e| evaluate_expr(batch, e)).collect();
     let key_arrays = key_arrays?;
 
     // Compute partition for each row
@@ -697,7 +704,8 @@ fn partition_batch_by_hash(
         if indices.is_empty() {
             result.push(None);
         } else {
-            let indices_arr = UInt32Array::from(indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
+            let indices_arr =
+                UInt32Array::from(indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
             let columns: Result<Vec<ArrayRef>> = batch
                 .columns()
                 .iter()

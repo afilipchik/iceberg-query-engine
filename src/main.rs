@@ -441,7 +441,8 @@ async fn run_repl(tpch_path: Option<PathBuf>) {
             match ctx.register_parquet(*table, &file_path) {
                 Ok(()) => {
                     if let Some(schema) = ctx.table_schema(table) {
-                        let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+                        let columns: Vec<String> =
+                            schema.fields().iter().map(|f| f.name().clone()).collect();
                         println!("  Loaded {}: {} columns", table, columns.len());
                         helper.register_table(table, columns);
                     }
@@ -460,7 +461,7 @@ async fn run_repl(tpch_path: Option<PathBuf>) {
         .expect("valid history size")
         .history_ignore_dups(true)
         .expect("valid history config")
-        .completion_type(rustyline::CompletionType::List)
+        .completion_type(rustyline::CompletionType::Fuzzy)
         .build();
 
     // Create a cloneable helper for the editor
@@ -628,7 +629,8 @@ async fn handle_dot_command(
                 match ctx.register_parquet(name, &path) {
                     Ok(()) => {
                         if let Some(schema) = ctx.table_schema(name) {
-                            let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+                            let columns: Vec<String> =
+                                schema.fields().iter().map(|f| f.name().clone()).collect();
                             println!(
                                 "Loaded '{}' ({} columns) in {:.3}ms\n",
                                 name,
@@ -659,7 +661,8 @@ async fn handle_dot_command(
                     match ctx.register_parquet(*table, &file_path) {
                         Ok(()) => {
                             if let Some(schema) = ctx.table_schema(table) {
-                                let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+                                let columns: Vec<String> =
+                                    schema.fields().iter().map(|f| f.name().clone()).collect();
                                 println!("  Loaded {}: {} columns", table, columns.len());
                                 helper.register_table(table, columns);
                             }
@@ -675,7 +678,10 @@ async fn handle_dot_command(
         ".mode" => {
             if parts.len() < 2 {
                 println!("Current output format: {}", state.formatter.format().name());
-                println!("Available formats: {}", OutputFormat::all_names().join(", "));
+                println!(
+                    "Available formats: {}",
+                    OutputFormat::all_names().join(", ")
+                );
                 println!();
             } else {
                 let format_str = parts[1];
@@ -686,14 +692,20 @@ async fn handle_dot_command(
                     }
                     None => {
                         eprintln!("Unknown format: {}", format_str);
-                        eprintln!("Available formats: {}\n", OutputFormat::all_names().join(", "));
+                        eprintln!(
+                            "Available formats: {}\n",
+                            OutputFormat::all_names().join(", ")
+                        );
                     }
                 }
             }
         }
         ".format" => {
             println!("Current output format: {}", state.formatter.format().name());
-            println!("Available formats: {}\n", OutputFormat::all_names().join(", "));
+            println!(
+                "Available formats: {}\n",
+                OutputFormat::all_names().join(", ")
+            );
         }
         _ => {
             eprintln!(

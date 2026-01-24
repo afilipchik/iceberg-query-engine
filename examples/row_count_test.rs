@@ -1,5 +1,5 @@
-use query_engine::storage::{ParquetTable, StreamingParquetReader};
 use query_engine::physical::operators::TableProvider;
+use query_engine::storage::{ParquetTable, StreamingParquetReader};
 
 fn main() {
     let table = ParquetTable::try_new("/tmp/tpch-1gb/lineitem.parquet").unwrap();

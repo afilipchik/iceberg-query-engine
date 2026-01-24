@@ -288,9 +288,7 @@ impl PhysicalOperator for IcebergScanExec {
         let metadata = self.load_metadata()?;
 
         // Get snapshot ID
-        let snapshot_id = self
-            .snapshot_id
-            .or(metadata.current_snapshot_id);
+        let snapshot_id = self.snapshot_id.or(metadata.current_snapshot_id);
 
         // If no snapshot, return empty stream
         let Some(snapshot_id) = snapshot_id else {
@@ -383,10 +381,13 @@ impl IcebergScanExec {
                         // At least one condition must potentially match
                         self.file_might_match(file, left) || self.file_might_match(file, right)
                     }
-                    _ => self.check_comparison_predicate(file, left, op, right)
+                    _ => self.check_comparison_predicate(file, left, op, right),
                 }
             }
-            Expr::UnaryExpr { op: UnaryOp::Not, expr } => {
+            Expr::UnaryExpr {
+                op: UnaryOp::Not,
+                expr,
+            } => {
                 // Conservative: if we can prove inner always matches, we can skip
                 // For simplicity, always include
                 !self.file_definitely_matches(file, expr)
@@ -413,14 +414,24 @@ impl IcebergScanExec {
         };
 
         // Get column index from schema
-        let col_idx = self.schema.fields().iter().position(|f| f.name() == col_name);
+        let col_idx = self
+            .schema
+            .fields()
+            .iter()
+            .position(|f| f.name() == col_name);
         let Some(col_idx) = col_idx else {
             return true; // Column not in schema, include file
         };
 
         // Get bounds for this column from file statistics
-        let lower_bound = file.lower_bounds.as_ref().and_then(|b| b.get(&(col_idx as i32)));
-        let upper_bound = file.upper_bounds.as_ref().and_then(|b| b.get(&(col_idx as i32)));
+        let lower_bound = file
+            .lower_bounds
+            .as_ref()
+            .and_then(|b| b.get(&(col_idx as i32)));
+        let upper_bound = file
+            .upper_bounds
+            .as_ref()
+            .and_then(|b| b.get(&(col_idx as i32)));
 
         // If no statistics available, include the file
         if lower_bound.is_none() && upper_bound.is_none() {

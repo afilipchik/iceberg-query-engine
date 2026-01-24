@@ -239,11 +239,21 @@ impl OutputFormatter {
                     }
                 }
 
-                writeln!(writer, "*************************** {} ***************************", row_count + 1)?;
+                writeln!(
+                    writer,
+                    "*************************** {} ***************************",
+                    row_count + 1
+                )?;
                 for (col_idx, field_name) in field_names.iter().enumerate() {
                     let col = batch.column(col_idx);
                     let value = self.format_display_value(col, row_idx);
-                    writeln!(writer, "{:>width$}: {}", field_name, value, width = max_name_len)?;
+                    writeln!(
+                        writer,
+                        "{:>width$}: {}",
+                        field_name,
+                        value,
+                        width = max_name_len
+                    )?;
                 }
                 row_count += 1;
             }
@@ -398,12 +408,20 @@ impl OutputFormatter {
                 let arr = array.as_any().downcast_ref::<Date32Array>().unwrap();
                 // Days since epoch
                 let days = arr.value(row);
-                format!("{}", chrono::NaiveDate::from_num_days_from_ce_opt(days + 719163).unwrap_or_default())
+                format!(
+                    "{}",
+                    chrono::NaiveDate::from_num_days_from_ce_opt(days + 719163).unwrap_or_default()
+                )
             }
             DataType::Date64 => {
                 let arr = array.as_any().downcast_ref::<Date64Array>().unwrap();
                 let millis = arr.value(row);
-                format!("{}", chrono::DateTime::from_timestamp_millis(millis).map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default())
+                format!(
+                    "{}",
+                    chrono::DateTime::from_timestamp_millis(millis)
+                        .map(|d| d.format("%Y-%m-%d").to_string())
+                        .unwrap_or_default()
+                )
             }
             DataType::Decimal128(_, scale) => {
                 let arr = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
@@ -412,7 +430,12 @@ impl OutputFormatter {
                     let divisor = 10i128.pow(*scale as u32);
                     let int_part = value / divisor;
                     let frac_part = (value % divisor).abs();
-                    format!("{}.{:0>width$}", int_part, frac_part, width = *scale as usize)
+                    format!(
+                        "{}.{:0>width$}",
+                        int_part,
+                        frac_part,
+                        width = *scale as usize
+                    )
                 } else {
                     value.to_string()
                 }
@@ -468,7 +491,10 @@ mod tests {
         assert_eq!(OutputFormat::from_str("c"), Some(OutputFormat::Csv));
         assert_eq!(OutputFormat::from_str("json"), Some(OutputFormat::Json));
         assert_eq!(OutputFormat::from_str("j"), Some(OutputFormat::Json));
-        assert_eq!(OutputFormat::from_str("vertical"), Some(OutputFormat::Vertical));
+        assert_eq!(
+            OutputFormat::from_str("vertical"),
+            Some(OutputFormat::Vertical)
+        );
         assert_eq!(OutputFormat::from_str("v"), Some(OutputFormat::Vertical));
         assert_eq!(OutputFormat::from_str("invalid"), None);
     }
@@ -487,9 +513,7 @@ mod tests {
 
     #[test]
     fn test_csv_quoting() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("text", DataType::Utf8, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
         let text_array = StringArray::from(vec!["hello, world", "say \"hi\"", "normal"]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(text_array)]).unwrap();
 

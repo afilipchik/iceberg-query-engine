@@ -384,7 +384,10 @@ mod tests {
         assert_eq!(parse_memory_size("1GB").unwrap(), 1024 * 1024 * 1024);
         assert_eq!(parse_memory_size("1G").unwrap(), 1024 * 1024 * 1024);
         assert_eq!(parse_memory_size("512mb").unwrap(), 512 * 1024 * 1024);
-        assert_eq!(parse_memory_size("2.5GB").unwrap(), (2.5 * 1024.0 * 1024.0 * 1024.0) as usize);
+        assert_eq!(
+            parse_memory_size("2.5GB").unwrap(),
+            (2.5 * 1024.0 * 1024.0 * 1024.0) as usize
+        );
     }
 
     #[test]

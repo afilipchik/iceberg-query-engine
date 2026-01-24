@@ -57,13 +57,9 @@ impl ScalarValue {
             ScalarValue::Interval(_) => {
                 ArrowDataType::Interval(arrow::datatypes::IntervalUnit::DayTime)
             }
-            ScalarValue::List(_, elem_type) => {
-                ArrowDataType::List(Arc::new(arrow::datatypes::Field::new(
-                    "item",
-                    elem_type.as_ref().clone(),
-                    true,
-                )))
-            }
+            ScalarValue::List(_, elem_type) => ArrowDataType::List(Arc::new(
+                arrow::datatypes::Field::new("item", elem_type.as_ref().clone(), true),
+            )),
         }
     }
 
@@ -746,7 +742,9 @@ impl fmt::Display for ScalarFunction {
             ScalarFunction::BitCount => write!(f, "BIT_COUNT"),
             ScalarFunction::BitwiseLeftShift => write!(f, "BITWISE_LEFT_SHIFT"),
             ScalarFunction::BitwiseRightShift => write!(f, "BITWISE_RIGHT_SHIFT"),
-            ScalarFunction::BitwiseRightShiftArithmetic => write!(f, "BITWISE_RIGHT_SHIFT_ARITHMETIC"),
+            ScalarFunction::BitwiseRightShiftArithmetic => {
+                write!(f, "BITWISE_RIGHT_SHIFT_ARITHMETIC")
+            }
             // URL
             ScalarFunction::UrlExtractHost => write!(f, "URL_EXTRACT_HOST"),
             ScalarFunction::UrlExtractPath => write!(f, "URL_EXTRACT_PATH"),
@@ -1173,11 +1171,10 @@ impl Expr {
                 AggregateFunction::CountIf | AggregateFunction::RegrCount => {
                     Ok(ArrowDataType::Int64)
                 }
-                AggregateFunction::AnyValue | AggregateFunction::Arbitrary => {
-                    args.first()
-                        .map(|a| a.data_type(schema))
-                        .unwrap_or(Ok(ArrowDataType::Null))
-                }
+                AggregateFunction::AnyValue | AggregateFunction::Arbitrary => args
+                    .first()
+                    .map(|a| a.data_type(schema))
+                    .unwrap_or(Ok(ArrowDataType::Null)),
                 AggregateFunction::GeometricMean
                 | AggregateFunction::Corr
                 | AggregateFunction::CovarPop
@@ -1195,11 +1192,10 @@ impl Expr {
                 | AggregateFunction::BitwiseXorAgg
                 | AggregateFunction::ApproxDistinct => Ok(ArrowDataType::Int64),
                 AggregateFunction::Listagg => Ok(ArrowDataType::Utf8),
-                AggregateFunction::MaxBy | AggregateFunction::MinBy => {
-                    args.first()
-                        .map(|a| a.data_type(schema))
-                        .unwrap_or(Ok(ArrowDataType::Null))
-                }
+                AggregateFunction::MaxBy | AggregateFunction::MinBy => args
+                    .first()
+                    .map(|a| a.data_type(schema))
+                    .unwrap_or(Ok(ArrowDataType::Null)),
             },
             Expr::ScalarFunc { func, args } => {
                 match func {
@@ -1254,9 +1250,10 @@ impl Expr {
                     | ScalarFunction::DateParse
                     | ScalarFunction::ParseDatetime
                     | ScalarFunction::AtTimezone
-                    | ScalarFunction::WithTimezone => Ok(
-                        ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-                    ),
+                    | ScalarFunction::WithTimezone => Ok(ArrowDataType::Timestamp(
+                        arrow::datatypes::TimeUnit::Microsecond,
+                        None,
+                    )),
                     // Date/time functions returning Date32
                     ScalarFunction::CurrentDate
                     | ScalarFunction::FromIso8601Date
@@ -1266,9 +1263,9 @@ impl Expr {
                         ArrowDataType::Time64(arrow::datatypes::TimeUnit::Microsecond),
                     ),
                     // Duration/Interval functions
-                    ScalarFunction::ParseDuration => Ok(
-                        ArrowDataType::Interval(arrow::datatypes::IntervalUnit::DayTime),
-                    ),
+                    ScalarFunction::ParseDuration => Ok(ArrowDataType::Interval(
+                        arrow::datatypes::IntervalUnit::DayTime,
+                    )),
                     // Math functions preserving input type
                     ScalarFunction::Abs
                     | ScalarFunction::Ceil
@@ -1349,9 +1346,7 @@ impl Expr {
                     | ScalarFunction::IsInfinite
                     | ScalarFunction::LuhnCheck => Ok(ArrowDataType::Boolean),
                     // Conditional functions - find first non-null type
-                    ScalarFunction::Coalesce
-                    | ScalarFunction::Greatest
-                    | ScalarFunction::Least => {
+                    ScalarFunction::Coalesce | ScalarFunction::Greatest | ScalarFunction::Least => {
                         // Try to find the first non-null type among arguments
                         for arg in args {
                             let arg_type = arg.data_type(schema)?;
@@ -1455,7 +1450,9 @@ impl Expr {
                     | ScalarFunction::JsonValue
                     | ScalarFunction::JsonObject
                     | ScalarFunction::JsonArray => Ok(ArrowDataType::Utf8),
-                    ScalarFunction::JsonSize | ScalarFunction::JsonArrayLength => Ok(ArrowDataType::Int64),
+                    ScalarFunction::JsonSize | ScalarFunction::JsonArrayLength => {
+                        Ok(ArrowDataType::Int64)
+                    }
                     ScalarFunction::JsonArrayContains
                     | ScalarFunction::IsJsonScalar
                     | ScalarFunction::JsonExists => Ok(ArrowDataType::Boolean),
@@ -1515,21 +1512,15 @@ impl Expr {
                         }
                     }
                     // Sequence and ArrayRepeat return a list of int64
-                    ScalarFunction::Sequence => {
-                        Ok(ArrowDataType::List(Arc::new(arrow::datatypes::Field::new(
-                            "item",
-                            ArrowDataType::Int64,
-                            true,
-                        ))))
-                    }
+                    ScalarFunction::Sequence => Ok(ArrowDataType::List(Arc::new(
+                        arrow::datatypes::Field::new("item", ArrowDataType::Int64, true),
+                    ))),
                     ScalarFunction::ArrayRepeat => {
                         // Return list of element type
                         if let Some(arg) = args.first() {
                             let elem_type = arg.data_type(schema)?;
                             Ok(ArrowDataType::List(Arc::new(arrow::datatypes::Field::new(
-                                "item",
-                                elem_type,
-                                true,
+                                "item", elem_type, true,
                             ))))
                         } else {
                             Ok(ArrowDataType::List(Arc::new(arrow::datatypes::Field::new(
@@ -1540,7 +1531,7 @@ impl Expr {
                         }
                     }
                     // Default for remaining string functions
-                    _ => Ok(ArrowDataType::Utf8)
+                    _ => Ok(ArrowDataType::Utf8),
                 }
             }
             Expr::Cast { data_type, .. } => Ok(data_type.clone()),

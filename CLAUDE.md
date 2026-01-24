@@ -22,6 +22,17 @@ When your context is compacted/summarized, you MUST:
 
 This ensures the documentation remains accurate and useful for future AI agent sessions.
 
+### Code Formatting Rule
+
+**BEFORE EVERY COMMIT, RUN `cargo fmt --all -- --check` AND FIX ANY ERRORS.**
+
+Before committing any code changes:
+1. Run `cargo fmt --all -- --check` to check for formatting issues
+2. If there are formatting errors, run `cargo fmt --all` to fix them
+3. Only then proceed with the commit
+
+This ensures consistent code formatting across the codebase.
+
 ---
 
 ## Project Overview

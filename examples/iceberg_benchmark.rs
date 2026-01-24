@@ -13,13 +13,12 @@ use std::time::Instant;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
 
-    let data_path = args.get(1)
+    let data_path = args
+        .get(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp/tpch-1gb"));
 
-    let memory_limit_mb: usize = args.get(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(64);
+    let memory_limit_mb: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(64);
 
     println!("=== Iceberg Larger-Than-Memory Benchmark ===");
     println!("Data path: {:?}", data_path);
@@ -76,12 +75,18 @@ async fn test_streaming_parquet(data_path: &PathBuf) -> Result<(), Box<dyn std::
     println!("    Batches: {}", batch_count);
     println!("    Peak batch memory: {} KB", peak_batch_size / 1024);
     println!("    Time: {:.2?}", elapsed);
-    println!("    Throughput: {:.2} M rows/sec", total_rows as f64 / elapsed.as_secs_f64() / 1_000_000.0);
+    println!(
+        "    Throughput: {:.2} M rows/sec",
+        total_rows as f64 / elapsed.as_secs_f64() / 1_000_000.0
+    );
 
     Ok(())
 }
 
-async fn test_memory_limited_context(data_path: &PathBuf, memory_limit_mb: usize) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_memory_limited_context(
+    data_path: &PathBuf,
+    memory_limit_mb: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     let memory_limit = memory_limit_mb * 1024 * 1024;
 
     let config = ExecutionConfig::new()
@@ -109,7 +114,10 @@ async fn test_memory_limited_context(data_path: &PathBuf, memory_limit_mb: usize
     println!("  Results:");
     println!("    Row count: {}", result.row_count);
     println!("    Time: {:.2?}", elapsed);
-    println!("    Peak memory: {} KB", result.metrics.peak_memory_bytes / 1024);
+    println!(
+        "    Peak memory: {} KB",
+        result.metrics.peak_memory_bytes / 1024
+    );
 
     if let Some(ref spill) = result.metrics.spill_metrics {
         println!("    Spilled: {} KB", spill.bytes_spilled / 1024);
@@ -120,7 +128,10 @@ async fn test_memory_limited_context(data_path: &PathBuf, memory_limit_mb: usize
         let batch = &result.batches[0];
         if batch.num_columns() > 0 {
             let count_col = batch.column(0);
-            if let Some(arr) = count_col.as_any().downcast_ref::<arrow::array::Int64Array>() {
+            if let Some(arr) = count_col
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+            {
                 println!("    COUNT(*) = {}", arr.value(0));
             }
         }
@@ -129,7 +140,10 @@ async fn test_memory_limited_context(data_path: &PathBuf, memory_limit_mb: usize
     Ok(())
 }
 
-async fn test_aggregation_query(data_path: &PathBuf, memory_limit_mb: usize) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_aggregation_query(
+    data_path: &PathBuf,
+    memory_limit_mb: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     let memory_limit = memory_limit_mb * 1024 * 1024;
 
     let config = ExecutionConfig::new()
@@ -169,7 +183,10 @@ async fn test_aggregation_query(data_path: &PathBuf, memory_limit_mb: usize) -> 
     println!("  Results:");
     println!("    Row count: {}", result.row_count);
     println!("    Time: {:.2?}", elapsed);
-    println!("    Peak memory: {} KB", result.metrics.peak_memory_bytes / 1024);
+    println!(
+        "    Peak memory: {} KB",
+        result.metrics.peak_memory_bytes / 1024
+    );
 
     if let Some(ref spill) = result.metrics.spill_metrics {
         println!("    Spilled: {} KB", spill.bytes_spilled / 1024);
@@ -178,8 +195,14 @@ async fn test_aggregation_query(data_path: &PathBuf, memory_limit_mb: usize) -> 
     // Print results
     println!("  Query results:");
     for batch in &result.batches {
-        let flag_col = batch.column(0).as_any().downcast_ref::<arrow::array::StringArray>();
-        let status_col = batch.column(1).as_any().downcast_ref::<arrow::array::StringArray>();
+        let flag_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>();
+        let status_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>();
         let qty_col = batch.column(2);
         let price_col = batch.column(3);
         let count_col = batch.column(4);
@@ -187,11 +210,14 @@ async fn test_aggregation_query(data_path: &PathBuf, memory_limit_mb: usize) -> 
         for row in 0..batch.num_rows() {
             let flag = flag_col.map(|a| a.value(row)).unwrap_or("?");
             let status = status_col.map(|a| a.value(row)).unwrap_or("?");
-            println!("    {} | {} | qty: {:?} | price: {:?} | count: {:?}",
-                flag, status,
+            println!(
+                "    {} | {} | qty: {:?} | price: {:?} | count: {:?}",
+                flag,
+                status,
                 get_numeric_value(qty_col, row),
                 get_numeric_value(price_col, row),
-                get_numeric_value(count_col, row));
+                get_numeric_value(count_col, row)
+            );
         }
     }
 

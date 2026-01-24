@@ -12,46 +12,163 @@ use std::sync::{Arc, RwLock};
 /// SQL keywords for completion and highlighting
 pub const SQL_KEYWORDS: &[&str] = &[
     // Data Query
-    "SELECT", "FROM", "WHERE", "GROUP", "BY", "HAVING", "ORDER", "ASC", "DESC",
-    "LIMIT", "OFFSET", "DISTINCT", "ALL", "AS", "CASE", "WHEN", "THEN", "ELSE", "END",
+    "SELECT",
+    "FROM",
+    "WHERE",
+    "GROUP",
+    "BY",
+    "HAVING",
+    "ORDER",
+    "ASC",
+    "DESC",
+    "LIMIT",
+    "OFFSET",
+    "DISTINCT",
+    "ALL",
+    "AS",
+    "CASE",
+    "WHEN",
+    "THEN",
+    "ELSE",
+    "END",
     // Joins
-    "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "OUTER", "CROSS", "ON", "USING",
-    "NATURAL", "SEMI", "ANTI",
+    "JOIN",
+    "INNER",
+    "LEFT",
+    "RIGHT",
+    "FULL",
+    "OUTER",
+    "CROSS",
+    "ON",
+    "USING",
+    "NATURAL",
+    "SEMI",
+    "ANTI",
     // Set operations
-    "UNION", "INTERSECT", "EXCEPT", "MINUS",
+    "UNION",
+    "INTERSECT",
+    "EXCEPT",
+    "MINUS",
     // Predicates
-    "AND", "OR", "NOT", "IN", "EXISTS", "BETWEEN", "LIKE", "ILIKE", "IS", "NULL",
-    "TRUE", "FALSE",
+    "AND",
+    "OR",
+    "NOT",
+    "IN",
+    "EXISTS",
+    "BETWEEN",
+    "LIKE",
+    "ILIKE",
+    "IS",
+    "NULL",
+    "TRUE",
+    "FALSE",
     // Aggregate functions
-    "COUNT", "SUM", "AVG", "MIN", "MAX", "FIRST", "LAST",
+    "COUNT",
+    "SUM",
+    "AVG",
+    "MIN",
+    "MAX",
+    "FIRST",
+    "LAST",
     // Scalar functions
-    "COALESCE", "NULLIF", "CAST", "EXTRACT", "SUBSTRING", "SUBSTR", "TRIM",
-    "UPPER", "LOWER", "LENGTH", "CONCAT", "REPLACE", "POSITION", "STRPOS",
-    "ROUND", "FLOOR", "CEIL", "CEILING", "ABS", "POWER", "SQRT", "EXP", "LN", "LOG",
-    "DATE", "TIME", "TIMESTAMP", "INTERVAL", "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND",
+    "COALESCE",
+    "NULLIF",
+    "CAST",
+    "EXTRACT",
+    "SUBSTRING",
+    "SUBSTR",
+    "TRIM",
+    "UPPER",
+    "LOWER",
+    "LENGTH",
+    "CONCAT",
+    "REPLACE",
+    "POSITION",
+    "STRPOS",
+    "ROUND",
+    "FLOOR",
+    "CEIL",
+    "CEILING",
+    "ABS",
+    "POWER",
+    "SQRT",
+    "EXP",
+    "LN",
+    "LOG",
+    "DATE",
+    "TIME",
+    "TIMESTAMP",
+    "INTERVAL",
+    "YEAR",
+    "MONTH",
+    "DAY",
+    "HOUR",
+    "MINUTE",
+    "SECOND",
     // Data types
-    "INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "FLOAT", "DOUBLE", "REAL",
-    "DECIMAL", "NUMERIC", "VARCHAR", "CHAR", "TEXT", "STRING", "BOOLEAN", "BOOL",
-    "DATE", "TIMESTAMP", "BINARY", "VARBINARY",
+    "INT",
+    "INTEGER",
+    "BIGINT",
+    "SMALLINT",
+    "TINYINT",
+    "FLOAT",
+    "DOUBLE",
+    "REAL",
+    "DECIMAL",
+    "NUMERIC",
+    "VARCHAR",
+    "CHAR",
+    "TEXT",
+    "STRING",
+    "BOOLEAN",
+    "BOOL",
+    "DATE",
+    "TIMESTAMP",
+    "BINARY",
+    "VARBINARY",
     // DML (for future)
-    "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE", "TRUNCATE",
+    "INSERT",
+    "INTO",
+    "VALUES",
+    "UPDATE",
+    "SET",
+    "DELETE",
+    "TRUNCATE",
     // DDL (for future)
-    "CREATE", "TABLE", "DROP", "ALTER", "ADD", "COLUMN", "PRIMARY", "KEY",
-    "FOREIGN", "REFERENCES", "INDEX", "VIEW", "SCHEMA", "DATABASE",
+    "CREATE",
+    "TABLE",
+    "DROP",
+    "ALTER",
+    "ADD",
+    "COLUMN",
+    "PRIMARY",
+    "KEY",
+    "FOREIGN",
+    "REFERENCES",
+    "INDEX",
+    "VIEW",
+    "SCHEMA",
+    "DATABASE",
     // Other
-    "WITH", "RECURSIVE", "OVER", "PARTITION", "ROWS", "RANGE", "UNBOUNDED",
-    "PRECEDING", "FOLLOWING", "CURRENT", "ROW", "NULLS", "FIRST", "LAST",
+    "WITH",
+    "RECURSIVE",
+    "OVER",
+    "PARTITION",
+    "ROWS",
+    "RANGE",
+    "UNBOUNDED",
+    "PRECEDING",
+    "FOLLOWING",
+    "CURRENT",
+    "ROW",
+    "NULLS",
+    "FIRST",
+    "LAST",
 ];
 
 /// Dot commands for the REPL
 pub const DOT_COMMANDS: &[&str] = &[
-    ".help", ".h",
-    ".quit", ".exit", ".q",
-    ".tables",
-    ".schema",
-    ".load",
-    ".tpch",
-    ".mode",
+    ".help", ".h", ".quit", ".exit", ".q", ".tables", ".schema", ".load", ".tpch", ".mode",
     ".format",
 ];
 
@@ -126,7 +243,11 @@ impl ReplHelper {
         }
 
         // SQL keywords (preserve case based on what user started typing)
-        let use_uppercase = word.chars().next().map(|c| c.is_uppercase()).unwrap_or(true);
+        let use_uppercase = word
+            .chars()
+            .next()
+            .map(|c| c.is_uppercase())
+            .unwrap_or(true);
         for &kw in SQL_KEYWORDS {
             if kw.to_lowercase().starts_with(&word_lower) {
                 let replacement = if use_uppercase {
@@ -145,12 +266,15 @@ impl ReplHelper {
         let after_table_keyword = ["from", "join", "into", "update", "table"]
             .iter()
             .any(|kw| {
-                line_lower.rfind(kw).map(|pos| {
-                    // Check if cursor is after this keyword
-                    let after_kw = &line_lower[pos + kw.len()..];
-                    // Count words after keyword - if 0 or 1 partial word, suggest tables
-                    after_kw.split_whitespace().count() <= 1
-                }).unwrap_or(false)
+                line_lower
+                    .rfind(kw)
+                    .map(|pos| {
+                        // Check if cursor is after this keyword
+                        let after_kw = &line_lower[pos + kw.len()..];
+                        // Count words after keyword - if 0 or 1 partial word, suggest tables
+                        after_kw.split_whitespace().count() <= 1
+                    })
+                    .unwrap_or(false)
             });
 
         if after_table_keyword || word_lower.is_empty() {
@@ -175,7 +299,10 @@ impl ReplHelper {
                         let col_lower = col.to_lowercase();
                         if col_lower.starts_with(&word_lower) {
                             // Avoid duplicates
-                            if !completions.iter().any(|p| p.replacement.to_lowercase() == col_lower) {
+                            if !completions
+                                .iter()
+                                .any(|p| p.replacement.to_lowercase() == col_lower)
+                            {
                                 completions.push(Pair {
                                     display: col.clone(),
                                     replacement: col.clone(),
@@ -219,10 +346,35 @@ impl ReplHelper {
     /// Check if a word is a function name
     fn is_function(word: &str) -> bool {
         const FUNCTIONS: &[&str] = &[
-            "COUNT", "SUM", "AVG", "MIN", "MAX", "COALESCE", "NULLIF", "CAST",
-            "EXTRACT", "SUBSTRING", "SUBSTR", "TRIM", "UPPER", "LOWER", "LENGTH",
-            "CONCAT", "REPLACE", "POSITION", "STRPOS", "ROUND", "FLOOR", "CEIL",
-            "CEILING", "ABS", "POWER", "SQRT", "EXP", "LN", "LOG",
+            "COUNT",
+            "SUM",
+            "AVG",
+            "MIN",
+            "MAX",
+            "COALESCE",
+            "NULLIF",
+            "CAST",
+            "EXTRACT",
+            "SUBSTRING",
+            "SUBSTR",
+            "TRIM",
+            "UPPER",
+            "LOWER",
+            "LENGTH",
+            "CONCAT",
+            "REPLACE",
+            "POSITION",
+            "STRPOS",
+            "ROUND",
+            "FLOOR",
+            "CEIL",
+            "CEILING",
+            "ABS",
+            "POWER",
+            "SQRT",
+            "EXP",
+            "LN",
+            "LOG",
         ];
         FUNCTIONS.iter().any(|f| f.eq_ignore_ascii_case(word))
     }
@@ -292,7 +444,13 @@ impl Highlighter for ReplHelper {
                 string_char = c;
                 result.push_str("\x1b[32m"); // Green
                 result.push(c);
-            } else if c.is_ascii_digit() || (c == '.' && chars.peek().map(|(_, nc)| nc.is_ascii_digit()).unwrap_or(false)) {
+            } else if c.is_ascii_digit()
+                || (c == '.'
+                    && chars
+                        .peek()
+                        .map(|(_, nc)| nc.is_ascii_digit())
+                        .unwrap_or(false))
+            {
                 // Number - magenta
                 result.push_str("\x1b[35m"); // Magenta
                 result.push(c);
@@ -461,7 +619,10 @@ mod tests {
     #[test]
     fn test_column_completions() {
         let helper = ReplHelper::new();
-        helper.register_table("customers", vec!["id".to_string(), "name".to_string(), "email".to_string()]);
+        helper.register_table(
+            "customers",
+            vec!["id".to_string(), "name".to_string(), "email".to_string()],
+        );
 
         // After mentioning table, suggest its columns
         let completions = helper.get_completions("n", "SELECT n FROM customers");
@@ -525,7 +686,8 @@ mod tests {
         helper.register_table("customers", vec![]);
         helper.register_table("orders", vec![]);
 
-        let tables = helper.extract_tables_from_query("select * from customers join orders on c.id = o.id");
+        let tables =
+            helper.extract_tables_from_query("select * from customers join orders on c.id = o.id");
         assert!(tables.contains(&"customers".to_string()));
         assert!(tables.contains(&"orders".to_string()));
     }

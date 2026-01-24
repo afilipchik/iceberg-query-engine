@@ -1,9 +1,7 @@
 //! Execution context - main entry point for query execution
 
 use crate::error::Result;
-use crate::execution::{
-    create_memory_pool, ExecutionConfig, SharedMemoryPool, SpillMetrics,
-};
+use crate::execution::{create_memory_pool, ExecutionConfig, SharedMemoryPool, SpillMetrics};
 use crate::optimizer::Optimizer;
 use crate::parser;
 use crate::physical::operators::{MemoryTable, TableProvider};
@@ -389,8 +387,7 @@ pub fn print_results(result: &QueryResult) {
     if result.metrics.files_pruned_by_stats > 0 || result.metrics.files_pruned_by_partition > 0 {
         println!(
             "Pruning: {} by stats, {} by partition",
-            result.metrics.files_pruned_by_stats,
-            result.metrics.files_pruned_by_partition
+            result.metrics.files_pruned_by_stats, result.metrics.files_pruned_by_partition
         );
     }
 
