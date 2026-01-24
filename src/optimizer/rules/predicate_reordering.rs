@@ -39,7 +39,7 @@ impl OptimizerRule for PredicateReordering {
         match plan {
             LogicalPlan::Filter(node) => {
                 // Split conjunctive predicates
-                let mut predicates = self.split_conjunction(&node.predicate);
+                let predicates = self.split_conjunction(&node.predicate);
 
                 if predicates.len() <= 1 {
                     // Nothing to reorder
@@ -245,7 +245,7 @@ impl PredicateReordering {
     }
 
     /// Check if an expression is a comparison with a unique column (primary key)
-    fn is_unique_column_comparison(&self, expr: &Expr, _input: &LogicalPlan) -> bool {
+    fn is_unique_column_comparison(&self, _expr: &Expr, _input: &LogicalPlan) -> bool {
         // For now, we don't have primary key information
         // This could be enhanced by reading table statistics
         false

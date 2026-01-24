@@ -5,7 +5,7 @@
 use crate::error::Result;
 use crate::optimizer::{cost::CostEstimator, OptimizerRule};
 use crate::planner::{
-    BinaryOp, Expr, JoinNode, JoinType, LogicalPlan,
+    Expr, JoinNode, JoinType, LogicalPlan,
 };
 use std::sync::Arc;
 
@@ -263,6 +263,7 @@ struct JoinInfo {
     filter: Option<Expr>,
     schema: crate::planner::PlanSchema,
     left_cardinality: usize,
+    #[allow(dead_code)]
     right_cardinality: usize,
 }
 

@@ -23,7 +23,7 @@ use parquet::file::properties::WriterProperties;
 use std::fmt;
 use std::fs::File;
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Number of hash partitions for spilling
@@ -132,6 +132,7 @@ impl BuildPartition {
 struct SpilledPartition {
     build_file: PathBuf,
     probe_file: Option<PathBuf>,
+    #[allow(dead_code)]
     build_rows: usize,
 }
 
@@ -224,7 +225,7 @@ impl SpillableHashJoinExec {
         &self,
         mut build_stream: RecordBatchStream,
         build_keys: &[Expr],
-        spill_dir: &PathBuf,
+        spill_dir: &Path,
     ) -> Result<(Vec<Option<BuildPartition>>, Vec<Option<SpilledPartition>>)> {
         let mut partitions: Vec<Option<BuildPartition>> = (0..NUM_PARTITIONS)
             .map(|_| Some(BuildPartition::new()))
@@ -278,6 +279,7 @@ impl SpillableHashJoinExec {
         Ok((partitions, spilled))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn probe_with_spilling(
         &self,
         mut probe_stream: RecordBatchStream,
@@ -285,7 +287,7 @@ impl SpillableHashJoinExec {
         in_memory_partitions: &mut [Option<BuildPartition>],
         hash_tables: &[Option<HashMap<JoinKey, Vec<HashEntry>>>],
         spilled_partitions: &[Option<SpilledPartition>],
-        spill_dir: &PathBuf,
+        spill_dir: &Path,
         swapped: bool,
     ) -> Result<Vec<RecordBatch>> {
         let mut results = Vec::new();
@@ -389,7 +391,9 @@ pub struct SpillableHashAggregateExec {
     group_by: Vec<Expr>,
     aggregates: Vec<AggregateExpr>,
     schema: SchemaRef,
+    #[allow(dead_code)]
     memory_pool: SharedMemoryPool,
+    #[allow(dead_code)]
     config: ExecutionConfig,
 }
 
@@ -571,7 +575,7 @@ impl ExternalSortExec {
     async fn generate_runs(
         &self,
         mut input_stream: RecordBatchStream,
-        spill_dir: &PathBuf,
+        spill_dir: &Path,
     ) -> Result<Vec<PathBuf>> {
         let mut runs = Vec::new();
         let mut buffer: Vec<RecordBatch> = Vec::new();
@@ -691,9 +695,9 @@ fn partition_batch_by_hash(
 
     for row in 0..batch.num_rows() {
         let key = extract_join_key(&key_arrays, row);
-        let mut hasher = hashbrown::hash_map::DefaultHashBuilder::default().build_hasher();
-        key.hash(&mut hasher);
-        let partition = (hasher.finish() as usize) % num_partitions;
+        
+        
+        let partition = (hashbrown::hash_map::DefaultHashBuilder::default().hash_one(&key) as usize) % num_partitions;
         partition_indices[partition].push(row);
     }
 

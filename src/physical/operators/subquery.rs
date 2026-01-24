@@ -1,12 +1,10 @@
 //! Subquery execution support
 
 use crate::error::{QueryError, Result};
-use crate::physical::{PhysicalOperator, PhysicalPlanner, RecordBatchStream};
+use crate::physical::PhysicalPlanner;
 use crate::physical::operators::TableProvider;
 use crate::planner::{Expr, LogicalPlan, ScalarValue};
 use arrow::array::{Array, ArrayRef, BooleanArray};
-use arrow::compute;
-use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 use std::collections::HashMap;
@@ -65,14 +63,15 @@ impl SubqueryExecutor {
         planner
     }
 
+    #[allow(dead_code)]
     /// Register outer context column values as temporary in-memory tables
     fn register_outer_context(
         &self,
         planner: &mut PhysicalPlanner,
         outer_context: &std::collections::HashMap<String, Expr>,
     ) -> Result<()> {
-        use crate::physical::operators::{MemoryTable, TableProvider};
-        use arrow::array::{ArrayRef, PrimitiveArray};
+        use crate::physical::operators::MemoryTable;
+        use arrow::array::ArrayRef;
         use arrow::datatypes::{DataType, Field, Schema};
 
         // Create a temporary table for each outer column value
@@ -173,7 +172,7 @@ impl SubqueryExecutor {
         // Run the async code in a blocking way
         let batches = if let Ok(_handle) = tokio::runtime::Handle::try_current() {
             // We're inside a tokio runtime, use spawn_blocking
-            let plan_clone = plan.clone();
+            let _plan_clone = plan.clone();
             std::thread::spawn(move || {
                 let runtime = tokio::runtime::Runtime::new()
                     .map_err(|e| QueryError::Execution(format!("Failed to create runtime: {}", e)))?;
@@ -331,7 +330,7 @@ impl SubqueryExecutor {
         // Run the async code in a blocking way
         let batches = if let Ok(_handle) = tokio::runtime::Handle::try_current() {
             // We're inside a tokio runtime, use spawn_blocking
-            let plan_clone = plan.clone();
+            let _plan_clone = plan.clone();
             std::thread::spawn(move || {
                 let runtime = tokio::runtime::Runtime::new()
                     .map_err(|e| QueryError::Execution(format!("Failed to create runtime: {}", e)))?;
@@ -491,21 +490,6 @@ pub fn evaluate_subquery_expr(
                 Err(e) => Err(e),
             }
         }
-        Expr::InSubquery { expr, subquery, negated } => {
-            // Try executing once - if it fails with ColumnNotFound, it's correlated
-            match executor.execute_in_subquery(subquery) {
-                Ok(in_values) => {
-                    // Uncorrelated - use the same values for all rows
-                    let left_array = super::filter::evaluate_expr(batch, expr)?;
-                    evaluate_in_subquery(&left_array, &in_values, *negated)
-                }
-                Err(QueryError::ColumnNotFound(_)) => {
-                    // Correlated IN subquery - execute for each row
-                    execute_correlated_in_subquery(batch, expr, subquery, *negated, executor)
-                }
-                Err(e) => Err(e),
-            }
-        }
         Expr::Exists { subquery, negated } => {
             // Try executing once - if it fails with ColumnNotFound, it's correlated
             match executor.execute_exists(subquery) {
@@ -534,7 +518,7 @@ fn build_outer_context(batch: &RecordBatch) -> std::collections::HashMap<String,
     let mut context = std::collections::HashMap::new();
 
     for (i, field) in batch.schema().fields().iter().enumerate() {
-        let column = batch.column(i);
+        let _column = batch.column(i);
         let column_name = field.name().clone();
 
         // Store the column reference - we'll create row-specific values later
@@ -548,7 +532,7 @@ fn build_outer_context(batch: &RecordBatch) -> std::collections::HashMap<String,
 
 /// Build row-specific context with actual scalar values for a single row
 fn build_row_context(
-    outer_context: &std::collections::HashMap<String, Expr>,
+    _outer_context: &std::collections::HashMap<String, Expr>,
     batch: &RecordBatch,
     row: usize,
 ) -> Result<std::collections::HashMap<String, Expr>> {
@@ -623,9 +607,9 @@ fn contains_subquery(plan: &LogicalPlan) -> bool {
             Expr::ScalarFunc { args, .. } => args.iter().any(expr_has_subquery),
             Expr::Cast { expr, .. } => expr_has_subquery(expr),
             Expr::Case { operand, when_then, else_expr } => {
-                operand.as_ref().map_or(false, |e| expr_has_subquery(e))
+                operand.as_ref().is_some_and(|e| expr_has_subquery(e))
                     || when_then.iter().any(|(w, t)| expr_has_subquery(w) || expr_has_subquery(t))
-                    || else_expr.as_ref().map_or(false, |e| expr_has_subquery(e))
+                    || else_expr.as_ref().is_some_and(|e| expr_has_subquery(e))
             }
             _ => false,
         }
@@ -646,7 +630,7 @@ fn contains_subquery(plan: &LogicalPlan) -> bool {
             }
             LogicalPlan::Join(node) => {
                 node.on.iter().any(|(l, r)| expr_has_subquery(l) || expr_has_subquery(r))
-                    || node.filter.as_ref().map_or(false, |f| expr_has_subquery(f))
+                    || node.filter.as_ref().is_some_and(expr_has_subquery)
                     || plan_has_subquery(&node.left)
                     || plan_has_subquery(&node.right)
             }
@@ -926,7 +910,7 @@ fn substitute_columns_in_plan(
 
     // First, check if the column reference exists in our substitution map
     // If so, substitute it; otherwise, keep it as-is
-    let substituted_expr = |expr: &Expr| -> Expr {
+    let _substituted_expr = |expr: &Expr| -> Expr {
         match expr {
             Expr::Column(col) => {
                 // Try to substitute both qualified and unqualified names
@@ -1201,7 +1185,7 @@ fn results_array_from_scalars(scalars: &[ScalarValue], num_rows: usize) -> Resul
 
     // All scalars should have the same type
     match &scalars[0] {
-        ScalarValue::Int64(v) => {
+        ScalarValue::Int64(_v) => {
             use arrow::array::Int64Array;
             let values: Vec<Option<i64>> = scalars
                 .iter()
@@ -1213,7 +1197,7 @@ fn results_array_from_scalars(scalars: &[ScalarValue], num_rows: usize) -> Resul
                 .collect();
             Ok(Arc::new(Int64Array::from(values)))
         }
-        ScalarValue::Float64(v) => {
+        ScalarValue::Float64(_v) => {
             use arrow::array::Float64Array;
             let values: Vec<Option<f64>> = scalars
                 .iter()
@@ -1225,7 +1209,7 @@ fn results_array_from_scalars(scalars: &[ScalarValue], num_rows: usize) -> Resul
                 .collect();
             Ok(Arc::new(Float64Array::from(values)))
         }
-        ScalarValue::Boolean(v) => {
+        ScalarValue::Boolean(_v) => {
             use arrow::array::BooleanArray;
             let values: Vec<Option<bool>> = scalars
                 .iter()
@@ -1237,7 +1221,7 @@ fn results_array_from_scalars(scalars: &[ScalarValue], num_rows: usize) -> Resul
                 .collect();
             Ok(Arc::new(BooleanArray::from(values)))
         }
-        ScalarValue::Utf8(v) => {
+        ScalarValue::Utf8(_v) => {
             use arrow::array::StringArray;
             let values: Vec<Option<&str>> = scalars
                 .iter()
@@ -1321,7 +1305,7 @@ fn evaluate_in_subquery(left: &ArrayRef, right: &ArrayRef, negated: bool) -> Res
 /// Convert scalar value to array (for scalar subquery results)
 fn scalar_to_array(value: &ScalarValue, num_rows: usize) -> ArrayRef {
     use arrow::array::*;
-    use arrow::datatypes::DataType;
+    
 
     match value {
         ScalarValue::Null => Arc::new(NullArray::new(num_rows)),

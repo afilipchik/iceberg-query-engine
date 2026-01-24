@@ -447,25 +447,25 @@ impl IcebergScanExec {
             match op {
                 BinaryOp::Eq => {
                     // value = X: file might match if min <= X <= max
-                    let min_ok = min.map_or(true, |m| m <= *val);
-                    let max_ok = max.map_or(true, |m| m >= *val);
+                    let min_ok = min.is_none_or(|m| m <= *val);
+                    let max_ok = max.is_none_or(|m| m >= *val);
                     min_ok && max_ok
                 }
                 BinaryOp::Lt => {
                     // value < X: file might match if min < X
-                    min.map_or(true, |m| m < *val)
+                    min.is_none_or(|m| m < *val)
                 }
                 BinaryOp::LtEq => {
                     // value <= X: file might match if min <= X
-                    min.map_or(true, |m| m <= *val)
+                    min.is_none_or(|m| m <= *val)
                 }
                 BinaryOp::Gt => {
                     // value > X: file might match if max > X
-                    max.map_or(true, |m| m > *val)
+                    max.is_none_or(|m| m > *val)
                 }
                 BinaryOp::GtEq => {
                     // value >= X: file might match if max >= X
-                    max.map_or(true, |m| m >= *val)
+                    max.is_none_or(|m| m >= *val)
                 }
                 BinaryOp::NotEq => {
                     // value != X: file might not match only if min == max == X
@@ -481,14 +481,14 @@ impl IcebergScanExec {
 
             match op {
                 BinaryOp::Eq => {
-                    let min_ok = min.map_or(true, |m| m <= val);
-                    let max_ok = max.map_or(true, |m| m >= val);
+                    let min_ok = min.is_none_or(|m| m <= val);
+                    let max_ok = max.is_none_or(|m| m >= val);
                     min_ok && max_ok
                 }
-                BinaryOp::Lt => min.map_or(true, |m| m < val),
-                BinaryOp::LtEq => min.map_or(true, |m| m <= val),
-                BinaryOp::Gt => max.map_or(true, |m| m > val),
-                BinaryOp::GtEq => max.map_or(true, |m| m >= val),
+                BinaryOp::Lt => min.is_none_or(|m| m < val),
+                BinaryOp::LtEq => min.is_none_or(|m| m <= val),
+                BinaryOp::Gt => max.is_none_or(|m| m > val),
+                BinaryOp::GtEq => max.is_none_or(|m| m >= val),
                 BinaryOp::NotEq => !(min == Some(val) && max == Some(val)),
                 _ => true,
             }
