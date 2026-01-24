@@ -270,7 +270,7 @@ struct JoinInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::planner::{Expr, LogicalPlanBuilder, PlanSchema, ScalarValue, SchemaField};
+    use crate::planner::{Expr, LogicalPlanBuilder, PlanSchema, SchemaField};
     use arrow::datatypes::DataType;
 
     fn orders_schema() -> PlanSchema {
@@ -288,6 +288,7 @@ mod tests {
         ])
     }
 
+    #[allow(dead_code)]
     fn lineitem_schema() -> PlanSchema {
         PlanSchema::new(vec![
             SchemaField::new("orderkey", DataType::Int64),

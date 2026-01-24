@@ -168,7 +168,7 @@ async fn query_row_count(ctx: &ExecutionContext, sql: &str) -> usize {
 
 /// Helper to run a query and get first column as i64 values
 async fn query_i64_column(ctx: &ExecutionContext, sql: &str) -> Vec<Option<i64>> {
-    let result = ctx.sql(sql).await.expect(&format!("Query failed: {}", sql));
+    let result = ctx.sql(sql).await.unwrap_or_else(|e| panic!("Query failed: {}\nSQL: {}", e, sql));
     if result.batches.is_empty() || result.batches[0].num_rows() == 0 {
         return vec![];
     }
@@ -190,7 +190,7 @@ async fn query_i64_column(ctx: &ExecutionContext, sql: &str) -> Vec<Option<i64>>
 
 /// Helper to run a query and get first column as f64 values
 async fn query_f64_column(ctx: &ExecutionContext, sql: &str) -> Vec<Option<f64>> {
-    let result = ctx.sql(sql).await.expect(&format!("Query failed: {}", sql));
+    let result = ctx.sql(sql).await.unwrap_or_else(|e| panic!("Query failed: {}\nSQL: {}", e, sql));
     if result.batches.is_empty() || result.batches[0].num_rows() == 0 {
         return vec![];
     }
@@ -210,6 +210,7 @@ async fn query_f64_column(ctx: &ExecutionContext, sql: &str) -> Vec<Option<f64>>
         .collect()
 }
 
+#[allow(dead_code)]
 /// Helper to run a query and check if it succeeds
 async fn query_succeeds(ctx: &ExecutionContext, sql: &str) -> bool {
     ctx.sql(sql).await.is_ok()

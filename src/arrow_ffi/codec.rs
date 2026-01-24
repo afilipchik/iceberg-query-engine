@@ -420,10 +420,7 @@ mod tests {
     fn test_cpu_feature_detection() {
         let mode = detect_cpu_features();
         // Should at least be Scalar on any platform
-        match mode {
-            SimdMode::Scalar => {}
-            _ => {}
-        }
+        let _ = mode;
     }
 
     #[test]
@@ -432,18 +429,18 @@ mod tests {
         let right = Int64Array::from(vec![3, 2, 1, 4, 6]);
 
         let eq = compare_simd(&left, &right, CompareOp::Eq).unwrap();
-        assert_eq!(eq.value(0), false);
-        assert_eq!(eq.value(1), true);
-        assert_eq!(eq.value(2), false);
-        assert_eq!(eq.value(3), true);
-        assert_eq!(eq.value(4), false);
+        assert!(!eq.value(0));
+        assert!(eq.value(1));
+        assert!(!eq.value(2));
+        assert!(eq.value(3));
+        assert!(!eq.value(4));
 
         let lt = compare_simd(&left, &right, CompareOp::Lt).unwrap();
-        assert_eq!(lt.value(0), true);
-        assert_eq!(lt.value(1), false);
-        assert_eq!(lt.value(2), false);
-        assert_eq!(lt.value(3), false);
-        assert_eq!(lt.value(4), true);
+        assert!(lt.value(0));
+        assert!(!lt.value(1));
+        assert!(!lt.value(2));
+        assert!(!lt.value(3));
+        assert!(lt.value(4));
     }
 
     #[test]

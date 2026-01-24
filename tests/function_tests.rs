@@ -42,7 +42,7 @@ fn create_function_test_context() -> ExecutionContext {
                 Some(100),
             ])),
             Arc::new(Float64Array::from(vec![
-                Some(3.14159),
+                Some(std::f64::consts::PI),
                 Some(-2.5),
                 Some(0.0),
                 None,
@@ -80,6 +80,7 @@ macro_rules! test_scalar_function {
     };
 }
 
+#[allow(unused_macros)]
 /// Macro for documenting unsupported functions (tests that should fail gracefully)
 macro_rules! test_unsupported_function {
     ($name:ident, $sql:expr, $func_name:expr) => {
