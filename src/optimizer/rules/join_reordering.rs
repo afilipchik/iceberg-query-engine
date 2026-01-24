@@ -46,7 +46,29 @@ impl JoinReordering {
     fn reorder_joins(&self, plan: &LogicalPlan) -> Result<LogicalPlan> {
         match plan {
             LogicalPlan::Join(node) => {
-                // Try to find a better ordering
+                // Skip join reordering for CROSS joins without conditions
+                // They should be preserved in their original order
+                if node.join_type == JoinType::Cross && node.on.is_empty() {
+                    // Still recursively process children, but don't reorder this join
+                    let left = self.reorder_joins(&node.left)?;
+                    let right = self.reorder_joins(&node.right)?;
+
+                    // Compute schema from optimized children before moving them
+                    let left_schema = left.schema();
+                    let right_schema = right.schema();
+                    let join_schema = left_schema.merge(&right_schema);
+
+                    return Ok(LogicalPlan::Join(JoinNode {
+                        left: Arc::new(left),
+                        right: Arc::new(right),
+                        join_type: node.join_type,
+                        on: node.on.clone(),
+                        filter: node.filter.clone(),
+                        schema: join_schema,
+                    }));
+                }
+
+                // Try to find a better ordering for INNER joins
                 let optimized = self.optimize_join_order(node.clone())?;
 
                 // Recursively apply to children

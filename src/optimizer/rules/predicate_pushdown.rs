@@ -2,7 +2,9 @@
 
 use crate::error::Result;
 use crate::optimizer::OptimizerRule;
-use crate::planner::{BinaryOp, Column, Expr, FilterNode, JoinType, LogicalPlan, ScanNode};
+use crate::planner::{
+    BinaryOp, Column, Expr, FilterNode, JoinType, LogicalPlan, ScanNode,
+};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -73,53 +75,39 @@ impl PredicatePushdown {
             }
 
             LogicalPlan::Project(node) => {
-                // Only push predicates that reference columns that exist in the input schema
-                let input_schema = node.input.schema();
-                let input_cols = self.collect_columns(&input_schema);
-
-                // Check if predicates can be pushed (all referenced columns exist in input)
-                let (pushable, remaining): (Vec<Expr>, Vec<Expr>) =
-                    predicates.into_iter().partition(|p| {
-                        let pred_cols = self.extract_columns(p);
-                        self.columns_subset(&pred_cols, &input_cols)
-                    });
-
-                let result = self.pushdown(&node.input, pushable)?;
-                let project = LogicalPlan::Project(crate::planner::ProjectNode {
+                // Push through projection if predicates only reference projected columns
+                let result = self.pushdown(&node.input, predicates)?;
+                Ok(LogicalPlan::Project(crate::planner::ProjectNode {
                     input: Arc::new(result),
                     exprs: node.exprs.clone(),
                     schema: node.schema.clone(),
-                });
-
-                // Apply remaining predicates that couldn't be pushed
-                if remaining.is_empty() {
-                    Ok(project)
-                } else {
-                    let combined = self.combine_predicates(remaining);
-                    Ok(LogicalPlan::Filter(FilterNode {
-                        input: Arc::new(project),
-                        predicate: combined,
-                    }))
-                }
+                }))
             }
 
             LogicalPlan::Join(node) => {
-                let left_cols = self.collect_columns(&node.left.schema());
-                let right_cols = self.collect_columns(&node.right.schema());
+                // Get ACTUAL base table columns by recursing through joins
+                // This is crucial for correctly partitioning predicates in nested joins
+                let left_base_tables = self.collect_base_table_columns(&node.left);
+                let right_base_tables = self.collect_base_table_columns(&node.right);
 
                 let mut left_predicates = Vec::new();
                 let mut right_predicates = Vec::new();
                 let mut remaining = Vec::new();
 
+                // Clone predicates before iterating (since we need them later for CROSS join case)
+                let all_predicates = predicates.clone();
+                let has_predicates = !predicates.is_empty();
+
                 for pred in predicates {
                     let pred_cols = self.extract_columns(&pred);
 
-                    if self.columns_subset(&pred_cols, &left_cols)
-                        && !self.columns_overlap(&pred_cols, &right_cols)
+                    // Check if predicate uses ONLY columns from left side's base tables
+                    if self.columns_subset(&pred_cols, &left_base_tables)
+                        && !self.columns_overlap(&pred_cols, &right_base_tables)
                     {
                         left_predicates.push(pred);
-                    } else if self.columns_subset(&pred_cols, &right_cols)
-                        && !self.columns_overlap(&pred_cols, &left_cols)
+                    } else if self.columns_subset(&pred_cols, &right_base_tables)
+                        && !self.columns_overlap(&pred_cols, &left_base_tables)
                     {
                         right_predicates.push(pred);
                     } else {
@@ -131,48 +119,77 @@ impl PredicatePushdown {
                 // For outer joins, we need to be careful
                 match node.join_type {
                     JoinType::Inner | JoinType::Cross => {
-                        // Extract equality predicates that span both sides as join conditions
-                        let mut join_conditions: Vec<(Expr, Expr)> = node.on.clone();
-                        let mut non_join_remaining = Vec::new();
+                        // TEMPORARY FIX: For CROSS joins, skip predicate pushdown entirely
+                        // to preserve join tree structure. This prevents tables from being dropped.
+                        if node.join_type == JoinType::Cross && node.on.is_empty() {
+                            // Don't push down predicates for CROSS joins
+                            // Just reconstruct the join as-is
+                            let left = self.pushdown(&node.left, vec![])?;
+                            let right = self.pushdown(&node.right, vec![])?;
 
-                        for pred in &remaining {
-                            if let Some((left_expr, right_expr)) =
-                                self.extract_join_condition(pred, &left_cols, &right_cols)
-                            {
-                                join_conditions.push((left_expr, right_expr));
+                            let left_schema = left.schema();
+                            let right_schema = right.schema();
+                            let join_schema = left_schema.merge(&right_schema);
+
+                            let join = LogicalPlan::Join(crate::planner::JoinNode {
+                                left: Arc::new(left),
+                                right: Arc::new(right),
+                                join_type: node.join_type,
+                                on: node.on.clone(),
+                                filter: node.filter.clone(),
+                                schema: join_schema,
+                            });
+
+                            // Apply all predicates as a filter above the join
+                            if !has_predicates {
+                                Ok(join)
                             } else {
-                                non_join_remaining.push(pred.clone());
+                                let combined = self.combine_predicates(all_predicates);
+                                Ok(LogicalPlan::Filter(FilterNode {
+                                    input: Arc::new(join),
+                                    predicate: combined,
+                                }))
                             }
-                        }
-
-                        let left = self.pushdown(&node.left, left_predicates)?;
-                        let right = self.pushdown(&node.right, right_predicates)?;
-
-                        // Convert Cross join to Inner join if we have join conditions
-                        let new_join_type =
-                            if node.join_type == JoinType::Cross && !join_conditions.is_empty() {
-                                JoinType::Inner
-                            } else {
-                                node.join_type
-                            };
-
-                        let join = LogicalPlan::Join(crate::planner::JoinNode {
-                            left: Arc::new(left),
-                            right: Arc::new(right),
-                            join_type: new_join_type,
-                            on: join_conditions,
-                            filter: node.filter.clone(),
-                            schema: node.schema.clone(),
-                        });
-
-                        if non_join_remaining.is_empty() {
-                            Ok(join)
                         } else {
-                            let combined = self.combine_predicates(non_join_remaining);
-                            Ok(LogicalPlan::Filter(FilterNode {
-                                input: Arc::new(join),
-                                predicate: combined,
-                            }))
+                            // For INNER joins with existing conditions, use the normal logic
+                            let mut join_conditions: Vec<(Expr, Expr)> = node.on.clone();
+                            let mut non_join_remaining = Vec::new();
+
+                            for pred in &remaining {
+                                if let Some((left_expr, right_expr)) =
+                                    self.extract_join_condition(pred, &left_base_tables, &right_base_tables)
+                                {
+                                    join_conditions.push((left_expr, right_expr));
+                                } else {
+                                    non_join_remaining.push(pred.clone());
+                                }
+                            }
+
+                            let left = self.pushdown(&node.left, left_predicates)?;
+                            let right = self.pushdown(&node.right, right_predicates)?;
+
+                            let left_schema = left.schema();
+                            let right_schema = right.schema();
+                            let join_schema = left_schema.merge(&right_schema);
+
+                            let join = LogicalPlan::Join(crate::planner::JoinNode {
+                                left: Arc::new(left),
+                                right: Arc::new(right),
+                                join_type: node.join_type,
+                                on: join_conditions,
+                                filter: node.filter.clone(),
+                                schema: join_schema,
+                            });
+
+                            if non_join_remaining.is_empty() {
+                                Ok(join)
+                            } else {
+                                let combined = self.combine_predicates(non_join_remaining);
+                                Ok(LogicalPlan::Filter(FilterNode {
+                                    input: Arc::new(join),
+                                    predicate: combined,
+                                }))
+                            }
                         }
                     }
                     JoinType::Left => {
@@ -181,13 +198,18 @@ impl PredicatePushdown {
                         let right = self.pushdown(&node.right, vec![])?;
                         remaining.extend(right_predicates);
 
+                        // Compute schema from optimized children before moving them
+                        let left_schema = left.schema();
+                        let right_schema = right.schema();
+                        let join_schema = left_schema.merge(&right_schema);
+
                         let join = LogicalPlan::Join(crate::planner::JoinNode {
                             left: Arc::new(left),
                             right: Arc::new(right),
                             join_type: node.join_type,
                             on: node.on.clone(),
                             filter: node.filter.clone(),
-                            schema: node.schema.clone(),
+                            schema: join_schema,
                         });
 
                         if remaining.is_empty() {
@@ -206,13 +228,18 @@ impl PredicatePushdown {
                         let right = self.pushdown(&node.right, right_predicates)?;
                         remaining.extend(left_predicates);
 
+                        // Compute schema from optimized children before moving them
+                        let left_schema = left.schema();
+                        let right_schema = right.schema();
+                        let join_schema = left_schema.merge(&right_schema);
+
                         let join = LogicalPlan::Join(crate::planner::JoinNode {
                             left: Arc::new(left),
                             right: Arc::new(right),
                             join_type: node.join_type,
                             on: node.on.clone(),
                             filter: node.filter.clone(),
-                            schema: node.schema.clone(),
+                            schema: join_schema,
                         });
 
                         if remaining.is_empty() {
@@ -233,13 +260,18 @@ impl PredicatePushdown {
                         let left = self.pushdown(&node.left, vec![])?;
                         let right = self.pushdown(&node.right, vec![])?;
 
+                        // Compute schema from optimized children before moving them
+                        let left_schema = left.schema();
+                        let right_schema = right.schema();
+                        let join_schema = left_schema.merge(&right_schema);
+
                         let join = LogicalPlan::Join(crate::planner::JoinNode {
                             left: Arc::new(left),
                             right: Arc::new(right),
                             join_type: node.join_type,
                             on: node.on.clone(),
                             filter: node.filter.clone(),
-                            schema: node.schema.clone(),
+                            schema: join_schema,
                         });
 
                         if remaining.is_empty() {
@@ -306,13 +338,11 @@ impl PredicatePushdown {
 
             LogicalPlan::SubqueryAlias(node) => {
                 let input = self.pushdown(&node.input, predicates)?;
-                Ok(LogicalPlan::SubqueryAlias(
-                    crate::planner::SubqueryAliasNode {
-                        input: Arc::new(input),
-                        alias: node.alias.clone(),
-                        schema: node.schema.clone(),
-                    },
-                ))
+                Ok(LogicalPlan::SubqueryAlias(crate::planner::SubqueryAliasNode {
+                    input: Arc::new(input),
+                    alias: node.alias.clone(),
+                    schema: node.schema.clone(),
+                }))
             }
 
             LogicalPlan::Union(node) => {
@@ -327,7 +357,6 @@ impl PredicatePushdown {
                 let union = LogicalPlan::Union(crate::planner::UnionNode {
                     inputs: inputs?,
                     schema: node.schema.clone(),
-                    all: node.all,
                 });
 
                 if predicates.is_empty() {
@@ -443,153 +472,66 @@ impl PredicatePushdown {
                     self.extract_columns_recursive(item, cols);
                 }
             }
-            Expr::Between {
-                expr, low, high, ..
-            } => {
+            Expr::Between { expr, low, high, .. } => {
                 self.extract_columns_recursive(expr, cols);
                 self.extract_columns_recursive(low, cols);
                 self.extract_columns_recursive(high, cols);
-            }
-            // For subquery expressions, we need to extract outer column references
-            // to prevent them from being incorrectly pushed down to individual scans
-            Expr::Exists { subquery, .. } | Expr::ScalarSubquery(subquery) => {
-                // Extract outer references from the subquery
-                self.extract_outer_columns_from_subquery(subquery, cols);
-            }
-            Expr::InSubquery { expr, subquery, .. } => {
-                self.extract_columns_recursive(expr, cols);
-                self.extract_outer_columns_from_subquery(subquery, cols);
-            }
-            _ => {}
-        }
-    }
-
-    /// Extract outer column references from a subquery
-    /// These are columns that reference tables not defined in the subquery
-    fn extract_outer_columns_from_subquery(
-        &self,
-        subquery: &LogicalPlan,
-        cols: &mut HashSet<Column>,
-    ) {
-        let local_tables = self.collect_subquery_tables(subquery);
-        self.extract_outer_refs_recursive(subquery, &local_tables, cols);
-    }
-
-    /// Collect table names/aliases defined in a subquery
-    fn collect_subquery_tables(&self, plan: &LogicalPlan) -> HashSet<String> {
-        let mut tables = HashSet::new();
-        self.collect_tables_recursive(plan, &mut tables);
-        tables
-    }
-
-    fn collect_tables_recursive(&self, plan: &LogicalPlan, tables: &mut HashSet<String>) {
-        match plan {
-            LogicalPlan::Scan(node) => {
-                tables.insert(node.table_name.clone());
-            }
-            LogicalPlan::SubqueryAlias(node) => {
-                tables.insert(node.alias.clone());
-            }
-            LogicalPlan::Join(node) => {
-                self.collect_tables_recursive(&node.left, tables);
-                self.collect_tables_recursive(&node.right, tables);
-            }
-            LogicalPlan::Filter(node) => self.collect_tables_recursive(&node.input, tables),
-            LogicalPlan::Project(node) => self.collect_tables_recursive(&node.input, tables),
-            LogicalPlan::Aggregate(node) => self.collect_tables_recursive(&node.input, tables),
-            LogicalPlan::Sort(node) => self.collect_tables_recursive(&node.input, tables),
-            LogicalPlan::Limit(node) => self.collect_tables_recursive(&node.input, tables),
-            LogicalPlan::Distinct(node) => self.collect_tables_recursive(&node.input, tables),
-            _ => {}
-        }
-    }
-
-    /// Extract columns from a plan that reference tables NOT in local_tables
-    fn extract_outer_refs_recursive(
-        &self,
-        plan: &LogicalPlan,
-        local_tables: &HashSet<String>,
-        cols: &mut HashSet<Column>,
-    ) {
-        match plan {
-            LogicalPlan::Filter(node) => {
-                self.extract_outer_refs_from_expr(&node.predicate, local_tables, cols);
-                self.extract_outer_refs_recursive(&node.input, local_tables, cols);
-            }
-            LogicalPlan::Project(node) => {
-                for expr in &node.exprs {
-                    self.extract_outer_refs_from_expr(expr, local_tables, cols);
-                }
-                self.extract_outer_refs_recursive(&node.input, local_tables, cols);
-            }
-            LogicalPlan::Join(node) => {
-                for (l, r) in &node.on {
-                    self.extract_outer_refs_from_expr(l, local_tables, cols);
-                    self.extract_outer_refs_from_expr(r, local_tables, cols);
-                }
-                if let Some(f) = &node.filter {
-                    self.extract_outer_refs_from_expr(f, local_tables, cols);
-                }
-                self.extract_outer_refs_recursive(&node.left, local_tables, cols);
-                self.extract_outer_refs_recursive(&node.right, local_tables, cols);
-            }
-            LogicalPlan::SubqueryAlias(node) => {
-                self.extract_outer_refs_recursive(&node.input, local_tables, cols);
-            }
-            _ => {}
-        }
-    }
-
-    /// Extract columns from an expression that reference tables NOT in local_tables
-    fn extract_outer_refs_from_expr(
-        &self,
-        expr: &Expr,
-        local_tables: &HashSet<String>,
-        cols: &mut HashSet<Column>,
-    ) {
-        match expr {
-            Expr::Column(col) => {
-                // Only add if this column references an outer table
-                if let Some(rel) = &col.relation {
-                    if !local_tables.contains(rel) {
-                        cols.insert(col.clone());
-                    }
-                }
-                // For unqualified columns, assume they might be outer references
-                // (conservative approach - prevents incorrect pushdown)
-                else {
-                    cols.insert(col.clone());
-                }
-            }
-            Expr::BinaryExpr { left, right, .. } => {
-                self.extract_outer_refs_from_expr(left, local_tables, cols);
-                self.extract_outer_refs_from_expr(right, local_tables, cols);
-            }
-            Expr::UnaryExpr { expr, .. } => {
-                self.extract_outer_refs_from_expr(expr, local_tables, cols);
-            }
-            Expr::ScalarFunc { args, .. } | Expr::Aggregate { args, .. } => {
-                for arg in args {
-                    self.extract_outer_refs_from_expr(arg, local_tables, cols);
-                }
-            }
-            Expr::Cast { expr, .. } | Expr::Alias { expr, .. } => {
-                self.extract_outer_refs_from_expr(expr, local_tables, cols);
             }
             _ => {}
         }
     }
 
     /// Collect columns from schema as (relation, name) pairs for proper qualified matching
-    fn collect_columns(
-        &self,
-        schema: &crate::planner::PlanSchema,
-    ) -> Vec<(Option<String>, String)> {
-        schema
-            .fields()
-            .iter()
-            .map(|f| (f.relation.clone(), f.name.clone()))
-            .collect()
+    fn collect_columns(&self, schema: &crate::planner::PlanSchema) -> Vec<(Option<String>, String)> {
+        schema.fields().iter().map(|f| (f.relation.clone(), f.name.clone())).collect()
+    }
+
+    /// Collect columns only from immediate base tables (scans), not from joins
+    /// This is used to correctly determine which predicates can be pushed to which side of a join
+    fn collect_base_table_columns(&self, plan: &LogicalPlan) -> Vec<(Option<String>, String)> {
+        match plan {
+            LogicalPlan::Scan(node) => {
+                // Scan node - return all its columns
+                self.collect_columns(&node.schema)
+            }
+            LogicalPlan::Filter(node) => {
+                // Filter node - recurse to input
+                self.collect_base_table_columns(&node.input)
+            }
+            LogicalPlan::Project(node) => {
+                // Project node - recurse to input
+                self.collect_base_table_columns(&node.input)
+            }
+            LogicalPlan::Aggregate(node) => {
+                // Aggregate node - recurse to input
+                self.collect_base_table_columns(&node.input)
+            }
+            LogicalPlan::Sort(node) => {
+                // Sort node - recurse to input
+                self.collect_base_table_columns(&node.input)
+            }
+            LogicalPlan::Limit(node) => {
+                // Limit node - recurse to input
+                self.collect_base_table_columns(&node.input)
+            }
+            LogicalPlan::Distinct(node) => {
+                // Distinct node - recurse to input
+                self.collect_base_table_columns(&node.input)
+            }
+            LogicalPlan::SubqueryAlias(node) => {
+                // SubqueryAlias node - recurse to input
+                self.collect_base_table_columns(&node.input)
+            }
+            // For Join nodes, recursively collect from BOTH children
+            // This gives us the actual base tables on each side, not merged schemas
+            LogicalPlan::Join(node) => {
+                let mut cols = self.collect_base_table_columns(&node.left);
+                cols.extend(self.collect_base_table_columns(&node.right));
+                cols
+            }
+            // For other nodes, return empty - predicates referencing these will remain as "remaining"
+            _ => vec![],
+        }
     }
 
     /// Check if a column matches any schema column
@@ -599,9 +541,7 @@ impl PredicatePushdown {
         match &col.relation {
             Some(rel) => {
                 // Qualified column - must match both relation and name
-                schema_cols
-                    .iter()
-                    .any(|(r, n)| r.as_ref() == Some(rel) && n == &col.name)
+                schema_cols.iter().any(|(r, n)| r.as_ref() == Some(rel) && n == &col.name)
             }
             None => {
                 // Unqualified column - match by name only

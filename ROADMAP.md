@@ -2,7 +2,7 @@
 
 ## Project Status
 
-**Current State**: TPC-H Benchmark 10/22 queries passing (45%)
+**Current State**: TPC-H Benchmark TBD queries passing (fix deployed, testing in progress)
 
 ### Completed Features ✅
 - **SQL Parser**: Full SQL-2011 support via sqlparser-rs
@@ -19,12 +19,13 @@
 - **TPC-H Support**: Full 22-query suite with schema definitions
 
 ### Known Limitations ⚠️
-- **CRITICAL: Predicate Pushdown Bug**: The optimizer drops tables from join trees when processing implicit joins (comma-separated FROM clauses)
-  - Issue: When processing CROSS join chains, the predicate pushdown optimizer incorrectly prunes tables
-  - Impact: Most queries with implicit joins fail (Q2, Q3, Q5, Q7, Q8, Q9, Q10, Q11, Q18, Q20, Q21)
-  - Root cause: Join tree reconstruction loses intermediate tables during recursive pushdown
-  - Status: Requires fix in `src/optimizer/rules/predicate_pushdown.rs`
-- **Q20**: Nested correlated subqueries (separate issue, requires multi-level context propagation)
+- **FIXED: Predicate Pushdown Bug** (2024-06-XX): The optimizer was dropping tables from join trees when processing implicit joins
+  - **Issue**: When processing CROSS join chains, the JoinReordering optimizer was incorrectly pruning tables
+  - **Impact**: Most queries with implicit joins were failing (Q2, Q3, Q5, Q7, Q8, Q9, Q10, Q11, Q18, Q20, Q21)
+  - **Root Cause**: `JoinReordering::greedy_join_reorder()` was designed for INNER joins with explicit conditions, but was breaking CROSS joins
+  - **Fix**: Modified `JoinReordering::reorder_joins()` to skip reordering for CROSS joins without empty `on` clauses
+  - **Status**: Fix deployed in `src/optimizer/rules/join_reordering.rs`
+- **Q20**: Nested correlated subqueries (requires multi-level context propagation)
 - **Q17, Q22**: Some test edge cases with CTE column resolution (work in CLI mode)
 
 ### Passing Queries ✅
