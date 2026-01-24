@@ -1614,6 +1614,127 @@ impl<'a> Binder<'a> {
                 args,
                 distinct: false,
             }),
+            // New simple aggregates
+            "COUNT_IF" => Ok(Expr::Aggregate {
+                func: AggregateFunction::CountIf,
+                args,
+                distinct: false,
+            }),
+            "ANY_VALUE" => Ok(Expr::Aggregate {
+                func: AggregateFunction::AnyValue,
+                args,
+                distinct: false,
+            }),
+            "ARBITRARY" => Ok(Expr::Aggregate {
+                func: AggregateFunction::Arbitrary,
+                args,
+                distinct: false,
+            }),
+            "GEOMETRIC_MEAN" => Ok(Expr::Aggregate {
+                func: AggregateFunction::GeometricMean,
+                args,
+                distinct: false,
+            }),
+            "CHECKSUM" => Ok(Expr::Aggregate {
+                func: AggregateFunction::Checksum,
+                args,
+                distinct: false,
+            }),
+            // Bitwise aggregates
+            "BITWISE_AND_AGG" => Ok(Expr::Aggregate {
+                func: AggregateFunction::BitwiseAndAgg,
+                args,
+                distinct: false,
+            }),
+            "BITWISE_OR_AGG" => Ok(Expr::Aggregate {
+                func: AggregateFunction::BitwiseOrAgg,
+                args,
+                distinct: false,
+            }),
+            "BITWISE_XOR_AGG" => Ok(Expr::Aggregate {
+                func: AggregateFunction::BitwiseXorAgg,
+                args,
+                distinct: false,
+            }),
+            // String aggregates
+            "LISTAGG" | "STRING_AGG" | "GROUP_CONCAT" => Ok(Expr::Aggregate {
+                func: AggregateFunction::Listagg,
+                args,
+                distinct,
+            }),
+            // Correlation and regression aggregates
+            "CORR" => Ok(Expr::Aggregate {
+                func: AggregateFunction::Corr,
+                args,
+                distinct: false,
+            }),
+            "COVAR_POP" => Ok(Expr::Aggregate {
+                func: AggregateFunction::CovarPop,
+                args,
+                distinct: false,
+            }),
+            "COVAR_SAMP" => Ok(Expr::Aggregate {
+                func: AggregateFunction::CovarSamp,
+                args,
+                distinct: false,
+            }),
+            "KURTOSIS" => Ok(Expr::Aggregate {
+                func: AggregateFunction::Kurtosis,
+                args,
+                distinct: false,
+            }),
+            "SKEWNESS" => Ok(Expr::Aggregate {
+                func: AggregateFunction::Skewness,
+                args,
+                distinct: false,
+            }),
+            "REGR_SLOPE" => Ok(Expr::Aggregate {
+                func: AggregateFunction::RegrSlope,
+                args,
+                distinct: false,
+            }),
+            "REGR_INTERCEPT" => Ok(Expr::Aggregate {
+                func: AggregateFunction::RegrIntercept,
+                args,
+                distinct: false,
+            }),
+            "REGR_COUNT" => Ok(Expr::Aggregate {
+                func: AggregateFunction::RegrCount,
+                args,
+                distinct: false,
+            }),
+            "REGR_AVGX" => Ok(Expr::Aggregate {
+                func: AggregateFunction::RegrAvgx,
+                args,
+                distinct: false,
+            }),
+            "REGR_AVGY" => Ok(Expr::Aggregate {
+                func: AggregateFunction::RegrAvgy,
+                args,
+                distinct: false,
+            }),
+            // Approximate aggregates
+            "APPROX_PERCENTILE" => Ok(Expr::Aggregate {
+                func: AggregateFunction::ApproxPercentile,
+                args,
+                distinct: false,
+            }),
+            "APPROX_DISTINCT" | "APPROX_COUNT_DISTINCT" => Ok(Expr::Aggregate {
+                func: AggregateFunction::ApproxDistinct,
+                args,
+                distinct: false,
+            }),
+            // Multi-value aggregates
+            "MAX_BY" => Ok(Expr::Aggregate {
+                func: AggregateFunction::MaxBy,
+                args,
+                distinct: false,
+            }),
+            "MIN_BY" => Ok(Expr::Aggregate {
+                func: AggregateFunction::MinBy,
+                args,
+                distinct: false,
+            }),
             // Scalar functions
             "UPPER" => Ok(Expr::ScalarFunc {
                 func: ScalarFunction::Upper,
@@ -2022,6 +2143,555 @@ impl<'a> Binder<'a> {
             }),
             "UUID" => Ok(Expr::ScalarFunc {
                 func: ScalarFunction::Uuid,
+                args,
+            }),
+            // New Math functions - Trigonometric
+            "SINH" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Sinh,
+                args,
+            }),
+            "COSH" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Cosh,
+                args,
+            }),
+            "TANH" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Tanh,
+                args,
+            }),
+            "COT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Cot,
+                args,
+            }),
+            // New Math functions - Special values
+            "INFINITY" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Infinity,
+                args,
+            }),
+            "NAN" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Nan,
+                args,
+            }),
+            "IS_FINITE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::IsFinite,
+                args,
+            }),
+            "IS_NAN" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::IsNan,
+                args,
+            }),
+            "IS_INFINITE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::IsInfinite,
+                args,
+            }),
+            // New Math functions - Base conversion
+            "FROM_BASE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::FromBase,
+                args,
+            }),
+            "TO_BASE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ToBase,
+                args,
+            }),
+            "WIDTH_BUCKET" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::WidthBucket,
+                args,
+            }),
+            // New Math functions - Statistical distributions
+            "BETA_CDF" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::BetaCdf,
+                args,
+            }),
+            "INVERSE_BETA_CDF" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::InverseBetaCdf,
+                args,
+            }),
+            "NORMAL_CDF" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::NormalCdf,
+                args,
+            }),
+            "INVERSE_NORMAL_CDF" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::InverseNormalCdf,
+                args,
+            }),
+            "T_CDF" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::TCdf,
+                args,
+            }),
+            "T_PDF" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::TPdf,
+                args,
+            }),
+            "WILSON_INTERVAL_LOWER" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::WilsonIntervalLower,
+                args,
+            }),
+            "WILSON_INTERVAL_UPPER" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::WilsonIntervalUpper,
+                args,
+            }),
+            // New Math functions - Vector operations
+            "COSINE_SIMILARITY" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::CosineSimilarity,
+                args,
+            }),
+            "COSINE_DISTANCE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::CosineDistance,
+                args,
+            }),
+            // New String functions
+            "SPLIT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Split,
+                args,
+            }),
+            "CODEPOINT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Codepoint,
+                args,
+            }),
+            "HAMMING_DISTANCE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::HammingDistance,
+                args,
+            }),
+            "LEVENSHTEIN_DISTANCE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::LevenshteinDistance,
+                args,
+            }),
+            "SOUNDEX" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Soundex,
+                args,
+            }),
+            "TRANSLATE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Translate,
+                args,
+            }),
+            "LUHN_CHECK" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::LuhnCheck,
+                args,
+            }),
+            "NORMALIZE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Normalize,
+                args,
+            }),
+            "TO_UTF8" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ToUtf8,
+                args,
+            }),
+            "FROM_UTF8" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::FromUtf8,
+                args,
+            }),
+            "WORD_STEM" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::WordStem,
+                args,
+            }),
+            // New Date/Time functions - Extraction
+            "MILLISECOND" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Millisecond,
+                args,
+            }),
+            "YEAR_OF_WEEK" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::YearOfWeek,
+                args,
+            }),
+            "TIMEZONE_HOUR" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::TimezoneHour,
+                args,
+            }),
+            "TIMEZONE_MINUTE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::TimezoneMinute,
+                args,
+            }),
+            // New Date/Time functions - Current
+            "CURRENT_TIME" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::CurrentTime,
+                args,
+            }),
+            "CURRENT_TIMEZONE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::CurrentTimezone,
+                args,
+            }),
+            "LOCALTIME" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Localtime,
+                args,
+            }),
+            "LOCALTIMESTAMP" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Localtimestamp,
+                args,
+            }),
+            // New Date/Time functions - Arithmetic
+            "LAST_DAY_OF_MONTH" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::LastDayOfMonth,
+                args,
+            }),
+            // New Date/Time functions - Parsing and formatting
+            "FROM_UNIXTIME" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::FromUnixtime,
+                args,
+            }),
+            "TO_UNIXTIME" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ToUnixtime,
+                args,
+            }),
+            "FROM_ISO8601_TIMESTAMP" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::FromIso8601Timestamp,
+                args,
+            }),
+            "FROM_ISO8601_DATE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::FromIso8601Date,
+                args,
+            }),
+            "TO_ISO8601" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ToIso8601,
+                args,
+            }),
+            "DATE_FORMAT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::DateFormat,
+                args,
+            }),
+            "DATE_PARSE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::DateParse,
+                args,
+            }),
+            "PARSE_DATETIME" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ParseDatetime,
+                args,
+            }),
+            "PARSE_DURATION" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ParseDuration,
+                args,
+            }),
+            "HUMAN_READABLE_SECONDS" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::HumanReadableSeconds,
+                args,
+            }),
+            // New Date/Time functions - Timezone
+            "AT_TIMEZONE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::AtTimezone,
+                args,
+            }),
+            "WITH_TIMEZONE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::WithTimezone,
+                args,
+            }),
+            "TIMEZONE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Timezone,
+                args,
+            }),
+            // New Type conversion
+            "TRY_CAST" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::TryCast,
+                args,
+            }),
+            // New Conditional functions
+            "TRY" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Try,
+                args,
+            }),
+            // New Formatting functions
+            "FORMAT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Format,
+                args,
+            }),
+            "FORMAT_NUMBER" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::FormatNumber,
+                args,
+            }),
+            "PARSE_DATA_SIZE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ParseDataSize,
+                args,
+            }),
+            // New Regex functions
+            "REGEXP_EXTRACT_ALL" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::RegexpExtractAll,
+                args,
+            }),
+            "REGEXP_POSITION" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::RegexpPosition,
+                args,
+            }),
+            // New Binary/Encoding functions - Base64
+            "TO_BASE64URL" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ToBase64Url,
+                args,
+            }),
+            "FROM_BASE64URL" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::FromBase64Url,
+                args,
+            }),
+            // New Binary/Encoding functions - Base32
+            "TO_BASE32" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ToBase32,
+                args,
+            }),
+            "FROM_BASE32" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::FromBase32,
+                args,
+            }),
+            // New Binary/Encoding functions - Hash
+            "CRC32" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Crc32,
+                args,
+            }),
+            "XXHASH64" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Xxhash64,
+                args,
+            }),
+            "MURMUR3" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Murmur3,
+                args,
+            }),
+            "SPOOKY_HASH_V2_32" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::SpookyHashV2_32,
+                args,
+            }),
+            "SPOOKY_HASH_V2_64" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::SpookyHashV2_64,
+                args,
+            }),
+            // New Binary/Encoding functions - HMAC
+            "HMAC_MD5" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::HmacMd5,
+                args,
+            }),
+            "HMAC_SHA1" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::HmacSha1,
+                args,
+            }),
+            "HMAC_SHA256" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::HmacSha256,
+                args,
+            }),
+            "HMAC_SHA512" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::HmacSha512,
+                args,
+            }),
+            // New Binary/Encoding functions - Endian conversion
+            "FROM_BIG_ENDIAN_32" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::FromBigEndian32,
+                args,
+            }),
+            "TO_BIG_ENDIAN_32" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ToBigEndian32,
+                args,
+            }),
+            "FROM_BIG_ENDIAN_64" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::FromBigEndian64,
+                args,
+            }),
+            "TO_BIG_ENDIAN_64" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ToBigEndian64,
+                args,
+            }),
+            // New Binary/Encoding functions - IEEE754
+            "FROM_IEEE754_32" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::FromIeee754_32,
+                args,
+            }),
+            "TO_IEEE754_32" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ToIeee754_32,
+                args,
+            }),
+            "FROM_IEEE754_64" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::FromIeee754_64,
+                args,
+            }),
+            "TO_IEEE754_64" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ToIeee754_64,
+                args,
+            }),
+            // New Bitwise functions
+            "BITWISE_LEFT_SHIFT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::BitwiseLeftShift,
+                args,
+            }),
+            "BITWISE_RIGHT_SHIFT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::BitwiseRightShift,
+                args,
+            }),
+            "BITWISE_RIGHT_SHIFT_ARITHMETIC" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::BitwiseRightShiftArithmetic,
+                args,
+            }),
+            // New URL functions
+            "URL_EXTRACT_FRAGMENT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::UrlExtractFragment,
+                args,
+            }),
+            "URL_EXTRACT_PARAMETER" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::UrlExtractParameter,
+                args,
+            }),
+            // JSON functions
+            "JSON_EXTRACT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::JsonExtract,
+                args,
+            }),
+            "JSON_EXTRACT_SCALAR" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::JsonExtractScalar,
+                args,
+            }),
+            "JSON_SIZE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::JsonSize,
+                args,
+            }),
+            "JSON_ARRAY_LENGTH" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::JsonArrayLength,
+                args,
+            }),
+            "JSON_ARRAY_GET" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::JsonArrayGet,
+                args,
+            }),
+            "JSON_ARRAY_CONTAINS" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::JsonArrayContains,
+                args,
+            }),
+            "IS_JSON_SCALAR" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::IsJsonScalar,
+                args,
+            }),
+            "JSON_FORMAT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::JsonFormat,
+                args,
+            }),
+            "JSON_PARSE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::JsonParse,
+                args,
+            }),
+            "JSON_QUERY" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::JsonQuery,
+                args,
+            }),
+            "JSON_VALUE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::JsonValue,
+                args,
+            }),
+            "JSON_EXISTS" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::JsonExists,
+                args,
+            }),
+            "JSON_OBJECT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::JsonObject,
+                args,
+            }),
+            "JSON_ARRAY" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::JsonArray,
+                args,
+            }),
+            // Array functions
+            "CARDINALITY" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Cardinality,
+                args,
+            }),
+            "ARRAY_LENGTH" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ArrayLength,
+                args,
+            }),
+            "ELEMENT_AT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ElementAt,
+                args,
+            }),
+            "ARRAY_CONTAINS" | "CONTAINS" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ArrayContains,
+                args,
+            }),
+            "ARRAY_POSITION" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ArrayPosition,
+                args,
+            }),
+            "ARRAY_DISTINCT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ArrayDistinct,
+                args,
+            }),
+            "ARRAY_INTERSECT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ArrayIntersect,
+                args,
+            }),
+            "ARRAY_UNION" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ArrayUnion,
+                args,
+            }),
+            "ARRAY_EXCEPT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ArrayExcept,
+                args,
+            }),
+            "ARRAY_JOIN" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ArrayJoin,
+                args,
+            }),
+            "ARRAY_MAX" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ArrayMax,
+                args,
+            }),
+            "ARRAY_MIN" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ArrayMin,
+                args,
+            }),
+            "ARRAY_REMOVE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ArrayRemove,
+                args,
+            }),
+            "ARRAY_SORT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ArraySort,
+                args,
+            }),
+            "ARRAYS_OVERLAP" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ArraysOverlap,
+                args,
+            }),
+            "ARRAY_CONCAT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ArrayConcat,
+                args,
+            }),
+            "FLATTEN" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Flatten,
+                args,
+            }),
+            "ARRAY_REVERSE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ArrayReverse,
+                args,
+            }),
+            "SEQUENCE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Sequence,
+                args,
+            }),
+            "SHUFFLE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Shuffle,
+                args,
+            }),
+            "SLICE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Slice,
+                args,
+            }),
+            "TRIM_ARRAY" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::TrimArray,
+                args,
+            }),
+            "ARRAY_REPEAT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ArrayRepeat,
+                args,
+            }),
+            "NGRAMS" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Ngrams,
+                args,
+            }),
+            "COMBINATIONS" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Combinations,
+                args,
+            }),
+            "ARRAY_FIRST" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ArrayFirst,
+                args,
+            }),
+            "ARRAY_LAST" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ArrayLast,
+                args,
+            }),
+            "CONTAINS_SEQUENCE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ContainsSequence,
+                args,
+            }),
+            "ZIP" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Zip,
                 args,
             }),
             _ => Err(QueryError::NotImplemented(format!(

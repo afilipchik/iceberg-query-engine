@@ -1977,3 +1977,370 @@ fn test_encoding_comprehensive() {
     assert_eq!(get_string(&ctx, "SELECT TO_BASE64('abc') FROM test_data WHERE id = 1"), Some("YWJj".to_string()));
     assert_eq!(get_string(&ctx, "SELECT TO_BASE64('hello') FROM test_data WHERE id = 1"), Some("aGVsbG8=".to_string()));
 }
+
+// =============================================================================
+// DATE_ADD, DATE_DIFF, DATE_TRUNC, DATE_PART FUNCTION TESTS
+// =============================================================================
+
+#[test]
+fn test_date_add_days() {
+    let ctx = create_test_context();
+    // DATE_ADD with days - adding to a timestamp
+    let result = get_string(&ctx, "SELECT DATE_FORMAT(DATE_ADD('day', 5, DATE_PARSE('2024-01-15', '%Y-%m-%d')), '%Y-%m-%d') FROM test_data WHERE id = 1");
+    assert_eq!(result, Some("2024-01-20".to_string()), "DATE_ADD 5 days to 2024-01-15 should be 2024-01-20");
+}
+
+#[test]
+fn test_date_add_months() {
+    let ctx = create_test_context();
+    let result = get_string(&ctx, "SELECT DATE_FORMAT(DATE_ADD('month', 2, DATE_PARSE('2024-01-15', '%Y-%m-%d')), '%Y-%m-%d') FROM test_data WHERE id = 1");
+    assert_eq!(result, Some("2024-03-15".to_string()), "DATE_ADD 2 months to 2024-01-15 should be 2024-03-15");
+}
+
+#[test]
+fn test_date_add_years() {
+    let ctx = create_test_context();
+    let result = get_string(&ctx, "SELECT DATE_FORMAT(DATE_ADD('year', 1, DATE_PARSE('2024-01-15', '%Y-%m-%d')), '%Y-%m-%d') FROM test_data WHERE id = 1");
+    assert_eq!(result, Some("2025-01-15".to_string()), "DATE_ADD 1 year to 2024-01-15 should be 2025-01-15");
+}
+
+#[test]
+fn test_date_add_negative() {
+    let ctx = create_test_context();
+    let result = get_string(&ctx, "SELECT DATE_FORMAT(DATE_ADD('day', -10, DATE_PARSE('2024-01-15', '%Y-%m-%d')), '%Y-%m-%d') FROM test_data WHERE id = 1");
+    assert_eq!(result, Some("2024-01-05".to_string()), "DATE_ADD -10 days to 2024-01-15 should be 2024-01-05");
+}
+
+#[test]
+fn test_date_diff_days() {
+    let ctx = create_test_context();
+    let result = get_int64(&ctx, "SELECT DATE_DIFF('day', DATE_PARSE('2024-01-10', '%Y-%m-%d'), DATE_PARSE('2024-01-15', '%Y-%m-%d')) FROM test_data WHERE id = 1");
+    assert_eq!(result, Some(5), "DATE_DIFF days between 2024-01-10 and 2024-01-15 should be 5");
+}
+
+#[test]
+fn test_date_diff_months() {
+    let ctx = create_test_context();
+    let result = get_int64(&ctx, "SELECT DATE_DIFF('month', DATE_PARSE('2024-01-15', '%Y-%m-%d'), DATE_PARSE('2024-04-15', '%Y-%m-%d')) FROM test_data WHERE id = 1");
+    assert_eq!(result, Some(3), "DATE_DIFF months between 2024-01-15 and 2024-04-15 should be 3");
+}
+
+#[test]
+fn test_date_diff_years() {
+    let ctx = create_test_context();
+    let result = get_int64(&ctx, "SELECT DATE_DIFF('year', DATE_PARSE('2020-01-01', '%Y-%m-%d'), DATE_PARSE('2024-01-01', '%Y-%m-%d')) FROM test_data WHERE id = 1");
+    assert_eq!(result, Some(4), "DATE_DIFF years between 2020 and 2024 should be 4");
+}
+
+#[test]
+fn test_date_diff_negative() {
+    let ctx = create_test_context();
+    let result = get_int64(&ctx, "SELECT DATE_DIFF('day', DATE_PARSE('2024-01-15', '%Y-%m-%d'), DATE_PARSE('2024-01-10', '%Y-%m-%d')) FROM test_data WHERE id = 1");
+    assert_eq!(result, Some(-5), "DATE_DIFF days (reverse) should be -5");
+}
+
+#[test]
+fn test_date_trunc_month() {
+    let ctx = create_test_context();
+    let result = get_string(&ctx, "SELECT DATE_FORMAT(DATE_TRUNC('month', DATE_PARSE('2024-03-15 14:30:00', '%Y-%m-%d %H:%i:%s')), '%Y-%m-%d') FROM test_data WHERE id = 1");
+    assert_eq!(result, Some("2024-03-01".to_string()), "DATE_TRUNC to month should be first of month");
+}
+
+#[test]
+fn test_date_trunc_year() {
+    let ctx = create_test_context();
+    let result = get_string(&ctx, "SELECT DATE_FORMAT(DATE_TRUNC('year', DATE_PARSE('2024-07-20', '%Y-%m-%d')), '%Y-%m-%d') FROM test_data WHERE id = 1");
+    assert_eq!(result, Some("2024-01-01".to_string()), "DATE_TRUNC to year should be Jan 1");
+}
+
+#[test]
+fn test_date_trunc_quarter() {
+    let ctx = create_test_context();
+    // May is in Q2, which starts on April 1
+    let result = get_string(&ctx, "SELECT DATE_FORMAT(DATE_TRUNC('quarter', DATE_PARSE('2024-05-15', '%Y-%m-%d')), '%Y-%m-%d') FROM test_data WHERE id = 1");
+    assert_eq!(result, Some("2024-04-01".to_string()), "DATE_TRUNC to quarter should be start of quarter");
+}
+
+#[test]
+fn test_date_part_year() {
+    let ctx = create_test_context();
+    // DATE_PART with DATE literal - consistent with YEAR function syntax
+    let result = get_float64(&ctx, "SELECT DATE_PART('year', DATE '2024-06-15') FROM test_data WHERE id = 1");
+    assert_eq!(result, Some(2024.0), "DATE_PART('year', DATE '2024-06-15') should be 2024");
+}
+
+#[test]
+fn test_date_part_month() {
+    let ctx = create_test_context();
+    let result = get_float64(&ctx, "SELECT DATE_PART('month', DATE '2024-06-15') FROM test_data WHERE id = 1");
+    assert_eq!(result, Some(6.0), "DATE_PART('month', DATE '2024-06-15') should be 6");
+}
+
+#[test]
+fn test_date_part_day() {
+    let ctx = create_test_context();
+    let result = get_float64(&ctx, "SELECT DATE_PART('day', DATE '2024-06-15') FROM test_data WHERE id = 1");
+    assert_eq!(result, Some(15.0), "DATE_PART('day', DATE '2024-06-15') should be 15");
+}
+
+#[test]
+fn test_date_part_quarter() {
+    let ctx = create_test_context();
+    // June is in Q2
+    let result = get_float64(&ctx, "SELECT DATE_PART('quarter', DATE '2024-06-15') FROM test_data WHERE id = 1");
+    assert_eq!(result, Some(2.0), "DATE_PART('quarter', DATE '2024-06-15') should be 2");
+}
+
+// =============================================================================
+// DATE_FORMAT AND DATE_PARSE FUNCTION TESTS
+// =============================================================================
+
+#[test]
+fn test_date_format_basic() {
+    let ctx = create_test_context();
+    let result = get_string(&ctx, "SELECT DATE_FORMAT(DATE_PARSE('2024-07-15', '%Y-%m-%d'), '%Y-%m-%d') FROM test_data WHERE id = 1");
+    assert_eq!(result, Some("2024-07-15".to_string()), "DATE_FORMAT should format correctly");
+}
+
+#[test]
+fn test_date_format_different_pattern() {
+    let ctx = create_test_context();
+    let result = get_string(&ctx, "SELECT DATE_FORMAT(DATE_PARSE('2024-07-15', '%Y-%m-%d'), '%d/%m/%Y') FROM test_data WHERE id = 1");
+    assert_eq!(result, Some("15/07/2024".to_string()), "DATE_FORMAT with different pattern");
+}
+
+#[test]
+fn test_date_parse_with_time() {
+    let ctx = create_test_context();
+    let result = get_string(&ctx, "SELECT DATE_FORMAT(DATE_PARSE('2024-07-15 14:30:45', '%Y-%m-%d %H:%i:%s'), '%H:%i:%s') FROM test_data WHERE id = 1");
+    assert_eq!(result, Some("14:30:45".to_string()), "DATE_PARSE should handle time correctly");
+}
+
+// =============================================================================
+// BASE32 ENCODING FUNCTION TESTS
+// =============================================================================
+
+#[test]
+fn test_to_base32_basic() {
+    let ctx = create_test_context();
+    let result = get_string(&ctx, "SELECT TO_BASE32('hello') FROM test_data WHERE id = 1");
+    assert_eq!(result, Some("NBSWY3DP".to_string()), "TO_BASE32('hello') should be 'NBSWY3DP'");
+}
+
+#[test]
+fn test_to_base32_empty() {
+    let ctx = create_test_context();
+    let result = get_string(&ctx, "SELECT TO_BASE32('') FROM test_data WHERE id = 1");
+    assert_eq!(result, Some("".to_string()), "TO_BASE32 of empty string should be empty");
+}
+
+#[test]
+fn test_to_base32_various() {
+    let ctx = create_test_context();
+    // 'a' in Base32 is 'ME======'
+    let result = get_string(&ctx, "SELECT TO_BASE32('a') FROM test_data WHERE id = 1");
+    assert_eq!(result, Some("ME======".to_string()));
+
+    let result = get_string(&ctx, "SELECT TO_BASE32('ab') FROM test_data WHERE id = 1");
+    assert_eq!(result, Some("MFRA====".to_string()));
+}
+
+// =============================================================================
+// FORMAT AND FORMAT_NUMBER FUNCTION TESTS
+// =============================================================================
+
+#[test]
+fn test_format_number_basic() {
+    let ctx = create_test_context();
+    let result = get_string(&ctx, "SELECT FORMAT_NUMBER(1234567.89, 2) FROM test_data WHERE id = 1");
+    assert_eq!(result, Some("1,234,567.89".to_string()), "FORMAT_NUMBER should add thousands separators");
+}
+
+#[test]
+fn test_format_number_no_decimals() {
+    let ctx = create_test_context();
+    let result = get_string(&ctx, "SELECT FORMAT_NUMBER(1234567, 0) FROM test_data WHERE id = 1");
+    assert_eq!(result, Some("1,234,567".to_string()), "FORMAT_NUMBER with 0 decimals");
+}
+
+#[test]
+fn test_format_number_negative() {
+    let ctx = create_test_context();
+    let result = get_string(&ctx, "SELECT FORMAT_NUMBER(-9876543.21, 2) FROM test_data WHERE id = 1");
+    assert_eq!(result, Some("-9,876,543.21".to_string()), "FORMAT_NUMBER with negative number");
+}
+
+#[test]
+fn test_format_number_small() {
+    let ctx = create_test_context();
+    let result = get_string(&ctx, "SELECT FORMAT_NUMBER(42.5, 2) FROM test_data WHERE id = 1");
+    assert_eq!(result, Some("42.50".to_string()), "FORMAT_NUMBER with small number");
+}
+
+#[test]
+fn test_format_simple() {
+    let ctx = create_test_context();
+    let result = get_string(&ctx, "SELECT FORMAT('Value: %s', 'hello') FROM test_data WHERE id = 1");
+    assert_eq!(result, Some("Value: hello".to_string()), "FORMAT should replace %s");
+}
+
+// =============================================================================
+// STATISTICAL FUNCTION TESTS (BETA_CDF, T_CDF, WILSON_INTERVAL)
+// =============================================================================
+
+#[test]
+fn test_beta_cdf_basic() {
+    let ctx = create_test_context();
+    // BETA_CDF(1, 1, 0.5) for uniform distribution should be 0.5
+    let result = get_float64(&ctx, "SELECT BETA_CDF(1, 1, 0.5) FROM test_data WHERE id = 1");
+    assert!(result.is_some());
+    assert!((result.unwrap() - 0.5).abs() < 0.001, "BETA_CDF(1, 1, 0.5) should be ~0.5");
+}
+
+#[test]
+fn test_beta_cdf_at_zero() {
+    let ctx = create_test_context();
+    // BETA_CDF at x=0 should be 0
+    let result = get_float64(&ctx, "SELECT BETA_CDF(2, 3, 0) FROM test_data WHERE id = 1");
+    assert!(result.is_some());
+    assert!((result.unwrap() - 0.0).abs() < 0.001, "BETA_CDF at x=0 should be 0");
+}
+
+#[test]
+fn test_beta_cdf_at_one() {
+    let ctx = create_test_context();
+    // BETA_CDF at x=1 should be 1
+    let result = get_float64(&ctx, "SELECT BETA_CDF(2, 3, 1) FROM test_data WHERE id = 1");
+    assert!(result.is_some());
+    assert!((result.unwrap() - 1.0).abs() < 0.001, "BETA_CDF at x=1 should be 1");
+}
+
+#[test]
+fn test_inverse_beta_cdf_basic() {
+    let ctx = create_test_context();
+    // INVERSE_BETA_CDF(1, 1, 0.5) for uniform should be 0.5
+    let result = get_float64(&ctx, "SELECT INVERSE_BETA_CDF(1, 1, 0.5) FROM test_data WHERE id = 1");
+    assert!(result.is_some());
+    assert!((result.unwrap() - 0.5).abs() < 0.001, "INVERSE_BETA_CDF(1, 1, 0.5) should be ~0.5");
+}
+
+#[test]
+fn test_t_cdf_standard() {
+    let ctx = create_test_context();
+    // T_CDF(0, 10) should be 0.5 (symmetric around 0)
+    let result = get_float64(&ctx, "SELECT T_CDF(0, 10) FROM test_data WHERE id = 1");
+    assert!(result.is_some());
+    assert!((result.unwrap() - 0.5).abs() < 0.001, "T_CDF(0, df) should be 0.5");
+}
+
+#[test]
+fn test_t_cdf_positive() {
+    let ctx = create_test_context();
+    // T_CDF at large positive x should approach 1
+    let result = get_float64(&ctx, "SELECT T_CDF(5, 10) FROM test_data WHERE id = 1");
+    assert!(result.is_some());
+    assert!(result.unwrap() > 0.99, "T_CDF(5, 10) should be close to 1");
+}
+
+#[test]
+fn test_t_pdf_at_zero() {
+    let ctx = create_test_context();
+    // T_PDF at 0 should be the maximum value
+    let result = get_float64(&ctx, "SELECT T_PDF(0, 10) FROM test_data WHERE id = 1");
+    assert!(result.is_some());
+    assert!(result.unwrap() > 0.38, "T_PDF(0, 10) should be around 0.39");
+}
+
+#[test]
+fn test_wilson_interval_lower_basic() {
+    let ctx = create_test_context();
+    // Wilson interval for 10 successes out of 100 trials with z=1.96 (95% CI)
+    let result = get_float64(&ctx, "SELECT WILSON_INTERVAL_LOWER(10, 100, 1.96) FROM test_data WHERE id = 1");
+    assert!(result.is_some());
+    let lower = result.unwrap();
+    assert!(lower > 0.04 && lower < 0.07, "Wilson lower bound should be between 0.04 and 0.07");
+}
+
+#[test]
+fn test_wilson_interval_upper_basic() {
+    let ctx = create_test_context();
+    // Wilson interval for 10 successes out of 100 trials with z=1.96 (95% CI)
+    let result = get_float64(&ctx, "SELECT WILSON_INTERVAL_UPPER(10, 100, 1.96) FROM test_data WHERE id = 1");
+    assert!(result.is_some());
+    let upper = result.unwrap();
+    assert!(upper > 0.15 && upper < 0.20, "Wilson upper bound should be between 0.15 and 0.20");
+}
+
+#[test]
+fn test_wilson_interval_bounds_relationship() {
+    let ctx = create_test_context();
+    // Upper bound should be greater than lower bound
+    let lower = get_float64(&ctx, "SELECT WILSON_INTERVAL_LOWER(50, 100, 1.96) FROM test_data WHERE id = 1");
+    let upper = get_float64(&ctx, "SELECT WILSON_INTERVAL_UPPER(50, 100, 1.96) FROM test_data WHERE id = 1");
+    assert!(lower.is_some() && upper.is_some());
+    assert!(upper.unwrap() > lower.unwrap(), "Upper bound should be greater than lower bound");
+}
+
+// =============================================================================
+// TIMEZONE FUNCTION TESTS
+// =============================================================================
+
+#[test]
+fn test_timezone_basic() {
+    let ctx = create_test_context();
+    // TIMEZONE() should return a timezone string
+    let result = get_string(&ctx, "SELECT TIMEZONE(NOW()) FROM test_data WHERE id = 1");
+    assert!(result.is_some(), "TIMEZONE should return a value");
+}
+
+#[test]
+fn test_at_timezone_utc() {
+    let ctx = create_test_context();
+    // AT_TIMEZONE with UTC should not change the timestamp
+    let result = get_int64(&ctx, "SELECT DATE_DIFF('second', NOW(), AT_TIMEZONE(NOW(), 'UTC')) FROM test_data WHERE id = 1");
+    assert!(result.is_some());
+    // The difference should be 0 or very small
+    assert!(result.unwrap().abs() < 2, "AT_TIMEZONE with UTC should not significantly change the timestamp");
+}
+
+// =============================================================================
+// EDGE CASE AND BOUNDARY TESTS
+// =============================================================================
+
+#[test]
+fn test_date_add_month_end_boundary() {
+    let ctx = create_test_context();
+    // Adding 1 month to Jan 31 should handle month-end correctly
+    let result = get_string(&ctx, "SELECT DATE_FORMAT(DATE_ADD('month', 1, DATE_PARSE('2024-01-31', '%Y-%m-%d')), '%Y-%m-%d') FROM test_data WHERE id = 1");
+    // Feb 2024 has 29 days (leap year), so Jan 31 + 1 month = Feb 29 or closest
+    assert!(result.is_some(), "DATE_ADD should handle month-end boundary");
+}
+
+#[test]
+fn test_date_add_leap_year() {
+    let ctx = create_test_context();
+    // Adding 1 day to Feb 28 in a leap year should give Feb 29
+    let result = get_string(&ctx, "SELECT DATE_FORMAT(DATE_ADD('day', 1, DATE_PARSE('2024-02-28', '%Y-%m-%d')), '%Y-%m-%d') FROM test_data WHERE id = 1");
+    assert_eq!(result, Some("2024-02-29".to_string()), "2024-02-28 + 1 day should be 2024-02-29 (leap year)");
+}
+
+#[test]
+fn test_date_diff_across_year_boundary() {
+    let ctx = create_test_context();
+    let result = get_int64(&ctx, "SELECT DATE_DIFF('day', DATE_PARSE('2023-12-31', '%Y-%m-%d'), DATE_PARSE('2024-01-02', '%Y-%m-%d')) FROM test_data WHERE id = 1");
+    assert_eq!(result, Some(2), "DATE_DIFF across year boundary should be 2 days");
+}
+
+#[test]
+fn test_format_number_zero() {
+    let ctx = create_test_context();
+    let result = get_string(&ctx, "SELECT FORMAT_NUMBER(0, 2) FROM test_data WHERE id = 1");
+    assert_eq!(result, Some("0.00".to_string()), "FORMAT_NUMBER(0) should be '0.00'");
+}
+
+#[test]
+fn test_format_number_large() {
+    let ctx = create_test_context();
+    let result = get_string(&ctx, "SELECT FORMAT_NUMBER(1234567890123, 0) FROM test_data WHERE id = 1");
+    assert_eq!(result, Some("1,234,567,890,123".to_string()), "FORMAT_NUMBER with large number");
+}

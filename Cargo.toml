@@ -45,6 +45,7 @@ rand = "0.8"
 bytes = "1"
 regex = "1"
 base64 = "0.21"
+data-encoding = "2"
 md-5 = "0.10"
 sha1 = "0.10"
 sha2 = "0.10"
@@ -52,6 +53,11 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 hex = "0.4"
 percent-encoding = "2"
+crc32fast = "1"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+hmac = "0.12"
+unicode-normalization = "0.1"
+statrs = "0.17"
 
 # HTTP Client (for metastore)
 reqwest = { version = "0.11", features = ["json"] }
