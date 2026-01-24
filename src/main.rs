@@ -4,7 +4,8 @@ use clap::{Parser, Subcommand};
 use query_engine::execution::{print_results, ExecutionContext};
 use query_engine::tpch::{self, TpchGenerator};
 use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustyline::history::DefaultHistory;
+use rustyline::{Config, Editor};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -432,7 +433,15 @@ async fn run_repl(tpch_path: Option<PathBuf>) {
         println!();
     }
 
-    let mut rl = match DefaultEditor::new() {
+    // Configure rustyline with history settings
+    let config = Config::builder()
+        .max_history_size(1000)
+        .expect("valid history size")
+        .history_ignore_dups(true)
+        .expect("valid history config")
+        .build();
+
+    let mut rl: Editor<(), DefaultHistory> = match Editor::with_config(config) {
         Ok(editor) => editor,
         Err(e) => {
             eprintln!("Failed to initialize readline: {}", e);
@@ -440,11 +449,17 @@ async fn run_repl(tpch_path: Option<PathBuf>) {
         }
     };
 
-    // Load history if available
+    // Set up history file path
     let history_path = dirs_next::home_dir()
         .map(|h| h.join(".query_engine_history"))
         .unwrap_or_else(|| PathBuf::from(".query_engine_history"));
-    let _ = rl.load_history(&history_path);
+
+    // Load history if it exists
+    if history_path.exists() {
+        if let Err(e) = rl.load_history(&history_path) {
+            eprintln!("Warning: Could not load history: {}", e);
+        }
+    }
 
     loop {
         let readline = rl.readline("sql> ");
@@ -455,6 +470,7 @@ async fn run_repl(tpch_path: Option<PathBuf>) {
                     continue;
                 }
 
+                // Add to history (ignore if it fails - not critical)
                 let _ = rl.add_history_entry(line);
 
                 // Handle dot commands
@@ -497,7 +513,9 @@ async fn run_repl(tpch_path: Option<PathBuf>) {
     }
 
     // Save history
-    let _ = rl.save_history(&history_path);
+    if let Err(e) = rl.save_history(&history_path) {
+        eprintln!("Warning: Could not save history: {}", e);
+    }
 }
 
 /// Handle dot commands, returns false if should exit
