@@ -94,6 +94,15 @@ impl AggregateExpr {
             }
             AggregateFunction::Avg => Ok(DataType::Float64),
             AggregateFunction::Min | AggregateFunction::Max => self.input.data_type(schema),
+            // Statistical aggregates always return Float64
+            AggregateFunction::Stddev
+            | AggregateFunction::StddevPop
+            | AggregateFunction::StddevSamp
+            | AggregateFunction::Variance
+            | AggregateFunction::VarPop
+            | AggregateFunction::VarSamp => Ok(DataType::Float64),
+            // Boolean aggregates return Boolean
+            AggregateFunction::BoolAnd | AggregateFunction::BoolOr => Ok(DataType::Boolean),
         }
     }
 }
@@ -242,6 +251,7 @@ struct AccumulatorState {
     count: i64,
     sum: f64,
     sum_i64: i64,
+    sum_squares: f64, // For variance/stddev calculation
     min_f64: Option<f64>,
     max_f64: Option<f64>,
     min_i64: Option<i64>,
@@ -249,6 +259,9 @@ struct AccumulatorState {
     min_str: Option<String>,
     max_str: Option<String>,
     distinct_set: Option<std::collections::HashSet<GroupValue>>,
+    // Boolean aggregate states
+    bool_and: Option<bool>,
+    bool_or: Option<bool>,
 }
 
 impl Default for AccumulatorState {
@@ -257,6 +270,7 @@ impl Default for AccumulatorState {
             count: 0,
             sum: 0.0,
             sum_i64: 0,
+            sum_squares: 0.0,
             min_f64: None,
             max_f64: None,
             min_i64: None,
@@ -264,6 +278,8 @@ impl Default for AccumulatorState {
             min_str: None,
             max_str: None,
             distinct_set: None,
+            bool_and: None,
+            bool_or: None,
         }
     }
 }
@@ -412,9 +428,119 @@ fn aggregate_scalar_simd(
                 "COUNT DISTINCT not implemented for SIMD aggregation".into(),
             ));
         }
+        // Statistical aggregates
+        AggregateFunction::Stddev | AggregateFunction::StddevSamp => {
+            if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                let values: Vec<f64> = a.iter().flatten().map(|v| v as f64).collect();
+                let stddev = compute_stddev_sample(&values);
+                Arc::new(Float64Array::from(vec![stddev]))
+            } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
+                let values: Vec<f64> = a.iter().flatten().collect();
+                let stddev = compute_stddev_sample(&values);
+                Arc::new(Float64Array::from(vec![stddev]))
+            } else {
+                return Err(QueryError::NotImplemented(format!(
+                    "STDDEV not implemented for type {:?}",
+                    input.data_type()
+                )));
+            }
+        }
+        AggregateFunction::StddevPop => {
+            if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                let values: Vec<f64> = a.iter().flatten().map(|v| v as f64).collect();
+                let stddev = compute_stddev_pop(&values);
+                Arc::new(Float64Array::from(vec![stddev]))
+            } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
+                let values: Vec<f64> = a.iter().flatten().collect();
+                let stddev = compute_stddev_pop(&values);
+                Arc::new(Float64Array::from(vec![stddev]))
+            } else {
+                return Err(QueryError::NotImplemented(format!(
+                    "STDDEV_POP not implemented for type {:?}",
+                    input.data_type()
+                )));
+            }
+        }
+        AggregateFunction::Variance | AggregateFunction::VarSamp => {
+            if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                let values: Vec<f64> = a.iter().flatten().map(|v| v as f64).collect();
+                let var = compute_variance_sample(&values);
+                Arc::new(Float64Array::from(vec![var]))
+            } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
+                let values: Vec<f64> = a.iter().flatten().collect();
+                let var = compute_variance_sample(&values);
+                Arc::new(Float64Array::from(vec![var]))
+            } else {
+                return Err(QueryError::NotImplemented(format!(
+                    "VARIANCE not implemented for type {:?}",
+                    input.data_type()
+                )));
+            }
+        }
+        AggregateFunction::VarPop => {
+            if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                let values: Vec<f64> = a.iter().flatten().map(|v| v as f64).collect();
+                let var = compute_variance_pop(&values);
+                Arc::new(Float64Array::from(vec![var]))
+            } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
+                let values: Vec<f64> = a.iter().flatten().collect();
+                let var = compute_variance_pop(&values);
+                Arc::new(Float64Array::from(vec![var]))
+            } else {
+                return Err(QueryError::NotImplemented(format!(
+                    "VAR_POP not implemented for type {:?}",
+                    input.data_type()
+                )));
+            }
+        }
+        AggregateFunction::BoolAnd => {
+            if let Some(a) = input.as_any().downcast_ref::<BooleanArray>() {
+                let result = a.iter().flatten().all(|v| v);
+                Arc::new(BooleanArray::from(vec![result]))
+            } else {
+                return Err(QueryError::Type(
+                    "BOOL_AND requires boolean argument".into(),
+                ));
+            }
+        }
+        AggregateFunction::BoolOr => {
+            if let Some(a) = input.as_any().downcast_ref::<BooleanArray>() {
+                let result = a.iter().flatten().any(|v| v);
+                Arc::new(BooleanArray::from(vec![result]))
+            } else {
+                return Err(QueryError::Type("BOOL_OR requires boolean argument".into()));
+            }
+        }
     };
 
     RecordBatch::try_new(schema.clone(), vec![result]).map_err(Into::into)
+}
+
+// Helper functions for statistical calculations
+fn compute_variance_pop(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let n = values.len() as f64;
+    let mean = values.iter().sum::<f64>() / n;
+    values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n
+}
+
+fn compute_variance_sample(values: &[f64]) -> f64 {
+    if values.len() < 2 {
+        return 0.0;
+    }
+    let n = values.len() as f64;
+    let mean = values.iter().sum::<f64>() / n;
+    values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0)
+}
+
+fn compute_stddev_pop(values: &[f64]) -> f64 {
+    compute_variance_pop(values).sqrt()
+}
+
+fn compute_stddev_sample(values: &[f64]) -> f64 {
+    compute_variance_sample(values).sqrt()
 }
 
 /// Hash-based aggregation for grouped queries
@@ -626,6 +752,44 @@ fn update_accumulator(
                 }
             }
         }
+        // Statistical aggregates - we track sum and sum_squares for online calculation
+        AggregateFunction::Stddev
+        | AggregateFunction::StddevPop
+        | AggregateFunction::StddevSamp
+        | AggregateFunction::Variance
+        | AggregateFunction::VarPop
+        | AggregateFunction::VarSamp => {
+            if !input.is_null(row) {
+                let val = if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                    a.value(row) as f64
+                } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
+                    a.value(row)
+                } else if let Some(a) = input.as_any().downcast_ref::<arrow::array::Int32Array>() {
+                    a.value(row) as f64
+                } else {
+                    return;
+                };
+                state.count += 1;
+                state.sum += val;
+                state.sum_squares += val * val;
+            }
+        }
+        AggregateFunction::BoolAnd => {
+            if !input.is_null(row) {
+                if let Some(a) = input.as_any().downcast_ref::<BooleanArray>() {
+                    let val = a.value(row);
+                    state.bool_and = Some(state.bool_and.map_or(val, |v| v && val));
+                }
+            }
+        }
+        AggregateFunction::BoolOr => {
+            if !input.is_null(row) {
+                if let Some(a) = input.as_any().downcast_ref::<BooleanArray>() {
+                    let val = a.value(row);
+                    state.bool_or = Some(state.bool_or.map_or(val, |v| v || val));
+                }
+            }
+        }
     }
 }
 
@@ -831,6 +995,92 @@ fn build_agg_array(
                 };
                 match val {
                     Some(v) => builder.append_value(v as i32),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        // Statistical aggregates
+        (AggregateFunction::Variance | AggregateFunction::VarSamp, DataType::Float64) => {
+            let mut builder = Float64Builder::with_capacity(num_groups);
+            for states in groups.values() {
+                let state = &states[agg_idx];
+                if state.count >= 2 {
+                    let n = state.count as f64;
+                    let mean = state.sum / n;
+                    let variance = (state.sum_squares / n) - (mean * mean);
+                    // Bessel's correction for sample variance
+                    let sample_variance = variance * n / (n - 1.0);
+                    builder.append_value(sample_variance);
+                } else {
+                    builder.append_null();
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        (AggregateFunction::VarPop, DataType::Float64) => {
+            let mut builder = Float64Builder::with_capacity(num_groups);
+            for states in groups.values() {
+                let state = &states[agg_idx];
+                if state.count > 0 {
+                    let n = state.count as f64;
+                    let mean = state.sum / n;
+                    let variance = (state.sum_squares / n) - (mean * mean);
+                    builder.append_value(variance);
+                } else {
+                    builder.append_null();
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        (AggregateFunction::Stddev | AggregateFunction::StddevSamp, DataType::Float64) => {
+            let mut builder = Float64Builder::with_capacity(num_groups);
+            for states in groups.values() {
+                let state = &states[agg_idx];
+                if state.count >= 2 {
+                    let n = state.count as f64;
+                    let mean = state.sum / n;
+                    let variance = (state.sum_squares / n) - (mean * mean);
+                    // Bessel's correction for sample stddev
+                    let sample_variance = variance * n / (n - 1.0);
+                    builder.append_value(sample_variance.sqrt());
+                } else {
+                    builder.append_null();
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        (AggregateFunction::StddevPop, DataType::Float64) => {
+            let mut builder = Float64Builder::with_capacity(num_groups);
+            for states in groups.values() {
+                let state = &states[agg_idx];
+                if state.count > 0 {
+                    let n = state.count as f64;
+                    let mean = state.sum / n;
+                    let variance = (state.sum_squares / n) - (mean * mean);
+                    builder.append_value(variance.sqrt());
+                } else {
+                    builder.append_null();
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        // Boolean aggregates
+        (AggregateFunction::BoolAnd, DataType::Boolean) => {
+            let mut builder = arrow::array::BooleanBuilder::with_capacity(num_groups);
+            for states in groups.values() {
+                match states[agg_idx].bool_and {
+                    Some(v) => builder.append_value(v),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        (AggregateFunction::BoolOr, DataType::Boolean) => {
+            let mut builder = arrow::array::BooleanBuilder::with_capacity(num_groups);
+            for states in groups.values() {
+                match states[agg_idx].bool_or {
+                    Some(v) => builder.append_value(v),
                     None => builder.append_null(),
                 }
             }

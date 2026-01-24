@@ -166,6 +166,16 @@ pub enum AggregateFunction {
     Avg,
     Min,
     Max,
+    // Statistical aggregates
+    Stddev,
+    StddevPop,
+    StddevSamp,
+    Variance,
+    VarPop,
+    VarSamp,
+    // Boolean aggregates
+    BoolAnd,
+    BoolOr,
 }
 
 impl fmt::Display for AggregateFunction {
@@ -177,6 +187,14 @@ impl fmt::Display for AggregateFunction {
             AggregateFunction::Avg => write!(f, "AVG"),
             AggregateFunction::Min => write!(f, "MIN"),
             AggregateFunction::Max => write!(f, "MAX"),
+            AggregateFunction::Stddev => write!(f, "STDDEV"),
+            AggregateFunction::StddevPop => write!(f, "STDDEV_POP"),
+            AggregateFunction::StddevSamp => write!(f, "STDDEV_SAMP"),
+            AggregateFunction::Variance => write!(f, "VARIANCE"),
+            AggregateFunction::VarPop => write!(f, "VAR_POP"),
+            AggregateFunction::VarSamp => write!(f, "VAR_SAMP"),
+            AggregateFunction::BoolAnd => write!(f, "BOOL_AND"),
+            AggregateFunction::BoolOr => write!(f, "BOOL_OR"),
         }
     }
 }
@@ -191,6 +209,27 @@ pub enum ScalarFunction {
     Round,
     Power,
     Sqrt,
+    Mod,
+    Sign,
+    Truncate,
+    Ln,
+    Log,
+    Log2,
+    Log10,
+    Exp,
+    Random,
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    Atan2,
+    Degrees,
+    Radians,
+    Pi,
+    E,
+    Cbrt,
     // String
     Upper,
     Lower,
@@ -201,31 +240,114 @@ pub enum ScalarFunction {
     Substring,
     Concat,
     Replace,
+    Position,
+    Strpos,
+    Reverse,
+    Lpad,
+    Rpad,
+    SplitPart,
+    StartsWith,
+    EndsWith,
+    Chr,
+    Ascii,
+    ConcatWs,
+    Left,
+    Right,
+    Repeat,
     // Date/Time
     Year,
     Month,
     Day,
     DateTrunc,
     DatePart,
+    CurrentDate,
+    CurrentTimestamp,
+    Now,
+    DateAdd,
+    DateDiff,
+    Hour,
+    Minute,
+    Second,
+    Quarter,
+    Week,
+    DayOfWeek,
+    DayOfYear,
     // Type conversion
     Cast,
     // Conditional
     Coalesce,
     NullIf,
     Case,
+    If,
+    Greatest,
+    Least,
+    // Regex
+    RegexpLike,
+    RegexpExtract,
+    RegexpReplace,
+    RegexpSplit,
+    RegexpCount,
+    // Binary/Encoding
+    ToHex,
+    FromHex,
+    ToBase64,
+    FromBase64,
+    Md5,
+    Sha256,
+    Sha1,
+    Sha512,
+    // Bitwise
+    BitwiseAnd,
+    BitwiseOr,
+    BitwiseXor,
+    BitwiseNot,
+    BitCount,
+    // URL
+    UrlExtractHost,
+    UrlExtractPath,
+    UrlExtractPort,
+    UrlExtractProtocol,
+    UrlExtractQuery,
+    UrlEncode,
+    UrlDecode,
     // Other
     Extract,
+    Typeof,
+    Uuid,
 }
 
 impl fmt::Display for ScalarFunction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            // Math
             ScalarFunction::Abs => write!(f, "ABS"),
             ScalarFunction::Ceil => write!(f, "CEIL"),
             ScalarFunction::Floor => write!(f, "FLOOR"),
             ScalarFunction::Round => write!(f, "ROUND"),
             ScalarFunction::Power => write!(f, "POWER"),
             ScalarFunction::Sqrt => write!(f, "SQRT"),
+            ScalarFunction::Mod => write!(f, "MOD"),
+            ScalarFunction::Sign => write!(f, "SIGN"),
+            ScalarFunction::Truncate => write!(f, "TRUNCATE"),
+            ScalarFunction::Ln => write!(f, "LN"),
+            ScalarFunction::Log => write!(f, "LOG"),
+            ScalarFunction::Log2 => write!(f, "LOG2"),
+            ScalarFunction::Log10 => write!(f, "LOG10"),
+            ScalarFunction::Exp => write!(f, "EXP"),
+            ScalarFunction::Random => write!(f, "RANDOM"),
+            ScalarFunction::Sin => write!(f, "SIN"),
+            ScalarFunction::Cos => write!(f, "COS"),
+            ScalarFunction::Tan => write!(f, "TAN"),
+            ScalarFunction::Asin => write!(f, "ASIN"),
+            ScalarFunction::Acos => write!(f, "ACOS"),
+            ScalarFunction::Atan => write!(f, "ATAN"),
+            ScalarFunction::Atan2 => write!(f, "ATAN2"),
+            ScalarFunction::Degrees => write!(f, "DEGREES"),
+            ScalarFunction::Radians => write!(f, "RADIANS"),
+            ScalarFunction::Pi => write!(f, "PI"),
+            ScalarFunction::E => write!(f, "E"),
+            ScalarFunction::Cbrt => write!(f, "CBRT"),
+            // String
             ScalarFunction::Upper => write!(f, "UPPER"),
             ScalarFunction::Lower => write!(f, "LOWER"),
             ScalarFunction::Trim => write!(f, "TRIM"),
@@ -235,16 +357,80 @@ impl fmt::Display for ScalarFunction {
             ScalarFunction::Substring => write!(f, "SUBSTRING"),
             ScalarFunction::Concat => write!(f, "CONCAT"),
             ScalarFunction::Replace => write!(f, "REPLACE"),
+            ScalarFunction::Position => write!(f, "POSITION"),
+            ScalarFunction::Strpos => write!(f, "STRPOS"),
+            ScalarFunction::Reverse => write!(f, "REVERSE"),
+            ScalarFunction::Lpad => write!(f, "LPAD"),
+            ScalarFunction::Rpad => write!(f, "RPAD"),
+            ScalarFunction::SplitPart => write!(f, "SPLIT_PART"),
+            ScalarFunction::StartsWith => write!(f, "STARTS_WITH"),
+            ScalarFunction::EndsWith => write!(f, "ENDS_WITH"),
+            ScalarFunction::Chr => write!(f, "CHR"),
+            ScalarFunction::Ascii => write!(f, "ASCII"),
+            ScalarFunction::ConcatWs => write!(f, "CONCAT_WS"),
+            ScalarFunction::Left => write!(f, "LEFT"),
+            ScalarFunction::Right => write!(f, "RIGHT"),
+            ScalarFunction::Repeat => write!(f, "REPEAT"),
+            // Date/Time
             ScalarFunction::Year => write!(f, "YEAR"),
             ScalarFunction::Month => write!(f, "MONTH"),
             ScalarFunction::Day => write!(f, "DAY"),
             ScalarFunction::DateTrunc => write!(f, "DATE_TRUNC"),
             ScalarFunction::DatePart => write!(f, "DATE_PART"),
+            ScalarFunction::CurrentDate => write!(f, "CURRENT_DATE"),
+            ScalarFunction::CurrentTimestamp => write!(f, "CURRENT_TIMESTAMP"),
+            ScalarFunction::Now => write!(f, "NOW"),
+            ScalarFunction::DateAdd => write!(f, "DATE_ADD"),
+            ScalarFunction::DateDiff => write!(f, "DATE_DIFF"),
+            ScalarFunction::Hour => write!(f, "HOUR"),
+            ScalarFunction::Minute => write!(f, "MINUTE"),
+            ScalarFunction::Second => write!(f, "SECOND"),
+            ScalarFunction::Quarter => write!(f, "QUARTER"),
+            ScalarFunction::Week => write!(f, "WEEK"),
+            ScalarFunction::DayOfWeek => write!(f, "DAY_OF_WEEK"),
+            ScalarFunction::DayOfYear => write!(f, "DAY_OF_YEAR"),
+            // Type conversion
             ScalarFunction::Cast => write!(f, "CAST"),
+            // Conditional
             ScalarFunction::Coalesce => write!(f, "COALESCE"),
             ScalarFunction::NullIf => write!(f, "NULLIF"),
             ScalarFunction::Case => write!(f, "CASE"),
+            ScalarFunction::If => write!(f, "IF"),
+            ScalarFunction::Greatest => write!(f, "GREATEST"),
+            ScalarFunction::Least => write!(f, "LEAST"),
+            // Regex
+            ScalarFunction::RegexpLike => write!(f, "REGEXP_LIKE"),
+            ScalarFunction::RegexpExtract => write!(f, "REGEXP_EXTRACT"),
+            ScalarFunction::RegexpReplace => write!(f, "REGEXP_REPLACE"),
+            ScalarFunction::RegexpSplit => write!(f, "REGEXP_SPLIT"),
+            ScalarFunction::RegexpCount => write!(f, "REGEXP_COUNT"),
+            // Binary/Encoding
+            ScalarFunction::ToHex => write!(f, "TO_HEX"),
+            ScalarFunction::FromHex => write!(f, "FROM_HEX"),
+            ScalarFunction::ToBase64 => write!(f, "TO_BASE64"),
+            ScalarFunction::FromBase64 => write!(f, "FROM_BASE64"),
+            ScalarFunction::Md5 => write!(f, "MD5"),
+            ScalarFunction::Sha256 => write!(f, "SHA256"),
+            ScalarFunction::Sha1 => write!(f, "SHA1"),
+            ScalarFunction::Sha512 => write!(f, "SHA512"),
+            // Bitwise
+            ScalarFunction::BitwiseAnd => write!(f, "BITWISE_AND"),
+            ScalarFunction::BitwiseOr => write!(f, "BITWISE_OR"),
+            ScalarFunction::BitwiseXor => write!(f, "BITWISE_XOR"),
+            ScalarFunction::BitwiseNot => write!(f, "BITWISE_NOT"),
+            ScalarFunction::BitCount => write!(f, "BIT_COUNT"),
+            // URL
+            ScalarFunction::UrlExtractHost => write!(f, "URL_EXTRACT_HOST"),
+            ScalarFunction::UrlExtractPath => write!(f, "URL_EXTRACT_PATH"),
+            ScalarFunction::UrlExtractPort => write!(f, "URL_EXTRACT_PORT"),
+            ScalarFunction::UrlExtractProtocol => write!(f, "URL_EXTRACT_PROTOCOL"),
+            ScalarFunction::UrlExtractQuery => write!(f, "URL_EXTRACT_QUERY"),
+            ScalarFunction::UrlEncode => write!(f, "URL_ENCODE"),
+            ScalarFunction::UrlDecode => write!(f, "URL_DECODE"),
+            // Other
             ScalarFunction::Extract => write!(f, "EXTRACT"),
+            ScalarFunction::Typeof => write!(f, "TYPEOF"),
+            ScalarFunction::Uuid => write!(f, "UUID"),
         }
     }
 }
@@ -594,15 +780,29 @@ impl Expr {
                         Ok(ArrowDataType::Int64)
                     }
                 }
-                AggregateFunction::Avg => Ok(ArrowDataType::Float64),
+                AggregateFunction::Avg
+                | AggregateFunction::Stddev
+                | AggregateFunction::StddevPop
+                | AggregateFunction::StddevSamp
+                | AggregateFunction::Variance
+                | AggregateFunction::VarPop
+                | AggregateFunction::VarSamp => Ok(ArrowDataType::Float64),
                 AggregateFunction::Min | AggregateFunction::Max => args
                     .first()
                     .map(|a| a.data_type(schema))
                     .unwrap_or(Ok(ArrowDataType::Null)),
+                AggregateFunction::BoolAnd | AggregateFunction::BoolOr => {
+                    Ok(ArrowDataType::Boolean)
+                }
             },
             Expr::ScalarFunc { func, args } => {
                 match func {
-                    ScalarFunction::Length => Ok(ArrowDataType::Int64),
+                    // String functions returning Int64
+                    ScalarFunction::Length
+                    | ScalarFunction::Position
+                    | ScalarFunction::Strpos
+                    | ScalarFunction::Ascii => Ok(ArrowDataType::Int64),
+                    // String functions returning Utf8
                     ScalarFunction::Upper
                     | ScalarFunction::Lower
                     | ScalarFunction::Trim
@@ -610,22 +810,120 @@ impl Expr {
                     | ScalarFunction::Rtrim
                     | ScalarFunction::Substring
                     | ScalarFunction::Concat
-                    | ScalarFunction::Replace => Ok(ArrowDataType::Utf8),
-                    ScalarFunction::Year | ScalarFunction::Month | ScalarFunction::Day => {
-                        Ok(ArrowDataType::Int32)
-                    }
+                    | ScalarFunction::Replace
+                    | ScalarFunction::Reverse
+                    | ScalarFunction::Lpad
+                    | ScalarFunction::Rpad
+                    | ScalarFunction::SplitPart
+                    | ScalarFunction::Chr
+                    | ScalarFunction::ConcatWs
+                    | ScalarFunction::Left
+                    | ScalarFunction::Right
+                    | ScalarFunction::Repeat => Ok(ArrowDataType::Utf8),
+                    // Boolean functions
+                    ScalarFunction::StartsWith
+                    | ScalarFunction::EndsWith
+                    | ScalarFunction::RegexpLike => Ok(ArrowDataType::Boolean),
+                    // Date/time functions returning Int32
+                    ScalarFunction::Year
+                    | ScalarFunction::Month
+                    | ScalarFunction::Day
+                    | ScalarFunction::Hour
+                    | ScalarFunction::Minute
+                    | ScalarFunction::Second
+                    | ScalarFunction::Quarter
+                    | ScalarFunction::Week
+                    | ScalarFunction::DayOfWeek
+                    | ScalarFunction::DayOfYear => Ok(ArrowDataType::Int32),
+                    // Date/time functions returning Date32
+                    ScalarFunction::CurrentDate => Ok(ArrowDataType::Date32),
+                    // Date/time functions returning Timestamp
+                    ScalarFunction::CurrentTimestamp | ScalarFunction::Now => Ok(
+                        ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                    ),
+                    // Math functions preserving input type
                     ScalarFunction::Abs
                     | ScalarFunction::Ceil
                     | ScalarFunction::Floor
-                    | ScalarFunction::Round => args
+                    | ScalarFunction::Round
+                    | ScalarFunction::Truncate => args
                         .first()
                         .map(|a| a.data_type(schema))
                         .unwrap_or(Ok(ArrowDataType::Float64)),
-                    ScalarFunction::Power | ScalarFunction::Sqrt => Ok(ArrowDataType::Float64),
-                    ScalarFunction::Coalesce | ScalarFunction::NullIf => args
+                    // Math functions returning Int32 (sign)
+                    ScalarFunction::Sign => Ok(ArrowDataType::Int32),
+                    // Math functions returning Int64 (mod, bitwise)
+                    ScalarFunction::Mod
+                    | ScalarFunction::BitwiseAnd
+                    | ScalarFunction::BitwiseOr
+                    | ScalarFunction::BitwiseXor
+                    | ScalarFunction::BitwiseNot
+                    | ScalarFunction::BitCount => Ok(ArrowDataType::Int64),
+                    // Math functions returning Float64
+                    ScalarFunction::Power
+                    | ScalarFunction::Sqrt
+                    | ScalarFunction::Ln
+                    | ScalarFunction::Log
+                    | ScalarFunction::Log2
+                    | ScalarFunction::Log10
+                    | ScalarFunction::Exp
+                    | ScalarFunction::Random
+                    | ScalarFunction::Sin
+                    | ScalarFunction::Cos
+                    | ScalarFunction::Tan
+                    | ScalarFunction::Asin
+                    | ScalarFunction::Acos
+                    | ScalarFunction::Atan
+                    | ScalarFunction::Atan2
+                    | ScalarFunction::Degrees
+                    | ScalarFunction::Radians
+                    | ScalarFunction::Pi
+                    | ScalarFunction::E
+                    | ScalarFunction::Cbrt => Ok(ArrowDataType::Float64),
+                    // Conditional functions
+                    ScalarFunction::Coalesce
+                    | ScalarFunction::NullIf
+                    | ScalarFunction::Greatest
+                    | ScalarFunction::Least => args
                         .first()
                         .map(|a| a.data_type(schema))
                         .unwrap_or(Ok(ArrowDataType::Null)),
+                    // IF function - return type is from second arg (then branch)
+                    ScalarFunction::If => args
+                        .get(1)
+                        .map(|a| a.data_type(schema))
+                        .unwrap_or(Ok(ArrowDataType::Null)),
+                    // Regex functions
+                    ScalarFunction::RegexpExtract | ScalarFunction::RegexpReplace => {
+                        Ok(ArrowDataType::Utf8)
+                    }
+                    ScalarFunction::RegexpCount => Ok(ArrowDataType::Int64),
+                    ScalarFunction::RegexpSplit => Ok(ArrowDataType::Utf8), // Returns array, simplified for now
+                    // Binary/Encoding functions
+                    ScalarFunction::ToHex
+                    | ScalarFunction::ToBase64
+                    | ScalarFunction::Md5
+                    | ScalarFunction::Sha256
+                    | ScalarFunction::Sha1
+                    | ScalarFunction::Sha512 => Ok(ArrowDataType::Utf8),
+                    ScalarFunction::FromHex | ScalarFunction::FromBase64 => {
+                        Ok(ArrowDataType::Binary)
+                    }
+                    // URL functions
+                    ScalarFunction::UrlExtractHost
+                    | ScalarFunction::UrlExtractPath
+                    | ScalarFunction::UrlExtractProtocol
+                    | ScalarFunction::UrlExtractQuery
+                    | ScalarFunction::UrlEncode
+                    | ScalarFunction::UrlDecode => Ok(ArrowDataType::Utf8),
+                    ScalarFunction::UrlExtractPort => Ok(ArrowDataType::Int32),
+                    // Other
+                    ScalarFunction::Typeof => Ok(ArrowDataType::Utf8),
+                    ScalarFunction::Uuid => Ok(ArrowDataType::Utf8),
+                    ScalarFunction::DateAdd | ScalarFunction::DateTrunc => Ok(
+                        ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                    ),
+                    ScalarFunction::DateDiff | ScalarFunction::DatePart => Ok(ArrowDataType::Int64),
                     _ => Ok(ArrowDataType::Utf8), // Default
                 }
             }

@@ -617,6 +617,7 @@ fn evaluate_scalar_func(
     subquery_executor: Option<&SubqueryExecutor>,
 ) -> Result<ArrayRef> {
     use crate::planner::ScalarFunction;
+    use arrow::array::{BinaryArray, Float64Array};
 
     let evaluated_args: Result<Vec<ArrayRef>> = args
         .iter()
@@ -968,6 +969,1469 @@ fn evaluate_scalar_func(
                     }
                     Some(s)
                 })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        // ========== NEW MATH FUNCTIONS ==========
+        ScalarFunction::Mod => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "MOD requires 2 arguments".into(),
+                ));
+            }
+            arithmetic_op(&evaluated_args[0], &evaluated_args[1], |a, b| {
+                arrow::compute::kernels::numeric::rem(a, b)
+            })
+        }
+
+        ScalarFunction::Sign => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("SIGN requires 1 argument".into()))?;
+
+            if let Some(float_arr) = arr.as_any().downcast_ref::<Float64Array>() {
+                let result: Int32Array = float_arr
+                    .iter()
+                    .map(|opt| {
+                        opt.map(|v| {
+                            if v > 0.0 {
+                                1
+                            } else if v < 0.0 {
+                                -1
+                            } else {
+                                0
+                            }
+                        })
+                    })
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
+                let result: Int32Array = int_arr
+                    .iter()
+                    .map(|opt| {
+                        opt.map(|v| {
+                            if v > 0 {
+                                1
+                            } else if v < 0 {
+                                -1
+                            } else {
+                                0
+                            }
+                        })
+                    })
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            Err(QueryError::Type("SIGN requires numeric argument".into()))
+        }
+
+        ScalarFunction::Truncate => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("TRUNCATE requires 1 argument".into())
+            })?;
+            apply_math_unary(arr, |x| x.trunc())
+        }
+
+        ScalarFunction::Ln => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("LN requires 1 argument".into()))?;
+            apply_math_unary(arr, |x| x.ln())
+        }
+
+        ScalarFunction::Log => {
+            if evaluated_args.is_empty() {
+                return Err(QueryError::InvalidArgument(
+                    "LOG requires at least 1 argument".into(),
+                ));
+            }
+            if evaluated_args.len() == 1 {
+                // LOG(x) = natural log
+                apply_math_unary(&evaluated_args[0], |x| x.ln())
+            } else {
+                // LOG(base, x)
+                apply_math_binary(&evaluated_args[0], &evaluated_args[1], |base, x| {
+                    x.log(base)
+                })
+            }
+        }
+
+        ScalarFunction::Log2 => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("LOG2 requires 1 argument".into()))?;
+            apply_math_unary(arr, |x| x.log2())
+        }
+
+        ScalarFunction::Log10 => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("LOG10 requires 1 argument".into()))?;
+            apply_math_unary(arr, |x| x.log10())
+        }
+
+        ScalarFunction::Exp => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("EXP requires 1 argument".into()))?;
+            apply_math_unary(arr, |x| x.exp())
+        }
+
+        ScalarFunction::Random => {
+            use rand::Rng;
+            let num_rows = batch.num_rows();
+            let mut rng = rand::thread_rng();
+            let values: Vec<f64> = (0..num_rows).map(|_| rng.gen::<f64>()).collect();
+            Ok(Arc::new(Float64Array::from(values)))
+        }
+
+        ScalarFunction::Sin => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("SIN requires 1 argument".into()))?;
+            apply_math_unary(arr, |x| x.sin())
+        }
+
+        ScalarFunction::Cos => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("COS requires 1 argument".into()))?;
+            apply_math_unary(arr, |x| x.cos())
+        }
+
+        ScalarFunction::Tan => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("TAN requires 1 argument".into()))?;
+            apply_math_unary(arr, |x| x.tan())
+        }
+
+        ScalarFunction::Asin => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("ASIN requires 1 argument".into()))?;
+            apply_math_unary(arr, |x| x.asin())
+        }
+
+        ScalarFunction::Acos => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("ACOS requires 1 argument".into()))?;
+            apply_math_unary(arr, |x| x.acos())
+        }
+
+        ScalarFunction::Atan => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("ATAN requires 1 argument".into()))?;
+            apply_math_unary(arr, |x| x.atan())
+        }
+
+        ScalarFunction::Atan2 => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "ATAN2 requires 2 arguments".into(),
+                ));
+            }
+            apply_math_binary(&evaluated_args[0], &evaluated_args[1], |y, x| y.atan2(x))
+        }
+
+        ScalarFunction::Degrees => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("DEGREES requires 1 argument".into()))?;
+            apply_math_unary(arr, |x| x.to_degrees())
+        }
+
+        ScalarFunction::Radians => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("RADIANS requires 1 argument".into()))?;
+            apply_math_unary(arr, |x| x.to_radians())
+        }
+
+        ScalarFunction::Pi => {
+            let num_rows = batch.num_rows();
+            Ok(Arc::new(Float64Array::from(vec![
+                std::f64::consts::PI;
+                num_rows
+            ])))
+        }
+
+        ScalarFunction::E => {
+            let num_rows = batch.num_rows();
+            Ok(Arc::new(Float64Array::from(vec![
+                std::f64::consts::E;
+                num_rows
+            ])))
+        }
+
+        ScalarFunction::Cbrt => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("CBRT requires 1 argument".into()))?;
+            apply_math_unary(arr, |x| x.cbrt())
+        }
+
+        // ========== NEW STRING FUNCTIONS ==========
+        ScalarFunction::Position | ScalarFunction::Strpos => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "POSITION/STRPOS requires 2 arguments".into(),
+                ));
+            }
+            let str_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    QueryError::Type("POSITION/STRPOS requires string arguments".into())
+                })?;
+            let substr_arr = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    QueryError::Type("POSITION/STRPOS requires string arguments".into())
+                })?;
+
+            let result: Int64Array = (0..str_arr.len())
+                .map(|i| {
+                    if str_arr.is_null(i) || substr_arr.is_null(i) {
+                        None
+                    } else {
+                        let s = str_arr.value(i);
+                        let sub = substr_arr.value(i);
+                        Some(s.find(sub).map(|pos| pos as i64 + 1).unwrap_or(0))
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::Reverse => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("REVERSE requires 1 argument".into()))?;
+            let str_arr = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("REVERSE requires string argument".into()))?;
+
+            let result: StringArray = str_arr
+                .iter()
+                .map(|opt| opt.map(|s| s.chars().rev().collect::<String>()))
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::Lpad => {
+            if evaluated_args.len() < 2 {
+                return Err(QueryError::InvalidArgument(
+                    "LPAD requires at least 2 arguments".into(),
+                ));
+            }
+            let str_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("LPAD requires string argument".into()))?;
+            let len_arr = &evaluated_args[1];
+            let pad_char = if evaluated_args.len() > 2 {
+                if let Some(pad_arr) = evaluated_args[2].as_any().downcast_ref::<StringArray>() {
+                    pad_arr.value(0).to_string()
+                } else {
+                    " ".to_string()
+                }
+            } else {
+                " ".to_string()
+            };
+
+            let result: StringArray = (0..str_arr.len())
+                .map(|i| {
+                    if str_arr.is_null(i) {
+                        None
+                    } else {
+                        let s = str_arr.value(i);
+                        let target_len = get_int_value(len_arr, i).unwrap_or(0) as usize;
+                        let current_len = s.chars().count();
+                        if current_len >= target_len {
+                            Some(s.chars().take(target_len).collect::<String>())
+                        } else {
+                            let padding_needed = target_len - current_len;
+                            let pad_chars: String =
+                                pad_char.chars().cycle().take(padding_needed).collect();
+                            Some(format!("{}{}", pad_chars, s))
+                        }
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::Rpad => {
+            if evaluated_args.len() < 2 {
+                return Err(QueryError::InvalidArgument(
+                    "RPAD requires at least 2 arguments".into(),
+                ));
+            }
+            let str_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("RPAD requires string argument".into()))?;
+            let len_arr = &evaluated_args[1];
+            let pad_char = if evaluated_args.len() > 2 {
+                if let Some(pad_arr) = evaluated_args[2].as_any().downcast_ref::<StringArray>() {
+                    pad_arr.value(0).to_string()
+                } else {
+                    " ".to_string()
+                }
+            } else {
+                " ".to_string()
+            };
+
+            let result: StringArray = (0..str_arr.len())
+                .map(|i| {
+                    if str_arr.is_null(i) {
+                        None
+                    } else {
+                        let s = str_arr.value(i);
+                        let target_len = get_int_value(len_arr, i).unwrap_or(0) as usize;
+                        let current_len = s.chars().count();
+                        if current_len >= target_len {
+                            Some(s.chars().take(target_len).collect::<String>())
+                        } else {
+                            let padding_needed = target_len - current_len;
+                            let pad_chars: String =
+                                pad_char.chars().cycle().take(padding_needed).collect();
+                            Some(format!("{}{}", s, pad_chars))
+                        }
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::SplitPart => {
+            if evaluated_args.len() != 3 {
+                return Err(QueryError::InvalidArgument(
+                    "SPLIT_PART requires 3 arguments".into(),
+                ));
+            }
+            let str_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("SPLIT_PART requires string argument".into()))?;
+            let delim_arr = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("SPLIT_PART requires string delimiter".into()))?;
+            let idx_arr = &evaluated_args[2];
+
+            let result: StringArray = (0..str_arr.len())
+                .map(|i| {
+                    if str_arr.is_null(i) || delim_arr.is_null(i) {
+                        None
+                    } else {
+                        let s = str_arr.value(i);
+                        let delim = delim_arr.value(i);
+                        let idx = get_int_value(idx_arr, i).unwrap_or(1) as usize;
+                        let parts: Vec<&str> = s.split(delim).collect();
+                        if idx > 0 && idx <= parts.len() {
+                            Some(parts[idx - 1].to_string())
+                        } else {
+                            Some(String::new())
+                        }
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::StartsWith => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "STARTS_WITH requires 2 arguments".into(),
+                ));
+            }
+            let str_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("STARTS_WITH requires string argument".into()))?;
+            let prefix_arr = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("STARTS_WITH requires string prefix".into()))?;
+
+            let result: BooleanArray = (0..str_arr.len())
+                .map(|i| {
+                    if str_arr.is_null(i) || prefix_arr.is_null(i) {
+                        None
+                    } else {
+                        Some(str_arr.value(i).starts_with(prefix_arr.value(i)))
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::EndsWith => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "ENDS_WITH requires 2 arguments".into(),
+                ));
+            }
+            let str_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("ENDS_WITH requires string argument".into()))?;
+            let suffix_arr = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("ENDS_WITH requires string suffix".into()))?;
+
+            let result: BooleanArray = (0..str_arr.len())
+                .map(|i| {
+                    if str_arr.is_null(i) || suffix_arr.is_null(i) {
+                        None
+                    } else {
+                        Some(str_arr.value(i).ends_with(suffix_arr.value(i)))
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::Chr => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("CHR requires 1 argument".into()))?;
+
+            let result: StringArray = if let Some(int_arr) =
+                arr.as_any().downcast_ref::<Int64Array>()
+            {
+                int_arr
+                    .iter()
+                    .map(|opt| opt.and_then(|v| char::from_u32(v as u32).map(|c| c.to_string())))
+                    .collect()
+            } else if let Some(int_arr) = arr.as_any().downcast_ref::<Int32Array>() {
+                int_arr
+                    .iter()
+                    .map(|opt| opt.and_then(|v| char::from_u32(v as u32).map(|c| c.to_string())))
+                    .collect()
+            } else {
+                return Err(QueryError::Type("CHR requires integer argument".into()));
+            };
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::Ascii => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("ASCII requires 1 argument".into()))?;
+            let str_arr = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("ASCII requires string argument".into()))?;
+
+            let result: Int64Array = str_arr
+                .iter()
+                .map(|opt| opt.map(|s| s.chars().next().map(|c| c as i64).unwrap_or(0)))
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::ConcatWs => {
+            if evaluated_args.len() < 2 {
+                return Err(QueryError::InvalidArgument(
+                    "CONCAT_WS requires at least 2 arguments".into(),
+                ));
+            }
+            let sep_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("CONCAT_WS requires string separator".into()))?;
+
+            let num_rows = sep_arr.len();
+            let result: StringArray = (0..num_rows)
+                .map(|i| {
+                    if sep_arr.is_null(i) {
+                        None
+                    } else {
+                        let sep = sep_arr.value(i);
+                        let parts: Vec<String> = evaluated_args[1..]
+                            .iter()
+                            .filter_map(|arr| {
+                                arr.as_any().downcast_ref::<StringArray>().and_then(|sa| {
+                                    if sa.is_null(i) {
+                                        None
+                                    } else {
+                                        Some(sa.value(i).to_string())
+                                    }
+                                })
+                            })
+                            .collect();
+                        Some(parts.join(sep))
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::Left => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "LEFT requires 2 arguments".into(),
+                ));
+            }
+            let str_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("LEFT requires string argument".into()))?;
+            let len_arr = &evaluated_args[1];
+
+            let result: StringArray = (0..str_arr.len())
+                .map(|i| {
+                    if str_arr.is_null(i) {
+                        None
+                    } else {
+                        let s = str_arr.value(i);
+                        let n = get_int_value(len_arr, i).unwrap_or(0) as usize;
+                        Some(s.chars().take(n).collect::<String>())
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::Right => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "RIGHT requires 2 arguments".into(),
+                ));
+            }
+            let str_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("RIGHT requires string argument".into()))?;
+            let len_arr = &evaluated_args[1];
+
+            let result: StringArray = (0..str_arr.len())
+                .map(|i| {
+                    if str_arr.is_null(i) {
+                        None
+                    } else {
+                        let s = str_arr.value(i);
+                        let n = get_int_value(len_arr, i).unwrap_or(0) as usize;
+                        let chars: Vec<char> = s.chars().collect();
+                        let start = chars.len().saturating_sub(n);
+                        Some(chars[start..].iter().collect::<String>())
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::Repeat => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "REPEAT requires 2 arguments".into(),
+                ));
+            }
+            let str_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("REPEAT requires string argument".into()))?;
+            let count_arr = &evaluated_args[1];
+
+            let result: StringArray = (0..str_arr.len())
+                .map(|i| {
+                    if str_arr.is_null(i) {
+                        None
+                    } else {
+                        let s = str_arr.value(i);
+                        let n = get_int_value(count_arr, i).unwrap_or(0).max(0) as usize;
+                        Some(s.repeat(n))
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        // ========== DATE/TIME FUNCTIONS ==========
+        ScalarFunction::CurrentDate => {
+            let num_rows = batch.num_rows();
+            let today = chrono::Local::now().date_naive();
+            let days = today
+                .signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+                .num_days() as i32;
+            Ok(Arc::new(Date32Array::from(vec![days; num_rows])))
+        }
+
+        ScalarFunction::CurrentTimestamp | ScalarFunction::Now => {
+            let num_rows = batch.num_rows();
+            let now = chrono::Utc::now();
+            let micros = now.timestamp_micros();
+            Ok(Arc::new(arrow::array::TimestampMicrosecondArray::from(
+                vec![micros; num_rows],
+            )))
+        }
+
+        ScalarFunction::Hour => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("HOUR requires 1 argument".into()))?;
+
+            if let Some(ts_arr) = arr
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            {
+                use chrono::Timelike;
+                let result: Int32Array = ts_arr
+                    .iter()
+                    .map(|opt| {
+                        opt.map(|micros| {
+                            chrono::DateTime::from_timestamp_micros(micros)
+                                .map(|dt| dt.hour() as i32)
+                                .unwrap_or(0)
+                        })
+                    })
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            Err(QueryError::NotImplemented(
+                "HOUR for this type not implemented".into(),
+            ))
+        }
+
+        ScalarFunction::Minute => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("MINUTE requires 1 argument".into()))?;
+
+            if let Some(ts_arr) = arr
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            {
+                use chrono::Timelike;
+                let result: Int32Array = ts_arr
+                    .iter()
+                    .map(|opt| {
+                        opt.map(|micros| {
+                            chrono::DateTime::from_timestamp_micros(micros)
+                                .map(|dt| dt.minute() as i32)
+                                .unwrap_or(0)
+                        })
+                    })
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            Err(QueryError::NotImplemented(
+                "MINUTE for this type not implemented".into(),
+            ))
+        }
+
+        ScalarFunction::Second => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("SECOND requires 1 argument".into()))?;
+
+            if let Some(ts_arr) = arr
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            {
+                use chrono::Timelike;
+                let result: Int32Array = ts_arr
+                    .iter()
+                    .map(|opt| {
+                        opt.map(|micros| {
+                            chrono::DateTime::from_timestamp_micros(micros)
+                                .map(|dt| dt.second() as i32)
+                                .unwrap_or(0)
+                        })
+                    })
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            Err(QueryError::NotImplemented(
+                "SECOND for this type not implemented".into(),
+            ))
+        }
+
+        ScalarFunction::Quarter => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("QUARTER requires 1 argument".into()))?;
+
+            if let Some(date32) = arr.as_any().downcast_ref::<Date32Array>() {
+                let result: Int32Array = date32
+                    .iter()
+                    .map(|opt| {
+                        opt.map(|days| {
+                            let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719163)
+                                .unwrap_or_default();
+                            ((date.month() - 1) / 3 + 1) as i32
+                        })
+                    })
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            Err(QueryError::NotImplemented(
+                "QUARTER for this type not implemented".into(),
+            ))
+        }
+
+        ScalarFunction::Week => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("WEEK requires 1 argument".into()))?;
+
+            if let Some(date32) = arr.as_any().downcast_ref::<Date32Array>() {
+                use chrono::Datelike;
+                let result: Int32Array = date32
+                    .iter()
+                    .map(|opt| {
+                        opt.map(|days| {
+                            let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719163)
+                                .unwrap_or_default();
+                            date.iso_week().week() as i32
+                        })
+                    })
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            Err(QueryError::NotImplemented(
+                "WEEK for this type not implemented".into(),
+            ))
+        }
+
+        ScalarFunction::DayOfWeek => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("DAY_OF_WEEK requires 1 argument".into())
+            })?;
+
+            if let Some(date32) = arr.as_any().downcast_ref::<Date32Array>() {
+                use chrono::Datelike;
+                let result: Int32Array = date32
+                    .iter()
+                    .map(|opt| {
+                        opt.map(|days| {
+                            let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719163)
+                                .unwrap_or_default();
+                            date.weekday().num_days_from_sunday() as i32 + 1
+                        })
+                    })
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            Err(QueryError::NotImplemented(
+                "DAY_OF_WEEK for this type not implemented".into(),
+            ))
+        }
+
+        ScalarFunction::DayOfYear => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("DAY_OF_YEAR requires 1 argument".into())
+            })?;
+
+            if let Some(date32) = arr.as_any().downcast_ref::<Date32Array>() {
+                use chrono::Datelike;
+                let result: Int32Array = date32
+                    .iter()
+                    .map(|opt| {
+                        opt.map(|days| {
+                            let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719163)
+                                .unwrap_or_default();
+                            date.ordinal() as i32
+                        })
+                    })
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            Err(QueryError::NotImplemented(
+                "DAY_OF_YEAR for this type not implemented".into(),
+            ))
+        }
+
+        ScalarFunction::DateAdd
+        | ScalarFunction::DateDiff
+        | ScalarFunction::DateTrunc
+        | ScalarFunction::DatePart => Err(QueryError::NotImplemented(format!(
+            "Date function {:?} not fully implemented yet",
+            func
+        ))),
+
+        // ========== CONDITIONAL FUNCTIONS ==========
+        ScalarFunction::If => {
+            if evaluated_args.len() != 3 {
+                return Err(QueryError::InvalidArgument(
+                    "IF requires 3 arguments".into(),
+                ));
+            }
+            let condition = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| QueryError::Type("IF condition must be boolean".into()))?;
+
+            Ok(zip(condition, &evaluated_args[1], &evaluated_args[2])?)
+        }
+
+        ScalarFunction::Greatest => {
+            if evaluated_args.is_empty() {
+                return Err(QueryError::InvalidArgument(
+                    "GREATEST requires at least 1 argument".into(),
+                ));
+            }
+            let mut result = evaluated_args[0].clone();
+            for arr in &evaluated_args[1..] {
+                let (left, right) = coerce_arrays(&result, arr)?;
+                let gt = compare_arrays(&left, &right, |l, r| cmp::gt(l, r))?;
+                let gt_bool = gt
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| QueryError::Type("GREATEST comparison failed".into()))?;
+                result = zip(gt_bool, &left, &right)?;
+            }
+            Ok(result)
+        }
+
+        ScalarFunction::Least => {
+            if evaluated_args.is_empty() {
+                return Err(QueryError::InvalidArgument(
+                    "LEAST requires at least 1 argument".into(),
+                ));
+            }
+            let mut result = evaluated_args[0].clone();
+            for arr in &evaluated_args[1..] {
+                let (left, right) = coerce_arrays(&result, arr)?;
+                let lt = compare_arrays(&left, &right, |l, r| cmp::lt(l, r))?;
+                let lt_bool = lt
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| QueryError::Type("LEAST comparison failed".into()))?;
+                result = zip(lt_bool, &left, &right)?;
+            }
+            Ok(result)
+        }
+
+        // ========== REGEX FUNCTIONS ==========
+        ScalarFunction::RegexpLike => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "REGEXP_LIKE requires 2 arguments".into(),
+                ));
+            }
+            let str_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("REGEXP_LIKE requires string argument".into()))?;
+            let pattern_arr = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("REGEXP_LIKE requires string pattern".into()))?;
+
+            let result: BooleanArray = (0..str_arr.len())
+                .map(|i| {
+                    if str_arr.is_null(i) || pattern_arr.is_null(i) {
+                        None
+                    } else {
+                        let s = str_arr.value(i);
+                        let pattern = pattern_arr.value(i);
+                        match regex::Regex::new(pattern) {
+                            Ok(re) => Some(re.is_match(s)),
+                            Err(_) => Some(false),
+                        }
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::RegexpExtract => {
+            if evaluated_args.len() < 2 {
+                return Err(QueryError::InvalidArgument(
+                    "REGEXP_EXTRACT requires at least 2 arguments".into(),
+                ));
+            }
+            let str_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    QueryError::Type("REGEXP_EXTRACT requires string argument".into())
+                })?;
+            let pattern_arr = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("REGEXP_EXTRACT requires string pattern".into()))?;
+            let group_idx = if evaluated_args.len() > 2 {
+                get_int_value(&evaluated_args[2], 0).unwrap_or(0) as usize
+            } else {
+                0
+            };
+
+            let result: StringArray = (0..str_arr.len())
+                .map(|i| {
+                    if str_arr.is_null(i) || pattern_arr.is_null(i) {
+                        None
+                    } else {
+                        let s = str_arr.value(i);
+                        let pattern = pattern_arr.value(i);
+                        match regex::Regex::new(pattern) {
+                            Ok(re) => re.captures(s).and_then(|caps| {
+                                caps.get(group_idx).map(|m| m.as_str().to_string())
+                            }),
+                            Err(_) => None,
+                        }
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::RegexpReplace => {
+            if evaluated_args.len() != 3 {
+                return Err(QueryError::InvalidArgument(
+                    "REGEXP_REPLACE requires 3 arguments".into(),
+                ));
+            }
+            let str_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    QueryError::Type("REGEXP_REPLACE requires string argument".into())
+                })?;
+            let pattern_arr = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("REGEXP_REPLACE requires string pattern".into()))?;
+            let replacement_arr = evaluated_args[2]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    QueryError::Type("REGEXP_REPLACE requires string replacement".into())
+                })?;
+
+            let result: StringArray = (0..str_arr.len())
+                .map(|i| {
+                    if str_arr.is_null(i) || pattern_arr.is_null(i) || replacement_arr.is_null(i) {
+                        None
+                    } else {
+                        let s = str_arr.value(i);
+                        let pattern = pattern_arr.value(i);
+                        let replacement = replacement_arr.value(i);
+                        match regex::Regex::new(pattern) {
+                            Ok(re) => Some(re.replace_all(s, replacement).to_string()),
+                            Err(_) => Some(s.to_string()),
+                        }
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::RegexpCount => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "REGEXP_COUNT requires 2 arguments".into(),
+                ));
+            }
+            let str_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("REGEXP_COUNT requires string argument".into()))?;
+            let pattern_arr = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("REGEXP_COUNT requires string pattern".into()))?;
+
+            let result: Int64Array = (0..str_arr.len())
+                .map(|i| {
+                    if str_arr.is_null(i) || pattern_arr.is_null(i) {
+                        None
+                    } else {
+                        let s = str_arr.value(i);
+                        let pattern = pattern_arr.value(i);
+                        match regex::Regex::new(pattern) {
+                            Ok(re) => Some(re.find_iter(s).count() as i64),
+                            Err(_) => Some(0),
+                        }
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::RegexpSplit => {
+            // For simplicity, return first split part only
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "REGEXP_SPLIT requires 2 arguments".into(),
+                ));
+            }
+            let str_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("REGEXP_SPLIT requires string argument".into()))?;
+            let pattern_arr = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("REGEXP_SPLIT requires string pattern".into()))?;
+
+            let result: StringArray = (0..str_arr.len())
+                .map(|i| {
+                    if str_arr.is_null(i) || pattern_arr.is_null(i) {
+                        None
+                    } else {
+                        let s = str_arr.value(i);
+                        let pattern = pattern_arr.value(i);
+                        match regex::Regex::new(pattern) {
+                            Ok(re) => {
+                                let parts: Vec<&str> = re.split(s).collect();
+                                Some(parts.join(","))
+                            }
+                            Err(_) => Some(s.to_string()),
+                        }
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        // ========== BINARY/ENCODING FUNCTIONS ==========
+        ScalarFunction::ToHex => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("TO_HEX requires 1 argument".into()))?;
+
+            if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
+                let result: StringArray = int_arr
+                    .iter()
+                    .map(|opt| opt.map(|v| format!("{:x}", v)))
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            if let Some(bin_arr) = arr.as_any().downcast_ref::<BinaryArray>() {
+                let result: StringArray = bin_arr.iter().map(|opt| opt.map(hex::encode)).collect();
+                return Ok(Arc::new(result));
+            }
+            Err(QueryError::Type(
+                "TO_HEX requires integer or binary argument".into(),
+            ))
+        }
+
+        ScalarFunction::FromHex => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("FROM_HEX requires 1 argument".into())
+            })?;
+            let str_arr = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("FROM_HEX requires string argument".into()))?;
+
+            let result: BinaryArray = str_arr
+                .iter()
+                .map(|opt| opt.and_then(|s| hex::decode(s).ok()))
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::ToBase64 => {
+            use base64::Engine;
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("TO_BASE64 requires 1 argument".into())
+            })?;
+
+            if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
+                let result: StringArray = str_arr
+                    .iter()
+                    .map(|opt| {
+                        opt.map(|s| base64::engine::general_purpose::STANDARD.encode(s.as_bytes()))
+                    })
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            if let Some(bin_arr) = arr.as_any().downcast_ref::<BinaryArray>() {
+                let result: StringArray = bin_arr
+                    .iter()
+                    .map(|opt| opt.map(|b| base64::engine::general_purpose::STANDARD.encode(b)))
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            Err(QueryError::Type(
+                "TO_BASE64 requires string or binary argument".into(),
+            ))
+        }
+
+        ScalarFunction::FromBase64 => {
+            use base64::Engine;
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("FROM_BASE64 requires 1 argument".into())
+            })?;
+            let str_arr = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("FROM_BASE64 requires string argument".into()))?;
+
+            let result: BinaryArray = str_arr
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::Md5 => {
+            use md5::{Digest, Md5};
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("MD5 requires 1 argument".into()))?;
+
+            if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
+                let result: StringArray = str_arr
+                    .iter()
+                    .map(|opt| {
+                        opt.map(|s| {
+                            let mut hasher = Md5::new();
+                            hasher.update(s.as_bytes());
+                            format!("{:x}", hasher.finalize())
+                        })
+                    })
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            Err(QueryError::Type("MD5 requires string argument".into()))
+        }
+
+        ScalarFunction::Sha1 => {
+            use sha1::{Digest, Sha1};
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("SHA1 requires 1 argument".into()))?;
+
+            if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
+                let result: StringArray = str_arr
+                    .iter()
+                    .map(|opt| {
+                        opt.map(|s| {
+                            let mut hasher = Sha1::new();
+                            hasher.update(s.as_bytes());
+                            format!("{:x}", hasher.finalize())
+                        })
+                    })
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            Err(QueryError::Type("SHA1 requires string argument".into()))
+        }
+
+        ScalarFunction::Sha256 => {
+            use sha2::{Digest, Sha256};
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("SHA256 requires 1 argument".into()))?;
+
+            if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
+                let result: StringArray = str_arr
+                    .iter()
+                    .map(|opt| {
+                        opt.map(|s| {
+                            let mut hasher = Sha256::new();
+                            hasher.update(s.as_bytes());
+                            format!("{:x}", hasher.finalize())
+                        })
+                    })
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            Err(QueryError::Type("SHA256 requires string argument".into()))
+        }
+
+        ScalarFunction::Sha512 => {
+            use sha2::{Digest, Sha512};
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("SHA512 requires 1 argument".into()))?;
+
+            if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
+                let result: StringArray = str_arr
+                    .iter()
+                    .map(|opt| {
+                        opt.map(|s| {
+                            let mut hasher = Sha512::new();
+                            hasher.update(s.as_bytes());
+                            format!("{:x}", hasher.finalize())
+                        })
+                    })
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            Err(QueryError::Type("SHA512 requires string argument".into()))
+        }
+
+        // ========== BITWISE FUNCTIONS ==========
+        ScalarFunction::BitwiseAnd => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "BITWISE_AND requires 2 arguments".into(),
+                ));
+            }
+            let left = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| QueryError::Type("BITWISE_AND requires integer arguments".into()))?;
+            let right = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| QueryError::Type("BITWISE_AND requires integer arguments".into()))?;
+
+            let result: Int64Array = left
+                .iter()
+                .zip(right.iter())
+                .map(|(l, r)| match (l, r) {
+                    (Some(lv), Some(rv)) => Some(lv & rv),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::BitwiseOr => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "BITWISE_OR requires 2 arguments".into(),
+                ));
+            }
+            let left = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| QueryError::Type("BITWISE_OR requires integer arguments".into()))?;
+            let right = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| QueryError::Type("BITWISE_OR requires integer arguments".into()))?;
+
+            let result: Int64Array = left
+                .iter()
+                .zip(right.iter())
+                .map(|(l, r)| match (l, r) {
+                    (Some(lv), Some(rv)) => Some(lv | rv),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::BitwiseXor => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "BITWISE_XOR requires 2 arguments".into(),
+                ));
+            }
+            let left = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| QueryError::Type("BITWISE_XOR requires integer arguments".into()))?;
+            let right = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| QueryError::Type("BITWISE_XOR requires integer arguments".into()))?;
+
+            let result: Int64Array = left
+                .iter()
+                .zip(right.iter())
+                .map(|(l, r)| match (l, r) {
+                    (Some(lv), Some(rv)) => Some(lv ^ rv),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::BitwiseNot => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("BITWISE_NOT requires 1 argument".into())
+            })?;
+            let int_arr = arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| QueryError::Type("BITWISE_NOT requires integer argument".into()))?;
+
+            let result: Int64Array = int_arr.iter().map(|opt| opt.map(|v| !v)).collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::BitCount => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("BIT_COUNT requires 1 argument".into())
+            })?;
+            let int_arr = arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| QueryError::Type("BIT_COUNT requires integer argument".into()))?;
+
+            let result: Int64Array = int_arr
+                .iter()
+                .map(|opt| opt.map(|v| v.count_ones() as i64))
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        // ========== URL FUNCTIONS ==========
+        ScalarFunction::UrlExtractHost => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("URL_EXTRACT_HOST requires 1 argument".into())
+            })?;
+            let str_arr = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                QueryError::Type("URL_EXTRACT_HOST requires string argument".into())
+            })?;
+
+            let result: StringArray = str_arr
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|s| {
+                        url::Url::parse(s)
+                            .ok()
+                            .and_then(|u| u.host_str().map(|h| h.to_string()))
+                    })
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::UrlExtractPath => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("URL_EXTRACT_PATH requires 1 argument".into())
+            })?;
+            let str_arr = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                QueryError::Type("URL_EXTRACT_PATH requires string argument".into())
+            })?;
+
+            let result: StringArray = str_arr
+                .iter()
+                .map(|opt| opt.and_then(|s| url::Url::parse(s).ok().map(|u| u.path().to_string())))
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::UrlExtractPort => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("URL_EXTRACT_PORT requires 1 argument".into())
+            })?;
+            let str_arr = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                QueryError::Type("URL_EXTRACT_PORT requires string argument".into())
+            })?;
+
+            let result: Int32Array = str_arr
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|s| {
+                        url::Url::parse(s)
+                            .ok()
+                            .and_then(|u| u.port().map(|p| p as i32))
+                    })
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::UrlExtractProtocol => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("URL_EXTRACT_PROTOCOL requires 1 argument".into())
+            })?;
+            let str_arr = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                QueryError::Type("URL_EXTRACT_PROTOCOL requires string argument".into())
+            })?;
+
+            let result: StringArray = str_arr
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|s| url::Url::parse(s).ok().map(|u| u.scheme().to_string()))
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::UrlExtractQuery => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("URL_EXTRACT_QUERY requires 1 argument".into())
+            })?;
+            let str_arr = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                QueryError::Type("URL_EXTRACT_QUERY requires string argument".into())
+            })?;
+
+            let result: StringArray = str_arr
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|s| {
+                        url::Url::parse(s)
+                            .ok()
+                            .and_then(|u| u.query().map(|q| q.to_string()))
+                    })
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::UrlEncode => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("URL_ENCODE requires 1 argument".into())
+            })?;
+            let str_arr = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("URL_ENCODE requires string argument".into()))?;
+
+            let result: StringArray = str_arr
+                .iter()
+                .map(|opt| {
+                    opt.map(|s| {
+                        percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC)
+                            .to_string()
+                    })
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::UrlDecode => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("URL_DECODE requires 1 argument".into())
+            })?;
+            let str_arr = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("URL_DECODE requires string argument".into()))?;
+
+            let result: StringArray = str_arr
+                .iter()
+                .map(|opt| {
+                    opt.map(|s| {
+                        percent_encoding::percent_decode_str(s)
+                            .decode_utf8_lossy()
+                            .to_string()
+                    })
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        // ========== OTHER FUNCTIONS ==========
+        ScalarFunction::Typeof => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("TYPEOF requires 1 argument".into()))?;
+            let type_name = format!("{:?}", arr.data_type());
+            let num_rows = arr.len();
+            Ok(Arc::new(StringArray::from(vec![
+                type_name.as_str();
+                num_rows
+            ])))
+        }
+
+        ScalarFunction::Uuid => {
+            let num_rows = batch.num_rows();
+            let result: StringArray = (0..num_rows)
+                .map(|_| Some(uuid::Uuid::new_v4().to_string()))
                 .collect();
             Ok(Arc::new(result))
         }

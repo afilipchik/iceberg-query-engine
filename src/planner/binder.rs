@@ -1449,6 +1449,15 @@ impl<'a> Binder<'a> {
                     }),
                 }
             }
+            // POSITION(substr IN str) syntax
+            SqlExpr::Position { expr, r#in } => {
+                let str_expr = self.bind_expr(r#in, schema)?;
+                let substr_expr = self.bind_expr(expr, schema)?;
+                Ok(Expr::ScalarFunc {
+                    func: ScalarFunction::Position,
+                    args: vec![str_expr, substr_expr],
+                })
+            }
             _ => Err(QueryError::NotImplemented(format!(
                 "Expression not supported: {:?}",
                 expr
@@ -1563,6 +1572,48 @@ impl<'a> Binder<'a> {
                 args,
                 distinct: false,
             }),
+            // Statistical aggregates
+            "STDDEV" => Ok(Expr::Aggregate {
+                func: AggregateFunction::Stddev,
+                args,
+                distinct: false,
+            }),
+            "STDDEV_POP" => Ok(Expr::Aggregate {
+                func: AggregateFunction::StddevPop,
+                args,
+                distinct: false,
+            }),
+            "STDDEV_SAMP" => Ok(Expr::Aggregate {
+                func: AggregateFunction::StddevSamp,
+                args,
+                distinct: false,
+            }),
+            "VARIANCE" | "VAR" => Ok(Expr::Aggregate {
+                func: AggregateFunction::Variance,
+                args,
+                distinct: false,
+            }),
+            "VAR_POP" => Ok(Expr::Aggregate {
+                func: AggregateFunction::VarPop,
+                args,
+                distinct: false,
+            }),
+            "VAR_SAMP" => Ok(Expr::Aggregate {
+                func: AggregateFunction::VarSamp,
+                args,
+                distinct: false,
+            }),
+            // Boolean aggregates
+            "BOOL_AND" | "EVERY" => Ok(Expr::Aggregate {
+                func: AggregateFunction::BoolAnd,
+                args,
+                distinct: false,
+            }),
+            "BOOL_OR" | "ANY" => Ok(Expr::Aggregate {
+                func: AggregateFunction::BoolOr,
+                args,
+                distinct: false,
+            }),
             // Scalar functions
             "UPPER" => Ok(Expr::ScalarFunc {
                 func: ScalarFunction::Upper,
@@ -1654,6 +1705,323 @@ impl<'a> Binder<'a> {
             }),
             "EXTRACT" => Ok(Expr::ScalarFunc {
                 func: ScalarFunction::Extract,
+                args,
+            }),
+            // Math functions
+            "MOD" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Mod,
+                args,
+            }),
+            "SIGN" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Sign,
+                args,
+            }),
+            "TRUNCATE" | "TRUNC" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Truncate,
+                args,
+            }),
+            "LN" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Ln,
+                args,
+            }),
+            "LOG" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Log,
+                args,
+            }),
+            "LOG2" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Log2,
+                args,
+            }),
+            "LOG10" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Log10,
+                args,
+            }),
+            "EXP" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Exp,
+                args,
+            }),
+            "RANDOM" | "RAND" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Random,
+                args,
+            }),
+            "SIN" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Sin,
+                args,
+            }),
+            "COS" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Cos,
+                args,
+            }),
+            "TAN" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Tan,
+                args,
+            }),
+            "ASIN" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Asin,
+                args,
+            }),
+            "ACOS" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Acos,
+                args,
+            }),
+            "ATAN" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Atan,
+                args,
+            }),
+            "ATAN2" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Atan2,
+                args,
+            }),
+            "DEGREES" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Degrees,
+                args,
+            }),
+            "RADIANS" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Radians,
+                args,
+            }),
+            "PI" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Pi,
+                args,
+            }),
+            "E" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::E,
+                args,
+            }),
+            "CBRT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Cbrt,
+                args,
+            }),
+            // String functions
+            "POSITION" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Position,
+                args,
+            }),
+            "STRPOS" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Strpos,
+                args,
+            }),
+            "REVERSE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Reverse,
+                args,
+            }),
+            "LPAD" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Lpad,
+                args,
+            }),
+            "RPAD" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Rpad,
+                args,
+            }),
+            "SPLIT_PART" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::SplitPart,
+                args,
+            }),
+            "STARTS_WITH" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::StartsWith,
+                args,
+            }),
+            "ENDS_WITH" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::EndsWith,
+                args,
+            }),
+            "CHR" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Chr,
+                args,
+            }),
+            "ASCII" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Ascii,
+                args,
+            }),
+            "CONCAT_WS" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ConcatWs,
+                args,
+            }),
+            "LEFT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Left,
+                args,
+            }),
+            "RIGHT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Right,
+                args,
+            }),
+            "REPEAT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Repeat,
+                args,
+            }),
+            // Date/Time functions
+            "CURRENT_DATE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::CurrentDate,
+                args,
+            }),
+            "CURRENT_TIMESTAMP" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::CurrentTimestamp,
+                args,
+            }),
+            "NOW" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Now,
+                args,
+            }),
+            "DATE_ADD" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::DateAdd,
+                args,
+            }),
+            "DATE_DIFF" | "DATEDIFF" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::DateDiff,
+                args,
+            }),
+            "HOUR" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Hour,
+                args,
+            }),
+            "MINUTE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Minute,
+                args,
+            }),
+            "SECOND" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Second,
+                args,
+            }),
+            "QUARTER" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Quarter,
+                args,
+            }),
+            "WEEK" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Week,
+                args,
+            }),
+            "DAY_OF_WEEK" | "DAYOFWEEK" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::DayOfWeek,
+                args,
+            }),
+            "DAY_OF_YEAR" | "DAYOFYEAR" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::DayOfYear,
+                args,
+            }),
+            // Conditional functions
+            "IF" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::If,
+                args,
+            }),
+            "GREATEST" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Greatest,
+                args,
+            }),
+            "LEAST" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Least,
+                args,
+            }),
+            // Regex functions
+            "REGEXP_LIKE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::RegexpLike,
+                args,
+            }),
+            "REGEXP_EXTRACT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::RegexpExtract,
+                args,
+            }),
+            "REGEXP_REPLACE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::RegexpReplace,
+                args,
+            }),
+            "REGEXP_SPLIT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::RegexpSplit,
+                args,
+            }),
+            "REGEXP_COUNT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::RegexpCount,
+                args,
+            }),
+            // Binary/Encoding functions
+            "TO_HEX" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ToHex,
+                args,
+            }),
+            "FROM_HEX" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::FromHex,
+                args,
+            }),
+            "TO_BASE64" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::ToBase64,
+                args,
+            }),
+            "FROM_BASE64" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::FromBase64,
+                args,
+            }),
+            "MD5" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Md5,
+                args,
+            }),
+            "SHA256" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Sha256,
+                args,
+            }),
+            "SHA1" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Sha1,
+                args,
+            }),
+            "SHA512" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Sha512,
+                args,
+            }),
+            // Bitwise functions
+            "BITWISE_AND" | "BIT_AND" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::BitwiseAnd,
+                args,
+            }),
+            "BITWISE_OR" | "BIT_OR" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::BitwiseOr,
+                args,
+            }),
+            "BITWISE_XOR" | "BIT_XOR" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::BitwiseXor,
+                args,
+            }),
+            "BITWISE_NOT" | "BIT_NOT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::BitwiseNot,
+                args,
+            }),
+            "BIT_COUNT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::BitCount,
+                args,
+            }),
+            // URL functions
+            "URL_EXTRACT_HOST" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::UrlExtractHost,
+                args,
+            }),
+            "URL_EXTRACT_PATH" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::UrlExtractPath,
+                args,
+            }),
+            "URL_EXTRACT_PORT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::UrlExtractPort,
+                args,
+            }),
+            "URL_EXTRACT_PROTOCOL" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::UrlExtractProtocol,
+                args,
+            }),
+            "URL_EXTRACT_QUERY" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::UrlExtractQuery,
+                args,
+            }),
+            "URL_ENCODE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::UrlEncode,
+                args,
+            }),
+            "URL_DECODE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::UrlDecode,
+                args,
+            }),
+            // Other functions
+            "TYPEOF" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Typeof,
+                args,
+            }),
+            "UUID" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::Uuid,
                 args,
             }),
             _ => Err(QueryError::NotImplemented(format!(
