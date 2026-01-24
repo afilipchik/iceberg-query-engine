@@ -259,10 +259,13 @@ fn collect_aggregates(expr: &Expr, aggregates: &mut Vec<AggregateExpr>) {
             distinct,
         } => {
             let input = args.first().cloned().unwrap_or(Expr::Wildcard);
+            // Capture second argument for functions like APPROX_PERCENTILE
+            let second_arg = args.get(1).cloned();
             aggregates.push(AggregateExpr {
                 func: *func,
                 input,
                 distinct: *distinct,
+                second_arg,
             });
         }
         Expr::BinaryExpr { left, right, .. } => {

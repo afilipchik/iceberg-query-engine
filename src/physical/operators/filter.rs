@@ -5,7 +5,8 @@ use crate::physical::operators::subquery::{evaluate_subquery_expr, SubqueryExecu
 use crate::physical::{PhysicalOperator, RecordBatchStream};
 use crate::planner::{BinaryOp, Column, Expr, ScalarValue, UnaryOp};
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Datum, Int32Array, Int64Array, StringArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Datum, Float32Array, Int32Array, Int64Array,
+    StringArray, Time64MicrosecondArray, TimestampMicrosecondArray,
 };
 use arrow::compute;
 use arrow::compute::kernels::boolean;
@@ -340,6 +341,30 @@ fn scalar_to_array(value: &ScalarValue, num_rows: usize) -> ArrayRef {
                 interval;
                 num_rows
             ]))
+        }
+        ScalarValue::List(values, elem_type) => {
+            // Convert list to JSON string representation for now
+            let json_arr: Vec<serde_json::Value> = values
+                .iter()
+                .map(|v| match v {
+                    ScalarValue::Null => serde_json::Value::Null,
+                    ScalarValue::Boolean(b) => serde_json::Value::Bool(*b),
+                    ScalarValue::Int8(i) => serde_json::json!(*i),
+                    ScalarValue::Int16(i) => serde_json::json!(*i),
+                    ScalarValue::Int32(i) => serde_json::json!(*i),
+                    ScalarValue::Int64(i) => serde_json::json!(*i),
+                    ScalarValue::UInt8(i) => serde_json::json!(*i),
+                    ScalarValue::UInt16(i) => serde_json::json!(*i),
+                    ScalarValue::UInt32(i) => serde_json::json!(*i),
+                    ScalarValue::UInt64(i) => serde_json::json!(*i),
+                    ScalarValue::Float32(f) => serde_json::json!(f.0),
+                    ScalarValue::Float64(f) => serde_json::json!(f.0),
+                    ScalarValue::Utf8(s) => serde_json::Value::String(s.clone()),
+                    _ => serde_json::Value::Null,
+                })
+                .collect();
+            let json_str = serde_json::to_string(&json_arr).unwrap_or_else(|_| "[]".to_string());
+            Arc::new(StringArray::from(vec![json_str.as_str(); num_rows]))
         }
     }
 }
@@ -715,11 +740,37 @@ fn evaluate_scalar_func(
                 ));
             }
 
-            // Start with the last argument
-            let mut result = evaluated_args.last().unwrap().clone();
+            // Find the first non-null data type
+            let target_type = evaluated_args
+                .iter()
+                .map(|arr| arr.data_type().clone())
+                .find(|dt| *dt != DataType::Null)
+                .unwrap_or(DataType::Null);
 
-            // Work backwards, replacing nulls with previous values
-            for arr in evaluated_args.iter().rev().skip(1) {
+            // If all arguments are null type, return the first one
+            if target_type == DataType::Null {
+                return Ok(evaluated_args[0].clone());
+            }
+
+            // Convert all arguments to the target type
+            let num_rows = evaluated_args[0].len();
+            let converted_args: Vec<ArrayRef> = evaluated_args
+                .iter()
+                .map(|arr| {
+                    if arr.data_type() == &DataType::Null {
+                        // Create a null array of the target type
+                        arrow::array::new_null_array(&target_type, num_rows)
+                    } else {
+                        arr.clone()
+                    }
+                })
+                .collect();
+
+            // Start with the first argument
+            let mut result = converted_args.first().unwrap().clone();
+
+            // Work forwards, replacing nulls with subsequent values
+            for arr in converted_args.iter().skip(1) {
                 let is_null = compute::is_null(result.as_ref())?;
                 result = zip(&is_null, arr, &result)?;
             }
@@ -2436,6 +2487,1728 @@ fn evaluate_scalar_func(
             Ok(Arc::new(result))
         }
 
+        // ========== NEW MATH FUNCTIONS - TRIGONOMETRIC ==========
+        ScalarFunction::Sinh => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("SINH requires 1 argument".into()))?;
+            apply_math_unary(arr, |x| x.sinh())
+        }
+
+        ScalarFunction::Cosh => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("COSH requires 1 argument".into()))?;
+            apply_math_unary(arr, |x| x.cosh())
+        }
+
+        ScalarFunction::Tanh => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("TANH requires 1 argument".into()))?;
+            apply_math_unary(arr, |x| x.tanh())
+        }
+
+        ScalarFunction::Cot => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("COT requires 1 argument".into()))?;
+            apply_math_unary(arr, |x| 1.0 / x.tan())
+        }
+
+        // ========== NEW MATH FUNCTIONS - SPECIAL VALUES ==========
+        ScalarFunction::Infinity => {
+            let num_rows = batch.num_rows();
+            let result: Float64Array = (0..num_rows).map(|_| Some(f64::INFINITY)).collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::Nan => {
+            let num_rows = batch.num_rows();
+            let result: Float64Array = (0..num_rows).map(|_| Some(f64::NAN)).collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::IsFinite => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("IS_FINITE requires 1 argument".into()))?;
+            if let Some(float_arr) = arr.as_any().downcast_ref::<Float64Array>() {
+                let result: BooleanArray = float_arr
+                    .iter()
+                    .map(|opt| opt.map(|v| v.is_finite()))
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            // For integers, always finite
+            let num_rows = arr.len();
+            Ok(Arc::new(BooleanArray::from(vec![true; num_rows])))
+        }
+
+        ScalarFunction::IsNan => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("IS_NAN requires 1 argument".into()))?;
+            if let Some(float_arr) = arr.as_any().downcast_ref::<Float64Array>() {
+                let result: BooleanArray = float_arr
+                    .iter()
+                    .map(|opt| opt.map(|v| v.is_nan()))
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            // For integers, never NaN
+            let num_rows = arr.len();
+            Ok(Arc::new(BooleanArray::from(vec![false; num_rows])))
+        }
+
+        ScalarFunction::IsInfinite => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("IS_INFINITE requires 1 argument".into()))?;
+            if let Some(float_arr) = arr.as_any().downcast_ref::<Float64Array>() {
+                let result: BooleanArray = float_arr
+                    .iter()
+                    .map(|opt| opt.map(|v| v.is_infinite()))
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            // For integers, never infinite
+            let num_rows = arr.len();
+            Ok(Arc::new(BooleanArray::from(vec![false; num_rows])))
+        }
+
+        // ========== NEW MATH FUNCTIONS - BASE CONVERSION ==========
+        ScalarFunction::FromBase => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "FROM_BASE requires 2 arguments".into(),
+                ));
+            }
+            let str_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("FROM_BASE requires string argument".into()))?;
+            let radix = get_int_value(&evaluated_args[1], 0).unwrap_or(10) as u32;
+
+            let result: Int64Array = str_arr
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|s| i64::from_str_radix(s, radix).ok())
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::ToBase => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "TO_BASE requires 2 arguments".into(),
+                ));
+            }
+            let int_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| QueryError::Type("TO_BASE requires integer argument".into()))?;
+            let radix = get_int_value(&evaluated_args[1], 0).unwrap_or(10) as u32;
+
+            let result: StringArray = int_arr
+                .iter()
+                .map(|opt| {
+                    opt.map(|v| {
+                        match radix {
+                            2 => format!("{:b}", v),
+                            8 => format!("{:o}", v),
+                            16 => format!("{:x}", v),
+                            _ => format!("{}", v), // Only support common bases
+                        }
+                    })
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::WidthBucket => {
+            if evaluated_args.len() != 4 {
+                return Err(QueryError::InvalidArgument(
+                    "WIDTH_BUCKET requires 4 arguments".into(),
+                ));
+            }
+            let operand = get_float_array(&evaluated_args[0])?;
+            let low = get_float_array(&evaluated_args[1])?;
+            let high = get_float_array(&evaluated_args[2])?;
+            let count = get_int_value(&evaluated_args[3], 0).unwrap_or(1) as f64;
+
+            let result: Int64Array = operand
+                .iter()
+                .zip(low.iter())
+                .zip(high.iter())
+                .map(|((op, lo), hi)| {
+                    match (op, lo, hi) {
+                        (Some(v), Some(l), Some(h)) => {
+                            if v < l {
+                                Some(0)
+                            } else if v >= h {
+                                Some(count as i64 + 1)
+                            } else {
+                                Some(((v - l) / (h - l) * count).floor() as i64 + 1)
+                            }
+                        }
+                        _ => None,
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        // ========== NEW MATH FUNCTIONS - STATISTICAL DISTRIBUTIONS ==========
+        ScalarFunction::NormalCdf => {
+            use statrs::distribution::{ContinuousCDF, Normal};
+            if evaluated_args.len() < 3 {
+                return Err(QueryError::InvalidArgument(
+                    "NORMAL_CDF requires 3 arguments (mean, std, value)".into(),
+                ));
+            }
+            let mean = get_float_array(&evaluated_args[0])?;
+            let std = get_float_array(&evaluated_args[1])?;
+            let value = get_float_array(&evaluated_args[2])?;
+
+            let result: Float64Array = mean
+                .iter()
+                .zip(std.iter())
+                .zip(value.iter())
+                .map(|((m, s), v)| {
+                    match (m, s, v) {
+                        (Some(m), Some(s), Some(v)) => {
+                            Normal::new(*m, *s).ok().map(|n| n.cdf(*v))
+                        }
+                        _ => None,
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::InverseNormalCdf => {
+            use statrs::distribution::{ContinuousCDF, Normal};
+            if evaluated_args.len() < 3 {
+                return Err(QueryError::InvalidArgument(
+                    "INVERSE_NORMAL_CDF requires 3 arguments (mean, std, p)".into(),
+                ));
+            }
+            let mean = get_float_array(&evaluated_args[0])?;
+            let std = get_float_array(&evaluated_args[1])?;
+            let p = get_float_array(&evaluated_args[2])?;
+
+            let result: Float64Array = mean
+                .iter()
+                .zip(std.iter())
+                .zip(p.iter())
+                .map(|((m, s), prob)| {
+                    match (m, s, prob) {
+                        (Some(m), Some(s), Some(p)) => {
+                            Normal::new(*m, *s).ok().map(|n| n.inverse_cdf(*p))
+                        }
+                        _ => None,
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::BetaCdf
+        | ScalarFunction::InverseBetaCdf
+        | ScalarFunction::TCdf
+        | ScalarFunction::TPdf
+        | ScalarFunction::WilsonIntervalLower
+        | ScalarFunction::WilsonIntervalUpper => Err(QueryError::NotImplemented(format!(
+            "Statistical function {:?} not fully implemented",
+            func
+        ))),
+
+        // ========== NEW MATH FUNCTIONS - VECTOR OPERATIONS ==========
+        ScalarFunction::CosineSimilarity | ScalarFunction::CosineDistance => {
+            Err(QueryError::NotImplemented(
+                "Vector operations require array type support".into(),
+            ))
+        }
+
+        // ========== NEW STRING FUNCTIONS ==========
+        ScalarFunction::Split => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "SPLIT requires 2 arguments".into(),
+                ));
+            }
+            let str_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("SPLIT requires string argument".into()))?;
+            let delim_arr = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("SPLIT requires string delimiter".into()))?;
+
+            // Return comma-separated result until array type is supported
+            let result: StringArray = (0..str_arr.len())
+                .map(|i| {
+                    if str_arr.is_null(i) || delim_arr.is_null(i) {
+                        None
+                    } else {
+                        let s = str_arr.value(i);
+                        let d = delim_arr.value(i);
+                        let parts: Vec<&str> = s.split(d).collect();
+                        Some(parts.join(","))
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::Codepoint => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("CODEPOINT requires 1 argument".into()))?;
+            let str_arr = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("CODEPOINT requires string argument".into()))?;
+
+            let result: Int64Array = str_arr
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|s| s.chars().next().map(|c| c as i64))
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::HammingDistance => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "HAMMING_DISTANCE requires 2 arguments".into(),
+                ));
+            }
+            let str1 = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("HAMMING_DISTANCE requires string arguments".into()))?;
+            let str2 = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("HAMMING_DISTANCE requires string arguments".into()))?;
+
+            let result: Int64Array = (0..str1.len())
+                .map(|i| {
+                    if str1.is_null(i) || str2.is_null(i) {
+                        None
+                    } else {
+                        let s1 = str1.value(i);
+                        let s2 = str2.value(i);
+                        if s1.len() != s2.len() {
+                            None
+                        } else {
+                            Some(
+                                s1.chars()
+                                    .zip(s2.chars())
+                                    .filter(|(c1, c2)| c1 != c2)
+                                    .count() as i64,
+                            )
+                        }
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::LevenshteinDistance => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "LEVENSHTEIN_DISTANCE requires 2 arguments".into(),
+                ));
+            }
+            let str1 = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("LEVENSHTEIN_DISTANCE requires string arguments".into()))?;
+            let str2 = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("LEVENSHTEIN_DISTANCE requires string arguments".into()))?;
+
+            let result: Int64Array = (0..str1.len())
+                .map(|i| {
+                    if str1.is_null(i) || str2.is_null(i) {
+                        None
+                    } else {
+                        let s1 = str1.value(i);
+                        let s2 = str2.value(i);
+                        Some(levenshtein_distance(s1, s2) as i64)
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::Soundex => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("SOUNDEX requires 1 argument".into()))?;
+            let str_arr = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("SOUNDEX requires string argument".into()))?;
+
+            let result: StringArray = str_arr
+                .iter()
+                .map(|opt| opt.map(|s| soundex(s)))
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::Translate => {
+            if evaluated_args.len() != 3 {
+                return Err(QueryError::InvalidArgument(
+                    "TRANSLATE requires 3 arguments".into(),
+                ));
+            }
+            let str_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("TRANSLATE requires string argument".into()))?;
+            let from_arr = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("TRANSLATE requires string from argument".into()))?;
+            let to_arr = evaluated_args[2]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("TRANSLATE requires string to argument".into()))?;
+
+            let result: StringArray = (0..str_arr.len())
+                .map(|i| {
+                    if str_arr.is_null(i) || from_arr.is_null(i) || to_arr.is_null(i) {
+                        None
+                    } else {
+                        let s = str_arr.value(i);
+                        let from: Vec<char> = from_arr.value(i).chars().collect();
+                        let to: Vec<char> = to_arr.value(i).chars().collect();
+                        Some(
+                            s.chars()
+                                .map(|c| {
+                                    from.iter().position(|&fc| fc == c)
+                                        .and_then(|pos| to.get(pos).copied())
+                                        .unwrap_or(c)
+                                })
+                                .collect::<String>(),
+                        )
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::LuhnCheck => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("LUHN_CHECK requires 1 argument".into()))?;
+            let str_arr = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("LUHN_CHECK requires string argument".into()))?;
+
+            let result: BooleanArray = str_arr
+                .iter()
+                .map(|opt| opt.map(|s| luhn_check(s)))
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::Normalize => {
+            use unicode_normalization::UnicodeNormalization;
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("NORMALIZE requires 1 argument".into()))?;
+            let str_arr = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("NORMALIZE requires string argument".into()))?;
+
+            // Default to NFC normalization
+            let result: StringArray = str_arr
+                .iter()
+                .map(|opt| opt.map(|s| s.nfc().collect::<String>()))
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::ToUtf8 => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("TO_UTF8 requires 1 argument".into()))?;
+            let str_arr = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("TO_UTF8 requires string argument".into()))?;
+
+            let result: BinaryArray = str_arr
+                .iter()
+                .map(|opt| opt.map(|s| s.as_bytes().to_vec()))
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::FromUtf8 => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("FROM_UTF8 requires 1 argument".into()))?;
+            let bin_arr = arr
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| QueryError::Type("FROM_UTF8 requires binary argument".into()))?;
+
+            let result: StringArray = bin_arr
+                .iter()
+                .map(|opt| opt.and_then(|b| String::from_utf8(b.to_vec()).ok()))
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::WordStem => {
+            // Simple implementation - just return the word unchanged
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("WORD_STEM requires 1 argument".into()))?;
+            Ok(arr.clone())
+        }
+
+        // ========== NEW DATE/TIME FUNCTIONS ==========
+        ScalarFunction::Millisecond => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("MILLISECOND requires 1 argument".into())
+            })?;
+            if let Some(ts_arr) = arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+                let result: Int32Array = ts_arr
+                    .iter()
+                    .map(|opt| opt.map(|us| ((us % 1_000_000) / 1_000) as i32))
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            Err(QueryError::NotImplemented(
+                "MILLISECOND for this type not implemented".into(),
+            ))
+        }
+
+        ScalarFunction::YearOfWeek => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("YEAR_OF_WEEK requires 1 argument".into())
+            })?;
+            if let Some(date32) = arr.as_any().downcast_ref::<Date32Array>() {
+                use chrono::Datelike;
+                let result: Int32Array = date32
+                    .iter()
+                    .map(|opt| {
+                        opt.map(|days| {
+                            let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719163)
+                                .unwrap_or_default();
+                            date.iso_week().year()
+                        })
+                    })
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            Err(QueryError::NotImplemented(
+                "YEAR_OF_WEEK for this type not implemented".into(),
+            ))
+        }
+
+        ScalarFunction::TimezoneHour | ScalarFunction::TimezoneMinute => {
+            // These require timezone-aware timestamps, return 0 for now
+            let num_rows = batch.num_rows();
+            Ok(Arc::new(Int32Array::from(vec![0; num_rows])))
+        }
+
+        ScalarFunction::CurrentTime => {
+            use chrono::Timelike;
+            let now = chrono::Local::now();
+            let micros = now.hour() as i64 * 3600_000_000
+                + now.minute() as i64 * 60_000_000
+                + now.second() as i64 * 1_000_000
+                + now.nanosecond() as i64 / 1000;
+            let num_rows = batch.num_rows();
+            Ok(Arc::new(Time64MicrosecondArray::from(vec![micros; num_rows])))
+        }
+
+        ScalarFunction::CurrentTimezone => {
+            let tz = chrono::Local::now().format("%:z").to_string();
+            let num_rows = batch.num_rows();
+            Ok(Arc::new(StringArray::from(vec![tz.as_str(); num_rows])))
+        }
+
+        ScalarFunction::Localtime => {
+            use chrono::Timelike;
+            let now = chrono::Local::now();
+            let micros = now.hour() as i64 * 3600_000_000
+                + now.minute() as i64 * 60_000_000
+                + now.second() as i64 * 1_000_000;
+            let num_rows = batch.num_rows();
+            Ok(Arc::new(Time64MicrosecondArray::from(vec![micros; num_rows])))
+        }
+
+        ScalarFunction::Localtimestamp => {
+            let now = chrono::Local::now();
+            let micros = now.timestamp_micros();
+            let num_rows = batch.num_rows();
+            Ok(Arc::new(TimestampMicrosecondArray::from(vec![micros; num_rows])))
+        }
+
+        ScalarFunction::LastDayOfMonth => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("LAST_DAY_OF_MONTH requires 1 argument".into())
+            })?;
+            if let Some(date32) = arr.as_any().downcast_ref::<Date32Array>() {
+                use chrono::Datelike;
+                let result: Date32Array = date32
+                    .iter()
+                    .map(|opt| {
+                        opt.map(|days| {
+                            let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719163)
+                                .unwrap_or_default();
+                            let last = chrono::NaiveDate::from_ymd_opt(
+                                date.year(),
+                                date.month(),
+                                1,
+                            )
+                            .unwrap()
+                            .with_day(1)
+                            .unwrap()
+                            + chrono::Months::new(1)
+                            - chrono::Duration::days(1);
+                            last.num_days_from_ce() - 719163
+                        })
+                    })
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            Err(QueryError::NotImplemented(
+                "LAST_DAY_OF_MONTH for this type not implemented".into(),
+            ))
+        }
+
+        ScalarFunction::FromUnixtime => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("FROM_UNIXTIME requires 1 argument".into())
+            })?;
+            if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
+                let result: TimestampMicrosecondArray = int_arr
+                    .iter()
+                    .map(|opt| opt.map(|secs| secs * 1_000_000))
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            Err(QueryError::Type(
+                "FROM_UNIXTIME requires integer argument".into(),
+            ))
+        }
+
+        ScalarFunction::ToUnixtime => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("TO_UNIXTIME requires 1 argument".into())
+            })?;
+            if let Some(ts_arr) = arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+                let result: Int64Array = ts_arr
+                    .iter()
+                    .map(|opt| opt.map(|micros| micros / 1_000_000))
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            Err(QueryError::Type(
+                "TO_UNIXTIME requires timestamp argument".into(),
+            ))
+        }
+
+        ScalarFunction::FromIso8601Timestamp => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("FROM_ISO8601_TIMESTAMP requires 1 argument".into())
+            })?;
+            let str_arr = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                QueryError::Type("FROM_ISO8601_TIMESTAMP requires string argument".into())
+            })?;
+
+            let result: TimestampMicrosecondArray = str_arr
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|s| {
+                        chrono::DateTime::parse_from_rfc3339(s)
+                            .ok()
+                            .map(|dt| dt.timestamp_micros())
+                    })
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::FromIso8601Date => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("FROM_ISO8601_DATE requires 1 argument".into())
+            })?;
+            let str_arr = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                QueryError::Type("FROM_ISO8601_DATE requires string argument".into())
+            })?;
+
+            let result: Date32Array = str_arr
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|s| {
+                        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                            .ok()
+                            .map(|d| d.num_days_from_ce() - 719163)
+                    })
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::ToIso8601 => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("TO_ISO8601 requires 1 argument".into())
+            })?;
+            if let Some(ts_arr) = arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+                let result: StringArray = ts_arr
+                    .iter()
+                    .map(|opt| {
+                        opt.map(|micros| {
+                            let dt = chrono::DateTime::from_timestamp_micros(micros)
+                                .unwrap_or_default();
+                            dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
+                        })
+                    })
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            if let Some(date32) = arr.as_any().downcast_ref::<Date32Array>() {
+                let result: StringArray = date32
+                    .iter()
+                    .map(|opt| {
+                        opt.map(|days| {
+                            let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719163)
+                                .unwrap_or_default();
+                            date.format("%Y-%m-%d").to_string()
+                        })
+                    })
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            Err(QueryError::Type(
+                "TO_ISO8601 requires timestamp or date argument".into(),
+            ))
+        }
+
+        ScalarFunction::DateFormat | ScalarFunction::DateParse | ScalarFunction::ParseDatetime => {
+            Err(QueryError::NotImplemented(format!(
+                "Date format function {:?} not fully implemented",
+                func
+            )))
+        }
+
+        ScalarFunction::ParseDuration => {
+            Err(QueryError::NotImplemented(
+                "PARSE_DURATION not fully implemented".into(),
+            ))
+        }
+
+        ScalarFunction::HumanReadableSeconds => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("HUMAN_READABLE_SECONDS requires 1 argument".into())
+            })?;
+            let float_arr = get_float_array(arr)?;
+
+            let result: StringArray = float_arr
+                .iter()
+                .map(|opt| {
+                    match opt {
+                        Some(secs) => {
+                            let s = *secs;
+                            if s < 60.0 {
+                                Some(format!("{:.2} seconds", s))
+                            } else if s < 3600.0 {
+                                Some(format!("{:.2} minutes", s / 60.0))
+                            } else if s < 86400.0 {
+                                Some(format!("{:.2} hours", s / 3600.0))
+                            } else {
+                                Some(format!("{:.2} days", s / 86400.0))
+                            }
+                        }
+                        None => None,
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::AtTimezone | ScalarFunction::WithTimezone | ScalarFunction::Timezone => {
+            Err(QueryError::NotImplemented(
+                "Timezone conversion functions not fully implemented".into(),
+            ))
+        }
+
+        // ========== NEW CONDITIONAL/FORMATTING FUNCTIONS ==========
+        ScalarFunction::TryCast => {
+            // For now, just return the input (actual casting requires type info)
+            evaluated_args.first().cloned().ok_or_else(|| {
+                QueryError::InvalidArgument("TRY_CAST requires 1 argument".into())
+            })
+        }
+
+        ScalarFunction::Try => {
+            // For now, just return the input
+            evaluated_args.first().cloned().ok_or_else(|| {
+                QueryError::InvalidArgument("TRY requires 1 argument".into())
+            })
+        }
+
+        ScalarFunction::Format | ScalarFunction::FormatNumber => {
+            Err(QueryError::NotImplemented(
+                "FORMAT functions not fully implemented".into(),
+            ))
+        }
+
+        ScalarFunction::ParseDataSize => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("PARSE_DATA_SIZE requires 1 argument".into())
+            })?;
+            let str_arr = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                QueryError::Type("PARSE_DATA_SIZE requires string argument".into())
+            })?;
+
+            let result: Int64Array = str_arr
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|s| {
+                        let s = s.trim().to_uppercase();
+                        if s.ends_with("TB") {
+                            s[..s.len()-2].trim().parse::<f64>().ok().map(|v| (v * 1024.0 * 1024.0 * 1024.0 * 1024.0) as i64)
+                        } else if s.ends_with("GB") {
+                            s[..s.len()-2].trim().parse::<f64>().ok().map(|v| (v * 1024.0 * 1024.0 * 1024.0) as i64)
+                        } else if s.ends_with("MB") {
+                            s[..s.len()-2].trim().parse::<f64>().ok().map(|v| (v * 1024.0 * 1024.0) as i64)
+                        } else if s.ends_with("KB") {
+                            s[..s.len()-2].trim().parse::<f64>().ok().map(|v| (v * 1024.0) as i64)
+                        } else if s.ends_with("B") {
+                            s[..s.len()-1].trim().parse::<i64>().ok()
+                        } else {
+                            s.parse::<i64>().ok()
+                        }
+                    })
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        // ========== NEW REGEX FUNCTIONS ==========
+        ScalarFunction::RegexpExtractAll => {
+            // Return all matches as comma-separated string (until array support)
+            if evaluated_args.len() < 2 {
+                return Err(QueryError::InvalidArgument(
+                    "REGEXP_EXTRACT_ALL requires at least 2 arguments".into(),
+                ));
+            }
+            let str_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    QueryError::Type("REGEXP_EXTRACT_ALL requires string argument".into())
+                })?;
+            let pattern_arr = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("REGEXP_EXTRACT_ALL requires string pattern".into()))?;
+
+            let result: StringArray = (0..str_arr.len())
+                .map(|i| {
+                    if str_arr.is_null(i) || pattern_arr.is_null(i) {
+                        None
+                    } else {
+                        let s = str_arr.value(i);
+                        let pattern = pattern_arr.value(i);
+                        match regex::Regex::new(pattern) {
+                            Ok(re) => {
+                                let matches: Vec<&str> = re.find_iter(s).map(|m| m.as_str()).collect();
+                                Some(matches.join(","))
+                            }
+                            Err(_) => None,
+                        }
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::RegexpPosition => {
+            if evaluated_args.len() < 2 {
+                return Err(QueryError::InvalidArgument(
+                    "REGEXP_POSITION requires at least 2 arguments".into(),
+                ));
+            }
+            let str_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    QueryError::Type("REGEXP_POSITION requires string argument".into())
+                })?;
+            let pattern_arr = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("REGEXP_POSITION requires string pattern".into()))?;
+
+            let result: Int64Array = (0..str_arr.len())
+                .map(|i| {
+                    if str_arr.is_null(i) || pattern_arr.is_null(i) {
+                        None
+                    } else {
+                        let s = str_arr.value(i);
+                        let pattern = pattern_arr.value(i);
+                        match regex::Regex::new(pattern) {
+                            Ok(re) => re.find(s).map(|m| m.start() as i64 + 1),
+                            Err(_) => None,
+                        }
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        // ========== NEW BINARY/ENCODING FUNCTIONS ==========
+        ScalarFunction::ToBase64Url => {
+            use base64::Engine;
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("TO_BASE64URL requires 1 argument".into())
+            })?;
+
+            if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
+                let result: StringArray = str_arr
+                    .iter()
+                    .map(|opt| {
+                        opt.map(|s| base64::engine::general_purpose::URL_SAFE.encode(s.as_bytes()))
+                    })
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            if let Some(bin_arr) = arr.as_any().downcast_ref::<BinaryArray>() {
+                let result: StringArray = bin_arr
+                    .iter()
+                    .map(|opt| opt.map(|b| base64::engine::general_purpose::URL_SAFE.encode(b)))
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            Err(QueryError::Type(
+                "TO_BASE64URL requires string or binary argument".into(),
+            ))
+        }
+
+        ScalarFunction::FromBase64Url => {
+            use base64::Engine;
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("FROM_BASE64URL requires 1 argument".into())
+            })?;
+            let str_arr = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                QueryError::Type("FROM_BASE64URL requires string argument".into())
+            })?;
+
+            let result: BinaryArray = str_arr
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|s| base64::engine::general_purpose::URL_SAFE.decode(s).ok())
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::ToBase32 | ScalarFunction::FromBase32 => {
+            Err(QueryError::NotImplemented(
+                "Base32 encoding not implemented".into(),
+            ))
+        }
+
+        ScalarFunction::Crc32 => {
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("CRC32 requires 1 argument".into()))?;
+
+            if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
+                let result: Int32Array = str_arr
+                    .iter()
+                    .map(|opt| opt.map(|s| crc32fast::hash(s.as_bytes()) as i32))
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            if let Some(bin_arr) = arr.as_any().downcast_ref::<BinaryArray>() {
+                let result: Int32Array = bin_arr
+                    .iter()
+                    .map(|opt| opt.map(|b| crc32fast::hash(b) as i32))
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            Err(QueryError::Type(
+                "CRC32 requires string or binary argument".into(),
+            ))
+        }
+
+        ScalarFunction::Xxhash64 => {
+            use xxhash_rust::xxh64::xxh64;
+            let arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("XXHASH64 requires 1 argument".into()))?;
+
+            if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
+                let result: Int64Array = str_arr
+                    .iter()
+                    .map(|opt| opt.map(|s| xxh64(s.as_bytes(), 0) as i64))
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            if let Some(bin_arr) = arr.as_any().downcast_ref::<BinaryArray>() {
+                let result: Int64Array = bin_arr
+                    .iter()
+                    .map(|opt| opt.map(|b| xxh64(b, 0) as i64))
+                    .collect();
+                return Ok(Arc::new(result));
+            }
+            Err(QueryError::Type(
+                "XXHASH64 requires string or binary argument".into(),
+            ))
+        }
+
+        ScalarFunction::Murmur3 | ScalarFunction::SpookyHashV2_32 | ScalarFunction::SpookyHashV2_64 => {
+            Err(QueryError::NotImplemented(format!(
+                "Hash function {:?} not implemented",
+                func
+            )))
+        }
+
+        ScalarFunction::HmacMd5 | ScalarFunction::HmacSha1 | ScalarFunction::HmacSha256 | ScalarFunction::HmacSha512 => {
+            use hmac::{Hmac, Mac};
+
+            if evaluated_args.len() < 2 {
+                return Err(QueryError::InvalidArgument(
+                    "HMAC functions require 2 arguments (key, message)".into(),
+                ));
+            }
+
+            let key_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("HMAC key must be string".into()))?;
+
+            let msg_arr = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("HMAC message must be string".into()))?;
+
+            let result: StringArray = key_arr
+                .iter()
+                .zip(msg_arr.iter())
+                .map(|(key_opt, msg_opt)| match (key_opt, msg_opt) {
+                    (Some(key), Some(msg)) => {
+                        let hash = match func {
+                            ScalarFunction::HmacMd5 => {
+                                type HmacMd5 = Hmac<md5::Md5>;
+                                let mut mac = HmacMd5::new_from_slice(key.as_bytes()).unwrap();
+                                mac.update(msg.as_bytes());
+                                hex::encode(mac.finalize().into_bytes())
+                            }
+                            ScalarFunction::HmacSha1 => {
+                                type HmacSha1 = Hmac<sha1::Sha1>;
+                                let mut mac = HmacSha1::new_from_slice(key.as_bytes()).unwrap();
+                                mac.update(msg.as_bytes());
+                                hex::encode(mac.finalize().into_bytes())
+                            }
+                            ScalarFunction::HmacSha256 => {
+                                type HmacSha256 = Hmac<sha2::Sha256>;
+                                let mut mac = HmacSha256::new_from_slice(key.as_bytes()).unwrap();
+                                mac.update(msg.as_bytes());
+                                hex::encode(mac.finalize().into_bytes())
+                            }
+                            ScalarFunction::HmacSha512 => {
+                                type HmacSha512 = Hmac<sha2::Sha512>;
+                                let mut mac = HmacSha512::new_from_slice(key.as_bytes()).unwrap();
+                                mac.update(msg.as_bytes());
+                                hex::encode(mac.finalize().into_bytes())
+                            }
+                            _ => unreachable!(),
+                        };
+                        Some(hash)
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::FromBigEndian32 => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("FROM_BIG_ENDIAN_32 requires 1 argument".into())
+            })?;
+            let bin_arr = arr.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
+                QueryError::Type("FROM_BIG_ENDIAN_32 requires binary argument".into())
+            })?;
+
+            let result: Int32Array = bin_arr
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|b| {
+                        if b.len() >= 4 {
+                            Some(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::ToBigEndian32 => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("TO_BIG_ENDIAN_32 requires 1 argument".into())
+            })?;
+            let int_arr = arr.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                QueryError::Type("TO_BIG_ENDIAN_32 requires integer argument".into())
+            })?;
+
+            let result: BinaryArray = int_arr
+                .iter()
+                .map(|opt| opt.map(|v| v.to_be_bytes().to_vec()))
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::FromBigEndian64 => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("FROM_BIG_ENDIAN_64 requires 1 argument".into())
+            })?;
+            let bin_arr = arr.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
+                QueryError::Type("FROM_BIG_ENDIAN_64 requires binary argument".into())
+            })?;
+
+            let result: Int64Array = bin_arr
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|b| {
+                        if b.len() >= 8 {
+                            Some(i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::ToBigEndian64 => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("TO_BIG_ENDIAN_64 requires 1 argument".into())
+            })?;
+            let int_arr = arr.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                QueryError::Type("TO_BIG_ENDIAN_64 requires integer argument".into())
+            })?;
+
+            let result: BinaryArray = int_arr
+                .iter()
+                .map(|opt| opt.map(|v| v.to_be_bytes().to_vec()))
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::FromIeee754_32 => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("FROM_IEEE754_32 requires 1 argument".into())
+            })?;
+            let bin_arr = arr.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
+                QueryError::Type("FROM_IEEE754_32 requires binary argument".into())
+            })?;
+
+            let result: Float32Array = bin_arr
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|b| {
+                        if b.len() >= 4 {
+                            Some(f32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::ToIeee754_32 => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("TO_IEEE754_32 requires 1 argument".into())
+            })?;
+            let float_arr = arr.as_any().downcast_ref::<Float32Array>().ok_or_else(|| {
+                QueryError::Type("TO_IEEE754_32 requires float argument".into())
+            })?;
+
+            let result: BinaryArray = float_arr
+                .iter()
+                .map(|opt| opt.map(|v| v.to_be_bytes().to_vec()))
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::FromIeee754_64 => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("FROM_IEEE754_64 requires 1 argument".into())
+            })?;
+            let bin_arr = arr.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
+                QueryError::Type("FROM_IEEE754_64 requires binary argument".into())
+            })?;
+
+            let result: Float64Array = bin_arr
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|b| {
+                        if b.len() >= 8 {
+                            Some(f64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::ToIeee754_64 => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("TO_IEEE754_64 requires 1 argument".into())
+            })?;
+            let float_arr = arr.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                QueryError::Type("TO_IEEE754_64 requires float argument".into())
+            })?;
+
+            let result: BinaryArray = float_arr
+                .iter()
+                .map(|opt| opt.map(|v| v.to_be_bytes().to_vec()))
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        // ========== NEW BITWISE FUNCTIONS ==========
+        ScalarFunction::BitwiseLeftShift => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "BITWISE_LEFT_SHIFT requires 2 arguments".into(),
+                ));
+            }
+            let left = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| QueryError::Type("BITWISE_LEFT_SHIFT requires integer arguments".into()))?;
+            let right = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| QueryError::Type("BITWISE_LEFT_SHIFT requires integer arguments".into()))?;
+
+            let result: Int64Array = left
+                .iter()
+                .zip(right.iter())
+                .map(|(l, r)| match (l, r) {
+                    (Some(lv), Some(rv)) => Some(lv << (rv as u32)),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::BitwiseRightShift => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "BITWISE_RIGHT_SHIFT requires 2 arguments".into(),
+                ));
+            }
+            let left = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| QueryError::Type("BITWISE_RIGHT_SHIFT requires integer arguments".into()))?;
+            let right = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| QueryError::Type("BITWISE_RIGHT_SHIFT requires integer arguments".into()))?;
+
+            let result: Int64Array = left
+                .iter()
+                .zip(right.iter())
+                .map(|(l, r)| match (l, r) {
+                    (Some(lv), Some(rv)) => Some((lv as u64 >> (rv as u32)) as i64),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::BitwiseRightShiftArithmetic => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "BITWISE_RIGHT_SHIFT_ARITHMETIC requires 2 arguments".into(),
+                ));
+            }
+            let left = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| QueryError::Type("BITWISE_RIGHT_SHIFT_ARITHMETIC requires integer arguments".into()))?;
+            let right = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| QueryError::Type("BITWISE_RIGHT_SHIFT_ARITHMETIC requires integer arguments".into()))?;
+
+            let result: Int64Array = left
+                .iter()
+                .zip(right.iter())
+                .map(|(l, r)| match (l, r) {
+                    (Some(lv), Some(rv)) => Some(lv >> (rv as u32)),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        // ========== NEW URL FUNCTIONS ==========
+        ScalarFunction::UrlExtractFragment => {
+            let arr = evaluated_args.first().ok_or_else(|| {
+                QueryError::InvalidArgument("URL_EXTRACT_FRAGMENT requires 1 argument".into())
+            })?;
+            let str_arr = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                QueryError::Type("URL_EXTRACT_FRAGMENT requires string argument".into())
+            })?;
+
+            let result: StringArray = str_arr
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|s| {
+                        url::Url::parse(s)
+                            .ok()
+                            .and_then(|u| u.fragment().map(|f| f.to_string()))
+                    })
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::UrlExtractParameter => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "URL_EXTRACT_PARAMETER requires 2 arguments".into(),
+                ));
+            }
+            let url_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("URL_EXTRACT_PARAMETER requires string URL".into()))?;
+            let param_arr = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("URL_EXTRACT_PARAMETER requires string parameter name".into()))?;
+
+            let result: StringArray = (0..url_arr.len())
+                .map(|i| {
+                    if url_arr.is_null(i) || param_arr.is_null(i) {
+                        None
+                    } else {
+                        let url_str = url_arr.value(i);
+                        let param = param_arr.value(i);
+                        url::Url::parse(url_str).ok().and_then(|u| {
+                            u.query_pairs()
+                                .find(|(k, _)| k == param)
+                                .map(|(_, v)| v.to_string())
+                        })
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        // Aliases
+        ScalarFunction::Pow => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "POW requires 2 arguments".into(),
+                ));
+            }
+            apply_math_binary(&evaluated_args[0], &evaluated_args[1], |a, b| a.powf(b))
+        }
+
+        ScalarFunction::Rand => {
+            let num_rows = batch.num_rows();
+            let result: Float64Array = (0..num_rows)
+                .map(|_| Some(rand::random::<f64>()))
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        // ========== JSON FUNCTIONS ==========
+        ScalarFunction::JsonExtract => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "JSON_EXTRACT requires 2 arguments".into(),
+                ));
+            }
+            let json_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("JSON_EXTRACT requires string JSON".into()))?;
+            let path_arr = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("JSON_EXTRACT requires string path".into()))?;
+
+            let result: StringArray = (0..json_arr.len())
+                .map(|i| {
+                    if json_arr.is_null(i) || path_arr.is_null(i) {
+                        None
+                    } else {
+                        let json_str = json_arr.value(i);
+                        let path = path_arr.value(i);
+                        json_extract_impl(json_str, path)
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::JsonExtractScalar => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "JSON_EXTRACT_SCALAR requires 2 arguments".into(),
+                ));
+            }
+            let json_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("JSON_EXTRACT_SCALAR requires string JSON".into()))?;
+            let path_arr = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("JSON_EXTRACT_SCALAR requires string path".into()))?;
+
+            let result: StringArray = (0..json_arr.len())
+                .map(|i| {
+                    if json_arr.is_null(i) || path_arr.is_null(i) {
+                        None
+                    } else {
+                        let json_str = json_arr.value(i);
+                        let path = path_arr.value(i);
+                        json_extract_scalar_impl(json_str, path)
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::JsonSize => {
+            if evaluated_args.len() < 1 {
+                return Err(QueryError::InvalidArgument(
+                    "JSON_SIZE requires at least 1 argument".into(),
+                ));
+            }
+            let json_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("JSON_SIZE requires string JSON".into()))?;
+            let path_arr = evaluated_args.get(1);
+
+            let result: Int64Array = (0..json_arr.len())
+                .map(|i| {
+                    if json_arr.is_null(i) {
+                        None
+                    } else {
+                        let json_str = json_arr.value(i);
+                        let path = path_arr
+                            .and_then(|a| a.as_any().downcast_ref::<StringArray>())
+                            .map(|a| if a.is_null(i) { "$" } else { a.value(i) })
+                            .unwrap_or("$");
+                        json_size_impl(json_str, path)
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::JsonArrayLength => {
+            let json_arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("JSON_ARRAY_LENGTH requires 1 argument".into()))?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("JSON_ARRAY_LENGTH requires string JSON".into()))?;
+
+            let result: Int64Array = json_arr
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|json_str| {
+                        serde_json::from_str::<serde_json::Value>(json_str)
+                            .ok()
+                            .and_then(|v| v.as_array().map(|a| a.len() as i64))
+                    })
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::JsonArrayGet => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "JSON_ARRAY_GET requires 2 arguments".into(),
+                ));
+            }
+            let json_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("JSON_ARRAY_GET requires string JSON".into()))?;
+            let idx_arr = &evaluated_args[1];
+
+            let result: StringArray = (0..json_arr.len())
+                .map(|i| {
+                    if json_arr.is_null(i) {
+                        None
+                    } else {
+                        let json_str = json_arr.value(i);
+                        let idx = get_int_value(idx_arr, i).unwrap_or(0) as usize;
+                        serde_json::from_str::<serde_json::Value>(json_str)
+                            .ok()
+                            .and_then(|v| v.as_array().and_then(|a| a.get(idx).map(|e| e.to_string())))
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::JsonArrayContains => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "JSON_ARRAY_CONTAINS requires 2 arguments".into(),
+                ));
+            }
+            let json_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("JSON_ARRAY_CONTAINS requires string JSON".into()))?;
+            let value_arr = &evaluated_args[1];
+
+            let result: BooleanArray = (0..json_arr.len())
+                .map(|i| {
+                    if json_arr.is_null(i) {
+                        None
+                    } else {
+                        let json_str = json_arr.value(i);
+                        let search_value = get_scalar_value(value_arr, i);
+                        Some(json_array_contains_impl(json_str, &search_value))
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::IsJsonScalar => {
+            let json_arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("IS_JSON_SCALAR requires 1 argument".into()))?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("IS_JSON_SCALAR requires string JSON".into()))?;
+
+            let result: BooleanArray = json_arr
+                .iter()
+                .map(|opt| {
+                    opt.map(|json_str| {
+                        serde_json::from_str::<serde_json::Value>(json_str)
+                            .ok()
+                            .map(|v| !v.is_array() && !v.is_object())
+                            .unwrap_or(false)
+                    })
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::JsonFormat => {
+            let json_arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("JSON_FORMAT requires 1 argument".into()))?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("JSON_FORMAT requires string JSON".into()))?;
+
+            let result: StringArray = json_arr
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|json_str| {
+                        serde_json::from_str::<serde_json::Value>(json_str)
+                            .ok()
+                            .map(|v| serde_json::to_string_pretty(&v).unwrap_or_else(|_| json_str.to_string()))
+                    })
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::JsonParse => {
+            // JSON_PARSE validates and returns the JSON string
+            let str_arr = evaluated_args
+                .first()
+                .ok_or_else(|| QueryError::InvalidArgument("JSON_PARSE requires 1 argument".into()))?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("JSON_PARSE requires string argument".into()))?;
+
+            let result: StringArray = str_arr
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|s| {
+                        serde_json::from_str::<serde_json::Value>(s)
+                            .ok()
+                            .map(|_| s.to_string())
+                    })
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::JsonQuery => {
+            // JSON_QUERY is similar to JSON_EXTRACT but returns NULL for scalar values
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "JSON_QUERY requires 2 arguments".into(),
+                ));
+            }
+            let json_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("JSON_QUERY requires string JSON".into()))?;
+            let path_arr = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("JSON_QUERY requires string path".into()))?;
+
+            let result: StringArray = (0..json_arr.len())
+                .map(|i| {
+                    if json_arr.is_null(i) || path_arr.is_null(i) {
+                        None
+                    } else {
+                        let json_str = json_arr.value(i);
+                        let path = path_arr.value(i);
+                        json_query_impl(json_str, path)
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::JsonValue => {
+            // JSON_VALUE returns a scalar value as a string, NULL for objects/arrays
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "JSON_VALUE requires 2 arguments".into(),
+                ));
+            }
+            let json_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("JSON_VALUE requires string JSON".into()))?;
+            let path_arr = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("JSON_VALUE requires string path".into()))?;
+
+            let result: StringArray = (0..json_arr.len())
+                .map(|i| {
+                    if json_arr.is_null(i) || path_arr.is_null(i) {
+                        None
+                    } else {
+                        let json_str = json_arr.value(i);
+                        let path = path_arr.value(i);
+                        json_value_impl(json_str, path)
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::JsonExists => {
+            if evaluated_args.len() != 2 {
+                return Err(QueryError::InvalidArgument(
+                    "JSON_EXISTS requires 2 arguments".into(),
+                ));
+            }
+            let json_arr = evaluated_args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("JSON_EXISTS requires string JSON".into()))?;
+            let path_arr = evaluated_args[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QueryError::Type("JSON_EXISTS requires string path".into()))?;
+
+            let result: BooleanArray = (0..json_arr.len())
+                .map(|i| {
+                    if json_arr.is_null(i) || path_arr.is_null(i) {
+                        None
+                    } else {
+                        let json_str = json_arr.value(i);
+                        let path = path_arr.value(i);
+                        Some(json_exists_impl(json_str, path))
+                    }
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::JsonObject => {
+            // Creates a JSON object from key-value pairs
+            // JSON_OBJECT('key1', value1, 'key2', value2, ...)
+            if evaluated_args.is_empty() || evaluated_args.len() % 2 != 0 {
+                return Err(QueryError::InvalidArgument(
+                    "JSON_OBJECT requires an even number of arguments".into(),
+                ));
+            }
+            let num_rows = evaluated_args[0].len();
+            let result: StringArray = (0..num_rows)
+                .map(|i| {
+                    let mut obj = serde_json::Map::new();
+                    for pair in evaluated_args.chunks(2) {
+                        let key = get_string_value(&pair[0], i).unwrap_or_default();
+                        let value = get_json_value(&pair[1], i);
+                        obj.insert(key, value);
+                    }
+                    Some(serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or_default())
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
+        ScalarFunction::JsonArray => {
+            // Creates a JSON array from values
+            if evaluated_args.is_empty() {
+                let num_rows = batch.num_rows();
+                let result: StringArray = (0..num_rows).map(|_| Some("[]".to_string())).collect();
+                return Ok(Arc::new(result));
+            }
+            let num_rows = evaluated_args[0].len();
+            let result: StringArray = (0..num_rows)
+                .map(|i| {
+                    let arr: Vec<serde_json::Value> = evaluated_args
+                        .iter()
+                        .map(|arg| get_json_value(arg, i))
+                        .collect();
+                    Some(serde_json::to_string(&serde_json::Value::Array(arr)).unwrap_or_default())
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+
         _ => Err(QueryError::NotImplemented(format!(
             "Scalar function not implemented: {:?}",
             func
@@ -2598,6 +4371,388 @@ fn like_match_recursive(text: &[char], pattern: &[char]) -> bool {
 }
 
 use chrono::Datelike;
+
+/// Compute Levenshtein edit distance between two strings
+fn levenshtein_distance(s1: &str, s2: &str) -> usize {
+    let s1_chars: Vec<char> = s1.chars().collect();
+    let s2_chars: Vec<char> = s2.chars().collect();
+    let m = s1_chars.len();
+    let n = s2_chars.len();
+
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
+
+    let mut prev = (0..=n).collect::<Vec<_>>();
+    let mut curr = vec![0; n + 1];
+
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if s1_chars[i - 1] == s2_chars[j - 1] {
+                0
+            } else {
+                1
+            };
+            curr[j] = (prev[j] + 1)
+                .min(curr[j - 1] + 1)
+                .min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
+}
+
+/// Compute Soundex code for a string
+fn soundex(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+
+    let s = s.to_uppercase();
+    let mut result = String::new();
+    let mut prev_code = '0';
+
+    for (i, c) in s.chars().enumerate() {
+        if i == 0 {
+            result.push(c);
+            prev_code = soundex_code(c);
+            continue;
+        }
+
+        let code = soundex_code(c);
+        if code != '0' && code != prev_code {
+            result.push(code);
+            if result.len() >= 4 {
+                break;
+            }
+        }
+        if code != '0' {
+            prev_code = code;
+        }
+    }
+
+    while result.len() < 4 {
+        result.push('0');
+    }
+    result
+}
+
+fn soundex_code(c: char) -> char {
+    match c {
+        'B' | 'F' | 'P' | 'V' => '1',
+        'C' | 'G' | 'J' | 'K' | 'Q' | 'S' | 'X' | 'Z' => '2',
+        'D' | 'T' => '3',
+        'L' => '4',
+        'M' | 'N' => '5',
+        'R' => '6',
+        _ => '0',
+    }
+}
+
+/// Validate a number using the Luhn algorithm
+fn luhn_check(s: &str) -> bool {
+    let digits: Vec<u32> = s
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .map(|c| c.to_digit(10).unwrap())
+        .collect();
+
+    if digits.is_empty() {
+        return false;
+    }
+
+    let mut sum = 0;
+    for (i, &d) in digits.iter().rev().enumerate() {
+        if i % 2 == 1 {
+            let doubled = d * 2;
+            sum += if doubled > 9 { doubled - 9 } else { doubled };
+        } else {
+            sum += d;
+        }
+    }
+    sum % 10 == 0
+}
+
+// ========== JSON HELPER FUNCTIONS ==========
+
+/// Navigate a JSON path and return the extracted value as a JSON string
+fn json_extract_impl(json_str: &str, path: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let result = navigate_json_path(&value, path)?;
+    Some(result.to_string())
+}
+
+/// Navigate a JSON path and return a scalar value as a string (no quotes)
+fn json_extract_scalar_impl(json_str: &str, path: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let result = navigate_json_path(&value, path)?;
+    match result {
+        serde_json::Value::Null => Some("null".to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::String(s) => Some(s.clone()),
+        _ => None, // Return None for objects and arrays
+    }
+}
+
+/// Get the size of a JSON value at the given path
+fn json_size_impl(json_str: &str, path: &str) -> Option<i64> {
+    let value: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let result = navigate_json_path(&value, path)?;
+    match result {
+        serde_json::Value::Array(a) => Some(a.len() as i64),
+        serde_json::Value::Object(o) => Some(o.len() as i64),
+        serde_json::Value::String(s) => Some(s.len() as i64),
+        _ => Some(0),
+    }
+}
+
+/// Check if a JSON array contains a value
+fn json_array_contains_impl(json_str: &str, search_value: &ScalarValue) -> bool {
+    let value: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let arr = match value.as_array() {
+        Some(a) => a,
+        None => return false,
+    };
+    let search_json = scalar_to_json_value(search_value);
+    arr.iter().any(|v| json_values_equal(v, &search_json))
+}
+
+/// JSON_QUERY returns the extracted value only if it's an object or array
+fn json_query_impl(json_str: &str, path: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let result = navigate_json_path(&value, path)?;
+    match result {
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => Some(result.to_string()),
+        _ => None,
+    }
+}
+
+/// JSON_VALUE returns the scalar value at the path as a string
+fn json_value_impl(json_str: &str, path: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let result = navigate_json_path(&value, path)?;
+    match result {
+        serde_json::Value::Null => Some("null".to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::String(s) => Some(s.clone()),
+        _ => None, // Return None for objects and arrays
+    }
+}
+
+/// Check if a path exists in the JSON
+fn json_exists_impl(json_str: &str, path: &str) -> bool {
+    let value: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    navigate_json_path(&value, path).is_some()
+}
+
+/// Navigate a JSON path like "$.key[0].nested"
+fn navigate_json_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let path = path.trim();
+
+    // Handle root reference
+    if path == "$" || path.is_empty() {
+        return Some(value);
+    }
+
+    // Remove leading $. if present
+    let path = if path.starts_with("$.") {
+        &path[2..]
+    } else if path.starts_with("$") {
+        &path[1..]
+    } else {
+        path
+    };
+
+    let mut current = value;
+
+    for part in split_json_path(path) {
+        match part {
+            JsonPathPart::Key(key) => {
+                current = current.get(&key)?;
+            }
+            JsonPathPart::Index(idx) => {
+                current = current.get(idx)?;
+            }
+        }
+    }
+
+    Some(current)
+}
+
+enum JsonPathPart {
+    Key(String),
+    Index(usize),
+}
+
+fn split_json_path(path: &str) -> Vec<JsonPathPart> {
+    let mut parts = Vec::new();
+    let mut current_key = String::new();
+    let mut chars = path.chars().peekable();
+    let mut in_bracket = false;
+    let mut bracket_content = String::new();
+
+    while let Some(c) = chars.next() {
+        if in_bracket {
+            if c == ']' {
+                in_bracket = false;
+                let content = bracket_content.trim_matches(|c| c == '\'' || c == '"');
+                if let Ok(idx) = content.parse::<usize>() {
+                    parts.push(JsonPathPart::Index(idx));
+                } else {
+                    parts.push(JsonPathPart::Key(content.to_string()));
+                }
+                bracket_content.clear();
+            } else {
+                bracket_content.push(c);
+            }
+        } else {
+            match c {
+                '.' => {
+                    if !current_key.is_empty() {
+                        parts.push(JsonPathPart::Key(current_key.clone()));
+                        current_key.clear();
+                    }
+                }
+                '[' => {
+                    if !current_key.is_empty() {
+                        parts.push(JsonPathPart::Key(current_key.clone()));
+                        current_key.clear();
+                    }
+                    in_bracket = true;
+                }
+                _ => {
+                    current_key.push(c);
+                }
+            }
+        }
+    }
+
+    if !current_key.is_empty() {
+        parts.push(JsonPathPart::Key(current_key));
+    }
+
+    parts
+}
+
+/// Convert a ScalarValue to a serde_json Value
+fn scalar_to_json_value(scalar: &ScalarValue) -> serde_json::Value {
+    match scalar {
+        ScalarValue::Null => serde_json::Value::Null,
+        ScalarValue::Boolean(b) => serde_json::Value::Bool(*b),
+        ScalarValue::Int8(i) => serde_json::json!(*i),
+        ScalarValue::Int16(i) => serde_json::json!(*i),
+        ScalarValue::Int32(i) => serde_json::json!(*i),
+        ScalarValue::Int64(i) => serde_json::json!(*i),
+        ScalarValue::UInt8(i) => serde_json::json!(*i),
+        ScalarValue::UInt16(i) => serde_json::json!(*i),
+        ScalarValue::UInt32(i) => serde_json::json!(*i),
+        ScalarValue::UInt64(i) => serde_json::json!(*i),
+        ScalarValue::Float32(f) => serde_json::json!(f.0),
+        ScalarValue::Float64(f) => serde_json::json!(f.0),
+        ScalarValue::Utf8(s) => serde_json::Value::String(s.clone()),
+        _ => serde_json::Value::Null,
+    }
+}
+
+/// Compare two JSON values for equality
+fn json_values_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    match (a, b) {
+        (serde_json::Value::Null, serde_json::Value::Null) => true,
+        (serde_json::Value::Bool(a), serde_json::Value::Bool(b)) => a == b,
+        (serde_json::Value::Number(a), serde_json::Value::Number(b)) => {
+            // Compare as f64 for flexibility
+            a.as_f64() == b.as_f64()
+        }
+        (serde_json::Value::String(a), serde_json::Value::String(b)) => a == b,
+        // Also handle comparing string to number
+        (serde_json::Value::String(a), serde_json::Value::Number(b)) => {
+            a.parse::<f64>().ok() == b.as_f64()
+        }
+        (serde_json::Value::Number(a), serde_json::Value::String(b)) => {
+            a.as_f64() == b.parse::<f64>().ok()
+        }
+        _ => false,
+    }
+}
+
+/// Get a JSON value from an array at a given row index
+fn get_json_value(arr: &ArrayRef, row: usize) -> serde_json::Value {
+    if arr.is_null(row) {
+        return serde_json::Value::Null;
+    }
+
+    if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
+        return serde_json::Value::String(str_arr.value(row).to_string());
+    }
+    if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
+        return serde_json::json!(int_arr.value(row));
+    }
+    if let Some(int_arr) = arr.as_any().downcast_ref::<Int32Array>() {
+        return serde_json::json!(int_arr.value(row));
+    }
+    if let Some(float_arr) = arr.as_any().downcast_ref::<arrow::array::Float64Array>() {
+        return serde_json::json!(float_arr.value(row));
+    }
+    if let Some(bool_arr) = arr.as_any().downcast_ref::<BooleanArray>() {
+        return serde_json::Value::Bool(bool_arr.value(row));
+    }
+
+    serde_json::Value::Null
+}
+
+/// Get a string value from an array at a given row index
+fn get_string_value(arr: &ArrayRef, row: usize) -> Option<String> {
+    if arr.is_null(row) {
+        return None;
+    }
+    if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
+        return Some(str_arr.value(row).to_string());
+    }
+    if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
+        return Some(int_arr.value(row).to_string());
+    }
+    if let Some(int_arr) = arr.as_any().downcast_ref::<Int32Array>() {
+        return Some(int_arr.value(row).to_string());
+    }
+    None
+}
+
+/// Get a scalar value from an array at a given row index
+fn get_scalar_value(arr: &ArrayRef, row: usize) -> ScalarValue {
+    if arr.is_null(row) {
+        return ScalarValue::Null;
+    }
+
+    if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
+        return ScalarValue::Utf8(str_arr.value(row).to_string());
+    }
+    if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
+        return ScalarValue::Int64(int_arr.value(row));
+    }
+    if let Some(int_arr) = arr.as_any().downcast_ref::<Int32Array>() {
+        return ScalarValue::Int32(int_arr.value(row));
+    }
+    if let Some(float_arr) = arr.as_any().downcast_ref::<arrow::array::Float64Array>() {
+        return ScalarValue::Float64(ordered_float::OrderedFloat(float_arr.value(row)));
+    }
+    if let Some(bool_arr) = arr.as_any().downcast_ref::<BooleanArray>() {
+        return ScalarValue::Boolean(bool_arr.value(row));
+    }
+
+    ScalarValue::Null
+}
 
 #[cfg(test)]
 mod tests {

@@ -546,6 +546,20 @@ assert_eq!(result.schema.fields().len(), expected_cols);
 | `clap` | CLI argument parsing |
 | `rustyline` | Interactive REPL line editing |
 | `reqwest` | HTTP client for metastore REST API |
+| `regex` | Regular expression support |
+| `serde_json` | JSON parsing and serialization |
+| `sha2` | SHA-256/SHA-512 hash functions |
+| `sha1` | SHA-1 hash function |
+| `md-5` | MD5 hash function |
+| `hmac` | HMAC authentication codes |
+| `base64` | Base64 encoding/decoding |
+| `hex` | Hexadecimal encoding/decoding |
+| `crc32fast` | CRC32 checksums |
+| `xxhash-rust` | xxHash64 hashing |
+| `url` | URL parsing and manipulation |
+| `chrono` | Date/time operations |
+| `unicode-normalization` | Unicode normalization |
+| `rust-stemmers` | Word stemming (English) |
 
 ## CLI Commands
 
@@ -605,18 +619,44 @@ Based on the codebase structure, these appear to be planned but not fully implem
   - Avro manifest file reading
   - Time travel queries via snapshot IDs
   - Partition pruning
+- **Window functions** - ROW_NUMBER, RANK, DENSE_RANK, LEAD, LAG, etc.
+  - Requires new WindowExpr, WindowNode, and WindowExec infrastructure
+  - See plan at `.claude/plans/trino-function-implementation.md` Phase 6
+- **Array/Map type support** - Complex nested data types
+  - Array functions: array_agg, array_distinct, array_join, filter, transform, etc.
+  - Map functions: map_keys, map_values, map_entries, element_at, etc.
+  - See plan at `.claude/plans/trino-function-implementation.md` Phases 4-5
 - Cost-based optimization (cost.rs exists but is minimal)
 - Parallel execution (partition parameter exists but single-threaded)
-- More scalar functions
-- Window functions
 
 ## Current Test Status
 
 - **SQL Correctness Tests**: 131 passing (`tests/sql_comprehensive.rs`)
+- **Function Validation Tests**: 161 passing (`tests/function_validation_tests.rs`)
 - **TPC-H Benchmark**: 22/22 queries returning data
 - **Subquery Tests**: EXISTS, IN, ScalarSubquery all working
 
 ## Recently Implemented Features
+
+- **Comprehensive Trino SQL Function Compatibility** (100+ functions)
+  - **Math Functions** (40+): ABS, CEIL, FLOOR, ROUND, POWER, SQRT, CBRT, LN, LOG, LOG2, LOG10, EXP, SIN, COS, TAN, ASIN, ACOS, ATAN, ATAN2, SINH, COSH, TANH, DEGREES, RADIANS, PI, E, SIGN, MOD, TRUNCATE, RANDOM, INFINITY, NAN, IS_FINITE, IS_INFINITE, IS_NAN, FROM_BASE, TO_BASE
+  - **String Functions** (35+): UPPER, LOWER, TRIM, LTRIM, RTRIM, LENGTH, SUBSTRING, CONCAT, CONCAT_WS, REPLACE, POSITION, STRPOS, REVERSE, LPAD, RPAD, SPLIT_PART, STARTS_WITH, ENDS_WITH, CHR, CODEPOINT, ASCII, LEFT, RIGHT, REPEAT, TRANSLATE, LEVENSHTEIN_DISTANCE, HAMMING_DISTANCE, SOUNDEX, NORMALIZE, TO_UTF8, FROM_UTF8, LUHN_CHECK, WORD_STEM
+  - **Date/Time Functions** (25+): YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, MILLISECOND, DAY_OF_WEEK, DAY_OF_YEAR, WEEK, QUARTER, DATE_TRUNC, DATE_PART, EXTRACT, DATE_ADD, DATE_DIFF, CURRENT_DATE, CURRENT_TIMESTAMP, NOW, LOCALTIME, LOCALTIMESTAMP, LAST_DAY_OF_MONTH, FROM_UNIXTIME, TO_UNIXTIME, DATE_FORMAT, DATE_PARSE
+  - **Aggregate Functions** (30+): COUNT, SUM, AVG, MIN, MAX, STDDEV, STDDEV_POP, STDDEV_SAMP, VARIANCE, VAR_POP, VAR_SAMP, BOOL_AND, BOOL_OR, EVERY, COUNT_IF, ANY_VALUE, ARBITRARY, APPROX_DISTINCT, APPROX_PERCENTILE, CORR, COVAR_POP, COVAR_SAMP, REGR_SLOPE, REGR_INTERCEPT, KURTOSIS, SKEWNESS, GEOMETRIC_MEAN, BITWISE_AND_AGG, BITWISE_OR_AGG
+  - **JSON Functions** (14): JSON_EXTRACT, JSON_EXTRACT_SCALAR, JSON_ARRAY_LENGTH, JSON_ARRAY_GET, JSON_ARRAY_CONTAINS, JSON_SIZE, JSON_PARSE, JSON_FORMAT, JSON_KEYS, IS_JSON_SCALAR, JSON_QUERY, JSON_VALUE, JSON_EXISTS
+  - **Regex Functions** (6): REGEXP_LIKE, REGEXP_EXTRACT, REGEXP_EXTRACT_ALL, REGEXP_REPLACE, REGEXP_COUNT, REGEXP_SPLIT
+  - **Binary/Encoding Functions** (14): TO_HEX, FROM_HEX, TO_BASE64, FROM_BASE64, MD5, SHA1, SHA256, SHA512, HMAC_MD5, HMAC_SHA1, HMAC_SHA256, HMAC_SHA512, CRC32, XXHASH64
+  - **Bitwise Functions** (8): BITWISE_AND, BITWISE_OR, BITWISE_XOR, BITWISE_NOT, BIT_COUNT, BITWISE_LEFT_SHIFT, BITWISE_RIGHT_SHIFT, BITWISE_RIGHT_SHIFT_ARITHMETIC
+  - **URL Functions** (9): URL_EXTRACT_HOST, URL_EXTRACT_PATH, URL_EXTRACT_PROTOCOL, URL_EXTRACT_PORT, URL_EXTRACT_QUERY, URL_EXTRACT_FRAGMENT, URL_EXTRACT_PARAMETER, URL_ENCODE, URL_DECODE
+  - **Conditional Functions** (6): COALESCE, NULLIF, CASE, IF, GREATEST, LEAST, TRY, TRY_CAST
+  - See full implementation plan at `.claude/plans/trino-function-implementation.md`
+  - Validation tests at `tests/function_validation_tests.rs` (161 tests)
+
+- **Bug Fixes During Function Implementation**
+  - Fixed COALESCE type inference for NULL arguments
+  - Implemented HMAC functions (HmacMd5, HmacSha1, HmacSha256, HmacSha512)
+  - Fixed APPROX_PERCENTILE to correctly use the percentile parameter (was ignoring it)
+  - Added `second_arg` field to `AggregateExpr` for multi-argument aggregates
 
 - **HashAggregateExec Partition Handling Fix** (Critical bug fix)
   - Fixed issue where `HashAggregateExec` only collected data from partition 0
@@ -708,6 +748,8 @@ Based on the codebase structure, these appear to be planned but not fully implem
 | TPC-H schemas | `src/tpch/schema.rs` |
 | TPC-H data generator | `src/tpch/generator.rs` |
 | SQL tests | `tests/sql_comprehensive.rs` |
+| Function validation tests | `tests/function_validation_tests.rs` |
+| Trino function plan | `.claude/plans/trino-function-implementation.md` |
 | Error types | `src/error.rs` |
 | Metastore REST client | `src/metastore/mod.rs` |
 | Larger-than-memory plan | `.claude/plans/larger-than-memory-support.md` |

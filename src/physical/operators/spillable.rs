@@ -392,6 +392,8 @@ pub struct AggregateExpr {
     pub func: crate::planner::AggregateFunction,
     pub input: Expr,
     pub distinct: bool,
+    /// Optional second argument for functions like APPROX_PERCENTILE
+    pub second_arg: Option<Expr>,
 }
 
 impl fmt::Debug for SpillableHashAggregateExec {
@@ -448,6 +450,7 @@ impl PhysicalOperator for SpillableHashAggregateExec {
                     func: a.func,
                     input: a.input.clone(),
                     distinct: a.distinct,
+                    second_arg: a.second_arg.clone(),
                 })
                 .collect::<Vec<_>>(),
             &self.schema,

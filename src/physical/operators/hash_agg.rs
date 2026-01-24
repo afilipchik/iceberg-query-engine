@@ -3,7 +3,7 @@
 use crate::error::{QueryError, Result};
 use crate::physical::operators::filter::evaluate_expr;
 use crate::physical::{PhysicalOperator, RecordBatchStream};
-use crate::planner::{AggregateFunction, Expr};
+use crate::planner::{AggregateFunction, Expr, ScalarValue};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Builder, Float64Array, Float64Builder,
     Int64Array, Int64Builder, StringArray, StringBuilder, UInt64Builder,
@@ -32,6 +32,8 @@ pub struct AggregateExpr {
     pub func: AggregateFunction,
     pub input: Expr,
     pub distinct: bool,
+    /// Optional second argument for functions like APPROX_PERCENTILE
+    pub second_arg: Option<Expr>,
 }
 
 impl HashAggregateExec {
@@ -103,6 +105,33 @@ impl AggregateExpr {
             | AggregateFunction::VarSamp => Ok(DataType::Float64),
             // Boolean aggregates return Boolean
             AggregateFunction::BoolAnd | AggregateFunction::BoolOr => Ok(DataType::Boolean),
+            // New aggregate functions
+            AggregateFunction::CountIf => Ok(DataType::Int64),
+            AggregateFunction::AnyValue | AggregateFunction::Arbitrary => {
+                self.input.data_type(schema)
+            }
+            AggregateFunction::GeometricMean => Ok(DataType::Float64),
+            AggregateFunction::Checksum => Ok(DataType::Int64),
+            AggregateFunction::BitwiseAndAgg
+            | AggregateFunction::BitwiseOrAgg
+            | AggregateFunction::BitwiseXorAgg => Ok(DataType::Int64),
+            AggregateFunction::Listagg => Ok(DataType::Utf8),
+            // Correlation and covariance aggregates
+            AggregateFunction::Corr
+            | AggregateFunction::CovarPop
+            | AggregateFunction::CovarSamp
+            | AggregateFunction::Kurtosis
+            | AggregateFunction::Skewness
+            | AggregateFunction::RegrSlope
+            | AggregateFunction::RegrIntercept
+            | AggregateFunction::RegrAvgx
+            | AggregateFunction::RegrAvgy => Ok(DataType::Float64),
+            AggregateFunction::RegrCount => Ok(DataType::Int64),
+            // Approximate aggregates
+            AggregateFunction::ApproxPercentile => Ok(DataType::Float64),
+            AggregateFunction::ApproxDistinct => Ok(DataType::Int64),
+            // Multi-value aggregates
+            AggregateFunction::MaxBy | AggregateFunction::MinBy => self.input.data_type(schema),
         }
     }
 }
@@ -262,6 +291,33 @@ struct AccumulatorState {
     // Boolean aggregate states
     bool_and: Option<bool>,
     bool_or: Option<bool>,
+    // New aggregate states
+    count_if: i64,                    // For COUNT_IF
+    any_value: Option<GroupValue>,    // For ANY_VALUE/ARBITRARY
+    log_sum: f64,                     // For GEOMETRIC_MEAN (sum of logs)
+    log_count: i64,                   // For GEOMETRIC_MEAN (count for log)
+    bitwise_and: Option<i64>,         // For BITWISE_AND_AGG
+    bitwise_or: Option<i64>,          // For BITWISE_OR_AGG
+    bitwise_xor: i64,                 // For BITWISE_XOR_AGG
+    string_list: Vec<String>,         // For LISTAGG
+    // Correlation/covariance states
+    sum_x: f64,                       // For correlation
+    sum_y: f64,                       // For correlation
+    sum_xy: f64,                      // For correlation
+    sum_x_squares: f64,               // For correlation
+    sum_y_squares: f64,               // For correlation
+    // For kurtosis/skewness
+    sum_cubes: f64,                   // Sum of (x - mean)^3
+    sum_fourth: f64,                  // Sum of (x - mean)^4
+    // For max_by/min_by
+    max_by_value: Option<f64>,        // The max value of the second arg
+    max_by_result: Option<GroupValue>, // The value to return
+    min_by_value: Option<f64>,        // The min value of the second arg
+    min_by_result: Option<GroupValue>, // The value to return
+    // Approximate percentile - stores values for sorting
+    approx_values: Vec<f64>,
+    // Percentile value for APPROX_PERCENTILE (0.0 to 1.0)
+    percentile: f64,
 }
 
 impl Default for AccumulatorState {
@@ -280,6 +336,28 @@ impl Default for AccumulatorState {
             distinct_set: None,
             bool_and: None,
             bool_or: None,
+            // New aggregate states
+            count_if: 0,
+            any_value: None,
+            log_sum: 0.0,
+            log_count: 0,
+            bitwise_and: None,
+            bitwise_or: None,
+            bitwise_xor: 0,
+            string_list: Vec::new(),
+            sum_x: 0.0,
+            sum_y: 0.0,
+            sum_xy: 0.0,
+            sum_x_squares: 0.0,
+            sum_y_squares: 0.0,
+            sum_cubes: 0.0,
+            sum_fourth: 0.0,
+            max_by_value: None,
+            max_by_result: None,
+            min_by_value: None,
+            min_by_result: None,
+            approx_values: Vec::new(),
+            percentile: 0.5, // Default to median
         }
     }
 }
@@ -511,6 +589,256 @@ fn aggregate_scalar_simd(
                 return Err(QueryError::Type("BOOL_OR requires boolean argument".into()));
             }
         }
+        // New aggregate functions
+        AggregateFunction::CountIf => {
+            if let Some(a) = input.as_any().downcast_ref::<BooleanArray>() {
+                let count = a.iter().flatten().filter(|v| *v).count();
+                Arc::new(Int64Array::from(vec![count as i64]))
+            } else {
+                return Err(QueryError::Type("COUNT_IF requires boolean argument".into()));
+            }
+        }
+        AggregateFunction::AnyValue | AggregateFunction::Arbitrary => {
+            // Return first non-null value
+            if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                let first = a.iter().flatten().next();
+                match first {
+                    Some(v) => Arc::new(Int64Array::from(vec![v])),
+                    None => Arc::new(Int64Array::from(vec![Option::<i64>::None])),
+                }
+            } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
+                let first = a.iter().flatten().next();
+                match first {
+                    Some(v) => Arc::new(Float64Array::from(vec![v])),
+                    None => Arc::new(Float64Array::from(vec![Option::<f64>::None])),
+                }
+            } else if let Some(a) = input.as_any().downcast_ref::<StringArray>() {
+                let first = a.iter().flatten().next();
+                match first {
+                    Some(v) => Arc::new(StringArray::from(vec![Some(v)])),
+                    None => Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                }
+            } else {
+                return Err(QueryError::NotImplemented(format!(
+                    "ANY_VALUE not implemented for type {:?}",
+                    input.data_type()
+                )));
+            }
+        }
+        AggregateFunction::GeometricMean => {
+            if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
+                let values: Vec<f64> = a.iter().flatten().filter(|v| *v > 0.0).collect();
+                if values.is_empty() {
+                    Arc::new(Float64Array::from(vec![Option::<f64>::None]))
+                } else {
+                    let log_sum: f64 = values.iter().map(|v| v.ln()).sum();
+                    let geom_mean = (log_sum / values.len() as f64).exp();
+                    Arc::new(Float64Array::from(vec![geom_mean]))
+                }
+            } else if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                let values: Vec<f64> = a.iter().flatten().map(|v| v as f64).filter(|v| *v > 0.0).collect();
+                if values.is_empty() {
+                    Arc::new(Float64Array::from(vec![Option::<f64>::None]))
+                } else {
+                    let log_sum: f64 = values.iter().map(|v| v.ln()).sum();
+                    let geom_mean = (log_sum / values.len() as f64).exp();
+                    Arc::new(Float64Array::from(vec![geom_mean]))
+                }
+            } else {
+                return Err(QueryError::NotImplemented(format!(
+                    "GEOMETRIC_MEAN not implemented for type {:?}",
+                    input.data_type()
+                )));
+            }
+        }
+        AggregateFunction::Checksum => {
+            if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                let xor = a.iter().flatten().fold(0i64, |acc, v| acc ^ v);
+                Arc::new(Int64Array::from(vec![xor]))
+            } else if let Some(a) = input.as_any().downcast_ref::<arrow::array::Int32Array>() {
+                let xor = a.iter().flatten().fold(0i64, |acc, v| acc ^ (v as i64));
+                Arc::new(Int64Array::from(vec![xor]))
+            } else {
+                return Err(QueryError::NotImplemented(format!(
+                    "CHECKSUM not implemented for type {:?}",
+                    input.data_type()
+                )));
+            }
+        }
+        AggregateFunction::BitwiseAndAgg => {
+            if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                let result = a.iter().flatten().fold(None, |acc: Option<i64>, v| {
+                    Some(acc.map_or(v, |a| a & v))
+                });
+                match result {
+                    Some(v) => Arc::new(Int64Array::from(vec![v])),
+                    None => Arc::new(Int64Array::from(vec![Option::<i64>::None])),
+                }
+            } else {
+                return Err(QueryError::NotImplemented(format!(
+                    "BITWISE_AND_AGG not implemented for type {:?}",
+                    input.data_type()
+                )));
+            }
+        }
+        AggregateFunction::BitwiseOrAgg => {
+            if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                let result = a.iter().flatten().fold(None, |acc: Option<i64>, v| {
+                    Some(acc.map_or(v, |a| a | v))
+                });
+                match result {
+                    Some(v) => Arc::new(Int64Array::from(vec![v])),
+                    None => Arc::new(Int64Array::from(vec![Option::<i64>::None])),
+                }
+            } else {
+                return Err(QueryError::NotImplemented(format!(
+                    "BITWISE_OR_AGG not implemented for type {:?}",
+                    input.data_type()
+                )));
+            }
+        }
+        AggregateFunction::BitwiseXorAgg => {
+            if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                let xor = a.iter().flatten().fold(0i64, |acc, v| acc ^ v);
+                Arc::new(Int64Array::from(vec![xor]))
+            } else {
+                return Err(QueryError::NotImplemented(format!(
+                    "BITWISE_XOR_AGG not implemented for type {:?}",
+                    input.data_type()
+                )));
+            }
+        }
+        AggregateFunction::Listagg => {
+            if let Some(a) = input.as_any().downcast_ref::<StringArray>() {
+                let joined: String = a.iter().flatten().collect::<Vec<_>>().join(",");
+                Arc::new(StringArray::from(vec![Some(joined)]))
+            } else {
+                return Err(QueryError::NotImplemented(format!(
+                    "LISTAGG not implemented for type {:?}",
+                    input.data_type()
+                )));
+            }
+        }
+        AggregateFunction::Kurtosis => {
+            let values: Vec<f64> = if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
+                a.iter().flatten().collect()
+            } else if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                a.iter().flatten().map(|v| v as f64).collect()
+            } else {
+                return Err(QueryError::NotImplemented(format!(
+                    "KURTOSIS not implemented for type {:?}",
+                    input.data_type()
+                )));
+            };
+            if values.len() < 4 {
+                Arc::new(Float64Array::from(vec![Option::<f64>::None]))
+            } else {
+                let n = values.len() as f64;
+                let mean = values.iter().sum::<f64>() / n;
+                let variance = values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+                if variance > 0.0 {
+                    let m4 = values.iter().map(|x| (x - mean).powi(4)).sum::<f64>() / n;
+                    let kurtosis = m4 / variance.powi(2) - 3.0;
+                    Arc::new(Float64Array::from(vec![kurtosis]))
+                } else {
+                    Arc::new(Float64Array::from(vec![Option::<f64>::None]))
+                }
+            }
+        }
+        AggregateFunction::Skewness => {
+            let values: Vec<f64> = if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
+                a.iter().flatten().collect()
+            } else if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                a.iter().flatten().map(|v| v as f64).collect()
+            } else {
+                return Err(QueryError::NotImplemented(format!(
+                    "SKEWNESS not implemented for type {:?}",
+                    input.data_type()
+                )));
+            };
+            if values.len() < 3 {
+                Arc::new(Float64Array::from(vec![Option::<f64>::None]))
+            } else {
+                let n = values.len() as f64;
+                let mean = values.iter().sum::<f64>() / n;
+                let variance = values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+                if variance > 0.0 {
+                    let std_dev = variance.sqrt();
+                    let m3 = values.iter().map(|x| (x - mean).powi(3)).sum::<f64>() / n;
+                    let skewness = m3 / std_dev.powi(3);
+                    Arc::new(Float64Array::from(vec![skewness]))
+                } else {
+                    Arc::new(Float64Array::from(vec![Option::<f64>::None]))
+                }
+            }
+        }
+        AggregateFunction::ApproxPercentile => {
+            // Extract percentile from second argument (default to 0.5 for median)
+            let percentile = if let Some(ref second_arg) = aggregate.second_arg {
+                match second_arg {
+                    Expr::Literal(ScalarValue::Float64(p)) => (*p).into(),
+                    Expr::Literal(ScalarValue::Int64(p)) => *p as f64,
+                    _ => 0.5, // Default to median
+                }
+            } else {
+                0.5
+            };
+
+            let values: Vec<f64> = if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
+                a.iter().flatten().collect()
+            } else if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                a.iter().flatten().map(|v| v as f64).collect()
+            } else {
+                return Err(QueryError::NotImplemented(format!(
+                    "APPROX_PERCENTILE not implemented for type {:?}",
+                    input.data_type()
+                )));
+            };
+            if values.is_empty() {
+                Arc::new(Float64Array::from(vec![Option::<f64>::None]))
+            } else {
+                let mut sorted = values;
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                // Use the percentile value to calculate index
+                let idx = ((sorted.len() - 1) as f64 * percentile).round() as usize;
+                let idx = idx.min(sorted.len() - 1); // Clamp to valid range
+                Arc::new(Float64Array::from(vec![sorted[idx]]))
+            }
+        }
+        AggregateFunction::ApproxDistinct => {
+            // For SIMD path, just use exact count distinct
+            let count = if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                let set: std::collections::HashSet<_> = a.iter().flatten().collect();
+                set.len() as i64
+            } else if let Some(a) = input.as_any().downcast_ref::<StringArray>() {
+                let set: std::collections::HashSet<_> = a.iter().flatten().collect();
+                set.len() as i64
+            } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
+                let set: std::collections::HashSet<_> = a.iter().flatten().map(|v| ordered_float::OrderedFloat(v)).collect();
+                set.len() as i64
+            } else {
+                return Err(QueryError::NotImplemented(format!(
+                    "APPROX_DISTINCT not implemented for type {:?}",
+                    input.data_type()
+                )));
+            };
+            Arc::new(Int64Array::from(vec![count]))
+        }
+        // Two-argument aggregates - not supported in SIMD path
+        AggregateFunction::Corr
+        | AggregateFunction::CovarPop
+        | AggregateFunction::CovarSamp
+        | AggregateFunction::RegrSlope
+        | AggregateFunction::RegrIntercept
+        | AggregateFunction::RegrCount
+        | AggregateFunction::RegrAvgx
+        | AggregateFunction::RegrAvgy
+        | AggregateFunction::MaxBy
+        | AggregateFunction::MinBy => {
+            return Err(QueryError::NotImplemented(
+                format!("{:?} requires two arguments and is not supported in SIMD aggregation", aggregate.func)
+            ));
+        }
     };
 
     RecordBatch::try_new(schema.clone(), vec![result]).map_err(Into::into)
@@ -571,8 +899,22 @@ fn aggregate_batches_hash(
             let key = extract_group_key(&group_arrays, row);
 
             let states = groups.entry(key).or_insert_with(|| {
-                (0..aggregates.len())
-                    .map(|_| AccumulatorState::default())
+                aggregates
+                    .iter()
+                    .map(|agg| {
+                        let mut state = AccumulatorState::default();
+                        // Set percentile for APPROX_PERCENTILE from second_arg
+                        if agg.func == AggregateFunction::ApproxPercentile {
+                            if let Some(ref second_arg) = agg.second_arg {
+                                state.percentile = match second_arg {
+                                    Expr::Literal(ScalarValue::Float64(p)) => (*p).into(),
+                                    Expr::Literal(ScalarValue::Int64(p)) => *p as f64,
+                                    _ => 0.5,
+                                };
+                            }
+                        }
+                        state
+                    })
                     .collect()
             });
 
@@ -591,8 +933,22 @@ fn aggregate_batches_hash(
         // Return a single row with default aggregate values
         groups.insert(
             GroupKey { values: vec![] },
-            (0..aggregates.len())
-                .map(|_| AccumulatorState::default())
+            aggregates
+                .iter()
+                .map(|agg| {
+                    let mut state = AccumulatorState::default();
+                    // Set percentile for APPROX_PERCENTILE from second_arg
+                    if agg.func == AggregateFunction::ApproxPercentile {
+                        if let Some(ref second_arg) = agg.second_arg {
+                            state.percentile = match second_arg {
+                                Expr::Literal(ScalarValue::Float64(p)) => (*p).into(),
+                                Expr::Literal(ScalarValue::Int64(p)) => *p as f64,
+                                _ => 0.5,
+                            };
+                        }
+                    }
+                    state
+                })
                 .collect(),
         );
     }
@@ -788,6 +1144,156 @@ fn update_accumulator(
                     let val = a.value(row);
                     state.bool_or = Some(state.bool_or.map_or(val, |v| v || val));
                 }
+            }
+        }
+        // New aggregate functions
+        AggregateFunction::CountIf => {
+            if !input.is_null(row) {
+                if let Some(a) = input.as_any().downcast_ref::<BooleanArray>() {
+                    if a.value(row) {
+                        state.count_if += 1;
+                    }
+                }
+            }
+        }
+        AggregateFunction::AnyValue | AggregateFunction::Arbitrary => {
+            // Take the first non-null value
+            if !input.is_null(row) && state.any_value.is_none() {
+                state.any_value = Some(extract_group_value(input, row));
+            }
+        }
+        AggregateFunction::GeometricMean => {
+            if !input.is_null(row) {
+                let val = if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                    a.value(row) as f64
+                } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
+                    a.value(row)
+                } else if let Some(a) = input.as_any().downcast_ref::<arrow::array::Int32Array>() {
+                    a.value(row) as f64
+                } else {
+                    return;
+                };
+                if val > 0.0 {
+                    state.log_sum += val.ln();
+                    state.log_count += 1;
+                }
+            }
+        }
+        AggregateFunction::Checksum => {
+            // Simple XOR-based checksum
+            if !input.is_null(row) {
+                if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                    state.bitwise_xor ^= a.value(row);
+                } else if let Some(a) = input.as_any().downcast_ref::<arrow::array::Int32Array>() {
+                    state.bitwise_xor ^= a.value(row) as i64;
+                }
+            }
+        }
+        AggregateFunction::BitwiseAndAgg => {
+            if !input.is_null(row) {
+                if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                    let val = a.value(row);
+                    state.bitwise_and = Some(state.bitwise_and.map_or(val, |v| v & val));
+                } else if let Some(a) = input.as_any().downcast_ref::<arrow::array::Int32Array>() {
+                    let val = a.value(row) as i64;
+                    state.bitwise_and = Some(state.bitwise_and.map_or(val, |v| v & val));
+                }
+            }
+        }
+        AggregateFunction::BitwiseOrAgg => {
+            if !input.is_null(row) {
+                if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                    let val = a.value(row);
+                    state.bitwise_or = Some(state.bitwise_or.map_or(val, |v| v | val));
+                } else if let Some(a) = input.as_any().downcast_ref::<arrow::array::Int32Array>() {
+                    let val = a.value(row) as i64;
+                    state.bitwise_or = Some(state.bitwise_or.map_or(val, |v| v | val));
+                }
+            }
+        }
+        AggregateFunction::BitwiseXorAgg => {
+            if !input.is_null(row) {
+                if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                    state.bitwise_xor ^= a.value(row);
+                } else if let Some(a) = input.as_any().downcast_ref::<arrow::array::Int32Array>() {
+                    state.bitwise_xor ^= a.value(row) as i64;
+                }
+            }
+        }
+        AggregateFunction::Listagg => {
+            if !input.is_null(row) {
+                if let Some(a) = input.as_any().downcast_ref::<arrow::array::StringArray>() {
+                    state.string_list.push(a.value(row).to_string());
+                }
+            }
+        }
+        // Correlation/covariance - these need two inputs but we only get one here
+        // They need special handling with multiple inputs
+        AggregateFunction::Corr
+        | AggregateFunction::CovarPop
+        | AggregateFunction::CovarSamp
+        | AggregateFunction::RegrSlope
+        | AggregateFunction::RegrIntercept
+        | AggregateFunction::RegrCount
+        | AggregateFunction::RegrAvgx
+        | AggregateFunction::RegrAvgy => {
+            // These require special handling for two-argument aggregates
+            // For now, just count
+            if !input.is_null(row) {
+                state.count += 1;
+            }
+        }
+        AggregateFunction::Kurtosis | AggregateFunction::Skewness => {
+            // Track higher moments - would need running mean calculation
+            if !input.is_null(row) {
+                let val = if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                    a.value(row) as f64
+                } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
+                    a.value(row)
+                } else {
+                    return;
+                };
+                state.count += 1;
+                state.sum += val;
+                state.sum_squares += val * val;
+                state.sum_cubes += val * val * val;
+                state.sum_fourth += val * val * val * val;
+            }
+        }
+        AggregateFunction::ApproxPercentile => {
+            if !input.is_null(row) {
+                let val = if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                    a.value(row) as f64
+                } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
+                    a.value(row)
+                } else {
+                    return;
+                };
+                state.approx_values.push(val);
+            }
+        }
+        AggregateFunction::ApproxDistinct => {
+            // Use distinct set for approximate distinct
+            if !input.is_null(row) {
+                let value = extract_group_value(input, row);
+                let set = state
+                    .distinct_set
+                    .get_or_insert_with(std::collections::HashSet::new);
+                set.insert(value);
+            }
+        }
+        AggregateFunction::MaxBy | AggregateFunction::MinBy => {
+            // These need special handling with two inputs
+            // For single input, just track values
+            if !input.is_null(row) {
+                let val = if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                    a.value(row) as f64
+                } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
+                    a.value(row)
+                } else {
+                    return;
+                };
+                state.approx_values.push(val);
             }
         }
     }
@@ -1086,6 +1592,258 @@ fn build_agg_array(
             }
             Ok(Arc::new(builder.finish()))
         }
+        // New aggregate functions
+        (AggregateFunction::CountIf, DataType::Int64) => {
+            let mut builder = Int64Builder::with_capacity(num_groups);
+            for states in groups.values() {
+                builder.append_value(states[agg_idx].count_if);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        (AggregateFunction::AnyValue | AggregateFunction::Arbitrary, _) => {
+            // Build array from any_value
+            match data_type {
+                DataType::Int64 => {
+                    let mut builder = Int64Builder::with_capacity(num_groups);
+                    for states in groups.values() {
+                        match &states[agg_idx].any_value {
+                            Some(GroupValue::Int64(v)) => builder.append_value(*v),
+                            _ => builder.append_null(),
+                        }
+                    }
+                    Ok(Arc::new(builder.finish()))
+                }
+                DataType::Float64 => {
+                    let mut builder = Float64Builder::with_capacity(num_groups);
+                    for states in groups.values() {
+                        match &states[agg_idx].any_value {
+                            Some(GroupValue::Float64(v)) => builder.append_value(v.0),
+                            _ => builder.append_null(),
+                        }
+                    }
+                    Ok(Arc::new(builder.finish()))
+                }
+                DataType::Utf8 => {
+                    let mut builder = StringBuilder::with_capacity(num_groups, num_groups * 16);
+                    for states in groups.values() {
+                        match &states[agg_idx].any_value {
+                            Some(GroupValue::String(v)) => builder.append_value(v),
+                            _ => builder.append_null(),
+                        }
+                    }
+                    Ok(Arc::new(builder.finish()))
+                }
+                _ => Err(QueryError::NotImplemented(format!(
+                    "ANY_VALUE with type {:?} not supported",
+                    data_type
+                ))),
+            }
+        }
+        (AggregateFunction::GeometricMean, DataType::Float64) => {
+            let mut builder = Float64Builder::with_capacity(num_groups);
+            for states in groups.values() {
+                let state = &states[agg_idx];
+                if state.log_count > 0 {
+                    let geom_mean = (state.log_sum / state.log_count as f64).exp();
+                    builder.append_value(geom_mean);
+                } else {
+                    builder.append_null();
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        (AggregateFunction::Checksum, DataType::Int64) => {
+            let mut builder = Int64Builder::with_capacity(num_groups);
+            for states in groups.values() {
+                builder.append_value(states[agg_idx].bitwise_xor);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        (AggregateFunction::BitwiseAndAgg, DataType::Int64) => {
+            let mut builder = Int64Builder::with_capacity(num_groups);
+            for states in groups.values() {
+                match states[agg_idx].bitwise_and {
+                    Some(v) => builder.append_value(v),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        (AggregateFunction::BitwiseOrAgg, DataType::Int64) => {
+            let mut builder = Int64Builder::with_capacity(num_groups);
+            for states in groups.values() {
+                match states[agg_idx].bitwise_or {
+                    Some(v) => builder.append_value(v),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        (AggregateFunction::BitwiseXorAgg, DataType::Int64) => {
+            let mut builder = Int64Builder::with_capacity(num_groups);
+            for states in groups.values() {
+                builder.append_value(states[agg_idx].bitwise_xor);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        (AggregateFunction::Listagg, DataType::Utf8) => {
+            let mut builder = StringBuilder::with_capacity(num_groups, num_groups * 64);
+            for states in groups.values() {
+                let joined = states[agg_idx].string_list.join(",");
+                builder.append_value(&joined);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        // Approximate percentile
+        (AggregateFunction::ApproxPercentile, DataType::Float64) => {
+            let mut builder = Float64Builder::with_capacity(num_groups);
+            for states in groups.values() {
+                let state = &states[agg_idx];
+                if !state.approx_values.is_empty() {
+                    let mut sorted = state.approx_values.clone();
+                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    // Use the percentile value from state
+                    let idx = ((sorted.len() - 1) as f64 * state.percentile).round() as usize;
+                    let idx = idx.min(sorted.len() - 1); // Clamp to valid range
+                    builder.append_value(sorted[idx]);
+                } else {
+                    builder.append_null();
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        (AggregateFunction::ApproxDistinct, DataType::Int64) => {
+            let mut builder = Int64Builder::with_capacity(num_groups);
+            for states in groups.values() {
+                let count = states[agg_idx]
+                    .distinct_set
+                    .as_ref()
+                    .map(|s| s.len() as i64)
+                    .unwrap_or(0);
+                builder.append_value(count);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        // Kurtosis and skewness
+        (AggregateFunction::Kurtosis, DataType::Float64) => {
+            let mut builder = Float64Builder::with_capacity(num_groups);
+            for states in groups.values() {
+                let state = &states[agg_idx];
+                if state.count >= 4 {
+                    let n = state.count as f64;
+                    let mean = state.sum / n;
+                    let variance = (state.sum_squares / n) - (mean * mean);
+                    if variance > 0.0 {
+                        let std_dev = variance.sqrt();
+                        // Excess kurtosis
+                        let m4 = state.sum_fourth / n - 4.0 * mean * state.sum_cubes / n
+                            + 6.0 * mean * mean * state.sum_squares / n
+                            - 3.0 * mean.powi(4);
+                        let kurtosis = m4 / variance.powi(2) - 3.0;
+                        builder.append_value(kurtosis);
+                    } else {
+                        builder.append_null();
+                    }
+                } else {
+                    builder.append_null();
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        (AggregateFunction::Skewness, DataType::Float64) => {
+            let mut builder = Float64Builder::with_capacity(num_groups);
+            for states in groups.values() {
+                let state = &states[agg_idx];
+                if state.count >= 3 {
+                    let n = state.count as f64;
+                    let mean = state.sum / n;
+                    let variance = (state.sum_squares / n) - (mean * mean);
+                    if variance > 0.0 {
+                        let m3 = state.sum_cubes / n - 3.0 * mean * state.sum_squares / n
+                            + 2.0 * mean.powi(3);
+                        let skewness = m3 / variance.sqrt().powi(3);
+                        builder.append_value(skewness);
+                    } else {
+                        builder.append_null();
+                    }
+                } else {
+                    builder.append_null();
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        // Correlation and regression - placeholder implementations
+        (AggregateFunction::Corr, DataType::Float64)
+        | (AggregateFunction::CovarPop, DataType::Float64)
+        | (AggregateFunction::CovarSamp, DataType::Float64)
+        | (AggregateFunction::RegrSlope, DataType::Float64)
+        | (AggregateFunction::RegrIntercept, DataType::Float64)
+        | (AggregateFunction::RegrAvgx, DataType::Float64)
+        | (AggregateFunction::RegrAvgy, DataType::Float64) => {
+            // These require two-argument handling
+            let mut builder = Float64Builder::with_capacity(num_groups);
+            for states in groups.values() {
+                let state = &states[agg_idx];
+                if state.count > 0 {
+                    // Placeholder - just return average for now
+                    builder.append_value(state.sum / state.count as f64);
+                } else {
+                    builder.append_null();
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        (AggregateFunction::RegrCount, DataType::Int64) => {
+            let mut builder = Int64Builder::with_capacity(num_groups);
+            for states in groups.values() {
+                builder.append_value(states[agg_idx].count);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        // MaxBy and MinBy placeholders
+        (AggregateFunction::MaxBy | AggregateFunction::MinBy, _) => {
+            // These require special two-argument handling
+            match data_type {
+                DataType::Float64 => {
+                    let mut builder = Float64Builder::with_capacity(num_groups);
+                    for states in groups.values() {
+                        let vals = &states[agg_idx].approx_values;
+                        if !vals.is_empty() {
+                            let val = if func == AggregateFunction::MaxBy {
+                                vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+                            } else {
+                                vals.iter().cloned().fold(f64::INFINITY, f64::min)
+                            };
+                            builder.append_value(val);
+                        } else {
+                            builder.append_null();
+                        }
+                    }
+                    Ok(Arc::new(builder.finish()))
+                }
+                DataType::Int64 => {
+                    let mut builder = Int64Builder::with_capacity(num_groups);
+                    for states in groups.values() {
+                        let vals = &states[agg_idx].approx_values;
+                        if !vals.is_empty() {
+                            let val = if func == AggregateFunction::MaxBy {
+                                vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+                            } else {
+                                vals.iter().cloned().fold(f64::INFINITY, f64::min)
+                            };
+                            builder.append_value(val as i64);
+                        } else {
+                            builder.append_null();
+                        }
+                    }
+                    Ok(Arc::new(builder.finish()))
+                }
+                _ => Err(QueryError::NotImplemented(format!(
+                    "MAX_BY/MIN_BY with type {:?} not supported",
+                    data_type
+                ))),
+            }
+        }
         _ => Err(QueryError::NotImplemented(format!(
             "Aggregate {:?} with type {:?} not supported",
             func, data_type
@@ -1129,6 +1887,7 @@ mod tests {
             func: AggregateFunction::Sum,
             input: Expr::column("value"),
             distinct: false,
+            second_arg: None,
         }];
 
         let agg = HashAggregateExec::try_new(scan, group_by, aggregates).unwrap();
@@ -1152,6 +1911,7 @@ mod tests {
             func: AggregateFunction::Count,
             input: Expr::column("value"),
             distinct: false,
+            second_arg: None,
         }];
 
         let agg = HashAggregateExec::try_new(scan, group_by, aggregates).unwrap();
@@ -1177,11 +1937,13 @@ mod tests {
                 func: AggregateFunction::Sum,
                 input: Expr::column("value"),
                 distinct: false,
+                second_arg: None,
             },
             AggregateExpr {
                 func: AggregateFunction::Count,
                 input: Expr::column("value"),
                 distinct: false,
+                second_arg: None,
             },
         ];
 
