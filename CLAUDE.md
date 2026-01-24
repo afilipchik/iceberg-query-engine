@@ -608,6 +608,17 @@ Once in the REPL, the following dot-commands are available:
 | `.schema <table>` | Show schema for a table |
 | `.load <path> <name>` | Load Parquet file/directory as table |
 | `.tpch <path>` | Load all TPC-H tables from directory |
+| `.mode <format>` | Set output format (table, csv, json, vertical) |
+| `.format` | Show current output format |
+
+**Tab Completion**: Press Tab to autocomplete SQL keywords, table names, column names, and dot commands.
+
+**Syntax Highlighting**: SQL input is highlighted with colors:
+- Keywords (SELECT, FROM, WHERE, etc.) → Bold Blue
+- String literals → Green
+- Numbers → Magenta
+- Functions (COUNT, SUM, etc.) → Yellow
+- Dot commands → Cyan
 
 Any other input is executed as a SQL query.
 
@@ -682,11 +693,17 @@ Based on the codebase structure, these appear to be planned but not fully implem
   - 131 SQL correctness tests passing
   - Queries adapted for generated test data patterns
 
-- **Interactive SQL REPL**
+- **Interactive SQL REPL** (Enhanced)
   - `query_engine repl` command for interactive SQL sessions
-  - Readline support with history (saved to `~/.query_engine_history`)
-  - Dot-commands: `.tables`, `.schema`, `.load`, `.tpch`, `.help`, `.quit`
+  - Readline support with persistent history (saved to `~/.query_engine_history`)
+  - **Tab completion** for SQL keywords, table names, column names, and dot commands
+  - **Syntax highlighting** (keywords=blue, strings=green, numbers=magenta, functions=yellow)
+  - **Multiple output formats**: table (default), CSV, JSON, vertical
+  - Dot-commands: `.tables`, `.schema`, `.load`, `.tpch`, `.mode`, `.format`, `.help`, `.quit`
   - Optional `--tpch <path>` flag to preload TPC-H tables
+  - CLI module in `src/cli/` with:
+    - `helper.rs`: ReplHelper with Completer and Highlighter traits
+    - `output.rs`: OutputFormatter supporting Table/CSV/JSON/Vertical formats
 
 - **Parquet file support** (Phase 1 complete)
   - `ParquetTable` provider in `src/storage/parquet.rs`
@@ -748,9 +765,12 @@ Based on the codebase structure, these appear to be planned but not fully implem
 | TPC-H schemas | `src/tpch/schema.rs` |
 | TPC-H data generator | `src/tpch/generator.rs` |
 | SQL tests | `tests/sql_comprehensive.rs` |
+| CLI tests | `tests/cli_tests.rs` |
 | Function validation tests | `tests/function_validation_tests.rs` |
 | Trino function plan | `.claude/plans/trino-function-implementation.md` |
 | Error types | `src/error.rs` |
+| CLI helper (completion/highlighting) | `src/cli/helper.rs` |
+| CLI output formatter | `src/cli/output.rs` |
 | Metastore REST client | `src/metastore/mod.rs` |
 | Larger-than-memory plan | `.claude/plans/larger-than-memory-support.md` |
 | Iceberg implementation plan | `.claude/plans/zazzy-kindling-wigderson.md` |

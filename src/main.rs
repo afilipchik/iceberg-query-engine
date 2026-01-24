@@ -1,11 +1,15 @@
 //! Query Engine CLI
 
+mod cli;
+
 use clap::{Parser, Subcommand};
+use cli::{OutputFormat, OutputFormatter, ReplHelper};
 use query_engine::execution::{print_results, ExecutionContext};
 use query_engine::tpch::{self, TpchGenerator};
 use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustyline::{Config, Editor};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -401,13 +405,29 @@ async fn main() {
     }
 }
 
+/// REPL state for output formatting and other settings
+struct ReplState {
+    formatter: OutputFormatter,
+}
+
+impl ReplState {
+    fn new() -> Self {
+        Self {
+            formatter: OutputFormatter::new(OutputFormat::Table),
+        }
+    }
+}
+
 /// Run the interactive SQL REPL
 async fn run_repl(tpch_path: Option<PathBuf>) {
     println!("Query Engine Interactive SQL Shell");
     println!("Type .help for available commands, or enter SQL queries.");
+    println!("Tab completion and syntax highlighting enabled.");
     println!();
 
     let mut ctx = ExecutionContext::new();
+    let mut state = ReplState::new();
+    let helper = Arc::new(ReplHelper::new());
 
     // Preload TPC-H tables if path provided
     if let Some(path) = tpch_path {
@@ -421,7 +441,9 @@ async fn run_repl(tpch_path: Option<PathBuf>) {
             match ctx.register_parquet(*table, &file_path) {
                 Ok(()) => {
                     if let Some(schema) = ctx.table_schema(table) {
-                        println!("  Loaded {}: {} columns", table, schema.fields().len());
+                        let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+                        println!("  Loaded {}: {} columns", table, columns.len());
+                        helper.register_table(table, columns);
                     }
                 }
                 Err(e) => {
@@ -432,19 +454,40 @@ async fn run_repl(tpch_path: Option<PathBuf>) {
         println!();
     }
 
-    let mut rl = match DefaultEditor::new() {
-        Ok(editor) => editor,
+    // Configure rustyline with history and completion settings
+    let config = Config::builder()
+        .max_history_size(1000)
+        .expect("valid history size")
+        .history_ignore_dups(true)
+        .expect("valid history config")
+        .completion_type(rustyline::CompletionType::List)
+        .build();
+
+    // Create a cloneable helper for the editor
+    let helper_for_editor = (*helper).clone();
+
+    let mut rl = match Editor::with_config(config) {
+        Ok(mut editor) => {
+            editor.set_helper(Some(helper_for_editor));
+            editor
+        }
         Err(e) => {
             eprintln!("Failed to initialize readline: {}", e);
             return;
         }
     };
 
-    // Load history if available
+    // Set up history file path
     let history_path = dirs_next::home_dir()
         .map(|h| h.join(".query_engine_history"))
         .unwrap_or_else(|| PathBuf::from(".query_engine_history"));
-    let _ = rl.load_history(&history_path);
+
+    // Load history if it exists
+    if history_path.exists() {
+        if let Err(e) = rl.load_history(&history_path) {
+            eprintln!("Warning: Could not load history: {}", e);
+        }
+    }
 
     loop {
         let readline = rl.readline("sql> ");
@@ -455,11 +498,12 @@ async fn run_repl(tpch_path: Option<PathBuf>) {
                     continue;
                 }
 
+                // Add to history (ignore if it fails - not critical)
                 let _ = rl.add_history_entry(line);
 
                 // Handle dot commands
                 if line.starts_with('.') {
-                    if !handle_dot_command(&mut ctx, line).await {
+                    if !handle_dot_command(&mut ctx, &mut state, &helper, line).await {
                         break;
                     }
                     continue;
@@ -469,7 +513,10 @@ async fn run_repl(tpch_path: Option<PathBuf>) {
                 let start = Instant::now();
                 match ctx.sql(line).await {
                     Ok(result) => {
-                        print_results(&result);
+                        // Use the configured output format
+                        if let Err(e) = state.formatter.print(&result.batches) {
+                            eprintln!("Error formatting output: {}", e);
+                        }
                         println!(
                             "({} rows in {:.3}ms)\n",
                             result.row_count,
@@ -497,11 +544,18 @@ async fn run_repl(tpch_path: Option<PathBuf>) {
     }
 
     // Save history
-    let _ = rl.save_history(&history_path);
+    if let Err(e) = rl.save_history(&history_path) {
+        eprintln!("Warning: Could not save history: {}", e);
+    }
 }
 
 /// Handle dot commands, returns false if should exit
-async fn handle_dot_command(ctx: &mut ExecutionContext, line: &str) -> bool {
+async fn handle_dot_command(
+    ctx: &mut ExecutionContext,
+    state: &mut ReplState,
+    helper: &Arc<ReplHelper>,
+    line: &str,
+) -> bool {
     let parts: Vec<&str> = line.split_whitespace().collect();
     let cmd = parts.first().copied().unwrap_or("");
 
@@ -514,8 +568,11 @@ async fn handle_dot_command(ctx: &mut ExecutionContext, line: &str) -> bool {
             println!("  .schema <table>        Show schema for a table");
             println!("  .load <path> <name>    Load Parquet file/directory as table");
             println!("  .tpch <path>           Load all TPC-H tables from directory");
+            println!("  .mode <format>         Set output format (table, csv, json, vertical)");
+            println!("  .format                Show current output format");
             println!();
             println!("Or enter any SQL query to execute it.");
+            println!("Press Tab for auto-completion of SQL keywords and table names.");
             println!();
         }
         ".quit" | ".exit" | ".q" => {
@@ -571,12 +628,14 @@ async fn handle_dot_command(ctx: &mut ExecutionContext, line: &str) -> bool {
                 match ctx.register_parquet(name, &path) {
                     Ok(()) => {
                         if let Some(schema) = ctx.table_schema(name) {
+                            let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
                             println!(
                                 "Loaded '{}' ({} columns) in {:.3}ms\n",
                                 name,
-                                schema.fields().len(),
+                                columns.len(),
                                 start.elapsed().as_secs_f64() * 1000.0
                             );
+                            helper.register_table(name, columns);
                         }
                     }
                     Err(e) => {
@@ -600,7 +659,9 @@ async fn handle_dot_command(ctx: &mut ExecutionContext, line: &str) -> bool {
                     match ctx.register_parquet(*table, &file_path) {
                         Ok(()) => {
                             if let Some(schema) = ctx.table_schema(table) {
-                                println!("  Loaded {}: {} columns", table, schema.fields().len());
+                                let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+                                println!("  Loaded {}: {} columns", table, columns.len());
+                                helper.register_table(table, columns);
                             }
                         }
                         Err(e) => {
@@ -610,6 +671,29 @@ async fn handle_dot_command(ctx: &mut ExecutionContext, line: &str) -> bool {
                 }
                 println!();
             }
+        }
+        ".mode" => {
+            if parts.len() < 2 {
+                println!("Current output format: {}", state.formatter.format().name());
+                println!("Available formats: {}", OutputFormat::all_names().join(", "));
+                println!();
+            } else {
+                let format_str = parts[1];
+                match OutputFormat::from_str(format_str) {
+                    Some(format) => {
+                        state.formatter.set_format(format);
+                        println!("Output format set to: {}\n", format.name());
+                    }
+                    None => {
+                        eprintln!("Unknown format: {}", format_str);
+                        eprintln!("Available formats: {}\n", OutputFormat::all_names().join(", "));
+                    }
+                }
+            }
+        }
+        ".format" => {
+            println!("Current output format: {}", state.formatter.format().name());
+            println!("Available formats: {}\n", OutputFormat::all_names().join(", "));
         }
         _ => {
             eprintln!(
