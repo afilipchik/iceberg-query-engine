@@ -357,6 +357,7 @@ impl PredicatePushdown {
                 let union = LogicalPlan::Union(crate::planner::UnionNode {
                     inputs: inputs?,
                     schema: node.schema.clone(),
+                    all: node.all,
                 });
 
                 if predicates.is_empty() {
