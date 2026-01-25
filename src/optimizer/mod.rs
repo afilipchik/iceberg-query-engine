@@ -38,6 +38,7 @@ impl Optimizer {
         Self {
             rules: vec![
                 Arc::new(rules::ConstantFolding),
+                Arc::new(rules::JoinReorder), // Must run before PredicatePushdown
                 Arc::new(rules::PredicatePushdown),
                 Arc::new(rules::ProjectionPushdown),
             ],

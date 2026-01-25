@@ -103,6 +103,11 @@ impl PhysicalOperator for FilterExec {
     fn name(&self) -> &str {
         "Filter"
     }
+
+    fn output_partitions(&self) -> usize {
+        // Propagate partitions from input - filter preserves partitioning
+        self.input.output_partitions()
+    }
 }
 
 impl fmt::Display for FilterExec {

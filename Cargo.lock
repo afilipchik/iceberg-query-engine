@@ -2027,6 +2027,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "num_cpus"
+version = "1.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
+dependencies = [
+ "hermit-abi",
+ "libc",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2330,6 +2340,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "criterion",
+ "crossbeam",
  "data-encoding",
  "dirs-next",
  "futures",
@@ -2339,6 +2350,7 @@ dependencies = [
  "itertools 0.13.0",
  "md-5",
  "num-traits",
+ "num_cpus",
  "ordered-float 4.6.0",
  "parking_lot",
  "parquet",
@@ -2348,6 +2360,7 @@ dependencies = [
  "rayon",
  "regex",
  "reqwest",
+ "rust-stemmers",
  "rust_decimal",
  "rustyline",
  "serde",
@@ -2589,6 +2602,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "rust-stemmers"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e46a2036019fdb888131db7a4c847a1063a7493f971ed94ea82c67eada63ca54"
+dependencies = [
+ "serde",
+ "serde_derive",
 ]
 
 [[package]]

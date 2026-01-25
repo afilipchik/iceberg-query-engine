@@ -165,10 +165,18 @@ async fn main() {
                     if plan {
                         match ctx.logical_plan(sql) {
                             Ok(logical) => {
-                                println!("Logical Plan:\n{}", logical);
+                                println!("Logical Plan (before optimization):\n{}", logical);
                             }
                             Err(e) => {
                                 println!("Error creating plan: {}", e);
+                            }
+                        }
+                        match ctx.optimized_plan(sql) {
+                            Ok(optimized) => {
+                                println!("\nOptimized Plan:\n{}", optimized);
+                            }
+                            Err(e) => {
+                                println!("Error optimizing: {}", e);
                             }
                         }
                         println!();

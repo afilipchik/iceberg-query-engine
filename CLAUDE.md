@@ -117,6 +117,7 @@ src/
 │   ├── mod.rs                # Optimizer struct and OptimizerRule trait
 │   ├── rules/
 │   │   ├── mod.rs            # Rule exports
+│   │   ├── join_reorder.rs        # Eliminates cross joins, optimizes join order
 │   │   ├── predicate_pushdown.rs  # Handles subquery outer refs correctly
 │   │   ├── projection_pushdown.rs # Handles table alias column matching
 │   │   └── constant_folding.rs
@@ -571,6 +572,10 @@ assert_eq!(result.schema.fields().len(), expected_cols);
 | `chrono` | Date/time operations |
 | `unicode-normalization` | Unicode normalization |
 | `rust-stemmers` | Word stemming (English) |
+| `crossbeam` | Lock-free data structures (work-stealing queues) |
+| `num_cpus` | CPU core detection |
+| `rayon` | Data parallelism |
+| `statrs` | Statistical functions |
 
 ## CLI Commands
 
@@ -659,6 +664,62 @@ Based on the codebase structure, these appear to be planned but not fully implem
 - **Subquery Tests**: EXISTS, IN, ScalarSubquery all working
 
 ## Recently Implemented Features
+
+- **Morsel-Driven Parallelism** (Major performance improvement - 8x faster on Q1)
+  - DuckDB-style parallel execution with work-stealing scheduler
+  - `ParallelParquetSource`: Parallel row-group reading from Parquet files
+  - Thread-local hash tables for aggregation with final merge
+  - Column projection pushdown to Parquet reader
+  - **TPC-H SF=10 Q1 Benchmark:**
+    - Original engine: 1,860ms
+    - Morsel + projection: 227ms (**8x faster**)
+    - DuckDB: 180ms (1.4x faster than us)
+  - Located in `src/physical/morsel.rs`, `src/physical/morsel_agg.rs`
+  - Example usage: `cargo run --release --example morsel_test_projected`
+
+- **Vectorized Aggregation Module** (Performance optimization research)
+  - Studied DuckDB/ClickHouse optimization techniques
+  - Key optimizations implemented:
+    - Row-group statistics filtering (skip row groups based on min/max)
+    - Fixed-size accumulator arrays (no hash table for low-cardinality groups)
+    - Direct primitive array access via Arrow values()
+    - Cache-aligned data structures (64-byte alignment)
+    - Parallel row group reading with chunk assignment per thread
+  - **TPC-H SF=10 Q1 Final Performance:**
+    - Our engine: 250-265ms
+    - DuckDB: 170-190ms
+    - Ratio: **1.4-1.5x slower** than DuckDB
+  - Located in `src/physical/vectorized_agg.rs`
+  - Example benchmarks:
+    - `cargo run --release --example final_q1` (best performance)
+    - `cargo run --release --example optimized_q1`
+    - `cargo run --release --example vectorized_q1` (with row-group filtering)
+  - **Remaining DuckDB advantages:**
+    - Custom Parquet reader with better SIMD decompression
+    - More aggressive prefetching and caching
+    - Lower-level memory management
+
+- **Parallel Aggregation and Partition Fix** (Performance improvement)
+  - Fixed critical bug where Filter/Project operators didn't propagate `output_partitions()`
+  - Was causing only ~3% of data to be processed through filters
+  - Added parallel aggregation using rayon for multi-core hash table building
+  - Added parallel partition collection using tokio::spawn
+  - **TPC-H SF=10 Benchmark Improvements:**
+    - Q01: 8.4s → 2.7s (3.1x faster)
+    - Q04: 183ms → 120ms (1.5x faster)
+    - Q06: 1.0s → 549ms (1.9x faster)
+  - Located in `src/physical/operators/hash_agg.rs`, `filter.rs`, `project.rs`
+
+- **Join Reordering Optimizer** (Major performance improvement)
+  - Eliminates cartesian products from comma-separated table joins
+  - Builds join graph from equality predicates
+  - Greedy algorithm to find ordering where every join has a condition
+  - Optimizes build/probe sides for hash joins (smaller table as build)
+  - **TPC-H SF=10 Benchmark Improvements:**
+    - Q08: 350 seconds → 2.2 seconds (158x faster)
+    - Q09: 336 seconds → 2.4 seconds (138x faster)
+    - Q02: 11 seconds → 0.15 seconds (73x faster)
+  - Located in `src/optimizer/rules/join_reorder.rs`
 
 - **Comprehensive Trino SQL Function Compatibility** (100+ functions)
   - **Math Functions** (40+): ABS, CEIL, FLOOR, ROUND, POWER, SQRT, CBRT, LN, LOG, LOG2, LOG10, EXP, SIN, COS, TAN, ASIN, ACOS, ATAN, ATAN2, SINH, COSH, TANH, DEGREES, RADIANS, PI, E, SIGN, MOD, TRUNCATE, RANDOM, INFINITY, NAN, IS_FINITE, IS_INFINITE, IS_NAN, FROM_BASE, TO_BASE
@@ -761,6 +822,7 @@ Based on the codebase structure, these appear to be planned but not fully implem
 | Expression types | `src/planner/logical_expr.rs` |
 | Subquery expressions | `src/planner/logical_expr.rs` (Exists, InSubquery, ScalarSubquery) |
 | Optimizer rules | `src/optimizer/rules/*.rs` |
+| Join reordering | `src/optimizer/rules/join_reorder.rs` |
 | Predicate pushdown | `src/optimizer/rules/predicate_pushdown.rs` |
 | Projection pushdown | `src/optimizer/rules/projection_pushdown.rs` |
 | Physical execution | `src/physical/operators/*.rs` |

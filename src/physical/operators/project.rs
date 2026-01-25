@@ -79,6 +79,11 @@ impl PhysicalOperator for ProjectExec {
     fn name(&self) -> &str {
         "Project"
     }
+
+    fn output_partitions(&self) -> usize {
+        // Propagate partitions from input - projection preserves partitioning
+        self.input.output_partitions()
+    }
 }
 
 impl fmt::Display for ProjectExec {
