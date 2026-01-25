@@ -96,7 +96,9 @@ enum AccumulatorState {
 impl AccumulatorState {
     fn new(func: &AggregateFunction, input_type: &DataType) -> Self {
         match func {
-            AggregateFunction::Count | AggregateFunction::CountDistinct => AccumulatorState::Count(0),
+            AggregateFunction::Count | AggregateFunction::CountDistinct => {
+                AccumulatorState::Count(0)
+            }
             AggregateFunction::Sum => match input_type {
                 DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
                     AccumulatorState::SumInt(0)
@@ -150,7 +152,8 @@ impl AccumulatorState {
                     match max {
                         None => *max = Some(value.clone()),
                         Some(current) => {
-                            if compare_scalar_values(value, current) == std::cmp::Ordering::Greater {
+                            if compare_scalar_values(value, current) == std::cmp::Ordering::Greater
+                            {
                                 *max = Some(value.clone());
                             }
                         }
@@ -166,14 +169,8 @@ impl AccumulatorState {
             (AccumulatorState::Sum(a), AccumulatorState::Sum(b)) => *a += b,
             (AccumulatorState::SumInt(a), AccumulatorState::SumInt(b)) => *a += b,
             (
-                AccumulatorState::Avg {
-                    sum: s1,
-                    count: c1,
-                },
-                AccumulatorState::Avg {
-                    sum: s2,
-                    count: c2,
-                },
+                AccumulatorState::Avg { sum: s1, count: c1 },
+                AccumulatorState::Avg { sum: s2, count: c2 },
             ) => {
                 *s1 += s2;
                 *c1 += c2;
@@ -414,9 +411,8 @@ impl AggregationState {
             arrays.push(array);
         }
 
-        RecordBatch::try_new(schema.clone(), arrays).map_err(|e| {
-            QueryError::Execution(format!("Failed to build output batch: {}", e))
-        })
+        RecordBatch::try_new(schema.clone(), arrays)
+            .map_err(|e| QueryError::Execution(format!("Failed to build output batch: {}", e)))
     }
 }
 
@@ -426,46 +422,98 @@ fn extract_scalar(array: &ArrayRef, row: usize) -> ScalarValue {
     }
 
     match array.data_type() {
-        DataType::Int8 => {
-            ScalarValue::Int8(array.as_any().downcast_ref::<arrow::array::Int8Array>().unwrap().value(row))
-        }
-        DataType::Int16 => {
-            ScalarValue::Int16(array.as_any().downcast_ref::<arrow::array::Int16Array>().unwrap().value(row))
-        }
-        DataType::Int32 => {
-            ScalarValue::Int32(array.as_any().downcast_ref::<arrow::array::Int32Array>().unwrap().value(row))
-        }
-        DataType::Int64 => {
-            ScalarValue::Int64(array.as_any().downcast_ref::<Int64Array>().unwrap().value(row))
-        }
-        DataType::UInt8 => {
-            ScalarValue::UInt8(array.as_any().downcast_ref::<arrow::array::UInt8Array>().unwrap().value(row))
-        }
-        DataType::UInt16 => {
-            ScalarValue::UInt16(array.as_any().downcast_ref::<arrow::array::UInt16Array>().unwrap().value(row))
-        }
-        DataType::UInt32 => {
-            ScalarValue::UInt32(array.as_any().downcast_ref::<arrow::array::UInt32Array>().unwrap().value(row))
-        }
-        DataType::UInt64 => {
-            ScalarValue::UInt64(array.as_any().downcast_ref::<arrow::array::UInt64Array>().unwrap().value(row))
-        }
+        DataType::Int8 => ScalarValue::Int8(
+            array
+                .as_any()
+                .downcast_ref::<arrow::array::Int8Array>()
+                .unwrap()
+                .value(row),
+        ),
+        DataType::Int16 => ScalarValue::Int16(
+            array
+                .as_any()
+                .downcast_ref::<arrow::array::Int16Array>()
+                .unwrap()
+                .value(row),
+        ),
+        DataType::Int32 => ScalarValue::Int32(
+            array
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .unwrap()
+                .value(row),
+        ),
+        DataType::Int64 => ScalarValue::Int64(
+            array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(row),
+        ),
+        DataType::UInt8 => ScalarValue::UInt8(
+            array
+                .as_any()
+                .downcast_ref::<arrow::array::UInt8Array>()
+                .unwrap()
+                .value(row),
+        ),
+        DataType::UInt16 => ScalarValue::UInt16(
+            array
+                .as_any()
+                .downcast_ref::<arrow::array::UInt16Array>()
+                .unwrap()
+                .value(row),
+        ),
+        DataType::UInt32 => ScalarValue::UInt32(
+            array
+                .as_any()
+                .downcast_ref::<arrow::array::UInt32Array>()
+                .unwrap()
+                .value(row),
+        ),
+        DataType::UInt64 => ScalarValue::UInt64(
+            array
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+                .unwrap()
+                .value(row),
+        ),
         DataType::Float32 => {
-            let val = array.as_any().downcast_ref::<arrow::array::Float32Array>().unwrap().value(row);
+            let val = array
+                .as_any()
+                .downcast_ref::<arrow::array::Float32Array>()
+                .unwrap()
+                .value(row);
             ScalarValue::Float32(ordered_float::OrderedFloat(val))
         }
         DataType::Float64 => {
-            let val = array.as_any().downcast_ref::<Float64Array>().unwrap().value(row);
+            let val = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(row);
             ScalarValue::Float64(ordered_float::OrderedFloat(val))
         }
-        DataType::Utf8 => {
-            ScalarValue::Utf8(array.as_any().downcast_ref::<StringArray>().unwrap().value(row).to_string())
-        }
-        DataType::Date32 => {
-            ScalarValue::Date32(array.as_any().downcast_ref::<Date32Array>().unwrap().value(row))
-        }
+        DataType::Utf8 => ScalarValue::Utf8(
+            array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(row)
+                .to_string(),
+        ),
+        DataType::Date32 => ScalarValue::Date32(
+            array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .unwrap()
+                .value(row),
+        ),
         DataType::Decimal128(p, s) => {
-            let arr = array.as_any().downcast_ref::<arrow::array::Decimal128Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Decimal128Array>()
+                .unwrap();
             let val = arr.value(row);
             // Convert i128 to Decimal using scale
             let decimal = rust_decimal::Decimal::from_i128_with_scale(val, *s as u32);
@@ -549,9 +597,12 @@ fn build_scalar_array_ref(values: &[&ScalarValue], data_type: &DataType) -> Resu
                 }
             }
             Ok(Arc::new(
-                builder.finish().with_precision_and_scale(*p, *s).map_err(|e| {
-                    QueryError::Execution(format!("Invalid decimal precision/scale: {}", e))
-                })?,
+                builder
+                    .finish()
+                    .with_precision_and_scale(*p, *s)
+                    .map_err(|e| {
+                        QueryError::Execution(format!("Invalid decimal precision/scale: {}", e))
+                    })?,
             ))
         }
         _ => Err(QueryError::NotImplemented(format!(
@@ -617,9 +668,7 @@ pub fn execute_morsel_aggregation(
                             .iter()
                             .map(|col| compute::filter(col.as_ref(), filter_array))
                             .collect::<std::result::Result<Vec<_>, _>>()
-                            .map_err(|e| {
-                                QueryError::Execution(format!("Filter failed: {}", e))
-                            })?;
+                            .map_err(|e| QueryError::Execution(format!("Filter failed: {}", e)))?;
 
                         if filtered_columns.is_empty() || filtered_columns[0].len() == 0 {
                             continue;

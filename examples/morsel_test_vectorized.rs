@@ -4,13 +4,13 @@
 //!
 //! Run with: cargo run --release --example morsel_test_vectorized
 
-use arrow::array::{Float64Array, StringArray, Date32Array, Array, BooleanArray};
+use arrow::array::{Array, BooleanArray, Date32Array, Float64Array, StringArray};
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use hashbrown::HashMap;
-use query_engine::physical::morsel::{ParallelParquetSource, DEFAULT_MORSEL_SIZE};
 use query_engine::error::Result;
+use query_engine::physical::morsel::{ParallelParquetSource, DEFAULT_MORSEL_SIZE};
 use rayon::prelude::*;
 use std::sync::Arc;
 use std::time::Instant;
@@ -24,11 +24,15 @@ struct Q1AggState {
 impl Q1AggState {
     fn process_batch_vectorized(&mut self, batch: &RecordBatch, date_limit: i32) {
         // Get shipdate array and create filter mask
-        let shipdate = batch.column(10).as_any()
-            .downcast_ref::<Date32Array>().unwrap();
+        let shipdate = batch
+            .column(10)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
 
         // Create filter mask: shipdate <= date_limit
-        let mask: BooleanArray = shipdate.iter()
+        let mask: BooleanArray = shipdate
+            .iter()
             .map(|v| v.map(|d| d <= date_limit))
             .collect();
 
@@ -42,7 +46,10 @@ impl Q1AggState {
         let returnflag = returnflag.as_any().downcast_ref::<StringArray>().unwrap();
         let linestatus = linestatus.as_any().downcast_ref::<StringArray>().unwrap();
         let quantity = quantity.as_any().downcast_ref::<Float64Array>().unwrap();
-        let extendedprice = extendedprice.as_any().downcast_ref::<Float64Array>().unwrap();
+        let extendedprice = extendedprice
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
 
         let num_rows = returnflag.len();
 
@@ -114,8 +121,10 @@ fn main() -> Result<()> {
     results.sort_by_key(|(k, _)| (k.0.clone(), k.1.clone()));
 
     for ((flag, status), (sum_qty, sum_price, count)) in results {
-        println!("  {} | {} | {:>15.2} | {:>18.2} | {:>10}",
-            flag, status, sum_qty, sum_price, count);
+        println!(
+            "  {} | {} | {:>15.2} | {:>18.2} | {:>10}",
+            flag, status, sum_qty, sum_price, count
+        );
     }
 
     println!("\nTime: {:?}", elapsed);

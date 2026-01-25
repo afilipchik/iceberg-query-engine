@@ -4,12 +4,12 @@
 //!
 //! Run with: cargo run --release --example morsel_test_fast
 
-use arrow::array::{Float64Array, StringArray, Date32Array, Array};
+use arrow::array::{Array, Date32Array, Float64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use hashbrown::HashMap;
-use query_engine::physical::morsel::{ParallelParquetSource, DEFAULT_MORSEL_SIZE};
 use query_engine::error::Result;
+use query_engine::physical::morsel::{ParallelParquetSource, DEFAULT_MORSEL_SIZE};
 use rayon::prelude::*;
 use std::sync::Arc;
 use std::time::Instant;
@@ -24,16 +24,31 @@ struct Q1AggState {
 impl Q1AggState {
     fn process_batch(&mut self, batch: &RecordBatch, date_limit: i32) {
         // Get typed arrays directly - no expression evaluation overhead
-        let returnflag = batch.column(8).as_any()
-            .downcast_ref::<StringArray>().unwrap();
-        let linestatus = batch.column(9).as_any()
-            .downcast_ref::<StringArray>().unwrap();
-        let quantity = batch.column(4).as_any()
-            .downcast_ref::<Float64Array>().unwrap();
-        let extendedprice = batch.column(5).as_any()
-            .downcast_ref::<Float64Array>().unwrap();
-        let shipdate = batch.column(10).as_any()
-            .downcast_ref::<Date32Array>().unwrap();
+        let returnflag = batch
+            .column(8)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let linestatus = batch
+            .column(9)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let quantity = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let extendedprice = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let shipdate = batch
+            .column(10)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
 
         let num_rows = batch.num_rows();
 
@@ -118,8 +133,10 @@ fn main() -> Result<()> {
     results.sort_by_key(|(k, _)| (k.0.clone(), k.1.clone()));
 
     for ((flag, status), (sum_qty, sum_price, count)) in results {
-        println!("  {} | {} | {:>15.2} | {:>18.2} | {:>10}",
-            flag, status, sum_qty, sum_price, count);
+        println!(
+            "  {} | {} | {:>15.2} | {:>18.2} | {:>10}",
+            flag, status, sum_qty, sum_price, count
+        );
     }
 
     println!("\nTime: {:?}", elapsed);

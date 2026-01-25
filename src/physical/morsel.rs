@@ -293,6 +293,7 @@ impl ParallelParquetSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_morsel_creation() {
@@ -300,11 +301,8 @@ mod tests {
         use arrow::datatypes::{DataType, Field, Schema};
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap();
 
         let morsel = Morsel::new(batch, 0, 0);
         assert_eq!(morsel.num_rows(), 3);

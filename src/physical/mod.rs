@@ -7,9 +7,11 @@ pub mod morsel_agg;
 pub mod operators;
 mod plan;
 mod planner;
+pub mod vectorized_agg;
 
 pub use morsel::*;
 pub use morsel_agg::*;
 pub use operators::*;
 pub use plan::*;
 pub use planner::*;
+pub use vectorized_agg::*;

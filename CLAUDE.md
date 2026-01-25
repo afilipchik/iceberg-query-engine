@@ -572,6 +572,10 @@ assert_eq!(result.schema.fields().len(), expected_cols);
 | `chrono` | Date/time operations |
 | `unicode-normalization` | Unicode normalization |
 | `rust-stemmers` | Word stemming (English) |
+| `crossbeam` | Lock-free data structures (work-stealing queues) |
+| `num_cpus` | CPU core detection |
+| `rayon` | Data parallelism |
+| `statrs` | Statistical functions |
 
 ## CLI Commands
 
@@ -669,9 +673,31 @@ Based on the codebase structure, these appear to be planned but not fully implem
   - **TPC-H SF=10 Q1 Benchmark:**
     - Original engine: 1,860ms
     - Morsel + projection: 227ms (**8x faster**)
-    - DuckDB: 84ms (2.7x faster than us)
+    - DuckDB: 180ms (1.4x faster than us)
   - Located in `src/physical/morsel.rs`, `src/physical/morsel_agg.rs`
   - Example usage: `cargo run --release --example morsel_test_projected`
+
+- **Vectorized Aggregation Module** (Performance optimization research)
+  - Studied DuckDB/ClickHouse optimization techniques
+  - Key optimizations implemented:
+    - Row-group statistics filtering (skip row groups based on min/max)
+    - Fixed-size accumulator arrays (no hash table for low-cardinality groups)
+    - Direct primitive array access via Arrow values()
+    - Cache-aligned data structures (64-byte alignment)
+    - Parallel row group reading with chunk assignment per thread
+  - **TPC-H SF=10 Q1 Final Performance:**
+    - Our engine: 250-265ms
+    - DuckDB: 170-190ms
+    - Ratio: **1.4-1.5x slower** than DuckDB
+  - Located in `src/physical/vectorized_agg.rs`
+  - Example benchmarks:
+    - `cargo run --release --example final_q1` (best performance)
+    - `cargo run --release --example optimized_q1`
+    - `cargo run --release --example vectorized_q1` (with row-group filtering)
+  - **Remaining DuckDB advantages:**
+    - Custom Parquet reader with better SIMD decompression
+    - More aggressive prefetching and caching
+    - Lower-level memory management
 
 - **Parallel Aggregation and Partition Fix** (Performance improvement)
   - Fixed critical bug where Filter/Project operators didn't propagate `output_partitions()`

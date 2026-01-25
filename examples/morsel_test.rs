@@ -2,9 +2,9 @@
 //!
 //! Run with: cargo run --release --example morsel_test
 
+use arrow::datatypes::{DataType, Field, Schema};
 use query_engine::physical::execute_morsel_aggregation;
 use query_engine::planner::{AggregateFunction, Expr};
-use arrow::datatypes::{DataType, Field, Schema};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -19,10 +19,7 @@ fn main() {
 
     // Group by expressions (column indices in schema)
     // l_returnflag = col 8, l_linestatus = col 9
-    let group_by_exprs = vec![
-        Expr::column("l_returnflag"),
-        Expr::column("l_linestatus"),
-    ];
+    let group_by_exprs = vec![Expr::column("l_returnflag"), Expr::column("l_linestatus")];
 
     // Aggregate functions
     let agg_funcs = vec![
@@ -45,7 +42,9 @@ fn main() {
     let filter = Expr::BinaryExpr {
         left: Box::new(Expr::column("l_shipdate")),
         op: query_engine::planner::BinaryOp::LtEq,
-        right: Box::new(Expr::Literal(query_engine::planner::ScalarValue::Date32(10471))),
+        right: Box::new(Expr::Literal(query_engine::planner::ScalarValue::Date32(
+            10471,
+        ))),
     };
 
     // Output schema
@@ -80,29 +79,41 @@ fn main() {
 
             // Print results
             for row in 0..batch.num_rows() {
-                let flag = batch.column(0).as_any()
+                let flag = batch
+                    .column(0)
+                    .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
                     .unwrap()
                     .value(row);
-                let status = batch.column(1).as_any()
+                let status = batch
+                    .column(1)
+                    .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
                     .unwrap()
                     .value(row);
-                let sum_qty = batch.column(2).as_any()
+                let sum_qty = batch
+                    .column(2)
+                    .as_any()
                     .downcast_ref::<arrow::array::Float64Array>()
                     .unwrap()
                     .value(row);
-                let sum_price = batch.column(3).as_any()
+                let sum_price = batch
+                    .column(3)
+                    .as_any()
                     .downcast_ref::<arrow::array::Float64Array>()
                     .unwrap()
                     .value(row);
-                let count = batch.column(4).as_any()
+                let count = batch
+                    .column(4)
+                    .as_any()
                     .downcast_ref::<arrow::array::Int64Array>()
                     .unwrap()
                     .value(row);
 
-                println!("  {} | {} | {:>15.2} | {:>18.2} | {:>10}",
-                    flag, status, sum_qty, sum_price, count);
+                println!(
+                    "  {} | {} | {:>15.2} | {:>18.2} | {:>10}",
+                    flag, status, sum_qty, sum_price, count
+                );
             }
 
             println!("\nTime: {:?}", elapsed);

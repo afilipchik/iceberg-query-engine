@@ -4,12 +4,12 @@
 //!
 //! Run with: cargo run --release --example morsel_test_projected
 
-use arrow::array::{Float64Array, StringArray, Date32Array, Array};
+use arrow::array::{Array, Date32Array, Float64Array, StringArray};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use hashbrown::HashMap;
-use query_engine::physical::morsel::{ParallelParquetSource, DEFAULT_MORSEL_SIZE};
 use query_engine::error::Result;
+use query_engine::physical::morsel::{ParallelParquetSource, DEFAULT_MORSEL_SIZE};
 use rayon::prelude::*;
 use std::sync::Arc;
 use std::time::Instant;
@@ -28,16 +28,31 @@ impl Q1AggState {
     // 3 = l_linestatus (was 9)
     // 4 = l_shipdate (was 10)
     fn process_batch(&mut self, batch: &RecordBatch, date_limit: i32) {
-        let returnflag = batch.column(2).as_any()
-            .downcast_ref::<StringArray>().unwrap();
-        let linestatus = batch.column(3).as_any()
-            .downcast_ref::<StringArray>().unwrap();
-        let quantity = batch.column(0).as_any()
-            .downcast_ref::<Float64Array>().unwrap();
-        let extendedprice = batch.column(1).as_any()
-            .downcast_ref::<Float64Array>().unwrap();
-        let shipdate = batch.column(4).as_any()
-            .downcast_ref::<Date32Array>().unwrap();
+        let returnflag = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let linestatus = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let quantity = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let extendedprice = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let shipdate = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
 
         let num_rows = batch.num_rows();
 
@@ -117,8 +132,10 @@ fn main() -> Result<()> {
     results.sort_by_key(|(k, _)| (k.0.clone(), k.1.clone()));
 
     for ((flag, status), (sum_qty, sum_price, count)) in results {
-        println!("  {} | {} | {:>15.2} | {:>18.2} | {:>10}",
-            flag, status, sum_qty, sum_price, count);
+        println!(
+            "  {} | {} | {:>15.2} | {:>18.2} | {:>10}",
+            flag, status, sum_qty, sum_price, count
+        );
     }
 
     println!("\nTime: {:?}", elapsed);
