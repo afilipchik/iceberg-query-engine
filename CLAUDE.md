@@ -661,6 +661,29 @@ Based on the codebase structure, these appear to be planned but not fully implem
 
 ## Recently Implemented Features
 
+- **Morsel-Driven Parallelism** (Major performance improvement - 8x faster on Q1)
+  - DuckDB-style parallel execution with work-stealing scheduler
+  - `ParallelParquetSource`: Parallel row-group reading from Parquet files
+  - Thread-local hash tables for aggregation with final merge
+  - Column projection pushdown to Parquet reader
+  - **TPC-H SF=10 Q1 Benchmark:**
+    - Original engine: 1,860ms
+    - Morsel + projection: 227ms (**8x faster**)
+    - DuckDB: 84ms (2.7x faster than us)
+  - Located in `src/physical/morsel.rs`, `src/physical/morsel_agg.rs`
+  - Example usage: `cargo run --release --example morsel_test_projected`
+
+- **Parallel Aggregation and Partition Fix** (Performance improvement)
+  - Fixed critical bug where Filter/Project operators didn't propagate `output_partitions()`
+  - Was causing only ~3% of data to be processed through filters
+  - Added parallel aggregation using rayon for multi-core hash table building
+  - Added parallel partition collection using tokio::spawn
+  - **TPC-H SF=10 Benchmark Improvements:**
+    - Q01: 8.4s → 2.7s (3.1x faster)
+    - Q04: 183ms → 120ms (1.5x faster)
+    - Q06: 1.0s → 549ms (1.9x faster)
+  - Located in `src/physical/operators/hash_agg.rs`, `filter.rs`, `project.rs`
+
 - **Join Reordering Optimizer** (Major performance improvement)
   - Eliminates cartesian products from comma-separated table joins
   - Builds join graph from equality predicates

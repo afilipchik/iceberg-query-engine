@@ -13,6 +13,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use futures::stream::{self, TryStreamExt};
 use hashbrown::HashMap;
+use rayon::prelude::*;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -164,19 +165,41 @@ impl PhysicalOperator for HashAggregateExec {
             return Ok(Box::pin(stream::empty()));
         }
 
-        // Collect from all input partitions
+        // Collect from all input partitions in parallel using tokio
         let input_partitions = self.input.output_partitions().max(1);
-        let mut all_batches = Vec::new();
 
+        // Spawn concurrent tasks to collect from each partition
+        let mut handles = Vec::with_capacity(input_partitions);
         for part in 0..input_partitions {
-            let input_stream = self.input.execute(part).await?;
-            let batches: Vec<RecordBatch> = input_stream.try_collect().await?;
+            let input = self.input.clone();
+            handles.push(tokio::spawn(async move {
+                let input_stream = input.execute(part).await?;
+                let batches: Vec<RecordBatch> = input_stream.try_collect().await?;
+                Ok::<_, QueryError>(batches)
+            }));
+        }
+
+        // Collect results from all partitions
+        let mut all_batches = Vec::new();
+        for handle in handles {
+            let batches = handle
+                .await
+                .map_err(|e| QueryError::Execution(format!("Task join error: {}", e)))??;
             all_batches.extend(batches);
         }
 
         // Build hash table from all collected batches
-        let result =
-            aggregate_batches(&all_batches, &self.group_by, &self.aggregates, &self.schema)?;
+        // For large batch counts, use parallel aggregation
+        let result = if all_batches.len() > 4 {
+            aggregate_batches_parallel(
+                &all_batches,
+                &self.group_by,
+                &self.aggregates,
+                &self.schema,
+            )?
+        } else {
+            aggregate_batches(&all_batches, &self.group_by, &self.aggregates, &self.schema)?
+        };
 
         Ok(Box::pin(stream::once(async { Ok(result) })))
     }
@@ -380,6 +403,220 @@ fn aggregate_batches(
 
     // Regular hash-based aggregation for grouped queries
     aggregate_batches_hash(batches, group_by, aggregates, schema)
+}
+
+/// Parallel aggregation using rayon for multi-core performance
+fn aggregate_batches_parallel(
+    batches: &[RecordBatch],
+    group_by: &[Expr],
+    aggregates: &[AggregateExpr],
+    schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    // Use scalar SIMD path for simple cases
+    let has_count_distinct = aggregates
+        .iter()
+        .any(|a| a.func == AggregateFunction::CountDistinct);
+    if group_by.is_empty() && batches.len() == 1 && aggregates.len() == 1 && !has_count_distinct {
+        return aggregate_scalar_simd(&batches[0], &aggregates[0], schema);
+    }
+
+    // Determine number of threads
+    let num_threads = rayon::current_num_threads().min(batches.len());
+    if num_threads <= 1 {
+        return aggregate_batches_hash(batches, group_by, aggregates, schema);
+    }
+
+    // Split batches into chunks for parallel processing
+    let chunk_size = (batches.len() + num_threads - 1) / num_threads;
+    let chunks: Vec<_> = batches.chunks(chunk_size).collect();
+
+    // Build partial hash tables in parallel
+    let partial_results: Vec<Result<HashMap<GroupKey, Vec<AccumulatorState>>>> = chunks
+        .par_iter()
+        .map(|chunk| build_partial_hash_table(chunk, group_by, aggregates))
+        .collect();
+
+    // Check for errors and collect successful results
+    let mut merged_groups: HashMap<GroupKey, Vec<AccumulatorState>> = HashMap::new();
+    for result in partial_results {
+        let partial = result?;
+        for (key, states) in partial {
+            merged_groups
+                .entry(key)
+                .and_modify(|existing| {
+                    for (i, state) in states.iter().enumerate() {
+                        merge_accumulator_states(&mut existing[i], state, &aggregates[i].func);
+                    }
+                })
+                .or_insert(states);
+        }
+    }
+
+    // Handle empty input with no groups (scalar aggregates)
+    if merged_groups.is_empty() && group_by.is_empty() {
+        merged_groups.insert(
+            GroupKey { values: vec![] },
+            aggregates
+                .iter()
+                .map(|_| AccumulatorState::default())
+                .collect(),
+        );
+    }
+
+    // Build output arrays
+    build_output_from_groups(&merged_groups, group_by, aggregates, schema)
+}
+
+/// Build a partial hash table from a subset of batches
+fn build_partial_hash_table(
+    batches: &[RecordBatch],
+    group_by: &[Expr],
+    aggregates: &[AggregateExpr],
+) -> Result<HashMap<GroupKey, Vec<AccumulatorState>>> {
+    let mut groups: HashMap<GroupKey, Vec<AccumulatorState>> = HashMap::new();
+
+    for batch in batches {
+        // Evaluate group by expressions
+        let group_arrays: Result<Vec<ArrayRef>> =
+            group_by.iter().map(|e| evaluate_expr(batch, e)).collect();
+        let group_arrays = group_arrays?;
+
+        // Evaluate aggregate inputs
+        let agg_inputs: Result<Vec<ArrayRef>> = aggregates
+            .iter()
+            .map(|a| evaluate_expr(batch, &a.input))
+            .collect();
+        let agg_inputs = agg_inputs?;
+
+        // Process each row
+        for row in 0..batch.num_rows() {
+            let key = extract_group_key(&group_arrays, row);
+
+            let states = groups.entry(key).or_insert_with(|| {
+                aggregates
+                    .iter()
+                    .map(|_| AccumulatorState::default())
+                    .collect()
+            });
+
+            // Update each accumulator
+            for (i, agg) in aggregates.iter().enumerate() {
+                let input = &agg_inputs[i];
+                update_accumulator(&mut states[i], agg.func, input, row);
+            }
+        }
+    }
+
+    Ok(groups)
+}
+
+/// Merge two accumulator states
+fn merge_accumulator_states(
+    target: &mut AccumulatorState,
+    source: &AccumulatorState,
+    func: &AggregateFunction,
+) {
+    match func {
+        AggregateFunction::Count | AggregateFunction::CountDistinct => {
+            target.count += source.count;
+        }
+        AggregateFunction::Sum => {
+            target.sum += source.sum;
+            target.sum_i64 = target.sum_i64.saturating_add(source.sum_i64);
+        }
+        AggregateFunction::Avg => {
+            // For AVG, we need sum and count
+            target.sum += source.sum;
+            target.count += source.count;
+        }
+        AggregateFunction::Min => {
+            if let (Some(t), Some(s)) = (&mut target.min_f64, &source.min_f64) {
+                *t = t.min(*s);
+            } else if source.min_f64.is_some() {
+                target.min_f64 = source.min_f64;
+            }
+            if let (Some(t), Some(s)) = (&mut target.min_i64, &source.min_i64) {
+                *t = (*t).min(*s);
+            } else if source.min_i64.is_some() {
+                target.min_i64 = source.min_i64;
+            }
+            if let (Some(t), Some(s)) = (&mut target.min_str, &source.min_str) {
+                if s < t {
+                    *t = s.clone();
+                }
+            } else if source.min_str.is_some() {
+                target.min_str = source.min_str.clone();
+            }
+        }
+        AggregateFunction::Max => {
+            if let (Some(t), Some(s)) = (&mut target.max_f64, &source.max_f64) {
+                *t = t.max(*s);
+            } else if source.max_f64.is_some() {
+                target.max_f64 = source.max_f64;
+            }
+            if let (Some(t), Some(s)) = (&mut target.max_i64, &source.max_i64) {
+                *t = (*t).max(*s);
+            } else if source.max_i64.is_some() {
+                target.max_i64 = source.max_i64;
+            }
+            if let (Some(t), Some(s)) = (&mut target.max_str, &source.max_str) {
+                if s > t {
+                    *t = s.clone();
+                }
+            } else if source.max_str.is_some() {
+                target.max_str = source.max_str.clone();
+            }
+        }
+        AggregateFunction::Stddev
+        | AggregateFunction::StddevSamp
+        | AggregateFunction::StddevPop
+        | AggregateFunction::Variance
+        | AggregateFunction::VarSamp
+        | AggregateFunction::VarPop => {
+            // Use Welford's online algorithm for parallel merge
+            let n1 = target.count as f64;
+            let n2 = source.count as f64;
+            let n = n1 + n2;
+            if n > 0.0 {
+                let delta = source.sum / n2.max(1.0) - target.sum / n1.max(1.0);
+                target.sum += source.sum;
+                target.sum_squares += source.sum_squares + delta * delta * n1 * n2 / n;
+                target.count += source.count;
+            }
+        }
+        _ => {
+            // For other functions, just merge counts and sums
+            target.count += source.count;
+            target.sum += source.sum;
+        }
+    }
+}
+
+/// Build output RecordBatch from grouped hash map
+fn build_output_from_groups(
+    groups: &HashMap<GroupKey, Vec<AccumulatorState>>,
+    group_by: &[Expr],
+    aggregates: &[AggregateExpr],
+    schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    let num_groups = groups.len();
+    let mut output_arrays: Vec<ArrayRef> = Vec::new();
+
+    // Group by columns
+    for (i, _) in group_by.iter().enumerate() {
+        let field = schema.field(i);
+        let arr = build_group_array(groups, i, num_groups, field.data_type())?;
+        output_arrays.push(arr);
+    }
+
+    // Aggregate columns
+    for (i, agg) in aggregates.iter().enumerate() {
+        let field = schema.field(group_by.len() + i);
+        let arr = build_agg_array(groups, i, agg.func, num_groups, field.data_type())?;
+        output_arrays.push(arr);
+    }
+
+    RecordBatch::try_new(schema.clone(), output_arrays).map_err(Into::into)
 }
 
 /// Public interface for aggregate_batches used by spillable operators
