@@ -182,18 +182,18 @@ B. **JIT compilation with Cranelift**
 
 ### Phase 1: Quick Wins (1-2 days)
 1. [x] Fix filter partition propagation bug
-2. [ ] Add simple parallel scan with rayon
-3. [ ] Implement subquery result caching
+2. [x] Add simple parallel scan with rayon (morsel-driven parallelism)
+3. [x] Implement subquery result caching (memoization by correlation key)
 
 ### Phase 2: I/O Optimization (2-3 days)
-4. [ ] Streaming Parquet reader
-5. [ ] Row group pruning with statistics
-6. [ ] Async I/O for Parquet
+4. [x] Streaming Parquet reader (StreamingParquetReader)
+5. [x] Row group pruning with statistics (vectorized_agg.rs)
+6. [x] Async I/O for Parquet (AsyncParquetReader with tokio)
 
 ### Phase 3: Parallel Execution (3-5 days)
-7. [ ] Partitioned aggregation
-8. [ ] Parallel hash join build
-9. [ ] Work-stealing scheduler
+7. [x] Partitioned aggregation (morsel_agg.rs)
+8. [x] Parallel hash join build (rayon-based parallel build)
+9. [x] Work-stealing scheduler (crossbeam work-stealing example)
 
 ### Phase 4: Advanced Optimizations (5+ days)
 10. [ ] Subquery decorrelation

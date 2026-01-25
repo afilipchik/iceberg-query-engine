@@ -11,6 +11,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use futures::stream::{self, TryStreamExt};
 use hashbrown::HashMap;
+use rayon::prelude::*;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -196,7 +197,27 @@ struct HashEntry {
     row_idx: usize,
 }
 
+/// Threshold for parallel build (use parallel for larger datasets)
+const PARALLEL_BUILD_THRESHOLD: usize = 10_000;
+
 fn build_hash_table(
+    batches: &[RecordBatch],
+    key_exprs: &[Expr],
+) -> Result<HashMap<JoinKey, Vec<HashEntry>>> {
+    // Count total rows to decide if parallel build is worth it
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+    if total_rows < PARALLEL_BUILD_THRESHOLD || batches.len() < 2 {
+        // Use sequential build for small datasets
+        build_hash_table_sequential(batches, key_exprs)
+    } else {
+        // Use parallel build for large datasets
+        build_hash_table_parallel(batches, key_exprs)
+    }
+}
+
+/// Sequential hash table build (for small datasets)
+fn build_hash_table_sequential(
     batches: &[RecordBatch],
     key_exprs: &[Expr],
 ) -> Result<HashMap<JoinKey, Vec<HashEntry>>> {
@@ -223,6 +244,53 @@ fn build_hash_table(
     }
 
     Ok(table)
+}
+
+/// Parallel hash table build using rayon
+fn build_hash_table_parallel(
+    batches: &[RecordBatch],
+    key_exprs: &[Expr],
+) -> Result<HashMap<JoinKey, Vec<HashEntry>>> {
+    // Build partial hash tables in parallel, one per batch
+    let partial_tables: Vec<Result<HashMap<JoinKey, Vec<HashEntry>>>> = batches
+        .par_iter()
+        .enumerate()
+        .map(|(batch_idx, batch)| {
+            let mut partial: HashMap<JoinKey, Vec<HashEntry>> = HashMap::new();
+
+            let key_arrays: Result<Vec<ArrayRef>> =
+                key_exprs.iter().map(|e| evaluate_expr(batch, e)).collect();
+            let key_arrays = key_arrays?;
+
+            for row_idx in 0..batch.num_rows() {
+                let key = extract_join_key(&key_arrays, row_idx);
+
+                // Skip null keys (null != null in SQL)
+                if key.values.iter().any(|v| matches!(v, JoinValue::Null)) {
+                    continue;
+                }
+
+                partial
+                    .entry(key)
+                    .or_default()
+                    .push(HashEntry { batch_idx, row_idx });
+            }
+
+            Ok(partial)
+        })
+        .collect();
+
+    // Merge partial tables into final table
+    let mut final_table: HashMap<JoinKey, Vec<HashEntry>> = HashMap::new();
+
+    for partial_result in partial_tables {
+        let partial = partial_result?;
+        for (key, entries) in partial {
+            final_table.entry(key).or_default().extend(entries);
+        }
+    }
+
+    Ok(final_table)
 }
 
 fn extract_join_key(arrays: &[ArrayRef], row: usize) -> JoinKey {

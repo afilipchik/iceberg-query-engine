@@ -665,6 +665,24 @@ Based on the codebase structure, these appear to be planned but not fully implem
 
 ## Recently Implemented Features
 
+- **Correlated Subquery Memoization** (Performance improvement for Q17-Q22)
+  - Caches subquery results by correlation key values
+  - Avoids re-executing subqueries for repeated outer row values
+  - Implemented in `src/physical/operators/subquery.rs`
+  - Uses `CorrelatedCacheKey` combining plan hash + correlation values
+
+- **Parallel Hash Join Build** (Performance improvement)
+  - Uses rayon to build hash tables in parallel across batches
+  - Automatically enabled for datasets > 10,000 rows
+  - Merges partial hash tables after parallel build
+  - Located in `src/physical/operators/hash_join.rs`
+
+- **Async Parquet I/O** (I/O optimization)
+  - `AsyncParquetReader`: True async I/O using tokio
+  - `read_all_parallel()`: Concurrent file reading with configurable parallelism
+  - Overlaps I/O with computation for better NVMe utilization
+  - Located in `src/storage/parquet.rs`
+
 - **Morsel-Driven Parallelism** (Major performance improvement - 8x faster on Q1)
   - DuckDB-style parallel execution with work-stealing scheduler
   - `ParallelParquetSource`: Parallel row-group reading from Parquet files
@@ -830,6 +848,7 @@ Based on the codebase structure, these appear to be planned but not fully implem
 | Main entry point | `src/execution/context.rs` |
 | Parquet table provider | `src/storage/parquet.rs` |
 | Streaming Parquet reader | `src/storage/parquet.rs` (StreamingParquetReader) |
+| Async Parquet reader | `src/storage/parquet.rs` (AsyncParquetReader) |
 | TableProvider trait | `src/physical/operators/scan.rs` |
 | Memory pool/config | `src/execution/memory.rs` |
 | Spillable operators | `src/physical/operators/spillable.rs` |

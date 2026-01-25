@@ -23,6 +23,27 @@ struct SubqueryExecutorInner {
     tables: parking_lot::Mutex<HashMap<String, Arc<dyn TableProvider>>>,
     /// Cached results for uncorrelated subqueries (keyed by a hash of the plan)
     cache: parking_lot::Mutex<HashMap<usize, SubqueryResult>>,
+    /// Cached results for correlated subqueries (keyed by plan hash + correlation key values)
+    correlated_cache: parking_lot::Mutex<HashMap<CorrelatedCacheKey, SubqueryResult>>,
+}
+
+/// Cache key for correlated subqueries: plan hash + correlation values
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct CorrelatedCacheKey {
+    plan_hash: usize,
+    correlation_values: Vec<CorrelationValue>,
+}
+
+/// A hashable representation of correlation column values
+#[derive(Clone, Hash, PartialEq, Eq)]
+enum CorrelationValue {
+    Null,
+    Int64(i64),
+    Int32(i32),
+    Float64Bits(u64), // Store f64 as bits for hashing
+    Utf8(String),
+    Boolean(bool),
+    Date32(i32),
 }
 
 /// Result of a subquery execution
@@ -43,8 +64,80 @@ impl SubqueryExecutor {
             inner: Arc::new(SubqueryExecutorInner {
                 tables: parking_lot::Mutex::new(tables),
                 cache: parking_lot::Mutex::new(HashMap::new()),
+                correlated_cache: parking_lot::Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    /// Extract correlation values from a batch row for cache key
+    fn extract_correlation_values(&self, batch: &RecordBatch, row: usize) -> Vec<CorrelationValue> {
+        use arrow::array::*;
+
+        batch
+            .columns()
+            .iter()
+            .map(|col| {
+                if col.is_null(row) {
+                    return CorrelationValue::Null;
+                }
+                match col.data_type() {
+                    arrow::datatypes::DataType::Int64 => {
+                        let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                        CorrelationValue::Int64(arr.value(row))
+                    }
+                    arrow::datatypes::DataType::Int32 => {
+                        let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
+                        CorrelationValue::Int32(arr.value(row))
+                    }
+                    arrow::datatypes::DataType::Float64 => {
+                        let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
+                        CorrelationValue::Float64Bits(arr.value(row).to_bits())
+                    }
+                    arrow::datatypes::DataType::Utf8 => {
+                        let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+                        CorrelationValue::Utf8(arr.value(row).to_string())
+                    }
+                    arrow::datatypes::DataType::Boolean => {
+                        let arr = col.as_any().downcast_ref::<BooleanArray>().unwrap();
+                        CorrelationValue::Boolean(arr.value(row))
+                    }
+                    arrow::datatypes::DataType::Date32 => {
+                        let arr = col.as_any().downcast_ref::<Date32Array>().unwrap();
+                        CorrelationValue::Date32(arr.value(row))
+                    }
+                    _ => CorrelationValue::Null,
+                }
+            })
+            .collect()
+    }
+
+    /// Try to get cached result for correlated subquery
+    fn get_correlated_cache(
+        &self,
+        plan_hash: usize,
+        correlation_values: &[CorrelationValue],
+    ) -> Option<SubqueryResult> {
+        let cache = self.inner.correlated_cache.lock();
+        let key = CorrelatedCacheKey {
+            plan_hash,
+            correlation_values: correlation_values.to_vec(),
+        };
+        cache.get(&key).cloned()
+    }
+
+    /// Cache result for correlated subquery
+    fn set_correlated_cache(
+        &self,
+        plan_hash: usize,
+        correlation_values: Vec<CorrelationValue>,
+        result: SubqueryResult,
+    ) {
+        let mut cache = self.inner.correlated_cache.lock();
+        let key = CorrelatedCacheKey {
+            plan_hash,
+            correlation_values,
+        };
+        cache.insert(key, result);
     }
 
     /// Register a table provider
@@ -600,34 +693,42 @@ fn execute_correlated_scalar_subquery(
     let num_rows = batch.num_rows();
     let mut results = Vec::with_capacity(num_rows);
 
-    // Get the column names from the batch that might be referenced in the subquery
-    let _batch_columns: Vec<String> = batch
-        .schema()
-        .fields()
-        .iter()
-        .map(|f| f.name().clone())
-        .collect();
+    // Compute plan hash once for cache key
+    let plan_hash = executor.plan_hash(plan);
 
     // For each row, we need to:
-    // 1. Find which columns in the plan are correlated (not in subquery's own tables)
-    // 2. Substitute those with literal values from the current row
-    // 3. Execute the modified subquery
+    // 1. Extract correlation key values
+    // 2. Check cache for existing result
+    // 3. If not cached, substitute columns and execute
+    // 4. Cache the result
 
-    // For MVP: execute subquery once per row, substituting correlated column values as literals
     for row in 0..num_rows {
-        // Substitute correlated columns with literal values from this row
+        // Extract correlation values for this row (used as cache key)
+        let correlation_values = executor.extract_correlation_values(batch, row);
+
+        // Check cache first
+        if let Some(SubqueryResult::Scalar(cached)) =
+            executor.get_correlated_cache(plan_hash, &correlation_values)
+        {
+            results.push(cached);
+            continue;
+        }
+
+        // Cache miss - execute the subquery
         let substituted_plan = substitute_correlated_columns(plan, batch, row)?;
 
-        // Execute the substituted subquery
-        match executor.execute_scalar(&substituted_plan) {
-            Ok(scalar) => {
-                results.push(scalar);
-            }
-            Err(_e) => {
-                // If still failing, return null for this row
-                results.push(crate::planner::ScalarValue::Null);
-            }
-        }
+        let scalar = match executor.execute_scalar(&substituted_plan) {
+            Ok(scalar) => scalar,
+            Err(_e) => crate::planner::ScalarValue::Null,
+        };
+
+        // Cache the result
+        executor.set_correlated_cache(
+            plan_hash,
+            correlation_values,
+            SubqueryResult::Scalar(scalar.clone()),
+        );
+        results.push(scalar);
     }
 
     // Convert results to an array
@@ -644,15 +745,34 @@ fn execute_correlated_exists_subquery(
     let num_rows = batch.num_rows();
     let mut results = Vec::with_capacity(num_rows);
 
+    // Compute plan hash once for cache key
+    let plan_hash = executor.plan_hash(subquery);
+
     for row in 0..num_rows {
-        // Substitute correlated columns with literal values from this row
+        // Extract correlation values for this row (used as cache key)
+        let correlation_values = executor.extract_correlation_values(batch, row);
+
+        // Check cache first
+        if let Some(SubqueryResult::Boolean(cached)) =
+            executor.get_correlated_cache(plan_hash, &correlation_values)
+        {
+            results.push(if negated { !cached } else { cached });
+            continue;
+        }
+
+        // Cache miss - execute the subquery
         let substituted_plan = substitute_correlated_columns(subquery, batch, row)?;
 
-        // Execute the substituted subquery (false on error)
         let exists = executor
             .execute_exists(&substituted_plan)
             .unwrap_or_default();
 
+        // Cache the result (before applying negation)
+        executor.set_correlated_cache(
+            plan_hash,
+            correlation_values,
+            SubqueryResult::Boolean(exists),
+        );
         results.push(if negated { !exists } else { exists });
     }
 
