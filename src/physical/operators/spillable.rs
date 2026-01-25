@@ -9,7 +9,9 @@ use crate::execution::{ExecutionConfig, SharedMemoryPool};
 use crate::physical::operators::filter::evaluate_expr;
 use crate::physical::{PhysicalOperator, RecordBatchStream};
 use crate::planner::{Expr, JoinType};
-use arrow::array::{ArrayRef, Int64Array, UInt32Array, UInt64Array};
+use arrow::array::{
+    ArrayRef, Date32Array, Float64Array, Int64Array, StringArray, UInt32Array, UInt64Array,
+};
 use arrow::compute;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -431,6 +433,31 @@ impl SpillableHashAggregateExec {
     }
 }
 
+/// State for an aggregate partition during processing
+struct AggregatePartition {
+    batches: Vec<RecordBatch>,
+    memory_bytes: usize,
+}
+
+impl AggregatePartition {
+    fn new() -> Self {
+        Self {
+            batches: Vec::new(),
+            memory_bytes: 0,
+        }
+    }
+
+    fn add_batch(&mut self, batch: RecordBatch) {
+        self.memory_bytes += estimate_batch_size(&batch);
+        self.batches.push(batch);
+    }
+
+    fn clear(&mut self) {
+        self.batches.clear();
+        self.memory_bytes = 0;
+    }
+}
+
 #[async_trait]
 impl PhysicalOperator for SpillableHashAggregateExec {
     fn schema(&self) -> SchemaRef {
@@ -442,14 +469,94 @@ impl PhysicalOperator for SpillableHashAggregateExec {
     }
 
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
-        // For now, delegate to the non-spilling version
-        // Full implementation would partition by group key hash and spill
-        let input_stream = self.input.execute(partition).await?;
-        let batches: Vec<RecordBatch> = input_stream.try_collect().await?;
+        // Ensure spill directory exists
+        self.config.ensure_spill_dir()?;
 
-        // Use the existing aggregation logic
-        let result = crate::physical::operators::hash_agg::aggregate_batches_external(
-            &batches,
+        let spill_dir =
+            self.config
+                .spill_path
+                .join(format!("agg_{}_{}", partition, std::process::id()));
+        std::fs::create_dir_all(&spill_dir).map_err(|e| {
+            QueryError::Execution(format!("Failed to create spill directory: {}", e))
+        })?;
+
+        let input_stream = self.input.execute(partition).await?;
+
+        // Process with partitioning and spilling
+        let (in_memory_partitions, spilled_files) = self
+            .aggregate_with_spilling(input_stream, &spill_dir)
+            .await?;
+
+        // Aggregate in-memory partitions
+        let mut all_results = Vec::new();
+
+        for part in in_memory_partitions.into_iter().flatten() {
+            if !part.batches.is_empty() {
+                let result = crate::physical::operators::hash_agg::aggregate_batches_external(
+                    &part.batches,
+                    &self.group_by,
+                    &self
+                        .aggregates
+                        .iter()
+                        .map(|a| crate::physical::operators::hash_agg::AggregateExpr {
+                            func: a.func,
+                            input: a.input.clone(),
+                            distinct: a.distinct,
+                            second_arg: a.second_arg.clone(),
+                        })
+                        .collect::<Vec<_>>(),
+                    &self.schema,
+                )?;
+                all_results.push(result);
+            }
+        }
+
+        // Process spilled partitions one at a time to limit memory
+        for spill_file in &spilled_files {
+            if let Some(path) = spill_file {
+                let batches = read_parquet(path)?;
+                if !batches.is_empty() {
+                    let result = crate::physical::operators::hash_agg::aggregate_batches_external(
+                        &batches,
+                        &self.group_by,
+                        &self
+                            .aggregates
+                            .iter()
+                            .map(|a| crate::physical::operators::hash_agg::AggregateExpr {
+                                func: a.func,
+                                input: a.input.clone(),
+                                distinct: a.distinct,
+                                second_arg: a.second_arg.clone(),
+                            })
+                            .collect::<Vec<_>>(),
+                        &self.schema,
+                    )?;
+                    all_results.push(result);
+                }
+            }
+        }
+
+        // Clean up spill directory
+        let _ = std::fs::remove_dir_all(&spill_dir);
+
+        // If we have results from multiple partitions, we need a final merge
+        // For now, concatenate all partial results (works for most aggregates)
+        if all_results.is_empty() {
+            // Return empty result with correct schema
+            let empty_batch = RecordBatch::new_empty(self.schema.clone());
+            return Ok(Box::pin(stream::once(async { Ok(empty_batch) })));
+        }
+
+        // If only one partition had data, return it directly
+        if all_results.len() == 1 {
+            return Ok(Box::pin(stream::once(
+                async move { Ok(all_results.remove(0)) },
+            )));
+        }
+
+        // Multiple partitions: need to re-aggregate the partial results
+        let final_result = crate::physical::operators::hash_agg::aggregate_batches_external(
+            &all_results,
             &self.group_by,
             &self
                 .aggregates
@@ -464,11 +571,87 @@ impl PhysicalOperator for SpillableHashAggregateExec {
             &self.schema,
         )?;
 
-        Ok(Box::pin(stream::once(async { Ok(result) })))
+        Ok(Box::pin(stream::once(async { Ok(final_result) })))
     }
 
     fn name(&self) -> &str {
         "SpillableHashAggregate"
+    }
+}
+
+impl SpillableHashAggregateExec {
+    /// Process input with hash partitioning and spilling when memory limit is reached
+    async fn aggregate_with_spilling(
+        &self,
+        mut input_stream: RecordBatchStream,
+        spill_dir: &PathBuf,
+    ) -> Result<(Vec<Option<AggregatePartition>>, Vec<Option<PathBuf>>)> {
+        let mut partitions: Vec<Option<AggregatePartition>> = (0..NUM_PARTITIONS)
+            .map(|_| Some(AggregatePartition::new()))
+            .collect();
+        let mut spilled_files: Vec<Option<PathBuf>> = (0..NUM_PARTITIONS).map(|_| None).collect();
+        let mut spill_file_counts: Vec<usize> = vec![0; NUM_PARTITIONS];
+
+        let mut total_memory: usize = 0;
+        let memory_threshold =
+            (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
+
+        while let Some(batch) = input_stream.try_next().await? {
+            let batch_size = estimate_batch_size(&batch);
+
+            // Check if we need to spill before adding more data
+            if total_memory + batch_size > memory_threshold {
+                // Find the largest partition to spill
+                if let Some(idx) = find_largest_agg_partition(&partitions) {
+                    if let Some(ref mut part) = partitions[idx] {
+                        if !part.batches.is_empty() {
+                            // Spill this partition
+                            let spill_path = spill_dir
+                                .join(format!("part_{}_{}.parquet", idx, spill_file_counts[idx]));
+                            spill_file_counts[idx] += 1;
+
+                            write_batches_to_parquet(&spill_path, &part.batches)?;
+                            self.memory_pool.record_spill(part.memory_bytes);
+                            total_memory -= part.memory_bytes;
+
+                            // If we already have a spill file for this partition, merge them
+                            if let Some(ref existing_path) = spilled_files[idx] {
+                                // Append new file path to a list file or merge
+                                // For simplicity, we'll just keep the latest and merge on read
+                                merge_parquet_files(existing_path, &spill_path, spill_dir, idx)?;
+                            } else {
+                                spilled_files[idx] = Some(spill_path);
+                            }
+
+                            part.clear();
+                        }
+                    }
+                }
+            }
+
+            // Partition the batch by group key hash
+            let partitioned = partition_batch_by_hash(&batch, &self.group_by, NUM_PARTITIONS)?;
+
+            for (idx, part_batch) in partitioned.into_iter().enumerate() {
+                if let Some(pb) = part_batch {
+                    let pb_size = estimate_batch_size(&pb);
+
+                    if let Some(ref mut part) = partitions[idx] {
+                        part.add_batch(pb);
+                        total_memory += pb_size;
+                    } else if let Some(ref spill_path) = spilled_files[idx] {
+                        // Partition was fully spilled, append to spill file
+                        let temp_path = spill_dir
+                            .join(format!("temp_{}_{}.parquet", idx, spill_file_counts[idx]));
+                        spill_file_counts[idx] += 1;
+                        write_batches_to_parquet(&temp_path, &[pb])?;
+                        merge_parquet_files(spill_path, &temp_path, spill_dir, idx)?;
+                    }
+                }
+            }
+        }
+
+        Ok((partitions, spilled_files))
     }
 }
 
@@ -625,24 +808,336 @@ impl ExternalSortExec {
     }
 
     fn merge_runs(&self, runs: &[PathBuf]) -> Result<Vec<RecordBatch>> {
-        // Simple implementation: read all runs and merge
-        // A production implementation would use streaming k-way merge
-        let mut all_batches = Vec::new();
+        // Streaming k-way merge: process runs in batches to limit memory
+        // Maximum number of runs to merge at once
+        const MAX_MERGE_FANIN: usize = 8;
+        // Maximum rows to buffer per run during merge
+        const MERGE_BUFFER_ROWS: usize = 8192;
 
-        for run in runs {
-            let batches = read_parquet(run)?;
-            all_batches.extend(batches);
-        }
-
-        if all_batches.is_empty() {
+        if runs.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Final merge sort
-        let combined = compute::concat_batches(&self.schema, &all_batches)?;
-        let sorted = sort_batch(&combined, &self.order_by)?;
+        if runs.len() == 1 {
+            return read_parquet(&runs[0]);
+        }
 
-        Ok(vec![sorted])
+        // If we have too many runs, merge in multiple passes
+        if runs.len() > MAX_MERGE_FANIN {
+            return self.multi_pass_merge(runs, MAX_MERGE_FANIN);
+        }
+
+        // Single-pass k-way merge with bounded memory
+        self.streaming_k_way_merge(runs, MERGE_BUFFER_ROWS)
+    }
+
+    /// Multi-pass merge for when there are too many runs
+    fn multi_pass_merge(&self, runs: &[PathBuf], fanin: usize) -> Result<Vec<RecordBatch>> {
+        let mut current_runs = runs.to_vec();
+        let mut pass = 0;
+
+        // Get spill directory from first run's parent
+        let spill_dir = runs[0].parent().unwrap_or(std::path::Path::new("/tmp"));
+
+        while current_runs.len() > fanin {
+            let mut next_runs = Vec::new();
+
+            for chunk in current_runs.chunks(fanin) {
+                if chunk.len() == 1 {
+                    next_runs.push(chunk[0].clone());
+                } else {
+                    // Merge this chunk into a new run
+                    let merged = self.streaming_k_way_merge(chunk, 8192)?;
+                    if !merged.is_empty() {
+                        let output_path = spill_dir.join(format!(
+                            "merged_pass{}_{}.parquet",
+                            pass,
+                            next_runs.len()
+                        ));
+                        write_batches_to_parquet(&output_path, &merged)?;
+                        next_runs.push(output_path);
+                    }
+                }
+            }
+
+            // Clean up old runs from previous pass (except original runs)
+            if pass > 0 {
+                for run in &current_runs {
+                    let _ = std::fs::remove_file(run);
+                }
+            }
+
+            current_runs = next_runs;
+            pass += 1;
+        }
+
+        // Final merge
+        self.streaming_k_way_merge(&current_runs, 8192)
+    }
+
+    /// Streaming k-way merge with bounded memory usage
+    fn streaming_k_way_merge(
+        &self,
+        runs: &[PathBuf],
+        buffer_rows: usize,
+    ) -> Result<Vec<RecordBatch>> {
+        use std::cmp::Ordering;
+        use std::collections::BinaryHeap;
+
+        if runs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Open iterators for each run
+        let mut run_iterators: Vec<
+            Box<dyn Iterator<Item = std::result::Result<RecordBatch, arrow::error::ArrowError>>>,
+        > = Vec::new();
+        let mut run_buffers: Vec<Option<RecordBatch>> = Vec::new();
+        let mut run_indices: Vec<usize> = Vec::new(); // Current row index in each buffer
+
+        for run in runs {
+            let file = File::open(run).map_err(|e| {
+                QueryError::Execution(format!("Failed to open run file {:?}: {}", run, e))
+            })?;
+            let builder =
+                ParquetRecordBatchReaderBuilder::try_new(file)?.with_batch_size(buffer_rows);
+            let reader = builder.build()?;
+            run_iterators.push(Box::new(reader));
+            run_buffers.push(None);
+            run_indices.push(0);
+        }
+
+        // Load initial batch from each run
+        for (i, iter) in run_iterators.iter_mut().enumerate() {
+            if let Some(batch_result) = iter.next() {
+                run_buffers[i] = Some(batch_result?);
+                run_indices[i] = 0;
+            }
+        }
+
+        // Build output batches using a simple row-by-row merge
+        // For better performance, we'd want to do vectorized merge, but this is memory-safe
+        let mut result_batches = Vec::new();
+        let mut output_rows: Vec<(usize, usize)> = Vec::new(); // (run_idx, row_idx)
+
+        // Helper to compare rows
+        let compare_rows = |batch_a: &RecordBatch,
+                            row_a: usize,
+                            batch_b: &RecordBatch,
+                            row_b: usize,
+                            order_by: &[crate::planner::SortExpr]|
+         -> std::cmp::Ordering {
+            for sort_expr in order_by {
+                let col_a = evaluate_expr(batch_a, &sort_expr.expr).ok();
+                let col_b = evaluate_expr(batch_b, &sort_expr.expr).ok();
+
+                if let (Some(a), Some(b)) = (col_a, col_b) {
+                    let cmp = compare_array_values(&a, row_a, &b, row_b);
+                    let cmp = if sort_expr.direction == crate::planner::SortDirection::Desc {
+                        cmp.reverse()
+                    } else {
+                        cmp
+                    };
+                    if cmp != Ordering::Equal {
+                        return cmp;
+                    }
+                }
+            }
+            Ordering::Equal
+        };
+
+        // Simple merge: repeatedly find minimum across all runs
+        loop {
+            // Find run with minimum current row
+            let mut min_run: Option<usize> = None;
+
+            for (run_idx, buffer) in run_buffers.iter().enumerate() {
+                if let Some(ref batch) = buffer {
+                    if run_indices[run_idx] < batch.num_rows() {
+                        min_run = match min_run {
+                            None => Some(run_idx),
+                            Some(current_min) => {
+                                let cmp = compare_rows(
+                                    batch,
+                                    run_indices[run_idx],
+                                    run_buffers[current_min].as_ref().unwrap(),
+                                    run_indices[current_min],
+                                    &self.order_by,
+                                );
+                                if cmp == Ordering::Less {
+                                    Some(run_idx)
+                                } else {
+                                    Some(current_min)
+                                }
+                            }
+                        };
+                    }
+                }
+            }
+
+            match min_run {
+                None => break, // All runs exhausted
+                Some(run_idx) => {
+                    output_rows.push((run_idx, run_indices[run_idx]));
+                    run_indices[run_idx] += 1;
+
+                    // Check if current buffer is exhausted
+                    if let Some(ref batch) = run_buffers[run_idx] {
+                        if run_indices[run_idx] >= batch.num_rows() {
+                            // Try to load next batch from this run
+                            if let Some(next_batch) = run_iterators[run_idx].next() {
+                                run_buffers[run_idx] = Some(next_batch?);
+                                run_indices[run_idx] = 0;
+                            } else {
+                                run_buffers[run_idx] = None;
+                            }
+                        }
+                    }
+
+                    // Flush output when buffer is full
+                    if output_rows.len() >= buffer_rows {
+                        let batch = self.build_merged_batch(&run_buffers, &output_rows)?;
+                        result_batches.push(batch);
+                        output_rows.clear();
+                    }
+                }
+            }
+        }
+
+        // Flush remaining output
+        if !output_rows.is_empty() {
+            // For the final batch, we need to reload any exhausted buffers
+            // that are referenced in output_rows
+            let batch = self.build_merged_batch_final(&runs, &output_rows, buffer_rows)?;
+            result_batches.push(batch);
+        }
+
+        Ok(result_batches)
+    }
+
+    /// Build a merged batch from the given row references
+    fn build_merged_batch(
+        &self,
+        run_buffers: &[Option<RecordBatch>],
+        rows: &[(usize, usize)],
+    ) -> Result<RecordBatch> {
+        if rows.is_empty() {
+            return Ok(RecordBatch::new_empty(self.schema.clone()));
+        }
+
+        // Group rows by run
+        let mut run_row_groups: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+        for (output_idx, &(run_idx, row_idx)) in rows.iter().enumerate() {
+            run_row_groups
+                .entry(run_idx)
+                .or_default()
+                .push((output_idx, row_idx));
+        }
+
+        // Build output columns
+        let num_cols = self.schema.fields().len();
+        let mut output_columns: Vec<Vec<(usize, ArrayRef)>> = vec![Vec::new(); num_cols];
+
+        for (run_idx, row_list) in run_row_groups {
+            if let Some(ref batch) = run_buffers[run_idx] {
+                let take_indices: Vec<u32> = row_list.iter().map(|(_, r)| *r as u32).collect();
+                let indices_arr = UInt32Array::from(take_indices);
+
+                for col_idx in 0..num_cols.min(batch.num_columns()) {
+                    let taken = compute::take(batch.column(col_idx), &indices_arr, None)?;
+                    for (i, (out_idx, _)) in row_list.iter().enumerate() {
+                        let single =
+                            compute::take(&taken, &UInt32Array::from(vec![i as u32]), None)?;
+                        output_columns[col_idx].push((*out_idx, single));
+                    }
+                }
+            }
+        }
+
+        // Sort and concatenate columns
+        let mut final_columns: Vec<ArrayRef> = Vec::new();
+        for col_parts in output_columns {
+            let mut sorted_parts = col_parts;
+            sorted_parts.sort_by_key(|(idx, _)| *idx);
+            let arrays: Vec<&dyn arrow::array::Array> =
+                sorted_parts.iter().map(|(_, arr)| arr.as_ref()).collect();
+            if arrays.is_empty() {
+                final_columns.push(arrow::array::new_null_array(
+                    self.schema.field(final_columns.len()).data_type(),
+                    rows.len(),
+                ));
+            } else {
+                final_columns.push(compute::concat(&arrays)?);
+            }
+        }
+
+        RecordBatch::try_new(self.schema.clone(), final_columns).map_err(Into::into)
+    }
+
+    /// Build final merged batch, reloading data from files if needed
+    fn build_merged_batch_final(
+        &self,
+        runs: &[PathBuf],
+        rows: &[(usize, usize)],
+        _buffer_rows: usize,
+    ) -> Result<RecordBatch> {
+        if rows.is_empty() {
+            return Ok(RecordBatch::new_empty(self.schema.clone()));
+        }
+
+        // For the final batch, we may need to re-read some runs
+        // Group by run and load only what we need
+        let mut run_row_groups: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+        for (output_idx, &(run_idx, row_idx)) in rows.iter().enumerate() {
+            run_row_groups
+                .entry(run_idx)
+                .or_default()
+                .push((output_idx, row_idx));
+        }
+
+        let num_cols = self.schema.fields().len();
+        let mut output_columns: Vec<Vec<(usize, ArrayRef)>> = vec![Vec::new(); num_cols];
+
+        for (run_idx, row_list) in run_row_groups {
+            // Read the run
+            let batches = read_parquet(&runs[run_idx])?;
+            if batches.is_empty() {
+                continue;
+            }
+
+            // Concatenate all batches from this run
+            let combined = compute::concat_batches(&batches[0].schema(), &batches)?;
+
+            let take_indices: Vec<u32> = row_list.iter().map(|(_, r)| *r as u32).collect();
+            let indices_arr = UInt32Array::from(take_indices);
+
+            for col_idx in 0..num_cols.min(combined.num_columns()) {
+                let taken = compute::take(combined.column(col_idx), &indices_arr, None)?;
+                for (i, (out_idx, _)) in row_list.iter().enumerate() {
+                    let single = compute::take(&taken, &UInt32Array::from(vec![i as u32]), None)?;
+                    output_columns[col_idx].push((*out_idx, single));
+                }
+            }
+        }
+
+        // Sort and concatenate columns
+        let mut final_columns: Vec<ArrayRef> = Vec::new();
+        for col_parts in output_columns {
+            let mut sorted_parts = col_parts;
+            sorted_parts.sort_by_key(|(idx, _)| *idx);
+            let arrays: Vec<&dyn arrow::array::Array> =
+                sorted_parts.iter().map(|(_, arr)| arr.as_ref()).collect();
+            if arrays.is_empty() {
+                final_columns.push(arrow::array::new_null_array(
+                    self.schema.field(final_columns.len()).data_type(),
+                    rows.len(),
+                ));
+            } else {
+                final_columns.push(compute::concat(&arrays)?);
+            }
+        }
+
+        RecordBatch::try_new(self.schema.clone(), final_columns).map_err(Into::into)
     }
 }
 
@@ -674,6 +1169,139 @@ fn find_largest_partition(partitions: &[Option<BuildPartition>]) -> Option<usize
         .filter_map(|(idx, p)| p.as_ref().map(|part| (idx, part.memory_bytes)))
         .max_by_key(|(_, size)| *size)
         .map(|(idx, _)| idx)
+}
+
+/// Find the index of the largest aggregate partition
+fn find_largest_agg_partition(partitions: &[Option<AggregatePartition>]) -> Option<usize> {
+    partitions
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, p)| p.as_ref().map(|part| (idx, part.memory_bytes)))
+        .max_by_key(|(_, size)| *size)
+        .map(|(idx, _)| idx)
+}
+
+/// Merge two parquet files into one, using streaming to limit memory
+fn merge_parquet_files(
+    existing: &PathBuf,
+    new_file: &PathBuf,
+    spill_dir: &PathBuf,
+    partition_idx: usize,
+) -> Result<()> {
+    // Use a streaming approach: create a new merged file
+    let merged_path = spill_dir.join(format!("merged_{}.parquet", partition_idx));
+
+    // Open readers for both files
+    let file1 = File::open(existing)
+        .map_err(|e| QueryError::Execution(format!("Failed to open file {:?}: {}", existing, e)))?;
+    let file2 = File::open(new_file)
+        .map_err(|e| QueryError::Execution(format!("Failed to open file {:?}: {}", new_file, e)))?;
+
+    let reader1 = ParquetRecordBatchReaderBuilder::try_new(file1)?
+        .with_batch_size(8192)
+        .build()?;
+    let reader2 = ParquetRecordBatchReaderBuilder::try_new(file2)?
+        .with_batch_size(8192)
+        .build()?;
+
+    // Get schema from first file
+    let schema = {
+        let file = File::open(existing)?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        builder.schema().clone()
+    };
+
+    // Create output file
+    let output_file = File::create(&merged_path).map_err(|e| {
+        QueryError::Execution(format!(
+            "Failed to create merged file {:?}: {}",
+            merged_path, e
+        ))
+    })?;
+
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+
+    let mut writer = ArrowWriter::try_new(output_file, schema, Some(props))?;
+
+    // Stream batches from both files
+    for batch_result in reader1 {
+        let batch = batch_result?;
+        writer.write(&batch)?;
+    }
+
+    for batch_result in reader2 {
+        let batch = batch_result?;
+        writer.write(&batch)?;
+    }
+
+    writer.close()?;
+
+    // Replace existing file with merged file
+    std::fs::rename(&merged_path, existing)
+        .map_err(|e| QueryError::Execution(format!("Failed to rename merged file: {}", e)))?;
+
+    // Remove the new file since it's been merged
+    let _ = std::fs::remove_file(new_file);
+
+    Ok(())
+}
+
+/// Compare two array values at given indices
+fn compare_array_values(
+    a: &ArrayRef,
+    row_a: usize,
+    b: &ArrayRef,
+    row_b: usize,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    // Handle nulls
+    let a_null = a.is_null(row_a);
+    let b_null = b.is_null(row_b);
+
+    match (a_null, b_null) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Greater, // nulls last
+        (false, true) => return Ordering::Less,
+        (false, false) => {}
+    }
+
+    // Compare based on type
+    if let Some(arr_a) = a.as_any().downcast_ref::<Int64Array>() {
+        if let Some(arr_b) = b.as_any().downcast_ref::<Int64Array>() {
+            return arr_a.value(row_a).cmp(&arr_b.value(row_b));
+        }
+    }
+
+    if let Some(arr_a) = a.as_any().downcast_ref::<arrow::array::Int32Array>() {
+        if let Some(arr_b) = b.as_any().downcast_ref::<arrow::array::Int32Array>() {
+            return arr_a.value(row_a).cmp(&arr_b.value(row_b));
+        }
+    }
+
+    if let Some(arr_a) = a.as_any().downcast_ref::<Float64Array>() {
+        if let Some(arr_b) = b.as_any().downcast_ref::<Float64Array>() {
+            let va = arr_a.value(row_a);
+            let vb = arr_b.value(row_b);
+            return va.partial_cmp(&vb).unwrap_or(Ordering::Equal);
+        }
+    }
+
+    if let Some(arr_a) = a.as_any().downcast_ref::<StringArray>() {
+        if let Some(arr_b) = b.as_any().downcast_ref::<StringArray>() {
+            return arr_a.value(row_a).cmp(arr_b.value(row_b));
+        }
+    }
+
+    if let Some(arr_a) = a.as_any().downcast_ref::<Date32Array>() {
+        if let Some(arr_b) = b.as_any().downcast_ref::<Date32Array>() {
+            return arr_a.value(row_a).cmp(&arr_b.value(row_b));
+        }
+    }
+
+    Ordering::Equal
 }
 
 /// Partition a batch by hash of key columns
@@ -743,17 +1371,56 @@ fn write_batches_to_parquet(path: &PathBuf, batches: &[RecordBatch]) -> Result<(
     Ok(())
 }
 
-/// Append a batch to an existing Parquet file (or create new)
+/// Append a batch to an existing Parquet file (or create new) using streaming
 fn append_to_parquet(path: &PathBuf, batch: &RecordBatch) -> Result<()> {
-    // For simplicity, read existing, append, and rewrite
-    // A production implementation would use a proper append mechanism
-    let mut batches = if path.exists() {
-        read_parquet(path)?
-    } else {
-        Vec::new()
+    if !path.exists() {
+        // No existing file, just write the batch
+        return write_batches_to_parquet(path, &[batch.clone()]);
+    }
+
+    // Streaming append: create temp file, stream existing + new batch, then rename
+    let temp_path = path.with_extension("parquet.tmp");
+
+    // Get schema from existing file
+    let schema = {
+        let file = File::open(path)?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        builder.schema().clone()
     };
-    batches.push(batch.clone());
-    write_batches_to_parquet(path, &batches)
+
+    // Create output writer
+    let output_file = File::create(&temp_path).map_err(|e| {
+        QueryError::Execution(format!("Failed to create temp file {:?}: {}", temp_path, e))
+    })?;
+
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+
+    let mut writer = ArrowWriter::try_new(output_file, schema, Some(props))?;
+
+    // Stream existing batches (one at a time to limit memory)
+    {
+        let existing_file = File::open(path)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(existing_file)?
+            .with_batch_size(8192)
+            .build()?;
+
+        for batch_result in reader {
+            let existing_batch = batch_result?;
+            writer.write(&existing_batch)?;
+        }
+    }
+
+    // Write the new batch
+    writer.write(batch)?;
+    writer.close()?;
+
+    // Atomically replace old file with new
+    std::fs::rename(&temp_path, path)
+        .map_err(|e| QueryError::Execution(format!("Failed to rename temp file: {}", e)))?;
+
+    Ok(())
 }
 
 /// Read batches from a Parquet file

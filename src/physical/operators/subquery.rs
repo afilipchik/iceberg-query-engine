@@ -125,6 +125,9 @@ impl SubqueryExecutor {
         cache.get(&key).cloned()
     }
 
+    /// Maximum number of entries in the correlated cache to prevent unbounded memory growth
+    const MAX_CORRELATED_CACHE_SIZE: usize = 100_000;
+
     /// Cache result for correlated subquery
     fn set_correlated_cache(
         &self,
@@ -133,6 +136,13 @@ impl SubqueryExecutor {
         result: SubqueryResult,
     ) {
         let mut cache = self.inner.correlated_cache.lock();
+
+        // If cache is too large, clear it to prevent unbounded memory growth
+        // This is a simple strategy - a more sophisticated approach would use LRU eviction
+        if cache.len() >= Self::MAX_CORRELATED_CACHE_SIZE {
+            cache.clear();
+        }
+
         let key = CorrelatedCacheKey {
             plan_hash,
             correlation_values,
