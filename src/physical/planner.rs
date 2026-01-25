@@ -6,7 +6,7 @@ use crate::physical::operators::{
     ProjectExec, SortExec, SubqueryExecutor, TableProvider, UnionExec,
 };
 use crate::physical::PhysicalOperator;
-use crate::planner::{Expr, LogicalPlan, PlanSchema};
+use crate::planner::{Expr, JoinType, LogicalPlan, PlanSchema};
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -113,15 +113,30 @@ impl PhysicalPlanner {
                 let left = self.create_physical_plan(&node.left)?;
                 let right = self.create_physical_plan(&node.right)?;
 
-                let join = HashJoinExec::new(left, right, node.on.clone(), node.join_type);
+                // For Semi/Anti joins, the filter must be evaluated inside the join
+                // because the output doesn't include right-side columns
+                let is_semi_anti = matches!(node.join_type, JoinType::Semi | JoinType::Anti);
 
-                // Apply additional filter if present
-                match &node.filter {
-                    Some(predicate) => {
-                        let filter = self.create_filter(Arc::new(join), predicate.clone());
-                        Ok(Arc::new(filter))
+                if is_semi_anti && node.filter.is_some() {
+                    let join = HashJoinExec::with_filter(
+                        left,
+                        right,
+                        node.on.clone(),
+                        node.join_type,
+                        node.filter.clone(),
+                    );
+                    Ok(Arc::new(join))
+                } else {
+                    let join = HashJoinExec::new(left, right, node.on.clone(), node.join_type);
+
+                    // Apply additional filter if present (for non-Semi/Anti joins)
+                    match &node.filter {
+                        Some(predicate) => {
+                            let filter = self.create_filter(Arc::new(join), predicate.clone());
+                            Ok(Arc::new(filter))
+                        }
+                        None => Ok(Arc::new(join)),
                     }
-                    None => Ok(Arc::new(join)),
                 }
             }
 

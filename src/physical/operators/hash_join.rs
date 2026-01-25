@@ -24,6 +24,10 @@ pub struct HashJoinExec {
     on: Vec<(Expr, Expr)>,
     join_type: JoinType,
     schema: SchemaRef,
+    /// Optional filter to evaluate during the join (required for Semi/Anti joins with filters)
+    filter: Option<Expr>,
+    /// Schema combining left and right for filter evaluation
+    combined_schema: SchemaRef,
 }
 
 impl HashJoinExec {
@@ -32,6 +36,16 @@ impl HashJoinExec {
         right: Arc<dyn PhysicalOperator>,
         on: Vec<(Expr, Expr)>,
         join_type: JoinType,
+    ) -> Self {
+        Self::with_filter(left, right, on, join_type, None)
+    }
+
+    pub fn with_filter(
+        left: Arc<dyn PhysicalOperator>,
+        right: Arc<dyn PhysicalOperator>,
+        on: Vec<(Expr, Expr)>,
+        join_type: JoinType,
+        filter: Option<Expr>,
     ) -> Self {
         let left_schema = left.schema();
         let right_schema = right.schema();
@@ -64,12 +78,24 @@ impl HashJoinExec {
             }
         };
 
+        // Create combined schema for filter evaluation (left + right)
+        let combined_fields: Vec<_> = left
+            .schema()
+            .fields()
+            .iter()
+            .chain(right.schema().fields().iter())
+            .cloned()
+            .collect();
+        let combined_schema = Arc::new(Schema::new(combined_fields));
+
         Self {
             left,
             right,
             on,
             join_type,
             schema,
+            filter,
+            combined_schema,
         }
     }
 }
@@ -113,6 +139,8 @@ impl PhysicalOperator for HashJoinExec {
             self.join_type,
             swapped,
             &self.schema,
+            self.filter.as_ref(),
+            &self.combined_schema,
         )?;
 
         Ok(Box::pin(stream::iter(result.into_iter().map(Ok))))
@@ -327,7 +355,50 @@ fn extract_join_key(arrays: &[ArrayRef], row: usize) -> JoinKey {
     JoinKey { values }
 }
 
+/// Create a combined batch from multiple build/probe row pairs for batch filter evaluation
+fn create_combined_batch(
+    build_batches: &[RecordBatch],
+    build_indices: &[(usize, usize)], // (batch_idx, row_idx)
+    probe_batch: &RecordBatch,
+    probe_indices: &[usize],
+    swapped: bool,
+    combined_schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    if build_indices.is_empty() {
+        return Ok(RecordBatch::new_empty(combined_schema.clone()));
+    }
+
+    // Gather columns from build side
+    let build_columns: Result<Vec<ArrayRef>> = if build_batches.is_empty() {
+        Ok(vec![])
+    } else {
+        (0..build_batches[0].num_columns())
+            .map(|col_idx| gather_column(build_batches, col_idx, build_indices))
+            .collect()
+    };
+    let build_columns = build_columns?;
+
+    // Gather columns from probe side
+    let probe_indices_u32: Vec<u32> = probe_indices.iter().map(|&i| i as u32).collect();
+    let take_indices = UInt32Array::from(probe_indices_u32);
+    let probe_columns: Vec<ArrayRef> = probe_batch
+        .columns()
+        .iter()
+        .map(|col| compute::take(col.as_ref(), &take_indices, None))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    // Combine in correct order (left then right, accounting for swap)
+    let all_columns = if swapped {
+        probe_columns.into_iter().chain(build_columns).collect()
+    } else {
+        build_columns.into_iter().chain(probe_columns).collect()
+    };
+
+    RecordBatch::try_new(combined_schema.clone(), all_columns).map_err(Into::into)
+}
+
 #[allow(clippy::needless_range_loop)] // Index needed for parallel array access
+#[allow(clippy::too_many_arguments)]
 fn probe_hash_table(
     build_batches: &[RecordBatch],
     probe_batches: &[RecordBatch],
@@ -336,6 +407,8 @@ fn probe_hash_table(
     join_type: JoinType,
     swapped: bool,
     output_schema: &SchemaRef,
+    filter: Option<&Expr>,
+    combined_schema: &SchemaRef,
 ) -> Result<Vec<RecordBatch>> {
     let mut results = Vec::new();
 
@@ -352,9 +425,9 @@ fn probe_hash_table(
             .collect();
         let probe_key_arrays = probe_key_arrays?;
 
-        let mut build_indices: Vec<(usize, usize)> = Vec::new(); // (batch_idx, row_idx)
-        let mut probe_indices: Vec<usize> = Vec::new();
-        let mut probe_matched = vec![false; probe_batch.num_rows()];
+        // First pass: collect all candidate pairs from hash table lookup
+        let mut candidate_build_indices: Vec<(usize, usize)> = Vec::new();
+        let mut candidate_probe_indices: Vec<usize> = Vec::new();
 
         for probe_row in 0..probe_batch.num_rows() {
             let key = extract_join_key(&probe_key_arrays, probe_row);
@@ -365,12 +438,64 @@ fn probe_hash_table(
             }
 
             if let Some(entries) = hash_table.get(&key) {
-                probe_matched[probe_row] = true;
                 for entry in entries {
-                    build_matched[entry.batch_idx][entry.row_idx] = true;
-                    build_indices.push((entry.batch_idx, entry.row_idx));
-                    probe_indices.push(probe_row);
+                    candidate_build_indices.push((entry.batch_idx, entry.row_idx));
+                    candidate_probe_indices.push(probe_row);
                 }
+            }
+        }
+
+        // For Semi/Anti joins with filter, evaluate filter on all candidates at once
+        let (build_indices, probe_indices) =
+            if matches!(join_type, JoinType::Semi | JoinType::Anti) && filter.is_some() {
+                if candidate_build_indices.is_empty() {
+                    (vec![], vec![])
+                } else {
+                    // Create combined batch with all candidate pairs
+                    let combined_batch = create_combined_batch(
+                        build_batches,
+                        &candidate_build_indices,
+                        probe_batch,
+                        &candidate_probe_indices,
+                        swapped,
+                        combined_schema,
+                    )?;
+
+                    // Evaluate filter on entire batch
+                    let filter_result = evaluate_expr(&combined_batch, filter.unwrap())?;
+                    let filter_mask = filter_result
+                        .as_any()
+                        .downcast_ref::<arrow::array::BooleanArray>();
+
+                    // Filter the indices based on filter result
+                    let mut filtered_build_indices = Vec::new();
+                    let mut filtered_probe_indices = Vec::new();
+
+                    if let Some(mask) = filter_mask {
+                        for i in 0..mask.len() {
+                            if mask.value(i) {
+                                filtered_build_indices.push(candidate_build_indices[i]);
+                                filtered_probe_indices.push(candidate_probe_indices[i]);
+                            }
+                        }
+                    } else {
+                        // If filter didn't return boolean array, keep all candidates
+                        filtered_build_indices = candidate_build_indices;
+                        filtered_probe_indices = candidate_probe_indices;
+                    }
+
+                    (filtered_build_indices, filtered_probe_indices)
+                }
+            } else {
+                (candidate_build_indices, candidate_probe_indices)
+            };
+
+        // Update matched tracking
+        let mut probe_matched = vec![false; probe_batch.num_rows()];
+        for (i, (batch_idx, row_idx)) in build_indices.iter().enumerate() {
+            probe_matched[probe_indices[i]] = true;
+            if *batch_idx < build_matched.len() && *row_idx < build_matched[*batch_idx].len() {
+                build_matched[*batch_idx][*row_idx] = true;
             }
         }
 
