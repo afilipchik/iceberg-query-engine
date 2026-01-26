@@ -356,6 +356,8 @@ pub struct StreamingParquetScanBuilder {
     projection: Option<Vec<usize>>,
     batch_size: usize,
     /// Predicate for row group pruning (column_idx, min, max) -> should_include
+    #[allow(dead_code)]
+    #[allow(clippy::type_complexity)]
     row_group_filter: Option<Box<dyn Fn(usize, &ParquetFileInfo) -> bool + Send + Sync>>,
 }
 

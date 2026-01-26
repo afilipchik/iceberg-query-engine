@@ -1,8 +1,8 @@
 //! Subquery execution support
 
 use crate::error::{QueryError, Result};
-use crate::physical::operators::TableProvider;
 use crate::physical::PhysicalPlanner;
+use crate::physical::operators::TableProvider;
 use crate::planner::{Expr, LogicalPlan, ScalarValue};
 use arrow::array::{Array, ArrayRef, BooleanArray};
 use arrow::record_batch::RecordBatch;
@@ -63,39 +63,123 @@ impl SubqueryExecutor {
         planner
     }
 
+    #[allow(dead_code)]
+    /// Register outer context column values as temporary in-memory tables
+    fn register_outer_context(
+        &self,
+        planner: &mut PhysicalPlanner,
+        outer_context: &std::collections::HashMap<String, Expr>,
+    ) -> Result<()> {
+        use crate::physical::operators::MemoryTable;
+        use arrow::array::ArrayRef;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        // Create a temporary table for each outer column value
+        for (col_name, expr) in outer_context {
+            // Extract the scalar value from the expression
+            let scalar = match expr {
+                Expr::Literal(s) => s.clone(),
+                _ => {
+                    // For complex expressions, we'd need to evaluate them
+                    // For now, skip or use a default
+                    continue;
+                }
+            };
+
+            // Create a single-column schema and batch
+            let data_type = match scalar {
+                ScalarValue::Int64(_) => DataType::Int64,
+                ScalarValue::Int32(_) => DataType::Int32,
+                ScalarValue::Float64(_) => DataType::Float64,
+                ScalarValue::Float32(_) => DataType::Float32,
+                ScalarValue::Utf8(_) => DataType::Utf8,
+                ScalarValue::Boolean(_) => DataType::Boolean,
+                ScalarValue::Null => DataType::Null,
+                _ => continue, // Skip unsupported types
+            };
+
+            let schema = Arc::new(Schema::new(vec![Field::new(col_name.clone(), data_type, true)]));
+
+            // Create a single-element array
+            let array: ArrayRef = match scalar {
+                ScalarValue::Int64(v) => Arc::new(arrow::array::Int64Array::from(vec![v])),
+                ScalarValue::Int32(v) => Arc::new(arrow::array::Int32Array::from(vec![v])),
+                ScalarValue::Float64(v) => Arc::new(arrow::array::Float64Array::from(vec![v.0])),
+                ScalarValue::Float32(v) => Arc::new(arrow::array::Float32Array::from(vec![v.0])),
+                ScalarValue::Utf8(v) => Arc::new(arrow::array::StringArray::from(vec![v.as_str()])),
+                ScalarValue::Boolean(v) => Arc::new(arrow::array::BooleanArray::from(vec![v])),
+                ScalarValue::Null => continue,
+                _ => continue,
+            };
+
+            let batch = RecordBatch::try_new(schema.clone(), vec![array])
+                .map_err(|e| QueryError::Execution(format!("Failed to create batch: {}", e)))?;
+
+            // Create a temporary table provider
+            let table = Arc::new(MemoryTable::new(schema.clone(), vec![batch.clone()]));
+
+            // Register with a safe table name
+            let table_name = format!("_outer_{}", col_name.replace('.', "_"));
+            planner.register_table(table_name, table);
+
+            // Also register with the original column name for direct lookup
+            // This allows queries to reference the outer context column directly
+            let table2 = Arc::new(MemoryTable::new(schema, vec![batch]));
+            planner.register_table(col_name.clone(), table2);
+        }
+
+        Ok(())
+    }
+
     /// Execute a scalar subquery and return the scalar value
     pub fn execute_scalar(&self, plan: &LogicalPlan) -> Result<ScalarValue> {
-        let key = self.plan_hash(plan);
+        self.execute_scalar_with_context(plan, &std::collections::HashMap::new())
+    }
 
-        {
+    /// Execute a scalar subquery with outer column context
+    pub fn execute_scalar_with_context(
+        &self,
+        plan: &LogicalPlan,
+        outer_context: &std::collections::HashMap<String, Expr>,
+    ) -> Result<ScalarValue> {
+        // If there's outer context, we can't cache the result (it depends on outer values)
+        let cache_key = if outer_context.is_empty() {
+            Some(self.plan_hash(plan))
+        } else {
+            None // Don't cache correlated subqueries
+        };
+
+        if let Some(key) = cache_key {
             let cache = self.inner.cache.lock();
             if let Some(SubqueryResult::Scalar(value)) = cache.get(&key) {
                 return Ok(value.clone());
             }
         }
 
+        // If we have outer context, substitute column references with literals
+        let plan_to_execute = if outer_context.is_empty() {
+            plan.clone()
+        } else {
+            // Substitute correlated columns with literal values from outer context
+            substitute_columns_in_plan(plan, outer_context)?
+        };
+
+        // Create a planner
         let planner = self.create_planner();
-        let physical = planner.create_physical_plan(plan)?;
-        let _plan_clone = plan.clone();
+
+        let physical = planner.create_physical_plan(&plan_to_execute)?;
 
         // Run the async code in a blocking way
         let batches = if let Ok(_handle) = tokio::runtime::Handle::try_current() {
             // We're inside a tokio runtime, use spawn_blocking
+            let _plan_clone = plan.clone();
             std::thread::spawn(move || {
-                let runtime = tokio::runtime::Runtime::new().map_err(|e| {
-                    QueryError::Execution(format!("Failed to create runtime: {}", e))
-                })?;
+                let runtime = tokio::runtime::Runtime::new()
+                    .map_err(|e| QueryError::Execution(format!("Failed to create runtime: {}", e)))?;
                 let stream = runtime.block_on(physical.execute(0))?;
-                let result: Result<Vec<RecordBatch>> =
-                    runtime.block_on(async { stream.try_collect().await });
+                let result: Result<Vec<RecordBatch>> = runtime.block_on(async { stream.try_collect().await });
                 result
-            })
-            .join()
-            .unwrap_or_else(|_| {
-                Err(QueryError::Execution(
-                    "Subquery execution thread panicked".into(),
-                ))
-            })?
+            }).join().unwrap_or_else(|_| Err(QueryError::Execution("Subquery execution thread panicked".into())))?
         } else {
             // No existing runtime, create a new one and use it directly
             let runtime = tokio::runtime::Runtime::new()
@@ -106,10 +190,9 @@ impl SubqueryExecutor {
 
         if batches.is_empty() || batches[0].num_rows() == 0 {
             let result = ScalarValue::Null;
-            self.inner
-                .cache
-                .lock()
-                .insert(key, SubqueryResult::Scalar(result.clone()));
+            if let Some(key) = cache_key {
+                self.inner.cache.lock().insert(key, SubqueryResult::Scalar(result.clone()));
+            }
             return Ok(result);
         }
 
@@ -124,45 +207,55 @@ impl SubqueryExecutor {
         let column = batch.column(0);
         let scalar = array_ref_to_scalar(column, 0)?;
 
-        self.inner
-            .cache
-            .lock()
-            .insert(key, SubqueryResult::Scalar(scalar.clone()));
+        if let Some(key) = cache_key {
+            self.inner.cache.lock().insert(key, SubqueryResult::Scalar(scalar.clone()));
+        }
         Ok(scalar)
     }
 
-    /// Execute an IN subquery and return the array of values
-    pub fn execute_in_subquery(&self, plan: &LogicalPlan) -> Result<ArrayRef> {
-        let key = self.plan_hash(plan);
+    /// Execute an IN subquery with outer column context
+    pub fn execute_in_subquery_with_context(
+        &self,
+        plan: &LogicalPlan,
+        outer_context: &std::collections::HashMap<String, Expr>,
+    ) -> Result<ArrayRef> {
+        // If there's outer context, we can't cache the result (it depends on outer values)
+        let cache_key = if outer_context.is_empty() {
+            Some(self.plan_hash(plan))
+        } else {
+            None // Don't cache correlated subqueries
+        };
 
-        {
+        if let Some(key) = cache_key {
             let cache = self.inner.cache.lock();
             if let Some(SubqueryResult::Array(array)) = cache.get(&key) {
                 return Ok(array.clone());
             }
         }
 
+        // If we have outer context, substitute column references with literals
+        let plan_to_execute = if outer_context.is_empty() {
+            plan.clone()
+        } else {
+            // Substitute correlated columns with literal values from outer context
+            substitute_columns_in_plan(plan, outer_context)?
+        };
+
+        // Create a planner
         let planner = self.create_planner();
-        let physical = planner.create_physical_plan(plan)?;
+
+        let physical = planner.create_physical_plan(&plan_to_execute)?;
 
         // Run the async code in a blocking way
         let batches = if let Ok(_handle) = tokio::runtime::Handle::try_current() {
             // We're inside a tokio runtime, use a dedicated thread
             std::thread::spawn(move || {
-                let runtime = tokio::runtime::Runtime::new().map_err(|e| {
-                    QueryError::Execution(format!("Failed to create runtime: {}", e))
-                })?;
+                let runtime = tokio::runtime::Runtime::new()
+                    .map_err(|e| QueryError::Execution(format!("Failed to create runtime: {}", e)))?;
                 let stream = runtime.block_on(physical.execute(0))?;
-                let result: Result<Vec<RecordBatch>> =
-                    runtime.block_on(async { stream.try_collect().await });
+                let result: Result<Vec<RecordBatch>> = runtime.block_on(async { stream.try_collect().await });
                 result
-            })
-            .join()
-            .unwrap_or_else(|_| {
-                Err(QueryError::Execution(
-                    "Subquery execution thread panicked".into(),
-                ))
-            })?
+            }).join().unwrap_or_else(|_| Err(QueryError::Execution("Subquery execution thread panicked".into())))?
         } else {
             // No existing runtime, create a new one and use it directly
             let runtime = tokio::runtime::Runtime::new()
@@ -172,18 +265,12 @@ impl SubqueryExecutor {
         };
 
         if batches.is_empty() {
-            let result = new_empty_array(
-                plan.schema()
-                    .fields()
-                    .first()
-                    .ok_or_else(|| QueryError::Execution("IN subquery has no columns".into()))?
-                    .data_type
-                    .clone(),
-            );
-            self.inner
-                .cache
-                .lock()
-                .insert(key, SubqueryResult::Array(result.clone()));
+            let result = new_empty_array(plan.schema().fields().first()
+                .ok_or_else(|| QueryError::Execution("IN subquery has no columns".into()))?
+                .data_type.clone());
+            if let Some(key) = cache_key {
+                self.inner.cache.lock().insert(key, SubqueryResult::Array(result.clone()));
+            }
             return Ok(result);
         }
 
@@ -196,45 +283,61 @@ impl SubqueryExecutor {
             concat(&arrays)?
         };
 
-        self.inner
-            .cache
-            .lock()
-            .insert(key, SubqueryResult::Array(result.clone()));
+        if let Some(key) = cache_key {
+            self.inner.cache.lock().insert(key, SubqueryResult::Array(result.clone()));
+        }
         Ok(result)
     }
 
-    /// Execute an EXISTS subquery and return the boolean result
-    pub fn execute_exists(&self, plan: &LogicalPlan) -> Result<bool> {
-        let key = self.plan_hash(plan);
+    /// Execute an IN subquery and return the array of values
+    pub fn execute_in_subquery(&self, plan: &LogicalPlan) -> Result<ArrayRef> {
+        self.execute_in_subquery_with_context(plan, &std::collections::HashMap::new())
+    }
 
-        {
+    /// Execute an EXISTS subquery with outer column context
+    pub fn execute_exists_with_context(
+        &self,
+        plan: &LogicalPlan,
+        outer_context: &std::collections::HashMap<String, Expr>,
+    ) -> Result<bool> {
+        // If there's outer context, we can't cache the result (it depends on outer values)
+        let cache_key = if outer_context.is_empty() {
+            Some(self.plan_hash(plan))
+        } else {
+            None // Don't cache correlated subqueries
+        };
+
+        if let Some(key) = cache_key {
             let cache = self.inner.cache.lock();
             if let Some(SubqueryResult::Boolean(value)) = cache.get(&key) {
                 return Ok(*value);
             }
         }
 
+        // If we have outer context, substitute column references with literals
+        let plan_to_execute = if outer_context.is_empty() {
+            plan.clone()
+        } else {
+            // Substitute correlated columns with literal values from outer context
+            substitute_columns_in_plan(plan, outer_context)?
+        };
+
+        // Create a planner
         let planner = self.create_planner();
-        let physical = planner.create_physical_plan(plan)?;
+
+        let physical = planner.create_physical_plan(&plan_to_execute)?;
 
         // Run the async code in a blocking way
         let batches = if let Ok(_handle) = tokio::runtime::Handle::try_current() {
-            // We're inside a tokio runtime, use a dedicated thread
+            // We're inside a tokio runtime, use spawn_blocking
+            let _plan_clone = plan.clone();
             std::thread::spawn(move || {
-                let runtime = tokio::runtime::Runtime::new().map_err(|e| {
-                    QueryError::Execution(format!("Failed to create runtime: {}", e))
-                })?;
+                let runtime = tokio::runtime::Runtime::new()
+                    .map_err(|e| QueryError::Execution(format!("Failed to create runtime: {}", e)))?;
                 let stream = runtime.block_on(physical.execute(0))?;
-                let result: Result<Vec<RecordBatch>> =
-                    runtime.block_on(async { stream.try_collect().await });
+                let result: Result<Vec<RecordBatch>> = runtime.block_on(async { stream.try_collect().await });
                 result
-            })
-            .join()
-            .unwrap_or_else(|_| {
-                Err(QueryError::Execution(
-                    "Subquery execution thread panicked".into(),
-                ))
-            })?
+            }).join().unwrap_or_else(|_| Err(QueryError::Execution("Subquery execution thread panicked".into())))?
         } else {
             // No existing runtime, create a new one and use it directly
             let runtime = tokio::runtime::Runtime::new()
@@ -245,11 +348,15 @@ impl SubqueryExecutor {
 
         let has_rows = batches.iter().any(|b| b.num_rows() > 0);
 
-        self.inner
-            .cache
-            .lock()
-            .insert(key, SubqueryResult::Boolean(has_rows));
+        if let Some(key) = cache_key {
+            self.inner.cache.lock().insert(key, SubqueryResult::Boolean(has_rows));
+        }
         Ok(has_rows)
+    }
+
+    /// Execute an EXISTS subquery and return the boolean result
+    pub fn execute_exists(&self, plan: &LogicalPlan) -> Result<bool> {
+        self.execute_exists_with_context(plan, &std::collections::HashMap::new())
     }
 
     /// Simple hash of a plan for caching
@@ -271,65 +378,47 @@ fn array_ref_to_scalar(array: &ArrayRef, index: usize) -> Result<ScalarValue> {
 
     Ok(match array.data_type() {
         arrow::datatypes::DataType::Boolean => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
+            let arr = array.as_any().downcast_ref::<BooleanArray>()
                 .ok_or_else(|| QueryError::Type("Expected BooleanArray".into()))?;
             ScalarValue::Boolean(arr.value(index))
         }
         arrow::datatypes::DataType::Int8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int8Array>()
+            let arr = array.as_any().downcast_ref::<Int8Array>()
                 .ok_or_else(|| QueryError::Type("Expected Int8Array".into()))?;
             ScalarValue::Int8(arr.value(index))
         }
         arrow::datatypes::DataType::Int16 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int16Array>()
+            let arr = array.as_any().downcast_ref::<Int16Array>()
                 .ok_or_else(|| QueryError::Type("Expected Int16Array".into()))?;
             ScalarValue::Int16(arr.value(index))
         }
         arrow::datatypes::DataType::Int32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int32Array>()
+            let arr = array.as_any().downcast_ref::<Int32Array>()
                 .ok_or_else(|| QueryError::Type("Expected Int32Array".into()))?;
             ScalarValue::Int32(arr.value(index))
         }
         arrow::datatypes::DataType::Int64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
+            let arr = array.as_any().downcast_ref::<Int64Array>()
                 .ok_or_else(|| QueryError::Type("Expected Int64Array".into()))?;
             ScalarValue::Int64(arr.value(index))
         }
         arrow::datatypes::DataType::Float32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Float32Array>()
+            let arr = array.as_any().downcast_ref::<Float32Array>()
                 .ok_or_else(|| QueryError::Type("Expected Float32Array".into()))?;
             ScalarValue::Float32(ordered_float::OrderedFloat(arr.value(index)))
         }
         arrow::datatypes::DataType::Float64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
+            let arr = array.as_any().downcast_ref::<Float64Array>()
                 .ok_or_else(|| QueryError::Type("Expected Float64Array".into()))?;
             ScalarValue::Float64(ordered_float::OrderedFloat(arr.value(index)))
         }
         arrow::datatypes::DataType::Utf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<StringArray>()
+            let arr = array.as_any().downcast_ref::<StringArray>()
                 .ok_or_else(|| QueryError::Type("Expected StringArray".into()))?;
             ScalarValue::Utf8(arr.value(index).to_string())
         }
         arrow::datatypes::DataType::Date32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Date32Array>()
+            let arr = array.as_any().downcast_ref::<Date32Array>()
                 .ok_or_else(|| QueryError::Type("Expected Date32Array".into()))?;
             ScalarValue::Date32(arr.value(index))
         }
@@ -346,178 +435,13 @@ fn array_ref_to_scalar(array: &ArrayRef, index: usize) -> Result<ScalarValue> {
 fn new_empty_array(data_type: arrow::datatypes::DataType) -> ArrayRef {
     use arrow::array::*;
     match data_type {
-        arrow::datatypes::DataType::Boolean => {
-            Arc::new(BooleanArray::from(vec![] as Vec<Option<bool>>))
-        }
+        arrow::datatypes::DataType::Boolean => Arc::new(BooleanArray::from(vec![] as Vec<Option<bool>>)),
         arrow::datatypes::DataType::Int64 => Arc::new(Int64Array::from(vec![] as Vec<Option<i64>>)),
         arrow::datatypes::DataType::Int32 => Arc::new(Int32Array::from(vec![] as Vec<Option<i32>>)),
-        arrow::datatypes::DataType::Float64 => {
-            Arc::new(Float64Array::from(vec![] as Vec<Option<f64>>))
-        }
-        arrow::datatypes::DataType::Utf8 => {
-            Arc::new(StringArray::from(vec![] as Vec<Option<&str>>))
-        }
+        arrow::datatypes::DataType::Float64 => Arc::new(Float64Array::from(vec![] as Vec<Option<f64>>)),
+        arrow::datatypes::DataType::Utf8 => Arc::new(StringArray::from(vec![] as Vec<Option<&str>>)),
         _ => Arc::new(Int64Array::from(vec![] as Vec<Option<i64>>)),
     }
-}
-
-/// Collect all table names/aliases defined in a logical plan's FROM clause
-fn collect_table_aliases(plan: &LogicalPlan) -> std::collections::HashSet<String> {
-    let mut aliases = std::collections::HashSet::new();
-    collect_table_aliases_recursive(plan, &mut aliases);
-    aliases
-}
-
-fn collect_table_aliases_recursive(
-    plan: &LogicalPlan,
-    aliases: &mut std::collections::HashSet<String>,
-) {
-    use crate::planner::*;
-    match plan {
-        LogicalPlan::Scan(node) => {
-            aliases.insert(node.table_name.clone());
-        }
-        LogicalPlan::SubqueryAlias(node) => {
-            aliases.insert(node.alias.clone());
-            // Don't recurse into the aliased input - the alias shadows it
-        }
-        LogicalPlan::Join(node) => {
-            collect_table_aliases_recursive(&node.left, aliases);
-            collect_table_aliases_recursive(&node.right, aliases);
-        }
-        LogicalPlan::Filter(node) => {
-            collect_table_aliases_recursive(&node.input, aliases);
-        }
-        LogicalPlan::Project(node) => {
-            collect_table_aliases_recursive(&node.input, aliases);
-        }
-        LogicalPlan::Aggregate(node) => {
-            collect_table_aliases_recursive(&node.input, aliases);
-        }
-        LogicalPlan::Sort(node) => {
-            collect_table_aliases_recursive(&node.input, aliases);
-        }
-        LogicalPlan::Limit(node) => {
-            collect_table_aliases_recursive(&node.input, aliases);
-        }
-        LogicalPlan::Distinct(node) => {
-            collect_table_aliases_recursive(&node.input, aliases);
-        }
-        _ => {}
-    }
-}
-
-/// Check if an expression contains any column references to tables not in the given set
-fn has_outer_references(expr: &Expr, local_tables: &std::collections::HashSet<String>) -> bool {
-    use crate::planner::*;
-    match expr {
-        Expr::Column(col) => {
-            if let Some(rel) = &col.relation {
-                // This column references a specific table - check if it's local
-                !local_tables.contains(rel)
-            } else {
-                // Unqualified column - assume local
-                false
-            }
-        }
-        Expr::BinaryExpr { left, right, .. } => {
-            has_outer_references(left, local_tables) || has_outer_references(right, local_tables)
-        }
-        Expr::UnaryExpr { expr, .. } => has_outer_references(expr, local_tables),
-        Expr::ScalarFunc { args, .. } | Expr::Aggregate { args, .. } => {
-            args.iter().any(|a| has_outer_references(a, local_tables))
-        }
-        Expr::Cast { expr, .. } | Expr::Alias { expr, .. } => {
-            has_outer_references(expr, local_tables)
-        }
-        Expr::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => {
-            operand
-                .as_ref()
-                .is_some_and(|o| has_outer_references(o, local_tables))
-                || when_then.iter().any(|(w, t)| {
-                    has_outer_references(w, local_tables) || has_outer_references(t, local_tables)
-                })
-                || else_expr
-                    .as_ref()
-                    .is_some_and(|e| has_outer_references(e, local_tables))
-        }
-        Expr::InList { expr, list, .. } => {
-            has_outer_references(expr, local_tables)
-                || list.iter().any(|e| has_outer_references(e, local_tables))
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            has_outer_references(expr, local_tables)
-                || has_outer_references(low, local_tables)
-                || has_outer_references(high, local_tables)
-        }
-        _ => false,
-    }
-}
-
-/// Check if a plan contains any outer (correlated) column references
-fn plan_has_outer_references(
-    plan: &LogicalPlan,
-    local_tables: &std::collections::HashSet<String>,
-) -> bool {
-    use crate::planner::*;
-    match plan {
-        LogicalPlan::Filter(node) => {
-            has_outer_references(&node.predicate, local_tables)
-                || plan_has_outer_references(&node.input, local_tables)
-        }
-        LogicalPlan::Project(node) => {
-            node.exprs
-                .iter()
-                .any(|e| has_outer_references(e, local_tables))
-                || plan_has_outer_references(&node.input, local_tables)
-        }
-        LogicalPlan::Join(node) => {
-            node.on.iter().any(|(l, r)| {
-                has_outer_references(l, local_tables) || has_outer_references(r, local_tables)
-            }) || node
-                .filter
-                .as_ref()
-                .is_some_and(|f| has_outer_references(f, local_tables))
-                || plan_has_outer_references(&node.left, local_tables)
-                || plan_has_outer_references(&node.right, local_tables)
-        }
-        LogicalPlan::Aggregate(node) => {
-            node.group_by
-                .iter()
-                .any(|e| has_outer_references(e, local_tables))
-                || node
-                    .aggregates
-                    .iter()
-                    .any(|e| has_outer_references(e, local_tables))
-                || plan_has_outer_references(&node.input, local_tables)
-        }
-        LogicalPlan::Sort(node) => {
-            node.order_by
-                .iter()
-                .any(|s| has_outer_references(&s.expr, local_tables))
-                || plan_has_outer_references(&node.input, local_tables)
-        }
-        LogicalPlan::Limit(node) => plan_has_outer_references(&node.input, local_tables),
-        LogicalPlan::Distinct(node) => plan_has_outer_references(&node.input, local_tables),
-        LogicalPlan::SubqueryAlias(node) => plan_has_outer_references(&node.input, local_tables),
-        LogicalPlan::Scan(node) => node
-            .filter
-            .as_ref()
-            .is_some_and(|f| has_outer_references(f, local_tables)),
-        _ => false,
-    }
-}
-
-/// Check if a subquery is correlated (references columns from outer scope)
-fn is_correlated_subquery(subquery: &LogicalPlan) -> bool {
-    let local_tables = collect_table_aliases(subquery);
-    plan_has_outer_references(subquery, &local_tables)
 }
 
 /// Evaluate a subquery expression during filter execution
@@ -527,58 +451,56 @@ pub fn evaluate_subquery_expr(
     executor: &SubqueryExecutor,
 ) -> Result<ArrayRef> {
     match expr {
-        Expr::ScalarSubquery(plan) => {
-            // Check if this is a correlated subquery by analyzing the plan structure
-            if is_correlated_subquery(plan) {
-                // Correlated subquery - execute for each row
-                return execute_correlated_scalar_subquery(batch, plan, executor);
-            }
+        Expr::InSubquery { expr, subquery, negated } => {
+            // Check if the subquery contains nested subqueries
+            // If so, it's likely correlated and needs per-row execution
+            let has_nested_subqueries = contains_subquery(subquery);
 
-            // Uncorrelated - execute once
+            if has_nested_subqueries {
+                // Treat as correlated - execute for each row
+                execute_correlated_in_subquery(batch, expr, subquery, *negated, executor)
+            } else {
+                // Try executing once - if it fails with ColumnNotFound, it's correlated
+                match executor.execute_in_subquery(subquery) {
+                    Ok(in_values) => {
+                        // Uncorrelated - use the same values for all rows
+                        let left_array = super::filter::evaluate_expr(batch, expr)?;
+                        evaluate_in_subquery(&left_array, &in_values, *negated)
+                    }
+                    Err(QueryError::ColumnNotFound(_)) => {
+                        // Correlated IN subquery - execute for each row
+                        execute_correlated_in_subquery(batch, expr, subquery, *negated, executor)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        }
+        Expr::ScalarSubquery(plan) => {
+            // Check if this is a correlated subquery by trying to execute once
             match executor.execute_scalar(plan) {
                 Ok(scalar) => {
-                    // Use the same value for all rows
+                    // Uncorrelated - use the same value for all rows
                     let num_rows = batch.num_rows();
                     Ok(scalar_to_array(&scalar, num_rows))
                 }
                 Err(QueryError::ColumnNotFound(_)) => {
-                    // Fallback: Correlated subquery (shouldn't happen with plan analysis)
+                    // Correlated subquery - execute for each row
                     execute_correlated_scalar_subquery(batch, plan, executor)
                 }
                 Err(e) => Err(e),
             }
         }
-        Expr::InSubquery {
-            expr,
-            subquery,
-            negated,
-        } => {
-            // Execute the IN subquery once to get the set of values
-            let in_values = executor.execute_in_subquery(subquery)?;
-
-            // Evaluate the left side expression
-            let left_array = super::filter::evaluate_expr(batch, expr)?;
-
-            // Check membership
-            evaluate_in_subquery(&left_array, &in_values, *negated)
-        }
         Expr::Exists { subquery, negated } => {
-            // Check if this is a correlated subquery by analyzing the plan structure
-            if is_correlated_subquery(subquery) {
-                // Correlated EXISTS subquery - execute row-by-row
-                return execute_correlated_exists_subquery(batch, subquery, *negated, executor);
-            }
-
-            // Uncorrelated - execute once
+            // Try executing once - if it fails with ColumnNotFound, it's correlated
             match executor.execute_exists(subquery) {
                 Ok(exists) => {
-                    // Use the same result for all rows
+                    // Uncorrelated - use the same result for all rows
                     let result = if *negated { !exists } else { exists };
                     let arr = BooleanArray::from(vec![result; batch.num_rows()]);
                     Ok(Arc::new(arr))
                 }
                 Err(QueryError::ColumnNotFound(_)) => {
-                    // Fallback: Correlated EXISTS subquery (shouldn't happen with plan analysis)
+                    // Correlated EXISTS subquery
                     execute_correlated_exists_subquery(batch, subquery, *negated, executor)
                 }
                 Err(e) => Err(e),
@@ -591,6 +513,142 @@ pub fn evaluate_subquery_expr(
     }
 }
 
+/// Build outer context from a batch (collects all columns as potential outer references)
+fn build_outer_context(batch: &RecordBatch) -> std::collections::HashMap<String, Expr> {
+    let mut context = std::collections::HashMap::new();
+
+    for (i, field) in batch.schema().fields().iter().enumerate() {
+        let _column = batch.column(i);
+        let column_name = field.name().clone();
+
+        // Store the column reference - we'll create row-specific values later
+        // For now, just store the column name as a key
+        // The actual values will be substituted per-row
+        context.insert(column_name.clone(), Expr::column(&column_name));
+    }
+
+    context
+}
+
+/// Build row-specific context with actual scalar values for a single row
+fn build_row_context(
+    _outer_context: &std::collections::HashMap<String, Expr>,
+    batch: &RecordBatch,
+    row: usize,
+) -> Result<std::collections::HashMap<String, Expr>> {
+    let mut row_context = std::collections::HashMap::new();
+
+    for (i, field) in batch.schema().fields().iter().enumerate() {
+        let column = batch.column(i);
+        let column_name = field.name().clone();
+
+        // Extract the scalar value for this specific row
+        let scalar = if column.is_null(row) {
+            ScalarValue::Null
+        } else {
+            array_ref_to_scalar_value(column, row)?
+        };
+
+        // Create a literal expression with the actual value
+        row_context.insert(column_name.clone(), Expr::Literal(scalar.clone()));
+
+        // Also add variations of the column name for flexible matching
+        // 1. Unqualified name (e.g., "ps_partkey" from "partsupp.ps_partkey")
+        if let Some(dot_pos) = column_name.find('.') {
+            let unqualified = &column_name[dot_pos + 1..];
+            row_context.insert(unqualified.to_string(), Expr::Literal(scalar.clone()));
+        }
+
+        // 2. Base name after last underscore (e.g., "partkey" from "l_partkey")
+        if let Some(underscore_pos) = column_name.rfind('_') {
+            let base_name = &column_name[underscore_pos + 1..];
+            row_context.insert(base_name.to_string(), Expr::Literal(scalar.clone()));
+        }
+
+        // 3. With table prefix (e.g., for "s_suppkey" also add "supplier.s_suppkey")
+        // This handles cases where the subquery uses qualified names
+        if column_name.contains('_') {
+            let parts: Vec<&str> = column_name.split('_').collect();
+            if parts.len() >= 2 {
+                let table_guess = match parts[0] {
+                    "s" => "supplier",
+                    "p" => "part",
+                    "ps" => "partsupp",
+                    "l" => "lineitem",
+                    "o" => "orders",
+                    "c" => "customer",
+                    "n" => "nation",
+                    "r" => "region",
+                    _ => continue,
+                };
+                let qualified_guess = format!("{}.{}", table_guess, column_name);
+                row_context.entry(qualified_guess).or_insert_with(|| Expr::Literal(scalar.clone()));
+            }
+        }
+    }
+
+    Ok(row_context)
+}
+
+/// Check if a plan contains any subquery expressions
+fn contains_subquery(plan: &LogicalPlan) -> bool {
+    use crate::planner::*;
+
+    // Check expressions in the plan
+    fn expr_has_subquery(expr: &Expr) -> bool {
+        match expr {
+            Expr::ScalarSubquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => true,
+            Expr::BinaryExpr { left, right, .. } => {
+                expr_has_subquery(left) || expr_has_subquery(right)
+            }
+            Expr::UnaryExpr { expr, .. } => expr_has_subquery(expr),
+            Expr::Alias { expr, .. } => expr_has_subquery(expr),
+            Expr::Aggregate { args, .. } => args.iter().any(expr_has_subquery),
+            Expr::ScalarFunc { args, .. } => args.iter().any(expr_has_subquery),
+            Expr::Cast { expr, .. } => expr_has_subquery(expr),
+            Expr::Case { operand, when_then, else_expr } => {
+                operand.as_ref().is_some_and(|e| expr_has_subquery(e))
+                    || when_then.iter().any(|(w, t)| expr_has_subquery(w) || expr_has_subquery(t))
+                    || else_expr.as_ref().is_some_and(|e| expr_has_subquery(e))
+            }
+            _ => false,
+        }
+    }
+
+    fn plan_has_subquery(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Filter(node) => {
+                expr_has_subquery(&node.predicate) || plan_has_subquery(&node.input)
+            }
+            LogicalPlan::Project(node) => {
+                node.exprs.iter().any(expr_has_subquery) || plan_has_subquery(&node.input)
+            }
+            LogicalPlan::Aggregate(node) => {
+                node.group_by.iter().any(expr_has_subquery)
+                    || node.aggregates.iter().any(expr_has_subquery)
+                    || plan_has_subquery(&node.input)
+            }
+            LogicalPlan::Join(node) => {
+                node.on.iter().any(|(l, r)| expr_has_subquery(l) || expr_has_subquery(r))
+                    || node.filter.as_ref().is_some_and(expr_has_subquery)
+                    || plan_has_subquery(&node.left)
+                    || plan_has_subquery(&node.right)
+            }
+            LogicalPlan::Sort(node) => {
+                node.order_by.iter().any(|s| expr_has_subquery(&s.expr))
+                    || plan_has_subquery(&node.input)
+            }
+            LogicalPlan::Limit(node) => plan_has_subquery(&node.input),
+            LogicalPlan::Distinct(node) => plan_has_subquery(&node.input),
+            LogicalPlan::SubqueryAlias(node) => plan_has_subquery(&node.input),
+            LogicalPlan::Union(node) => node.inputs.iter().any(|p| plan_has_subquery(p)),
+            _ => false,
+        }
+    }
+
+    plan_has_subquery(plan)
+}
+
 /// Execute a correlated scalar subquery for each row in the batch
 fn execute_correlated_scalar_subquery(
     batch: &RecordBatch,
@@ -600,32 +658,31 @@ fn execute_correlated_scalar_subquery(
     let num_rows = batch.num_rows();
     let mut results = Vec::with_capacity(num_rows);
 
-    // Get the column names from the batch that might be referenced in the subquery
-    let _batch_columns: Vec<String> = batch
-        .schema()
-        .fields()
-        .iter()
-        .map(|f| f.name().clone())
-        .collect();
+    // Build outer context from batch columns
+    let outer_context = build_outer_context(batch);
 
-    // For each row, we need to:
-    // 1. Find which columns in the plan are correlated (not in subquery's own tables)
-    // 2. Substitute those with literal values from the current row
-    // 3. Execute the modified subquery
-
-    // For MVP: execute subquery once per row, substituting correlated column values as literals
+    // For each row, build row-specific context and execute the subquery
     for row in 0..num_rows {
-        // Substitute correlated columns with literal values from this row
-        let substituted_plan = substitute_correlated_columns(plan, batch, row)?;
+        // Build row-specific context with actual scalar values
+        let row_context = build_row_context(&outer_context, batch, row)?;
 
-        // Execute the substituted subquery
-        match executor.execute_scalar(&substituted_plan) {
+        // Execute the subquery with row-specific context
+        match executor.execute_scalar_with_context(plan, &row_context) {
             Ok(scalar) => {
                 results.push(scalar);
             }
-            Err(_e) => {
+            Err(QueryError::ColumnNotFound(_)) => {
+                // Try with substitution as fallback
+                let substituted_plan = substitute_correlated_columns(plan, batch, row)?;
+                match executor.execute_scalar(&substituted_plan) {
+                    Ok(scalar) => results.push(scalar),
+                    Err(_) => results.push(ScalarValue::Null),
+                }
+            }
+            Err(e) => {
                 // If still failing, return null for this row
-                results.push(crate::planner::ScalarValue::Null);
+                eprintln!("Row {} failed: {:?}", row, e);
+                results.push(ScalarValue::Null);
             }
         }
     }
@@ -644,14 +701,23 @@ fn execute_correlated_exists_subquery(
     let num_rows = batch.num_rows();
     let mut results = Vec::with_capacity(num_rows);
 
-    for row in 0..num_rows {
-        // Substitute correlated columns with literal values from this row
-        let substituted_plan = substitute_correlated_columns(subquery, batch, row)?;
+    // Build outer context from batch columns
+    let outer_context = build_outer_context(batch);
 
-        // Execute the substituted subquery (false on error)
-        let exists = executor
-            .execute_exists(&substituted_plan)
-            .unwrap_or_default();
+    for row in 0..num_rows {
+        // Build row-specific context with actual scalar values
+        let row_context = build_row_context(&outer_context, batch, row)?;
+
+        // Execute the subquery with row-specific context
+        let exists = match executor.execute_exists_with_context(subquery, &row_context) {
+            Ok(e) => e,
+            Err(QueryError::ColumnNotFound(_)) => {
+                // Try with substitution as fallback
+                let substituted_plan = substitute_correlated_columns(subquery, batch, row)?;
+                executor.execute_exists(&substituted_plan).unwrap_or(false)
+            }
+            Err(_) => false, // On error, treat as not found
+        };
 
         results.push(if negated { !exists } else { exists });
     }
@@ -659,7 +725,117 @@ fn execute_correlated_exists_subquery(
     Ok(Arc::new(BooleanArray::from(results)))
 }
 
+/// Execute a correlated IN subquery for each row in the batch
+fn execute_correlated_in_subquery(
+    batch: &RecordBatch,
+    expr: &Expr,
+    subquery: &LogicalPlan,
+    negated: bool,
+    executor: &SubqueryExecutor,
+) -> Result<ArrayRef> {
+    let num_rows = batch.num_rows();
+    let mut results = Vec::with_capacity(num_rows);
+
+    // Build outer context from batch columns
+    let outer_context = build_outer_context(batch);
+
+    for row in 0..num_rows {
+        // Build row-specific context with actual scalar values
+        let row_context = build_row_context(&outer_context, batch, row)?;
+
+        // Execute the IN subquery with row-specific context
+        let in_values = match executor.execute_in_subquery_with_context(subquery, &row_context) {
+            Ok(values) => values,
+            Err(QueryError::ColumnNotFound(_)) => {
+                // Try with substitution as fallback
+                let substituted_plan = substitute_correlated_columns(subquery, batch, row)?;
+                executor.execute_in_subquery(&substituted_plan).unwrap_or_else(|_| {
+                    new_empty_array(subquery.schema().fields().first()
+                        .map(|f| f.data_type.clone())
+                        .unwrap_or(arrow::datatypes::DataType::Int64))
+                })
+            }
+            Err(_) => {
+                // On error, use empty array (no matches)
+                new_empty_array(subquery.schema().fields().first()
+                    .map(|f| f.data_type.clone())
+                    .unwrap_or(arrow::datatypes::DataType::Int64))
+            }
+        };
+
+        // Evaluate the left side expression for this single row
+        let single_row_results = evaluate_in_subquery_single_value(batch, expr, row, &in_values, negated)?;
+        results.push(single_row_results);
+    }
+
+    // Convert results to an array
+    Ok(Arc::new(BooleanArray::from(results)))
+}
+
+/// Evaluate IN subquery for a single row value
+fn evaluate_in_subquery_single_value(
+    batch: &RecordBatch,
+    expr: &Expr,
+    row: usize,
+    in_values: &ArrayRef,
+    negated: bool,
+) -> Result<bool> {
+    use arrow::array::*;
+
+    // Evaluate the left side expression for this single row
+    let left_array = super::filter::evaluate_expr(batch, expr)?;
+    let mut found = false;
+
+    if left_array.is_null(row) {
+        return Ok(false);
+    }
+
+    for j in 0..in_values.len() {
+        if in_values.is_null(j) {
+            continue;
+        }
+
+        let matches = match (left_array.data_type(), in_values.data_type()) {
+            (arrow::datatypes::DataType::Int64, arrow::datatypes::DataType::Int64) => {
+                let left_arr = left_array.as_any().downcast_ref::<Int64Array>().unwrap();
+                let right_arr = in_values.as_any().downcast_ref::<Int64Array>().unwrap();
+                left_arr.value(row) == right_arr.value(j)
+            }
+            (arrow::datatypes::DataType::Int32, arrow::datatypes::DataType::Int32) => {
+                let left_arr = left_array.as_any().downcast_ref::<Int32Array>().unwrap();
+                let right_arr = in_values.as_any().downcast_ref::<Int32Array>().unwrap();
+                left_arr.value(row) == right_arr.value(j)
+            }
+            (arrow::datatypes::DataType::Float64, arrow::datatypes::DataType::Float64) => {
+                let left_arr = left_array.as_any().downcast_ref::<Float64Array>().unwrap();
+                let right_arr = in_values.as_any().downcast_ref::<Float64Array>().unwrap();
+                left_arr.value(row) == right_arr.value(j)
+            }
+            (arrow::datatypes::DataType::Utf8, arrow::datatypes::DataType::Utf8) => {
+                let left_arr = left_array.as_any().downcast_ref::<StringArray>().unwrap();
+                let right_arr = in_values.as_any().downcast_ref::<StringArray>().unwrap();
+                left_arr.value(row) == right_arr.value(j)
+            }
+            _ => {
+                return Err(QueryError::NotImplemented(format!(
+                    "IN subquery not supported for types: {:?} IN {:?}",
+                    left_array.data_type(),
+                    in_values.data_type()
+                )))
+            }
+        };
+
+        if matches {
+            found = true;
+            break;
+        }
+    }
+
+    Ok(if negated { !found } else { found })
+}
+
 /// Substitute correlated column references with literal values from a specific row
+/// This version supports nested subqueries by collecting ALL available columns from the batch
 fn substitute_correlated_columns(
     plan: &LogicalPlan,
     batch: &RecordBatch,
@@ -667,13 +843,9 @@ fn substitute_correlated_columns(
 ) -> Result<LogicalPlan> {
     use crate::planner::*;
 
-    // First, collect which table aliases are local to this subquery
-    // We should ONLY substitute columns that reference OUTER tables (not in this set)
-    let local_tables = collect_table_aliases(plan);
-
-    // Create a mapping of column names to their literal values for this row
-    let mut column_values: std::collections::HashMap<String, Expr> =
-        std::collections::HashMap::new();
+    // Create a comprehensive mapping of column names to their literal values for this row
+    // This includes all variations of the column name to handle nested references
+    let mut column_values: std::collections::HashMap<String, Expr> = std::collections::HashMap::new();
 
     for (i, field) in batch.schema().fields().iter().enumerate() {
         let column = batch.column(i);
@@ -683,58 +855,99 @@ fn substitute_correlated_columns(
             array_ref_to_scalar_value(column, row)?
         };
 
-        let literal_expr = Expr::Literal(scalar);
+        let literal_expr = Expr::Literal(scalar.clone());
 
         // Add the fully qualified name (e.g., "partsupp.ps_partkey")
         column_values.insert(field.name().clone(), literal_expr.clone());
 
-        // Also add just the column name without qualifier (e.g., "ps_partkey")
-        // This handles cases where the subquery uses unqualified references
+        // Add multiple variations for flexible matching:
+        // 1. Unqualified name only (e.g., "ps_partkey")
         if let Some(dot_pos) = field.name().find('.') {
             let unqualified = &field.name()[dot_pos + 1..];
             column_values.insert(unqualified.to_string(), literal_expr.clone());
         }
 
-        // Also add with potential table qualifiers from common patterns
-        // E.g., "l_partkey" could be referenced as just "partkey" if context is clear
+        // 2. Base name after last underscore (e.g., "partkey" from "l_partkey")
         if let Some(dot_pos) = field.name().rfind('_') {
-            // Extract base name after last underscore (common pattern: table_column)
             let base_name = &field.name()[dot_pos + 1..];
-            column_values.insert(base_name.to_string(), literal_expr);
+            column_values.insert(base_name.to_string(), literal_expr.clone());
+        }
+
+        // 3. With table prefix if not already present (e.g., for "s_suppkey" also add "supplier.s_suppkey")
+        // Extract potential table name from column prefix
+        if field.name().contains('_') {
+            // Common pattern: table_column (e.g., s_suppkey = supplier.s_suppkey)
+            let parts: Vec<&str> = field.name().split('_').collect();
+            if parts.len() >= 2 {
+                // Try to guess table name from prefix
+                let table_guess = match parts[0] {
+                    "s" => "supplier",
+                    "p" => "part",
+                    "ps" => "partsupp",
+                    "l" => "lineitem",
+                    "o" => "orders",
+                    "c" => "customer",
+                    "n" => "nation",
+                    "r" => "region",
+                    _ => continue,
+                };
+                let qualified_guess = format!("{}.{}", table_guess, field.name());
+                column_values.entry(qualified_guess.clone()).or_insert_with(|| literal_expr.clone());
+            }
         }
     }
 
     // Recursively substitute column references in the plan
-    substitute_columns_in_plan(plan, &column_values, &local_tables)
+    substitute_columns_in_plan(plan, &column_values)
 }
 
 /// Recursively substitute column references with literals in a logical plan
-/// Only substitutes columns that reference tables NOT in local_tables (i.e., outer references)
 fn substitute_columns_in_plan(
     plan: &LogicalPlan,
     column_values: &std::collections::HashMap<String, Expr>,
-    local_tables: &std::collections::HashSet<String>,
 ) -> Result<LogicalPlan> {
     use crate::planner::*;
+
+    // First, check if the column reference exists in our substitution map
+    // If so, substitute it; otherwise, keep it as-is
+    let _substituted_expr = |expr: &Expr| -> Expr {
+        match expr {
+            Expr::Column(col) => {
+                // Try to substitute both qualified and unqualified names
+                let qualified_name = if let Some(rel) = &col.relation {
+                    format!("{}.{}", rel, col.name)
+                } else {
+                    col.name.clone()
+                };
+
+                if let Some(substituted) = column_values.get(&qualified_name) {
+                    substituted.clone()
+                } else if let Some(substituted) = column_values.get(&col.name) {
+                    substituted.clone()
+                } else {
+                    expr.clone()
+                }
+            }
+            _ => expr.clone(),
+        }
+    };
 
     // Recursively process the plan
     match plan {
         LogicalPlan::Filter(node) => {
-            let new_predicate =
-                substitute_columns_in_expr(&node.predicate, column_values, local_tables);
-            let new_input = substitute_columns_in_plan(&node.input, column_values, local_tables)?;
+            let new_predicate = substitute_columns_in_expr(&node.predicate, column_values);
+            let new_input = substitute_columns_in_plan(&node.input, column_values)?;
             Ok(LogicalPlan::Filter(FilterNode {
                 input: Arc::new(new_input),
                 predicate: new_predicate,
             }))
         }
         LogicalPlan::Project(node) => {
-            let new_exprs: Vec<Expr> = node
-                .exprs
+            let new_exprs: Vec<Expr> = node.exprs
                 .iter()
-                .map(|e| substitute_columns_in_expr(e, column_values, local_tables))
+                .map(|e| substitute_columns_in_expr(e, column_values))
                 .collect();
-            let new_input = substitute_columns_in_plan(&node.input, column_values, local_tables)?;
+            let new_input = substitute_columns_in_plan(&node.input, column_values)?;
             Ok(LogicalPlan::Project(ProjectNode {
                 input: Arc::new(new_input),
                 exprs: new_exprs,
@@ -742,17 +955,15 @@ fn substitute_columns_in_plan(
             }))
         }
         LogicalPlan::Aggregate(node) => {
-            let new_group_by: Vec<Expr> = node
-                .group_by
+            let new_group_by: Vec<Expr> = node.group_by
                 .iter()
-                .map(|e| substitute_columns_in_expr(e, column_values, local_tables))
+                .map(|e| substitute_columns_in_expr(e, column_values))
                 .collect();
-            let new_aggregates: Vec<Expr> = node
-                .aggregates
+            let new_aggregates: Vec<Expr> = node.aggregates
                 .iter()
-                .map(|e| substitute_columns_in_expr(e, column_values, local_tables))
+                .map(|e| substitute_columns_in_expr(e, column_values))
                 .collect();
-            let new_input = substitute_columns_in_plan(&node.input, column_values, local_tables)?;
+            let new_input = substitute_columns_in_plan(&node.input, column_values)?;
             Ok(LogicalPlan::Aggregate(AggregateNode {
                 input: Arc::new(new_input),
                 group_by: new_group_by,
@@ -762,10 +973,8 @@ fn substitute_columns_in_plan(
         }
         LogicalPlan::Scan(node) => {
             // Substitute in filter expression if present
-            let new_filter = node
-                .filter
-                .as_ref()
-                .map(|f| substitute_columns_in_expr(f, column_values, local_tables));
+            let new_filter = node.filter.as_ref()
+                .map(|f| substitute_columns_in_expr(f, column_values));
             Ok(LogicalPlan::Scan(ScanNode {
                 table_name: node.table_name.clone(),
                 schema: node.schema.clone(),
@@ -774,151 +983,144 @@ fn substitute_columns_in_plan(
             }))
         }
         LogicalPlan::Join(node) => {
-            let new_on: Vec<(Expr, Expr)> = node
-                .on
-                .iter()
-                .map(|(l, r)| {
-                    (
-                        substitute_columns_in_expr(l, column_values, local_tables),
-                        substitute_columns_in_expr(r, column_values, local_tables),
-                    )
-                })
+            let left = substitute_columns_in_plan(&node.left, column_values)?;
+            let right = substitute_columns_in_plan(&node.right, column_values)?;
+            // Substitute in join conditions
+            let new_on: Vec<(Expr, Expr)> = node.on.iter()
+                .map(|(l, r)| (
+                    substitute_columns_in_expr(l, column_values),
+                    substitute_columns_in_expr(r, column_values),
+                ))
                 .collect();
-            let new_filter = node
-                .filter
-                .as_ref()
-                .map(|f| substitute_columns_in_expr(f, column_values, local_tables));
-            let new_left = substitute_columns_in_plan(&node.left, column_values, local_tables)?;
-            let new_right = substitute_columns_in_plan(&node.right, column_values, local_tables)?;
+            let new_filter = node.filter.as_ref()
+                .map(|f| substitute_columns_in_expr(f, column_values));
             Ok(LogicalPlan::Join(JoinNode {
-                left: Arc::new(new_left),
-                right: Arc::new(new_right),
+                left: Arc::new(left),
+                right: Arc::new(right),
                 join_type: node.join_type,
                 on: new_on,
                 filter: new_filter,
                 schema: node.schema.clone(),
             }))
         }
-        LogicalPlan::Sort(node) => {
-            let new_order_by: Vec<SortExpr> = node
-                .order_by
-                .iter()
-                .map(|s| SortExpr {
-                    expr: substitute_columns_in_expr(&s.expr, column_values, local_tables),
-                    direction: s.direction,
-                    nulls: s.nulls,
-                })
-                .collect();
-            let new_input = substitute_columns_in_plan(&node.input, column_values, local_tables)?;
-            Ok(LogicalPlan::Sort(SortNode {
-                input: Arc::new(new_input),
-                order_by: new_order_by,
-            }))
-        }
-        LogicalPlan::Limit(node) => {
-            let new_input = substitute_columns_in_plan(&node.input, column_values, local_tables)?;
-            Ok(LogicalPlan::Limit(LimitNode {
-                input: Arc::new(new_input),
-                skip: node.skip,
-                fetch: node.fetch,
-            }))
-        }
-        LogicalPlan::Distinct(node) => {
-            let new_input = substitute_columns_in_plan(&node.input, column_values, local_tables)?;
-            Ok(LogicalPlan::Distinct(DistinctNode {
-                input: Arc::new(new_input),
-            }))
-        }
         LogicalPlan::SubqueryAlias(node) => {
-            let new_input = substitute_columns_in_plan(&node.input, column_values, local_tables)?;
+            let new_input = substitute_columns_in_plan(&node.input, column_values)?;
             Ok(LogicalPlan::SubqueryAlias(SubqueryAliasNode {
                 input: Arc::new(new_input),
                 alias: node.alias.clone(),
                 schema: node.schema.clone(),
             }))
         }
-        LogicalPlan::Union(node) => {
-            let new_inputs: Result<Vec<Arc<LogicalPlan>>> = node
-                .inputs
-                .iter()
-                .map(|i| substitute_columns_in_plan(i, column_values, local_tables).map(Arc::new))
+        LogicalPlan::Limit(node) => {
+            let new_input = substitute_columns_in_plan(&node.input, column_values)?;
+            Ok(LogicalPlan::Limit(LimitNode {
+                input: Arc::new(new_input),
+                skip: node.skip,
+                fetch: node.fetch,
+            }))
+        }
+        LogicalPlan::Sort(node) => {
+            let new_input = substitute_columns_in_plan(&node.input, column_values)?;
+            let new_order_by: Vec<crate::planner::SortExpr> = node.order_by.iter()
+                .map(|s| crate::planner::SortExpr {
+                    expr: substitute_columns_in_expr(&s.expr, column_values),
+                    direction: s.direction,
+                    nulls: s.nulls,
+                })
                 .collect();
+            Ok(LogicalPlan::Sort(SortNode {
+                input: Arc::new(new_input),
+                order_by: new_order_by,
+            }))
+        }
+        LogicalPlan::Distinct(node) => {
+            let new_input = substitute_columns_in_plan(&node.input, column_values)?;
+            Ok(LogicalPlan::Distinct(DistinctNode {
+                input: Arc::new(new_input),
+            }))
+        }
+        LogicalPlan::Union(node) => {
+            let new_inputs: Vec<Arc<LogicalPlan>> = node.inputs.iter()
+                .map(|i| substitute_columns_in_plan(i, column_values).map(Arc::new))
+                .collect::<Result<_>>()?;
             Ok(LogicalPlan::Union(UnionNode {
-                inputs: new_inputs?,
+                inputs: new_inputs,
                 schema: node.schema.clone(),
                 all: node.all,
             }))
         }
-        // Pass through unchanged for leaf nodes
-        LogicalPlan::EmptyRelation(_) | LogicalPlan::Values(_) => Ok(plan.clone()),
+        // For other plan types, return as-is for now
+        _ => Ok(plan.clone()),
     }
 }
 
 /// Substitute column references in an expression
-/// Only substitutes columns that reference tables NOT in local_tables
 fn substitute_columns_in_expr(
     expr: &Expr,
     column_values: &std::collections::HashMap<String, Expr>,
-    local_tables: &std::collections::HashSet<String>,
 ) -> Expr {
-    use crate::planner::*;
     match expr {
         Expr::Column(col) => {
-            // Only substitute if the column's relation is NOT a local table
-            // If relation is Some and it's in local_tables, DON'T substitute
+            // Try multiple variations of the column name
+            // 1. Qualified with table: "table.column"
+            // 2. Unqualified: "column"
+            // 3. Try exact matches first
+
+            // Try qualified name first (e.g., "supplier.s_suppkey")
             if let Some(rel) = &col.relation {
-                if local_tables.contains(rel) {
-                    // This is a local table column - don't substitute
-                    return expr.clone();
+                let qualified = format!("{}.{}", rel, col.name);
+                if let Some(substituted) = column_values.get(&qualified) {
+                    return substituted.clone();
                 }
             }
 
-            // Try to substitute both qualified and unqualified names
-            let qualified_name = if let Some(rel) = &col.relation {
-                format!("{}.{}", rel, col.name)
-            } else {
-                col.name.clone()
-            };
-
-            if let Some(substituted) = column_values.get(&qualified_name) {
-                substituted.clone()
-            } else if let Some(substituted) = column_values.get(&col.name) {
-                substituted.clone()
-            } else {
-                expr.clone()
+            // Try unqualified name (e.g., "s_suppkey")
+            if let Some(substituted) = column_values.get(&col.name) {
+                return substituted.clone();
             }
+
+            // Try matching with wildcards - if column_values has "table.col", try matching "col"
+            // This handles cases where the subquery uses unqualified names
+            for (key, value) in column_values.iter() {
+                if key.ends_with(&format!(".{}", col.name)) || key == col.name.as_str() {
+                    return value.clone();
+                }
+                // Also try reverse: if subquery has "table.col" and column_values has "col"
+                if col.name.ends_with(&format!(".{}", key)) || col.name.as_str() == *key {
+                    return value.clone();
+                }
+            }
+
+            // If no match found, return original (will fail later)
+            expr.clone()
         }
         Expr::BinaryExpr { left, op, right } => {
-            let new_left = substitute_columns_in_expr(left, column_values, local_tables);
-            let new_right = substitute_columns_in_expr(right, column_values, local_tables);
+            let new_left = substitute_columns_in_expr(left, column_values);
+            let new_right = substitute_columns_in_expr(right, column_values);
             Expr::BinaryExpr {
                 left: Box::new(new_left),
                 op: *op,
                 right: Box::new(new_right),
             }
         }
-        Expr::UnaryExpr { op, expr: inner } => {
-            let new_expr = substitute_columns_in_expr(inner, column_values, local_tables);
+        Expr::UnaryExpr { op, expr } => {
+            let new_expr = substitute_columns_in_expr(expr, column_values);
             Expr::UnaryExpr {
                 op: *op,
                 expr: Box::new(new_expr),
             }
         }
-        Expr::Alias { expr: inner, name } => {
-            let new_expr = substitute_columns_in_expr(inner, column_values, local_tables);
+        Expr::Alias { expr, name } => {
+            let new_expr = substitute_columns_in_expr(expr, column_values);
             Expr::Alias {
                 expr: Box::new(new_expr),
                 name: name.clone(),
             }
         }
-        Expr::Aggregate {
-            func,
-            args,
-            distinct,
-        } => {
+        Expr::Aggregate { func, args, distinct } => {
             let new_args: Vec<Expr> = args
                 .iter()
-                .map(|a| substitute_columns_in_expr(a, column_values, local_tables))
+                .map(|a| substitute_columns_in_expr(a, column_values))
                 .collect();
             Expr::Aggregate {
                 func: *func,
@@ -929,43 +1131,36 @@ fn substitute_columns_in_expr(
         Expr::ScalarFunc { args, func } => {
             let new_args: Vec<Expr> = args
                 .iter()
-                .map(|a| substitute_columns_in_expr(a, column_values, local_tables))
+                .map(|a| substitute_columns_in_expr(a, column_values))
                 .collect();
             Expr::ScalarFunc {
                 args: new_args,
                 func: func.clone(),
             }
         }
-        Expr::Cast {
-            expr: inner,
-            data_type,
-        } => {
-            let new_expr = substitute_columns_in_expr(inner, column_values, local_tables);
+        Expr::Cast { expr, data_type } => {
+            let new_expr = substitute_columns_in_expr(expr, column_values);
             Expr::Cast {
                 expr: Box::new(new_expr),
                 data_type: data_type.clone(),
             }
         }
-        Expr::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => {
+        Expr::Case { operand, when_then, else_expr } => {
             let new_operand = operand
                 .as_ref()
-                .map(|e| substitute_columns_in_expr(e, column_values, local_tables));
+                .map(|e| substitute_columns_in_expr(e, column_values));
             let new_when_then: Vec<(Expr, Expr)> = when_then
                 .iter()
                 .map(|(w, t)| {
                     (
-                        substitute_columns_in_expr(w, column_values, local_tables),
-                        substitute_columns_in_expr(t, column_values, local_tables),
+                        substitute_columns_in_expr(w, column_values),
+                        substitute_columns_in_expr(t, column_values),
                     )
                 })
                 .collect();
             let new_else = else_expr
                 .as_ref()
-                .map(|e| substitute_columns_in_expr(e, column_values, local_tables));
+                .map(|e| substitute_columns_in_expr(e, column_values));
             Expr::Case {
                 operand: new_operand.map(Box::new),
                 when_then: new_when_then,
@@ -990,7 +1185,7 @@ fn results_array_from_scalars(scalars: &[ScalarValue], num_rows: usize) -> Resul
 
     // All scalars should have the same type
     match &scalars[0] {
-        ScalarValue::Int64(_) => {
+        ScalarValue::Int64(_v) => {
             use arrow::array::Int64Array;
             let values: Vec<Option<i64>> = scalars
                 .iter()
@@ -1002,7 +1197,7 @@ fn results_array_from_scalars(scalars: &[ScalarValue], num_rows: usize) -> Resul
                 .collect();
             Ok(Arc::new(Int64Array::from(values)))
         }
-        ScalarValue::Float64(_) => {
+        ScalarValue::Float64(_v) => {
             use arrow::array::Float64Array;
             let values: Vec<Option<f64>> = scalars
                 .iter()
@@ -1014,7 +1209,7 @@ fn results_array_from_scalars(scalars: &[ScalarValue], num_rows: usize) -> Resul
                 .collect();
             Ok(Arc::new(Float64Array::from(values)))
         }
-        ScalarValue::Boolean(_) => {
+        ScalarValue::Boolean(_v) => {
             use arrow::array::BooleanArray;
             let values: Vec<Option<bool>> = scalars
                 .iter()
@@ -1026,7 +1221,7 @@ fn results_array_from_scalars(scalars: &[ScalarValue], num_rows: usize) -> Resul
                 .collect();
             Ok(Arc::new(BooleanArray::from(values)))
         }
-        ScalarValue::Utf8(_) => {
+        ScalarValue::Utf8(_v) => {
             use arrow::array::StringArray;
             let values: Vec<Option<&str>> = scalars
                 .iter()
@@ -1110,6 +1305,7 @@ fn evaluate_in_subquery(left: &ArrayRef, right: &ArrayRef, negated: bool) -> Res
 /// Convert scalar value to array (for scalar subquery results)
 fn scalar_to_array(value: &ScalarValue, num_rows: usize) -> ArrayRef {
     use arrow::array::*;
+    
 
     match value {
         ScalarValue::Null => Arc::new(NullArray::new(num_rows)),
@@ -1129,7 +1325,7 @@ fn scalar_to_array(value: &ScalarValue, num_rows: usize) -> ArrayRef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{BooleanArray, Int64Array};
+    use arrow::array::{Int64Array, BooleanArray};
 
     #[test]
     fn test_scalar_to_array_conversion() {

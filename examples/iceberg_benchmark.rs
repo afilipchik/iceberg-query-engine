@@ -6,7 +6,7 @@
 use query_engine::execution::{ExecutionConfig, ExecutionContext};
 use query_engine::physical::operators::TableProvider;
 use query_engine::storage::{ParquetTable, StreamingParquetReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[tokio::main]
@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn test_streaming_parquet(data_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_streaming_parquet(data_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let lineitem_path = data_path.join("lineitem.parquet");
 
     if !lineitem_path.exists() {
@@ -83,10 +83,7 @@ async fn test_streaming_parquet(data_path: &PathBuf) -> Result<(), Box<dyn std::
     Ok(())
 }
 
-async fn test_memory_limited_context(
-    data_path: &PathBuf,
-    memory_limit_mb: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_memory_limited_context(data_path: &Path, memory_limit_mb: usize) -> Result<(), Box<dyn std::error::Error>> {
     let memory_limit = memory_limit_mb * 1024 * 1024;
 
     let config = ExecutionConfig::new()
@@ -140,10 +137,7 @@ async fn test_memory_limited_context(
     Ok(())
 }
 
-async fn test_aggregation_query(
-    data_path: &PathBuf,
-    memory_limit_mb: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_aggregation_query(data_path: &Path, memory_limit_mb: usize) -> Result<(), Box<dyn std::error::Error>> {
     let memory_limit = memory_limit_mb * 1024 * 1024;
 
     let config = ExecutionConfig::new()
