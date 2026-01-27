@@ -1,5 +1,25 @@
 # Plan: Supporting Larger-Than-Memory Datasets
 
+## Status: PARTIAL ⚠️
+
+### Phase Status
+
+| Phase | Status | Notes |
+|-------|--------|-------|
+| Phase 1: Memory Accounting | ✅ DONE | MemoryPool, ExecutionConfig, MemoryConsumer trait |
+| Phase 2: Streaming Reads | ✅ DONE | StreamingParquetReader, AsyncParquetReader |
+| Phase 3: Spillable Hash Join | ⚠️ HAS BUGS | Schema issues - disabled by default |
+| Phase 4: Spillable Hash Aggregate | ⚠️ HAS BUGS | Parquet I/O bugs - disabled by default |
+| Phase 5: External Sort | ⚠️ HAS BUGS | Schema issues - disabled by default |
+| Phase 6: Sort-Merge Join | ❌ NOT STARTED | Alternative to hash join |
+| Phase 7: Iceberg Optimizations | ❌ NOT STARTED | Statistics pruning, delete files |
+
+### Current Workaround
+
+Memory limits in HashJoinExec (50M rows / 4GB) prevent OOM. Spilling disabled by default.
+
+---
+
 ## Executive Summary
 
 This plan enables the query engine to process datasets that exceed available RAM by implementing:
@@ -10,18 +30,19 @@ This plan enables the query engine to process datasets that exceed available RAM
 
 ## Current State Analysis
 
-### What Exists
-- `MemoryPool` with `try_allocate()` / RAII reservations (unused)
-- `IcebergScanExec` with partition filter support (incomplete - returns empty)
-- `IcebergDataFile` with `lower_bounds`/`upper_bounds` statistics (parsed but unused)
-- Async streaming interface between operators
+### What's Done ✅
+- `MemoryPool` with `try_allocate()` / RAII reservations
+- `MemoryConsumer` trait for spillable operators
+- `ExecutionConfig` with memory limits and spill paths
+- `StreamingParquetReader` for row-group streaming
+- `AsyncParquetReader` for async I/O
+- Spillable operator implementations (have bugs)
 
-### What's Missing
-- Memory accounting in operators
-- Disk spilling for joins/aggregations/sorts
-- Streaming Parquet row-group reading
+### What's Missing ❌
+- Fix spillable operator bugs (schema, Parquet I/O)
 - Iceberg statistics-based file pruning
 - Sort-merge join alternative to hash join
+- Integration tests with memory limits
 
 ---
 

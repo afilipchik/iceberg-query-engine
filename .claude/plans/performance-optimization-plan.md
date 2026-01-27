@@ -178,25 +178,25 @@ B. **JIT compilation with Cranelift**
 
 **Recommendation**: Option A is sufficient for most gains.
 
-## Proposed Implementation Roadmap
+## Implementation Roadmap
 
-### Phase 1: Quick Wins (1-2 days)
+### Phase 1: Quick Wins ✅ COMPLETE
 1. [x] Fix filter partition propagation bug
 2. [x] Add simple parallel scan with rayon (morsel-driven parallelism)
 3. [x] Implement subquery result caching (memoization by correlation key)
 
-### Phase 2: I/O Optimization (2-3 days)
+### Phase 2: I/O Optimization ✅ COMPLETE
 4. [x] Streaming Parquet reader (StreamingParquetReader)
 5. [x] Row group pruning with statistics (vectorized_agg.rs)
 6. [x] Async I/O for Parquet (AsyncParquetReader with tokio)
 
-### Phase 3: Parallel Execution (3-5 days)
+### Phase 3: Parallel Execution ✅ COMPLETE
 7. [x] Partitioned aggregation (morsel_agg.rs)
 8. [x] Parallel hash join build (rayon-based parallel build)
 9. [x] Work-stealing scheduler (crossbeam work-stealing example)
 
-### Phase 4: Advanced Optimizations (5+ days)
-10. [ ] Subquery decorrelation
+### Phase 4: Advanced Optimizations (NOT STARTED)
+10. [ ] Subquery decorrelation (Q17-Q22 performance)
 11. [ ] Expression vectorization
 12. [ ] Cost-based join ordering
 
@@ -216,6 +216,6 @@ For each optimization, measure:
 
 ## Current Blockers
 
-1. **Correlated subqueries**: Q17-Q22 are blocked until decorrelation implemented
-2. **Single-threaded**: All queries blocked by lack of parallelism
-3. **Memory**: Large datasets may OOM without streaming
+1. **Correlated subqueries**: Q17-Q22 slow until decorrelation implemented
+2. ~~**Single-threaded**: All queries blocked by lack of parallelism~~ ✅ RESOLVED (morsel-driven parallelism)
+3. ~~**Memory**: Large datasets may OOM without streaming~~ ✅ RESOLVED (streaming + memory limits)
