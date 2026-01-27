@@ -658,12 +658,53 @@ Based on the codebase structure, these appear to be planned but not fully implem
 
 ## Current Test Status
 
-- **SQL Correctness Tests**: 131 passing (`tests/sql_comprehensive.rs`)
+- **SQL Correctness Tests**: 128 passing (`tests/sql_comprehensive.rs`)
 - **Function Validation Tests**: 161 passing (`tests/function_validation_tests.rs`)
-- **TPC-H Benchmark**: 22/22 queries returning data
+- **TPC-H Benchmark**: 22/22 queries executing correctly
 - **Subquery Tests**: EXISTS, IN, ScalarSubquery all working
 
+## TPC-H Benchmark Comparison (SF=0.1 / 100MB)
+
+| Query | Our Engine | DuckDB | Ratio | Notes |
+|-------|------------|--------|-------|-------|
+| Q01   |     41ms   |   15ms |  2.7x | |
+| Q02   |      9ms   |   11ms |  **0.8x** | Faster than DuckDB |
+| Q03   |     52ms   |   12ms |  4.3x | |
+| Q04   |      3ms   |   16ms |  **0.2x** | 5x faster than DuckDB |
+| Q05   |    256ms   |   24ms | 10.7x | |
+| Q06   |      8ms   |   25ms |  **0.3x** | 3x faster than DuckDB |
+| Q07   |   2656ms   |   20ms |  133x | Multi-way join bottleneck |
+| Q08   |     63ms   |   19ms |  3.3x | |
+| Q09   |    792ms   |   15ms |   53x | Multi-way join bottleneck |
+| Q10   |    132ms   |   21ms |  6.3x | |
+| Q11   |    128ms   |   34ms |  3.8x | |
+| Q12   |     43ms   |   32ms |  1.3x | |
+| Q13   |     52ms   |   35ms |  1.5x | |
+| Q14   |     12ms   |   31ms |  **0.4x** | 2.6x faster than DuckDB |
+| Q15   |     59ms   |   30ms |  2.0x | |
+| Q16   |     20ms   |   19ms |  1.1x | Nearly equal |
+| Q17   |    199ms   |   10ms |   20x | Scalar subquery |
+| Q18   |    364ms   |   12ms |   30x | IN subquery |
+| Q19   |    305ms   |   20ms |   15x | |
+| Q20   |    120ms   |   26ms |  4.6x | |
+| Q21   |  61373ms   |   22ms | 2790x | **Main bottleneck** - nested EXISTS |
+| Q22   |     51ms   |   20ms |  2.6x | |
+| **TOTAL** | **66.7s** | **0.49s** | **136x** | |
+
+**Key findings:**
+- Q21 takes 92% of total time (61s out of 66.7s) - nested EXISTS/NOT EXISTS still O(n²)
+- Q7, Q9 need better join optimization for multi-way joins
+- Several queries (Q02, Q04, Q06, Q14) are faster than DuckDB
+- Excluding Q21: 5.3s total vs 0.47s DuckDB (11x slower)
+
 ## Recently Implemented Features
+
+- **Q21 EXISTS/NOT EXISTS Fix** (2026-01-27 - 400x speedup at SF=0.01)
+  - Fixed PredicatePushdown pushing EXISTS predicates to scan nodes
+  - SubqueryDecorrelation now properly finds and transforms EXISTS/NOT EXISTS
+  - Q21 at SF=0.01: 363 seconds → 921ms (395x faster)
+  - At SF=0.1 still slow (61s) due to O(n²) execution - needs DelimJoin
+  - Located in `src/optimizer/rules/predicate_pushdown.rs`
 
 - **Optimizer Rule Order Fix** (Critical fix for Q17 scalar subquery)
   - Changed optimizer rule order to run PredicatePushdown before SubqueryDecorrelation

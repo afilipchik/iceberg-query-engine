@@ -24,6 +24,19 @@ We have a basic `SubqueryDecorrelation` optimizer rule (`src/optimizer/rules/sub
 
 **All Q17-Q22 now execute correctly and efficiently at SF=0.01!**
 
+### Benchmark Results (SF=0.1 / 100MB) - 2026-01-27
+
+| Query | Our Engine | DuckDB | Ratio |
+|-------|------------|--------|-------|
+| Q17   |    199ms   |   10ms |   20x |
+| Q18   |    364ms   |   12ms |   30x |
+| Q19   |    305ms   |   20ms |   15x |
+| Q20   |    120ms   |   26ms |  4.6x |
+| Q21   |  61373ms   |   22ms | 2790x | ← Main bottleneck
+| Q22   |     51ms   |   20ms |  2.6x |
+
+**Remaining Problem**: Q21 at SF=0.1 still takes 61 seconds due to O(n²) nested EXISTS/NOT EXISTS execution. The decorrelation to semi/anti joins is working, but the execution is still row-by-row. Need DelimJoin infrastructure for true O(n) execution.
+
 ### Root Cause Analysis
 
 The current approach has limitations:
