@@ -559,15 +559,14 @@ fn decorrelate_scalar_subquery(
     let (correlation_predicates, decorrelated_subquery) =
         extract_correlation_predicates(subquery, outer)?;
 
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[SCALAR_DECORR] Found {} correlation predicates",
+        correlation_predicates.len()
+    );
+
     if correlation_predicates.is_empty() {
         // Not a correlated subquery - can't decorrelate with this method
-        return Ok(None);
-    }
-
-    // Build the join conditions
-    let join_on = build_join_conditions(&correlation_predicates, outer, &decorrelated_subquery)?;
-
-    if join_on.is_empty() {
         return Ok(None);
     }
 
@@ -578,28 +577,99 @@ fn decorrelate_scalar_subquery(
     }
 
     // The scalar value column - this is what the subquery computes
-    let scalar_col_name = &subquery_schema.fields()[0].name;
+    let scalar_col_name = subquery_schema.fields()[0].name.clone();
 
     // For scalar subqueries, we need to add the correlation columns to the group-by
     // if the subquery has aggregation, to ensure we get one result per outer row
+    // This MUST happen before build_join_conditions so the schema includes correlation columns
     let join_right =
         ensure_grouped_by_correlation(&decorrelated_subquery, &correlation_predicates)?;
 
-    // Build the join schema - outer columns + scalar result column
-    let mut join_fields: Vec<crate::planner::SchemaField> = outer.schema().fields().to_vec();
-    // Add the scalar result column with a unique name to avoid conflicts
-    let result_col_name = format!("__scalar_subquery_{}", scalar_col_name);
-    let result_field = crate::planner::SchemaField::new(
-        &result_col_name,
-        subquery_schema.fields()[0].data_type.clone(),
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[SCALAR_DECORR] After ensure_grouped_by_correlation, schema: {:?}",
+        join_right
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>()
     );
-    join_fields.push(result_field);
+
+    // Build the join conditions using the updated schema
+    let join_on = build_join_conditions(&correlation_predicates, outer, &join_right)?;
+
+    if join_on.is_empty() {
+        #[cfg(debug_assertions)]
+        eprintln!("[SCALAR_DECORR] No join conditions built, cannot decorrelate");
+        return Ok(None);
+    }
+
+    // Get the updated schema from join_right (after ensure_grouped_by_correlation)
+    let join_right_schema = join_right.schema();
+
+    // Find the scalar result column - the original scalar column from the subquery
+    // After ensure_grouped_by_correlation, correlation columns are prepended
+    let scalar_field_idx = join_right_schema
+        .fields()
+        .iter()
+        .position(|f| {
+            f.name == scalar_col_name
+                || f.name.contains("AVG")
+                || f.name.contains("SUM")
+                || f.name.contains("COUNT")
+                || f.name.contains("MAX")
+                || f.name.contains("MIN")
+        })
+        .unwrap_or(join_right_schema.fields().len() - 1);
+    let scalar_field = &join_right_schema.fields()[scalar_field_idx];
+
+    // Create a sanitized name for the result column
+    let result_col_name = "__scalar_result".to_string();
+
+    // Wrap join_right with a projection that renames the scalar column to a safe name
+    let mut wrapper_exprs = Vec::new();
+    let mut wrapper_fields = Vec::new();
+
+    for (i, field) in join_right_schema.fields().iter().enumerate() {
+        if i == scalar_field_idx {
+            // Rename the scalar result column
+            wrapper_exprs.push(Expr::Alias {
+                expr: Box::new(Expr::column(&field.name)),
+                name: result_col_name.clone(),
+            });
+            wrapper_fields.push(crate::planner::SchemaField::new(
+                &result_col_name,
+                field.data_type.clone(),
+            ));
+        } else {
+            // Keep other columns (like correlation columns) as-is
+            wrapper_exprs.push(Expr::column(&field.name));
+            wrapper_fields.push(field.clone());
+        }
+    }
+
+    let wrapped_right = LogicalPlan::Project(ProjectNode {
+        input: Arc::new(join_right),
+        exprs: wrapper_exprs,
+        schema: PlanSchema::new(wrapper_fields.clone()),
+    });
+
+    // Build the join schema - outer columns + wrapped subquery columns
+    let mut join_fields: Vec<crate::planner::SchemaField> = outer.schema().fields().to_vec();
+    join_fields.extend(wrapper_fields);
     let join_schema = PlanSchema::new(join_fields);
+
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[SCALAR_DECORR] Creating Left Join with result column '{}', original='{}'",
+        result_col_name, scalar_field.name
+    );
 
     // Create Left Join (to preserve outer rows even if subquery has no match)
     let join = LogicalPlan::Join(JoinNode {
         left: Arc::new(outer.clone()),
-        right: Arc::new(join_right),
+        right: Arc::new(wrapped_right),
         join_type: JoinType::Left,
         on: join_on,
         filter: None,
@@ -632,6 +702,94 @@ fn ensure_grouped_by_correlation(
     subquery: &LogicalPlan,
     correlation_predicates: &[CorrelationPredicate],
 ) -> Result<LogicalPlan> {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[ENSURE_GROUPED] subquery type: {:?}, predicates: {:?}",
+        std::mem::discriminant(subquery),
+        correlation_predicates
+            .iter()
+            .map(|p| &p.inner_col)
+            .collect::<Vec<_>>()
+    );
+
+    // Handle Project wrapping Aggregate (common pattern: SELECT expr * AGG(...))
+    if let LogicalPlan::Project(proj_node) = subquery {
+        if let LogicalPlan::Aggregate(_) = proj_node.input.as_ref() {
+            #[cfg(debug_assertions)]
+            eprintln!("[ENSURE_GROUPED] Found Project over Aggregate");
+
+            // Recursively process the aggregate
+            let new_agg = ensure_grouped_by_correlation(&proj_node.input, correlation_predicates)?;
+            let new_agg_schema = new_agg.schema();
+
+            // Update project schema to include correlation columns
+            let mut new_proj_fields = Vec::new();
+
+            // Add correlation columns from the aggregate's output
+            for pred in correlation_predicates {
+                let inner_col = &pred.inner_col;
+                let unqualified_name = if let Some(dot_pos) = inner_col.find('.') {
+                    &inner_col[dot_pos + 1..]
+                } else {
+                    inner_col.as_str()
+                };
+
+                // Find in the new aggregate schema
+                if let Some(field) = new_agg_schema.fields().iter().find(|f| {
+                    f.name == *inner_col
+                        || f.name == unqualified_name
+                        || inner_col.ends_with(&format!(".{}", f.name))
+                        || f.name.ends_with(&format!(".{}", unqualified_name))
+                }) {
+                    new_proj_fields.push(field.clone());
+                }
+            }
+
+            // Add original projection fields
+            new_proj_fields.extend(proj_node.schema.fields().iter().cloned());
+
+            // Create new projection expressions that include correlation columns
+            let mut new_exprs = Vec::new();
+            for pred in correlation_predicates {
+                let inner_col = &pred.inner_col;
+                let unqualified_name = if let Some(dot_pos) = inner_col.find('.') {
+                    &inner_col[dot_pos + 1..]
+                } else {
+                    inner_col.as_str()
+                };
+
+                // Find the actual column name in the aggregate output
+                if let Some(field) = new_agg_schema.fields().iter().find(|f| {
+                    f.name == *inner_col
+                        || f.name == unqualified_name
+                        || inner_col.ends_with(&format!(".{}", f.name))
+                        || f.name.ends_with(&format!(".{}", unqualified_name))
+                }) {
+                    new_exprs.push(Expr::column(&field.name));
+                }
+            }
+            new_exprs.extend(proj_node.exprs.iter().cloned());
+
+            let new_schema = PlanSchema::new(new_proj_fields);
+
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[ENSURE_GROUPED] New project schema: {:?}",
+                new_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+            );
+
+            return Ok(LogicalPlan::Project(ProjectNode {
+                input: Arc::new(new_agg),
+                exprs: new_exprs,
+                schema: new_schema,
+            }));
+        }
+    }
+
     // If the subquery already has aggregation, we need to add the correlation columns to group-by
     if let LogicalPlan::Aggregate(agg_node) = subquery {
         // Check if we need to add correlation columns to group-by
@@ -640,6 +798,16 @@ fn ensure_grouped_by_correlation(
 
         // Get the input schema once to avoid temporary lifetime issues
         let input_schema = agg_node.input.schema();
+
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[ENSURE_GROUPED] Aggregate input schema: {:?}",
+            input_schema
+                .fields()
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>()
+        );
 
         for pred in correlation_predicates {
             // Parse the inner column name to get the unqualified name
@@ -650,6 +818,12 @@ fn ensure_grouped_by_correlation(
                 inner_col.as_str()
             };
 
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[ENSURE_GROUPED] Looking for inner_col={}, unqualified={}",
+                inner_col, unqualified_name
+            );
+
             // Find the actual column in the input schema
             let input_field = input_schema.fields().iter().find(|f| {
                 f.name == *inner_col
@@ -657,6 +831,12 @@ fn ensure_grouped_by_correlation(
                     || inner_col.ends_with(&format!(".{}", f.name))
                     || f.name.ends_with(&format!(".{}", unqualified_name))
             });
+
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[ENSURE_GROUPED] Found field: {:?}",
+                input_field.map(|f| f.name.as_str())
+            );
 
             if let Some(field) = input_field {
                 // Use the actual field name from the input schema
@@ -943,21 +1123,78 @@ fn try_extract_correlation(
     outer_columns: &HashSet<String>,
     inner_columns: &HashSet<String>,
 ) -> Option<CorrelationPredicate> {
-    // Check if left references outer and right references inner
-    let left_refs_outer =
-        references_columns(left, outer_columns) && !references_columns(left, inner_columns);
-    let right_refs_inner =
-        references_columns(right, inner_columns) && !references_columns(right, outer_columns);
+    let left_in_outer = references_columns(left, outer_columns);
+    let left_in_inner = references_columns(left, inner_columns);
+    let right_in_outer = references_columns(right, outer_columns);
+    let right_in_inner = references_columns(right, inner_columns);
 
-    if left_refs_outer && right_refs_inner {
-        // Get the inner column name
+    // Case 1: left is exclusively outer, right is in inner (may also be in outer due to shared names)
+    // This handles Q17's case: p_partkey (only outer) = l_partkey (in both)
+    let left_exclusively_outer = left_in_outer && !left_in_inner;
+    let right_has_inner = right_in_inner;
+
+    if left_exclusively_outer && right_has_inner {
         if let Some(inner_col) = get_column_name(right) {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[TRY_EXTRACT] Case 1: left exclusively outer, right has inner: {:?} {:?} {}",
+                left, op, inner_col
+            );
             return Some(CorrelationPredicate {
                 outer_expr: left.clone(),
                 inner_col,
                 op,
             });
         }
+    }
+
+    // Case 2: right is exclusively outer, left is in inner
+    let right_exclusively_outer = right_in_outer && !right_in_inner;
+    let left_has_inner = left_in_inner;
+
+    if right_exclusively_outer && left_has_inner {
+        if let Some(inner_col) = get_column_name(left) {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[TRY_EXTRACT] Case 2: right exclusively outer, left has inner: {} {:?} {:?}",
+                inner_col,
+                flip_op(op),
+                right
+            );
+            return Some(CorrelationPredicate {
+                outer_expr: right.clone(),
+                inner_col,
+                op: flip_op(op),
+            });
+        }
+    }
+
+    // Case 3: Standard case - left only outer, right only inner (no overlap)
+    let left_only_outer = left_in_outer && !left_in_inner;
+    let right_only_inner = right_in_inner && !right_in_outer;
+
+    if left_only_outer && right_only_inner {
+        if let Some(inner_col) = get_column_name(right) {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[TRY_EXTRACT] Case 3: standard - left only outer, right only inner: {:?} {:?} {}",
+                left, op, inner_col
+            );
+            return Some(CorrelationPredicate {
+                outer_expr: left.clone(),
+                inner_col,
+                op,
+            });
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        eprintln!(
+            "[TRY_EXTRACT] No match: left_in_outer={}, left_in_inner={}, right_in_outer={}, right_in_inner={}",
+            left_in_outer, left_in_inner, right_in_outer, right_in_inner
+        );
+        eprintln!("  left={:?}, right={:?}", left, right);
     }
 
     None

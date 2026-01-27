@@ -391,6 +391,11 @@ impl PredicatePushdown {
     }
 
     fn can_push_to_scan(&self, expr: &Expr, scan_cols: &[(Option<String>, String)]) -> bool {
+        // Never push predicates containing subqueries to scans
+        // They need to remain in Filter nodes for SubqueryDecorrelation to process
+        if expr.contains_subquery() {
+            return false;
+        }
         let cols = self.extract_columns(expr);
         self.columns_subset(&cols, scan_cols)
     }
