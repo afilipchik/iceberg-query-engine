@@ -221,9 +221,10 @@ impl ExecutionContext {
         let optimized = self.optimizer.optimize(logical)?;
         metrics.optimize_time = optimize_start.elapsed();
 
-        // Physical planning
+        // Physical planning with spillable operators for memory safety
         let physical_start = Instant::now();
-        let mut planner = PhysicalPlanner::new();
+        let mut planner =
+            PhysicalPlanner::with_config(self.memory_pool.clone(), self.config.clone());
         for (name, provider) in &self.tables {
             planner.register_table(name.clone(), provider.clone());
         }
@@ -312,7 +313,8 @@ impl ExecutionContext {
     pub fn physical_plan(&self, query: &str) -> Result<Arc<dyn PhysicalOperator>> {
         let optimized = self.optimized_plan(query)?;
 
-        let mut planner = PhysicalPlanner::new();
+        let mut planner =
+            PhysicalPlanner::with_config(self.memory_pool.clone(), self.config.clone());
         for (name, provider) in &self.tables {
             planner.register_table(name.clone(), provider.clone());
         }

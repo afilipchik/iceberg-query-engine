@@ -202,6 +202,10 @@ pub struct ExecutionConfig {
 
     /// Memory threshold (0.0-1.0) at which to start spilling
     pub spill_threshold: f64,
+
+    /// Enable spillable operators for larger-than-memory datasets
+    /// When false (default), uses regular operators with memory limit checks
+    pub enable_spilling: bool,
 }
 
 impl Default for ExecutionConfig {
@@ -215,6 +219,8 @@ impl Default for ExecutionConfig {
             prefer_sort_merge_join: false,
             enable_stats_pruning: true,
             spill_threshold: 0.8,
+            // Spillable operators disabled by default until bugs are fixed
+            enable_spilling: false,
         }
     }
 }
@@ -263,6 +269,12 @@ impl ExecutionConfig {
     /// Enable/disable Iceberg stats pruning
     pub fn with_stats_pruning(mut self, enabled: bool) -> Self {
         self.enable_stats_pruning = enabled;
+        self
+    }
+
+    /// Enable spillable operators for larger-than-memory datasets
+    pub fn with_spilling(mut self, enabled: bool) -> Self {
+        self.enable_spilling = enabled;
         self
     }
 

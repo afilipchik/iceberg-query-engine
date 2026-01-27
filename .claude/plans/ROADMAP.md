@@ -32,7 +32,7 @@ This document tracks the main development direction. Each work area has a satell
 - [x] JoinReorder optimizer - preserves table qualifiers for aliased tables
 - [x] Cross join detection - 10M row limit check
 
-**Remaining Issues** (low priority):
+**Remaining Issues** (high priority):
 - [ ] Value mismatches in Q2, Q7, Q13, Q17, Q21 (rounding/ordering differences)
 - [ ] Q20 timeout (complex correlated subquery)
 

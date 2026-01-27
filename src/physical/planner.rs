@@ -1,9 +1,11 @@
 //! Physical planner - converts logical plans to physical plans
 
 use crate::error::{QueryError, Result};
+use crate::execution::{ExecutionConfig, SharedMemoryPool};
 use crate::physical::operators::{
-    AggregateExpr, FilterExec, HashAggregateExec, HashJoinExec, LimitExec, MemoryTableExec,
-    ProjectExec, SortExec, SubqueryExecutor, TableProvider, UnionExec,
+    AggregateExpr, ExternalSortExec, FilterExec, HashAggregateExec, HashJoinExec, LimitExec,
+    MemoryTableExec, ProjectExec, SortExec, SpillableHashAggregateExec, SpillableHashJoinExec,
+    SubqueryExecutor, TableProvider, UnionExec,
 };
 use crate::physical::PhysicalOperator;
 use crate::planner::{Expr, JoinType, LogicalPlan, PlanSchema};
@@ -17,6 +19,10 @@ pub struct PhysicalPlanner {
     tables: HashMap<String, Arc<dyn TableProvider>>,
     /// Optional subquery executor for handling subqueries in filters
     subquery_executor: Option<SubqueryExecutor>,
+    /// Memory pool for spillable operators
+    memory_pool: Option<SharedMemoryPool>,
+    /// Execution configuration for spillable operators
+    config: Option<ExecutionConfig>,
 }
 
 impl Default for PhysicalPlanner {
@@ -26,11 +32,31 @@ impl Default for PhysicalPlanner {
 }
 
 impl PhysicalPlanner {
+    /// Create a new physical planner without memory management (uses regular operators)
     pub fn new() -> Self {
         Self {
             tables: HashMap::new(),
             subquery_executor: None,
+            memory_pool: None,
+            config: None,
         }
+    }
+
+    /// Create a physical planner with memory management (uses spillable operators)
+    pub fn with_config(memory_pool: SharedMemoryPool, config: ExecutionConfig) -> Self {
+        Self {
+            tables: HashMap::new(),
+            subquery_executor: None,
+            memory_pool: Some(memory_pool),
+            config: Some(config),
+        }
+    }
+
+    /// Check if spillable operators should be used
+    fn use_spillable(&self) -> bool {
+        self.memory_pool.is_some()
+            && self.config.is_some()
+            && self.config.as_ref().unwrap().enable_spilling
     }
 
     /// Helper to create a FilterExec with subquery executor if needed
@@ -118,6 +144,8 @@ impl PhysicalPlanner {
                 let is_semi_anti = matches!(node.join_type, JoinType::Semi | JoinType::Anti);
 
                 if is_semi_anti && node.filter.is_some() {
+                    // SpillableHashJoinExec doesn't support with_filter yet,
+                    // use regular HashJoinExec for this case
                     let join = HashJoinExec::with_filter(
                         left,
                         right,
@@ -126,7 +154,27 @@ impl PhysicalPlanner {
                         node.filter.clone(),
                     );
                     Ok(Arc::new(join))
+                } else if self.use_spillable() {
+                    // Use spillable hash join with memory management
+                    let join = SpillableHashJoinExec::new(
+                        left,
+                        right,
+                        node.on.clone(),
+                        node.join_type,
+                        self.memory_pool.clone().unwrap(),
+                        self.config.clone().unwrap(),
+                    );
+
+                    // Apply additional filter if present
+                    match &node.filter {
+                        Some(predicate) => {
+                            let filter = self.create_filter(Arc::new(join), predicate.clone());
+                            Ok(Arc::new(filter))
+                        }
+                        None => Ok(Arc::new(join)),
+                    }
                 } else {
+                    // Use regular hash join (no memory management)
                     let join = HashJoinExec::new(left, right, node.on.clone(), node.join_type);
 
                     // Apply additional filter if present (for non-Semi/Anti joins)
@@ -148,14 +196,49 @@ impl PhysicalPlanner {
 
                 let schema = plan_schema_to_arrow(&node.schema);
 
-                let agg = HashAggregateExec::new(input, node.group_by.clone(), aggregates, schema);
-                Ok(Arc::new(agg))
+                if self.use_spillable() {
+                    // Convert to spillable AggregateExpr type
+                    let spillable_aggs: Vec<crate::physical::operators::spillable::AggregateExpr> =
+                        aggregates
+                            .into_iter()
+                            .map(|a| crate::physical::operators::spillable::AggregateExpr {
+                                func: a.func,
+                                input: a.input,
+                                distinct: a.distinct,
+                                second_arg: a.second_arg,
+                            })
+                            .collect();
+
+                    let agg = SpillableHashAggregateExec::new(
+                        input,
+                        node.group_by.clone(),
+                        spillable_aggs,
+                        schema,
+                        self.memory_pool.clone().unwrap(),
+                        self.config.clone().unwrap(),
+                    );
+                    Ok(Arc::new(agg))
+                } else {
+                    let agg =
+                        HashAggregateExec::new(input, node.group_by.clone(), aggregates, schema);
+                    Ok(Arc::new(agg))
+                }
             }
 
             LogicalPlan::Sort(node) => {
                 let input = self.create_physical_plan(&node.input)?;
-                let sort = SortExec::new(input, node.order_by.clone());
-                Ok(Arc::new(sort))
+                if self.use_spillable() {
+                    let sort = ExternalSortExec::new(
+                        input,
+                        node.order_by.clone(),
+                        self.memory_pool.clone().unwrap(),
+                        self.config.clone().unwrap(),
+                    );
+                    Ok(Arc::new(sort))
+                } else {
+                    let sort = SortExec::new(input, node.order_by.clone());
+                    Ok(Arc::new(sort))
+                }
             }
 
             LogicalPlan::Limit(node) => {
@@ -175,8 +258,20 @@ impl PhysicalPlanner {
                     .map(|f| Expr::column(f.name().clone()))
                     .collect();
 
-                let agg = HashAggregateExec::new(input, group_by, vec![], input_schema);
-                Ok(Arc::new(agg))
+                if self.use_spillable() {
+                    let agg = SpillableHashAggregateExec::new(
+                        input,
+                        group_by,
+                        vec![],
+                        input_schema,
+                        self.memory_pool.clone().unwrap(),
+                        self.config.clone().unwrap(),
+                    );
+                    Ok(Arc::new(agg))
+                } else {
+                    let agg = HashAggregateExec::new(input, group_by, vec![], input_schema);
+                    Ok(Arc::new(agg))
+                }
             }
 
             LogicalPlan::Union(node) => {
@@ -205,13 +300,25 @@ impl PhysicalPlanner {
                         .map(|f| Expr::Column(crate::planner::Column::new(f.name.clone())))
                         .collect();
 
-                    let agg = HashAggregateExec::new(
-                        union_exec,
-                        group_by,
-                        vec![], // No aggregates, just grouping for distinct
-                        schema,
-                    );
-                    Ok(Arc::new(agg))
+                    if self.use_spillable() {
+                        let agg = SpillableHashAggregateExec::new(
+                            union_exec,
+                            group_by,
+                            vec![],
+                            schema,
+                            self.memory_pool.clone().unwrap(),
+                            self.config.clone().unwrap(),
+                        );
+                        Ok(Arc::new(agg))
+                    } else {
+                        let agg = HashAggregateExec::new(
+                            union_exec,
+                            group_by,
+                            vec![], // No aggregates, just grouping for distinct
+                            schema,
+                        );
+                        Ok(Arc::new(agg))
+                    }
                 } else {
                     Ok(union_exec)
                 }

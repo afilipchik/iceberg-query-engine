@@ -15,9 +15,31 @@ use rayon::prelude::*;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use tokio::sync::OnceCell;
+
+// Debug logging for crash investigation (disabled by default)
+#[allow(dead_code)]
+fn debug_log(_msg: &str) {
+    // Uncomment to enable debug logging:
+    // use std::fs::OpenOptions;
+    // use std::io::Write;
+    // if let Ok(mut file) = OpenOptions::new()
+    //     .create(true)
+    //     .append(true)
+    //     .open("/tmp/hash_join_debug.log")
+    // {
+    //     let _ = writeln!(file, "[HashJoin] {}", msg);
+    //     let _ = file.flush();
+    // }
+}
+
+/// Cached build side data - collected once, reused across partitions
+struct BuildSideCache {
+    batches: Vec<RecordBatch>,
+    hash_table: HashMap<JoinKey, Vec<HashEntry>>,
+}
 
 /// Hash join execution operator
-#[derive(Debug)]
 pub struct HashJoinExec {
     left: Arc<dyn PhysicalOperator>,
     right: Arc<dyn PhysicalOperator>,
@@ -28,6 +50,21 @@ pub struct HashJoinExec {
     filter: Option<Expr>,
     /// Schema combining left and right for filter evaluation
     combined_schema: SchemaRef,
+    /// Cached build side - computed once, shared across all partition executions
+    build_cache: OnceCell<BuildSideCache>,
+}
+
+impl std::fmt::Debug for HashJoinExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HashJoinExec")
+            .field("left", &self.left)
+            .field("right", &self.right)
+            .field("on", &self.on)
+            .field("join_type", &self.join_type)
+            .field("schema", &self.schema)
+            .field("filter", &self.filter)
+            .finish()
+    }
 }
 
 impl HashJoinExec {
@@ -96,6 +133,7 @@ impl HashJoinExec {
             schema,
             filter,
             combined_schema,
+            build_cache: OnceCell::new(),
         }
     }
 }
@@ -111,30 +149,145 @@ impl PhysicalOperator for HashJoinExec {
     }
 
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
-        // Collect build side (left for inner/left join, right for right join)
+        debug_log(&format!(
+            "execute() partition={} join_type={:?}",
+            partition, self.join_type
+        ));
+
+        // Determine build and probe sides
         let (build_side, probe_side, swapped) = match self.join_type {
             JoinType::Right => (&self.right, &self.left, true),
             _ => (&self.left, &self.right, false),
         };
 
-        let build_stream = build_side.execute(partition).await?;
-        let build_batches: Vec<RecordBatch> = build_stream.try_collect().await?;
-
-        // Build hash table
         let (on_left, on_right): (Vec<_>, Vec<_>) = self.on.iter().cloned().unzip();
-        let build_keys = if swapped { &on_right } else { &on_left };
+        let build_keys = if swapped {
+            on_right.clone()
+        } else {
+            on_left.clone()
+        };
         let probe_keys = if swapped { &on_left } else { &on_right };
 
-        let hash_table = build_hash_table(&build_batches, build_keys)?;
+        // Get or build the cached build side (computed ONCE, reused across all partitions)
+        let cache = self
+            .build_cache
+            .get_or_try_init(|| async {
+                debug_log(&format!(
+                    "CACHE MISS: Building hash table for join_type={:?}",
+                    self.join_type
+                ));
 
-        // Probe
+                // Collect ALL partitions from the build side
+                let build_partitions = build_side.output_partitions().max(1);
+                debug_log(&format!(
+                    "Collecting {} build partitions from {}",
+                    build_partitions,
+                    build_side.name()
+                ));
+
+                // Memory safety: limit build side size to prevent OOM crashes
+                // Default 50M rows - enough for TPC-H SF=100 lineitem (600M) with proper joins
+                const MAX_BUILD_ROWS: usize = 50_000_000;
+                const MAX_BUILD_BYTES: usize = 4 * 1024 * 1024 * 1024; // 4GB
+
+                let mut build_batches = Vec::new();
+                let mut total_build_rows = 0usize;
+                let mut total_build_bytes = 0usize;
+                for p in 0..build_partitions {
+                    let stream = build_side.execute(p).await?;
+                    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                    for b in &batches {
+                        total_build_rows += b.num_rows();
+                        // Estimate memory: ~50 bytes per row as rough average
+                        total_build_bytes += b.get_array_memory_size();
+                    }
+                    build_batches.extend(batches);
+
+                    // Check memory limits DURING collection to fail early
+                    if total_build_rows > MAX_BUILD_ROWS {
+                        return Err(crate::error::QueryError::Execution(format!(
+                            "Hash join build side exceeds {} rows (at {} rows). \
+                        This usually indicates a cross join or missing join condition. \
+                        Consider using spillable operators for larger datasets.",
+                            MAX_BUILD_ROWS, total_build_rows
+                        )));
+                    }
+                    if total_build_bytes > MAX_BUILD_BYTES {
+                        return Err(crate::error::QueryError::Execution(format!(
+                            "Hash join build side exceeds {} bytes (at {} bytes). \
+                        Consider using spillable operators for larger datasets.",
+                            MAX_BUILD_BYTES, total_build_bytes
+                        )));
+                    }
+                }
+                debug_log(&format!(
+                    "Build side collected: {} batches, {} total rows, {} bytes",
+                    build_batches.len(),
+                    total_build_rows,
+                    total_build_bytes
+                ));
+
+                // Build hash table
+                debug_log("Building hash table...");
+                let hash_table = build_hash_table(&build_batches, &build_keys)?;
+                debug_log(&format!(
+                    "Hash table built with {} entries",
+                    hash_table.len()
+                ));
+
+                Ok::<_, crate::error::QueryError>(BuildSideCache {
+                    batches: build_batches,
+                    hash_table,
+                })
+            })
+            .await?;
+
+        debug_log(&format!(
+            "CACHE HIT: Reusing hash table with {} entries for partition {}",
+            cache.hash_table.len(),
+            partition
+        ));
+
+        // Probe with only THIS partition (allows parallel execution across partitions)
+        debug_log(&format!(
+            "Probing partition {} from {}",
+            partition,
+            probe_side.name()
+        ));
         let probe_stream = probe_side.execute(partition).await?;
         let probe_batches: Vec<RecordBatch> = probe_stream.try_collect().await?;
+        let probe_rows: usize = probe_batches.iter().map(|b| b.num_rows()).sum();
+        debug_log(&format!(
+            "Probe side collected: {} batches, {} rows",
+            probe_batches.len(),
+            probe_rows
+        ));
 
+        // Safety check: prevent cross join explosions
+        // For Cross joins, the output size is build_rows * probe_rows
+        let build_rows: usize = cache.batches.iter().map(|b| b.num_rows()).sum();
+        if self.join_type == JoinType::Cross && build_rows > 0 && probe_rows > 0 {
+            let max_output = build_rows.saturating_mul(probe_rows);
+            const CROSS_JOIN_LIMIT: usize = 10_000_000; // 10 million rows max
+            if max_output > CROSS_JOIN_LIMIT {
+                debug_log(&format!(
+                    "CROSS JOIN EXPLOSION DETECTED: {} x {} = {} rows (limit: {})",
+                    build_rows, probe_rows, max_output, CROSS_JOIN_LIMIT
+                ));
+                return Err(crate::error::QueryError::Execution(format!(
+                    "Cross join would produce {} rows ({} x {}), exceeding limit of {}. \
+                    This usually indicates missing join conditions in the query. \
+                    Check that all table joins have proper ON or WHERE conditions.",
+                    max_output, build_rows, probe_rows, CROSS_JOIN_LIMIT
+                )));
+            }
+        }
+
+        debug_log("Starting probe_hash_table...");
         let result = probe_hash_table(
-            &build_batches,
+            &cache.batches,
             &probe_batches,
-            &hash_table,
+            &cache.hash_table,
             probe_keys,
             self.join_type,
             swapped,
@@ -143,7 +296,23 @@ impl PhysicalOperator for HashJoinExec {
             &self.combined_schema,
         )?;
 
+        let result_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        debug_log(&format!(
+            "Join produced {} result batches, {} rows",
+            result.len(),
+            result_rows
+        ));
+
         Ok(Box::pin(stream::iter(result.into_iter().map(Ok))))
+    }
+
+    fn output_partitions(&self) -> usize {
+        // Hash join can be parallelized by probe side partitions
+        // The build side is fully collected, probe side is partitioned
+        match self.join_type {
+            JoinType::Right => self.left.output_partitions().max(1),
+            _ => self.right.output_partitions().max(1),
+        }
     }
 
     fn name(&self) -> &str {

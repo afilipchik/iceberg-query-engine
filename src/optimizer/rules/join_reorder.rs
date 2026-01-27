@@ -176,10 +176,15 @@ impl JoinReorder {
         }
 
         // Step 2: Build a mapping from column names to relation indices
+        // Include both unqualified (col_name) and qualified (table.col_name) mappings
         let mut column_to_relation: HashMap<String, Vec<usize>> = HashMap::new();
         for (idx, rel) in relations.iter().enumerate() {
             for col in &rel.columns {
+                // Unqualified column name
                 column_to_relation.entry(col.clone()).or_default().push(idx);
+                // Qualified column name (table.column)
+                let qualified = format!("{}.{}", rel.name, col);
+                column_to_relation.entry(qualified).or_default().push(idx);
             }
         }
 
@@ -496,7 +501,12 @@ impl JoinReorder {
     fn extract_columns_recursive(&self, expr: &Expr, columns: &mut HashSet<String>) {
         match expr {
             Expr::Column(col) => {
-                columns.insert(col.name.clone());
+                // Include table qualifier if present, otherwise just the column name
+                if let Some(ref relation) = col.relation {
+                    columns.insert(format!("{}.{}", relation, col.name));
+                } else {
+                    columns.insert(col.name.clone());
+                }
             }
             Expr::BinaryExpr { left, right, .. } => {
                 self.extract_columns_recursive(left, columns);
