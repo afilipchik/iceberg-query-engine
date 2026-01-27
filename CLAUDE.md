@@ -665,6 +665,15 @@ Based on the codebase structure, these appear to be planned but not fully implem
 
 ## Recently Implemented Features
 
+- **Optimizer Rule Order Fix** (Critical fix for Q17 scalar subquery)
+  - Changed optimizer rule order to run PredicatePushdown before SubqueryDecorrelation
+  - Fixes cross join explosion in Q17 (was trying to produce 4 billion rows)
+  - Q17 now executes in 8ms instead of crashing
+  - Q20 now returns correct results (7 rows instead of 297 duplicates)
+  - Added `reorder_filter_with_join` helper in JoinReorder rule
+  - Rule order: ConstantFolding → PredicatePushdown → SubqueryDecorrelation → JoinReorder → PredicatePushdown → ProjectionPushdown
+  - Located in `src/optimizer/mod.rs`, `src/optimizer/rules/join_reorder.rs`
+
 - **Correlated Subquery Memoization** (Performance improvement for Q17-Q22)
   - Caches subquery results by correlation key values
   - Avoids re-executing subqueries for repeated outer row values

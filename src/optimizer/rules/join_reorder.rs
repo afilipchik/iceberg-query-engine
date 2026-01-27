@@ -47,6 +47,11 @@ impl JoinReorder {
     fn reorder(&self, plan: &LogicalPlan) -> Result<LogicalPlan> {
         match plan {
             LogicalPlan::Filter(node) => {
+                // Check if input contains joins that need reordering
+                // If so, we need to pass filter predicates down to help with join ordering
+                if self.needs_reordering(&node.input) {
+                    return self.reorder_filter_with_join(node);
+                }
                 let input = self.reorder(&node.input)?;
                 Ok(LogicalPlan::Filter(crate::planner::FilterNode {
                     input: Arc::new(input),
@@ -160,6 +165,251 @@ impl JoinReorder {
                 self.needs_reordering(&node.left) || self.needs_reordering(&node.right)
             }
             _ => false,
+        }
+    }
+
+    /// Handle Filter node when its input contains joins needing reorder
+    /// This includes filter predicates in the join reordering process
+    fn reorder_filter_with_join(&self, filter: &crate::planner::FilterNode) -> Result<LogicalPlan> {
+        // Collect all relations and conditions from the join tree
+        let mut relations: Vec<JoinRelation> = Vec::new();
+        let mut all_conditions: Vec<(Expr, Expr)> = Vec::new();
+
+        // First, extract join conditions from the filter predicate
+        self.extract_join_conditions(&filter.predicate, &mut all_conditions);
+
+        // Then collect from the join tree
+        self.collect_relations_and_conditions(&filter.input, &mut relations, &mut all_conditions);
+
+        if relations.len() <= 1 {
+            // Not a multi-table join, just recurse normally
+            let input = self.reorder(&filter.input)?;
+            return Ok(LogicalPlan::Filter(crate::planner::FilterNode {
+                input: Arc::new(input),
+                predicate: filter.predicate.clone(),
+            }));
+        }
+
+        // Build the optimized join tree using all conditions (including filter predicates)
+        let (join_result, used_conditions) =
+            self.build_optimized_join_tree(&relations, &all_conditions)?;
+
+        // Rebuild the filter with remaining (non-join) predicates
+        let remaining_filter =
+            self.rebuild_filter_without_join_conditions(&filter.predicate, &used_conditions);
+
+        if let Some(remaining) = remaining_filter {
+            Ok(LogicalPlan::Filter(crate::planner::FilterNode {
+                input: Arc::new(join_result),
+                predicate: remaining,
+            }))
+        } else {
+            Ok(join_result)
+        }
+    }
+
+    /// Build an optimized join tree and return which conditions were used as join conditions
+    fn build_optimized_join_tree(
+        &self,
+        relations: &[JoinRelation],
+        conditions: &[(Expr, Expr)],
+    ) -> Result<(LogicalPlan, HashSet<usize>)> {
+        // Build column to relation mapping
+        let mut column_to_relation: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, rel) in relations.iter().enumerate() {
+            for col in &rel.columns {
+                column_to_relation.entry(col.clone()).or_default().push(idx);
+                let qualified = format!("{}.{}", rel.name, col);
+                column_to_relation.entry(qualified).or_default().push(idx);
+            }
+        }
+
+        // Build join edges from conditions
+        let mut edges: Vec<JoinEdge> = Vec::new();
+        let mut used_condition_indices: HashSet<usize> = HashSet::new();
+
+        for (cond_idx, (left_expr, right_expr)) in conditions.iter().enumerate() {
+            let left_cols = self.extract_columns(left_expr);
+            let right_cols = self.extract_columns(right_expr);
+
+            let left_rels = self.find_relations(&left_cols, &column_to_relation);
+            let right_rels = self.find_relations(&right_cols, &column_to_relation);
+
+            if left_rels.len() == 1 && right_rels.len() == 1 {
+                let left_idx = left_rels[0];
+                let right_idx = right_rels[0];
+
+                if left_idx != right_idx {
+                    used_condition_indices.insert(cond_idx);
+
+                    let existing = edges.iter_mut().find(|e| {
+                        (e.left_idx == left_idx && e.right_idx == right_idx)
+                            || (e.left_idx == right_idx && e.right_idx == left_idx)
+                    });
+
+                    if let Some(edge) = existing {
+                        if edge.left_idx == left_idx {
+                            edge.conditions
+                                .push((left_expr.clone(), right_expr.clone()));
+                        } else {
+                            edge.conditions
+                                .push((right_expr.clone(), left_expr.clone()));
+                        }
+                    } else {
+                        edges.push(JoinEdge {
+                            left_idx,
+                            right_idx,
+                            conditions: vec![(left_expr.clone(), right_expr.clone())],
+                        });
+                    }
+                }
+            }
+        }
+
+        // Greedy join ordering
+        let mut joined: HashSet<usize> = HashSet::new();
+        let mut result_plan: Option<LogicalPlan> = None;
+        let mut used_edges: HashSet<usize> = HashSet::new();
+
+        let start_idx = self.select_start_relation(relations, &edges);
+        joined.insert(start_idx);
+        result_plan = Some(relations[start_idx].plan.clone());
+
+        while joined.len() < relations.len() {
+            let mut best_edge: Option<(usize, usize)> = None;
+            let mut best_score: i32 = -1;
+
+            for (edge_idx, edge) in edges.iter().enumerate() {
+                if used_edges.contains(&edge_idx) {
+                    continue;
+                }
+
+                let left_in = joined.contains(&edge.left_idx);
+                let right_in = joined.contains(&edge.right_idx);
+
+                if left_in && !right_in {
+                    let score = edge.conditions.len() as i32;
+                    if score > best_score {
+                        best_score = score;
+                        best_edge = Some((edge_idx, edge.right_idx));
+                    }
+                } else if !left_in && right_in {
+                    let score = edge.conditions.len() as i32;
+                    if score > best_score {
+                        best_score = score;
+                        best_edge = Some((edge_idx, edge.left_idx));
+                    }
+                }
+            }
+
+            if let Some((edge_idx, new_rel_idx)) = best_edge {
+                let edge = &edges[edge_idx];
+                used_edges.insert(edge_idx);
+                joined.insert(new_rel_idx);
+
+                let current = result_plan.take().unwrap();
+                let new_rel = relations[new_rel_idx].plan.clone();
+
+                let (left, right, on) = if edge.left_idx == new_rel_idx {
+                    (new_rel, current, edge.conditions.clone())
+                } else {
+                    (current, new_rel, edge.conditions.clone())
+                };
+
+                let mut schema_fields = left.schema().fields().to_vec();
+                schema_fields.extend(right.schema().fields().iter().cloned());
+                let schema = crate::planner::PlanSchema::new(schema_fields);
+
+                result_plan = Some(LogicalPlan::Join(JoinNode {
+                    left: Arc::new(left),
+                    right: Arc::new(right),
+                    join_type: JoinType::Inner,
+                    on,
+                    filter: None,
+                    schema,
+                }));
+            } else {
+                // No edge found - need cross join (shouldn't happen if conditions exist)
+                let next_rel = (0..relations.len()).find(|i| !joined.contains(i)).unwrap();
+                joined.insert(next_rel);
+
+                let current = result_plan.take().unwrap();
+                let new_rel = relations[next_rel].plan.clone();
+
+                let mut schema_fields = current.schema().fields().to_vec();
+                schema_fields.extend(new_rel.schema().fields().iter().cloned());
+                let schema = crate::planner::PlanSchema::new(schema_fields);
+
+                result_plan = Some(LogicalPlan::Join(JoinNode {
+                    left: Arc::new(current),
+                    right: Arc::new(new_rel),
+                    join_type: JoinType::Cross,
+                    on: vec![],
+                    filter: None,
+                    schema,
+                }));
+            }
+        }
+
+        Ok((result_plan.unwrap(), used_condition_indices))
+    }
+
+    /// Rebuild filter predicate without the conditions used as join conditions
+    fn rebuild_filter_without_join_conditions(
+        &self,
+        predicate: &Expr,
+        used_indices: &HashSet<usize>,
+    ) -> Option<Expr> {
+        let mut remaining = Vec::new();
+        let mut idx = 0;
+        self.collect_non_join_predicates(predicate, used_indices, &mut idx, &mut remaining);
+
+        if remaining.is_empty() {
+            None
+        } else {
+            Some(
+                remaining
+                    .into_iter()
+                    .reduce(|acc, p| Expr::BinaryExpr {
+                        left: Box::new(acc),
+                        op: BinaryOp::And,
+                        right: Box::new(p),
+                    })
+                    .unwrap(),
+            )
+        }
+    }
+
+    /// Collect predicates that weren't used as join conditions
+    fn collect_non_join_predicates(
+        &self,
+        expr: &Expr,
+        used_indices: &HashSet<usize>,
+        current_idx: &mut usize,
+        result: &mut Vec<Expr>,
+    ) {
+        match expr {
+            Expr::BinaryExpr {
+                left,
+                op: BinaryOp::And,
+                right,
+            } => {
+                self.collect_non_join_predicates(left, used_indices, current_idx, result);
+                self.collect_non_join_predicates(right, used_indices, current_idx, result);
+            }
+            Expr::BinaryExpr {
+                op: BinaryOp::Eq, ..
+            } => {
+                // This is a potential join condition
+                if !used_indices.contains(current_idx) {
+                    result.push(expr.clone());
+                }
+                *current_idx += 1;
+            }
+            _ => {
+                // Non-equality predicates are never join conditions
+                result.push(expr.clone());
+            }
         }
     }
 
@@ -400,12 +650,48 @@ impl JoinReorder {
     ) {
         match plan {
             LogicalPlan::Join(node) => {
-                // Collect conditions from this join
-                conditions.extend(node.on.iter().cloned());
+                // Only flatten Cross and Inner joins - other join types have specific semantics
+                // and shouldn't be reordered (e.g., LeftJoin from subquery decorrelation)
+                if node.join_type == JoinType::Cross || node.join_type == JoinType::Inner {
+                    // Collect conditions from this join
+                    conditions.extend(node.on.iter().cloned());
 
-                // Recursively collect from children
-                self.collect_relations_and_conditions(&node.left, relations, conditions);
-                self.collect_relations_and_conditions(&node.right, relations, conditions);
+                    // Recursively collect from children
+                    self.collect_relations_and_conditions(&node.left, relations, conditions);
+                    self.collect_relations_and_conditions(&node.right, relations, conditions);
+                } else {
+                    // For LeftJoin/RightJoin/Semi/Anti, we still need to process the left child
+                    // to find any Cross joins there, but NOT include the join's ON conditions
+                    // in the reorder pool (those are for the outer join semantics)
+                    //
+                    // Check if left child has Cross joins that need reordering
+                    if self.needs_reordering(&node.left) {
+                        // Collect from left child only - we'll keep this join structure
+                        self.collect_relations_and_conditions(&node.left, relations, conditions);
+                        // Right child becomes an opaque relation
+                        let right_schema = node.right.schema();
+                        let right_columns: HashSet<String> = right_schema
+                            .fields()
+                            .iter()
+                            .map(|f| f.name.clone())
+                            .collect();
+                        relations.push(JoinRelation {
+                            plan: (*node.right).clone(),
+                            name: format!("{:?}_right", node.join_type),
+                            columns: right_columns,
+                        });
+                    } else {
+                        // Treat the whole join as an opaque relation
+                        let schema = plan.schema();
+                        let columns: HashSet<String> =
+                            schema.fields().iter().map(|f| f.name.clone()).collect();
+                        relations.push(JoinRelation {
+                            plan: plan.clone(),
+                            name: format!("{:?}_join", node.join_type),
+                            columns,
+                        });
+                    }
+                }
             }
 
             LogicalPlan::Scan(node) => {

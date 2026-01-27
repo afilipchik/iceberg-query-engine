@@ -37,9 +37,14 @@ impl Optimizer {
     pub fn new() -> Self {
         Self {
             rules: vec![
-                Arc::new(rules::SubqueryDecorrelation), // Must run first to transform subqueries into joins
+                // First pass: push predicates and fold constants before decorrelation
                 Arc::new(rules::ConstantFolding),
-                Arc::new(rules::JoinReorder), // Must run before PredicatePushdown
+                Arc::new(rules::PredicatePushdown), // Push join conditions before decorrelation
+                // Then decorrelate subqueries
+                Arc::new(rules::SubqueryDecorrelation),
+                // Reorder joins after decorrelation
+                Arc::new(rules::JoinReorder),
+                // Final predicate pushdown for any remaining opportunities
                 Arc::new(rules::PredicatePushdown),
                 Arc::new(rules::ProjectionPushdown),
             ],
