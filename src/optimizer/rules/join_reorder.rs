@@ -150,6 +150,22 @@ impl JoinReorder {
             LogicalPlan::Scan(_) | LogicalPlan::EmptyRelation(_) | LogicalPlan::Values(_) => {
                 Ok(plan.clone())
             }
+
+            // DelimJoin/DelimGet - recursively optimize children but don't reorder
+            LogicalPlan::DelimJoin(node) => {
+                let left = self.reorder(&node.left)?;
+                let right = self.reorder(&node.right)?;
+                Ok(LogicalPlan::DelimJoin(crate::planner::DelimJoinNode {
+                    left: Arc::new(left),
+                    right: Arc::new(right),
+                    join_type: node.join_type,
+                    delim_columns: node.delim_columns.clone(),
+                    on: node.on.clone(),
+                    schema: node.schema.clone(),
+                }))
+            }
+
+            LogicalPlan::DelimGet(node) => Ok(LogicalPlan::DelimGet(node.clone())),
         }
     }
 

@@ -981,6 +981,31 @@ fn substitute_columns_in_plan(
         }
         // Pass through unchanged for leaf nodes
         LogicalPlan::EmptyRelation(_) | LogicalPlan::Values(_) => Ok(plan.clone()),
+
+        LogicalPlan::DelimJoin(node) => {
+            let new_on: Vec<(Expr, Expr)> = node
+                .on
+                .iter()
+                .map(|(l, r)| {
+                    (
+                        substitute_columns_in_expr(l, column_values, local_tables),
+                        substitute_columns_in_expr(r, column_values, local_tables),
+                    )
+                })
+                .collect();
+            let new_left = substitute_columns_in_plan(&node.left, column_values, local_tables)?;
+            let new_right = substitute_columns_in_plan(&node.right, column_values, local_tables)?;
+            Ok(LogicalPlan::DelimJoin(DelimJoinNode {
+                left: Arc::new(new_left),
+                right: Arc::new(new_right),
+                join_type: node.join_type,
+                delim_columns: node.delim_columns.clone(),
+                on: new_on,
+                schema: node.schema.clone(),
+            }))
+        }
+
+        LogicalPlan::DelimGet(node) => Ok(LogicalPlan::DelimGet(node.clone())),
     }
 }
 

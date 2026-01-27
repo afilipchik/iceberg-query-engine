@@ -13,6 +13,7 @@ This document tracks the main development direction. Each work area has a satell
 | **Correctness** | ✅ DONE | [archive/correctness.md](archive/correctness.md) |
 | **Memory Safety** | ✅ DONE | [archive/memory-safety.md](archive/memory-safety.md) |
 | **Performance** | 🔄 IN PROGRESS | [performance-optimization-plan.md](performance-optimization-plan.md) |
+| **Subquery Decorrelation** | 🔄 IN PROGRESS | [subquery-decorrelation-plan.md](subquery-decorrelation-plan.md) |
 | **Trino Functions** | ✅ DONE (160+) | [trino-function-implementation.md](trino-function-implementation.md) |
 | **Larger-than-Memory** | ⚠️ PARTIAL | [larger-than-memory-support.md](larger-than-memory-support.md) |
 | **Window Functions** | ❌ NOT STARTED | See below |
@@ -221,11 +222,15 @@ src/
 ├── physical/operators/
 │   ├── hash_join.rs      # Join with memory limits
 │   ├── hash_agg.rs       # Aggregation
+│   ├── delim_join.rs     # DelimJoin/DelimGet for subquery decorrelation
 │   ├── spillable.rs      # Spillable operators (has bugs)
 │   ├── filter.rs         # Expression evaluation, functions
 │   └── subquery.rs       # Correlated subquery execution
 ├── optimizer/rules/
-│   └── join_reorder.rs   # Join order optimization
+│   ├── join_reorder.rs   # Join order optimization
+│   └── flatten_dependent_join.rs  # Correlated subquery to DelimJoin
+├── planner/
+│   └── logical_plan.rs   # Includes DelimJoinNode, DelimGetNode
 ├── execution/
 │   ├── context.rs        # Main entry point
 │   └── memory.rs         # Memory pool, config

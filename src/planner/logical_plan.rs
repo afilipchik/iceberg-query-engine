@@ -14,6 +14,10 @@ pub enum JoinType {
     Semi,
     Anti,
     Cross,
+    /// Single join - for scalar subqueries (returns exactly one row per outer row)
+    Single,
+    /// Mark join - for IN subqueries (adds a boolean column)
+    Mark,
 }
 
 impl fmt::Display for JoinType {
@@ -26,6 +30,8 @@ impl fmt::Display for JoinType {
             JoinType::Semi => write!(f, "SEMI"),
             JoinType::Anti => write!(f, "ANTI"),
             JoinType::Cross => write!(f, "CROSS"),
+            JoinType::Single => write!(f, "SINGLE"),
+            JoinType::Mark => write!(f, "MARK"),
         }
     }
 }
@@ -57,6 +63,12 @@ pub enum LogicalPlan {
     EmptyRelation(EmptyRelationNode),
     /// Values (inline data)
     Values(ValuesNode),
+    /// DelimJoin - Join with deduplication for subquery decorrelation
+    /// Collects distinct correlation values from outer, executes inner once, then joins
+    DelimJoin(DelimJoinNode),
+    /// DelimGet - Scan of deduplicated outer values inside a decorrelated subquery
+    /// Receives correlation values from parent DelimJoin
+    DelimGet(DelimGetNode),
 }
 
 impl LogicalPlan {
@@ -75,6 +87,8 @@ impl LogicalPlan {
             LogicalPlan::SubqueryAlias(node) => node.schema.clone(),
             LogicalPlan::EmptyRelation(node) => node.schema.clone(),
             LogicalPlan::Values(node) => node.schema.clone(),
+            LogicalPlan::DelimJoin(node) => node.schema.clone(),
+            LogicalPlan::DelimGet(node) => node.schema.clone(),
         }
     }
 
@@ -91,6 +105,8 @@ impl LogicalPlan {
             LogicalPlan::Distinct(node) => vec![&node.input],
             LogicalPlan::Union(node) => node.inputs.iter().map(|x| x.as_ref()).collect(),
             LogicalPlan::SubqueryAlias(node) => vec![&node.input],
+            LogicalPlan::DelimJoin(node) => vec![&node.left, &node.right],
+            LogicalPlan::DelimGet(_) => vec![], // DelimGet is a source, no children
         }
     }
 
@@ -148,6 +164,18 @@ impl LogicalPlan {
                 alias: node.alias.clone(),
                 schema: node.schema.clone(),
             }),
+            LogicalPlan::DelimJoin(node) => {
+                let mut iter = children.into_iter();
+                LogicalPlan::DelimJoin(DelimJoinNode {
+                    left: iter.next().unwrap(),
+                    right: iter.next().unwrap(),
+                    join_type: node.join_type,
+                    delim_columns: node.delim_columns.clone(),
+                    on: node.on.clone(),
+                    schema: node.schema.clone(),
+                })
+            }
+            LogicalPlan::DelimGet(node) => LogicalPlan::DelimGet(node.clone()),
         }
     }
 
@@ -298,6 +326,28 @@ impl LogicalPlan {
             LogicalPlan::Values(node) => {
                 writeln!(f, "{}Values: {} rows", prefix, node.values.len())?;
             }
+            LogicalPlan::DelimJoin(node) => {
+                writeln!(f, "{}DelimJoin: {} join", prefix, node.join_type)?;
+                if !node.delim_columns.is_empty() {
+                    let cols: Vec<String> =
+                        node.delim_columns.iter().map(|e| e.to_string()).collect();
+                    writeln!(f, "{}  delim_columns: [{}]", prefix, cols.join(", "))?;
+                }
+                if !node.on.is_empty() {
+                    let on_str: Vec<String> = node
+                        .on
+                        .iter()
+                        .map(|(l, r)| format!("{} = {}", l, r))
+                        .collect();
+                    writeln!(f, "{}  on: {}", prefix, on_str.join(" AND "))?;
+                }
+                node.left.fmt_indent(f, indent + 1)?;
+                node.right.fmt_indent(f, indent + 1)?;
+            }
+            LogicalPlan::DelimGet(node) => {
+                let cols: Vec<String> = node.columns.iter().map(|e| e.to_string()).collect();
+                writeln!(f, "{}DelimGet: columns=[{}]", prefix, cols.join(", "))?;
+            }
         }
         Ok(())
     }
@@ -401,6 +451,64 @@ pub struct EmptyRelationNode {
 pub struct ValuesNode {
     pub values: Vec<Vec<Expr>>,
     pub schema: PlanSchema,
+}
+
+/// DelimJoin node - Join with deduplication for subquery decorrelation
+///
+/// This is DuckDB's approach to efficient correlated subquery execution:
+/// 1. Collect all rows from the left (outer) side
+/// 2. Extract DISTINCT values of the correlation columns (delim_columns)
+/// 3. Execute the right (inner) side ONCE with these distinct values via DelimGet
+/// 4. Build a hash table from the right side results
+/// 5. Probe with all left side rows
+///
+/// This transforms O(n*m) execution to O(n + m) where n and m are the sizes
+/// of the outer and inner relations.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DelimJoinNode {
+    /// Left input (outer query)
+    pub left: Arc<LogicalPlan>,
+    /// Right input (decorrelated subquery, contains DelimGet)
+    pub right: Arc<LogicalPlan>,
+    /// Join type: Semi (EXISTS), Anti (NOT EXISTS), Single (scalar), Mark (IN)
+    pub join_type: JoinType,
+    /// Columns used for deduplication (correlation columns from outer query)
+    pub delim_columns: Vec<Expr>,
+    /// Join conditions (correlation predicates)
+    pub on: Vec<(Expr, Expr)>,
+    /// Output schema
+    pub schema: PlanSchema,
+}
+
+/// DelimGet node - Scan of deduplicated outer values
+///
+/// This node appears inside the right side of a DelimJoin. During execution,
+/// it receives the distinct correlation values from the parent DelimJoin
+/// and produces them as a table that the rest of the subquery can use.
+///
+/// For example, in:
+/// ```sql
+/// SELECT * FROM orders o
+/// WHERE EXISTS (SELECT 1 FROM lineitem l WHERE l.l_orderkey = o.o_orderkey)
+/// ```
+///
+/// The decorrelated form would be:
+/// ```text
+/// DelimJoin (Semi)
+///   ├── Scan: orders
+///   └── Join (Inner)
+///         ├── DelimGet [o_orderkey]  <- receives distinct o_orderkey values
+///         └── Scan: lineitem
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct DelimGetNode {
+    /// Columns that will be provided by the parent DelimJoin
+    /// These are the correlation columns from the outer query
+    pub columns: Vec<Expr>,
+    /// Schema of the deduplicated columns
+    pub schema: PlanSchema,
+    /// Unique identifier to link with parent DelimJoin (set during planning)
+    pub delim_id: u64,
 }
 
 /// Builder for creating logical plans

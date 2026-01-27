@@ -87,6 +87,11 @@ impl ProjectionPushdown {
                 self.collect_recursive(&node.input, required);
             }
             LogicalPlan::EmptyRelation(_) | LogicalPlan::Values(_) => {}
+            LogicalPlan::DelimJoin(node) => {
+                self.collect_recursive(&node.left, required);
+                self.collect_recursive(&node.right, required);
+            }
+            LogicalPlan::DelimGet(_) => {}
         }
     }
 
@@ -492,6 +497,22 @@ impl ProjectionPushdown {
             }
 
             LogicalPlan::EmptyRelation(_) | LogicalPlan::Values(_) => Ok(plan.clone()),
+
+            LogicalPlan::DelimJoin(node) => {
+                // Recursively push projections but don't modify DelimJoin structure
+                let left = self.pushdown(&node.left, required)?;
+                let right = self.pushdown(&node.right, required)?;
+                Ok(LogicalPlan::DelimJoin(crate::planner::DelimJoinNode {
+                    left: Arc::new(left),
+                    right: Arc::new(right),
+                    join_type: node.join_type,
+                    delim_columns: node.delim_columns.clone(),
+                    on: node.on.clone(),
+                    schema: node.schema.clone(),
+                }))
+            }
+
+            LogicalPlan::DelimGet(node) => Ok(LogicalPlan::DelimGet(node.clone())),
         }
     }
 }

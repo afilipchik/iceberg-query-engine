@@ -40,7 +40,9 @@ impl Optimizer {
                 // First pass: push predicates and fold constants before decorrelation
                 Arc::new(rules::ConstantFolding),
                 Arc::new(rules::PredicatePushdown), // Push join conditions before decorrelation
-                // Then decorrelate subqueries
+                // TODO: Enable FlattenDependentJoin once column resolution is fixed
+                // Arc::new(rules::FlattenDependentJoin),
+                // Decorrelate subqueries to regular joins
                 Arc::new(rules::SubqueryDecorrelation),
                 // Reorder joins after decorrelation
                 Arc::new(rules::JoinReorder),

@@ -348,6 +348,98 @@ impl PhysicalPlanner {
                 let exec = MemoryTableExec::new("values", schema, vec![], None);
                 Ok(Arc::new(exec))
             }
+
+            LogicalPlan::DelimJoin(node) => {
+                use crate::physical::operators::DelimJoinExec;
+                use std::sync::Arc as StdArc;
+
+                // Create shared delim state
+                let delim_state = StdArc::new(crate::physical::operators::DelimState::new());
+
+                // Create the left (outer) side
+                let left = self.create_physical_plan(&node.left)?;
+
+                // For the right side, we need to find DelimGet nodes and connect them
+                // to the shared state.
+                let right =
+                    self.create_physical_plan_with_delim_state(&node.right, &delim_state)?;
+
+                let schema = plan_schema_to_arrow(&node.schema);
+                // Use with_delim_state to share the state with child DelimGet nodes
+                let delim_join = DelimJoinExec::with_delim_state(
+                    left,
+                    right,
+                    node.join_type,
+                    node.delim_columns.clone(),
+                    node.on.clone(),
+                    schema,
+                    delim_state,
+                );
+
+                Ok(Arc::new(delim_join))
+            }
+
+            LogicalPlan::DelimGet(node) => {
+                // DelimGet without a parent DelimJoin is an error
+                Err(QueryError::Execution(
+                    "DelimGet encountered without parent DelimJoin. \
+                     Ensure the logical plan is correctly structured."
+                        .to_string(),
+                ))
+            }
+        }
+    }
+
+    /// Create physical plan for the inner side of a DelimJoin, connecting DelimGet nodes
+    fn create_physical_plan_with_delim_state(
+        &self,
+        logical: &LogicalPlan,
+        delim_state: &std::sync::Arc<crate::physical::operators::DelimState>,
+    ) -> Result<Arc<dyn PhysicalOperator>> {
+        use crate::physical::operators::DelimGetExec;
+
+        match logical {
+            LogicalPlan::DelimGet(node) => {
+                // Create DelimGetExec connected to the shared state
+                let schema = plan_schema_to_arrow(&node.schema);
+                let delim_get = DelimGetExec::new(std::sync::Arc::clone(delim_state), schema);
+                Ok(Arc::new(delim_get))
+            }
+            LogicalPlan::Filter(node) => {
+                let input = self.create_physical_plan_with_delim_state(&node.input, delim_state)?;
+                let filter = self.create_filter(input, node.predicate.clone());
+                Ok(Arc::new(filter))
+            }
+            LogicalPlan::Project(node) => {
+                let input = self.create_physical_plan_with_delim_state(&node.input, delim_state)?;
+                let schema = plan_schema_to_arrow(&node.schema);
+                let project = ProjectExec::new(input, node.exprs.clone(), schema);
+                Ok(Arc::new(project))
+            }
+            LogicalPlan::Join(node) => {
+                let left = self.create_physical_plan_with_delim_state(&node.left, delim_state)?;
+                let right = self.create_physical_plan_with_delim_state(&node.right, delim_state)?;
+                let join = HashJoinExec::new(left, right, node.on.clone(), node.join_type);
+                match &node.filter {
+                    Some(predicate) => {
+                        let filter = self.create_filter(Arc::new(join), predicate.clone());
+                        Ok(Arc::new(filter))
+                    }
+                    None => Ok(Arc::new(join)),
+                }
+            }
+            LogicalPlan::Aggregate(node) => {
+                let input = self.create_physical_plan_with_delim_state(&node.input, delim_state)?;
+                let aggregates = extract_aggregates(&node.aggregates);
+                let schema = plan_schema_to_arrow(&node.schema);
+                let agg = HashAggregateExec::new(input, node.group_by.clone(), aggregates, schema);
+                Ok(Arc::new(agg))
+            }
+            LogicalPlan::SubqueryAlias(node) => {
+                self.create_physical_plan_with_delim_state(&node.input, delim_state)
+            }
+            // For other node types, fall back to regular planning
+            _ => self.create_physical_plan(logical),
         }
     }
 }

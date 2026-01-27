@@ -195,10 +195,16 @@ B. **JIT compilation with Cranelift**
 8. [x] Parallel hash join build (rayon-based parallel build)
 9. [x] Work-stealing scheduler (crossbeam work-stealing example)
 
-### Phase 4: Advanced Optimizations (NOT STARTED)
-10. [ ] Subquery decorrelation (Q17-Q22 performance)
-11. [ ] Expression vectorization
-12. [ ] Cost-based join ordering
+### Phase 4: Advanced Optimizations (IN PROGRESS)
+10. [x] **DelimJoin Infrastructure** (foundation for subquery decorrelation)
+    - `DelimJoinNode`, `DelimGetNode` logical plan nodes
+    - `DelimJoinExec`, `DelimGetExec` physical operators
+    - `FlattenDependentJoin` optimizer rule (needs column resolution fixes)
+    - Shared `DelimState` for efficient value passing
+    - **See [subquery-decorrelation-plan.md](subquery-decorrelation-plan.md)**
+11. [ ] Enable FlattenDependentJoin rule (fix column resolution)
+12. [ ] Expression vectorization
+13. [ ] Cost-based join ordering
 
 ## Metrics to Track
 

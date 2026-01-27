@@ -364,6 +364,42 @@ impl PredicatePushdown {
                     }))
                 }
             }
+
+            LogicalPlan::DelimJoin(node) => {
+                // Don't push predicates into DelimJoin - handle like a regular join
+                let left = self.pushdown(&node.left, vec![])?;
+                let right = self.pushdown(&node.right, vec![])?;
+                let plan = LogicalPlan::DelimJoin(crate::planner::DelimJoinNode {
+                    left: Arc::new(left),
+                    right: Arc::new(right),
+                    join_type: node.join_type,
+                    delim_columns: node.delim_columns.clone(),
+                    on: node.on.clone(),
+                    schema: node.schema.clone(),
+                });
+                if predicates.is_empty() {
+                    Ok(plan)
+                } else {
+                    let combined = self.combine_predicates(predicates);
+                    Ok(LogicalPlan::Filter(FilterNode {
+                        input: Arc::new(plan),
+                        predicate: combined,
+                    }))
+                }
+            }
+
+            LogicalPlan::DelimGet(node) => {
+                // DelimGet is a leaf node - can't push predicates into it
+                if predicates.is_empty() {
+                    Ok(plan.clone())
+                } else {
+                    let combined = self.combine_predicates(predicates);
+                    Ok(LogicalPlan::Filter(FilterNode {
+                        input: Arc::new(LogicalPlan::DelimGet(node.clone())),
+                        predicate: combined,
+                    }))
+                }
+            }
         }
     }
 

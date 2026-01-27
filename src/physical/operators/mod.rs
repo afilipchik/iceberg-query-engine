@@ -1,5 +1,6 @@
 //! Physical operators
 
+mod delim_join;
 mod filter;
 pub mod hash_agg;
 mod hash_join;
@@ -13,6 +14,7 @@ pub mod spillable;
 mod subquery;
 mod union;
 
+pub use delim_join::{DelimGetExec, DelimJoinExec, DelimState};
 pub use filter::{evaluate_expr, FilterExec};
 pub use hash_agg::{AggregateExpr, HashAggregateExec};
 pub use hash_join::HashJoinExec;

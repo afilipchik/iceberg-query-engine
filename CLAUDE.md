@@ -240,6 +240,8 @@ let result = ctx.sql("SELECT * FROM users").await?;
 | `UnionExec` | Combine inputs | Stream concatenation |
 | `ParquetScanExec` | Read Parquet files | Async streaming with projection |
 | `IcebergScanExec` | Read Iceberg tables | Manifest parsing + Parquet scan |
+| `DelimJoinExec` | Deduplicated join | Distinct key extraction + hash join |
+| `DelimGetExec` | Receive distinct keys | Shared state from parent DelimJoin |
 
 ### TableProvider Trait
 
@@ -699,6 +701,18 @@ Based on the codebase structure, these appear to be planned but not fully implem
 
 ## Recently Implemented Features
 
+- **DelimJoin Infrastructure** (2026-01-27)
+  - DuckDB-style deduplication join for efficient correlated subquery execution
+  - New logical plan nodes: `DelimJoinNode`, `DelimGetNode` in `src/planner/logical_plan.rs`
+  - New join types: `JoinType::Single` (scalar subquery), `JoinType::Mark` (IN subquery)
+  - Physical operators: `DelimJoinExec`, `DelimGetExec` in `src/physical/operators/delim_join.rs`
+  - Shared `DelimState` for passing distinct correlation values between operators
+  - Optimizer rule: `FlattenDependentJoin` in `src/optimizer/rules/flatten_dependent_join.rs`
+    - Currently disabled pending column resolution fixes
+    - Design: Transform O(n*m) row-by-row execution to O(n+m) set-based execution
+  - Physical planner updated to handle DelimJoin/DelimGet nodes
+  - Foundation for future Q21 performance improvement at larger scale factors
+
 - **Q21 EXISTS/NOT EXISTS Fix** (2026-01-27 - 400x speedup at SF=0.01)
   - Fixed PredicatePushdown pushing EXISTS predicates to scan nodes
   - SubqueryDecorrelation now properly finds and transforms EXISTS/NOT EXISTS
@@ -895,6 +909,8 @@ Based on the codebase structure, these appear to be planned but not fully implem
 | Projection pushdown | `src/optimizer/rules/projection_pushdown.rs` |
 | Physical execution | `src/physical/operators/*.rs` |
 | Subquery execution | `src/physical/operators/subquery.rs` |
+| DelimJoin operators | `src/physical/operators/delim_join.rs` |
+| Flatten dependent join rule | `src/optimizer/rules/flatten_dependent_join.rs` |
 | Main entry point | `src/execution/context.rs` |
 | Parquet table provider | `src/storage/parquet.rs` |
 | Streaming Parquet reader | `src/storage/parquet.rs` (StreamingParquetReader) |

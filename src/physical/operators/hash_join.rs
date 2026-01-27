@@ -728,6 +728,12 @@ fn probe_hash_table(
                 // Semi and Anti joins are handled after processing all probe batches
                 // since we need to know which build rows matched across all probes
             }
+            JoinType::Single | JoinType::Mark => {
+                // Single and Mark joins are similar to Semi/Anti - handle after all probes
+                // Single: for scalar subqueries, returns one row per outer row
+                // Mark: for IN subqueries, adds a boolean column for match status
+                // For now, treat like Semi join (keep matched rows)
+            }
             JoinType::Full => {
                 // Implemented below after processing all probe batches
                 if !build_indices.is_empty() {

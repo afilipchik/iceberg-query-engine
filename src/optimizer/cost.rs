@@ -229,6 +229,38 @@ impl CostEstimator {
                 total_byte_size: None,
                 column_stats: vec![],
             },
+
+            LogicalPlan::DelimJoin(node) => {
+                // DelimJoin is similar to a regular join but more efficient
+                // due to deduplication
+                let left_stats = self.estimate_statistics(&node.left);
+                let right_stats = self.estimate_statistics(&node.right);
+                let left_rows = left_stats.row_count.unwrap_or(self.default_row_count);
+                let right_rows = right_stats.row_count.unwrap_or(self.default_row_count);
+
+                // For Semi/Anti joins, output is at most left side
+                let output_rows = match node.join_type {
+                    crate::planner::JoinType::Semi | crate::planner::JoinType::Anti => left_rows,
+                    crate::planner::JoinType::Single => left_rows,
+                    crate::planner::JoinType::Mark => left_rows,
+                    _ => (left_rows as f64 * right_rows as f64 * 0.1) as usize,
+                };
+
+                Statistics {
+                    row_count: Some(output_rows),
+                    total_byte_size: None,
+                    column_stats: vec![],
+                }
+            }
+
+            LogicalPlan::DelimGet(node) => {
+                // DelimGet receives distinct correlation values - estimate based on delim columns
+                Statistics {
+                    row_count: Some(self.default_row_count / 10), // Distinct values typically smaller
+                    total_byte_size: Some(node.schema.len() * 8 * self.default_row_count / 10),
+                    column_stats: vec![],
+                }
+            }
         }
     }
 
@@ -327,6 +359,32 @@ impl CostEstimator {
             LogicalPlan::EmptyRelation(_) => Cost::default(),
 
             LogicalPlan::Values(_) => Cost::new(row_count * 0.1, 0.0, row_count * 16.0),
+
+            LogicalPlan::DelimJoin(node) => {
+                let left_cost = self.estimate(&node.left);
+                let right_cost = self.estimate(&node.right);
+                let left_rows = self
+                    .estimate_statistics(&node.left)
+                    .row_count
+                    .unwrap_or(self.default_row_count) as f64;
+
+                // DelimJoin is more efficient than regular join due to deduplication
+                // Build cost is for distinct values only, not all rows
+                let distinct_factor = 0.1; // Assume 10% distinct values
+                left_cost
+                    + right_cost
+                    + Cost::new(
+                        left_rows * distinct_factor * self.hash_join_build_cost
+                            + left_rows * self.hash_join_probe_cost,
+                        0.0,
+                        left_rows * distinct_factor * 16.0, // Hash table memory for distinct values
+                    )
+            }
+
+            LogicalPlan::DelimGet(_) => {
+                // DelimGet is a source that receives data from parent - minimal cost
+                Cost::new(row_count * 0.1, 0.0, row_count * 8.0)
+            }
         }
     }
 }
