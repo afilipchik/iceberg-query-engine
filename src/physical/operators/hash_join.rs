@@ -566,6 +566,172 @@ fn create_combined_batch(
     RecordBatch::try_new(combined_schema.clone(), all_columns).map_err(Into::into)
 }
 
+/// Parallel probe for SEMI/ANTI joins - uses rayon for parallel execution
+#[allow(clippy::too_many_arguments)]
+fn probe_semi_anti_parallel(
+    build_batches: &[RecordBatch],
+    probe_batches: &[RecordBatch],
+    hash_table: &HashMap<JoinKey, Vec<HashEntry>>,
+    probe_key_exprs: &[Expr],
+    join_type: JoinType,
+    swapped: bool,
+    output_schema: &SchemaRef,
+    filter: Option<&Expr>,
+    combined_schema: &SchemaRef,
+) -> Result<Vec<RecordBatch>> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Track which build rows have been matched using atomic bools for parallel access
+    let build_matched: Vec<Vec<AtomicBool>> = build_batches
+        .iter()
+        .map(|b| (0..b.num_rows()).map(|_| AtomicBool::new(false)).collect())
+        .collect();
+
+    // Process all probe batches in parallel
+    probe_batches.par_iter().try_for_each(|probe_batch| {
+        let probe_key_arrays: Result<Vec<ArrayRef>> = probe_key_exprs
+            .iter()
+            .map(|e| evaluate_expr(probe_batch, e))
+            .collect();
+        let probe_key_arrays = probe_key_arrays?;
+
+        // Process each probe row
+        for probe_row in 0..probe_batch.num_rows() {
+            let key = extract_join_key(&probe_key_arrays, probe_row);
+
+            // Skip null keys
+            if key.values.iter().any(|v| matches!(v, JoinValue::Null)) {
+                continue;
+            }
+
+            if let Some(entries) = hash_table.get(&key) {
+                // For SEMI join: we just need to find ONE matching entry
+                // For ANTI join: we need to know if ANY entry matches
+                for entry in entries {
+                    // Check if there's a filter to evaluate
+                    if let Some(filter_expr) = filter {
+                        // Create a mini-batch with just this pair for filter evaluation
+                        let build_row_batch = create_single_row_combined_batch(
+                            build_batches,
+                            entry.batch_idx,
+                            entry.row_idx,
+                            probe_batch,
+                            probe_row,
+                            swapped,
+                            combined_schema,
+                        )?;
+
+                        // Evaluate filter
+                        let filter_result = evaluate_expr(&build_row_batch, filter_expr)?;
+                        if let Some(bool_arr) = filter_result
+                            .as_any()
+                            .downcast_ref::<arrow::array::BooleanArray>()
+                        {
+                            if bool_arr.len() > 0 && bool_arr.value(0) {
+                                // Filter passed - mark build row as matched
+                                build_matched[entry.batch_idx][entry.row_idx]
+                                    .store(true, Ordering::Relaxed);
+                                // For SEMI join, we can stop after finding one match per build row
+                                // but we still need to process all probe rows
+                                break;
+                            }
+                        }
+                    } else {
+                        // No filter - any hash match counts
+                        build_matched[entry.batch_idx][entry.row_idx]
+                            .store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+        }
+        Ok::<(), crate::error::QueryError>(())
+    })?;
+
+    // Convert atomic bools to regular bools and create output
+    let matched_rows: Vec<(usize, usize)> = build_matched
+        .iter()
+        .enumerate()
+        .flat_map(|(batch_idx, rows)| {
+            rows.iter()
+                .enumerate()
+                .filter_map(move |(row_idx, matched)| {
+                    if matched.load(Ordering::Relaxed) {
+                        Some((batch_idx, row_idx))
+                    } else {
+                        None
+                    }
+                })
+        })
+        .collect();
+
+    let unmatched_rows: Vec<(usize, usize)> = build_matched
+        .iter()
+        .enumerate()
+        .flat_map(|(batch_idx, rows)| {
+            rows.iter()
+                .enumerate()
+                .filter_map(move |(row_idx, matched)| {
+                    if !matched.load(Ordering::Relaxed) {
+                        Some((batch_idx, row_idx))
+                    } else {
+                        None
+                    }
+                })
+        })
+        .collect();
+
+    let mut results = Vec::new();
+    if matches!(join_type, JoinType::Semi) && !matched_rows.is_empty() {
+        let batch = create_semi_anti_batch(build_batches, &matched_rows, output_schema)?;
+        results.push(batch);
+    }
+    if matches!(join_type, JoinType::Anti) && !unmatched_rows.is_empty() {
+        let batch = create_semi_anti_batch(build_batches, &unmatched_rows, output_schema)?;
+        results.push(batch);
+    }
+
+    Ok(results)
+}
+
+/// Create a combined batch with a single row pair for filter evaluation
+fn create_single_row_combined_batch(
+    build_batches: &[RecordBatch],
+    build_batch_idx: usize,
+    build_row_idx: usize,
+    probe_batch: &RecordBatch,
+    probe_row: usize,
+    swapped: bool,
+    combined_schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    let build_batch = &build_batches[build_batch_idx];
+
+    // Extract single row from build side
+    let build_indices = UInt32Array::from(vec![build_row_idx as u32]);
+    let build_columns: Vec<ArrayRef> = build_batch
+        .columns()
+        .iter()
+        .map(|col| compute::take(col.as_ref(), &build_indices, None))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    // Extract single row from probe side
+    let probe_indices = UInt32Array::from(vec![probe_row as u32]);
+    let probe_columns: Vec<ArrayRef> = probe_batch
+        .columns()
+        .iter()
+        .map(|col| compute::take(col.as_ref(), &probe_indices, None))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    // Combine in correct order
+    let all_columns = if swapped {
+        probe_columns.into_iter().chain(build_columns).collect()
+    } else {
+        build_columns.into_iter().chain(probe_columns).collect()
+    };
+
+    RecordBatch::try_new(combined_schema.clone(), all_columns).map_err(Into::into)
+}
+
 #[allow(clippy::needless_range_loop)] // Index needed for parallel array access
 #[allow(clippy::too_many_arguments)]
 fn probe_hash_table(
@@ -579,6 +745,22 @@ fn probe_hash_table(
     filter: Option<&Expr>,
     combined_schema: &SchemaRef,
 ) -> Result<Vec<RecordBatch>> {
+    // Use parallel path for SEMI/ANTI joins with sufficient data
+    let total_probe_rows: usize = probe_batches.iter().map(|b| b.num_rows()).sum();
+    if matches!(join_type, JoinType::Semi | JoinType::Anti) && total_probe_rows > 1000 {
+        return probe_semi_anti_parallel(
+            build_batches,
+            probe_batches,
+            hash_table,
+            probe_key_exprs,
+            join_type,
+            swapped,
+            output_schema,
+            filter,
+            combined_schema,
+        );
+    }
+
     let mut results = Vec::new();
 
     // Track which build rows have been matched (for outer joins)
