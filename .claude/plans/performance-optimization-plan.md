@@ -1,182 +1,46 @@
 # Query Engine Performance Optimization Plan
 
-## Current State (SF=10, ~60M rows in lineitem)
+## Current State (SF=0.1, ~600K rows in lineitem)
 
-### Latest Benchmark Results: Morsel-Driven Parallelism
+### Latest Benchmark Results (2026-01-27)
 
-| Version | Q01 Time | vs DuckDB | Improvement |
-|---------|----------|-----------|-------------|
-| DuckDB | 84ms | 1x | baseline |
-| **Morsel + Projected** | **227ms** | **2.7x** | **8x faster than original** |
-| Morsel + Specialized | 570ms | 6.8x | 3.3x faster |
-| Morsel + Generic | 970ms | 11.5x | 1.9x faster |
-| Original Engine | 1,860ms | 22x | baseline |
+| Query | Time (SF=0.01) | Time (SF=0.1) | Category | Status |
+|-------|----------------|---------------|----------|--------|
+| Q01   | 8ms            | ~40ms         | Aggregation | ✅ Optimized |
+| Q02   | 3ms            | ~10ms         | Multi-join | ✅ Good |
+| Q03   | 10ms           | ~50ms         | 3-way join | ✅ Good |
+| Q04   | 0.3ms          | ~3ms          | Subquery | ✅ Fast |
+| Q05   | 25ms           | ~250ms        | 6-way join | Needs work |
+| Q06   | 0.6ms          | ~8ms          | Filter+Agg | ✅ Fast |
+| Q07   | 227ms          | ~2.6s         | Multi-join | Needs work |
+| Q08   | 20ms           | ~60ms         | 8-way join | ✅ Good |
+| Q09   | 932ms          | ~10s          | 6-way join | **Bottleneck** |
+| Q10   | 18ms           | ~130ms        | 4-way join | ✅ Good |
+| Q17   | 7ms            | ~200ms        | Scalar subquery | ✅ Fixed |
+| Q18   | 151ms          | ~400ms        | IN subquery | ✅ Working |
+| Q21   | 945ms          | **10.2s**     | Nested EXISTS | **Main bottleneck** |
+| Q22   | 1ms            | ~50ms         | NOT EXISTS | ✅ Fixed |
 
-### Benchmark Results vs DuckDB (Standard Execution)
+**Total (SF=0.01)**: ~2.5s for all 22 queries
 
-| Query | Our Engine | DuckDB | Slowdown | Category | Improvement |
-|-------|-----------|--------|----------|----------|-------------|
-| Q01   | 2,679ms   | 84ms   | 32x      | Aggregation | **Morsel: 2.7x** |
-| Q02   | 154ms     | ~20ms  | ~8x      | Multi-join | - |
-| Q03   | 993ms     | 166ms  | 6x       | 3-way join | - |
-| Q04   | 120ms     | ~30ms  | ~4x      | Subquery | 1.5x faster |
-| Q05   | 5,374ms   | 156ms  | 34x      | 6-way join | - |
-| Q06   | 549ms     | 66ms   | 8x       | Filter+Agg | **1.9x faster** |
-| Q08   | 2,217ms   | ~200ms | 11x      | 8-way join | - |
-| Q09   | 2,350ms   | ~200ms | 12x      | 6-way join | - |
-| Q10   | 1,210ms   | 248ms  | 4.9x     | 4-way join | - |
-| Q17+  | >5min     | ~500ms | >600x    | Correlated subquery | - |
+### Recent Improvements
 
-### Changes Made This Session
+1. **Q21 Decorrelation Fix** (2026-01-27)
+   - SubqueryDecorrelation now correctly converts EXISTS/NOT EXISTS to SEMI/ANTI joins
+   - Q21 at SF=0.1: 61s → 10.2s (**6x faster**)
+   - Still slow due to triple lineitem scan with hash joins
 
-1. **Implemented Morsel-Driven Parallelism** (morsel.rs, morsel_agg.rs)
-   - `ParallelParquetSource`: Parallel row-group reading with work-stealing
-   - Thread-local hash tables for aggregation with final merge
-   - Column projection pushdown to Parquet reader
-   - **8x improvement on Q1** (1.86s → 227ms)
+2. **DelimJoin Infrastructure** (2026-01-27)
+   - Implemented DuckDB-style DelimJoin/DelimGet for O(n+m) subquery execution
+   - Fixed column resolution (inner column names for schema)
+   - Enabled for simple single-EXISTS cases
+   - Complex patterns (Q21/Q22 with multiple EXISTS) fall through to SubqueryDecorrelation
 
-2. **Fixed Critical Partitioning Bug** (filter.rs, project.rs)
-   - Filter and Project operators now propagate `output_partitions()` from input
-   - Was returning only ~3% of data (one partition instead of all)
-   - All queries now return correct row counts
-
-3. **Implemented Parallel Aggregation** (hash_agg.rs)
-   - Added `aggregate_batches_parallel()` using rayon
-   - Parallel partition collection using tokio::spawn
-   - Parallel hash table building with merge
-   - 3-4x improvement on aggregation-heavy queries (Q01, Q06)
-
-### Root Cause Analysis
-
-1. **Single-threaded execution**: DuckDB uses ~20 cores, we use 1
-2. **Memory materialization**: We load all data into memory before processing
-3. **No I/O optimization**: No predicate pushdown to Parquet row groups
-4. **Correlated subquery O(n²)**: Nested loop evaluation for Q17-Q22
-5. **Sequential hash table**: No concurrent writes/reads
-
-## Optimization Hypotheses (Prioritized by Impact)
-
-### Hypothesis 1: Parallel Execution (Expected: 10-20x improvement)
-
-**Theory**: Modern CPUs have 16-32 cores. If we parallelize scan, filter, and aggregation, we can achieve near-linear speedup for I/O-bound and CPU-bound operations.
-
-**Evidence**: DuckDB shows 2000%+ CPU utilization on queries. Our engine shows 100%.
-
-**Implementation Options**:
-
-A. **Rayon-based parallel scan** (Simplest)
-   - Use rayon's `par_iter` to process batches in parallel
-   - Merge results at the end
-   - Risk: Requires careful synchronization for aggregation
-   - Complexity: Low
-
-B. **Partitioned pipeline execution** (Most thorough)
-   - Split data into partitions at scan level
-   - Execute entire pipeline per partition
-   - Final merge/repartition step
-   - Complexity: Medium
-
-C. **Morsel-driven parallelism** (DuckDB approach)
-   - Work-stealing scheduler
-   - Fine-grained morsels (64K rows)
-   - Best load balancing
-   - Complexity: High
-
-**Recommendation**: Start with Option A for quick wins, evolve to Option B.
-
-### Hypothesis 2: Streaming Parquet Scan (Expected: 2-5x improvement)
-
-**Theory**: Currently we load entire Parquet files into memory before processing. Streaming row-group-by-row-group would:
-- Reduce memory footprint
-- Allow pipeline parallelism
-- Enable better cache utilization
-
-**Evidence**: Our Q1 timing shows ~1.5s for "plan" which is data loading.
-
-**Implementation Options**:
-
-A. **Row-group streaming with batch pipelining**
-   - Read one row group at a time
-   - Process immediately while reading next
-   - Pro: Lower memory, overlapped I/O
-   - Complexity: Medium
-
-B. **Async I/O with tokio**
-   - Use async Parquet reader
-   - Overlap I/O with computation
-   - Pro: Best for NVMe drives
-   - Complexity: Medium
-
-**Recommendation**: Option A first, then add async I/O.
-
-### Hypothesis 3: Predicate Pushdown to Parquet (Expected: 2-10x improvement)
-
-**Theory**: Parquet files have min/max statistics per row group. If we push predicates to the Parquet reader, we can skip entire row groups that don't match.
-
-**Evidence**: Q6 filter `l_shipdate >= '1994-01-01' AND l_shipdate < '1995-01-01'` should skip ~6/7 of row groups.
-
-**Implementation Options**:
-
-A. **Row group pruning with statistics**
-   - Read Parquet metadata
-   - Compare filter predicates against min/max
-   - Skip non-matching row groups
-   - Complexity: Low-Medium
-
-B. **Page-level predicate pushdown**
-   - Use page statistics for finer granularity
-   - More I/O savings
-   - Complexity: High
-
-**Recommendation**: Option A provides most benefit with lower complexity.
-
-### Hypothesis 4: Subquery Decorrelation (Expected: 100x+ for Q17-Q22)
-
-**Theory**: Correlated subqueries are evaluated once per outer row, leading to O(n²) complexity. Decorrelation transforms them into joins, achieving O(n log n).
-
-**Evidence**: Q17-Q22 take >5 minutes while equivalent DuckDB queries complete in <1s.
-
-**Implementation Options**:
-
-A. **Magic set transformation**
-   - Extract distinct values from outer query
-   - Execute subquery once for all values
-   - Join back to outer query
-   - Complexity: High
-
-B. **Lateral join rewrite**
-   - Transform correlated subquery to lateral join
-   - Use hash join for efficiency
-   - Complexity: High
-
-C. **Caching + memoization** (Quick win)
-   - Cache subquery results by correlation key
-   - Reuse for repeated values
-   - Pro: Simple, works for many cases
-   - Complexity: Low
-
-**Recommendation**: Start with Option C for quick wins, then implement Option A.
-
-### Hypothesis 5: Vectorized/SIMD Execution (Expected: 2-4x improvement)
-
-**Theory**: Arrow already uses SIMD for many operations, but we can improve by:
-- Batching expressions into larger chunks
-- Using SIMD-friendly hash functions
-- Avoiding per-row function calls
-
-**Implementation Options**:
-
-A. **Expression compilation to Arrow compute**
-   - Replace per-row evaluation with batch kernels
-   - Use Arrow's SIMD-optimized functions
-   - Complexity: Medium
-
-B. **JIT compilation with Cranelift**
-   - Compile expressions to native code
-   - Maximum performance
-   - Complexity: Very High
-
-**Recommendation**: Option A is sufficient for most gains.
+3. **Previous Optimizations**
+   - Morsel-driven parallelism (8x on Q1)
+   - Parallel hash join build
+   - Subquery result caching/memoization
+   - Join reordering (158x improvement on Q8)
 
 ## Implementation Roadmap
 
@@ -195,36 +59,74 @@ B. **JIT compilation with Cranelift**
 8. [x] Parallel hash join build (rayon-based parallel build)
 9. [x] Work-stealing scheduler (crossbeam work-stealing example)
 
-### Phase 4: Advanced Optimizations (IN PROGRESS)
-10. [x] **DelimJoin Infrastructure** (foundation for subquery decorrelation)
+### Phase 4: Subquery Decorrelation ✅ MOSTLY COMPLETE
+10. [x] **DelimJoin Infrastructure**
     - `DelimJoinNode`, `DelimGetNode` logical plan nodes
     - `DelimJoinExec`, `DelimGetExec` physical operators
-    - `FlattenDependentJoin` optimizer rule (works for simple single-EXISTS)
+    - `FlattenDependentJoin` optimizer rule
     - Shared `DelimState` for efficient value passing
-    - Fixed column resolution: uses inner column names for DelimGet schema
-    - **ENABLED**: Simple single-EXISTS/NOT EXISTS cases are flattened
-    - Complex patterns (multiple EXISTS, Q21/Q22) fall through to SubqueryDecorrelation
-    - **See [subquery-decorrelation-plan.md](subquery-decorrelation-plan.md)**
-11. [ ] Extend FlattenDependentJoin for multiple EXISTS (Q21/Q22 optimization)
-12. [ ] Expression vectorization
-13. [ ] Cost-based join ordering
+    - Fixed column resolution for inner column names
+    - **ENABLED**: Simple single-EXISTS/NOT EXISTS flattened via DelimJoin
+    - Complex patterns fall through to SubqueryDecorrelation
 
-## Metrics to Track
+11. [x] **SubqueryDecorrelation improvements**
+    - EXISTS/NOT EXISTS → SEMI/ANTI joins
+    - Proper predicate extraction
+    - Q21 now uses efficient hash joins (6x faster)
 
-For each optimization, measure:
-1. **Wall-clock time** for all 22 TPC-H queries
-2. **CPU utilization** (target: >1500%)
-3. **Memory peak usage**
-4. **I/O throughput**
+### Phase 5: Advanced Optimizations (TODO)
+12. [ ] **Multiple EXISTS flattening** - Handle Q21 pattern with combined DelimJoin
+13. [ ] **Parallel SEMI/ANTI joins** - Speed up Q21 nested join execution
+14. [ ] **Expression vectorization** - CPU-bound query optimization
+15. [ ] **Cost-based join ordering** - Better multi-way join plans (Q5, Q7, Q9)
+
+## Current Architecture
+
+```
+SQL Query
+    │
+    ▼
+┌─────────────────┐
+│   Optimizer     │
+│  - ConstantFolding
+│  - PredicatePushdown
+│  - FlattenDependentJoin (simple EXISTS → DelimJoin)
+│  - SubqueryDecorrelation (complex → SEMI/ANTI joins)
+│  - JoinReorder
+│  - ProjectionPushdown
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ Physical Plan   │
+│  - DelimJoinExec (O(n+m) for simple EXISTS)
+│  - HashJoinExec (SEMI/ANTI for complex patterns)
+│  - HashAggregateExec (parallel)
+│  - Morsel-driven scan
+└─────────────────┘
+```
+
+## Key Files
+
+| Component | File | Status |
+|-----------|------|--------|
+| DelimJoin logical | `src/planner/logical_plan.rs` | ✅ Complete |
+| DelimJoin physical | `src/physical/operators/delim_join.rs` | ✅ Complete |
+| FlattenDependentJoin | `src/optimizer/rules/flatten_dependent_join.rs` | ✅ Simple cases |
+| SubqueryDecorrelation | `src/optimizer/rules/subquery_decorrelation.rs` | ✅ Complete |
+| JoinReorder | `src/optimizer/rules/join_reorder.rs` | ✅ Complete |
 
 ## Success Criteria
 
-- Within 5x of DuckDB for Q1-Q16
-- Within 20x of DuckDB for Q17-Q22
-- All 22 queries complete in <30s total at SF=10
+- [x] All 22 TPC-H queries execute correctly
+- [x] All 615+ tests pass
+- [ ] Within 5x of DuckDB for Q1-Q16
+- [ ] Within 20x of DuckDB for Q17-Q22
+- [ ] Q21 under 1 second at SF=0.1
 
 ## Current Blockers
 
-1. **Correlated subqueries**: Q17-Q22 slow until decorrelation implemented
-2. ~~**Single-threaded**: All queries blocked by lack of parallelism~~ ✅ RESOLVED (morsel-driven parallelism)
-3. ~~**Memory**: Large datasets may OOM without streaming~~ ✅ RESOLVED (streaming + memory limits)
+1. **Q21 Performance**: Still 10s at SF=0.1 due to triple lineitem scan
+   - Solution: Extend FlattenDependentJoin for multiple EXISTS patterns
+2. **Q9 Performance**: ~10s at SF=0.1 due to 6-way join
+   - Solution: Better join ordering / parallel execution
