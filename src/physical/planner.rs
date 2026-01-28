@@ -379,7 +379,7 @@ impl PhysicalPlanner {
                 Ok(Arc::new(delim_join))
             }
 
-            LogicalPlan::DelimGet(node) => {
+            LogicalPlan::DelimGet(_node) => {
                 // DelimGet without a parent DelimJoin is an error
                 Err(QueryError::Execution(
                     "DelimGet encountered without parent DelimJoin. \

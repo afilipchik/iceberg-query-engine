@@ -882,7 +882,6 @@ impl ExternalSortExec {
         buffer_rows: usize,
     ) -> Result<Vec<RecordBatch>> {
         use std::cmp::Ordering;
-        use std::collections::BinaryHeap;
 
         if runs.is_empty() {
             return Ok(Vec::new());

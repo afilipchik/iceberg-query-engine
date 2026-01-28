@@ -13,10 +13,8 @@
 //! (on 60M rows, 32 threads, NVMe SSD)
 
 use crate::error::{QueryError, Result};
-use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, StringArray,
-};
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::array::{Array, Date32Array, Float64Array, StringArray};
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use hashbrown::HashMap;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -237,7 +235,7 @@ impl VectorizedParquetSource {
             let file = File::open(&file_path)?;
             let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
             let metadata = builder.metadata().clone();
-            let parquet_schema = builder.parquet_schema();
+            let _parquet_schema = builder.parquet_schema();
 
             for row_group_idx in 0..metadata.num_row_groups() {
                 total += 1;

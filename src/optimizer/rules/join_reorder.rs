@@ -6,7 +6,7 @@
 
 use crate::error::Result;
 use crate::optimizer::OptimizerRule;
-use crate::planner::{BinaryOp, Column, Expr, JoinNode, JoinType, LogicalPlan, PlanSchema};
+use crate::planner::{BinaryOp, Expr, JoinNode, JoinType, LogicalPlan};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -756,8 +756,8 @@ impl JoinReorder {
                     schema.fields().iter().map(|f| f.name.clone()).collect();
 
                 let name = match plan {
-                    LogicalPlan::Project(n) => "project".to_string(),
-                    LogicalPlan::Aggregate(n) => "aggregate".to_string(),
+                    LogicalPlan::Project(_n) => "project".to_string(),
+                    LogicalPlan::Aggregate(_n) => "aggregate".to_string(),
                     _ => "relation".to_string(),
                 };
 

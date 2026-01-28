@@ -430,7 +430,7 @@ impl Highlighter for ReplHelper {
         let mut in_string = false;
         let mut string_char = '"';
 
-        while let Some((i, c)) = chars.next() {
+        while let Some((_i, c)) = chars.next() {
             if in_string {
                 // Inside a string literal
                 result.push(c);

@@ -509,7 +509,7 @@ fn extract_scalar(array: &ArrayRef, row: usize) -> ScalarValue {
                 .unwrap()
                 .value(row),
         ),
-        DataType::Decimal128(p, s) => {
+        DataType::Decimal128(_p, s) => {
             let arr = array
                 .as_any()
                 .downcast_ref::<arrow::array::Decimal128Array>()
@@ -526,7 +526,7 @@ fn extract_scalar(array: &ArrayRef, row: usize) -> ScalarValue {
 fn build_group_array<'a>(
     values: impl Iterator<Item = &'a ScalarValue>,
     data_type: &DataType,
-    capacity: usize,
+    _capacity: usize,
 ) -> Result<ArrayRef> {
     let values: Vec<&ScalarValue> = values.collect();
     build_scalar_array_ref(&values, data_type)
@@ -583,7 +583,6 @@ fn build_scalar_array_ref(values: &[&ScalarValue], data_type: &DataType) -> Resu
             Ok(Arc::new(Date32Array::from(vals)))
         }
         DataType::Decimal128(p, s) => {
-            use rust_decimal::prelude::ToPrimitive;
             let mut builder = Decimal128Builder::with_capacity(values.len());
             for v in values {
                 match v {

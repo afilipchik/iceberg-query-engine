@@ -11,8 +11,8 @@
 use crate::error::Result;
 use crate::optimizer::OptimizerRule;
 use crate::planner::{
-    AggregateNode, BinaryOp, Column, DelimGetNode, DelimJoinNode, DistinctNode, Expr, FilterNode,
-    JoinNode, JoinType, LimitNode, LogicalPlan, PlanSchema, ProjectNode, SchemaField, SortNode,
+    AggregateNode, BinaryOp, DelimGetNode, DelimJoinNode, DistinctNode, Expr, FilterNode, JoinNode,
+    JoinType, LimitNode, LogicalPlan, PlanSchema, ProjectNode, SchemaField, SortNode,
     SubqueryAliasNode, UnionNode,
 };
 use std::collections::HashSet;
@@ -241,6 +241,7 @@ fn flatten_exists(
 }
 
 /// Flatten an IN/NOT IN subquery into a DelimJoin
+#[allow(dead_code)]
 fn flatten_in_subquery(
     outer: &LogicalPlan,
     in_expr: &Expr,
@@ -305,6 +306,7 @@ fn flatten_in_subquery(
 }
 
 /// Try to flatten a scalar subquery comparison
+#[allow(dead_code)]
 fn try_flatten_scalar_comparison(
     outer: &LogicalPlan,
     left: &Expr,
@@ -737,6 +739,7 @@ fn find_base_with_columns(plan: &LogicalPlan, correlations: &[CorrelationColumn]
 }
 
 /// Check if a subquery has other correlations besides IN
+#[allow(dead_code)]
 fn has_other_correlations(plan: &LogicalPlan, outer_columns: &HashSet<String>) -> bool {
     match plan {
         LogicalPlan::Filter(node) => {
@@ -757,6 +760,7 @@ fn has_other_correlations(plan: &LogicalPlan, outer_columns: &HashSet<String>) -
     }
 }
 
+#[allow(dead_code)]
 fn expr_has_outer_refs(expr: &Expr, outer_columns: &HashSet<String>) -> bool {
     match expr {
         Expr::Column(col) => {
@@ -871,6 +875,7 @@ fn combine_predicates(predicates: Vec<Expr>) -> Expr {
         .unwrap()
 }
 
+#[allow(dead_code)]
 fn is_comparison_op(op: BinaryOp) -> bool {
     matches!(
         op,

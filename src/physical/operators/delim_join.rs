@@ -20,7 +20,7 @@ use arrow::compute;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use hashbrown::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, RwLock};
@@ -610,7 +610,7 @@ fn produce_single_output(
 
     for outer_batch in outer_batches {
         // Build output arrays - one per output column
-        let mut output_builders: Vec<Vec<ArrayRef>> = vec![Vec::new(); schema.fields().len()];
+        let _output_builders: Vec<Vec<ArrayRef>> = vec![Vec::new(); schema.fields().len()];
         let mut matched_outer_indices: Vec<u64> = Vec::new();
         let mut matched_inner_entries: Vec<InnerEntry> = Vec::new();
 

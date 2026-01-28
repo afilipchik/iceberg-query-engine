@@ -1986,7 +1986,7 @@ fn build_agg_array(
                     let mean = state.sum / n;
                     let variance = (state.sum_squares / n) - (mean * mean);
                     if variance > 0.0 {
-                        let std_dev = variance.sqrt();
+                        let _std_dev = variance.sqrt();
                         // Excess kurtosis
                         let m4 = state.sum_fourth / n - 4.0 * mean * state.sum_cubes / n
                             + 6.0 * mean * mean * state.sum_squares / n

@@ -347,7 +347,7 @@ fn scalar_to_array(value: &ScalarValue, num_rows: usize) -> ArrayRef {
                 num_rows
             ]))
         }
-        ScalarValue::List(values, elem_type) => {
+        ScalarValue::List(values, _elem_type) => {
             // Convert list to JSON string representation for now
             let json_arr: Vec<serde_json::Value> = values
                 .iter()
@@ -1825,7 +1825,7 @@ fn evaluate_scalar_func(
 
             // Handle Date32 input
             if let Some(date32_arr) = date_arr.as_any().downcast_ref::<Date32Array>() {
-                use chrono::{Datelike, Duration, Months, NaiveDate};
+                use chrono::{Duration, Months, NaiveDate};
                 let result: Date32Array = (0..date32_arr.len())
                     .map(|i| {
                         if date32_arr.is_null(i) || unit_arr.is_null(i) {
@@ -4106,7 +4106,7 @@ fn evaluate_scalar_func(
                     let mut result = fmt.to_string();
 
                     // Replace %s, %d, %f with corresponding arguments
-                    for (arg_idx, arg) in evaluated_args.iter().skip(1).enumerate() {
+                    for (_arg_idx, arg) in evaluated_args.iter().skip(1).enumerate() {
                         let value = if let Some(s_arr) = arg.as_any().downcast_ref::<StringArray>()
                         {
                             if s_arr.is_null(i) {
