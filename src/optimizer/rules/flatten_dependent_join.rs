@@ -134,6 +134,14 @@ fn flatten_plan(plan: &LogicalPlan) -> Result<LogicalPlan> {
 }
 
 /// Try to flatten a filter with correlated subqueries into DelimJoin
+///
+/// Currently we only flatten simple cases:
+/// - Single EXISTS or NOT EXISTS (not multiple)
+/// - No other subquery expressions in the same filter
+/// - No scalar subqueries (disabled due to GROUP BY issues)
+///
+/// Complex patterns like `EXISTS(...) AND NOT EXISTS(...)` (Q21) are left
+/// for the regular SubqueryDecorrelation rule.
 fn try_flatten_filter(node: &FilterNode) -> Result<Option<LogicalPlan>> {
     // Extract subquery expressions from the predicate
     let (subquery_exprs, other_predicates) = extract_subquery_predicates(&node.predicate);
@@ -142,74 +150,35 @@ fn try_flatten_filter(node: &FilterNode) -> Result<Option<LogicalPlan>> {
         return Ok(None);
     }
 
-    let mut current_plan = (*node.input).clone();
-    let mut unhandled_exprs = Vec::new();
-    let mut any_flattened = false;
-
-    for subquery_expr in subquery_exprs {
-        match &subquery_expr {
-            Expr::Exists { subquery, negated } => {
-                if let Some(flattened) = flatten_exists(&current_plan, subquery, *negated)? {
-                    current_plan = flattened;
-                    any_flattened = true;
-                } else {
-                    unhandled_exprs.push(subquery_expr.clone());
-                }
-            }
-            Expr::InSubquery {
-                expr,
-                subquery,
-                negated,
-            } => {
-                if let Some(flattened) =
-                    flatten_in_subquery(&current_plan, expr, subquery, *negated)?
-                {
-                    current_plan = flattened;
-                    any_flattened = true;
-                } else {
-                    unhandled_exprs.push(subquery_expr.clone());
-                }
-            }
-            Expr::BinaryExpr { left, op, right } if is_comparison_op(*op) => {
-                // TODO: Scalar subquery flattening is disabled for now due to complexity
-                // with GROUP BY column resolution. Fall back to regular correlated execution.
-                // Check for scalar subquery comparisons
-                // if let Some((flattened, remaining_pred)) =
-                //     try_flatten_scalar_comparison(&current_plan, left, right, *op)?
-                // {
-                //     current_plan = flattened;
-                //     any_flattened = true;
-                //     if let Some(pred) = remaining_pred {
-                //         unhandled_exprs.push(pred);
-                //     }
-                // } else {
-                //     unhandled_exprs.push(subquery_expr.clone());
-                // }
-                unhandled_exprs.push(subquery_expr.clone());
-            }
-            _ => {
-                unhandled_exprs.push(subquery_expr.clone());
-            }
-        }
-    }
-
-    if !any_flattened {
+    // Conservative approach: only flatten if there's exactly one EXISTS/NOT EXISTS
+    // and no other subquery expressions. This avoids issues with Q21/Q22.
+    if subquery_exprs.len() != 1 {
         return Ok(None);
     }
 
-    // Re-apply unhandled expressions and other predicates
-    let mut remaining = unhandled_exprs;
-    remaining.extend(other_predicates);
+    let subquery_expr = &subquery_exprs[0];
 
-    if !remaining.is_empty() {
-        let combined = combine_predicates(remaining);
-        current_plan = LogicalPlan::Filter(FilterNode {
-            input: Arc::new(current_plan),
-            predicate: combined,
-        });
+    // Only handle simple EXISTS/NOT EXISTS for now
+    let flattened = match subquery_expr {
+        Expr::Exists { subquery, negated } => flatten_exists(&(*node.input), subquery, *negated)?,
+        // IN subquery and scalar subquery flattening disabled for now
+        _ => None,
+    };
+
+    match flattened {
+        Some(mut plan) => {
+            // Re-apply other predicates if any
+            if !other_predicates.is_empty() {
+                let combined = combine_predicates(other_predicates);
+                plan = LogicalPlan::Filter(FilterNode {
+                    input: Arc::new(plan),
+                    predicate: combined,
+                });
+            }
+            Ok(Some(plan))
+        }
+        None => Ok(None),
     }
-
-    Ok(Some(current_plan))
 }
 
 /// Flatten an EXISTS/NOT EXISTS subquery into a DelimJoin

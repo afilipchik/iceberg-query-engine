@@ -41,11 +41,9 @@ impl Optimizer {
                 Arc::new(rules::ConstantFolding),
                 Arc::new(rules::PredicatePushdown), // Push join conditions before decorrelation
                 // FlattenDependentJoin: DelimJoin-based subquery flattening
-                // Currently disabled due to issues with complex nested EXISTS (Q21, Q22)
-                // The infrastructure is in place but needs more work on schema handling
-                // for multi-level correlated subqueries.
-                // TODO: Re-enable after fixing nested EXISTS decorrelation
-                // Arc::new(rules::FlattenDependentJoin),
+                // Only handles simple single-EXISTS cases; complex patterns (Q21, Q22)
+                // with multiple EXISTS/NOT EXISTS fall through to SubqueryDecorrelation
+                Arc::new(rules::FlattenDependentJoin),
                 // Decorrelate subqueries to regular joins
                 Arc::new(rules::SubqueryDecorrelation),
                 // Reorder joins after decorrelation
