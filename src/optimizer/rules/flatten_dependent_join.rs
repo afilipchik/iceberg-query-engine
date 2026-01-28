@@ -171,18 +171,21 @@ fn try_flatten_filter(node: &FilterNode) -> Result<Option<LogicalPlan>> {
                 }
             }
             Expr::BinaryExpr { left, op, right } if is_comparison_op(*op) => {
+                // TODO: Scalar subquery flattening is disabled for now due to complexity
+                // with GROUP BY column resolution. Fall back to regular correlated execution.
                 // Check for scalar subquery comparisons
-                if let Some((flattened, remaining_pred)) =
-                    try_flatten_scalar_comparison(&current_plan, left, right, *op)?
-                {
-                    current_plan = flattened;
-                    any_flattened = true;
-                    if let Some(pred) = remaining_pred {
-                        unhandled_exprs.push(pred);
-                    }
-                } else {
-                    unhandled_exprs.push(subquery_expr.clone());
-                }
+                // if let Some((flattened, remaining_pred)) =
+                //     try_flatten_scalar_comparison(&current_plan, left, right, *op)?
+                // {
+                //     current_plan = flattened;
+                //     any_flattened = true;
+                //     if let Some(pred) = remaining_pred {
+                //         unhandled_exprs.push(pred);
+                //     }
+                // } else {
+                //     unhandled_exprs.push(subquery_expr.clone());
+                // }
+                unhandled_exprs.push(subquery_expr.clone());
             }
             _ => {
                 unhandled_exprs.push(subquery_expr.clone());
@@ -234,7 +237,9 @@ fn flatten_exists(
     });
 
     // Rewrite the subquery to use DelimGet instead of outer references
-    let rewritten_subquery = rewrite_with_delim_get(&decorrelated, &corr_columns, &delim_get)?;
+    // For EXISTS, we don't need the original output - just need to check if rows exist
+    let rewritten_subquery =
+        rewrite_with_delim_get(&decorrelated, &corr_columns, &delim_get, false)?;
 
     // Create DelimJoin
     let join_type = if negated {
@@ -303,7 +308,9 @@ fn flatten_in_subquery(
         delim_id,
     });
 
-    let rewritten_subquery = rewrite_with_delim_get(&decorrelated, &corr_columns, &delim_get)?;
+    // For IN subqueries, we don't need to preserve the original output
+    let rewritten_subquery =
+        rewrite_with_delim_get(&decorrelated, &corr_columns, &delim_get, false)?;
 
     let join_type = if negated {
         JoinType::Anti
@@ -360,7 +367,9 @@ fn try_flatten_scalar_comparison(
         delim_id,
     });
 
-    let rewritten_subquery = rewrite_with_delim_get(&decorrelated, &corr_columns, &delim_get)?;
+    // For scalar subqueries, we need to preserve the output (like COUNT(*))
+    let rewritten_subquery =
+        rewrite_with_delim_get(&decorrelated, &corr_columns, &delim_get, true)?;
 
     // Get scalar result column name
     let scalar_col = if decorrelated.schema().fields().is_empty() {
@@ -593,18 +602,22 @@ fn build_delim_schema(correlations: &[CorrelationColumn]) -> PlanSchema {
 }
 
 /// Rewrite a plan to use DelimGet instead of outer references
+///
+/// For EXISTS subqueries, we only need to check row existence, so we can strip projections.
+/// For scalar/IN subqueries, we need to preserve the output value (like COUNT(*)).
 fn rewrite_with_delim_get(
     plan: &LogicalPlan,
     correlations: &[CorrelationColumn],
     delim_get: &LogicalPlan,
+    preserve_output: bool, // If true, preserve the original output columns (for scalar subqueries)
 ) -> Result<LogicalPlan> {
-    // For now, create a join between the subquery and DelimGet
-    // This ensures correlation columns are available
+    // Find the innermost plan that has the correlation columns
+    let join_target = find_base_with_columns(plan, correlations);
 
-    // Build the join between DelimGet and the subquery base tables
-    let subquery_with_delim = LogicalPlan::Join(JoinNode {
+    // Build the join between DelimGet and the target plan
+    let joined = LogicalPlan::Join(JoinNode {
         left: Arc::new(delim_get.clone()),
-        right: Arc::new(plan.clone()),
+        right: Arc::new(join_target.clone()),
         join_type: JoinType::Inner,
         on: correlations
             .iter()
@@ -616,12 +629,142 @@ fn rewrite_with_delim_get(
         filter: None,
         schema: {
             let delim_schema = delim_get.schema();
-            let plan_schema = plan.schema();
-            delim_schema.merge(&plan_schema)
+            let target_schema = join_target.schema();
+            delim_schema.merge(&target_schema)
         },
     });
 
-    Ok(subquery_with_delim)
+    // For scalar subqueries, we need to apply aggregates/projections to get the output value
+    // For EXISTS, we just need the join to check for matches
+    if preserve_output && has_aggregate_or_projection(plan) {
+        // Rebuild the plan structure on top of the join
+        let result = rebuild_on_join(plan, joined, correlations)?;
+        Ok(result)
+    } else {
+        Ok(joined)
+    }
+}
+
+/// Check if a plan has aggregates or projections that need to be preserved
+fn has_aggregate_or_projection(plan: &LogicalPlan) -> bool {
+    matches!(plan, LogicalPlan::Aggregate(_) | LogicalPlan::Project(_))
+}
+
+/// Rebuild the plan structure on top of the join result
+fn rebuild_on_join(
+    original: &LogicalPlan,
+    joined: LogicalPlan,
+    correlations: &[CorrelationColumn],
+) -> Result<LogicalPlan> {
+    match original {
+        LogicalPlan::Project(node) => {
+            // Check if input needs to be rebuilt
+            let new_input = rebuild_on_join(&node.input, joined, correlations)?;
+
+            // Add correlation columns to the projection
+            let mut new_exprs = node.exprs.clone();
+            let mut new_schema_fields = node.schema.fields().to_vec();
+            for corr in correlations {
+                // Add the inner column to the projection if not already there
+                if !new_exprs.iter().any(|e| matches_column(e, &corr.inner_col)) {
+                    new_exprs.push(Expr::column(&corr.inner_col));
+                    // Also add to schema
+                    if !new_schema_fields.iter().any(|f| f.name == corr.inner_col) {
+                        new_schema_fields.push(SchemaField::new(
+                            &corr.inner_col,
+                            arrow::datatypes::DataType::Int64,
+                        ));
+                    }
+                }
+            }
+
+            Ok(LogicalPlan::Project(ProjectNode {
+                input: Arc::new(new_input),
+                exprs: new_exprs,
+                schema: PlanSchema::new(new_schema_fields),
+            }))
+        }
+        LogicalPlan::Aggregate(node) => {
+            // For aggregates, we need to include correlation columns in GROUP BY
+            let new_input = rebuild_on_join(&node.input, joined, correlations)?;
+
+            // Add correlation columns to group_by
+            let mut new_group_by = node.group_by.clone();
+            for corr in correlations {
+                // Add the inner column to the group by
+                let col_expr = Expr::column(&corr.inner_col);
+                if !new_group_by
+                    .iter()
+                    .any(|e| matches_column(e, &corr.inner_col))
+                {
+                    new_group_by.push(col_expr);
+                }
+            }
+
+            // Rebuild the schema with correlation columns
+            let mut new_schema_fields = node.schema.fields().to_vec();
+            for corr in correlations {
+                if !new_schema_fields.iter().any(|f| f.name == corr.inner_col) {
+                    new_schema_fields.push(SchemaField::new(
+                        &corr.inner_col,
+                        arrow::datatypes::DataType::Int64,
+                    ));
+                }
+            }
+
+            Ok(LogicalPlan::Aggregate(AggregateNode {
+                input: Arc::new(new_input),
+                group_by: new_group_by,
+                aggregates: node.aggregates.clone(),
+                schema: PlanSchema::new(new_schema_fields),
+            }))
+        }
+        LogicalPlan::Filter(node) => {
+            let new_input = rebuild_on_join(&node.input, joined, correlations)?;
+            Ok(LogicalPlan::Filter(FilterNode {
+                input: Arc::new(new_input),
+                predicate: node.predicate.clone(),
+            }))
+        }
+        // For Scan and other base nodes, return the joined result
+        _ => Ok(joined),
+    }
+}
+
+fn matches_column(expr: &Expr, col_name: &str) -> bool {
+    match expr {
+        Expr::Column(col) => col.name == col_name,
+        _ => false,
+    }
+}
+
+/// Find the innermost plan node that has the correlation columns
+fn find_base_with_columns(plan: &LogicalPlan, correlations: &[CorrelationColumn]) -> LogicalPlan {
+    match plan {
+        // For Project, look at the input which should have the actual columns
+        LogicalPlan::Project(node) => find_base_with_columns(&node.input, correlations),
+        // For Filter, look at the input
+        LogicalPlan::Filter(node) => find_base_with_columns(&node.input, correlations),
+        // For other plan types (Scan, Join, etc.), return as-is if they have the columns
+        _ => {
+            let schema = plan.schema();
+            let has_cols = correlations.iter().all(|c| {
+                schema
+                    .fields()
+                    .iter()
+                    .any(|f| f.name == c.inner_col || f.qualified_name().ends_with(&c.inner_col))
+            });
+            if has_cols {
+                plan.clone()
+            } else {
+                // Recurse into children if available
+                match plan.children().first() {
+                    Some(child) => find_base_with_columns(child, correlations),
+                    None => plan.clone(), // No children, use as-is
+                }
+            }
+        }
+    }
 }
 
 /// Check if a subquery has other correlations besides IN

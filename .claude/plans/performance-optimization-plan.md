@@ -199,10 +199,13 @@ B. **JIT compilation with Cranelift**
 10. [x] **DelimJoin Infrastructure** (foundation for subquery decorrelation)
     - `DelimJoinNode`, `DelimGetNode` logical plan nodes
     - `DelimJoinExec`, `DelimGetExec` physical operators
-    - `FlattenDependentJoin` optimizer rule (needs column resolution fixes)
+    - `FlattenDependentJoin` optimizer rule (works for simple EXISTS)
     - Shared `DelimState` for efficient value passing
+    - Fixed column resolution: uses inner column names for DelimGet schema
+    - Simple EXISTS/NOT EXISTS tests pass (6/6 subquery tests)
+    - **Currently disabled**: Complex nested EXISTS (Q21, Q22) need schema handling fixes
     - **See [subquery-decorrelation-plan.md](subquery-decorrelation-plan.md)**
-11. [ ] Enable FlattenDependentJoin rule (fix column resolution)
+11. [ ] Enable FlattenDependentJoin rule (fix nested EXISTS schema handling)
 12. [ ] Expression vectorization
 13. [ ] Cost-based join ordering
 

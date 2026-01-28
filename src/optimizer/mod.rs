@@ -40,7 +40,11 @@ impl Optimizer {
                 // First pass: push predicates and fold constants before decorrelation
                 Arc::new(rules::ConstantFolding),
                 Arc::new(rules::PredicatePushdown), // Push join conditions before decorrelation
-                // TODO: Enable FlattenDependentJoin once column resolution is fixed
+                // FlattenDependentJoin: DelimJoin-based subquery flattening
+                // Currently disabled due to issues with complex nested EXISTS (Q21, Q22)
+                // The infrastructure is in place but needs more work on schema handling
+                // for multi-level correlated subqueries.
+                // TODO: Re-enable after fixing nested EXISTS decorrelation
                 // Arc::new(rules::FlattenDependentJoin),
                 // Decorrelate subqueries to regular joins
                 Arc::new(rules::SubqueryDecorrelation),

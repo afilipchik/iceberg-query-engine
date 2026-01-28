@@ -160,7 +160,9 @@ impl PhysicalOperator for DelimJoinExec {
         }
 
         // Step 2: Extract distinct correlation values
-        let distinct_batch = extract_distinct_values(&outer_batches, &self.delim_columns)?;
+        // Pass the `on` conditions so we can name the columns correctly for the inner side
+        let distinct_batch =
+            extract_distinct_values(&outer_batches, &self.delim_columns, &self.on)?;
 
         // Step 3: Store in shared state for DelimGet to use
         self.delim_state
@@ -185,9 +187,13 @@ impl PhysicalOperator for DelimJoinExec {
             JoinType::Anti => {
                 produce_anti_output(&outer_batches, &inner_hash, &self.on, &self.schema)?
             }
-            JoinType::Single => {
-                produce_single_output(&outer_batches, &inner_hash, &self.on, &self.schema)?
-            }
+            JoinType::Single => produce_single_output(
+                &outer_batches,
+                &inner_batches,
+                &inner_hash,
+                &self.on,
+                &self.schema,
+            )?,
             JoinType::Mark => {
                 produce_mark_output(&outer_batches, &inner_hash, &self.on, &self.schema)?
             }
@@ -253,7 +259,12 @@ impl PhysicalOperator for DelimGetExec {
 // Helper functions
 
 /// Extract distinct values from the outer side for the correlation columns
-fn extract_distinct_values(batches: &[RecordBatch], delim_columns: &[Expr]) -> Result<RecordBatch> {
+/// The `on` parameter contains (outer_expr, inner_expr) pairs - we use inner_expr names for the output schema
+fn extract_distinct_values(
+    batches: &[RecordBatch],
+    delim_columns: &[Expr],
+    on: &[(Expr, Expr)],
+) -> Result<RecordBatch> {
     if batches.is_empty() {
         return Err(QueryError::Execution("No batches to extract from".into()));
     }
@@ -282,13 +293,14 @@ fn extract_distinct_values(batches: &[RecordBatch], delim_columns: &[Expr]) -> R
         return Err(QueryError::Execution("No columns to deduplicate".into()));
     }
 
-    // Build a schema for the delim columns
-    let delim_fields: Vec<arrow::datatypes::Field> = delim_columns
+    // Build a schema for the delim columns using INNER column names from the `on` conditions
+    // This is crucial: the inner side expects columns named by inner_expr, not outer_expr
+    let delim_fields: Vec<arrow::datatypes::Field> = on
         .iter()
         .zip(concat_columns.iter())
         .enumerate()
-        .map(|(i, (expr, array))| {
-            let name = match expr {
+        .map(|(i, ((_, inner_expr), array))| {
+            let name = match inner_expr {
                 Expr::Column(col) => col.name.clone(),
                 _ => format!("__delim_col_{}", i),
             };
@@ -474,11 +486,16 @@ fn hash_join_key(
 
         if let Expr::Column(col) = expr {
             // Find the column
+            let mut found = false;
             for (i, field) in batch.schema().fields().iter().enumerate() {
                 if field.name() == &col.name || field.name().ends_with(&col.name) {
                     hash_array_value(batch.column(i).as_ref(), row_idx, &mut hasher);
+                    found = true;
                     break;
                 }
+            }
+            if !found {
+                return Err(QueryError::ColumnNotFound(col.name.clone()));
             }
         }
     }
@@ -569,15 +586,114 @@ fn produce_anti_output(
 }
 
 /// Produce output for Single join (scalar subquery - one value per outer row)
+/// This joins each outer row with the single matching inner row (scalar result)
 fn produce_single_output(
     outer_batches: &[RecordBatch],
+    inner_batches: &[RecordBatch],
     inner_hash: &HashMap<u64, Vec<InnerEntry>>,
     on: &[(Expr, Expr)],
     schema: &SchemaRef,
 ) -> Result<Vec<RecordBatch>> {
-    // For now, just return outer rows (scalar value would need to be joined)
-    // TODO: implement proper scalar joining
-    produce_semi_output(outer_batches, inner_hash, on, schema)
+    let mut results = Vec::new();
+
+    // Get the number of columns to take from outer and inner
+    let outer_cols = if !outer_batches.is_empty() {
+        outer_batches[0].num_columns()
+    } else {
+        0
+    };
+    let inner_cols = if !inner_batches.is_empty() {
+        inner_batches[0].num_columns()
+    } else {
+        0
+    };
+
+    for outer_batch in outer_batches {
+        // Build output arrays - one per output column
+        let mut output_builders: Vec<Vec<ArrayRef>> = vec![Vec::new(); schema.fields().len()];
+        let mut matched_outer_indices: Vec<u64> = Vec::new();
+        let mut matched_inner_entries: Vec<InnerEntry> = Vec::new();
+
+        for row_idx in 0..outer_batch.num_rows() {
+            let hash = hash_join_key(outer_batch, row_idx, on, true)?;
+            if let Some(inner_entries) = inner_hash.get(&hash) {
+                // For Single join, there should be exactly one match per outer row
+                // If multiple, take the first
+                if let Some(entry) = inner_entries.first() {
+                    matched_outer_indices.push(row_idx as u64);
+                    matched_inner_entries.push(entry.clone());
+                }
+            }
+        }
+
+        if !matched_outer_indices.is_empty() {
+            // Take matched outer rows
+            let mut outer_index_builder = UInt64Builder::with_capacity(matched_outer_indices.len());
+            for idx in &matched_outer_indices {
+                outer_index_builder.append_value(*idx);
+            }
+            let outer_index_array = outer_index_builder.finish();
+
+            let mut output_columns: Vec<ArrayRef> = Vec::new();
+
+            // Take outer columns
+            for col in outer_batch.columns() {
+                let taken = compute::take(col.as_ref(), &outer_index_array, None)
+                    .map_err(|e| QueryError::Execution(e.to_string()))?;
+                output_columns.push(Arc::from(taken));
+            }
+
+            // Add inner columns (scalar results)
+            // We need to gather values from inner batches based on matched_inner_entries
+            if !inner_batches.is_empty() {
+                // Only add inner columns that are expected in the output schema
+                // (skip correlation columns that are already represented in the outer)
+                for inner_col_idx in 0..inner_cols {
+                    let inner_col_name = inner_batches[0]
+                        .schema()
+                        .field(inner_col_idx)
+                        .name()
+                        .to_string();
+
+                    // Only add if this column is in the output schema (after the outer columns)
+                    let in_output_schema = schema.fields().iter().skip(outer_cols).any(|f| {
+                        f.name() == &inner_col_name
+                            || f.name().ends_with(&format!(".{}", inner_col_name))
+                    });
+                    if !in_output_schema {
+                        continue;
+                    }
+
+                    // Gather values from inner batches
+                    let mut values: Vec<ArrayRef> = Vec::new();
+                    for entry in &matched_inner_entries {
+                        let inner_batch = &inner_batches[entry.batch_idx];
+                        let inner_col = inner_batch.column(inner_col_idx);
+                        // Take single row
+                        let mut idx_builder = UInt64Builder::with_capacity(1);
+                        idx_builder.append_value(entry.row_idx as u64);
+                        let idx_array = idx_builder.finish();
+                        let taken = compute::take(inner_col.as_ref(), &idx_array, None)
+                            .map_err(|e| QueryError::Execution(e.to_string()))?;
+                        values.push(Arc::from(taken));
+                    }
+
+                    // Concatenate all gathered values
+                    if !values.is_empty() {
+                        let refs: Vec<&dyn Array> = values.iter().map(|a| a.as_ref()).collect();
+                        let concat = compute::concat(&refs)
+                            .map_err(|e| QueryError::Execution(e.to_string()))?;
+                        output_columns.push(concat);
+                    }
+                }
+            }
+
+            let result = RecordBatch::try_new(schema.clone(), output_columns)?;
+            results.push(result);
+        }
+    }
+
+    Ok(results)
 }
 
 /// Produce output for Mark join (adds boolean column for match status)
