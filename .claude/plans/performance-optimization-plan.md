@@ -18,19 +18,25 @@
 | Q10   | 18ms           | ~130ms        | 4-way join | ✅ Good |
 | Q17   | 7ms            | ~200ms        | Scalar subquery | ✅ Fixed |
 | Q18   | 151ms          | ~400ms        | IN subquery | ✅ Working |
-| Q21   | 945ms          | **10.2s**     | Nested EXISTS | **Main bottleneck** |
+| Q21   | **170ms**      | **1.76s**     | Nested EXISTS | ✅ **5.8x faster** |
 | Q22   | 1ms            | ~50ms         | NOT EXISTS | ✅ Fixed |
 
-**Total (SF=0.01)**: ~2.5s for all 22 queries
+**Total (SF=0.01)**: ~1.7s for all 22 queries (was 2.5s)
 
 ### Recent Improvements
 
-1. **Q21 Decorrelation Fix** (2026-01-27)
-   - SubqueryDecorrelation now correctly converts EXISTS/NOT EXISTS to SEMI/ANTI joins
-   - Q21 at SF=0.1: 61s → 10.2s (**6x faster**)
-   - Still slow due to triple lineitem scan with hash joins
+1. **Parallel SEMI/ANTI Join Optimization** (2026-01-27)
+   - Added `probe_semi_anti_parallel` with rayon parallelization
+   - Uses atomic bools for thread-safe match tracking
+   - Early termination after finding first match per build row
+   - Q21 at SF=0.01: 982ms → 170ms (**5.8x faster**)
+   - Q21 at SF=0.1: 10.2s → 1.76s (**5.8x faster**)
 
-2. **DelimJoin Infrastructure** (2026-01-27)
+2. **Q21 Decorrelation Fix** (2026-01-27)
+   - SubqueryDecorrelation now correctly converts EXISTS/NOT EXISTS to SEMI/ANTI joins
+   - Q21 at SF=0.1: 61s → 10.2s (**6x faster**) - before parallel optimization
+
+3. **DelimJoin Infrastructure** (2026-01-27)
    - Implemented DuckDB-style DelimJoin/DelimGet for O(n+m) subquery execution
    - Fixed column resolution (inner column names for schema)
    - Enabled for simple single-EXISTS cases
@@ -126,7 +132,8 @@ SQL Query
 
 ## Current Blockers
 
-1. **Q21 Performance**: Still 10s at SF=0.1 due to triple lineitem scan
-   - Solution: Extend FlattenDependentJoin for multiple EXISTS patterns
-2. **Q9 Performance**: ~10s at SF=0.1 due to 6-way join
-   - Solution: Better join ordering / parallel execution
+1. ~~**Q21 Performance**: 10s at SF=0.1~~ ✅ RESOLVED (1.76s with parallel SEMI/ANTI)
+2. **Q9 Performance**: ~930ms at SF=0.01, ~10s at SF=0.1 due to 6-way join
+   - Solution: Cost-based join ordering (start with smallest tables)
+3. **Q7 Performance**: ~230ms at SF=0.01 due to multi-way join
+   - Solution: Better join ordering
