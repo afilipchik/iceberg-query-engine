@@ -7,6 +7,7 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use futures::stream;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Table provider trait for accessing table data
@@ -16,6 +17,12 @@ pub trait TableProvider: Send + Sync + fmt::Debug {
 
     /// Get all batches from the table
     fn scan(&self, projection: Option<&[usize]>) -> Result<Vec<RecordBatch>>;
+
+    /// Get Parquet file paths if this is a Parquet-based table
+    /// Returns None for non-Parquet tables (e.g., MemoryTable)
+    fn parquet_files(&self) -> Option<Vec<PathBuf>> {
+        None
+    }
 }
 
 /// In-memory table provider

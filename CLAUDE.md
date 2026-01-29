@@ -39,6 +39,40 @@ Before committing any code changes:
 
 This ensures consistent code formatting across the codebase.
 
+### Benchmark Timeout Rule
+
+**SET BENCHMARK TIMEOUT TO 10x DUCKDB EXECUTION TIME.**
+
+When running benchmarks:
+1. Use timeout = 10 × DuckDB time for that query
+2. If the query cannot complete within 10x DuckDB time, it **FAILS**
+3. Reference DuckDB times from the benchmark table below
+
+| Query | DuckDB Time (SF=10) | Timeout |
+|-------|---------------------|---------|
+| Q01 | 89ms | 890ms |
+| Q02 | 13ms | 130ms |
+| Q03 | 84ms | 840ms |
+| Q04 | 80ms | 800ms |
+| Q05 | 49ms | 490ms |
+| Q06 | 24ms | 240ms |
+| Q07 | 61ms | 610ms |
+| Q08 | 76ms | 760ms |
+| Q09 | 8ms | 80ms |
+| Q10 | 98ms | 980ms |
+| Q11 | 10ms | 100ms |
+| Q12 | 66ms | 660ms |
+| Q13 | 131ms | 1.3s |
+| Q14 | 35ms | 350ms |
+| Q15 | 33ms | 330ms |
+| Q16 | 40ms | 400ms |
+| Q17 | 75ms | 750ms |
+| Q18 | 283ms | 2.8s |
+| Q19 | 87ms | 870ms |
+| Q20 | 161ms | 1.6s |
+| Q21 | 201ms | 2s |
+| Q22 | 36ms | 360ms |
+
 ---
 
 ## Project Overview
@@ -708,6 +742,25 @@ Based on the codebase structure, these appear to be planned but not fully implem
 
 ## Recently Implemented Features
 
+- **Morsel-Driven Aggregation Integration + Vectorization** (2026-01-29)
+  - Integrated morsel-driven parallel aggregation into the query engine
+  - New `MorselAggregateExec` physical operator in `src/physical/operators/morsel_agg.rs`
+  - Automatic routing: PhysicalPlanner detects aggregation over Parquet tables
+  - Uses existing morsel infrastructure from `src/physical/morsel.rs` and `src/physical/morsel_agg.rs`
+  - Configuration flag: `ExecutionConfig::enable_morsel_execution` (default: true)
+  - Extended `TableProvider` trait with `parquet_files()` method for file discovery
+  - **Optimizations in `morsel_agg.rs`:**
+    - `AggregationState` with dual-mode: perfect hash (fixed array) + HashMap fallback
+    - `TypedArrayAccessor` for pre-downcast typed array access
+    - `raw_key()` u64 key extraction without ScalarValue allocation
+    - `update_f64()` / `update_i64()` direct primitive accumulator updates
+    - f64 fast path for all-float aggregate inputs
+  - **TPC-H Q1 (SF=10) Performance:**
+    - Standard HashAggregateExec: 1830ms
+    - With morsel + vectorization: **502ms (3.6x faster)**
+    - vs DuckDB (89ms): 5.6x (within 10x target)
+    - Remaining gap to DuckDB is primarily Parquet I/O (custom SIMD reader)
+
 - **DelimJoin Infrastructure** (2026-01-27)
   - DuckDB-style deduplication join for efficient correlated subquery execution
   - New logical plan nodes: `DelimJoinNode`, `DelimGetNode` in `src/planner/logical_plan.rs`
@@ -915,6 +968,8 @@ Based on the codebase structure, these appear to be planned but not fully implem
 | Predicate pushdown | `src/optimizer/rules/predicate_pushdown.rs` |
 | Projection pushdown | `src/optimizer/rules/projection_pushdown.rs` |
 | Physical execution | `src/physical/operators/*.rs` |
+| Morsel aggregation operator | `src/physical/operators/morsel_agg.rs` |
+| Morsel framework | `src/physical/morsel.rs`, `src/physical/morsel_agg.rs` |
 | Subquery execution | `src/physical/operators/subquery.rs` |
 | DelimJoin operators | `src/physical/operators/delim_join.rs` |
 | Flatten dependent join rule | `src/optimizer/rules/flatten_dependent_join.rs` |

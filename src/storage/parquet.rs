@@ -148,6 +148,10 @@ impl TableProvider for ParquetTable {
         // The Parquet reader already does this, so batches have correct schema
         Ok(all_batches)
     }
+
+    fn parquet_files(&self) -> Option<Vec<PathBuf>> {
+        Some(self.files.clone())
+    }
 }
 
 /// Streaming Parquet reader that reads data row-group by row-group

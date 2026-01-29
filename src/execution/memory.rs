@@ -206,6 +206,10 @@ pub struct ExecutionConfig {
     /// Enable spillable operators for larger-than-memory datasets
     /// When false (default), uses regular operators with memory limit checks
     pub enable_spilling: bool,
+
+    /// Enable morsel-driven parallel execution for aggregations over Parquet
+    /// When true (default), uses optimized parallel aggregation for Parquet scans
+    pub enable_morsel_execution: bool,
 }
 
 impl Default for ExecutionConfig {
@@ -221,6 +225,8 @@ impl Default for ExecutionConfig {
             spill_threshold: 0.8,
             // Spillable operators disabled by default until bugs are fixed
             enable_spilling: false,
+            // Morsel execution enabled by default for better performance
+            enable_morsel_execution: true,
         }
     }
 }
@@ -275,6 +281,12 @@ impl ExecutionConfig {
     /// Enable spillable operators for larger-than-memory datasets
     pub fn with_spilling(mut self, enabled: bool) -> Self {
         self.enable_spilling = enabled;
+        self
+    }
+
+    /// Enable morsel-driven parallel execution for aggregations over Parquet
+    pub fn with_morsel_execution(mut self, enabled: bool) -> Self {
+        self.enable_morsel_execution = enabled;
         self
     }
 

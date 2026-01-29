@@ -4,8 +4,8 @@ use crate::error::{QueryError, Result};
 use crate::execution::{ExecutionConfig, SharedMemoryPool};
 use crate::physical::operators::{
     AggregateExpr, ExternalSortExec, FilterExec, HashAggregateExec, HashJoinExec, LimitExec,
-    MemoryTableExec, ProjectExec, SortExec, SpillableHashAggregateExec, SpillableHashJoinExec,
-    SubqueryExecutor, TableProvider, UnionExec,
+    MemoryTableExec, MorselAggregateExec, ProjectExec, SortExec, SpillableHashAggregateExec,
+    SpillableHashJoinExec, SubqueryExecutor, TableProvider, UnionExec,
 };
 use crate::physical::PhysicalOperator;
 use crate::planner::{Expr, JoinType, LogicalPlan, PlanSchema};
@@ -57,6 +57,60 @@ impl PhysicalPlanner {
         self.memory_pool.is_some()
             && self.config.is_some()
             && self.config.as_ref().unwrap().enable_spilling
+    }
+
+    /// Check if morsel execution should be used
+    fn use_morsel_execution(&self) -> bool {
+        self.config.is_some() && self.config.as_ref().unwrap().enable_morsel_execution
+    }
+
+    /// Try to extract Parquet files and filter from a logical plan for morsel execution
+    /// Returns (files, input_schema, filter, projection) if the plan is suitable for morsel execution
+    fn try_extract_parquet_source(
+        &self,
+        plan: &LogicalPlan,
+    ) -> Option<(
+        Vec<std::path::PathBuf>,
+        arrow::datatypes::SchemaRef,
+        Option<Expr>,
+        Option<Vec<usize>>,
+    )> {
+        match plan {
+            LogicalPlan::Scan(node) => {
+                let provider = self.tables.get(&node.table_name)?;
+                let files = provider.parquet_files()?;
+                let input_schema = provider.schema();
+                let filter = node.filter.clone();
+                let projection = node.projection.clone();
+                Some((files, input_schema, filter, projection))
+            }
+            LogicalPlan::Filter(node) => {
+                // Check if input is a Scan over ParquetTable
+                if let LogicalPlan::Scan(scan_node) = node.input.as_ref() {
+                    let provider = self.tables.get(&scan_node.table_name)?;
+                    let files = provider.parquet_files()?;
+                    let input_schema = provider.schema();
+                    // Combine filters if scan also has a filter
+                    let filter = match &scan_node.filter {
+                        Some(scan_filter) => Some(Expr::BinaryExpr {
+                            left: Box::new(scan_filter.clone()),
+                            op: crate::planner::BinaryOp::And,
+                            right: Box::new(node.predicate.clone()),
+                        }),
+                        None => Some(node.predicate.clone()),
+                    };
+                    let projection = scan_node.projection.clone();
+                    Some((files, input_schema, filter, projection))
+                } else {
+                    None
+                }
+            }
+            LogicalPlan::Project(node) => {
+                // Project can be handled if input is Scan or Filter->Scan
+                self.try_extract_parquet_source(&node.input)
+            }
+            _ => None,
+        }
     }
 
     /// Helper to create a FilterExec with subquery executor if needed
@@ -189,12 +243,32 @@ impl PhysicalPlanner {
             }
 
             LogicalPlan::Aggregate(node) => {
-                let input = self.create_physical_plan(&node.input)?;
-
                 // Convert logical aggregate expressions to physical
                 let aggregates = extract_aggregates(&node.aggregates);
 
                 let schema = plan_schema_to_arrow(&node.schema);
+
+                // Try morsel execution for Parquet-based aggregations
+                if self.use_morsel_execution() {
+                    if let Some((files, input_schema, filter, projection)) =
+                        self.try_extract_parquet_source(&node.input)
+                    {
+                        // Use morsel-driven parallel aggregation
+                        let morsel_agg = MorselAggregateExec::new(
+                            files,
+                            input_schema,
+                            projection,
+                            filter,
+                            node.group_by.clone(),
+                            aggregates,
+                            schema,
+                        );
+                        return Ok(Arc::new(morsel_agg));
+                    }
+                }
+
+                // Fall back to regular execution
+                let input = self.create_physical_plan(&node.input)?;
 
                 if self.use_spillable() {
                     // Convert to spillable AggregateExpr type
