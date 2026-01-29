@@ -293,7 +293,7 @@ impl JoinReorder {
 
         while joined.len() < relations.len() {
             let mut best_edge: Option<(usize, usize)> = None;
-            let mut best_score: i32 = -1;
+            let mut best_score: i32 = i32::MIN;
 
             for (edge_idx, edge) in edges.iter().enumerate() {
                 if used_edges.contains(&edge_idx) {
@@ -304,13 +304,20 @@ impl JoinReorder {
                 let right_in = joined.contains(&edge.right_idx);
 
                 if left_in && !right_in {
-                    let score = edge.conditions.len() as i32;
+                    // Score based on: prefer small tables (dimension tables) to join early
+                    // This reduces intermediate result sizes
+                    let size_score = self.estimate_relation_size_score(&relations[edge.right_idx]);
+                    let cond_score = edge.conditions.len() as i32 * 100;
+                    let score = size_score + cond_score;
                     if score > best_score {
                         best_score = score;
                         best_edge = Some((edge_idx, edge.right_idx));
                     }
                 } else if !left_in && right_in {
-                    let score = edge.conditions.len() as i32;
+                    // Score based on: prefer small tables (dimension tables) to join early
+                    let size_score = self.estimate_relation_size_score(&relations[edge.left_idx]);
+                    let cond_score = edge.conditions.len() as i32 * 100;
+                    let score = size_score + cond_score;
                     if score > best_score {
                         best_score = score;
                         best_edge = Some((edge_idx, edge.left_idx));
@@ -344,6 +351,42 @@ impl JoinReorder {
                     filter: None,
                     schema,
                 }));
+
+                // Check for additional edges from the newly joined relation to already-joined relations
+                // These need to be added as filters
+                for (other_edge_idx, other_edge) in edges.iter().enumerate() {
+                    if used_edges.contains(&other_edge_idx) {
+                        continue;
+                    }
+
+                    let connects_new =
+                        other_edge.left_idx == new_rel_idx || other_edge.right_idx == new_rel_idx;
+                    let other_side = if other_edge.left_idx == new_rel_idx {
+                        other_edge.right_idx
+                    } else {
+                        other_edge.left_idx
+                    };
+                    let other_in_result = joined.contains(&other_side);
+
+                    if connects_new && other_in_result {
+                        // This edge adds more conditions between already-joined relations
+                        // Add as filter on top
+                        used_edges.insert(other_edge_idx);
+                        used_condition_indices.insert(other_edge_idx);
+                        let conditions = &other_edge.conditions;
+                        for (l, r) in conditions {
+                            let filter_expr = Expr::BinaryExpr {
+                                left: Box::new(l.clone()),
+                                op: BinaryOp::Eq,
+                                right: Box::new(r.clone()),
+                            };
+                            result_plan = Some(LogicalPlan::Filter(crate::planner::FilterNode {
+                                input: Arc::new(result_plan.take().unwrap()),
+                                predicate: filter_expr,
+                            }));
+                        }
+                    }
+                }
             } else {
                 // No edge found - need cross join (shouldn't happen if conditions exist)
                 let next_rel = (0..relations.len()).find(|i| !joined.contains(i)).unwrap();
@@ -520,7 +563,7 @@ impl JoinReorder {
         while joined.len() < relations.len() {
             // Find the best edge to use (connects to current result, with join condition)
             let mut best_edge: Option<(usize, usize)> = None; // (edge_idx, new_relation_idx)
-            let mut best_score: i32 = -1;
+            let mut best_score: i32 = i32::MIN;
 
             for (edge_idx, edge) in edges.iter().enumerate() {
                 if used_edges.contains(&edge_idx) {
@@ -532,14 +575,18 @@ impl JoinReorder {
 
                 if left_in && !right_in {
                     // Can add right relation
-                    let score = edge.conditions.len() as i32;
+                    let base_score = edge.conditions.len() as i32 * 100;
+                    let size_score = self.estimate_relation_size_score(&relations[edge.right_idx]);
+                    let score = base_score + size_score;
                     if score > best_score {
                         best_score = score;
                         best_edge = Some((edge_idx, edge.right_idx));
                     }
                 } else if !left_in && right_in {
                     // Can add left relation
-                    let score = edge.conditions.len() as i32;
+                    let base_score = edge.conditions.len() as i32 * 100;
+                    let size_score = self.estimate_relation_size_score(&relations[edge.left_idx]);
+                    let score = base_score + size_score;
                     if score > best_score {
                         best_score = score;
                         best_edge = Some((edge_idx, edge.left_idx));
@@ -881,12 +928,24 @@ impl JoinReorder {
         relations.into_iter().collect()
     }
 
+    /// Get the underlying table name from a relation plan (handles SubqueryAlias)
+    fn get_underlying_table_name(&self, plan: &LogicalPlan) -> Option<String> {
+        match plan {
+            LogicalPlan::Scan(node) => Some(node.table_name.clone()),
+            LogicalPlan::SubqueryAlias(node) => self.get_underlying_table_name(&node.input),
+            LogicalPlan::Filter(node) => self.get_underlying_table_name(&node.input),
+            LogicalPlan::Project(node) => self.get_underlying_table_name(&node.input),
+            _ => None,
+        }
+    }
+
     /// Select the best starting relation for join ordering
-    /// Prefers: relations with filters > fact tables (high connectivity) > any
+    /// For hash joins, we want to start with SMALL dimension tables and join to larger tables.
+    /// Prefers: small tables with filters > small tables > any
     fn select_start_relation(&self, relations: &[JoinRelation], edges: &[JoinEdge]) -> usize {
-        // Priority 1: Relations with filters (most selective)
-        // Priority 2: Relations with many columns (likely fact tables)
-        // Priority 3: Most connected relation
+        // Priority 1: Small dimension tables (nation, region, etc.)
+        // Priority 2: Tables with filters (selective)
+        // Priority 3: Avoid fact tables (lineitem, orders) as starting point
 
         let mut best_idx = 0;
         let mut best_score = i32::MIN;
@@ -894,31 +953,64 @@ impl JoinReorder {
         for (idx, rel) in relations.iter().enumerate() {
             let mut score = 0i32;
 
+            // Estimate table size based on table name heuristics
+            // Smaller tables get HIGHER scores (we want to start with small tables)
+            // Check both the alias name and the underlying table name
+            let name_lower = rel.name.to_lowercase();
+            let underlying_name = self
+                .get_underlying_table_name(&rel.plan)
+                .map(|s| s.to_lowercase())
+                .unwrap_or_default();
+
+            // Fact tables are large - penalize them heavily
+            // Check both alias name and underlying table name
+            let is_lineitem =
+                name_lower.contains("lineitem") || underlying_name.contains("lineitem");
+            let is_orders = name_lower.contains("orders")
+                || underlying_name.contains("orders")
+                || name_lower.contains("sales")
+                || underlying_name.contains("sales");
+            let is_partsupp =
+                name_lower.contains("partsupp") || underlying_name.contains("partsupp");
+            let is_customer =
+                name_lower.contains("customer") || underlying_name.contains("customer");
+            let is_part = name_lower.contains("part") || underlying_name.contains("part");
+            let is_supplier =
+                name_lower.contains("supplier") || underlying_name.contains("supplier");
+            let is_nation = name_lower.contains("nation") || underlying_name.contains("nation");
+            let is_region = name_lower.contains("region") || underlying_name.contains("region");
+
+            if is_lineitem {
+                score -= 10000; // Largest table - avoid starting with it
+            } else if is_orders {
+                score -= 5000; // Large fact tables
+            } else if is_partsupp {
+                score -= 3000; // Medium-large
+            } else if is_customer || (is_part && !is_partsupp) {
+                score -= 1000; // Medium
+            } else if is_supplier {
+                score += 2000; // Small dimension table
+            } else if is_nation || is_region {
+                score += 5000; // Very small dimension tables - great starting point
+            }
+
             // Check if this relation has a filter (indicates selectivity)
             let has_filter = self.relation_has_filter(&rel.plan);
             if has_filter {
-                score += 10000; // Strong preference for filtered relations
+                score += 3000; // Filtered relations are smaller - good starting point
             }
 
-            // Number of edges (connectivity) - prefer highly connected tables
+            // Number of edges (connectivity) - slightly prefer connected tables
+            // but not as much as size consideration
             let edge_count = edges
                 .iter()
                 .filter(|e| e.left_idx == idx || e.right_idx == idx)
                 .count() as i32;
-            score += edge_count * 100;
+            score += edge_count * 10;
 
-            // Number of columns (heuristic for fact tables which have more columns)
+            // Number of columns - fewer columns often means dimension table
             let col_count = rel.columns.len() as i32;
-            score += col_count;
-
-            // Prefer tables whose name suggests they're fact tables
-            let name_lower = rel.name.to_lowercase();
-            if name_lower.contains("lineitem")
-                || name_lower.contains("orders")
-                || name_lower.contains("sales")
-            {
-                score += 5000;
-            }
+            score -= col_count * 5; // Penalize tables with many columns
 
             if score > best_score {
                 best_score = score;
@@ -938,12 +1030,58 @@ impl JoinReorder {
             _ => false,
         }
     }
+
+    /// Estimate a score for relation size (higher score = prefer to join next)
+    /// Small tables get higher scores because they're better as hash table build sides
+    fn estimate_relation_size_score(&self, rel: &JoinRelation) -> i32 {
+        let name_lower = rel.name.to_lowercase();
+        let underlying_name = self
+            .get_underlying_table_name(&rel.plan)
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+        let mut score = 0i32;
+
+        // Check both alias name and underlying table name
+        let is_lineitem = name_lower.contains("lineitem") || underlying_name.contains("lineitem");
+        let is_orders = name_lower.contains("orders")
+            || underlying_name.contains("orders")
+            || name_lower.contains("sales")
+            || underlying_name.contains("sales");
+        let is_partsupp = name_lower.contains("partsupp") || underlying_name.contains("partsupp");
+        let is_customer = name_lower.contains("customer") || underlying_name.contains("customer");
+        let is_part = name_lower.contains("part") || underlying_name.contains("part");
+        let is_supplier = name_lower.contains("supplier") || underlying_name.contains("supplier");
+        let is_nation = name_lower.contains("nation") || underlying_name.contains("nation");
+        let is_region = name_lower.contains("region") || underlying_name.contains("region");
+
+        // Fact tables are large - prefer to join them later (lower score)
+        if is_lineitem {
+            score -= 5000;
+        } else if is_orders {
+            score -= 3000;
+        } else if is_partsupp {
+            score -= 2000;
+        } else if is_customer || (is_part && !is_partsupp) {
+            score -= 500;
+        } else if is_supplier {
+            score += 1000;
+        } else if is_nation || is_region {
+            score += 2000;
+        }
+
+        // Tables with filters are smaller (more selective)
+        if self.relation_has_filter(&rel.plan) {
+            score += 1500;
+        }
+
+        score
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::planner::{ScanNode, SchemaField};
+    use crate::planner::{PlanSchema, ScanNode, SchemaField};
     use arrow::datatypes::DataType as ArrowDataType;
 
     fn make_scan(name: &str, columns: Vec<&str>) -> LogicalPlan {

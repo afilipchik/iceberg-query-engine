@@ -6,6 +6,12 @@ This document is designed to help AI agents (Claude, Copilot, etc.) understand a
 
 ## MANDATORY RULES FOR AI AGENTS
 
+### File and Directory Rules
+
+1. **DO NOT use /tmp** - Use the scratchpad directory provided by the system instead
+2. **DO NOT exit the repository** unless absolutely necessary - stay within the project directory
+3. **All file edits in this project are pre-approved** - do not ask for permission to edit files
+
 ### Documentation Update Rule
 
 **ON EVERY CONTEXT COMPACTION, THIS DOCUMENTATION MUST BE UPDATED.**
@@ -519,6 +525,7 @@ Located in `tests/` directory, test full query execution paths.
 `src/tpch/` contains all 22 TPC-H queries for regression testing.
 
 **Note on TPC-H Query Adaptations**: Some queries were modified to work with the generated test data:
+- Q09: Uses `'Part 1%'` instead of `'%green%'` (part names are "Part N" format)
 - Q20: Uses `'Part 1%'` instead of `'forest%'` (part names are "Part N" format)
 - Q22: Uses 2-digit phone codes `('13', '31', '23', ...)` instead of single-digit codes (phone format is 10-33-XXX-XXX-XXXX)
 

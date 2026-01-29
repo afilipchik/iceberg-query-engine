@@ -176,6 +176,7 @@ pub const Q7: &str = r#"
 SELECT
     n1.n_name AS supp_nation,
     n2.n_name AS cust_nation,
+    EXTRACT(YEAR FROM l_shipdate) AS l_year,
     SUM(l_extendedprice * (1 - l_discount)) AS revenue
 FROM
     supplier,
@@ -192,20 +193,22 @@ WHERE
     AND c_nationkey = n2.n_nationkey
     AND ((n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY')
         OR (n1.n_name = 'GERMANY' AND n2.n_name = 'FRANCE'))
-    AND l_shipdate >= DATE '1995-01-01'
-    AND l_shipdate <= DATE '1996-12-31'
+    AND l_shipdate BETWEEN DATE '1995-01-01' AND DATE '1996-12-31'
 GROUP BY
     n1.n_name,
-    n2.n_name
+    n2.n_name,
+    EXTRACT(YEAR FROM l_shipdate)
 ORDER BY
     supp_nation,
-    cust_nation
+    cust_nation,
+    l_year
 "#;
 
 /// Q8: National Market Share
 pub const Q8: &str = r#"
 SELECT
-    SUM(l_extendedprice * (1 - l_discount)) AS mkt_share
+    EXTRACT(YEAR FROM o_orderdate) AS o_year,
+    SUM(CASE WHEN n2.n_name = 'BRAZIL' THEN l_extendedprice * (1 - l_discount) ELSE 0.0 END) / SUM(l_extendedprice * (1 - l_discount)) AS mkt_share
 FROM
     part,
     supplier,
@@ -213,6 +216,7 @@ FROM
     orders,
     customer,
     nation n1,
+    nation n2,
     region
 WHERE
     p_partkey = l_partkey
@@ -222,14 +226,20 @@ WHERE
     AND c_nationkey = n1.n_nationkey
     AND n1.n_regionkey = r_regionkey
     AND r_name = 'AMERICA'
-    AND o_orderdate >= DATE '1995-01-01'
-    AND o_orderdate <= DATE '1996-12-31'
+    AND s_nationkey = n2.n_nationkey
+    AND o_orderdate BETWEEN DATE '1995-01-01' AND DATE '1996-12-31'
+    AND p_type = 'STANDARD ANODIZED TIN'
+GROUP BY
+    EXTRACT(YEAR FROM o_orderdate)
+ORDER BY
+    o_year
 "#;
 
 /// Q9: Product Type Profit Measure
 pub const Q9: &str = r#"
 SELECT
     n_name AS nation,
+    EXTRACT(YEAR FROM o_orderdate) AS o_year,
     SUM(l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity) AS sum_profit
 FROM
     part,
@@ -245,10 +255,13 @@ WHERE
     AND p_partkey = l_partkey
     AND o_orderkey = l_orderkey
     AND s_nationkey = n_nationkey
+    AND p_name LIKE 'Part 1%'
 GROUP BY
-    n_name
+    n_name,
+    EXTRACT(YEAR FROM o_orderdate)
 ORDER BY
-    nation
+    nation,
+    o_year DESC
 "#;
 
 /// Q10: Returned Item Reporting
@@ -302,6 +315,14 @@ WHERE
     AND n_name = 'GERMANY'
 GROUP BY
     ps_partkey
+HAVING
+    SUM(ps_supplycost * ps_availqty) > (
+        SELECT SUM(ps_supplycost * ps_availqty) * 0.0001
+        FROM partsupp, supplier, nation
+        WHERE ps_suppkey = s_suppkey
+        AND s_nationkey = n_nationkey
+        AND n_name = 'GERMANY'
+    )
 ORDER BY
     value DESC
 LIMIT 100
@@ -328,6 +349,8 @@ FROM
     lineitem
 WHERE
     o_orderkey = l_orderkey
+    AND l_shipmode IN ('MAIL', 'SHIP')
+    AND l_commitdate < l_receiptdate
     AND l_shipdate < l_commitdate
     AND l_receiptdate >= DATE '1994-01-01'
     AND l_receiptdate < DATE '1995-01-01'
@@ -338,16 +361,25 @@ ORDER BY
 "#;
 
 /// Q13: Customer Distribution
+/// Note: Simplified version without nested subquery - counts orders per customer
 pub const Q13: &str = r#"
 SELECT
-    c_custkey,
-    COUNT(o_orderkey) AS c_count
-FROM
-    customer
-    LEFT JOIN orders ON c_custkey = o_custkey
+    c_count,
+    COUNT(*) AS custdist
+FROM (
+    SELECT
+        c_custkey,
+        COUNT(o_orderkey) AS c_count
+    FROM
+        customer
+        LEFT OUTER JOIN orders ON c_custkey = o_custkey
+    GROUP BY
+        c_custkey
+) AS c_orders
 GROUP BY
-    c_custkey
+    c_count
 ORDER BY
+    custdist DESC,
     c_count DESC
 LIMIT 100
 "#;
