@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Query Results</title>
+  <style>
+    :root {
+      --bg-color: #ffffff;
+      --text-color: #1a1a1a;
+      --border-color: #e0e0e0;
+      --header-bg: #f5f5f5;
+      --accent-color: #0066cc;
+    }
+
+    [data-theme="dark"] {
+      --bg-color: #1a1a1a;
+      --text-color: #f0f0f0;
+      --border-color: #333333;
+      --header-bg: #2a2a2a;
+      --accent-color: #66b3ff;
+    }
+
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: var(--bg-color);
+      color: var(--text-color);
+      margin: 0;
+      padding: 16px;
+    }
+
+    .metrics-bar {
+      display: flex;
+      gap: 24px;
+      padding: 12px 16px;
+      background: var(--header-bg);
+      border-radius: 8px;
+      margin-bottom: 12px;
+      font-weight: 500;
+    }
+
+    .metrics-breakdown {
+      display: flex;
+      gap: 16px;
+      padding: 8px 0;
+      margin-bottom: 16px;
+      font-size: 13px;
+    }
+
+    .metric-item {
+      display: flex;
+      gap: 6px;
+    }
+
+    .metric-item label {
+      color: var(--text-color);
+      opacity: 0.6;
+    }
+
+    .results-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+
+    .results-table th {
+      background: var(--header-bg);
+      padding: 10px 12px;
+      text-align: left;
+      border-bottom: 2px solid var(--border-color);
+    }
+
+    .results-table th small {
+      font-weight: normal;
+      opacity: 0.6;
+      font-size: 11px;
+    }
+
+    .results-table td {
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border-color);
+    }
+
+    .results-table tr:hover {
+      background: var(--header-bg);
+    }
+
+    .error {
+      padding: 16px;
+      background: #ffebee;
+      color: #c62828;
+      border-radius: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div id="results">Loading...</div>
+  <script src="app.js"></script>
+</body>
+</html>

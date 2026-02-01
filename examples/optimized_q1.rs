@@ -1,3 +1,5 @@
+#![cfg(target_arch = "x86_64")]
+
 //! Optimized TPC-H Q1 with minimized I/O overhead
 //!
 //! Key optimizations:
@@ -8,9 +10,7 @@
 //!
 //! Run with: cargo run --release --example optimized_q1
 
-use arrow::array::{Date32Array, Float64Array, PrimitiveArray, StringArray};
-use arrow::buffer::Buffer;
-use arrow::datatypes::Float64Type;
+use arrow::array::{Date32Array, Float64Array, StringArray};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ProjectionMask;
 use query_engine::error::Result;
@@ -189,6 +189,7 @@ impl Q1State {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn main() -> Result<()> {
     let path = "./data/tpch-10gb/lineitem.parquet";
     let date_limit = 10471;
@@ -360,5 +361,12 @@ fn main() -> Result<()> {
         elapsed.as_secs_f64() / 0.084
     );
 
+    Ok(())
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn main() -> Result<()> {
+    eprintln!("This example is only available on x86_64 platforms due to SIMD intrinsics.");
+    eprintln!("Try running: cargo run --release --example final_q1");
     Ok(())
 }

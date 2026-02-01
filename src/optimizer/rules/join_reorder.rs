@@ -943,7 +943,7 @@ impl JoinReorder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::planner::{ScanNode, SchemaField};
+    use crate::planner::{PlanSchema, ScanNode, SchemaField};
     use arrow::datatypes::DataType as ArrowDataType;
 
     fn make_scan(name: &str, columns: Vec<&str>) -> LogicalPlan {
