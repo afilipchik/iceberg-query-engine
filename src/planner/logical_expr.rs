@@ -1240,7 +1240,8 @@ impl Expr {
                     | ScalarFunction::DayOfYear
                     | ScalarFunction::YearOfWeek
                     | ScalarFunction::TimezoneHour
-                    | ScalarFunction::TimezoneMinute => Ok(ArrowDataType::Int32),
+                    | ScalarFunction::TimezoneMinute
+                    | ScalarFunction::Extract => Ok(ArrowDataType::Int32),
                     // Date/time functions returning Timestamp
                     ScalarFunction::CurrentTimestamp
                     | ScalarFunction::Now
@@ -1430,9 +1431,23 @@ impl Expr {
                     // Other
                     ScalarFunction::Typeof => Ok(ArrowDataType::Utf8),
                     ScalarFunction::Uuid => Ok(ArrowDataType::Utf8),
-                    ScalarFunction::DateAdd | ScalarFunction::DateTrunc => Ok(
-                        ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-                    ),
+                    ScalarFunction::DateAdd => {
+                        // DATE_ADD('unit', value, date) - return type matches the date arg (3rd)
+                        if let Some(date_arg) = args.get(2) {
+                            date_arg.data_type(schema)
+                        } else if let Some(date_arg) = args.get(1) {
+                            date_arg.data_type(schema)
+                        } else {
+                            Ok(ArrowDataType::Timestamp(
+                                arrow::datatypes::TimeUnit::Microsecond,
+                                None,
+                            ))
+                        }
+                    }
+                    ScalarFunction::DateTrunc => Ok(ArrowDataType::Timestamp(
+                        arrow::datatypes::TimeUnit::Microsecond,
+                        None,
+                    )),
                     ScalarFunction::DateDiff => Ok(ArrowDataType::Int64),
                     ScalarFunction::DatePart => Ok(ArrowDataType::Float64),
                     // TryCast and Try preserve input type or return null
@@ -1569,8 +1584,17 @@ impl Expr {
 
     /// Create schema field for this expression
     pub fn to_field(&self, schema: &PlanSchema) -> crate::error::Result<SchemaField> {
-        let name = self.output_name();
         let data_type = self.data_type(schema)?;
+        // For Column expressions, preserve the relation qualifier to handle self-joins
+        // (e.g., n1.n_name vs n2.n_name must remain distinct in aggregate output schema)
+        if let Expr::Column(col) = self {
+            let mut field = SchemaField::new(col.name.clone(), data_type);
+            if let Some(ref rel) = col.relation {
+                field = field.with_relation(rel.clone());
+            }
+            return Ok(field);
+        }
+        let name = self.output_name();
         Ok(SchemaField::new(name, data_type))
     }
 

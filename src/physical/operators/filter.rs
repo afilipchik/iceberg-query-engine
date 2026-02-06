@@ -166,6 +166,15 @@ pub fn evaluate_expr(batch: &RecordBatch, expr: &Expr) -> Result<ArrayRef> {
     evaluate_expr_internal(batch, expr, None)
 }
 
+/// Evaluate an expression with optional subquery executor support
+pub fn evaluate_expr_with_subquery(
+    batch: &RecordBatch,
+    expr: &Expr,
+    executor: Option<&SubqueryExecutor>,
+) -> Result<ArrayRef> {
+    evaluate_expr_internal(batch, expr, executor)
+}
+
 /// Internal expression evaluation with optional subquery support
 fn evaluate_expr_internal(
     batch: &RecordBatch,
@@ -880,8 +889,35 @@ fn evaluate_scalar_func(
             let arr = evaluated_args
                 .first()
                 .ok_or_else(|| QueryError::InvalidArgument("ROUND requires 1 argument".into()))?;
-            // For integers, round is identity; for floats, use round
-            apply_math_unary_preserve_int(arr, |x| x.round(), |x| x)
+
+            // Check for optional second argument (decimal places)
+            if evaluated_args.len() >= 2 {
+                let decimals_arr = &evaluated_args[1];
+                // Get the decimal places value (must be an integer)
+                let decimals = if let Some(int_arr) =
+                    decimals_arr.as_any().downcast_ref::<Int64Array>()
+                {
+                    if int_arr.len() > 0 && !int_arr.is_null(0) {
+                        int_arr.value(0) as i32
+                    } else {
+                        0
+                    }
+                } else if let Some(int_arr) = decimals_arr.as_any().downcast_ref::<Int32Array>() {
+                    if int_arr.len() > 0 && !int_arr.is_null(0) {
+                        int_arr.value(0)
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+
+                let factor = 10f64.powi(decimals);
+                apply_math_unary_preserve_int(arr, move |x| (x * factor).round() / factor, |x| x)
+            } else {
+                // No decimal places specified, round to integer
+                apply_math_unary_preserve_int(arr, |x| x.round(), |x| x)
+            }
         }
 
         ScalarFunction::Power => {

@@ -419,15 +419,15 @@ macro_rules! duckdb_validated_test {
 }
 
 // TPC-H queries (22)
-duckdb_validated_test!(validated_tpch_q01, "tpch/q01", ignore: "engine bug: hash aggregation merges R/F and R/O groups with parquet data");
+duckdb_validated_test!(validated_tpch_q01, "tpch/q01");
 duckdb_validated_test!(validated_tpch_q02, "tpch/q02");
 duckdb_validated_test!(validated_tpch_q03, "tpch/q03");
 duckdb_validated_test!(validated_tpch_q04, "tpch/q04");
 duckdb_validated_test!(validated_tpch_q05, "tpch/q05");
 duckdb_validated_test!(validated_tpch_q06, "tpch/q06");
-duckdb_validated_test!(validated_tpch_q07, "tpch/q07", ignore: "engine bug: EXTRACT(YEAR FROM date) returns NULL with parquet Date32 columns");
-duckdb_validated_test!(validated_tpch_q08, "tpch/q08", ignore: "engine bug: EXTRACT(YEAR FROM date) returns NULL with parquet Date32 columns");
-duckdb_validated_test!(validated_tpch_q09, "tpch/q09", ignore: "engine bug: EXTRACT(YEAR FROM date) returns NULL with parquet Date32 columns");
+duckdb_validated_test!(validated_tpch_q07, "tpch/q07");
+duckdb_validated_test!(validated_tpch_q08, "tpch/q08");
+duckdb_validated_test!(validated_tpch_q09, "tpch/q09");
 duckdb_validated_test!(validated_tpch_q10, "tpch/q10");
 duckdb_validated_test!(validated_tpch_q11, "tpch/q11");
 duckdb_validated_test!(validated_tpch_q12, "tpch/q12");
@@ -464,9 +464,9 @@ duckdb_validated_test!(validated_orderby_alias, "orderby/alias");
 duckdb_validated_test!(validated_agg_count_star, "agg/count_star");
 duckdb_validated_test!(validated_agg_count_column, "agg/count_column");
 duckdb_validated_test!(validated_agg_sum_avg_min_max, "agg/sum_avg_min_max");
-duckdb_validated_test!(validated_agg_count_distinct, "agg/count_distinct", ignore: "engine bug: COUNT(DISTINCT col) returns total count instead of distinct count with parquet");
+duckdb_validated_test!(validated_agg_count_distinct, "agg/count_distinct");
 duckdb_validated_test!(validated_agg_group_by_single, "agg/group_by_single");
-duckdb_validated_test!(validated_agg_group_by_multiple, "agg/group_by_multiple", ignore: "engine bug: hash aggregation merges R/F and R/O groups with parquet data");
+duckdb_validated_test!(validated_agg_group_by_multiple, "agg/group_by_multiple");
 duckdb_validated_test!(validated_agg_having, "agg/having");
 duckdb_validated_test!(validated_agg_with_where, "agg/with_where");
 duckdb_validated_test!(validated_agg_expression_group, "agg/expression_group");
@@ -474,14 +474,14 @@ duckdb_validated_test!(validated_agg_empty_result, "agg/empty_result");
 
 // Joins (10)
 duckdb_validated_test!(validated_join_inner, "join/inner");
-duckdb_validated_test!(validated_join_left, "join/left", ignore: "engine bug: LEFT JOIN misses some matching rows with parquet data");
-duckdb_validated_test!(validated_join_right, "join/right", ignore: "engine bug: RIGHT JOIN misses some matching rows with parquet data");
+duckdb_validated_test!(validated_join_left, "join/left");
+duckdb_validated_test!(validated_join_right, "join/right");
 duckdb_validated_test!(validated_join_full_outer, "join/full_outer");
 duckdb_validated_test!(validated_join_cross, "join/cross");
 duckdb_validated_test!(validated_join_self, "join/self");
 duckdb_validated_test!(validated_join_multi_way, "join/multi_way");
 duckdb_validated_test!(validated_join_with_aggregate, "join/with_aggregate");
-duckdb_validated_test!(validated_join_with_filter, "join/with_filter", ignore: "engine bug: hash join produces different matches with parquet data");
+duckdb_validated_test!(validated_join_with_filter, "join/with_filter");
 duckdb_validated_test!(validated_join_inequality, "join/inequality");
 
 // Subqueries (8)
@@ -547,3 +547,144 @@ duckdb_validated_test!(
     validated_complex_union_with_aggregate,
     "complex/union_with_aggregate"
 );
+
+// =========================================================================
+// P1 — SQL Feature Gaps (11 queries)
+// =========================================================================
+
+duckdb_validated_test!(validated_basic_is_null, "basic/is_null");
+duckdb_validated_test!(validated_basic_is_null_filter, "basic/is_null_filter");
+duckdb_validated_test!(validated_basic_not_like, "basic/not_like");
+duckdb_validated_test!(validated_basic_not_between, "basic/not_between");
+duckdb_validated_test!(validated_basic_standalone_or, "basic/standalone_or");
+duckdb_validated_test!(validated_basic_not_operator, "basic/not_operator");
+duckdb_validated_test!(validated_complex_multiple_ctes, "complex/multiple_ctes");
+duckdb_validated_test!(
+    validated_agg_having_without_group_by,
+    "agg/having_without_group_by"
+);
+duckdb_validated_test!(validated_orderby_offset_only, "orderby/offset_only");
+duckdb_validated_test!(
+    validated_basic_aliased_subquery_join,
+    "basic/aliased_subquery_join"
+);
+duckdb_validated_test!(validated_basic_nested_not, "basic/nested_not");
+
+// =========================================================================
+// P1 — String Functions (13 queries)
+// =========================================================================
+
+duckdb_validated_test!(validated_func_concat, "func/concat");
+duckdb_validated_test!(validated_func_concat_ws, "func/concat_ws");
+duckdb_validated_test!(validated_func_left_right, "func/left_right");
+duckdb_validated_test!(validated_func_reverse, "func/reverse");
+duckdb_validated_test!(validated_func_lpad_rpad, "func/lpad_rpad");
+duckdb_validated_test!(validated_func_starts_ends_with, "func/starts_ends_with");
+duckdb_validated_test!(validated_func_split_part, "func/split_part");
+duckdb_validated_test!(validated_func_repeat, "func/repeat_func");
+duckdb_validated_test!(validated_func_chr_ascii, "func/chr_ascii");
+duckdb_validated_test!(validated_func_strpos, "func/strpos");
+duckdb_validated_test!(validated_func_translate, "func/translate");
+duckdb_validated_test!(validated_func_string_combined, "func/string_combined");
+duckdb_validated_test!(validated_func_substring_variants, "func/substring_variants");
+
+// =========================================================================
+// P2 — Date/Time Functions (8 queries)
+// =========================================================================
+
+duckdb_validated_test!(validated_func_date_add, "func/date_add");
+duckdb_validated_test!(validated_func_date_diff, "func/date_diff");
+duckdb_validated_test!(validated_func_date_comparison, "func/date_comparison");
+duckdb_validated_test!(validated_func_year_month_day, "func/year_month_day");
+duckdb_validated_test!(validated_func_date_part, "func/date_part");
+duckdb_validated_test!(validated_func_current_date_test, "func/current_date_test");
+duckdb_validated_test!(validated_func_last_day_of_month, "func/last_day_of_month");
+duckdb_validated_test!(validated_func_date_arithmetic, "func/date_arithmetic");
+
+// =========================================================================
+// P2 — Math Functions (8 queries)
+// =========================================================================
+
+duckdb_validated_test!(validated_func_power_sqrt, "func/power_sqrt");
+duckdb_validated_test!(validated_func_mod_sign, "func/mod_sign");
+duckdb_validated_test!(validated_func_ln_log_exp, "func/ln_log_exp");
+duckdb_validated_test!(validated_func_trig_functions, "func/trig_functions");
+duckdb_validated_test!(validated_func_degrees_radians, "func/degrees_radians");
+duckdb_validated_test!(validated_func_truncate_func, "func/truncate_func");
+duckdb_validated_test!(validated_func_pi_e, "func/pi_e");
+duckdb_validated_test!(validated_func_math_on_data, "func/math_on_data");
+
+// =========================================================================
+// P2 — Regex Functions (4 queries)
+// =========================================================================
+
+duckdb_validated_test!(validated_func_regexp_like, "func/regexp_like");
+duckdb_validated_test!(validated_func_regexp_extract, "func/regexp_extract");
+duckdb_validated_test!(validated_func_regexp_replace, "func/regexp_replace");
+duckdb_validated_test!(validated_func_regexp_on_data, "func/regexp_on_data");
+
+// =========================================================================
+// P2 — Conditional Functions (5 queries)
+// =========================================================================
+
+duckdb_validated_test!(validated_func_if_func, "func/if_func");
+duckdb_validated_test!(validated_func_greatest_least, "func/greatest_least");
+duckdb_validated_test!(
+    validated_func_greatest_least_data,
+    "func/greatest_least_data"
+);
+duckdb_validated_test!(validated_func_try_cast, "func/try_cast");
+duckdb_validated_test!(validated_func_coalesce_chain, "func/coalesce_chain");
+
+// =========================================================================
+// P2 — Aggregate Functions (8 queries)
+// =========================================================================
+
+duckdb_validated_test!(validated_agg_stddev_variance, "agg/stddev_variance");
+duckdb_validated_test!(validated_agg_bool_agg, "agg/bool_agg");
+duckdb_validated_test!(validated_agg_min_max_by, "agg/min_max_by");
+duckdb_validated_test!(validated_agg_count_if, "agg/count_if");
+duckdb_validated_test!(validated_agg_sum_distinct, "agg/sum_distinct");
+duckdb_validated_test!(validated_agg_multiple_distinct, "agg/multiple_distinct");
+duckdb_validated_test!(validated_agg_nested_agg_subquery, "agg/nested_agg_subquery");
+duckdb_validated_test!(validated_agg_group_by_expression, "agg/group_by_expression");
+
+// =========================================================================
+// P3 — Binary/Encoding Functions (4 queries)
+// =========================================================================
+
+duckdb_validated_test!(validated_func_hex_functions, "func/hex_functions");
+duckdb_validated_test!(validated_func_md5_sha, "func/md5_sha");
+duckdb_validated_test!(validated_func_base64, "func/base64");
+duckdb_validated_test!(validated_func_encode_combined, "func/encode_combined");
+
+// =========================================================================
+// P3 — Bitwise Functions (3 queries)
+// =========================================================================
+
+duckdb_validated_test!(validated_func_bitwise_ops, "func/bitwise_ops");
+duckdb_validated_test!(validated_func_bitwise_shift, "func/bitwise_shift");
+duckdb_validated_test!(validated_func_bit_count, "func/bit_count");
+
+// =========================================================================
+// P3 — Additional Complex Queries (6 queries)
+// =========================================================================
+
+duckdb_validated_test!(
+    validated_complex_correlated_exists_multiple,
+    "complex/correlated_exists_multiple"
+);
+duckdb_validated_test!(
+    validated_complex_subquery_in_select,
+    "complex/subquery_in_select"
+);
+duckdb_validated_test!(
+    validated_complex_deeply_nested_subquery,
+    "complex/deeply_nested_subquery"
+);
+duckdb_validated_test!(
+    validated_complex_multi_agg_multi_join,
+    "complex/multi_agg_multi_join"
+);
+duckdb_validated_test!(validated_complex_case_grouping, "complex/case_grouping");
+duckdb_validated_test!(validated_complex_union_cte, "complex/union_cte");

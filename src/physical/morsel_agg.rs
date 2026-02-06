@@ -10,8 +10,8 @@ use crate::physical::morsel::{ParallelParquetSource, DEFAULT_MORSEL_SIZE};
 use crate::physical::operators::evaluate_expr;
 use crate::planner::{AggregateFunction, Expr, ScalarValue};
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Builder, Float64Array, Float64Builder,
-    Int64Array, Int64Builder, StringArray, StringBuilder,
+    Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Decimal128Builder, Float64Array,
+    Float64Builder, Int32Builder, Int64Array, Int64Builder, StringArray, StringBuilder,
 };
 use arrow::compute;
 use arrow::datatypes::{DataType, SchemaRef};
@@ -88,9 +88,21 @@ enum AccumulatorState {
     Count(i64),
     Sum(f64),
     SumInt(i64),
-    Avg { sum: f64, count: i64 },
+    Avg {
+        sum: f64,
+        count: i64,
+    },
     Min(Option<ScalarValue>),
     Max(Option<ScalarValue>),
+    BoolAnd(Option<bool>),
+    BoolOr(Option<bool>),
+    /// Online variance using Welford's algorithm: (count, mean, M2)
+    /// Finalize: population variance = M2/count, sample variance = M2/(count-1)
+    Variance {
+        count: i64,
+        mean: f64,
+        m2: f64,
+    },
 }
 
 impl AccumulatorState {
@@ -108,6 +120,18 @@ impl AccumulatorState {
             AggregateFunction::Avg => AccumulatorState::Avg { sum: 0.0, count: 0 },
             AggregateFunction::Min => AccumulatorState::Min(None),
             AggregateFunction::Max => AccumulatorState::Max(None),
+            AggregateFunction::BoolAnd => AccumulatorState::BoolAnd(None),
+            AggregateFunction::BoolOr => AccumulatorState::BoolOr(None),
+            AggregateFunction::Stddev
+            | AggregateFunction::StddevPop
+            | AggregateFunction::StddevSamp
+            | AggregateFunction::Variance
+            | AggregateFunction::VarPop
+            | AggregateFunction::VarSamp => AccumulatorState::Variance {
+                count: 0,
+                mean: 0.0,
+                m2: 0.0,
+            },
             _ => AccumulatorState::Count(0), // Default for unsupported
         }
     }
@@ -161,6 +185,25 @@ impl AccumulatorState {
                     }
                 }
             }
+            AccumulatorState::BoolAnd(state) => {
+                if let ScalarValue::Boolean(v) = value {
+                    *state = Some(state.unwrap_or(true) && *v);
+                }
+            }
+            AccumulatorState::BoolOr(state) => {
+                if let ScalarValue::Boolean(v) = value {
+                    *state = Some(state.unwrap_or(false) || *v);
+                }
+            }
+            AccumulatorState::Variance { count, mean, m2 } => {
+                if let Some(x) = scalar_to_f64(value) {
+                    *count += 1;
+                    let delta = x - *mean;
+                    *mean += delta / *count as f64;
+                    let delta2 = x - *mean;
+                    *m2 += delta * delta2;
+                }
+            }
         }
     }
 
@@ -199,6 +242,19 @@ impl AccumulatorState {
                     _ => {}
                 }
             }
+            AccumulatorState::BoolAnd(state) => {
+                *state = Some(state.unwrap_or(true) && (value != 0.0));
+            }
+            AccumulatorState::BoolOr(state) => {
+                *state = Some(state.unwrap_or(false) || (value != 0.0));
+            }
+            AccumulatorState::Variance { count, mean, m2 } => {
+                *count += 1;
+                let delta = value - *mean;
+                *mean += delta / *count as f64;
+                let delta2 = value - *mean;
+                *m2 += delta * delta2;
+            }
         }
     }
 
@@ -236,6 +292,20 @@ impl AccumulatorState {
                     }
                     _ => {}
                 }
+            }
+            AccumulatorState::BoolAnd(state) => {
+                *state = Some(state.unwrap_or(true) && (value != 0));
+            }
+            AccumulatorState::BoolOr(state) => {
+                *state = Some(state.unwrap_or(false) || (value != 0));
+            }
+            AccumulatorState::Variance { count, mean, m2 } => {
+                let x = value as f64;
+                *count += 1;
+                let delta = x - *mean;
+                *mean += delta / *count as f64;
+                let delta2 = x - *mean;
+                *m2 += delta * delta2;
             }
         }
     }
@@ -284,11 +354,47 @@ impl AccumulatorState {
                     }
                 }
             }
+            (AccumulatorState::BoolAnd(a), AccumulatorState::BoolAnd(b)) => {
+                if let Some(b_val) = b {
+                    *a = Some(a.unwrap_or(true) && *b_val);
+                }
+            }
+            (AccumulatorState::BoolOr(a), AccumulatorState::BoolOr(b)) => {
+                if let Some(b_val) = b {
+                    *a = Some(a.unwrap_or(false) || *b_val);
+                }
+            }
+            (
+                AccumulatorState::Variance {
+                    count: ca,
+                    mean: ma,
+                    m2: m2a,
+                },
+                AccumulatorState::Variance {
+                    count: cb,
+                    mean: mb,
+                    m2: m2b,
+                },
+            ) => {
+                if *cb > 0 {
+                    if *ca == 0 {
+                        *ca = *cb;
+                        *ma = *mb;
+                        *m2a = *m2b;
+                    } else {
+                        let total = *ca + *cb;
+                        let delta = *mb - *ma;
+                        *m2a += *m2b + delta * delta * (*ca as f64) * (*cb as f64) / (total as f64);
+                        *ma = (*ma * (*ca as f64) + *mb * (*cb as f64)) / (total as f64);
+                        *ca = total;
+                    }
+                }
+            }
             _ => {}
         }
     }
 
-    fn finalize(&self) -> ScalarValue {
+    fn finalize(&self, func: &AggregateFunction) -> ScalarValue {
         match self {
             AccumulatorState::Count(c) => ScalarValue::Int64(*c),
             AccumulatorState::Sum(s) => ScalarValue::Float64(ordered_float::OrderedFloat(*s)),
@@ -302,6 +408,37 @@ impl AccumulatorState {
             }
             AccumulatorState::Min(v) => v.clone().unwrap_or(ScalarValue::Null),
             AccumulatorState::Max(v) => v.clone().unwrap_or(ScalarValue::Null),
+            AccumulatorState::BoolAnd(v) => match v {
+                Some(val) => ScalarValue::Boolean(*val),
+                None => ScalarValue::Null,
+            },
+            AccumulatorState::BoolOr(v) => match v {
+                Some(val) => ScalarValue::Boolean(*val),
+                None => ScalarValue::Null,
+            },
+            AccumulatorState::Variance { count, m2, .. } => {
+                if *count == 0 {
+                    return ScalarValue::Null;
+                }
+                let result = match func {
+                    AggregateFunction::VarPop => *m2 / *count as f64,
+                    AggregateFunction::Variance | AggregateFunction::VarSamp => {
+                        if *count < 2 {
+                            return ScalarValue::Null;
+                        }
+                        *m2 / (*count - 1) as f64
+                    }
+                    AggregateFunction::StddevPop => (*m2 / *count as f64).sqrt(),
+                    AggregateFunction::Stddev | AggregateFunction::StddevSamp => {
+                        if *count < 2 {
+                            return ScalarValue::Null;
+                        }
+                        (*m2 / (*count - 1) as f64).sqrt()
+                    }
+                    _ => *m2 / *count as f64,
+                };
+                ScalarValue::Float64(ordered_float::OrderedFloat(result))
+            }
         }
     }
 }
@@ -616,28 +753,108 @@ impl AggregationState {
             return None;
         }
 
-        let mut flat_idx = 0usize;
+        let n = group_accessors.len();
+
+        // Phase 1: Register all keys and collect ids.
+        // We must do this BEFORE computing flat_idx because discovering a new
+        // key in column j changes strides for columns 0..j-1.
+        let mut ids = [0u8; 8]; // max 8 group-by columns
+        let mut any_new = false;
         for (col, accessor) in group_accessors.iter().enumerate() {
-            // Extract a cheap key (u64) without ScalarValue allocation
             let raw_key = accessor.raw_key(row);
             let next_id = self.raw_key_maps[col].len() as u8;
             let id = *self.raw_key_maps[col].entry(raw_key).or_insert(next_id);
-
+            ids[col] = id;
             if id == next_id {
-                // New value — recompute strides and capacity
-                let mut cap = 1usize;
-                for km in &self.raw_key_maps {
-                    cap = cap.saturating_mul(km.len());
+                any_new = true;
+            }
+        }
+
+        if any_new {
+            // Recompute capacity
+            let mut cap = 1usize;
+            for km in &self.raw_key_maps {
+                cap = cap.saturating_mul(km.len());
+            }
+            if cap > PERFECT_HASH_MAX_GROUPS {
+                self.overflowed = true;
+                return None;
+            }
+
+            // Save old strides and capacity before recomputing
+            let old_strides = self.key_strides.clone();
+            let old_capacity = self.perfect_capacity;
+
+            // Recompute strides with new cardinalities
+            self.key_strides = vec![1; n];
+            for i in (0..n - 1).rev() {
+                self.key_strides[i] = self.key_strides[i + 1] * self.raw_key_maps[i + 1].len();
+            }
+
+            // Check if strides actually changed and we have existing entries to rehash
+            let needs_rehash = old_capacity > 0 && old_strides != self.key_strides;
+
+            if needs_rehash {
+                // Rehash: move existing accumulators from old positions to new positions.
+                // This is needed because old entries were placed using old strides.
+                let mut new_accs: Vec<Vec<AccumulatorState>> = (0..cap)
+                    .map(|_| {
+                        self.agg_funcs
+                            .iter()
+                            .zip(&self.input_types)
+                            .map(|(func, dt)| AccumulatorState::new(func, dt))
+                            .collect()
+                    })
+                    .collect();
+                let mut new_key_order: Vec<GroupKey> = (0..cap)
+                    .map(|_| GroupKey {
+                        values: vec![ScalarValue::Null; n],
+                    })
+                    .collect();
+
+                for old_idx in 0..old_capacity.min(self.perfect_accs.len()) {
+                    if old_idx >= self.key_order.len() {
+                        continue;
+                    }
+                    // Check if this slot has data
+                    let has_data = !self.key_order[old_idx]
+                        .values
+                        .iter()
+                        .all(|v| matches!(v, ScalarValue::Null));
+                    if !has_data {
+                        continue;
+                    }
+
+                    // Decode old ids from old_idx using old strides
+                    let mut new_idx = 0usize;
+                    let mut remainder = old_idx;
+                    for col in 0..n {
+                        let old_stride = old_strides[col];
+                        let col_id = if old_stride > 0 {
+                            remainder / old_stride
+                        } else {
+                            0
+                        };
+                        if old_stride > 0 {
+                            remainder %= old_stride;
+                        }
+                        new_idx += col_id * self.key_strides[col];
+                    }
+
+                    // Move accumulators and key_order to new position
+                    std::mem::swap(&mut new_accs[new_idx], &mut self.perfect_accs[old_idx]);
+                    new_key_order[new_idx] = std::mem::replace(
+                        &mut self.key_order[old_idx],
+                        GroupKey {
+                            values: vec![ScalarValue::Null; n],
+                        },
+                    );
                 }
-                if cap > PERFECT_HASH_MAX_GROUPS {
-                    self.overflowed = true;
-                    return None;
-                }
-                let n = self.raw_key_maps.len();
-                self.key_strides = vec![1; n];
-                for i in (0..n - 1).rev() {
-                    self.key_strides[i] = self.key_strides[i + 1] * self.raw_key_maps[i + 1].len();
-                }
+
+                self.perfect_accs = new_accs;
+                self.key_order = new_key_order;
+            } else {
+                // No rehash needed — just extend arrays
                 while self.perfect_accs.len() < cap {
                     self.perfect_accs.push(
                         self.agg_funcs
@@ -647,15 +864,19 @@ impl AggregationState {
                             .collect(),
                     );
                 }
-                self.perfect_capacity = cap;
                 while self.key_order.len() < cap {
                     self.key_order.push(GroupKey {
                         values: vec![ScalarValue::Null; n],
                     });
                 }
             }
+            self.perfect_capacity = cap;
+        }
 
-            flat_idx += id as usize * self.key_strides[col];
+        // Phase 2: Compute flat_idx using final (correct) strides
+        let mut flat_idx = 0usize;
+        for col in 0..n {
+            flat_idx += ids[col] as usize * self.key_strides[col];
         }
 
         // Record key values for output (only on first assignment)
@@ -827,6 +1048,9 @@ impl AggregationState {
                     AccumulatorState::Avg { count, .. } => *count > 0,
                     AccumulatorState::Min(v) => v.is_some(),
                     AccumulatorState::Max(v) => v.is_some(),
+                    AccumulatorState::BoolAnd(v) => v.is_some(),
+                    AccumulatorState::BoolOr(v) => v.is_some(),
+                    AccumulatorState::Variance { count, .. } => *count > 0,
                 });
                 if has_data {
                     self.groups.insert(key, accs);
@@ -849,6 +1073,9 @@ impl AggregationState {
                     AccumulatorState::Avg { count, .. } => *count > 0,
                     AccumulatorState::Min(v) => v.is_some(),
                     AccumulatorState::Max(v) => v.is_some(),
+                    AccumulatorState::BoolAnd(v) => v.is_some(),
+                    AccumulatorState::BoolOr(v) => v.is_some(),
+                    AccumulatorState::Variance { count, .. } => *count > 0,
                 });
                 if !has_data {
                     continue;
@@ -962,36 +1189,119 @@ impl AggregationState {
             self.init_perfect_hash(key.values.len());
         }
 
-        let mut flat_idx = 0usize;
+        let n = key.values.len();
+
+        // Phase 1: Register all keys and collect ids
+        let mut ids = [0u8; 8];
+        let mut any_new = false;
         for (col, val) in key.values.iter().enumerate() {
-            // Use ScalarValue key_maps for merge operations
             let next_id = self.key_maps[col].len() as u8;
             let id = *self.key_maps[col].entry(val.clone()).or_insert(next_id);
+            ids[col] = id;
 
-            // Also register in raw_key_maps so the fast path stays in sync
             if id == next_id {
+                any_new = true;
                 let raw = scalar_to_raw_key(val);
                 self.raw_key_maps[col].entry(raw).or_insert(id);
             }
+        }
 
-            if id == next_id {
-                let mut cap = 1usize;
-                for km in &self.key_maps {
-                    cap = cap.saturating_mul(km.len());
-                }
-                if cap > PERFECT_HASH_MAX_GROUPS {
-                    self.overflowed = true;
-                    return None;
-                }
-                let n = self.key_maps.len();
-                self.key_strides = vec![1; n];
-                for i in (0..n - 1).rev() {
-                    self.key_strides[i] = self.key_strides[i + 1] * self.key_maps[i + 1].len();
-                }
-                self.perfect_capacity = cap;
+        if any_new {
+            let mut cap = 1usize;
+            for km in &self.key_maps {
+                cap = cap.saturating_mul(km.len());
+            }
+            if cap > PERFECT_HASH_MAX_GROUPS {
+                self.overflowed = true;
+                return None;
             }
 
-            flat_idx += id as usize * self.key_strides[col];
+            let old_strides = self.key_strides.clone();
+            let old_capacity = self.perfect_capacity;
+
+            self.key_strides = vec![1; n];
+            for i in (0..n - 1).rev() {
+                self.key_strides[i] = self.key_strides[i + 1] * self.key_maps[i + 1].len();
+            }
+
+            // Rehash existing entries if strides changed
+            if old_capacity > 0 && old_strides != self.key_strides {
+                let mut new_accs: Vec<Vec<AccumulatorState>> = (0..cap)
+                    .map(|_| {
+                        self.agg_funcs
+                            .iter()
+                            .zip(&self.input_types)
+                            .map(|(func, dt)| AccumulatorState::new(func, dt))
+                            .collect()
+                    })
+                    .collect();
+                let mut new_key_order: Vec<GroupKey> = (0..cap)
+                    .map(|_| GroupKey {
+                        values: vec![ScalarValue::Null; n],
+                    })
+                    .collect();
+
+                for old_idx in 0..old_capacity.min(self.perfect_accs.len()) {
+                    if old_idx >= self.key_order.len() {
+                        continue;
+                    }
+                    let has_data = !self.key_order[old_idx]
+                        .values
+                        .iter()
+                        .all(|v| matches!(v, ScalarValue::Null));
+                    if !has_data {
+                        continue;
+                    }
+
+                    let mut new_idx = 0usize;
+                    let mut remainder = old_idx;
+                    for col in 0..n {
+                        let old_stride = old_strides[col];
+                        let col_id = if old_stride > 0 {
+                            remainder / old_stride
+                        } else {
+                            0
+                        };
+                        if old_stride > 0 {
+                            remainder %= old_stride;
+                        }
+                        new_idx += col_id * self.key_strides[col];
+                    }
+
+                    std::mem::swap(&mut new_accs[new_idx], &mut self.perfect_accs[old_idx]);
+                    new_key_order[new_idx] = std::mem::replace(
+                        &mut self.key_order[old_idx],
+                        GroupKey {
+                            values: vec![ScalarValue::Null; n],
+                        },
+                    );
+                }
+
+                self.perfect_accs = new_accs;
+                self.key_order = new_key_order;
+            } else {
+                while self.perfect_accs.len() < cap {
+                    self.perfect_accs.push(
+                        self.agg_funcs
+                            .iter()
+                            .zip(&self.input_types)
+                            .map(|(func, dt)| AccumulatorState::new(func, dt))
+                            .collect(),
+                    );
+                }
+                while self.key_order.len() < cap {
+                    self.key_order.push(GroupKey {
+                        values: vec![ScalarValue::Null; n],
+                    });
+                }
+            }
+            self.perfect_capacity = cap;
+        }
+
+        // Phase 2: Compute flat_idx with final strides
+        let mut flat_idx = 0usize;
+        for col in 0..n {
+            flat_idx += ids[col] as usize * self.key_strides[col];
         }
 
         Some(flat_idx)
@@ -1017,6 +1327,9 @@ impl AggregationState {
                     AccumulatorState::Avg { count, .. } => *count > 0,
                     AccumulatorState::Min(v) => v.is_some(),
                     AccumulatorState::Max(v) => v.is_some(),
+                    AccumulatorState::BoolAnd(v) => v.is_some(),
+                    AccumulatorState::BoolOr(v) => v.is_some(),
+                    AccumulatorState::Variance { count, .. } => *count > 0,
                 });
                 if has_data {
                     all_groups.push((&self.key_order[idx], accs));
@@ -1046,9 +1359,10 @@ impl AggregationState {
 
         // Aggregate columns
         for agg_idx in 0..self.agg_funcs.len() {
+            let func = &self.agg_funcs[agg_idx];
             let values: Vec<ScalarValue> = all_groups
                 .iter()
-                .map(|(_, accs)| accs[agg_idx].finalize())
+                .map(|(_, accs)| accs[agg_idx].finalize(func))
                 .collect();
 
             let field = schema.field(num_group_cols + agg_idx);
@@ -1154,6 +1468,13 @@ fn extract_scalar(array: &ArrayRef, row: usize) -> ScalarValue {
                 .unwrap()
                 .value(row),
         ),
+        DataType::Boolean => ScalarValue::Boolean(
+            array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .value(row),
+        ),
         DataType::Decimal128(_p, s) => {
             let arr = array
                 .as_any()
@@ -1248,6 +1569,29 @@ fn build_scalar_array_ref(values: &[&ScalarValue], data_type: &DataType) -> Resu
                         QueryError::Execution(format!("Invalid decimal precision/scale: {}", e))
                     })?,
             ))
+        }
+        DataType::Boolean => {
+            let mut builder = BooleanBuilder::with_capacity(values.len());
+            for v in values {
+                match v {
+                    ScalarValue::Boolean(val) => builder.append_value(*val),
+                    ScalarValue::Null => builder.append_null(),
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Int32 => {
+            let mut builder = Int32Builder::with_capacity(values.len());
+            for v in values {
+                match v {
+                    ScalarValue::Int32(val) => builder.append_value(*val),
+                    ScalarValue::Int64(val) => builder.append_value(*val as i32),
+                    ScalarValue::Null => builder.append_null(),
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
         }
         _ => Err(QueryError::NotImplemented(format!(
             "Unsupported data type for group array: {:?}",

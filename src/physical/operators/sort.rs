@@ -43,17 +43,26 @@ impl PhysicalOperator for SortExec {
     }
 
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
-        let input_stream = self.input.execute(partition).await?;
-
-        // Collect all batches
-        let batches: Vec<RecordBatch> = input_stream.try_collect().await?;
-
-        // Concatenate into single batch
-        if batches.is_empty() {
+        // Sort always produces a single partition by collecting from all input partitions
+        if partition != 0 {
             return Ok(Box::pin(stream::empty()));
         }
 
-        let batch = concat_batches(&self.schema, &batches)?;
+        // Collect from ALL input partitions (input may split data across partitions)
+        let input_partitions = self.input.output_partitions().max(1);
+        let mut all_batches = Vec::new();
+        for p in 0..input_partitions {
+            let input_stream = self.input.execute(p).await?;
+            let batches: Vec<RecordBatch> = input_stream.try_collect().await?;
+            all_batches.extend(batches);
+        }
+
+        // Concatenate into single batch
+        if all_batches.is_empty() {
+            return Ok(Box::pin(stream::empty()));
+        }
+
+        let batch = concat_batches(&self.schema, &all_batches)?;
 
         // Sort
         let sorted = sort_batch(&batch, &self.order_by)?;

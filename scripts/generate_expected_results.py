@@ -19,6 +19,8 @@ def get_queries():
     """Return all test queries as a list of (id, sql, ordered) tuples.
 
     `ordered` is True if the query has ORDER BY (so row order matters).
+    Tuples can optionally be (id, sql, ordered, engine_sql) where engine_sql
+    is an alternate SQL that the engine will run (if different from DuckDB SQL).
     """
     queries = []
 
@@ -1118,6 +1120,676 @@ FROM orders WHERE o_totalprice < 100000
 ORDER BY category
 """, True))
 
+    # =========================================================================
+    # P1 — SQL Feature Gaps (11 queries)
+    # =========================================================================
+
+    queries.append(("basic/is_null", """
+SELECT c_custkey, c_name
+FROM customer
+WHERE c_acctbal IS NULL OR c_acctbal IS NOT NULL
+ORDER BY c_custkey
+LIMIT 10
+""", True))
+
+    queries.append(("basic/is_null_filter", """
+SELECT o_orderkey, o_comment
+FROM orders
+WHERE o_clerk IS NOT NULL AND o_comment IS NOT NULL
+ORDER BY o_orderkey
+LIMIT 10
+""", True))
+
+    queries.append(("basic/not_like", """
+SELECT n_nationkey, n_name
+FROM nation
+WHERE n_name NOT LIKE 'A%'
+ORDER BY n_nationkey
+""", True))
+
+    queries.append(("basic/not_between", """
+SELECT o_orderkey, o_totalprice
+FROM orders
+WHERE o_totalprice NOT BETWEEN 100000.0 AND 200000.0
+ORDER BY o_orderkey
+LIMIT 20
+""", True))
+
+    queries.append(("basic/standalone_or", """
+SELECT n_nationkey, n_name
+FROM nation
+WHERE n_regionkey = 0 OR n_regionkey = 4
+ORDER BY n_nationkey
+""", True))
+
+    queries.append(("basic/not_operator", """
+SELECT n_nationkey, n_name
+FROM nation
+WHERE NOT (n_regionkey = 0)
+ORDER BY n_nationkey
+""", True))
+
+    queries.append(("complex/multiple_ctes", """
+WITH
+    asian_nations AS (
+        SELECT n_nationkey, n_name FROM nation n, region r
+        WHERE n.n_regionkey = r.r_regionkey AND r.r_name = 'ASIA'
+    ),
+    asian_suppliers AS (
+        SELECT s_suppkey, s_name, s_nationkey FROM supplier
+        WHERE s_nationkey IN (SELECT n_nationkey FROM asian_nations)
+    )
+SELECT an.n_name, COUNT(*) AS supplier_count
+FROM asian_nations an, asian_suppliers asup
+WHERE an.n_nationkey = asup.s_nationkey
+GROUP BY an.n_name
+ORDER BY supplier_count DESC, an.n_name
+""", True))
+
+    queries.append(("agg/having_without_group_by", """
+SELECT COUNT(*) AS cnt, SUM(n_nationkey) AS total
+FROM nation
+HAVING COUNT(*) > 10
+""", False))
+
+    queries.append(("orderby/offset_only", """
+SELECT n_nationkey, n_name FROM nation ORDER BY n_nationkey LIMIT 100 OFFSET 20
+""", True))
+
+    queries.append(("basic/aliased_subquery_join", """
+SELECT sub.n_name, r.r_name
+FROM (SELECT n_name, n_regionkey FROM nation WHERE n_nationkey < 10) sub, region r
+WHERE sub.n_regionkey = r.r_regionkey
+ORDER BY sub.n_name
+""", True))
+
+    queries.append(("basic/nested_not", """
+SELECT n_nationkey, n_name
+FROM nation
+WHERE NOT (n_regionkey = 0 OR n_regionkey = 1)
+ORDER BY n_nationkey
+""", True))
+
+    # =========================================================================
+    # P1 — String Functions (13 queries)
+    # =========================================================================
+
+    queries.append(("func/concat", """
+SELECT n_nationkey, CONCAT(n_name, ' - ', n_comment) AS full_desc
+FROM nation
+ORDER BY n_nationkey
+LIMIT 5
+""", True))
+
+    queries.append(("func/concat_ws", """
+SELECT n_nationkey, CONCAT_WS(', ', n_name, n_comment) AS combined
+FROM nation
+ORDER BY n_nationkey
+LIMIT 5
+""", True))
+
+    queries.append(("func/left_right", """
+SELECT n_nationkey, LEFT(n_name, 3) AS left3, RIGHT(n_name, 3) AS right3
+FROM nation
+ORDER BY n_nationkey
+LIMIT 10
+""", True))
+
+    queries.append(("func/reverse", """
+SELECT n_nationkey, REVERSE(n_name) AS reversed_name
+FROM nation
+ORDER BY n_nationkey
+LIMIT 10
+""", True))
+
+    queries.append(("func/lpad_rpad", """
+SELECT n_nationkey, LPAD(n_name, 15, '.') AS lpadded, RPAD(n_name, 15, '.') AS rpadded
+FROM nation
+ORDER BY n_nationkey
+LIMIT 10
+""", True))
+
+    queries.append(("func/starts_ends_with", """
+SELECT n_nationkey, n_name
+FROM nation
+WHERE STARTS_WITH(n_name, 'A') OR ENDS_WITH(n_name, 'A')
+ORDER BY n_nationkey
+""", True))
+
+    queries.append(("func/split_part", """
+SELECT s_suppkey, SPLIT_PART(s_phone, '-', 1) AS area_code
+FROM supplier
+ORDER BY s_suppkey
+LIMIT 10
+""", True))
+
+    queries.append(("func/repeat_func", """
+SELECT n_nationkey, REPEAT(LEFT(n_name, 2), 3) AS repeated
+FROM nation
+ORDER BY n_nationkey
+LIMIT 10
+""", True))
+
+    queries.append(("func/chr_ascii", """
+SELECT CHR(65) AS char_a, CHR(90) AS char_z, ASCII('A') AS ascii_a, ASCII('Z') AS ascii_z
+FROM nation
+LIMIT 1
+""", False))
+
+    queries.append(("func/strpos", """
+SELECT n_nationkey, STRPOS(n_name, 'A') AS pos_a
+FROM nation
+ORDER BY n_nationkey
+LIMIT 10
+""", True))
+
+    queries.append(("func/translate", """
+SELECT TRANSLATE('hello world', 'lo', 'LO') AS translated
+FROM nation
+LIMIT 1
+""", False))
+
+    queries.append(("func/string_combined", """
+SELECT
+    n_nationkey,
+    LENGTH(TRIM(n_name)) AS trimmed_len,
+    UPPER(SUBSTRING(n_name FROM 1 FOR 3)) AS prefix_upper,
+    REPLACE(n_name, ' ', '_') AS underscored
+FROM nation
+ORDER BY n_nationkey
+LIMIT 10
+""", True))
+
+    queries.append(("func/substring_variants", """
+SELECT
+    SUBSTRING('hello world' FROM 1 FOR 5) AS sub1,
+    SUBSTRING('hello world' FROM 7) AS sub2
+FROM nation
+LIMIT 1
+""", False))
+
+    # =========================================================================
+    # P2 — Date/Time Functions (8 queries)
+    # =========================================================================
+
+    queries.append(("func/date_add", """
+SELECT o_orderkey, o_orderdate, CAST(o_orderdate + INTERVAL '30' DAY AS DATE) AS plus_30
+FROM orders
+ORDER BY o_orderkey
+LIMIT 10
+""", True, """
+SELECT o_orderkey, o_orderdate, DATE_ADD('day', 30, o_orderdate) AS plus_30
+FROM orders
+ORDER BY o_orderkey
+LIMIT 10
+"""))
+
+    queries.append(("func/date_diff", """
+SELECT o_orderkey,
+    DATEDIFF('day', DATE '1995-01-01', o_orderdate) AS days_since_95
+FROM orders
+ORDER BY o_orderkey
+LIMIT 10
+""", True, """
+SELECT o_orderkey,
+    DATE_DIFF('day', DATE '1995-01-01', o_orderdate) AS days_since_95
+FROM orders
+ORDER BY o_orderkey
+LIMIT 10
+"""))
+
+    queries.append(("func/date_comparison", """
+SELECT o_orderkey, o_orderdate
+FROM orders
+WHERE o_orderdate >= DATE '1997-01-01' AND o_orderdate < DATE '1997-07-01'
+ORDER BY o_orderkey
+LIMIT 10
+""", True))
+
+    queries.append(("func/year_month_day", """
+SELECT o_orderkey,
+    EXTRACT(YEAR FROM o_orderdate) AS yr,
+    EXTRACT(MONTH FROM o_orderdate) AS mo,
+    EXTRACT(DAY FROM o_orderdate) AS dy
+FROM orders
+ORDER BY o_orderkey
+LIMIT 10
+""", True))
+
+    queries.append(("func/date_part", """
+SELECT o_orderkey,
+    CAST(DATE_PART('year', o_orderdate) AS BIGINT) AS yr,
+    CAST(DATE_PART('quarter', o_orderdate) AS BIGINT) AS qtr
+FROM orders
+ORDER BY o_orderkey
+LIMIT 10
+""", True))
+
+    queries.append(("func/current_date_test", """
+SELECT COUNT(*) AS cnt
+FROM orders
+WHERE o_orderdate < CURRENT_DATE
+""", False))
+
+    queries.append(("func/last_day_of_month", """
+SELECT LAST_DAY(DATE '1995-02-15') AS feb_end,
+       LAST_DAY(DATE '1996-02-15') AS feb_leap_end,
+       LAST_DAY(DATE '1995-12-01') AS dec_end
+FROM nation
+LIMIT 1
+""", False, """
+SELECT LAST_DAY_OF_MONTH(DATE '1995-02-15') AS feb_end,
+       LAST_DAY_OF_MONTH(DATE '1996-02-15') AS feb_leap_end,
+       LAST_DAY_OF_MONTH(DATE '1995-12-01') AS dec_end
+FROM nation
+LIMIT 1
+"""))
+
+    queries.append(("func/date_arithmetic", """
+SELECT o_orderkey, o_orderdate,
+    CAST(o_orderdate + INTERVAL '1' YEAR AS DATE) AS plus_year,
+    CAST(o_orderdate - INTERVAL '6' MONTH AS DATE) AS minus_6mo
+FROM orders
+ORDER BY o_orderkey
+LIMIT 5
+""", True, """
+SELECT o_orderkey, o_orderdate,
+    DATE_ADD('year', 1, o_orderdate) AS plus_year,
+    DATE_ADD('month', -6, o_orderdate) AS minus_6mo
+FROM orders
+ORDER BY o_orderkey
+LIMIT 5
+"""))
+
+    # =========================================================================
+    # P2 — Math Functions (8 queries)
+    # =========================================================================
+
+    queries.append(("func/power_sqrt", """
+SELECT POWER(2, 10) AS pow2_10, SQRT(144.0) AS sqrt144, CBRT(27.0) AS cbrt27
+FROM nation
+LIMIT 1
+""", False))
+
+    queries.append(("func/mod_sign", """
+SELECT MOD(17, 5) AS mod_result, SIGN(-42) AS neg_sign, SIGN(42) AS pos_sign, SIGN(0) AS zero_sign
+FROM nation
+LIMIT 1
+""", False))
+
+    queries.append(("func/ln_log_exp", """
+SELECT LN(2.718281828459045) AS ln_e, LOG10(1000.0) AS log10_1000, LOG2(8.0) AS log2_8, EXP(1.0) AS exp_1
+FROM nation
+LIMIT 1
+""", False))
+
+    queries.append(("func/trig_functions", """
+SELECT
+    SIN(0.0) AS sin0,
+    COS(0.0) AS cos0,
+    TAN(0.0) AS tan0,
+    ASIN(1.0) AS asin1,
+    ACOS(1.0) AS acos1
+FROM nation
+LIMIT 1
+""", False))
+
+    queries.append(("func/degrees_radians", """
+SELECT DEGREES(3.141592653589793) AS deg, RADIANS(180.0) AS rad
+FROM nation
+LIMIT 1
+""", False))
+
+    queries.append(("func/truncate_func", """
+SELECT
+    ROUND(3.14159, 2) AS round2,
+    ROUND(3.14159, 4) AS round4,
+    ROUND(3.14159) AS round0
+FROM nation
+LIMIT 1
+""", False))
+
+    queries.append(("func/pi_e", """
+SELECT PI() AS pi_val, EXP(1.0) AS e_val
+FROM nation
+LIMIT 1
+""", False))
+
+    queries.append(("func/math_on_data", """
+SELECT n_nationkey, SQRT(CAST(n_nationkey + 1 AS DOUBLE)) AS sqrt_val, ABS(n_nationkey - 12) AS abs_val
+FROM nation
+ORDER BY n_nationkey
+LIMIT 10
+""", True))
+
+    # =========================================================================
+    # P2 — Regex Functions (4 queries)
+    # =========================================================================
+
+    queries.append(("func/regexp_like", """
+SELECT n_nationkey, n_name
+FROM nation
+WHERE REGEXP_MATCHES(n_name, '^[A-E].*')
+ORDER BY n_nationkey
+""", True, """
+SELECT n_nationkey, n_name
+FROM nation
+WHERE REGEXP_LIKE(n_name, '^[A-E].*')
+ORDER BY n_nationkey
+"""))
+
+    queries.append(("func/regexp_extract", """
+SELECT s_suppkey, REGEXP_EXTRACT(s_phone, '([0-9]+)-', 1) AS first_digits
+FROM supplier
+ORDER BY s_suppkey
+LIMIT 10
+""", True))
+
+    queries.append(("func/regexp_replace", """
+SELECT n_nationkey, REGEXP_REPLACE(n_name, '[AEIOU]', '*', 'g') AS replaced
+FROM nation
+ORDER BY n_nationkey
+LIMIT 10
+""", True, """
+SELECT n_nationkey, REGEXP_REPLACE(n_name, '[AEIOU]', '*') AS replaced
+FROM nation
+ORDER BY n_nationkey
+LIMIT 10
+"""))
+
+    queries.append(("func/regexp_on_data", """
+SELECT COUNT(*) AS cnt
+FROM part
+WHERE REGEXP_MATCHES(p_name, '^Part [0-9]+$')
+""", False, """
+SELECT COUNT(*) AS cnt
+FROM part
+WHERE REGEXP_LIKE(p_name, '^Part [0-9]+$')
+"""))
+
+    # =========================================================================
+    # P2 — Conditional Functions (5 queries)
+    # =========================================================================
+
+    queries.append(("func/if_func", """
+SELECT n_nationkey, n_name,
+    CASE WHEN n_regionkey = 0 THEN 'Africa' ELSE 'Other' END AS region_label
+FROM nation
+ORDER BY n_nationkey
+LIMIT 10
+""", True))
+
+    queries.append(("func/greatest_least", """
+SELECT GREATEST(1, 5, 3) AS greatest_val, LEAST(1, 5, 3) AS least_val
+FROM nation
+LIMIT 1
+""", False))
+
+    queries.append(("func/greatest_least_data", """
+SELECT n_nationkey,
+    GREATEST(n_nationkey, n_regionkey, 10) AS max_val,
+    LEAST(n_nationkey, n_regionkey, 10) AS min_val
+FROM nation
+ORDER BY n_nationkey
+LIMIT 10
+""", True))
+
+    queries.append(("func/try_cast", """
+SELECT TRY_CAST('123' AS INTEGER) AS valid_int,
+    TRY_CAST('abc' AS INTEGER) AS invalid_int,
+    TRY_CAST('3.14' AS DOUBLE) AS valid_double
+FROM nation
+LIMIT 1
+""", False))
+
+    queries.append(("func/coalesce_chain", """
+SELECT
+    COALESCE(NULL, NULL, 'third') AS c1,
+    COALESCE('first', NULL, 'third') AS c2,
+    NULLIF('same', 'same') AS n1,
+    NULLIF('diff', 'other') AS n2
+FROM nation
+LIMIT 1
+""", False))
+
+    # =========================================================================
+    # P2 — Aggregate Functions (8 queries)
+    # =========================================================================
+
+    queries.append(("agg/stddev_variance", """
+SELECT
+    STDDEV_POP(l_quantity) AS stddev_pop_qty,
+    STDDEV_SAMP(l_quantity) AS stddev_samp_qty,
+    VAR_POP(l_quantity) AS var_pop_qty,
+    VAR_SAMP(l_quantity) AS var_samp_qty
+FROM lineitem
+""", False))
+
+    queries.append(("agg/bool_agg", """
+SELECT
+    BOOL_AND(n_nationkey > 0) AS all_positive,
+    BOOL_OR(n_nationkey = 0) AS any_zero,
+    BOOL_AND(n_nationkey >= 0) AS all_non_negative
+FROM nation
+""", False))
+
+    queries.append(("agg/min_max_by", """
+SELECT MAX(n_name) AS max_name, MIN(n_name) AS min_name
+FROM nation
+""", False))
+
+    queries.append(("agg/count_if", """
+SELECT
+    COUNT(*) AS total,
+    COUNT(CASE WHEN n_regionkey = 0 THEN 1 END) AS africa_count,
+    COUNT(CASE WHEN n_regionkey = 1 THEN 1 END) AS america_count
+FROM nation
+""", False))
+
+    queries.append(("agg/sum_distinct", """
+SELECT SUM(DISTINCT n_regionkey) AS sum_distinct_regions
+FROM nation
+""", False))
+
+    queries.append(("agg/multiple_distinct", """
+SELECT COUNT(DISTINCT l_returnflag) AS distinct_flags,
+    COUNT(DISTINCT l_linestatus) AS distinct_statuses,
+    COUNT(*) AS total
+FROM lineitem
+""", False))
+
+    queries.append(("agg/nested_agg_subquery", """
+SELECT n_name, supplier_count
+FROM (
+    SELECT n.n_name, COUNT(*) AS supplier_count
+    FROM nation n, supplier s
+    WHERE n.n_nationkey = s.s_nationkey
+    GROUP BY n.n_name
+) sub
+WHERE supplier_count >= (
+    SELECT AVG(cnt) FROM (
+        SELECT COUNT(*) AS cnt
+        FROM supplier GROUP BY s_nationkey
+    ) avg_sub
+)
+ORDER BY supplier_count DESC, n_name
+""", True))
+
+    queries.append(("agg/group_by_expression", """
+SELECT
+    CASE WHEN l_quantity < 10 THEN 'small'
+         WHEN l_quantity < 30 THEN 'medium'
+         ELSE 'large' END AS size_bucket,
+    COUNT(*) AS cnt,
+    AVG(l_extendedprice) AS avg_price
+FROM lineitem
+GROUP BY
+    CASE WHEN l_quantity < 10 THEN 'small'
+         WHEN l_quantity < 30 THEN 'medium'
+         ELSE 'large' END
+ORDER BY size_bucket
+""", True))
+
+    # =========================================================================
+    # P3 — Binary/Encoding Functions (4 queries)
+    # =========================================================================
+
+    queries.append(("func/hex_functions", """
+SELECT LOWER(TO_HEX(255)) AS hex_255, LOWER(TO_HEX(4096)) AS hex_4096
+FROM nation
+LIMIT 1
+""", False, """
+SELECT TO_HEX(255) AS hex_255, TO_HEX(4096) AS hex_4096
+FROM nation
+LIMIT 1
+"""))
+
+    queries.append(("func/md5_sha", """
+SELECT MD5('hello') AS md5_hello, SHA256('hello') AS sha256_hello
+FROM nation
+LIMIT 1
+""", False))
+
+    queries.append(("func/base64", """
+SELECT TO_BASE64(CAST('hello world' AS BLOB)) AS encoded
+FROM nation
+LIMIT 1
+""", False, """
+SELECT TO_BASE64('hello world') AS encoded
+FROM nation
+LIMIT 1
+"""))
+
+    queries.append(("func/encode_combined", """
+SELECT
+    MD5('test') AS md5_test,
+    LENGTH(MD5('test')) AS md5_len
+FROM nation
+LIMIT 1
+""", False))
+
+    # =========================================================================
+    # P3 — Bitwise Functions (3 queries)
+    # =========================================================================
+
+    queries.append(("func/bitwise_ops", """
+SELECT
+    12 & 10 AS bit_and,
+    12 | 10 AS bit_or,
+    XOR(12, 10) AS bit_xor
+FROM nation
+LIMIT 1
+""", False, """
+SELECT
+    BITWISE_AND(12, 10) AS bit_and,
+    BITWISE_OR(12, 10) AS bit_or,
+    BITWISE_XOR(12, 10) AS bit_xor
+FROM nation
+LIMIT 1
+"""))
+
+    queries.append(("func/bitwise_shift", """
+SELECT
+    1 << 4 AS shift_left,
+    16 >> 2 AS shift_right
+FROM nation
+LIMIT 1
+""", False, """
+SELECT
+    BITWISE_LEFT_SHIFT(1, 4) AS shift_left,
+    BITWISE_RIGHT_SHIFT(16, 2) AS shift_right
+FROM nation
+LIMIT 1
+"""))
+
+    queries.append(("func/bit_count", """
+SELECT BIT_COUNT(255) AS bits_255, BIT_COUNT(0) AS bits_0, BIT_COUNT(7) AS bits_7
+FROM nation
+LIMIT 1
+""", False))
+
+    # =========================================================================
+    # P3 — Additional Complex Queries (6 queries)
+    # =========================================================================
+
+    queries.append(("complex/correlated_exists_multiple", """
+SELECT n_name
+FROM nation n
+WHERE EXISTS (
+    SELECT 1 FROM supplier s
+    WHERE s.s_nationkey = n.n_nationkey AND s.s_acctbal > 5000
+)
+AND EXISTS (
+    SELECT 1 FROM customer c
+    WHERE c.c_nationkey = n.n_nationkey AND c.c_acctbal > 5000
+)
+ORDER BY n_name
+""", True))
+
+    queries.append(("complex/subquery_in_select", """
+SELECT n.n_name,
+    (SELECT COUNT(*) FROM supplier s WHERE s.s_nationkey = n.n_nationkey) AS num_suppliers
+FROM nation n
+ORDER BY n.n_name
+LIMIT 10
+""", True))
+
+    queries.append(("complex/deeply_nested_subquery", """
+SELECT s_name, s_acctbal
+FROM supplier
+WHERE s_nationkey IN (
+    SELECT n_nationkey FROM nation
+    WHERE n_regionkey IN (
+        SELECT r_regionkey FROM region
+        WHERE r_name IN ('EUROPE', 'ASIA')
+    )
+)
+ORDER BY s_acctbal DESC, s_name
+LIMIT 10
+""", True))
+
+    queries.append(("complex/multi_agg_multi_join", """
+SELECT r.r_name,
+    COUNT(DISTINCT n.n_nationkey) AS num_nations,
+    COUNT(DISTINCT s.s_suppkey) AS num_suppliers,
+    AVG(s.s_acctbal) AS avg_balance
+FROM region r, nation n, supplier s
+WHERE r.r_regionkey = n.n_regionkey AND n.n_nationkey = s.s_nationkey
+GROUP BY r.r_name
+ORDER BY num_suppliers DESC, r.r_name
+""", True))
+
+    queries.append(("complex/case_grouping", """
+SELECT
+    CASE WHEN o_totalprice < 50000 THEN 'low'
+         WHEN o_totalprice < 150000 THEN 'medium'
+         ELSE 'high' END AS price_tier,
+    COUNT(*) AS num_orders,
+    AVG(o_totalprice) AS avg_price
+FROM orders
+GROUP BY
+    CASE WHEN o_totalprice < 50000 THEN 'low'
+         WHEN o_totalprice < 150000 THEN 'medium'
+         ELSE 'high' END
+ORDER BY price_tier
+""", True))
+
+    queries.append(("complex/union_cte", """
+WITH top_customers AS (
+    SELECT c_custkey, c_name, c_acctbal FROM customer
+    WHERE c_acctbal > 9000
+),
+low_customers AS (
+    SELECT c_custkey, c_name, c_acctbal FROM customer
+    WHERE c_acctbal < -900
+)
+SELECT * FROM top_customers
+UNION ALL
+SELECT * FROM low_customers
+ORDER BY c_acctbal DESC, c_custkey
+LIMIT 20
+""", True))
+
     return queries
 
 
@@ -1161,7 +1833,7 @@ def main():
 
     # Create output directory structure
     os.makedirs(output_dir, exist_ok=True)
-    for subdir in ["tpch", "basic", "orderby", "agg", "join", "subquery", "expr", "distinct", "setop", "complex"]:
+    for subdir in ["tpch", "basic", "orderby", "agg", "join", "subquery", "expr", "distinct", "setop", "complex", "func"]:
         os.makedirs(os.path.join(output_dir, subdir), exist_ok=True)
 
     # Connect to DuckDB and load tables
@@ -1180,7 +1852,10 @@ def main():
     success_count = 0
     fail_count = 0
 
-    for query_id, sql, ordered in queries:
+    for entry in queries:
+        query_id, sql, ordered = entry[0], entry[1], entry[2]
+        # Optional 4th element: engine_sql (SQL for the Rust engine if different from DuckDB)
+        engine_sql = entry[3] if len(entry) > 3 else sql
         csv_filename = f"{query_id}.csv"
         csv_path = os.path.join(output_dir, csv_filename)
 
@@ -1207,7 +1882,7 @@ def main():
 
             manifest.append({
                 "id": query_id,
-                "sql": sql.strip(),
+                "sql": engine_sql.strip(),
                 "ordered": ordered,
                 "row_count": len(rows),
                 "file": csv_filename,

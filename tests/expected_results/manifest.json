@@ -600,5 +600,495 @@
     "ordered": true,
     "row_count": 3,
     "file": "complex/union_with_aggregate.csv"
+  },
+  {
+    "id": "basic/is_null",
+    "sql": "SELECT c_custkey, c_name\nFROM customer\nWHERE c_acctbal IS NULL OR c_acctbal IS NOT NULL\nORDER BY c_custkey\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "basic/is_null.csv"
+  },
+  {
+    "id": "basic/is_null_filter",
+    "sql": "SELECT o_orderkey, o_comment\nFROM orders\nWHERE o_clerk IS NOT NULL AND o_comment IS NOT NULL\nORDER BY o_orderkey\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "basic/is_null_filter.csv"
+  },
+  {
+    "id": "basic/not_like",
+    "sql": "SELECT n_nationkey, n_name\nFROM nation\nWHERE n_name NOT LIKE 'A%'\nORDER BY n_nationkey",
+    "ordered": true,
+    "row_count": 23,
+    "file": "basic/not_like.csv"
+  },
+  {
+    "id": "basic/not_between",
+    "sql": "SELECT o_orderkey, o_totalprice\nFROM orders\nWHERE o_totalprice NOT BETWEEN 100000.0 AND 200000.0\nORDER BY o_orderkey\nLIMIT 20",
+    "ordered": true,
+    "row_count": 20,
+    "file": "basic/not_between.csv"
+  },
+  {
+    "id": "basic/standalone_or",
+    "sql": "SELECT n_nationkey, n_name\nFROM nation\nWHERE n_regionkey = 0 OR n_regionkey = 4\nORDER BY n_nationkey",
+    "ordered": true,
+    "row_count": 10,
+    "file": "basic/standalone_or.csv"
+  },
+  {
+    "id": "basic/not_operator",
+    "sql": "SELECT n_nationkey, n_name\nFROM nation\nWHERE NOT (n_regionkey = 0)\nORDER BY n_nationkey",
+    "ordered": true,
+    "row_count": 20,
+    "file": "basic/not_operator.csv"
+  },
+  {
+    "id": "complex/multiple_ctes",
+    "sql": "WITH\n    asian_nations AS (\n        SELECT n_nationkey, n_name FROM nation n, region r\n        WHERE n.n_regionkey = r.r_regionkey AND r.r_name = 'ASIA'\n    ),\n    asian_suppliers AS (\n        SELECT s_suppkey, s_name, s_nationkey FROM supplier\n        WHERE s_nationkey IN (SELECT n_nationkey FROM asian_nations)\n    )\nSELECT an.n_name, COUNT(*) AS supplier_count\nFROM asian_nations an, asian_suppliers asup\nWHERE an.n_nationkey = asup.s_nationkey\nGROUP BY an.n_name\nORDER BY supplier_count DESC, an.n_name",
+    "ordered": true,
+    "row_count": 0,
+    "file": "complex/multiple_ctes.csv"
+  },
+  {
+    "id": "agg/having_without_group_by",
+    "sql": "SELECT COUNT(*) AS cnt, SUM(n_nationkey) AS total\nFROM nation\nHAVING COUNT(*) > 10",
+    "ordered": false,
+    "row_count": 1,
+    "file": "agg/having_without_group_by.csv"
+  },
+  {
+    "id": "orderby/offset_only",
+    "sql": "SELECT n_nationkey, n_name FROM nation ORDER BY n_nationkey LIMIT 100 OFFSET 20",
+    "ordered": true,
+    "row_count": 5,
+    "file": "orderby/offset_only.csv"
+  },
+  {
+    "id": "basic/aliased_subquery_join",
+    "sql": "SELECT sub.n_name, r.r_name\nFROM (SELECT n_name, n_regionkey FROM nation WHERE n_nationkey < 10) sub, region r\nWHERE sub.n_regionkey = r.r_regionkey\nORDER BY sub.n_name",
+    "ordered": true,
+    "row_count": 10,
+    "file": "basic/aliased_subquery_join.csv"
+  },
+  {
+    "id": "basic/nested_not",
+    "sql": "SELECT n_nationkey, n_name\nFROM nation\nWHERE NOT (n_regionkey = 0 OR n_regionkey = 1)\nORDER BY n_nationkey",
+    "ordered": true,
+    "row_count": 15,
+    "file": "basic/nested_not.csv"
+  },
+  {
+    "id": "func/concat",
+    "sql": "SELECT n_nationkey, CONCAT(n_name, ' - ', n_comment) AS full_desc\nFROM nation\nORDER BY n_nationkey\nLIMIT 5",
+    "ordered": true,
+    "row_count": 5,
+    "file": "func/concat.csv"
+  },
+  {
+    "id": "func/concat_ws",
+    "sql": "SELECT n_nationkey, CONCAT_WS(', ', n_name, n_comment) AS combined\nFROM nation\nORDER BY n_nationkey\nLIMIT 5",
+    "ordered": true,
+    "row_count": 5,
+    "file": "func/concat_ws.csv"
+  },
+  {
+    "id": "func/left_right",
+    "sql": "SELECT n_nationkey, LEFT(n_name, 3) AS left3, RIGHT(n_name, 3) AS right3\nFROM nation\nORDER BY n_nationkey\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "func/left_right.csv"
+  },
+  {
+    "id": "func/reverse",
+    "sql": "SELECT n_nationkey, REVERSE(n_name) AS reversed_name\nFROM nation\nORDER BY n_nationkey\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "func/reverse.csv"
+  },
+  {
+    "id": "func/lpad_rpad",
+    "sql": "SELECT n_nationkey, LPAD(n_name, 15, '.') AS lpadded, RPAD(n_name, 15, '.') AS rpadded\nFROM nation\nORDER BY n_nationkey\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "func/lpad_rpad.csv"
+  },
+  {
+    "id": "func/starts_ends_with",
+    "sql": "SELECT n_nationkey, n_name\nFROM nation\nWHERE STARTS_WITH(n_name, 'A') OR ENDS_WITH(n_name, 'A')\nORDER BY n_nationkey",
+    "ordered": true,
+    "row_count": 11,
+    "file": "func/starts_ends_with.csv"
+  },
+  {
+    "id": "func/split_part",
+    "sql": "SELECT s_suppkey, SPLIT_PART(s_phone, '-', 1) AS area_code\nFROM supplier\nORDER BY s_suppkey\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "func/split_part.csv"
+  },
+  {
+    "id": "func/repeat_func",
+    "sql": "SELECT n_nationkey, REPEAT(LEFT(n_name, 2), 3) AS repeated\nFROM nation\nORDER BY n_nationkey\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "func/repeat_func.csv"
+  },
+  {
+    "id": "func/chr_ascii",
+    "sql": "SELECT CHR(65) AS char_a, CHR(90) AS char_z, ASCII('A') AS ascii_a, ASCII('Z') AS ascii_z\nFROM nation\nLIMIT 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "func/chr_ascii.csv"
+  },
+  {
+    "id": "func/strpos",
+    "sql": "SELECT n_nationkey, STRPOS(n_name, 'A') AS pos_a\nFROM nation\nORDER BY n_nationkey\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "func/strpos.csv"
+  },
+  {
+    "id": "func/translate",
+    "sql": "SELECT TRANSLATE('hello world', 'lo', 'LO') AS translated\nFROM nation\nLIMIT 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "func/translate.csv"
+  },
+  {
+    "id": "func/string_combined",
+    "sql": "SELECT\n    n_nationkey,\n    LENGTH(TRIM(n_name)) AS trimmed_len,\n    UPPER(SUBSTRING(n_name FROM 1 FOR 3)) AS prefix_upper,\n    REPLACE(n_name, ' ', '_') AS underscored\nFROM nation\nORDER BY n_nationkey\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "func/string_combined.csv"
+  },
+  {
+    "id": "func/substring_variants",
+    "sql": "SELECT\n    SUBSTRING('hello world' FROM 1 FOR 5) AS sub1,\n    SUBSTRING('hello world' FROM 7) AS sub2\nFROM nation\nLIMIT 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "func/substring_variants.csv"
+  },
+  {
+    "id": "func/date_add",
+    "sql": "SELECT o_orderkey, o_orderdate, DATE_ADD('day', 30, o_orderdate) AS plus_30\nFROM orders\nORDER BY o_orderkey\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "func/date_add.csv"
+  },
+  {
+    "id": "func/date_diff",
+    "sql": "SELECT o_orderkey,\n    DATE_DIFF('day', DATE '1995-01-01', o_orderdate) AS days_since_95\nFROM orders\nORDER BY o_orderkey\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "func/date_diff.csv"
+  },
+  {
+    "id": "func/date_comparison",
+    "sql": "SELECT o_orderkey, o_orderdate\nFROM orders\nWHERE o_orderdate >= DATE '1997-01-01' AND o_orderdate < DATE '1997-07-01'\nORDER BY o_orderkey\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "func/date_comparison.csv"
+  },
+  {
+    "id": "func/year_month_day",
+    "sql": "SELECT o_orderkey,\n    EXTRACT(YEAR FROM o_orderdate) AS yr,\n    EXTRACT(MONTH FROM o_orderdate) AS mo,\n    EXTRACT(DAY FROM o_orderdate) AS dy\nFROM orders\nORDER BY o_orderkey\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "func/year_month_day.csv"
+  },
+  {
+    "id": "func/date_part",
+    "sql": "SELECT o_orderkey,\n    CAST(DATE_PART('year', o_orderdate) AS BIGINT) AS yr,\n    CAST(DATE_PART('quarter', o_orderdate) AS BIGINT) AS qtr\nFROM orders\nORDER BY o_orderkey\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "func/date_part.csv"
+  },
+  {
+    "id": "func/current_date_test",
+    "sql": "SELECT COUNT(*) AS cnt\nFROM orders\nWHERE o_orderdate < CURRENT_DATE",
+    "ordered": false,
+    "row_count": 1,
+    "file": "func/current_date_test.csv"
+  },
+  {
+    "id": "func/last_day_of_month",
+    "sql": "SELECT LAST_DAY_OF_MONTH(DATE '1995-02-15') AS feb_end,\n       LAST_DAY_OF_MONTH(DATE '1996-02-15') AS feb_leap_end,\n       LAST_DAY_OF_MONTH(DATE '1995-12-01') AS dec_end\nFROM nation\nLIMIT 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "func/last_day_of_month.csv"
+  },
+  {
+    "id": "func/date_arithmetic",
+    "sql": "SELECT o_orderkey, o_orderdate,\n    DATE_ADD('year', 1, o_orderdate) AS plus_year,\n    DATE_ADD('month', -6, o_orderdate) AS minus_6mo\nFROM orders\nORDER BY o_orderkey\nLIMIT 5",
+    "ordered": true,
+    "row_count": 5,
+    "file": "func/date_arithmetic.csv"
+  },
+  {
+    "id": "func/power_sqrt",
+    "sql": "SELECT POWER(2, 10) AS pow2_10, SQRT(144.0) AS sqrt144, CBRT(27.0) AS cbrt27\nFROM nation\nLIMIT 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "func/power_sqrt.csv"
+  },
+  {
+    "id": "func/mod_sign",
+    "sql": "SELECT MOD(17, 5) AS mod_result, SIGN(-42) AS neg_sign, SIGN(42) AS pos_sign, SIGN(0) AS zero_sign\nFROM nation\nLIMIT 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "func/mod_sign.csv"
+  },
+  {
+    "id": "func/ln_log_exp",
+    "sql": "SELECT LN(2.718281828459045) AS ln_e, LOG10(1000.0) AS log10_1000, LOG2(8.0) AS log2_8, EXP(1.0) AS exp_1\nFROM nation\nLIMIT 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "func/ln_log_exp.csv"
+  },
+  {
+    "id": "func/trig_functions",
+    "sql": "SELECT\n    SIN(0.0) AS sin0,\n    COS(0.0) AS cos0,\n    TAN(0.0) AS tan0,\n    ASIN(1.0) AS asin1,\n    ACOS(1.0) AS acos1\nFROM nation\nLIMIT 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "func/trig_functions.csv"
+  },
+  {
+    "id": "func/degrees_radians",
+    "sql": "SELECT DEGREES(3.141592653589793) AS deg, RADIANS(180.0) AS rad\nFROM nation\nLIMIT 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "func/degrees_radians.csv"
+  },
+  {
+    "id": "func/truncate_func",
+    "sql": "SELECT\n    ROUND(3.14159, 2) AS round2,\n    ROUND(3.14159, 4) AS round4,\n    ROUND(3.14159) AS round0\nFROM nation\nLIMIT 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "func/truncate_func.csv"
+  },
+  {
+    "id": "func/pi_e",
+    "sql": "SELECT PI() AS pi_val, EXP(1.0) AS e_val\nFROM nation\nLIMIT 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "func/pi_e.csv"
+  },
+  {
+    "id": "func/math_on_data",
+    "sql": "SELECT n_nationkey, SQRT(CAST(n_nationkey + 1 AS DOUBLE)) AS sqrt_val, ABS(n_nationkey - 12) AS abs_val\nFROM nation\nORDER BY n_nationkey\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "func/math_on_data.csv"
+  },
+  {
+    "id": "func/regexp_like",
+    "sql": "SELECT n_nationkey, n_name\nFROM nation\nWHERE REGEXP_LIKE(n_name, '^[A-E].*')\nORDER BY n_nationkey",
+    "ordered": true,
+    "row_count": 7,
+    "file": "func/regexp_like.csv"
+  },
+  {
+    "id": "func/regexp_extract",
+    "sql": "SELECT s_suppkey, REGEXP_EXTRACT(s_phone, '([0-9]+)-', 1) AS first_digits\nFROM supplier\nORDER BY s_suppkey\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "func/regexp_extract.csv"
+  },
+  {
+    "id": "func/regexp_replace",
+    "sql": "SELECT n_nationkey, REGEXP_REPLACE(n_name, '[AEIOU]', '*') AS replaced\nFROM nation\nORDER BY n_nationkey\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "func/regexp_replace.csv"
+  },
+  {
+    "id": "func/regexp_on_data",
+    "sql": "SELECT COUNT(*) AS cnt\nFROM part\nWHERE REGEXP_LIKE(p_name, '^Part [0-9]+$')",
+    "ordered": false,
+    "row_count": 1,
+    "file": "func/regexp_on_data.csv"
+  },
+  {
+    "id": "func/if_func",
+    "sql": "SELECT n_nationkey, n_name,\n    CASE WHEN n_regionkey = 0 THEN 'Africa' ELSE 'Other' END AS region_label\nFROM nation\nORDER BY n_nationkey\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "func/if_func.csv"
+  },
+  {
+    "id": "func/greatest_least",
+    "sql": "SELECT GREATEST(1, 5, 3) AS greatest_val, LEAST(1, 5, 3) AS least_val\nFROM nation\nLIMIT 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "func/greatest_least.csv"
+  },
+  {
+    "id": "func/greatest_least_data",
+    "sql": "SELECT n_nationkey,\n    GREATEST(n_nationkey, n_regionkey, 10) AS max_val,\n    LEAST(n_nationkey, n_regionkey, 10) AS min_val\nFROM nation\nORDER BY n_nationkey\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "func/greatest_least_data.csv"
+  },
+  {
+    "id": "func/try_cast",
+    "sql": "SELECT TRY_CAST('123' AS INTEGER) AS valid_int,\n    TRY_CAST('abc' AS INTEGER) AS invalid_int,\n    TRY_CAST('3.14' AS DOUBLE) AS valid_double\nFROM nation\nLIMIT 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "func/try_cast.csv"
+  },
+  {
+    "id": "func/coalesce_chain",
+    "sql": "SELECT\n    COALESCE(NULL, NULL, 'third') AS c1,\n    COALESCE('first', NULL, 'third') AS c2,\n    NULLIF('same', 'same') AS n1,\n    NULLIF('diff', 'other') AS n2\nFROM nation\nLIMIT 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "func/coalesce_chain.csv"
+  },
+  {
+    "id": "agg/stddev_variance",
+    "sql": "SELECT\n    STDDEV_POP(l_quantity) AS stddev_pop_qty,\n    STDDEV_SAMP(l_quantity) AS stddev_samp_qty,\n    VAR_POP(l_quantity) AS var_pop_qty,\n    VAR_SAMP(l_quantity) AS var_samp_qty\nFROM lineitem",
+    "ordered": false,
+    "row_count": 1,
+    "file": "agg/stddev_variance.csv"
+  },
+  {
+    "id": "agg/bool_agg",
+    "sql": "SELECT\n    BOOL_AND(n_nationkey > 0) AS all_positive,\n    BOOL_OR(n_nationkey = 0) AS any_zero,\n    BOOL_AND(n_nationkey >= 0) AS all_non_negative\nFROM nation",
+    "ordered": false,
+    "row_count": 1,
+    "file": "agg/bool_agg.csv"
+  },
+  {
+    "id": "agg/min_max_by",
+    "sql": "SELECT MAX(n_name) AS max_name, MIN(n_name) AS min_name\nFROM nation",
+    "ordered": false,
+    "row_count": 1,
+    "file": "agg/min_max_by.csv"
+  },
+  {
+    "id": "agg/count_if",
+    "sql": "SELECT\n    COUNT(*) AS total,\n    COUNT(CASE WHEN n_regionkey = 0 THEN 1 END) AS africa_count,\n    COUNT(CASE WHEN n_regionkey = 1 THEN 1 END) AS america_count\nFROM nation",
+    "ordered": false,
+    "row_count": 1,
+    "file": "agg/count_if.csv"
+  },
+  {
+    "id": "agg/sum_distinct",
+    "sql": "SELECT SUM(DISTINCT n_regionkey) AS sum_distinct_regions\nFROM nation",
+    "ordered": false,
+    "row_count": 1,
+    "file": "agg/sum_distinct.csv"
+  },
+  {
+    "id": "agg/multiple_distinct",
+    "sql": "SELECT COUNT(DISTINCT l_returnflag) AS distinct_flags,\n    COUNT(DISTINCT l_linestatus) AS distinct_statuses,\n    COUNT(*) AS total\nFROM lineitem",
+    "ordered": false,
+    "row_count": 1,
+    "file": "agg/multiple_distinct.csv"
+  },
+  {
+    "id": "agg/nested_agg_subquery",
+    "sql": "SELECT n_name, supplier_count\nFROM (\n    SELECT n.n_name, COUNT(*) AS supplier_count\n    FROM nation n, supplier s\n    WHERE n.n_nationkey = s.s_nationkey\n    GROUP BY n.n_name\n) sub\nWHERE supplier_count >= (\n    SELECT AVG(cnt) FROM (\n        SELECT COUNT(*) AS cnt\n        FROM supplier GROUP BY s_nationkey\n    ) avg_sub\n)\nORDER BY supplier_count DESC, n_name",
+    "ordered": true,
+    "row_count": 1,
+    "file": "agg/nested_agg_subquery.csv"
+  },
+  {
+    "id": "agg/group_by_expression",
+    "sql": "SELECT\n    CASE WHEN l_quantity < 10 THEN 'small'\n         WHEN l_quantity < 30 THEN 'medium'\n         ELSE 'large' END AS size_bucket,\n    COUNT(*) AS cnt,\n    AVG(l_extendedprice) AS avg_price\nFROM lineitem\nGROUP BY\n    CASE WHEN l_quantity < 10 THEN 'small'\n         WHEN l_quantity < 30 THEN 'medium'\n         ELSE 'large' END\nORDER BY size_bucket",
+    "ordered": true,
+    "row_count": 3,
+    "file": "agg/group_by_expression.csv"
+  },
+  {
+    "id": "func/hex_functions",
+    "sql": "SELECT TO_HEX(255) AS hex_255, TO_HEX(4096) AS hex_4096\nFROM nation\nLIMIT 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "func/hex_functions.csv"
+  },
+  {
+    "id": "func/md5_sha",
+    "sql": "SELECT MD5('hello') AS md5_hello, SHA256('hello') AS sha256_hello\nFROM nation\nLIMIT 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "func/md5_sha.csv"
+  },
+  {
+    "id": "func/base64",
+    "sql": "SELECT TO_BASE64('hello world') AS encoded\nFROM nation\nLIMIT 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "func/base64.csv"
+  },
+  {
+    "id": "func/encode_combined",
+    "sql": "SELECT\n    MD5('test') AS md5_test,\n    LENGTH(MD5('test')) AS md5_len\nFROM nation\nLIMIT 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "func/encode_combined.csv"
+  },
+  {
+    "id": "func/bitwise_ops",
+    "sql": "SELECT\n    BITWISE_AND(12, 10) AS bit_and,\n    BITWISE_OR(12, 10) AS bit_or,\n    BITWISE_XOR(12, 10) AS bit_xor\nFROM nation\nLIMIT 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "func/bitwise_ops.csv"
+  },
+  {
+    "id": "func/bitwise_shift",
+    "sql": "SELECT\n    BITWISE_LEFT_SHIFT(1, 4) AS shift_left,\n    BITWISE_RIGHT_SHIFT(16, 2) AS shift_right\nFROM nation\nLIMIT 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "func/bitwise_shift.csv"
+  },
+  {
+    "id": "func/bit_count",
+    "sql": "SELECT BIT_COUNT(255) AS bits_255, BIT_COUNT(0) AS bits_0, BIT_COUNT(7) AS bits_7\nFROM nation\nLIMIT 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "func/bit_count.csv"
+  },
+  {
+    "id": "complex/correlated_exists_multiple",
+    "sql": "SELECT n_name\nFROM nation n\nWHERE EXISTS (\n    SELECT 1 FROM supplier s\n    WHERE s.s_nationkey = n.n_nationkey AND s.s_acctbal > 5000\n)\nAND EXISTS (\n    SELECT 1 FROM customer c\n    WHERE c.c_nationkey = n.n_nationkey AND c.c_acctbal > 5000\n)\nORDER BY n_name",
+    "ordered": true,
+    "row_count": 3,
+    "file": "complex/correlated_exists_multiple.csv"
+  },
+  {
+    "id": "complex/subquery_in_select",
+    "sql": "SELECT n.n_name,\n    (SELECT COUNT(*) FROM supplier s WHERE s.s_nationkey = n.n_nationkey) AS num_suppliers\nFROM nation n\nORDER BY n.n_name\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "complex/subquery_in_select.csv"
+  },
+  {
+    "id": "complex/deeply_nested_subquery",
+    "sql": "SELECT s_name, s_acctbal\nFROM supplier\nWHERE s_nationkey IN (\n    SELECT n_nationkey FROM nation\n    WHERE n_regionkey IN (\n        SELECT r_regionkey FROM region\n        WHERE r_name IN ('EUROPE', 'ASIA')\n    )\n)\nORDER BY s_acctbal DESC, s_name\nLIMIT 10",
+    "ordered": true,
+    "row_count": 6,
+    "file": "complex/deeply_nested_subquery.csv"
+  },
+  {
+    "id": "complex/multi_agg_multi_join",
+    "sql": "SELECT r.r_name,\n    COUNT(DISTINCT n.n_nationkey) AS num_nations,\n    COUNT(DISTINCT s.s_suppkey) AS num_suppliers,\n    AVG(s.s_acctbal) AS avg_balance\nFROM region r, nation n, supplier s\nWHERE r.r_regionkey = n.n_regionkey AND n.n_nationkey = s.s_nationkey\nGROUP BY r.r_name\nORDER BY num_suppliers DESC, r.r_name",
+    "ordered": true,
+    "row_count": 4,
+    "file": "complex/multi_agg_multi_join.csv"
+  },
+  {
+    "id": "complex/case_grouping",
+    "sql": "SELECT\n    CASE WHEN o_totalprice < 50000 THEN 'low'\n         WHEN o_totalprice < 150000 THEN 'medium'\n         ELSE 'high' END AS price_tier,\n    COUNT(*) AS num_orders,\n    AVG(o_totalprice) AS avg_price\nFROM orders\nGROUP BY\n    CASE WHEN o_totalprice < 50000 THEN 'low'\n         WHEN o_totalprice < 150000 THEN 'medium'\n         ELSE 'high' END\nORDER BY price_tier",
+    "ordered": true,
+    "row_count": 3,
+    "file": "complex/case_grouping.csv"
+  },
+  {
+    "id": "complex/union_cte",
+    "sql": "WITH top_customers AS (\n    SELECT c_custkey, c_name, c_acctbal FROM customer\n    WHERE c_acctbal > 9000\n),\nlow_customers AS (\n    SELECT c_custkey, c_name, c_acctbal FROM customer\n    WHERE c_acctbal < -900\n)\nSELECT * FROM top_customers\nUNION ALL\nSELECT * FROM low_customers\nORDER BY c_acctbal DESC, c_custkey\nLIMIT 20",
+    "ordered": true,
+    "row_count": 14,
+    "file": "complex/union_cte.csv"
   }
 ]

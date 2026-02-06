@@ -836,7 +836,12 @@ impl<'a> Binder<'a> {
         for (i, gb) in group_by.iter().enumerate() {
             if expr == gb {
                 let field = &agg_schema.fields()[i];
-                return Ok((Expr::Column(Column::new(field.name.clone())), field.clone()));
+                // Preserve relation qualifier for self-joins (n1.n_name vs n2.n_name)
+                let col = Column {
+                    relation: field.relation.clone(),
+                    name: field.name.clone(),
+                };
+                return Ok((Expr::Column(col), field.clone()));
             }
         }
 
@@ -897,7 +902,11 @@ impl<'a> Binder<'a> {
         for (i, gb) in group_by.iter().enumerate() {
             if expr == gb {
                 let field = &agg_schema.fields()[i];
-                return Ok(Expr::Column(Column::new(field.name.clone())));
+                // Preserve relation qualifier for self-joins
+                return Ok(Expr::Column(Column {
+                    relation: field.relation.clone(),
+                    name: field.name.clone(),
+                }));
             }
         }
 

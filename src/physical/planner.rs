@@ -185,7 +185,14 @@ impl PhysicalPlanner {
             LogicalPlan::Project(node) => {
                 let input = self.create_physical_plan(&node.input)?;
                 let schema = plan_schema_to_arrow(&node.schema);
-                let project = ProjectExec::new(input, node.exprs.clone(), schema);
+                let mut project = ProjectExec::new(input, node.exprs.clone(), schema);
+                // If any projection expression contains a subquery, attach executor
+                let has_subquery = node.exprs.iter().any(|e| e.contains_subquery());
+                if has_subquery {
+                    if let Some(ref executor) = self.subquery_executor {
+                        project = project.with_subquery_executor(executor.clone());
+                    }
+                }
                 Ok(Arc::new(project))
             }
 
@@ -249,7 +256,9 @@ impl PhysicalPlanner {
                 let schema = plan_schema_to_arrow(&node.schema);
 
                 // Try morsel execution for Parquet-based aggregations
-                if self.use_morsel_execution() {
+                // Skip morsel path for DISTINCT aggregates (not yet supported)
+                let has_distinct = aggregates.iter().any(|a| a.distinct);
+                if self.use_morsel_execution() && !has_distinct {
                     if let Some((files, input_schema, filter, projection)) =
                         self.try_extract_parquet_source(&node.input)
                     {

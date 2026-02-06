@@ -393,11 +393,11 @@ fn aggregate_batches(
     schema: &SchemaRef,
 ) -> Result<RecordBatch> {
     // Special case: scalar aggregate (no GROUP BY) - use Arrow's SIMD kernels
-    // Note: COUNT DISTINCT requires the hash-based path for tracking distinct values
-    let has_count_distinct = aggregates
+    // Note: DISTINCT aggregates require the hash-based path for tracking distinct values
+    let has_distinct = aggregates
         .iter()
-        .any(|a| a.func == AggregateFunction::CountDistinct);
-    if group_by.is_empty() && batches.len() == 1 && aggregates.len() == 1 && !has_count_distinct {
+        .any(|a| a.func == AggregateFunction::CountDistinct || a.distinct);
+    if group_by.is_empty() && batches.len() == 1 && aggregates.len() == 1 && !has_distinct {
         return aggregate_scalar_simd(&batches[0], &aggregates[0], schema);
     }
 
@@ -413,10 +413,10 @@ fn aggregate_batches_parallel(
     schema: &SchemaRef,
 ) -> Result<RecordBatch> {
     // Use scalar SIMD path for simple cases
-    let has_count_distinct = aggregates
+    let has_distinct = aggregates
         .iter()
-        .any(|a| a.func == AggregateFunction::CountDistinct);
-    if group_by.is_empty() && batches.len() == 1 && aggregates.len() == 1 && !has_count_distinct {
+        .any(|a| a.func == AggregateFunction::CountDistinct || a.distinct);
+    if group_by.is_empty() && batches.len() == 1 && aggregates.len() == 1 && !has_distinct {
         return aggregate_scalar_simd(&batches[0], &aggregates[0], schema);
     }
 
@@ -502,7 +502,7 @@ fn build_partial_hash_table(
             // Update each accumulator
             for (i, agg) in aggregates.iter().enumerate() {
                 let input = &agg_inputs[i];
-                update_accumulator(&mut states[i], agg.func, input, row);
+                update_accumulator(&mut states[i], agg.func, input, row, agg.distinct);
             }
         }
     }
@@ -612,7 +612,14 @@ fn build_output_from_groups(
     // Aggregate columns
     for (i, agg) in aggregates.iter().enumerate() {
         let field = schema.field(group_by.len() + i);
-        let arr = build_agg_array(groups, i, agg.func, num_groups, field.data_type())?;
+        let arr = build_agg_array(
+            groups,
+            i,
+            agg.func,
+            num_groups,
+            field.data_type(),
+            agg.distinct,
+        )?;
         output_arrays.push(arr);
     }
 
@@ -1173,7 +1180,7 @@ fn aggregate_batches_hash(
             // Update each accumulator
             for (i, agg) in aggregates.iter().enumerate() {
                 let input = &agg_inputs[i];
-                update_accumulator(&mut states[i], agg.func, input, row);
+                update_accumulator(&mut states[i], agg.func, input, row, agg.distinct);
             }
         }
     }
@@ -1219,7 +1226,14 @@ fn aggregate_batches_hash(
     // Aggregate columns
     for (i, agg) in aggregates.iter().enumerate() {
         let field = schema.field(group_by.len() + i);
-        let arr = build_agg_array(&groups, i, agg.func, num_groups, field.data_type())?;
+        let arr = build_agg_array(
+            &groups,
+            i,
+            agg.func,
+            num_groups,
+            field.data_type(),
+            agg.distinct,
+        )?;
         output_arrays.push(arr);
     }
 
@@ -1266,6 +1280,7 @@ fn update_accumulator(
     func: AggregateFunction,
     input: &ArrayRef,
     row: usize,
+    distinct: bool,
 ) {
     match func {
         AggregateFunction::Count => {
@@ -1284,21 +1299,32 @@ fn update_accumulator(
         }
         AggregateFunction::Sum => {
             if !input.is_null(row) {
-                state.count += 1;
-                if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
-                    state.sum_i64 += a.value(row);
-                    state.sum += a.value(row) as f64;
-                } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
-                    state.sum += a.value(row);
-                } else if let Some(a) = input.as_any().downcast_ref::<arrow::array::Int32Array>() {
-                    state.sum_i64 += a.value(row) as i64;
-                    state.sum += a.value(row) as f64;
-                } else if let Some(a) = input
-                    .as_any()
-                    .downcast_ref::<arrow::array::Decimal128Array>()
-                {
-                    state.sum_i64 += a.value(row) as i64;
-                    state.sum += a.value(row) as f64;
+                if distinct {
+                    // For SUM(DISTINCT), collect values in distinct_set
+                    let value = extract_group_value(input, row);
+                    let set = state
+                        .distinct_set
+                        .get_or_insert_with(std::collections::HashSet::new);
+                    set.insert(value);
+                } else {
+                    state.count += 1;
+                    if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+                        state.sum_i64 += a.value(row);
+                        state.sum += a.value(row) as f64;
+                    } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
+                        state.sum += a.value(row);
+                    } else if let Some(a) =
+                        input.as_any().downcast_ref::<arrow::array::Int32Array>()
+                    {
+                        state.sum_i64 += a.value(row) as i64;
+                        state.sum += a.value(row) as f64;
+                    } else if let Some(a) = input
+                        .as_any()
+                        .downcast_ref::<arrow::array::Decimal128Array>()
+                    {
+                        state.sum_i64 += a.value(row) as i64;
+                        state.sum += a.value(row) as f64;
+                    }
                 }
             }
         }
@@ -1627,7 +1653,57 @@ fn build_agg_array(
     func: AggregateFunction,
     num_groups: usize,
     data_type: &DataType,
+    distinct: bool,
 ) -> Result<ArrayRef> {
+    // Handle SUM(DISTINCT) by computing sum from distinct_set
+    if distinct && func == AggregateFunction::Sum {
+        match data_type {
+            DataType::Float64 => {
+                let mut builder = Float64Builder::with_capacity(num_groups);
+                for states in groups.values() {
+                    let sum: f64 = states[agg_idx]
+                        .distinct_set
+                        .as_ref()
+                        .map(|s| {
+                            s.iter()
+                                .map(|v| match v {
+                                    GroupValue::Float64(x) => x.into_inner(),
+                                    GroupValue::Int64(x) => *x as f64,
+                                    GroupValue::Date32(x) => *x as f64,
+                                    _ => 0.0,
+                                })
+                                .sum()
+                        })
+                        .unwrap_or(0.0);
+                    builder.append_value(sum);
+                }
+                return Ok(Arc::new(builder.finish()));
+            }
+            _ => {
+                // Int64 and other integer types
+                let mut builder = Int64Builder::with_capacity(num_groups);
+                for states in groups.values() {
+                    let sum: i64 = states[agg_idx]
+                        .distinct_set
+                        .as_ref()
+                        .map(|s| {
+                            s.iter()
+                                .map(|v| match v {
+                                    GroupValue::Int64(x) => *x,
+                                    GroupValue::Date32(x) => *x as i64,
+                                    GroupValue::Float64(x) => x.into_inner() as i64,
+                                    _ => 0,
+                                })
+                                .sum()
+                        })
+                        .unwrap_or(0);
+                    builder.append_value(sum);
+                }
+                return Ok(Arc::new(builder.finish()));
+            }
+        }
+    }
+
     match (func, data_type) {
         (AggregateFunction::Count, DataType::Int64) => {
             let mut builder = Int64Builder::with_capacity(num_groups);

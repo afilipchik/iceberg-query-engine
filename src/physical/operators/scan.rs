@@ -193,7 +193,23 @@ impl PhysicalOperator for MemoryTableExec {
                     RecordBatch::try_new(self.schema.clone(), columns).map_err(Into::into)
                 })
                 .collect::<Result<Vec<_>>>()?,
-            None => partition_batches,
+            None => {
+                // Re-wrap batches with the logical schema to preserve qualified names
+                // (e.g., "n1.n_name" vs "n2.n_name" for self-joins)
+                partition_batches
+                    .into_iter()
+                    .map(|batch| {
+                        if batch.schema() != self.schema
+                            && batch.num_columns() == self.schema.fields().len()
+                        {
+                            RecordBatch::try_new(self.schema.clone(), batch.columns().to_vec())
+                                .map_err(Into::into)
+                        } else {
+                            Ok(batch)
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
         };
 
         let stream = stream::iter(batches.into_iter().map(Ok));
