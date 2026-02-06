@@ -2341,6 +2341,7 @@ dependencies = [
  "crc32fast",
  "criterion",
  "crossbeam",
+ "csv",
  "data-encoding",
  "dirs-next",
  "futures",

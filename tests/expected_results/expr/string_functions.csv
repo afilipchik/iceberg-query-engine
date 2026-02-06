@@ -1,0 +1,11 @@
+n_nationkey,upper_name,lower_name,name_len,name_prefix
+0,ALGERIA,algeria,7,ALG
+1,ARGENTINA,argentina,9,ARG
+2,BRAZIL,brazil,6,BRA
+3,CANADA,canada,6,CAN
+4,EGYPT,egypt,5,EGY
+5,ETHIOPIA,ethiopia,8,ETH
+6,FRANCE,france,6,FRA
+7,GERMANY,germany,7,GER
+8,INDIA,india,5,IND
+9,INDONESIA,indonesia,9,IND

@@ -80,6 +80,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
 pretty_assertions = "1"
+csv = "1"
 
 [[bin]]
 name = "query_engine"

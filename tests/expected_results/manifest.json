@@ -1,0 +1,604 @@
+[
+  {
+    "id": "tpch/q01",
+    "sql": "SELECT\n    l_returnflag,\n    l_linestatus,\n    SUM(l_quantity) AS sum_qty,\n    SUM(l_extendedprice) AS sum_base_price,\n    SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price,\n    SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,\n    AVG(l_quantity) AS avg_qty,\n    AVG(l_extendedprice) AS avg_price,\n    AVG(l_discount) AS avg_disc,\n    COUNT(*) AS count_order\nFROM\n    lineitem\nWHERE\n    l_shipdate <= DATE '1998-09-02'\nGROUP BY\n    l_returnflag,\n    l_linestatus\nORDER BY\n    l_returnflag,\n    l_linestatus",
+    "ordered": true,
+    "row_count": 6,
+    "file": "tpch/q01.csv"
+  },
+  {
+    "id": "tpch/q02",
+    "sql": "SELECT\n    s_acctbal,\n    s_name,\n    n_name,\n    p_partkey,\n    p_mfgr,\n    s_address,\n    s_phone,\n    s_comment\nFROM\n    part,\n    supplier,\n    partsupp,\n    nation,\n    region\nWHERE\n    p_partkey = ps_partkey\n    AND s_suppkey = ps_suppkey\n    AND p_size = 15\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'EUROPE'\nORDER BY\n    s_acctbal DESC,\n    n_name,\n    s_name,\n    p_partkey\nLIMIT 100",
+    "ordered": true,
+    "row_count": 4,
+    "file": "tpch/q02.csv"
+  },
+  {
+    "id": "tpch/q03",
+    "sql": "SELECT\n    l_orderkey,\n    SUM(l_extendedprice * (1 - l_discount)) AS revenue,\n    o_orderdate,\n    o_shippriority\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    c_mktsegment = 'BUILDING'\n    AND c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate < DATE '1995-03-15'\n    AND l_shipdate > DATE '1995-03-15'\nGROUP BY\n    l_orderkey,\n    o_orderdate,\n    o_shippriority\nORDER BY\n    revenue DESC,\n    o_orderdate\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "tpch/q03.csv"
+  },
+  {
+    "id": "tpch/q04",
+    "sql": "SELECT\n    o_orderpriority,\n    COUNT(*) AS order_count\nFROM\n    orders\nWHERE\n    o_orderdate >= DATE '1993-07-01'\n    AND o_orderdate < DATE '1993-10-01'\nGROUP BY\n    o_orderpriority\nORDER BY\n    o_orderpriority",
+    "ordered": true,
+    "row_count": 5,
+    "file": "tpch/q04.csv"
+  },
+  {
+    "id": "tpch/q05",
+    "sql": "SELECT\n    n_name,\n    SUM(l_extendedprice * (1 - l_discount)) AS revenue\nFROM\n    customer,\n    orders,\n    lineitem,\n    supplier,\n    nation,\n    region\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND l_suppkey = s_suppkey\n    AND c_nationkey = s_nationkey\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'ASIA'\n    AND o_orderdate >= DATE '1994-01-01'\n    AND o_orderdate < DATE '1995-01-01'\nGROUP BY\n    n_name\nORDER BY\n    revenue DESC",
+    "ordered": true,
+    "row_count": 0,
+    "file": "tpch/q05.csv"
+  },
+  {
+    "id": "tpch/q06",
+    "sql": "SELECT\n    SUM(l_extendedprice * l_discount) AS revenue\nFROM\n    lineitem\nWHERE\n    l_shipdate >= DATE '1994-01-01'\n    AND l_shipdate < DATE '1995-01-01'\n    AND l_discount >= 0.05\n    AND l_discount <= 0.07\n    AND l_quantity < 24",
+    "ordered": false,
+    "row_count": 1,
+    "file": "tpch/q06.csv"
+  },
+  {
+    "id": "tpch/q07",
+    "sql": "SELECT\n    n1.n_name AS supp_nation,\n    n2.n_name AS cust_nation,\n    EXTRACT(YEAR FROM l_shipdate) AS l_year,\n    SUM(l_extendedprice * (1 - l_discount)) AS revenue\nFROM\n    supplier,\n    lineitem,\n    orders,\n    customer,\n    nation n1,\n    nation n2\nWHERE\n    s_suppkey = l_suppkey\n    AND o_orderkey = l_orderkey\n    AND c_custkey = o_custkey\n    AND s_nationkey = n1.n_nationkey\n    AND c_nationkey = n2.n_nationkey\n    AND ((n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY')\n        OR (n1.n_name = 'GERMANY' AND n2.n_name = 'FRANCE'))\n    AND l_shipdate BETWEEN DATE '1995-01-01' AND DATE '1996-12-31'\nGROUP BY\n    n1.n_name,\n    n2.n_name,\n    EXTRACT(YEAR FROM l_shipdate)\nORDER BY\n    supp_nation,\n    cust_nation,\n    l_year",
+    "ordered": true,
+    "row_count": 4,
+    "file": "tpch/q07.csv"
+  },
+  {
+    "id": "tpch/q08",
+    "sql": "SELECT\n    EXTRACT(YEAR FROM o_orderdate) AS o_year,\n    SUM(CASE WHEN n2.n_name = 'BRAZIL' THEN l_extendedprice * (1 - l_discount) ELSE 0.0 END) / SUM(l_extendedprice * (1 - l_discount)) AS mkt_share\nFROM\n    part,\n    supplier,\n    lineitem,\n    orders,\n    customer,\n    nation n1,\n    nation n2,\n    region\nWHERE\n    p_partkey = l_partkey\n    AND s_suppkey = l_suppkey\n    AND l_orderkey = o_orderkey\n    AND o_custkey = c_custkey\n    AND c_nationkey = n1.n_nationkey\n    AND n1.n_regionkey = r_regionkey\n    AND r_name = 'AMERICA'\n    AND s_nationkey = n2.n_nationkey\n    AND o_orderdate BETWEEN DATE '1995-01-01' AND DATE '1996-12-31'\n    AND p_type = 'STANDARD ANODIZED TIN'\nGROUP BY\n    EXTRACT(YEAR FROM o_orderdate)\nORDER BY\n    o_year",
+    "ordered": true,
+    "row_count": 2,
+    "file": "tpch/q08.csv"
+  },
+  {
+    "id": "tpch/q09",
+    "sql": "SELECT\n    n_name AS nation,\n    EXTRACT(YEAR FROM o_orderdate) AS o_year,\n    SUM(l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity) AS sum_profit\nFROM\n    part,\n    supplier,\n    lineitem,\n    partsupp,\n    orders,\n    nation\nWHERE\n    s_suppkey = l_suppkey\n    AND ps_suppkey = l_suppkey\n    AND ps_partkey = l_partkey\n    AND p_partkey = l_partkey\n    AND o_orderkey = l_orderkey\n    AND s_nationkey = n_nationkey\n    AND p_name LIKE 'Part 1%'\nGROUP BY\n    n_name,\n    EXTRACT(YEAR FROM o_orderdate)\nORDER BY\n    nation,\n    o_year DESC",
+    "ordered": true,
+    "row_count": 49,
+    "file": "tpch/q09.csv"
+  },
+  {
+    "id": "tpch/q10",
+    "sql": "SELECT\n    c_custkey,\n    c_name,\n    SUM(l_extendedprice * (1 - l_discount)) AS revenue,\n    c_acctbal,\n    n_name,\n    c_address,\n    c_phone,\n    c_comment\nFROM\n    customer,\n    orders,\n    lineitem,\n    nation\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate >= DATE '1993-10-01'\n    AND o_orderdate < DATE '1994-01-01'\n    AND l_returnflag = 'R'\n    AND c_nationkey = n_nationkey\nGROUP BY\n    c_custkey,\n    c_name,\n    c_acctbal,\n    c_phone,\n    n_name,\n    c_address,\n    c_comment\nORDER BY\n    revenue DESC\nLIMIT 20",
+    "ordered": true,
+    "row_count": 20,
+    "file": "tpch/q10.csv"
+  },
+  {
+    "id": "tpch/q11",
+    "sql": "SELECT\n    ps_partkey,\n    SUM(ps_supplycost * ps_availqty) AS value\nFROM\n    partsupp,\n    supplier,\n    nation\nWHERE\n    ps_suppkey = s_suppkey\n    AND s_nationkey = n_nationkey\n    AND n_name = 'GERMANY'\nGROUP BY\n    ps_partkey\nHAVING\n    SUM(ps_supplycost * ps_availqty) > (\n        SELECT SUM(ps_supplycost * ps_availqty) * 0.0001\n        FROM partsupp, supplier, nation\n        WHERE ps_suppkey = s_suppkey\n        AND s_nationkey = n_nationkey\n        AND n_name = 'GERMANY'\n    )\nORDER BY\n    value DESC\nLIMIT 100",
+    "ordered": true,
+    "row_count": 20,
+    "file": "tpch/q11.csv"
+  },
+  {
+    "id": "tpch/q12",
+    "sql": "SELECT\n    l_shipmode,\n    SUM(CASE\n        WHEN o_orderpriority = '1-URGENT'\n            OR o_orderpriority = '2-HIGH'\n            THEN 1\n        ELSE 0\n    END) AS high_line_count,\n    SUM(CASE\n        WHEN o_orderpriority <> '1-URGENT'\n            AND o_orderpriority <> '2-HIGH'\n            THEN 1\n        ELSE 0\n    END) AS low_line_count\nFROM\n    orders,\n    lineitem\nWHERE\n    o_orderkey = l_orderkey\n    AND l_shipmode IN ('MAIL', 'SHIP')\n    AND l_commitdate < l_receiptdate\n    AND l_shipdate < l_commitdate\n    AND l_receiptdate >= DATE '1994-01-01'\n    AND l_receiptdate < DATE '1995-01-01'\nGROUP BY\n    l_shipmode\nORDER BY\n    l_shipmode",
+    "ordered": true,
+    "row_count": 2,
+    "file": "tpch/q12.csv"
+  },
+  {
+    "id": "tpch/q13",
+    "sql": "SELECT\n    c_count,\n    COUNT(*) AS custdist\nFROM (\n    SELECT\n        c_custkey,\n        COUNT(o_orderkey) AS c_count\n    FROM\n        customer\n        LEFT OUTER JOIN orders ON c_custkey = o_custkey\n    GROUP BY\n        c_custkey\n) AS c_orders\nGROUP BY\n    c_count\nORDER BY\n    custdist DESC,\n    c_count DESC\nLIMIT 100",
+    "ordered": true,
+    "row_count": 1,
+    "file": "tpch/q13.csv"
+  },
+  {
+    "id": "tpch/q14",
+    "sql": "SELECT\n    SUM(l_extendedprice * (1 - l_discount)) AS promo_revenue\nFROM\n    lineitem,\n    part\nWHERE\n    l_partkey = p_partkey\n    AND l_shipdate >= DATE '1995-09-01'\n    AND l_shipdate < DATE '1995-10-01'",
+    "ordered": false,
+    "row_count": 1,
+    "file": "tpch/q14.csv"
+  },
+  {
+    "id": "tpch/q15",
+    "sql": "WITH revenue AS (\n    SELECT\n        l_suppkey,\n        SUM(l_extendedprice * (1 - l_discount)) AS total_revenue\n    FROM\n        lineitem\n    WHERE\n        l_shipdate >= DATE '1996-01-01'\n        AND l_shipdate < DATE '1996-04-01'\n    GROUP BY\n        l_suppkey\n)\nSELECT\n    s_suppkey,\n    s_name,\n    s_address,\n    s_phone,\n    total_revenue\nFROM\n    supplier,\n    revenue\nWHERE\n    s_suppkey = revenue.l_suppkey\n    AND total_revenue = (\n        SELECT MAX(total_revenue)\n        FROM revenue\n    )\nORDER BY\n    total_revenue DESC",
+    "ordered": true,
+    "row_count": 1,
+    "file": "tpch/q15.csv"
+  },
+  {
+    "id": "tpch/q16",
+    "sql": "SELECT\n    p_brand,\n    p_type,\n    p_size,\n    COUNT(ps_suppkey) AS supplier_cnt\nFROM\n    partsupp,\n    part\nWHERE\n    p_partkey = ps_partkey\n    AND p_brand <> 'Brand#45'\n    AND p_size >= 1\nGROUP BY\n    p_brand,\n    p_type,\n    p_size\nORDER BY\n    supplier_cnt DESC,\n    p_brand,\n    p_type,\n    p_size\nLIMIT 100",
+    "ordered": true,
+    "row_count": 100,
+    "file": "tpch/q16.csv"
+  },
+  {
+    "id": "tpch/q17",
+    "sql": "SELECT\n    SUM(l_extendedprice) / 7.0 AS avg_yearly\nFROM\n    lineitem,\n    part\nWHERE\n    p_partkey = l_partkey\n    AND p_brand = 'Brand#23'\n    AND p_container = 'MED BOX'\n    AND l_quantity < (\n        SELECT 0.2 * AVG(l_quantity)\n        FROM lineitem\n        WHERE l_partkey = p_partkey\n    )",
+    "ordered": false,
+    "row_count": 1,
+    "file": "tpch/q17.csv"
+  },
+  {
+    "id": "tpch/q18",
+    "sql": "SELECT\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice,\n    SUM(l_quantity) AS total_quantity\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    c_custkey = o_custkey\n    AND o_orderkey = l_orderkey\nGROUP BY\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice\nORDER BY\n    o_totalprice DESC,\n    o_orderdate\nLIMIT 100",
+    "ordered": true,
+    "row_count": 100,
+    "file": "tpch/q18.csv"
+  },
+  {
+    "id": "tpch/q19",
+    "sql": "SELECT\n    SUM(l_extendedprice * (1 - l_discount)) AS revenue\nFROM\n    lineitem,\n    part\nWHERE\n    p_partkey = l_partkey\n    AND (\n        (p_brand = 'Brand#12'\n        AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')\n        AND l_quantity >= 1 AND l_quantity <= 11)\n        OR (p_brand = 'Brand#23'\n        AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')\n        AND l_quantity >= 10 AND l_quantity <= 20)\n        OR (p_brand = 'Brand#34'\n        AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')\n        AND l_quantity >= 20 AND l_quantity <= 30)\n    )\n    AND (\n        (p_brand = 'Brand#12' AND l_shipmode IN ('AIR', 'AIR REG'))\n        OR (p_brand = 'Brand#23' AND l_shipmode IN ('AIR', 'AIR REG'))\n        OR (p_brand = 'Brand#34' AND l_shipmode IN ('AIR', 'AIR REG'))\n    )",
+    "ordered": false,
+    "row_count": 1,
+    "file": "tpch/q19.csv"
+  },
+  {
+    "id": "tpch/q20",
+    "sql": "SELECT\n    s_name,\n    s_address\nFROM\n    supplier,\n    nation\nWHERE\n    s_suppkey IN (\n        SELECT ps_suppkey\n        FROM partsupp\n        WHERE ps_partkey IN (\n            SELECT p_partkey\n            FROM part\n            WHERE p_name LIKE 'Part 1%'\n        )\n        AND ps_availqty > (\n            SELECT 0.5 * SUM(l_quantity)\n            FROM lineitem\n            WHERE l_partkey = ps_partkey\n            AND l_suppkey = ps_suppkey\n            AND l_shipdate >= DATE '1994-01-01'\n            AND l_shipdate < DATE '1995-01-01'\n        )\n    )\n    AND s_nationkey = n_nationkey\n    AND n_name = 'CANADA'\nORDER BY\n    s_name",
+    "ordered": true,
+    "row_count": 0,
+    "file": "tpch/q20.csv"
+  },
+  {
+    "id": "tpch/q21",
+    "sql": "SELECT\n    s_name,\n    COUNT(*) AS numwait\nFROM\n    supplier,\n    lineitem l1,\n    orders,\n    nation\nWHERE\n    s_suppkey = l1.l_suppkey\n    AND o_orderkey = l1.l_orderkey\n    AND o_orderstatus = 'F'\n    AND l1.l_receiptdate > l1.l_commitdate\n    AND EXISTS (\n        SELECT *\n        FROM lineitem l2\n        WHERE l2.l_orderkey = l1.l_orderkey\n        AND l2.l_suppkey <> l1.l_suppkey\n    )\n    AND NOT EXISTS (\n        SELECT *\n        FROM lineitem l3\n        WHERE l3.l_orderkey = l1.l_orderkey\n        AND l3.l_suppkey <> l1.l_suppkey\n        AND l3.l_receiptdate > l3.l_commitdate\n    )\n    AND s_nationkey = n_nationkey\n    AND n_name = 'SAUDI ARABIA'\nGROUP BY\n    s_name\nORDER BY\n    numwait DESC,\n    s_name\nLIMIT 100",
+    "ordered": true,
+    "row_count": 0,
+    "file": "tpch/q21.csv"
+  },
+  {
+    "id": "tpch/q22",
+    "sql": "SELECT\n    cntrycode,\n    COUNT(*) AS numcust,\n    SUM(c_acctbal) AS totacctbal\nFROM (\n    SELECT\n        SUBSTRING(c_phone FROM 1 FOR 2) AS cntrycode,\n        c_acctbal\n    FROM\n        customer\n    WHERE\n        SUBSTRING(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')\n        AND c_acctbal > (\n            SELECT AVG(c_acctbal)\n            FROM customer\n            WHERE c_acctbal > 0.00\n            AND SUBSTRING(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')\n        )\n        AND NOT EXISTS (\n            SELECT *\n            FROM orders\n            WHERE o_custkey = c_custkey\n        )\n) AS custsale\nGROUP BY\n    cntrycode\nORDER BY\n    cntrycode",
+    "ordered": true,
+    "row_count": 0,
+    "file": "tpch/q22.csv"
+  },
+  {
+    "id": "basic/select_all_nation",
+    "sql": "SELECT * FROM nation ORDER BY n_nationkey",
+    "ordered": true,
+    "row_count": 25,
+    "file": "basic/select_all_nation.csv"
+  },
+  {
+    "id": "basic/select_columns",
+    "sql": "SELECT n_nationkey, n_name FROM nation ORDER BY n_nationkey",
+    "ordered": true,
+    "row_count": 25,
+    "file": "basic/select_columns.csv"
+  },
+  {
+    "id": "basic/where_equals",
+    "sql": "SELECT n_nationkey, n_name FROM nation WHERE n_regionkey = 1 ORDER BY n_nationkey",
+    "ordered": true,
+    "row_count": 5,
+    "file": "basic/where_equals.csv"
+  },
+  {
+    "id": "basic/where_comparison",
+    "sql": "SELECT n_nationkey, n_name FROM nation WHERE n_nationkey > 10 AND n_nationkey <= 20 ORDER BY n_nationkey",
+    "ordered": true,
+    "row_count": 10,
+    "file": "basic/where_comparison.csv"
+  },
+  {
+    "id": "basic/where_and_or",
+    "sql": "SELECT n_nationkey, n_name, n_regionkey FROM nation\nWHERE (n_regionkey = 0 OR n_regionkey = 1) AND n_nationkey < 10\nORDER BY n_nationkey",
+    "ordered": true,
+    "row_count": 5,
+    "file": "basic/where_and_or.csv"
+  },
+  {
+    "id": "basic/where_like",
+    "sql": "SELECT p_partkey, p_name FROM part WHERE p_name LIKE 'Part 1%' ORDER BY p_partkey LIMIT 20",
+    "ordered": true,
+    "row_count": 20,
+    "file": "basic/where_like.csv"
+  },
+  {
+    "id": "basic/where_between",
+    "sql": "SELECT o_orderkey, o_totalprice FROM orders\nWHERE o_totalprice BETWEEN 100000.0 AND 200000.0\nORDER BY o_orderkey\nLIMIT 20",
+    "ordered": true,
+    "row_count": 20,
+    "file": "basic/where_between.csv"
+  },
+  {
+    "id": "basic/where_in_list",
+    "sql": "SELECT n_nationkey, n_name FROM nation\nWHERE n_name IN ('FRANCE', 'GERMANY', 'BRAZIL', 'JAPAN')\nORDER BY n_nationkey",
+    "ordered": true,
+    "row_count": 4,
+    "file": "basic/where_in_list.csv"
+  },
+  {
+    "id": "orderby/asc_desc",
+    "sql": "SELECT n_nationkey, n_name FROM nation ORDER BY n_name ASC LIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "orderby/asc_desc.csv"
+  },
+  {
+    "id": "orderby/desc",
+    "sql": "SELECT n_nationkey, n_name FROM nation ORDER BY n_nationkey DESC LIMIT 5",
+    "ordered": true,
+    "row_count": 5,
+    "file": "orderby/desc.csv"
+  },
+  {
+    "id": "orderby/limit_offset",
+    "sql": "SELECT n_nationkey, n_name FROM nation ORDER BY n_nationkey LIMIT 5 OFFSET 10",
+    "ordered": true,
+    "row_count": 5,
+    "file": "orderby/limit_offset.csv"
+  },
+  {
+    "id": "orderby/multi_column",
+    "sql": "SELECT n_regionkey, n_nationkey, n_name FROM nation ORDER BY n_regionkey ASC, n_name ASC",
+    "ordered": true,
+    "row_count": 25,
+    "file": "orderby/multi_column.csv"
+  },
+  {
+    "id": "orderby/expression",
+    "sql": "SELECT n_nationkey, n_name, n_regionkey FROM nation ORDER BY n_regionkey * 100 + n_nationkey",
+    "ordered": true,
+    "row_count": 25,
+    "file": "orderby/expression.csv"
+  },
+  {
+    "id": "orderby/alias",
+    "sql": "SELECT n_nationkey AS id, n_name AS name FROM nation ORDER BY id DESC LIMIT 5",
+    "ordered": true,
+    "row_count": 5,
+    "file": "orderby/alias.csv"
+  },
+  {
+    "id": "agg/count_star",
+    "sql": "SELECT COUNT(*) AS cnt FROM lineitem",
+    "ordered": false,
+    "row_count": 1,
+    "file": "agg/count_star.csv"
+  },
+  {
+    "id": "agg/count_column",
+    "sql": "SELECT COUNT(l_comment) AS cnt FROM lineitem",
+    "ordered": false,
+    "row_count": 1,
+    "file": "agg/count_column.csv"
+  },
+  {
+    "id": "agg/sum_avg_min_max",
+    "sql": "SELECT\n    SUM(l_quantity) AS total_qty,\n    AVG(l_quantity) AS avg_qty,\n    MIN(l_quantity) AS min_qty,\n    MAX(l_quantity) AS max_qty\nFROM lineitem",
+    "ordered": false,
+    "row_count": 1,
+    "file": "agg/sum_avg_min_max.csv"
+  },
+  {
+    "id": "agg/count_distinct",
+    "sql": "SELECT COUNT(DISTINCT l_returnflag) AS distinct_flags FROM lineitem",
+    "ordered": false,
+    "row_count": 1,
+    "file": "agg/count_distinct.csv"
+  },
+  {
+    "id": "agg/group_by_single",
+    "sql": "SELECT l_returnflag, COUNT(*) AS cnt FROM lineitem GROUP BY l_returnflag ORDER BY l_returnflag",
+    "ordered": true,
+    "row_count": 3,
+    "file": "agg/group_by_single.csv"
+  },
+  {
+    "id": "agg/group_by_multiple",
+    "sql": "SELECT l_returnflag, l_linestatus, COUNT(*) AS cnt\nFROM lineitem\nGROUP BY l_returnflag, l_linestatus\nORDER BY l_returnflag, l_linestatus",
+    "ordered": true,
+    "row_count": 6,
+    "file": "agg/group_by_multiple.csv"
+  },
+  {
+    "id": "agg/having",
+    "sql": "SELECT l_returnflag, COUNT(*) AS cnt\nFROM lineitem\nGROUP BY l_returnflag\nHAVING COUNT(*) > 1000\nORDER BY l_returnflag",
+    "ordered": true,
+    "row_count": 3,
+    "file": "agg/having.csv"
+  },
+  {
+    "id": "agg/with_where",
+    "sql": "SELECT n_regionkey, COUNT(*) AS cnt, MIN(n_nationkey) AS min_key\nFROM nation\nWHERE n_nationkey > 5\nGROUP BY n_regionkey\nORDER BY n_regionkey",
+    "ordered": true,
+    "row_count": 5,
+    "file": "agg/with_where.csv"
+  },
+  {
+    "id": "agg/expression_group",
+    "sql": "SELECT n_regionkey, COUNT(*) AS cnt\nFROM nation\nGROUP BY n_regionkey\nORDER BY cnt DESC, n_regionkey",
+    "ordered": true,
+    "row_count": 5,
+    "file": "agg/expression_group.csv"
+  },
+  {
+    "id": "agg/empty_result",
+    "sql": "SELECT n_regionkey, COUNT(*) AS cnt, SUM(n_nationkey) AS total\nFROM nation\nWHERE n_nationkey > 9999\nGROUP BY n_regionkey\nORDER BY n_regionkey",
+    "ordered": true,
+    "row_count": 0,
+    "file": "agg/empty_result.csv"
+  },
+  {
+    "id": "join/inner",
+    "sql": "SELECT n.n_name, r.r_name\nFROM nation n, region r\nWHERE n.n_regionkey = r.r_regionkey\nORDER BY n.n_name",
+    "ordered": true,
+    "row_count": 25,
+    "file": "join/inner.csv"
+  },
+  {
+    "id": "join/left",
+    "sql": "SELECT c_custkey, o_orderkey\nFROM customer\nLEFT JOIN orders ON c_custkey = o_custkey\nORDER BY c_custkey, o_orderkey\nLIMIT 20",
+    "ordered": true,
+    "row_count": 20,
+    "file": "join/left.csv"
+  },
+  {
+    "id": "join/right",
+    "sql": "SELECT c_custkey, o_orderkey, c_name\nFROM orders\nRIGHT JOIN customer ON o_custkey = c_custkey\nORDER BY c_custkey, o_orderkey\nLIMIT 20",
+    "ordered": true,
+    "row_count": 20,
+    "file": "join/right.csv"
+  },
+  {
+    "id": "join/full_outer",
+    "sql": "SELECT n.n_name, r.r_name\nFROM nation n\nFULL OUTER JOIN region r ON n.n_regionkey = r.r_regionkey\nORDER BY n.n_name, r.r_name\nLIMIT 30",
+    "ordered": true,
+    "row_count": 25,
+    "file": "join/full_outer.csv"
+  },
+  {
+    "id": "join/cross",
+    "sql": "SELECT r1.r_name AS r1_name, r2.r_name AS r2_name\nFROM region r1, region r2\nORDER BY r1_name, r2_name",
+    "ordered": true,
+    "row_count": 25,
+    "file": "join/cross.csv"
+  },
+  {
+    "id": "join/self",
+    "sql": "SELECT n1.n_name AS name1, n2.n_name AS name2\nFROM nation n1, nation n2\nWHERE n1.n_regionkey = n2.n_regionkey AND n1.n_nationkey < n2.n_nationkey\nORDER BY name1, name2\nLIMIT 20",
+    "ordered": true,
+    "row_count": 20,
+    "file": "join/self.csv"
+  },
+  {
+    "id": "join/multi_way",
+    "sql": "SELECT n.n_name, r.r_name, s.s_name\nFROM nation n, region r, supplier s\nWHERE n.n_regionkey = r.r_regionkey AND s.s_nationkey = n.n_nationkey\nORDER BY r.r_name, n.n_name, s.s_name\nLIMIT 20",
+    "ordered": true,
+    "row_count": 10,
+    "file": "join/multi_way.csv"
+  },
+  {
+    "id": "join/with_aggregate",
+    "sql": "SELECT n.n_name, COUNT(*) AS supplier_count\nFROM nation n, supplier s\nWHERE n.n_nationkey = s.s_nationkey\nGROUP BY n.n_name\nORDER BY supplier_count DESC, n.n_name\nLIMIT 10",
+    "ordered": true,
+    "row_count": 7,
+    "file": "join/with_aggregate.csv"
+  },
+  {
+    "id": "join/with_filter",
+    "sql": "SELECT c_name, o_totalprice\nFROM customer, orders\nWHERE c_custkey = o_custkey AND o_totalprice > 200000.0\nORDER BY o_totalprice DESC, c_name\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "join/with_filter.csv"
+  },
+  {
+    "id": "join/inequality",
+    "sql": "SELECT n1.n_name AS nation1, n2.n_name AS nation2\nFROM nation n1, nation n2\nWHERE n1.n_regionkey = n2.n_regionkey AND n1.n_nationkey < n2.n_nationkey\nORDER BY nation1, nation2",
+    "ordered": true,
+    "row_count": 50,
+    "file": "join/inequality.csv"
+  },
+  {
+    "id": "subquery/scalar",
+    "sql": "SELECT n_name\nFROM nation\nWHERE n_nationkey = (SELECT MIN(n_nationkey) FROM nation WHERE n_regionkey = 0)",
+    "ordered": false,
+    "row_count": 1,
+    "file": "subquery/scalar.csv"
+  },
+  {
+    "id": "subquery/in",
+    "sql": "SELECT s_name\nFROM supplier\nWHERE s_nationkey IN (SELECT n_nationkey FROM nation WHERE n_regionkey = 1)\nORDER BY s_name\nLIMIT 10",
+    "ordered": true,
+    "row_count": 1,
+    "file": "subquery/in.csv"
+  },
+  {
+    "id": "subquery/not_in",
+    "sql": "SELECT n_name\nFROM nation\nWHERE n_nationkey NOT IN (SELECT s_nationkey FROM supplier)\nORDER BY n_name",
+    "ordered": true,
+    "row_count": 18,
+    "file": "subquery/not_in.csv"
+  },
+  {
+    "id": "subquery/exists",
+    "sql": "SELECT n_name\nFROM nation n\nWHERE EXISTS (\n    SELECT 1 FROM supplier s WHERE s.s_nationkey = n.n_nationkey\n)\nORDER BY n_name",
+    "ordered": true,
+    "row_count": 7,
+    "file": "subquery/exists.csv"
+  },
+  {
+    "id": "subquery/not_exists",
+    "sql": "SELECT n_name\nFROM nation n\nWHERE NOT EXISTS (\n    SELECT 1 FROM supplier s WHERE s.s_nationkey = n.n_nationkey\n)\nORDER BY n_name",
+    "ordered": true,
+    "row_count": 18,
+    "file": "subquery/not_exists.csv"
+  },
+  {
+    "id": "subquery/correlated_scalar",
+    "sql": "SELECT s.s_name, s.s_acctbal, n.n_name AS nation_name\nFROM supplier s, nation n\nWHERE n.n_nationkey = s.s_nationkey\nORDER BY s_name\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "subquery/correlated_scalar.csv"
+  },
+  {
+    "id": "subquery/from_clause",
+    "sql": "SELECT avg_price\nFROM (\n    SELECT AVG(l_extendedprice) AS avg_price\n    FROM lineitem\n    WHERE l_quantity > 20\n) AS sub",
+    "ordered": false,
+    "row_count": 1,
+    "file": "subquery/from_clause.csv"
+  },
+  {
+    "id": "subquery/nested",
+    "sql": "SELECT s_name\nFROM supplier\nWHERE s_nationkey IN (\n    SELECT n_nationkey FROM nation\n    WHERE n_regionkey IN (SELECT r_regionkey FROM region WHERE r_name = 'EUROPE')\n)\nORDER BY s_name\nLIMIT 10",
+    "ordered": true,
+    "row_count": 6,
+    "file": "subquery/nested.csv"
+  },
+  {
+    "id": "expr/arithmetic",
+    "sql": "SELECT\n    SUM(l_extendedprice * (1 - l_discount)) AS total_disc_price,\n    SUM(l_extendedprice + l_tax) AS total_price_tax,\n    SUM(l_quantity * 2) AS total_double_qty,\n    SUM(l_extendedprice - l_discount) AS total_minus_disc\nFROM lineitem\nWHERE l_orderkey <= 10",
+    "ordered": false,
+    "row_count": 1,
+    "file": "expr/arithmetic.csv"
+  },
+  {
+    "id": "expr/case_when",
+    "sql": "SELECT l_returnflag,\n    CASE\n        WHEN l_returnflag = 'R' THEN 'Returned'\n        WHEN l_returnflag = 'A' THEN 'Accepted'\n        ELSE 'None'\n    END AS flag_desc,\n    COUNT(*) AS cnt\nFROM lineitem\nGROUP BY l_returnflag\nORDER BY l_returnflag",
+    "ordered": true,
+    "row_count": 3,
+    "file": "expr/case_when.csv"
+  },
+  {
+    "id": "expr/coalesce_nullif",
+    "sql": "SELECT\n    COALESCE(NULL, 'default') AS c1,\n    COALESCE(NULL, NULL, 'fallback') AS c2,\n    NULLIF(1, 1) AS n1,\n    NULLIF(1, 2) AS n2\nFROM nation\nLIMIT 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "expr/coalesce_nullif.csv"
+  },
+  {
+    "id": "expr/cast",
+    "sql": "SELECT\n    CAST(SUM(l_quantity) AS BIGINT) AS total_qty_int,\n    CAST(42 AS DOUBLE) AS int_to_double,\n    CAST(100 AS VARCHAR) AS int_to_str\nFROM lineitem\nWHERE l_orderkey = 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "expr/cast.csv"
+  },
+  {
+    "id": "expr/string_functions",
+    "sql": "SELECT\n    n_nationkey,\n    UPPER(n_name) AS upper_name,\n    LOWER(n_name) AS lower_name,\n    LENGTH(n_name) AS name_len,\n    SUBSTRING(n_name FROM 1 FOR 3) AS name_prefix\nFROM nation\nORDER BY n_nationkey\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "expr/string_functions.csv"
+  },
+  {
+    "id": "expr/math_functions",
+    "sql": "SELECT\n    ABS(-42) AS abs_val,\n    ROUND(3.7) AS rounded,\n    FLOOR(3.7) AS floored,\n    CEIL(3.2) AS ceiled\nFROM nation\nLIMIT 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "expr/math_functions.csv"
+  },
+  {
+    "id": "expr/date_extract",
+    "sql": "SELECT\n    o_orderkey,\n    CAST(EXTRACT(YEAR FROM o_orderdate) AS BIGINT) AS order_year,\n    CAST(EXTRACT(MONTH FROM o_orderdate) AS BIGINT) AS order_month,\n    CAST(EXTRACT(DAY FROM o_orderdate) AS BIGINT) AS order_day\nFROM orders\nORDER BY o_orderkey\nLIMIT 10",
+    "ordered": true,
+    "row_count": 10,
+    "file": "expr/date_extract.csv"
+  },
+  {
+    "id": "expr/trim_replace",
+    "sql": "SELECT\n    TRIM('  hello  ') AS trimmed,\n    REPLACE('hello world', 'world', 'rust') AS replaced,\n    POSITION('llo' IN 'hello') AS pos\nFROM nation\nLIMIT 1",
+    "ordered": false,
+    "row_count": 1,
+    "file": "expr/trim_replace.csv"
+  },
+  {
+    "id": "distinct/simple",
+    "sql": "SELECT DISTINCT l_returnflag FROM lineitem ORDER BY l_returnflag",
+    "ordered": true,
+    "row_count": 3,
+    "file": "distinct/simple.csv"
+  },
+  {
+    "id": "distinct/multi_column",
+    "sql": "SELECT DISTINCT l_returnflag, l_linestatus FROM lineitem ORDER BY l_returnflag, l_linestatus",
+    "ordered": true,
+    "row_count": 6,
+    "file": "distinct/multi_column.csv"
+  },
+  {
+    "id": "distinct/with_expression",
+    "sql": "SELECT DISTINCT n_regionkey FROM nation ORDER BY n_regionkey",
+    "ordered": true,
+    "row_count": 5,
+    "file": "distinct/with_expression.csv"
+  },
+  {
+    "id": "setop/union",
+    "sql": "SELECT n_name FROM nation WHERE n_regionkey = 0\nUNION\nSELECT n_name FROM nation WHERE n_regionkey = 1\nORDER BY n_name",
+    "ordered": true,
+    "row_count": 10,
+    "file": "setop/union.csv"
+  },
+  {
+    "id": "setop/union_all",
+    "sql": "SELECT n_regionkey FROM nation WHERE n_nationkey < 5\nUNION ALL\nSELECT n_regionkey FROM nation WHERE n_nationkey >= 20\nORDER BY n_regionkey",
+    "ordered": true,
+    "row_count": 10,
+    "file": "setop/union_all.csv"
+  },
+  {
+    "id": "setop/intersect",
+    "sql": "SELECT n_regionkey FROM nation WHERE n_nationkey < 10\nINTERSECT\nSELECT n_regionkey FROM nation WHERE n_nationkey >= 5\nORDER BY n_regionkey",
+    "ordered": true,
+    "row_count": 5,
+    "file": "setop/intersect.csv"
+  },
+  {
+    "id": "setop/except",
+    "sql": "SELECT n_regionkey FROM nation WHERE n_nationkey < 15\nEXCEPT\nSELECT n_regionkey FROM nation WHERE n_nationkey >= 10\nORDER BY n_regionkey",
+    "ordered": true,
+    "row_count": 0,
+    "file": "setop/except.csv"
+  },
+  {
+    "id": "complex/nested_subquery_agg",
+    "sql": "SELECT n_name, total_balance\nFROM (\n    SELECT n.n_name, SUM(s.s_acctbal) AS total_balance\n    FROM nation n, supplier s\n    WHERE n.n_nationkey = s.s_nationkey\n    GROUP BY n.n_name\n) sub\nWHERE total_balance > 0\nORDER BY total_balance DESC\nLIMIT 10",
+    "ordered": true,
+    "row_count": 7,
+    "file": "complex/nested_subquery_agg.csv"
+  },
+  {
+    "id": "complex/multi_join_having",
+    "sql": "SELECT r.r_name, COUNT(DISTINCT s.s_suppkey) AS num_suppliers\nFROM region r, nation n, supplier s\nWHERE r.r_regionkey = n.n_regionkey AND n.n_nationkey = s.s_nationkey\nGROUP BY r.r_name\nHAVING COUNT(DISTINCT s.s_suppkey) > 1\nORDER BY num_suppliers DESC",
+    "ordered": true,
+    "row_count": 2,
+    "file": "complex/multi_join_having.csv"
+  },
+  {
+    "id": "complex/cte_with_join",
+    "sql": "WITH european_nations AS (\n    SELECT n.n_nationkey, n.n_name\n    FROM nation n, region r\n    WHERE n.n_regionkey = r.r_regionkey AND r.r_name = 'EUROPE'\n)\nSELECT en.n_name, COUNT(*) AS supplier_count\nFROM european_nations en, supplier s\nWHERE en.n_nationkey = s.s_nationkey\nGROUP BY en.n_name\nORDER BY supplier_count DESC, en.n_name",
+    "ordered": true,
+    "row_count": 3,
+    "file": "complex/cte_with_join.csv"
+  },
+  {
+    "id": "complex/derived_table_chain",
+    "sql": "SELECT region_name, avg_balance\nFROM (\n    SELECT r.r_name AS region_name, AVG(s.s_acctbal) AS avg_balance\n    FROM region r, nation n, supplier s\n    WHERE r.r_regionkey = n.n_regionkey AND n.n_nationkey = s.s_nationkey\n    GROUP BY r.r_name\n) sub\nORDER BY avg_balance DESC",
+    "ordered": true,
+    "row_count": 4,
+    "file": "complex/derived_table_chain.csv"
+  },
+  {
+    "id": "complex/case_in_aggregate",
+    "sql": "SELECT\n    n_regionkey,\n    COUNT(*) AS total_nations,\n    SUM(CASE WHEN n_nationkey < 10 THEN 1 ELSE 0 END) AS small_key_count,\n    SUM(CASE WHEN n_nationkey >= 10 THEN 1 ELSE 0 END) AS large_key_count\nFROM nation\nGROUP BY n_regionkey\nORDER BY n_regionkey",
+    "ordered": true,
+    "row_count": 5,
+    "file": "complex/case_in_aggregate.csv"
+  },
+  {
+    "id": "complex/exists_with_aggregate",
+    "sql": "SELECT n_name\nFROM nation n\nWHERE EXISTS (\n    SELECT 1\n    FROM supplier s\n    WHERE s.s_nationkey = n.n_nationkey\n    AND s.s_acctbal > (\n        SELECT AVG(s2.s_acctbal) FROM supplier s2\n    )\n)\nORDER BY n_name",
+    "ordered": true,
+    "row_count": 4,
+    "file": "complex/exists_with_aggregate.csv"
+  },
+  {
+    "id": "complex/union_with_aggregate",
+    "sql": "SELECT 'high' AS category, COUNT(*) AS cnt\nFROM orders WHERE o_totalprice > 200000\nUNION ALL\nSELECT 'medium' AS category, COUNT(*) AS cnt\nFROM orders WHERE o_totalprice BETWEEN 100000 AND 200000\nUNION ALL\nSELECT 'low' AS category, COUNT(*) AS cnt\nFROM orders WHERE o_totalprice < 100000\nORDER BY category",
+    "ordered": true,
+    "row_count": 3,
+    "file": "complex/union_with_aggregate.csv"
+  }
+]

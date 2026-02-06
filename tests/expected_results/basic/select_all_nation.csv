@@ -1,0 +1,26 @@
+n_nationkey,n_name,n_regionkey,n_comment
+0,ALGERIA,0,comment
+1,ARGENTINA,1,comment
+2,BRAZIL,1,comment
+3,CANADA,1,comment
+4,EGYPT,4,comment
+5,ETHIOPIA,0,comment
+6,FRANCE,3,comment
+7,GERMANY,3,comment
+8,INDIA,2,comment
+9,INDONESIA,2,comment
+10,IRAN,4,comment
+11,IRAQ,4,comment
+12,JAPAN,2,comment
+13,JORDAN,4,comment
+14,KENYA,0,comment
+15,MOROCCO,0,comment
+16,MOZAMBIQUE,0,comment
+17,PERU,1,comment
+18,CHINA,2,comment
+19,ROMANIA,3,comment
+20,SAUDI ARABIA,4,comment
+21,VIETNAM,2,comment
+22,RUSSIA,3,comment
+23,UNITED KINGDOM,3,comment
+24,UNITED STATES,1,comment
