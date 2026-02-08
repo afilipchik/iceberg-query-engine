@@ -58,11 +58,9 @@ impl PhysicalPlanner {
         }
     }
 
-    /// Check if spillable operators should be used
+    /// Check if spillable operators should be used (always true when memory pool is configured)
     fn use_spillable(&self) -> bool {
-        self.memory_pool.is_some()
-            && self.config.is_some()
-            && self.config.as_ref().unwrap().enable_spilling
+        self.memory_pool.is_some() && self.config.is_some()
     }
 
     /// Check if morsel execution should be used
@@ -199,18 +197,14 @@ impl PhysicalPlanner {
         let mut table_scans: HashMap<String, Vec<Option<Vec<usize>>>> = HashMap::new();
         Self::collect_scan_projections(logical, &mut table_scans);
 
-        // Build scan tasks: for each table, compute the union projection
+        // Build scan tasks: only prescan tables that are accessed 2+ times.
+        // Single-use tables will be read on-demand, reducing peak memory.
         let scan_tasks: Vec<_> = table_scans
             .iter()
+            .filter(|(_, projections)| projections.len() > 1) // Only shared tables
             .filter_map(|(table_name, projections)| {
                 let provider = self.tables.get(table_name)?;
-                // For tables scanned multiple times, use union projection
-                // For single-scan tables, use the requested projection
-                let proj = if projections.len() > 1 {
-                    Self::union_projection(projections)
-                } else {
-                    projections[0].clone()
-                };
+                let proj = Self::union_projection(projections);
                 Some((table_name.clone(), provider.clone(), proj))
             })
             .collect();

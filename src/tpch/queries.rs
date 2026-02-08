@@ -29,6 +29,43 @@ pub fn get_query(num: usize) -> Option<&'static str> {
     }
 }
 
+/// Get TPC-H query adjusted for scale factor.
+/// Q11's HAVING threshold uses 0.0001/SF per the TPC-H spec.
+pub fn get_query_for_sf(num: usize, sf: f64) -> Option<String> {
+    if num == 11 && sf != 1.0 {
+        let factor = 0.0001 / sf;
+        Some(format!(
+            r#"SELECT
+    ps_partkey,
+    SUM(ps_supplycost * ps_availqty) AS value
+FROM
+    partsupp,
+    supplier,
+    nation
+WHERE
+    ps_suppkey = s_suppkey
+    AND s_nationkey = n_nationkey
+    AND n_name = 'GERMANY'
+GROUP BY
+    ps_partkey
+HAVING
+    SUM(ps_supplycost * ps_availqty) > (
+        SELECT SUM(ps_supplycost * ps_availqty) * {}
+        FROM partsupp, supplier, nation
+        WHERE ps_suppkey = s_suppkey
+        AND s_nationkey = n_nationkey
+        AND n_name = 'GERMANY'
+    )
+ORDER BY
+    value DESC
+LIMIT 100"#,
+            factor
+        ))
+    } else {
+        get_query(num).map(|s| s.to_string())
+    }
+}
+
 /// Q1: Pricing Summary Report
 pub const Q1: &str = r#"
 SELECT

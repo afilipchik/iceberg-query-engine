@@ -201,9 +201,10 @@ impl PhysicalOperator for HashJoinExec {
             None
         };
 
-        // Semi/Anti always use probe_semi_anti_parallel which handles i64 internally.
-        // Other join types may fall through to the generic probe loop which also handles i64.
-        let can_skip_generic_ht = matches!(self.join_type, JoinType::Semi | JoinType::Anti);
+        // All join types can skip the generic hash table when i64 fast path is available.
+        // The generic probe loop has i64 fallback logic, and specialized parallel paths
+        // (Semi/Anti, Inner) handle i64 directly.
+        let can_skip_generic_ht = true;
 
         // Get or build the cached build side (computed ONCE, reused across all partitions)
         // For Semi/Anti, probe collection runs concurrently via probe_prefetch_handle
@@ -224,7 +225,7 @@ impl PhysicalOperator for HashJoinExec {
                 ));
 
                 // Memory safety: limit build side by bytes to prevent OOM crashes
-                const MAX_BUILD_BYTES: usize = 8 * 1024 * 1024 * 1024; // 8GB
+                const MAX_BUILD_BYTES: usize = 16 * 1024 * 1024 * 1024; // 16GB
 
                 // Collect all build partitions in parallel using tokio::spawn
                 let handles: Vec<_> = (0..build_partitions)
@@ -1698,9 +1699,33 @@ fn gather_column(
         offset += batch.num_rows();
     }
 
-    let all_arrays: Vec<&dyn arrow::array::Array> =
-        batches.iter().map(|b| b.column(col_idx).as_ref()).collect();
-    let concatenated = compute::concat(&all_arrays)?;
+    // Check if we need LargeUtf8 promotion to avoid 2GB i32 offset overflow
+    let dt = batches[0].column(col_idx).data_type().clone();
+    let needs_large_utf8 = dt == arrow::datatypes::DataType::Utf8 && {
+        let total_bytes: usize = batches
+            .iter()
+            .map(|b| b.column(col_idx).get_array_memory_size())
+            .sum();
+        total_bytes > 1_500_000_000 // 1.5GB threshold
+    };
+
+    let all_arrays: Vec<ArrayRef> = if needs_large_utf8 {
+        batches
+            .iter()
+            .map(|b| {
+                compute::cast(
+                    b.column(col_idx).as_ref(),
+                    &arrow::datatypes::DataType::LargeUtf8,
+                )
+                .map_err(Into::into)
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        batches.iter().map(|b| b.column(col_idx).clone()).collect()
+    };
+
+    let all_refs: Vec<&dyn arrow::array::Array> = all_arrays.iter().map(|a| a.as_ref()).collect();
+    let concatenated = compute::concat(&all_refs)?;
 
     let take_indices: Vec<u32> = indices
         .iter()
@@ -1713,7 +1738,14 @@ fn gather_column(
         })
         .collect();
     let take_arr = UInt32Array::from(take_indices);
-    compute::take(concatenated.as_ref(), &take_arr, None).map_err(Into::into)
+    let result = compute::take(concatenated.as_ref(), &take_arr, None)?;
+
+    // Cast back to Utf8 if we promoted
+    if needs_large_utf8 {
+        compute::cast(result.as_ref(), &arrow::datatypes::DataType::Utf8).map_err(Into::into)
+    } else {
+        Ok(result)
+    }
 }
 
 #[allow(dead_code)] // Reserved for join filter optimization

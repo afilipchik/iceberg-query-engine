@@ -39,6 +39,16 @@ Before committing any code changes:
 
 This ensures consistent code formatting across the codebase.
 
+### Memory Safety Rule
+
+**THE ENGINE MUST BE MEMORY-SAFE BY DEFAULT. OOM IS NEVER ACCEPTABLE.**
+
+- Spillable operators (SpillableHashJoinExec, SpillableHashAggregateExec, ExternalSortExec) are ALWAYS used
+- There is no flag or parameter to "enable" safe memory behavior — it is the default and only mode
+- Being slow on larger-than-memory datasets is acceptable; crashing with OOM is not
+- When adding new operators, they MUST handle memory limits and spill to disk when needed
+- Never add a parameter that lets users opt out of memory safety
+
 ### Benchmark Timeout Rule
 
 **SET BENCHMARK TIMEOUT TO 10x DUCKDB EXECUTION TIME.**
@@ -925,7 +935,7 @@ Based on the codebase structure, these appear to be planned but not fully implem
   - Column projection pushdown
   - CLI commands: `load-parquet`, `benchmark-parquet`, `generate-parquet`
 
-- **Larger-Than-Memory Dataset Support** (NEW)
+- **Larger-Than-Memory Dataset Support** (Memory-safe by default)
   - Memory pool infrastructure in `src/execution/memory.rs`
     - `MemoryPool` with RAII-based `MemoryReservation` tracking
     - `MemoryConsumer` trait for operators that can spill to disk
@@ -938,7 +948,7 @@ Based on the codebase structure, these appear to be planned but not fully implem
     - File-level min/max statistics filtering
     - Partition pruning support
     - Streaming data file reading via Parquet
-  - Spillable operators in `src/physical/operators/spillable.rs`
+  - Spillable operators are always active (no opt-in flag) in `src/physical/operators/spillable.rs`
     - `SpillableHashJoinExec`: Partitioned hash join that spills to disk
     - `SpillableHashAggregateExec`: Hash aggregation with spill support
     - `ExternalSortExec`: External merge sort for large datasets

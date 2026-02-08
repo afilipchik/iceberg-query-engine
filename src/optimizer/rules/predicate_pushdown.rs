@@ -422,7 +422,139 @@ impl PredicatePushdown {
                 self.split_conjunction(right, predicates);
             }
             _ => {
-                predicates.push(expr.clone());
+                // Try to extract common factors from OR expressions
+                // e.g. (A AND X) OR (B AND X) OR (C AND X) → X AND (A OR B OR C)
+                if let Some(factored) = self.extract_common_or_factors(expr) {
+                    for p in factored {
+                        self.split_conjunction(&p, predicates);
+                    }
+                } else {
+                    predicates.push(expr.clone());
+                }
+            }
+        }
+    }
+
+    /// Extract common factors from OR expressions.
+    /// Transforms `(A AND B) OR (A AND C)` into `[A, (B OR C)]`.
+    /// Returns None if no common factors found or expression is not an OR.
+    fn extract_common_or_factors(&self, expr: &Expr) -> Option<Vec<Expr>> {
+        // Collect OR branches
+        let mut branches = Vec::new();
+        self.collect_or_branches(expr, &mut branches);
+        if branches.len() < 2 {
+            return None;
+        }
+
+        // For each branch, split into AND conditions
+        let branch_conditions: Vec<Vec<Expr>> = branches
+            .iter()
+            .map(|b| {
+                let mut conds = Vec::new();
+                self.split_conjunction_into(b, &mut conds);
+                conds
+            })
+            .collect();
+
+        // Find conditions from the first branch that appear in ALL other branches
+        let mut common = Vec::new();
+        let mut first_remaining = Vec::new();
+
+        for cond in &branch_conditions[0] {
+            let cond_str = format!("{:?}", cond);
+            let in_all = branch_conditions[1..]
+                .iter()
+                .all(|branch| branch.iter().any(|c| format!("{:?}", c) == cond_str));
+            if in_all {
+                common.push(cond.clone());
+            } else {
+                first_remaining.push(cond.clone());
+            }
+        }
+
+        if common.is_empty() {
+            return None;
+        }
+
+        // Build remaining OR branches (remove common conditions from each)
+        let mut remaining_branches = Vec::new();
+        remaining_branches.push(first_remaining);
+
+        for branch in &branch_conditions[1..] {
+            let remaining: Vec<Expr> = branch
+                .iter()
+                .filter(|c| {
+                    let c_str = format!("{:?}", c);
+                    !common
+                        .iter()
+                        .any(|common_c| format!("{:?}", common_c) == c_str)
+                })
+                .cloned()
+                .collect();
+            remaining_branches.push(remaining);
+        }
+
+        // Build result: common conditions + simplified OR
+        let mut result = common;
+
+        // Only add the OR if branches have remaining conditions
+        let non_empty_branches: Vec<Expr> = remaining_branches
+            .into_iter()
+            .filter_map(|branch| {
+                if branch.is_empty() {
+                    None
+                } else {
+                    Some(self.combine_predicates(branch))
+                }
+            })
+            .collect();
+
+        if !non_empty_branches.is_empty() && non_empty_branches.len() >= 2 {
+            let or_expr = non_empty_branches
+                .into_iter()
+                .reduce(|a, b| Expr::BinaryExpr {
+                    left: Box::new(a),
+                    op: BinaryOp::Or,
+                    right: Box::new(b),
+                })
+                .unwrap();
+            result.push(or_expr);
+        } else if non_empty_branches.len() == 1 {
+            result.push(non_empty_branches.into_iter().next().unwrap());
+        }
+        // If all branches become empty, common conditions alone suffice
+
+        Some(result)
+    }
+
+    fn collect_or_branches(&self, expr: &Expr, branches: &mut Vec<Expr>) {
+        match expr {
+            Expr::BinaryExpr {
+                left,
+                op: BinaryOp::Or,
+                right,
+            } => {
+                self.collect_or_branches(left, branches);
+                self.collect_or_branches(right, branches);
+            }
+            _ => {
+                branches.push(expr.clone());
+            }
+        }
+    }
+
+    fn split_conjunction_into(&self, expr: &Expr, conditions: &mut Vec<Expr>) {
+        match expr {
+            Expr::BinaryExpr {
+                left,
+                op: BinaryOp::And,
+                right,
+            } => {
+                self.split_conjunction_into(left, conditions);
+                self.split_conjunction_into(right, conditions);
+            }
+            _ => {
+                conditions.push(expr.clone());
             }
         }
     }

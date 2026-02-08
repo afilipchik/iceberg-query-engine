@@ -6,7 +6,7 @@ use crate::physical::{PhysicalOperator, RecordBatchStream};
 use crate::planner::{SortDirection, SortExpr};
 use arrow::array::ArrayRef;
 use arrow::compute::{self, SortColumn, SortOptions};
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, Field, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use futures::stream::{self, TryStreamExt};
@@ -62,10 +62,30 @@ impl PhysicalOperator for SortExec {
             return Ok(Box::pin(stream::empty()));
         }
 
-        let batch = concat_batches(&self.schema, &all_batches)?;
+        // Check if Utf8 columns risk exceeding the 2GB i32 offset limit
+        let needs_large_utf8 = check_string_overflow_risk(&self.schema, &all_batches);
+
+        let (working_schema, working_batches) = if needs_large_utf8 {
+            let schema = promote_utf8_schema(&self.schema);
+            let batches = all_batches
+                .iter()
+                .map(|b| promote_utf8_batch(b))
+                .collect::<Result<Vec<_>>>()?;
+            (schema, batches)
+        } else {
+            (self.schema.clone(), all_batches)
+        };
+
+        let batch = concat_batches(&working_schema, &working_batches)?;
 
         // Sort
         let sorted = sort_batch(&batch, &self.order_by)?;
+
+        let sorted = if needs_large_utf8 {
+            demote_utf8_batch(&sorted)?
+        } else {
+            sorted
+        };
 
         Ok(Box::pin(stream::once(async { Ok(sorted) })))
     }
@@ -136,6 +156,96 @@ fn sort_batch(batch: &RecordBatch, order_by: &[SortExpr]) -> Result<RecordBatch>
         .collect();
 
     RecordBatch::try_new(batch.schema(), sorted_columns?).map_err(Into::into)
+}
+
+/// Check if concatenating batches would risk exceeding the 2GB i32 offset limit
+/// for any Utf8 column. Returns true if any string column's total data exceeds 1.5GB.
+fn check_string_overflow_risk(schema: &SchemaRef, batches: &[RecordBatch]) -> bool {
+    const THRESHOLD: usize = 1_500_000_000; // 1.5GB
+
+    for (col_idx, field) in schema.fields().iter().enumerate() {
+        if *field.data_type() == DataType::Utf8 {
+            let total_bytes: usize = batches
+                .iter()
+                .map(|b| {
+                    if col_idx < b.num_columns() {
+                        b.column(col_idx).get_array_memory_size()
+                    } else {
+                        0
+                    }
+                })
+                .sum();
+            if total_bytes > THRESHOLD {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Create a new schema with Utf8 fields promoted to LargeUtf8
+fn promote_utf8_schema(schema: &SchemaRef) -> SchemaRef {
+    let fields: Vec<Arc<Field>> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            if *f.data_type() == DataType::Utf8 {
+                Arc::new(Field::new(f.name(), DataType::LargeUtf8, f.is_nullable()))
+            } else {
+                f.clone()
+            }
+        })
+        .collect();
+    Arc::new(arrow::datatypes::Schema::new(fields))
+}
+
+/// Cast Utf8 columns to LargeUtf8 in a batch
+fn promote_utf8_batch(batch: &RecordBatch) -> Result<RecordBatch> {
+    let new_schema = promote_utf8_schema(&batch.schema());
+    let columns: Result<Vec<ArrayRef>> = batch
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(i, col)| {
+            if *batch.schema().field(i).data_type() == DataType::Utf8 {
+                compute::cast(col.as_ref(), &DataType::LargeUtf8).map_err(Into::into)
+            } else {
+                Ok(col.clone())
+            }
+        })
+        .collect();
+    RecordBatch::try_new(new_schema, columns?).map_err(Into::into)
+}
+
+/// Cast LargeUtf8 columns back to Utf8 in a batch
+fn demote_utf8_batch(batch: &RecordBatch) -> Result<RecordBatch> {
+    let fields: Vec<Arc<Field>> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| {
+            if *f.data_type() == DataType::LargeUtf8 {
+                Arc::new(Field::new(f.name(), DataType::Utf8, f.is_nullable()))
+            } else {
+                f.clone()
+            }
+        })
+        .collect();
+    let new_schema = Arc::new(arrow::datatypes::Schema::new(fields));
+
+    let columns: Result<Vec<ArrayRef>> = batch
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(i, col)| {
+            if *batch.schema().field(i).data_type() == DataType::LargeUtf8 {
+                compute::cast(col.as_ref(), &DataType::Utf8).map_err(Into::into)
+            } else {
+                Ok(col.clone())
+            }
+        })
+        .collect();
+    RecordBatch::try_new(new_schema, columns?).map_err(Into::into)
 }
 
 #[cfg(test)]

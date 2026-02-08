@@ -26,7 +26,11 @@ use std::fmt;
 use std::fs::File;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Unique counter for spill directory names to avoid conflicts between concurrent operators
+static SPILL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Number of hash partitions for spilling
 const NUM_PARTITIONS: usize = 64;
@@ -148,26 +152,72 @@ impl PhysicalOperator for SpillableHashJoinExec {
     }
 
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
-        // Ensure spill directory exists
-        self.config.ensure_spill_dir()?;
-
-        let spill_dir = self.config.spill_path.join(format!("join_{}", partition));
-        std::fs::create_dir_all(&spill_dir).map_err(|e| {
-            QueryError::Execution(format!("Failed to create spill directory: {}", e))
-        })?;
-
         // Determine build and probe sides
         let (build_side, probe_side, swapped) = match self.join_type {
             JoinType::Right => (&self.right, &self.left, true),
             _ => (&self.left, &self.right, false),
         };
 
+        // Collect ALL build-side partitions
+        let build_partitions = build_side.output_partitions().max(1);
+        let mut build_batches = Vec::new();
+        for p in 0..build_partitions {
+            let build_stream = build_side.execute(p).await?;
+            let batches: Vec<RecordBatch> = build_stream.try_collect().await?;
+            build_batches.extend(batches);
+        }
+
+        // Check if build side fits in memory — if so, delegate to HashJoinExec
+        let build_size: usize = build_batches.iter().map(|b| estimate_batch_size(b)).sum();
+        let memory_threshold =
+            (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
+
+        if build_size <= memory_threshold {
+            // Build side fits in memory — use the proven HashJoinExec
+            let build_schema = build_batches
+                .first()
+                .map(|b| b.schema())
+                .unwrap_or_else(|| build_side.schema());
+            let build_mem = Arc::new(crate::physical::operators::MemoryTableExec::new(
+                "join_build",
+                build_schema,
+                build_batches,
+                None,
+            ));
+            let (left, right) = if swapped {
+                (self.left.clone(), build_mem as Arc<dyn PhysicalOperator>)
+            } else {
+                (build_mem as Arc<dyn PhysicalOperator>, self.right.clone())
+            };
+            let hash_join = crate::physical::operators::HashJoinExec::new(
+                left,
+                right,
+                self.on.clone(),
+                self.join_type,
+            );
+            return hash_join.execute(partition).await;
+        }
+
+        // Build side exceeds memory — use spillable path
+        self.config.ensure_spill_dir()?;
+
+        let spill_id = SPILL_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let spill_dir = self
+            .config
+            .spill_path
+            .join(format!("join_{}_{}", partition, spill_id));
+        std::fs::create_dir_all(&spill_dir).map_err(|e| {
+            QueryError::Execution(format!("Failed to create spill directory: {}", e))
+        })?;
+
         let (on_left, on_right): (Vec<_>, Vec<_>) = self.on.iter().cloned().unzip();
         let build_keys = if swapped { &on_right } else { &on_left };
         let probe_keys = if swapped { &on_left } else { &on_right };
 
+        let build_stream: RecordBatchStream =
+            Box::pin(stream::iter(build_batches.into_iter().map(Ok)));
+
         // Build phase with partitioning
-        let build_stream = build_side.execute(partition).await?;
         let (mut in_memory_partitions, spilled_partitions) = self
             .build_with_partitioning(build_stream, build_keys, &spill_dir)
             .await?;
@@ -185,8 +235,16 @@ impl PhysicalOperator for SpillableHashJoinExec {
             }
         }
 
-        // Probe phase
-        let probe_stream = probe_side.execute(partition).await?;
+        // Collect ALL probe-side partitions into a single stream
+        let probe_partitions = probe_side.output_partitions().max(1);
+        let mut probe_batches = Vec::new();
+        for p in 0..probe_partitions {
+            let probe_stream = probe_side.execute(p).await?;
+            let batches: Vec<RecordBatch> = probe_stream.try_collect().await?;
+            probe_batches.extend(batches);
+        }
+        let probe_stream: RecordBatchStream =
+            Box::pin(stream::iter(probe_batches.into_iter().map(Ok)));
         let results = self
             .probe_with_spilling(
                 probe_stream,
@@ -469,18 +527,69 @@ impl PhysicalOperator for SpillableHashAggregateExec {
     }
 
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
-        // Ensure spill directory exists
+        // Aggregation always produces a single partition by collecting from all input partitions
+        if partition != 0 {
+            return Ok(Box::pin(stream::empty()));
+        }
+
+        // Collect from ALL input partitions (input may split data across partitions)
+        let input_partitions = self.input.output_partitions().max(1);
+        let mut all_batches = Vec::new();
+        for p in 0..input_partitions {
+            let input_stream = self.input.execute(p).await?;
+            let batches: Vec<RecordBatch> = input_stream.try_collect().await?;
+            all_batches.extend(batches);
+        }
+
+        // Check total memory usage
+        let total_size: usize = all_batches.iter().map(|b| estimate_batch_size(b)).sum();
+        let memory_threshold =
+            (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
+
+        if total_size <= memory_threshold {
+            // Data fits in memory — delegate to the proven HashAggregateExec
+            let hash_aggs: Vec<crate::physical::operators::hash_agg::AggregateExpr> = self
+                .aggregates
+                .iter()
+                .map(|a| crate::physical::operators::hash_agg::AggregateExpr {
+                    func: a.func,
+                    input: a.input.clone(),
+                    distinct: a.distinct,
+                    second_arg: a.second_arg.clone(),
+                })
+                .collect();
+            let mem = crate::physical::operators::MemoryTableExec::new(
+                "agg_input",
+                all_batches
+                    .first()
+                    .map(|b| b.schema())
+                    .unwrap_or_else(|| self.schema.clone()),
+                all_batches,
+                None,
+            );
+            let hash_agg = crate::physical::operators::HashAggregateExec::new(
+                Arc::new(mem),
+                self.group_by.clone(),
+                hash_aggs,
+                self.schema.clone(),
+            );
+            return hash_agg.execute(0).await;
+        }
+
+        // Data exceeds memory — use spillable aggregation path
         self.config.ensure_spill_dir()?;
 
-        let spill_dir =
-            self.config
-                .spill_path
-                .join(format!("agg_{}_{}", partition, std::process::id()));
+        let spill_id = SPILL_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let spill_dir = self
+            .config
+            .spill_path
+            .join(format!("agg_{}_{}", partition, spill_id));
         std::fs::create_dir_all(&spill_dir).map_err(|e| {
             QueryError::Execution(format!("Failed to create spill directory: {}", e))
         })?;
 
-        let input_stream = self.input.execute(partition).await?;
+        let input_stream: RecordBatchStream =
+            Box::pin(stream::iter(all_batches.into_iter().map(Ok)));
 
         // Process with partitioning and spilling
         let (in_memory_partitions, spilled_files) = self
@@ -554,20 +663,40 @@ impl PhysicalOperator for SpillableHashAggregateExec {
             )));
         }
 
-        // Multiple partitions: need to re-aggregate the partial results
-        let final_result = crate::physical::operators::hash_agg::aggregate_batches_external(
-            &all_results,
-            &self.group_by,
-            &self
-                .aggregates
-                .iter()
-                .map(|a| crate::physical::operators::hash_agg::AggregateExpr {
+        // Multiple partitions: need to re-aggregate the partial results.
+        // Partial results use the output schema, so aggregate inputs must reference
+        // the output column names (e.g., "SUM(value)") not the original input columns.
+        let num_groups = self.group_by.len();
+        let merge_aggs: Vec<crate::physical::operators::hash_agg::AggregateExpr> = self
+            .aggregates
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let output_col_name = self.schema.field(num_groups + i).name().clone();
+                crate::physical::operators::hash_agg::AggregateExpr {
                     func: a.func,
-                    input: a.input.clone(),
+                    input: Expr::Column(crate::planner::Column::new(output_col_name)),
                     distinct: a.distinct,
                     second_arg: a.second_arg.clone(),
-                })
-                .collect::<Vec<_>>(),
+                }
+            })
+            .collect();
+
+        // Group-by expressions also need to reference output column names
+        let merge_group_by: Vec<Expr> = self
+            .group_by
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let col_name = self.schema.field(i).name().clone();
+                Expr::Column(crate::planner::Column::new(col_name))
+            })
+            .collect();
+
+        let final_result = crate::physical::operators::hash_agg::aggregate_batches_external(
+            &all_results,
+            &merge_group_by,
+            &merge_aggs,
             &self.schema,
         )?;
 
@@ -711,14 +840,62 @@ impl PhysicalOperator for ExternalSortExec {
     }
 
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
+        // Sort always produces a single partition
+        if partition != 0 {
+            return Ok(Box::pin(stream::empty()));
+        }
+
+        // Collect from ALL input partitions (input may split data across partitions)
+        let input_partitions = self.input.output_partitions().max(1);
+        let mut all_batches = Vec::new();
+        for p in 0..input_partitions {
+            let input_stream = self.input.execute(p).await?;
+            let batches: Vec<RecordBatch> = input_stream.try_collect().await?;
+            all_batches.extend(batches);
+        }
+
+        if all_batches.is_empty() {
+            return Ok(Box::pin(stream::empty()));
+        }
+
+        // Check total memory usage
+        let total_size: usize = all_batches.iter().map(|b| estimate_batch_size(b)).sum();
+        let memory_threshold =
+            (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
+
+        if total_size <= memory_threshold {
+            // Data fits in memory — use the regular SortExec path for correctness
+            let sort = crate::physical::operators::SortExec::new(
+                self.input.clone(),
+                self.order_by.clone(),
+            );
+            // SortExec.execute(0) re-collects from input partitions, so we create
+            // a temporary MemoryTableExec with our already-collected data
+            let mem = crate::physical::operators::MemoryTableExec::new(
+                "sort_input",
+                self.schema.clone(),
+                all_batches,
+                None,
+            );
+            let sort =
+                crate::physical::operators::SortExec::new(Arc::new(mem), self.order_by.clone());
+            return sort.execute(0).await;
+        }
+
+        // Data exceeds memory — use external sort with spilling
         self.config.ensure_spill_dir()?;
 
-        let spill_dir = self.config.spill_path.join(format!("sort_{}", partition));
+        let spill_id = SPILL_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let spill_dir = self
+            .config
+            .spill_path
+            .join(format!("sort_{}_{}", partition, spill_id));
         std::fs::create_dir_all(&spill_dir).map_err(|e| {
             QueryError::Execution(format!("Failed to create spill directory: {}", e))
         })?;
 
-        let input_stream = self.input.execute(partition).await?;
+        let input_stream: RecordBatchStream =
+            Box::pin(stream::iter(all_batches.into_iter().map(Ok)));
 
         // Generate sorted runs
         let runs = self.generate_runs(input_stream, &spill_dir).await?;
@@ -727,15 +904,12 @@ impl PhysicalOperator for ExternalSortExec {
         let result = if runs.is_empty() {
             Vec::new()
         } else if runs.len() == 1 {
-            // Single run - just read it
             if runs[0].is_file() {
                 read_parquet(&runs[0])?
             } else {
-                // In-memory run (stored as path to temp file)
                 Vec::new()
             }
         } else {
-            // Multi-way merge
             self.merge_runs(&runs)?
         };
 

@@ -44,6 +44,160 @@ struct JoinEdge {
 }
 
 impl JoinReorder {
+    /// Recursively reorder subquery plans inside an expression.
+    /// This ensures cross joins within scalar subqueries, EXISTS, and IN subqueries
+    /// are also optimized.
+    fn reorder_expr(&self, expr: &Expr) -> Result<Expr> {
+        match expr {
+            Expr::ScalarSubquery(subquery) => {
+                let reordered = self.reorder(subquery)?;
+                Ok(Expr::ScalarSubquery(Arc::new(reordered)))
+            }
+            Expr::Exists { subquery, negated } => {
+                let reordered = self.reorder(subquery)?;
+                Ok(Expr::Exists {
+                    subquery: Arc::new(reordered),
+                    negated: *negated,
+                })
+            }
+            Expr::InSubquery {
+                expr: inner_expr,
+                subquery,
+                negated,
+            } => {
+                let reordered_expr = self.reorder_expr(inner_expr)?;
+                let reordered_plan = self.reorder(subquery)?;
+                Ok(Expr::InSubquery {
+                    expr: Box::new(reordered_expr),
+                    subquery: Arc::new(reordered_plan),
+                    negated: *negated,
+                })
+            }
+            Expr::BinaryExpr { left, op, right } => {
+                let new_left = self.reorder_expr(left)?;
+                let new_right = self.reorder_expr(right)?;
+                Ok(Expr::BinaryExpr {
+                    left: Box::new(new_left),
+                    op: *op,
+                    right: Box::new(new_right),
+                })
+            }
+            Expr::UnaryExpr { op, expr: inner } => {
+                let new_inner = self.reorder_expr(inner)?;
+                Ok(Expr::UnaryExpr {
+                    op: *op,
+                    expr: Box::new(new_inner),
+                })
+            }
+            Expr::Alias { expr: inner, name } => {
+                let new_inner = self.reorder_expr(inner)?;
+                Ok(Expr::Alias {
+                    expr: Box::new(new_inner),
+                    name: name.clone(),
+                })
+            }
+            Expr::Cast {
+                expr: inner,
+                data_type,
+            } => {
+                let new_inner = self.reorder_expr(inner)?;
+                Ok(Expr::Cast {
+                    expr: Box::new(new_inner),
+                    data_type: data_type.clone(),
+                })
+            }
+            Expr::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
+                let new_operand = operand
+                    .as_ref()
+                    .map(|e| self.reorder_expr(e).map(Box::new))
+                    .transpose()?;
+                let new_when_then = when_then
+                    .iter()
+                    .map(|(w, t)| Ok((self.reorder_expr(w)?, self.reorder_expr(t)?)))
+                    .collect::<Result<Vec<_>>>()?;
+                let new_else = else_expr
+                    .as_ref()
+                    .map(|e| self.reorder_expr(e).map(Box::new))
+                    .transpose()?;
+                Ok(Expr::Case {
+                    operand: new_operand,
+                    when_then: new_when_then,
+                    else_expr: new_else,
+                })
+            }
+            Expr::ScalarFunc { func, args } => {
+                let new_args = args
+                    .iter()
+                    .map(|a| self.reorder_expr(a))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Expr::ScalarFunc {
+                    func: func.clone(),
+                    args: new_args,
+                })
+            }
+            Expr::Aggregate {
+                func,
+                args,
+                distinct,
+            } => {
+                let new_args = args
+                    .iter()
+                    .map(|a| self.reorder_expr(a))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Expr::Aggregate {
+                    func: func.clone(),
+                    args: new_args,
+                    distinct: *distinct,
+                })
+            }
+            Expr::InList {
+                expr: inner,
+                list,
+                negated,
+            } => {
+                let new_inner = self.reorder_expr(inner)?;
+                let new_list = list
+                    .iter()
+                    .map(|e| self.reorder_expr(e))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Expr::InList {
+                    expr: Box::new(new_inner),
+                    list: new_list,
+                    negated: *negated,
+                })
+            }
+            Expr::Between {
+                expr: inner,
+                low,
+                high,
+                negated,
+            } => {
+                let new_inner = self.reorder_expr(inner)?;
+                let new_low = self.reorder_expr(low)?;
+                let new_high = self.reorder_expr(high)?;
+                Ok(Expr::Between {
+                    expr: Box::new(new_inner),
+                    low: Box::new(new_low),
+                    high: Box::new(new_high),
+                    negated: *negated,
+                })
+            }
+            // Leaf expressions — no subqueries possible
+            Expr::Column(_) | Expr::Literal(_) | Expr::Wildcard | Expr::QualifiedWildcard(_) => {
+                Ok(expr.clone())
+            }
+        }
+    }
+
+    /// Reorder expressions in a vec, recursing into subqueries
+    fn reorder_exprs(&self, exprs: &[Expr]) -> Result<Vec<Expr>> {
+        exprs.iter().map(|e| self.reorder_expr(e)).collect()
+    }
+
     fn reorder(&self, plan: &LogicalPlan) -> Result<LogicalPlan> {
         match plan {
             LogicalPlan::Filter(node) => {
@@ -53,17 +207,19 @@ impl JoinReorder {
                     return self.reorder_filter_with_join(node);
                 }
                 let input = self.reorder(&node.input)?;
+                let predicate = self.reorder_expr(&node.predicate)?;
                 Ok(LogicalPlan::Filter(crate::planner::FilterNode {
                     input: Arc::new(input),
-                    predicate: node.predicate.clone(),
+                    predicate,
                 }))
             }
 
             LogicalPlan::Project(node) => {
                 let input = self.reorder(&node.input)?;
+                let exprs = self.reorder_exprs(&node.exprs)?;
                 Ok(LogicalPlan::Project(crate::planner::ProjectNode {
                     input: Arc::new(input),
-                    exprs: node.exprs.clone(),
+                    exprs,
                     schema: node.schema.clone(),
                 }))
             }
@@ -107,10 +263,12 @@ impl JoinReorder {
 
             LogicalPlan::Aggregate(node) => {
                 let input = self.reorder(&node.input)?;
+                let group_by = self.reorder_exprs(&node.group_by)?;
+                let aggregates = self.reorder_exprs(&node.aggregates)?;
                 Ok(LogicalPlan::Aggregate(crate::planner::AggregateNode {
                     input: Arc::new(input),
-                    group_by: node.group_by.clone(),
-                    aggregates: node.aggregates.clone(),
+                    group_by,
+                    aggregates,
                     schema: node.schema.clone(),
                 }))
             }
@@ -330,7 +488,13 @@ impl JoinReorder {
                     // This reduces intermediate result sizes
                     let size_score = self.estimate_relation_size_score(&relations[edge.right_idx]);
                     let cond_score = edge.conditions.len() as i32 * 100;
-                    let score = size_score + cond_score;
+                    // Penalize M:N same-dimension FK joins heavily
+                    let mn_penalty = if self.is_same_dimension_fk_edge(edge, relations) {
+                        -5000
+                    } else {
+                        0
+                    };
+                    let score = size_score + cond_score + mn_penalty;
                     if score > best_score {
                         best_score = score;
                         best_edge = Some((edge_idx, edge.right_idx));
@@ -339,7 +503,13 @@ impl JoinReorder {
                     // Score based on: prefer small tables (dimension tables) to join early
                     let size_score = self.estimate_relation_size_score(&relations[edge.left_idx]);
                     let cond_score = edge.conditions.len() as i32 * 100;
-                    let score = size_score + cond_score;
+                    // Penalize M:N same-dimension FK joins heavily
+                    let mn_penalty = if self.is_same_dimension_fk_edge(edge, relations) {
+                        -5000
+                    } else {
+                        0
+                    };
+                    let score = size_score + cond_score + mn_penalty;
                     if score > best_score {
                         best_score = score;
                         best_edge = Some((edge_idx, edge.left_idx));
@@ -355,22 +525,37 @@ impl JoinReorder {
                 let current = result_plan.take().unwrap();
                 let new_rel = relations[new_rel_idx].plan.clone();
 
-                // Put current (accumulated result) as build (left), new relation as probe (right)
-                let on = if edge.right_idx == new_rel_idx {
-                    // edge: left=current_side, right=new_rel → matches our layout
+                // Orient conditions so left=current, right=new_rel
+                let on_current_left = if edge.right_idx == new_rel_idx {
                     edge.conditions.clone()
                 } else {
-                    // edge: left=new_rel, right=current_side → swap for our layout
                     edge.conditions
                         .iter()
                         .map(|(l, r)| (r.clone(), l.clone()))
                         .collect()
                 };
 
-                let mut schema_fields = current.schema().fields().to_vec();
-                schema_fields.extend(new_rel.schema().fields().iter().cloned());
+                // Decide build/probe: prefer the smaller side as build (left).
+                // If the accumulated result has 2+ tables and the new relation is
+                // a small dimension table, swap so new_rel is build.
+                let accumulated_tables = self.count_joined_tables(&current);
+                let new_rel_is_small = !self.is_large_table(&relations[new_rel_idx]);
+                let swap_build_probe = accumulated_tables >= 2 && new_rel_is_small;
+
+                let (left, right, on) = if swap_build_probe {
+                    // new_rel as build (left), accumulated as probe (right)
+                    let swapped_on: Vec<(Expr, Expr)> = on_current_left
+                        .iter()
+                        .map(|(l, r)| (r.clone(), l.clone()))
+                        .collect();
+                    (new_rel, current, swapped_on)
+                } else {
+                    (current, new_rel, on_current_left)
+                };
+
+                let mut schema_fields = left.schema().fields().to_vec();
+                schema_fields.extend(right.schema().fields().iter().cloned());
                 let schema = crate::planner::PlanSchema::new(schema_fields);
-                let (left, right) = (current, new_rel);
 
                 result_plan = Some(LogicalPlan::Join(JoinNode {
                     left: Arc::new(left),
@@ -606,7 +791,13 @@ impl JoinReorder {
                     // Can add right relation
                     let base_score = edge.conditions.len() as i32 * 100;
                     let size_score = self.estimate_relation_size_score(&relations[edge.right_idx]);
-                    let score = base_score + size_score;
+                    // Penalize M:N same-dimension FK joins heavily
+                    let mn_penalty = if self.is_same_dimension_fk_edge(edge, &relations) {
+                        -5000
+                    } else {
+                        0
+                    };
+                    let score = base_score + size_score + mn_penalty;
                     if score > best_score {
                         best_score = score;
                         best_edge = Some((edge_idx, edge.right_idx));
@@ -615,7 +806,13 @@ impl JoinReorder {
                     // Can add left relation
                     let base_score = edge.conditions.len() as i32 * 100;
                     let size_score = self.estimate_relation_size_score(&relations[edge.left_idx]);
-                    let score = base_score + size_score;
+                    // Penalize M:N same-dimension FK joins heavily
+                    let mn_penalty = if self.is_same_dimension_fk_edge(edge, &relations) {
+                        -5000
+                    } else {
+                        0
+                    };
+                    let score = base_score + size_score + mn_penalty;
                     if score > best_score {
                         best_score = score;
                         best_edge = Some((edge_idx, edge.left_idx));
@@ -632,30 +829,40 @@ impl JoinReorder {
                 let new_rel = &relations[new_idx];
                 let current = result_plan.take().unwrap();
 
-                // Build join conditions: left side = current (build), right side = new_rel (probe)
-                // The accumulated result goes on the BUILD (left) side because it's smaller
-                // in a star/snowflake schema (dimension tables join first, then fact tables probe)
-                let conditions = if edge.right_idx == new_idx {
-                    // edge: left=current_side, right=new_rel → matches our layout
+                // Orient conditions so left=current, right=new_rel
+                let on_current_left = if edge.right_idx == new_idx {
                     edge.conditions.clone()
                 } else {
-                    // edge: left=new_rel, right=current_side → swap for our layout
                     edge.conditions
                         .iter()
                         .map(|(l, r)| (r.clone(), l.clone()))
                         .collect()
                 };
 
-                // Schema: current (left/build) first, then new_rel (right/probe)
-                let current_schema = current.schema();
-                let new_schema = new_rel.plan.schema();
-                let combined_schema = current_schema.merge(&new_schema);
+                // Decide build/probe: prefer the smaller side as build (left).
+                let accumulated_tables = self.count_joined_tables(&current);
+                let new_rel_is_small = !self.is_large_table(new_rel);
+                let swap_build_probe = accumulated_tables >= 2 && new_rel_is_small;
+
+                let (left, right, on) = if swap_build_probe {
+                    let swapped_on: Vec<(Expr, Expr)> = on_current_left
+                        .iter()
+                        .map(|(l, r)| (r.clone(), l.clone()))
+                        .collect();
+                    (new_rel.plan.clone(), current, swapped_on)
+                } else {
+                    (current, new_rel.plan.clone(), on_current_left)
+                };
+
+                let left_schema = left.schema();
+                let right_schema = right.schema();
+                let combined_schema = left_schema.merge(&right_schema);
 
                 result_plan = Some(LogicalPlan::Join(JoinNode {
-                    left: Arc::new(current),               // Accumulated result as build
-                    right: Arc::new(new_rel.plan.clone()), // New relation as probe
+                    left: Arc::new(left),
+                    right: Arc::new(right),
                     join_type: JoinType::Inner,
-                    on: conditions,
+                    on,
                     filter: None,
                     schema: combined_schema,
                 }));
@@ -1022,6 +1229,92 @@ impl JoinReorder {
         best_idx
     }
 
+    /// Check if an edge's conditions are all "same-dimension FK" patterns.
+    /// E.g., `c_nationkey = s_nationkey` — both reference the `nation` dimension
+    /// but neither table IS the nation table. This creates M:N join explosions.
+    fn is_same_dimension_fk_edge(&self, edge: &JoinEdge, relations: &[JoinRelation]) -> bool {
+        if edge.conditions.is_empty() {
+            return false;
+        }
+        // All conditions on this edge must be same-dimension FK
+        edge.conditions.iter().all(|(left_expr, right_expr)| {
+            self.is_same_dimension_fk_condition(left_expr, right_expr, relations, edge)
+        })
+    }
+
+    /// Check if a single condition is a same-dimension FK pattern.
+    /// Detects `X.foo_key = Y.foo_key` where both columns reference the same
+    /// dimension (e.g., nationkey → nation) but neither relation IS that dimension.
+    fn is_same_dimension_fk_condition(
+        &self,
+        left_expr: &Expr,
+        right_expr: &Expr,
+        relations: &[JoinRelation],
+        edge: &JoinEdge,
+    ) -> bool {
+        // Extract the raw column names
+        let left_name = self.extract_column_name(left_expr);
+        let right_name = self.extract_column_name(right_expr);
+        let (left_name, right_name) = match (left_name, right_name) {
+            (Some(l), Some(r)) => (l, r),
+            _ => return false,
+        };
+
+        // Strip single-char prefix + underscore: c_nationkey → nationkey, s_nationkey → nationkey
+        let left_base = strip_prefix(&left_name);
+        let right_base = strip_prefix(&right_name);
+
+        // Both base names must match
+        if left_base != right_base {
+            return false;
+        }
+
+        // The base name should end with "key" to indicate a foreign key pattern
+        if !left_base.ends_with("key") {
+            return false;
+        }
+
+        // Extract dimension name: "nationkey" → "nation", "partkey" → "part"
+        let dimension = left_base.trim_end_matches("key");
+        if dimension.is_empty() {
+            return false;
+        }
+
+        // Check if neither relation IS the dimension table
+        let left_rel = &relations[edge.left_idx];
+        let right_rel = &relations[edge.right_idx];
+        let left_table = self
+            .get_underlying_table_name(&left_rel.plan)
+            .unwrap_or_else(|| left_rel.name.clone())
+            .to_lowercase();
+        let right_table = self
+            .get_underlying_table_name(&right_rel.plan)
+            .unwrap_or_else(|| right_rel.name.clone())
+            .to_lowercase();
+
+        // If either table IS the dimension table, this is a normal FK→PK join (fine)
+        // Use starts_with to handle naming conventions: "supp" matches "supplier",
+        // "cust" matches "customer", "order" matches "orders", etc.
+        if left_table == dimension
+            || right_table == dimension
+            || left_table.starts_with(dimension)
+            || right_table.starts_with(dimension)
+        {
+            return false;
+        }
+
+        // Neither table is the dimension → same-dimension FK → M:N explosion risk
+        true
+    }
+
+    /// Extract the unqualified column name from a simple column expression
+    fn extract_column_name(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Column(col) => Some(col.name.clone()),
+            _ => None,
+        }
+    }
+
     /// Check if a logical plan has a filter predicate
     fn relation_has_filter(&self, plan: &LogicalPlan) -> bool {
         match plan {
@@ -1077,6 +1370,49 @@ impl JoinReorder {
 
         score
     }
+
+    /// Count the number of leaf tables in a join tree
+    fn count_joined_tables(&self, plan: &LogicalPlan) -> usize {
+        match plan {
+            LogicalPlan::Join(node) => {
+                self.count_joined_tables(&node.left) + self.count_joined_tables(&node.right)
+            }
+            LogicalPlan::Filter(node) => self.count_joined_tables(&node.input),
+            LogicalPlan::Project(node) => self.count_joined_tables(&node.input),
+            LogicalPlan::SubqueryAlias(node) => self.count_joined_tables(&node.input),
+            _ => 1,
+        }
+    }
+
+    /// Check if a relation involves a large table (lineitem, orders, partsupp)
+    fn is_large_table(&self, rel: &JoinRelation) -> bool {
+        let name_lower = rel.name.to_lowercase();
+        let underlying_name = self
+            .get_underlying_table_name(&rel.plan)
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+
+        let is_lineitem = name_lower.contains("lineitem") || underlying_name.contains("lineitem");
+        let is_orders = name_lower.contains("orders") || underlying_name.contains("orders");
+        let is_partsupp = name_lower.contains("partsupp") || underlying_name.contains("partsupp");
+
+        is_lineitem || is_orders || is_partsupp
+    }
+}
+
+/// Strip a single-char prefix + underscore from a column name.
+/// E.g., "c_nationkey" → "nationkey", "s_nationkey" → "nationkey",
+/// "ps_partkey" → "partkey", "l_orderkey" → "orderkey"
+fn strip_prefix(name: &str) -> &str {
+    // Handle 2-char prefixes like "ps_"
+    if name.len() > 3 && name.as_bytes()[2] == b'_' {
+        return &name[3..];
+    }
+    // Handle 1-char prefixes like "c_", "s_", "l_", "o_", "n_", "r_"
+    if name.len() > 2 && name.as_bytes()[1] == b'_' {
+        return &name[2..];
+    }
+    name
 }
 
 #[cfg(test)]
