@@ -99,25 +99,72 @@ impl ParquetTable {
         Ok(builder.schema().clone())
     }
 
-    /// Read all batches from a single Parquet file
+    /// Read all batches from a single Parquet file.
+    /// For large files (>4 row groups), uses parallel row group reading with rayon.
     fn read_file(path: &Path, projection: Option<&[usize]>) -> Result<Vec<RecordBatch>> {
+        use rayon::prelude::*;
+
         let file = File::open(path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let num_row_groups = builder.metadata().num_row_groups();
 
-        // Apply projection if specified
-        let reader = if let Some(indices) = projection {
-            // Create projection mask from parquet schema
-            let mask = parquet::arrow::ProjectionMask::roots(
-                builder.parquet_schema(),
-                indices.iter().copied(),
-            );
-            builder.with_projection(mask).build()?
-        } else {
-            builder.build()?
-        };
+        // For small files, use simple sequential reading
+        if num_row_groups <= 4 {
+            let builder = builder.with_batch_size(1_048_576);
+            let reader = if let Some(indices) = projection {
+                let mask = parquet::arrow::ProjectionMask::roots(
+                    builder.parquet_schema(),
+                    indices.iter().copied(),
+                );
+                builder.with_projection(mask).build()?
+            } else {
+                builder.build()?
+            };
+            return Ok(reader.collect::<std::result::Result<Vec<_>, _>>()?);
+        }
 
-        let batches: Vec<RecordBatch> = reader.collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(batches)
+        // For large files, read row groups in parallel using rayon
+        let path = path.to_path_buf();
+        let projection = projection.map(|p| p.to_vec());
+        let batches: Vec<Vec<RecordBatch>> = (0..num_row_groups)
+            .into_par_iter()
+            .map(|rg_idx| {
+                let file = File::open(&path)
+                    .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))?;
+                let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+                    .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))?;
+
+                // Select only this row group
+                let row_selection = parquet::arrow::arrow_reader::RowSelection::from(vec![
+                    parquet::arrow::arrow_reader::RowSelector::skip(
+                        (0..rg_idx)
+                            .map(|i| builder.metadata().row_group(i).num_rows() as usize)
+                            .sum(),
+                    ),
+                    parquet::arrow::arrow_reader::RowSelector::select(
+                        builder.metadata().row_group(rg_idx).num_rows() as usize,
+                    ),
+                ]);
+
+                let builder = builder
+                    .with_batch_size(1_048_576)
+                    .with_row_selection(row_selection);
+
+                let reader = if let Some(ref indices) = projection {
+                    let mask = parquet::arrow::ProjectionMask::roots(
+                        builder.parquet_schema(),
+                        indices.iter().copied(),
+                    );
+                    builder.with_projection(mask).build()?
+                } else {
+                    builder.build()?
+                };
+                reader.collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| QueryError::Execution(format!("Parallel parquet read failed: {}", e)))?;
+
+        Ok(batches.into_iter().flatten().collect())
     }
 
     /// Get the list of files this table reads from

@@ -69,6 +69,23 @@ impl JoinReorder {
             }
 
             LogicalPlan::Join(node) => {
+                // Semi/Anti/Single/Mark: preserve structure, reorder children independently
+                if matches!(
+                    node.join_type,
+                    JoinType::Semi | JoinType::Anti | JoinType::Single | JoinType::Mark
+                ) {
+                    let left = self.reorder(&node.left)?;
+                    let right = self.reorder(&node.right)?;
+                    return Ok(LogicalPlan::Join(JoinNode {
+                        left: Arc::new(left),
+                        right: Arc::new(right),
+                        join_type: node.join_type,
+                        on: node.on.clone(),
+                        filter: node.filter.clone(),
+                        schema: node.schema.clone(),
+                    }));
+                }
+
                 // Check if this is a join tree that needs reordering
                 // Only reorder if we have cross joins or inner joins without proper conditions
                 if self.needs_reordering(plan) {
@@ -169,18 +186,23 @@ impl JoinReorder {
         }
     }
 
-    /// Check if this join tree needs reordering (has cross joins)
+    /// Check if this join tree needs reordering (has cross joins or multi-way inner joins)
     fn needs_reordering(&self, plan: &LogicalPlan) -> bool {
+        // A tree with 3+ tables (2+ joins) in Cross/Inner chain benefits from reordering
+        self.count_flattenable_joins(plan) >= 2
+    }
+
+    /// Count how many flattenable (Cross/Inner) joins exist in a chain.
+    /// Stops at Semi/Anti/Left/Right/Full boundaries.
+    fn count_flattenable_joins(&self, plan: &LogicalPlan) -> usize {
         match plan {
-            LogicalPlan::Join(node) => {
-                // If this is a cross join, it needs reordering
-                if node.join_type == JoinType::Cross {
-                    return true;
-                }
-                // Also check children
-                self.needs_reordering(&node.left) || self.needs_reordering(&node.right)
+            LogicalPlan::Join(node)
+                if matches!(node.join_type, JoinType::Cross | JoinType::Inner) =>
+            {
+                1 + self.count_flattenable_joins(&node.left)
+                    + self.count_flattenable_joins(&node.right)
             }
-            _ => false,
+            _ => 0,
         }
     }
 
@@ -333,15 +355,22 @@ impl JoinReorder {
                 let current = result_plan.take().unwrap();
                 let new_rel = relations[new_rel_idx].plan.clone();
 
-                let (left, right, on) = if edge.left_idx == new_rel_idx {
-                    (new_rel, current, edge.conditions.clone())
+                // Put current (accumulated result) as build (left), new relation as probe (right)
+                let on = if edge.right_idx == new_rel_idx {
+                    // edge: left=current_side, right=new_rel → matches our layout
+                    edge.conditions.clone()
                 } else {
-                    (current, new_rel, edge.conditions.clone())
+                    // edge: left=new_rel, right=current_side → swap for our layout
+                    edge.conditions
+                        .iter()
+                        .map(|(l, r)| (r.clone(), l.clone()))
+                        .collect()
                 };
 
-                let mut schema_fields = left.schema().fields().to_vec();
-                schema_fields.extend(right.schema().fields().iter().cloned());
+                let mut schema_fields = current.schema().fields().to_vec();
+                schema_fields.extend(new_rel.schema().fields().iter().cloned());
                 let schema = crate::planner::PlanSchema::new(schema_fields);
+                let (left, right) = (current, new_rel);
 
                 result_plan = Some(LogicalPlan::Join(JoinNode {
                     left: Arc::new(left),
@@ -603,34 +632,28 @@ impl JoinReorder {
                 let new_rel = &relations[new_idx];
                 let current = result_plan.take().unwrap();
 
-                // Determine which side of the condition goes where
-                let base_conditions = if edge.right_idx == new_idx {
+                // Build join conditions: left side = current (build), right side = new_rel (probe)
+                // The accumulated result goes on the BUILD (left) side because it's smaller
+                // in a star/snowflake schema (dimension tables join first, then fact tables probe)
+                let conditions = if edge.right_idx == new_idx {
+                    // edge: left=current_side, right=new_rel → matches our layout
                     edge.conditions.clone()
                 } else {
-                    // Swap left/right in conditions
+                    // edge: left=new_rel, right=current_side → swap for our layout
                     edge.conditions
                         .iter()
                         .map(|(l, r)| (r.clone(), l.clone()))
                         .collect()
                 };
 
-                // Hash join optimization: smaller table should be BUILD (left) side
-                // New relation is likely smaller (dimension table), so put it as BUILD
-                // This means: new_rel (left/build) JOIN current (right/probe)
-                // Swap the conditions to match the new order
-                let conditions: Vec<(Expr, Expr)> = base_conditions
-                    .iter()
-                    .map(|(l, r)| (r.clone(), l.clone()))
-                    .collect();
-
-                // Build the combined schema with new relation first
-                let new_schema = new_rel.plan.schema();
+                // Schema: current (left/build) first, then new_rel (right/probe)
                 let current_schema = current.schema();
-                let combined_schema = new_schema.merge(&current_schema);
+                let new_schema = new_rel.plan.schema();
+                let combined_schema = current_schema.merge(&new_schema);
 
                 result_plan = Some(LogicalPlan::Join(JoinNode {
-                    left: Arc::new(new_rel.plan.clone()), // New (smaller) as build
-                    right: Arc::new(current),             // Current (larger) as probe
+                    left: Arc::new(current),               // Accumulated result as build
+                    right: Arc::new(new_rel.plan.clone()), // New relation as probe
                     join_type: JoinType::Inner,
                     on: conditions,
                     filter: None,
@@ -723,37 +746,15 @@ impl JoinReorder {
                     self.collect_relations_and_conditions(&node.left, relations, conditions);
                     self.collect_relations_and_conditions(&node.right, relations, conditions);
                 } else {
-                    // For LeftJoin/RightJoin/Semi/Anti, we still need to process the left child
-                    // to find any Cross joins there, but NOT include the join's ON conditions
-                    // in the reorder pool (those are for the outer join semantics)
-                    //
-                    // Check if left child has Cross joins that need reordering
-                    if self.needs_reordering(&node.left) {
-                        // Collect from left child only - we'll keep this join structure
-                        self.collect_relations_and_conditions(&node.left, relations, conditions);
-                        // Right child becomes an opaque relation
-                        let right_schema = node.right.schema();
-                        let right_columns: HashSet<String> = right_schema
-                            .fields()
-                            .iter()
-                            .map(|f| f.name.clone())
-                            .collect();
-                        relations.push(JoinRelation {
-                            plan: (*node.right).clone(),
-                            name: format!("{:?}_right", node.join_type),
-                            columns: right_columns,
-                        });
-                    } else {
-                        // Treat the whole join as an opaque relation
-                        let schema = plan.schema();
-                        let columns: HashSet<String> =
-                            schema.fields().iter().map(|f| f.name.clone()).collect();
-                        relations.push(JoinRelation {
-                            plan: plan.clone(),
-                            name: format!("{:?}_join", node.join_type),
-                            columns,
-                        });
-                    }
+                    // Left/Right/Full/Semi/Anti/Single/Mark: treat entire join as opaque relation
+                    let schema = plan.schema();
+                    let columns: HashSet<String> =
+                        schema.fields().iter().map(|f| f.name.clone()).collect();
+                    relations.push(JoinRelation {
+                        plan: plan.clone(),
+                        name: format!("{:?}_join", node.join_type),
+                        columns,
+                    });
                 }
             }
 
@@ -1137,6 +1138,18 @@ mod tests {
         let optimized = rule.optimize(&inner_abc).unwrap();
 
         // After optimization, there should be no cross joins
-        assert!(!rule.needs_reordering(&optimized));
+        assert!(!has_cross_joins(&optimized));
+    }
+
+    fn has_cross_joins(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Join(node) => {
+                if node.join_type == JoinType::Cross {
+                    return true;
+                }
+                has_cross_joins(&node.left) || has_cross_joins(&node.right)
+            }
+            _ => false,
+        }
     }
 }

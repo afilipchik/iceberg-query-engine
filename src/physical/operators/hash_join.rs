@@ -3,8 +3,8 @@
 use crate::error::Result;
 use crate::physical::operators::filter::evaluate_expr;
 use crate::physical::{PhysicalOperator, RecordBatchStream};
-use crate::planner::{Expr, JoinType};
-use arrow::array::{ArrayRef, Int64Array, UInt32Array, UInt64Array};
+use crate::planner::{BinaryOp, Expr, JoinType};
+use arrow::array::{Array, ArrayRef, Int64Array, UInt32Array, UInt64Array};
 use arrow::compute;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -37,6 +37,8 @@ fn debug_log(_msg: &str) {
 struct BuildSideCache {
     batches: Vec<RecordBatch>,
     hash_table: HashMap<JoinKey, Vec<HashEntry>>,
+    /// Fast path: specialized i64 hash table for single-key Int64 joins
+    i64_hash_table: Option<HashMap<i64, Vec<HashEntry>>>,
 }
 
 /// Hash join execution operator
@@ -168,7 +170,43 @@ impl PhysicalOperator for HashJoinExec {
         };
         let probe_keys = if swapped { &on_left } else { &on_right };
 
+        // For Semi/Anti joins, start probe collection early so it overlaps with build side
+        let probe_prefetch_handle = if matches!(self.join_type, JoinType::Semi | JoinType::Anti) {
+            let probe = probe_side.clone();
+            Some(tokio::spawn(async move {
+                let probe_partitions = probe.output_partitions().max(1);
+                let handles: Vec<_> = (0..probe_partitions)
+                    .map(|p| {
+                        let probe = probe.clone();
+                        tokio::spawn(async move {
+                            let stream = probe.execute(p).await?;
+                            let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                            Ok::<_, crate::error::QueryError>(batches)
+                        })
+                    })
+                    .collect();
+                let mut all_batches = Vec::new();
+                for handle in handles {
+                    let batches = handle.await.map_err(|e| {
+                        crate::error::QueryError::Execution(format!(
+                            "Probe partition task failed: {}",
+                            e
+                        ))
+                    })??;
+                    all_batches.extend(batches);
+                }
+                Ok::<_, crate::error::QueryError>(all_batches)
+            }))
+        } else {
+            None
+        };
+
+        // Semi/Anti always use probe_semi_anti_parallel which handles i64 internally.
+        // Other join types may fall through to the generic probe loop which also handles i64.
+        let can_skip_generic_ht = matches!(self.join_type, JoinType::Semi | JoinType::Anti);
+
         // Get or build the cached build side (computed ONCE, reused across all partitions)
+        // For Semi/Anti, probe collection runs concurrently via probe_prefetch_handle
         let cache = self
             .build_cache
             .get_or_try_init(|| async {
@@ -185,40 +223,49 @@ impl PhysicalOperator for HashJoinExec {
                     build_side.name()
                 ));
 
-                // Memory safety: limit build side size to prevent OOM crashes
-                // Default 50M rows - enough for TPC-H SF=100 lineitem (600M) with proper joins
-                const MAX_BUILD_ROWS: usize = 50_000_000;
-                const MAX_BUILD_BYTES: usize = 4 * 1024 * 1024 * 1024; // 4GB
+                // Memory safety: limit build side by bytes to prevent OOM crashes
+                const MAX_BUILD_BYTES: usize = 8 * 1024 * 1024 * 1024; // 8GB
+
+                // Collect all build partitions in parallel using tokio::spawn
+                let handles: Vec<_> = (0..build_partitions)
+                    .map(|p| {
+                        let build = build_side.clone();
+                        tokio::spawn(async move {
+                            let stream = build.execute(p).await?;
+                            let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                            Ok::<_, crate::error::QueryError>(batches)
+                        })
+                    })
+                    .collect();
+                let mut partition_results = Vec::with_capacity(handles.len());
+                for handle in handles {
+                    let batches = handle.await.map_err(|e| {
+                        crate::error::QueryError::Execution(format!(
+                            "Build partition task failed: {}",
+                            e
+                        ))
+                    })??;
+                    partition_results.push(batches);
+                }
 
                 let mut build_batches = Vec::new();
                 let mut total_build_rows = 0usize;
                 let mut total_build_bytes = 0usize;
-                for p in 0..build_partitions {
-                    let stream = build_side.execute(p).await?;
-                    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                for batches in partition_results {
                     for b in &batches {
                         total_build_rows += b.num_rows();
-                        // Estimate memory: ~50 bytes per row as rough average
                         total_build_bytes += b.get_array_memory_size();
                     }
                     build_batches.extend(batches);
-
-                    // Check memory limits DURING collection to fail early
-                    if total_build_rows > MAX_BUILD_ROWS {
-                        return Err(crate::error::QueryError::Execution(format!(
-                            "Hash join build side exceeds {} rows (at {} rows). \
-                        This usually indicates a cross join or missing join condition. \
+                }
+                if total_build_bytes > MAX_BUILD_BYTES {
+                    return Err(crate::error::QueryError::Execution(format!(
+                        "Hash join build side exceeds {}GB (at {} bytes, {} rows). \
                         Consider using spillable operators for larger datasets.",
-                            MAX_BUILD_ROWS, total_build_rows
-                        )));
-                    }
-                    if total_build_bytes > MAX_BUILD_BYTES {
-                        return Err(crate::error::QueryError::Execution(format!(
-                            "Hash join build side exceeds {} bytes (at {} bytes). \
-                        Consider using spillable operators for larger datasets.",
-                            MAX_BUILD_BYTES, total_build_bytes
-                        )));
-                    }
+                        MAX_BUILD_BYTES / (1024 * 1024 * 1024),
+                        total_build_bytes,
+                        total_build_rows
+                    )));
                 }
                 debug_log(&format!(
                     "Build side collected: {} batches, {} total rows, {} bytes",
@@ -227,67 +274,59 @@ impl PhysicalOperator for HashJoinExec {
                     total_build_bytes
                 ));
 
-                // Build hash table
-                debug_log("Building hash table...");
-                let hash_table = build_hash_table(&build_batches, &build_keys)?;
-                debug_log(&format!(
-                    "Hash table built with {} entries",
-                    hash_table.len()
-                ));
+                // Try specialized i64 hash table first (much faster for Int64 keys)
+                let i64_hash_table = if build_keys.len() == 1 {
+                    build_i64_hash_table(&build_batches, &build_keys[0])
+                } else {
+                    None
+                };
+
+                // Skip expensive generic hash table build when i64 fast path handles all lookups
+                let hash_table = if i64_hash_table.is_some() && can_skip_generic_ht {
+                    HashMap::new()
+                } else {
+                    build_hash_table(&build_batches, &build_keys)?
+                };
 
                 Ok::<_, crate::error::QueryError>(BuildSideCache {
                     batches: build_batches,
                     hash_table,
+                    i64_hash_table,
                 })
             })
             .await?;
 
-        debug_log(&format!(
-            "CACHE HIT: Reusing hash table with {} entries for partition {}",
-            cache.hash_table.len(),
-            partition
-        ));
-
-        // Probe with only THIS partition (allows parallel execution across partitions)
-        debug_log(&format!(
-            "Probing partition {} from {}",
-            partition,
-            probe_side.name()
-        ));
-        let probe_stream = probe_side.execute(partition).await?;
-        let probe_batches: Vec<RecordBatch> = probe_stream.try_collect().await?;
-        let probe_rows: usize = probe_batches.iter().map(|b| b.num_rows()).sum();
-        debug_log(&format!(
-            "Probe side collected: {} batches, {} rows",
-            probe_batches.len(),
-            probe_rows
-        ));
+        // Collect probe batches. For Semi/Anti, await the prefetched probe data
+        // that was running concurrently with the build side.
+        let probe_batches: Vec<RecordBatch> = if let Some(handle) = probe_prefetch_handle {
+            handle.await.map_err(|e| {
+                crate::error::QueryError::Execution(format!("Probe prefetch task failed: {}", e))
+            })??
+        } else {
+            let probe_stream = probe_side.execute(partition).await?;
+            probe_stream.try_collect().await?
+        };
 
         // Safety check: prevent cross join explosions
-        // For Cross joins, the output size is build_rows * probe_rows
         let build_rows: usize = cache.batches.iter().map(|b| b.num_rows()).sum();
+        let probe_rows: usize = probe_batches.iter().map(|b| b.num_rows()).sum();
         if self.join_type == JoinType::Cross && build_rows > 0 && probe_rows > 0 {
             let max_output = build_rows.saturating_mul(probe_rows);
-            const CROSS_JOIN_LIMIT: usize = 10_000_000; // 10 million rows max
+            const CROSS_JOIN_LIMIT: usize = 10_000_000;
             if max_output > CROSS_JOIN_LIMIT {
-                debug_log(&format!(
-                    "CROSS JOIN EXPLOSION DETECTED: {} x {} = {} rows (limit: {})",
-                    build_rows, probe_rows, max_output, CROSS_JOIN_LIMIT
-                ));
                 return Err(crate::error::QueryError::Execution(format!(
                     "Cross join would produce {} rows ({} x {}), exceeding limit of {}. \
-                    This usually indicates missing join conditions in the query. \
-                    Check that all table joins have proper ON or WHERE conditions.",
+                    This usually indicates missing join conditions in the query.",
                     max_output, build_rows, probe_rows, CROSS_JOIN_LIMIT
                 )));
             }
         }
 
-        debug_log("Starting probe_hash_table...");
         let result = probe_hash_table(
             &cache.batches,
             &probe_batches,
             &cache.hash_table,
+            cache.i64_hash_table.as_ref(),
             probe_keys,
             self.join_type,
             swapped,
@@ -296,20 +335,15 @@ impl PhysicalOperator for HashJoinExec {
             &self.combined_schema,
         )?;
 
-        let result_rows: usize = result.iter().map(|b| b.num_rows()).sum();
-        debug_log(&format!(
-            "Join produced {} result batches, {} rows",
-            result.len(),
-            result_rows
-        ));
-
         Ok(Box::pin(stream::iter(result.into_iter().map(Ok))))
     }
 
     fn output_partitions(&self) -> usize {
-        // Hash join can be parallelized by probe side partitions
-        // The build side is fully collected, probe side is partitioned
+        // Semi/Anti joins must see ALL probe rows to correctly determine
+        // matched/unmatched build rows, so they must use a single partition.
+        // Other join types can be parallelized by probe side partitions.
         match self.join_type {
+            JoinType::Semi | JoinType::Anti => 1,
             JoinType::Right => self.left.output_partitions().max(1),
             _ => self.right.output_partitions().max(1),
         }
@@ -490,6 +524,69 @@ fn build_hash_table_parallel(
     Ok(final_table)
 }
 
+/// Build a specialized i64 hash table for single-key Int64 joins.
+/// Returns None if the key expression doesn't evaluate to Int64/Int32.
+fn build_i64_hash_table(
+    batches: &[RecordBatch],
+    key_expr: &Expr,
+) -> Option<HashMap<i64, Vec<HashEntry>>> {
+    if batches.is_empty() {
+        return Some(HashMap::new());
+    }
+
+    // Check if the key evaluates to an Int64-compatible type
+    let first_key = evaluate_expr(&batches[0], key_expr).ok()?;
+    let is_int = first_key.as_any().downcast_ref::<Int64Array>().is_some()
+        || first_key
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .is_some()
+        || first_key
+            .as_any()
+            .downcast_ref::<arrow::array::Date32Array>()
+            .is_some();
+    if !is_int {
+        return None;
+    }
+
+    let mut table: HashMap<i64, Vec<HashEntry>> = HashMap::new();
+    for (batch_idx, batch) in batches.iter().enumerate() {
+        let key_arr = evaluate_expr(batch, key_expr).ok()?;
+        if let Some(int_arr) = key_arr.as_any().downcast_ref::<Int64Array>() {
+            for row_idx in 0..batch.num_rows() {
+                if int_arr.is_null(row_idx) {
+                    continue;
+                }
+                table
+                    .entry(int_arr.value(row_idx))
+                    .or_default()
+                    .push(HashEntry { batch_idx, row_idx });
+            }
+        } else if let Some(int_arr) = key_arr.as_any().downcast_ref::<arrow::array::Int32Array>() {
+            for row_idx in 0..batch.num_rows() {
+                if int_arr.is_null(row_idx) {
+                    continue;
+                }
+                table
+                    .entry(int_arr.value(row_idx) as i64)
+                    .or_default()
+                    .push(HashEntry { batch_idx, row_idx });
+            }
+        } else if let Some(int_arr) = key_arr.as_any().downcast_ref::<arrow::array::Date32Array>() {
+            for row_idx in 0..batch.num_rows() {
+                if int_arr.is_null(row_idx) {
+                    continue;
+                }
+                table
+                    .entry(int_arr.value(row_idx) as i64)
+                    .or_default()
+                    .push(HashEntry { batch_idx, row_idx });
+            }
+        }
+    }
+    Some(table)
+}
+
 fn extract_join_key(arrays: &[ArrayRef], row: usize) -> JoinKey {
     let values: Vec<JoinValue> = arrays
         .iter()
@@ -566,12 +663,363 @@ fn create_combined_batch(
     RecordBatch::try_new(combined_schema.clone(), all_columns).map_err(Into::into)
 }
 
+/// A pre-compiled filter for fast evaluation without per-row batch creation.
+/// Recognizes patterns like `col_a != col_b` and evaluates directly from arrays.
+struct CompiledFilter {
+    build_col_idx: usize,
+    probe_col_idx: usize,
+    op: BinaryOp,
+}
+
+impl CompiledFilter {
+    /// Try to compile a filter expression into a direct column comparison.
+    /// Uses the combined schema (build columns first, then probe columns) to resolve indices.
+    /// Returns None if the filter is too complex.
+    fn try_compile(
+        filter: &Expr,
+        build_schema: &Schema,
+        probe_schema: &Schema,
+        swapped: bool,
+    ) -> Option<Self> {
+        if let Expr::BinaryExpr { left, op, right } = filter {
+            if !matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq
+            ) {
+                return None;
+            }
+            let left_col = match left.as_ref() {
+                Expr::Column(c) => c,
+                _ => return None,
+            };
+            let right_col = match right.as_ref() {
+                Expr::Column(c) => c,
+                _ => return None,
+            };
+
+            // Resolve columns in the combined schema.
+            // Combined schema = build fields first (or probe first if swapped), then the other.
+            let (first_schema, second_schema) = if swapped {
+                (probe_schema, build_schema)
+            } else {
+                (build_schema, probe_schema)
+            };
+            let first_len = first_schema.fields().len();
+
+            let left_combined_idx =
+                resolve_column_in_combined(left_col, first_schema, second_schema, first_len)?;
+            let right_combined_idx =
+                resolve_column_in_combined(right_col, first_schema, second_schema, first_len)?;
+
+            // Determine which side each column is on
+            let (left_side, left_local_idx) = if left_combined_idx < first_len {
+                if swapped {
+                    (ColumnSide::Probe, left_combined_idx)
+                } else {
+                    (ColumnSide::Build, left_combined_idx)
+                }
+            } else {
+                if swapped {
+                    (ColumnSide::Build, left_combined_idx - first_len)
+                } else {
+                    (ColumnSide::Probe, left_combined_idx - first_len)
+                }
+            };
+
+            let (right_side, right_local_idx) = if right_combined_idx < first_len {
+                if swapped {
+                    (ColumnSide::Probe, right_combined_idx)
+                } else {
+                    (ColumnSide::Build, right_combined_idx)
+                }
+            } else {
+                if swapped {
+                    (ColumnSide::Build, right_combined_idx - first_len)
+                } else {
+                    (ColumnSide::Probe, right_combined_idx - first_len)
+                }
+            };
+
+            // We need one build-side column and one probe-side column
+            if left_side == ColumnSide::Build && right_side == ColumnSide::Probe {
+                Some(CompiledFilter {
+                    build_col_idx: left_local_idx,
+                    probe_col_idx: right_local_idx,
+                    op: *op,
+                })
+            } else if left_side == ColumnSide::Probe && right_side == ColumnSide::Build {
+                let swapped_op = match op {
+                    BinaryOp::Lt => BinaryOp::Gt,
+                    BinaryOp::LtEq => BinaryOp::GtEq,
+                    BinaryOp::Gt => BinaryOp::Lt,
+                    BinaryOp::GtEq => BinaryOp::LtEq,
+                    other => *other,
+                };
+                Some(CompiledFilter {
+                    build_col_idx: right_local_idx,
+                    probe_col_idx: left_local_idx,
+                    op: swapped_op,
+                })
+            } else {
+                None // Both on same side - can't optimize
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Evaluate the filter for a single (build_row, probe_row) pair directly from arrays.
+    #[inline(always)]
+    fn evaluate(
+        &self,
+        build_batch: &RecordBatch,
+        build_row: usize,
+        probe_batch: &RecordBatch,
+        probe_row: usize,
+    ) -> bool {
+        let build_col = build_batch.column(self.build_col_idx);
+        let probe_col = probe_batch.column(self.probe_col_idx);
+
+        // Fast path for Int64 (most common for join keys)
+        if let (Some(b_arr), Some(p_arr)) = (
+            build_col.as_any().downcast_ref::<Int64Array>(),
+            probe_col.as_any().downcast_ref::<Int64Array>(),
+        ) {
+            let bv = b_arr.value(build_row);
+            let pv = p_arr.value(probe_row);
+            return match self.op {
+                BinaryOp::Eq => bv == pv,
+                BinaryOp::NotEq => bv != pv,
+                BinaryOp::Lt => bv < pv,
+                BinaryOp::LtEq => bv <= pv,
+                BinaryOp::Gt => bv > pv,
+                BinaryOp::GtEq => bv >= pv,
+                _ => false,
+            };
+        }
+
+        // Float64 path
+        if let (Some(b_arr), Some(p_arr)) = (
+            build_col
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>(),
+            probe_col
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>(),
+        ) {
+            let bv = b_arr.value(build_row);
+            let pv = p_arr.value(probe_row);
+            return match self.op {
+                BinaryOp::Eq => bv == pv,
+                BinaryOp::NotEq => bv != pv,
+                BinaryOp::Lt => bv < pv,
+                BinaryOp::LtEq => bv <= pv,
+                BinaryOp::Gt => bv > pv,
+                BinaryOp::GtEq => bv >= pv,
+                _ => false,
+            };
+        }
+
+        // Utf8 path
+        if let (Some(b_arr), Some(p_arr)) = (
+            build_col
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>(),
+            probe_col
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>(),
+        ) {
+            let bv = b_arr.value(build_row);
+            let pv = p_arr.value(probe_row);
+            return match self.op {
+                BinaryOp::Eq => bv == pv,
+                BinaryOp::NotEq => bv != pv,
+                BinaryOp::Lt => bv < pv,
+                BinaryOp::LtEq => bv <= pv,
+                BinaryOp::Gt => bv > pv,
+                BinaryOp::GtEq => bv >= pv,
+                _ => false,
+            };
+        }
+
+        // Int32 path
+        if let (Some(b_arr), Some(p_arr)) = (
+            build_col
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>(),
+            probe_col
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>(),
+        ) {
+            let bv = b_arr.value(build_row);
+            let pv = p_arr.value(probe_row);
+            return match self.op {
+                BinaryOp::Eq => bv == pv,
+                BinaryOp::NotEq => bv != pv,
+                BinaryOp::Lt => bv < pv,
+                BinaryOp::LtEq => bv <= pv,
+                BinaryOp::Gt => bv > pv,
+                BinaryOp::GtEq => bv >= pv,
+                _ => false,
+            };
+        }
+
+        false // Unknown type - treat as no match
+    }
+}
+
+#[derive(PartialEq)]
+enum ColumnSide {
+    Build,
+    Probe,
+}
+
+/// Resolve a column to an index in the combined schema, using the same logic as find_column_index.
+fn resolve_column_in_combined(
+    col: &crate::planner::Column,
+    first_schema: &Schema,
+    second_schema: &Schema,
+    _first_len: usize,
+) -> Option<usize> {
+    // Build combined schema (same as used for filter evaluation in the hash join)
+    let combined_fields: Vec<_> = first_schema
+        .fields()
+        .iter()
+        .chain(second_schema.fields().iter())
+        .cloned()
+        .collect();
+    let combined = Schema::new(combined_fields);
+
+    // Use the exact same resolution as find_column_index in filter.rs
+    // 1. Try qualified name
+    if let Some(relation) = &col.relation {
+        let qualified = format!("{}.{}", relation, col.name);
+        if let Ok(idx) = combined.index_of(&qualified) {
+            return Some(idx);
+        }
+    }
+
+    // 2. Try unqualified name
+    if let Ok(idx) = combined.index_of(&col.name) {
+        return Some(idx);
+    }
+
+    // 3. Try suffix match
+    let suffix = format!(".{}", col.name);
+    for (i, field) in combined.fields().iter().enumerate() {
+        if field.name().ends_with(&suffix) || field.name() == &col.name {
+            return Some(i);
+        }
+    }
+
+    None
+}
+
+/// Parallel probe for INNER joins using specialized i64 hash table.
+/// Processes probe rows in parallel chunks using rayon, with direct Int64 array access
+/// to avoid per-row JoinKey allocation overhead.
+fn probe_inner_i64_parallel(
+    build_batches: &[RecordBatch],
+    probe_batches: &[RecordBatch],
+    i64_hash_table: &HashMap<i64, Vec<HashEntry>>,
+    probe_key_expr: &Expr,
+    swapped: bool,
+    output_schema: &SchemaRef,
+) -> Result<Vec<RecordBatch>> {
+    const CHUNK_SIZE: usize = 65536;
+
+    let mut results = Vec::new();
+
+    for probe_batch in probe_batches {
+        // Evaluate key expression once for the whole batch
+        let key_arr = evaluate_expr(probe_batch, probe_key_expr)?;
+        let n_rows = probe_batch.num_rows();
+
+        // Get direct access to the key array values (no per-row allocation)
+        let key_values: &[i64];
+        let _int32_values: Vec<i64>; // storage for converted i32 values
+        if let Some(int_arr) = key_arr.as_any().downcast_ref::<Int64Array>() {
+            key_values = int_arr.values();
+            _int32_values = Vec::new();
+        } else if let Some(int_arr) = key_arr.as_any().downcast_ref::<arrow::array::Int32Array>() {
+            _int32_values = int_arr.values().iter().map(|v| *v as i64).collect();
+            key_values = &_int32_values;
+        } else {
+            // Can't use i64 fast path for this type
+            continue;
+        }
+
+        // Check null bitmap once (most join keys are NOT NULL so this is often empty)
+        let null_bitmap = key_arr.nulls();
+
+        // Split into chunks and process in parallel
+        let chunks: Vec<std::ops::Range<usize>> = (0..n_rows)
+            .step_by(CHUNK_SIZE)
+            .map(|start| start..std::cmp::min(start + CHUNK_SIZE, n_rows))
+            .collect();
+
+        let chunk_results: Vec<(Vec<(usize, usize)>, Vec<usize>)> = chunks
+            .par_iter()
+            .map(|range| {
+                let mut build_indices = Vec::new();
+                let mut probe_indices = Vec::new();
+
+                for probe_row in range.clone() {
+                    // Fast null check via bitmap
+                    if let Some(nb) = null_bitmap {
+                        if !nb.is_valid(probe_row) {
+                            continue;
+                        }
+                    }
+                    let key_val = key_values[probe_row];
+                    if let Some(entries) = i64_hash_table.get(&key_val) {
+                        for entry in entries {
+                            build_indices.push((entry.batch_idx, entry.row_idx));
+                            probe_indices.push(probe_row);
+                        }
+                    }
+                }
+
+                (build_indices, probe_indices)
+            })
+            .collect();
+
+        // Merge chunk results
+        let mut all_build_indices = Vec::new();
+        let mut all_probe_indices = Vec::new();
+        for (bi, pi) in chunk_results {
+            all_build_indices.extend(bi);
+            all_probe_indices.extend(pi);
+        }
+
+        if !all_build_indices.is_empty() {
+            let batch = create_joined_batch(
+                build_batches,
+                probe_batch,
+                &all_build_indices,
+                &all_probe_indices,
+                swapped,
+                output_schema,
+            )?;
+            results.push(batch);
+        }
+    }
+
+    Ok(results)
+}
+
 /// Parallel probe for SEMI/ANTI joins - uses rayon for parallel execution
 #[allow(clippy::too_many_arguments)]
 fn probe_semi_anti_parallel(
     build_batches: &[RecordBatch],
     probe_batches: &[RecordBatch],
     hash_table: &HashMap<JoinKey, Vec<HashEntry>>,
+    cached_i64_ht: Option<&HashMap<i64, Vec<HashEntry>>>,
     probe_key_exprs: &[Expr],
     join_type: JoinType,
     swapped: bool,
@@ -587,66 +1035,126 @@ fn probe_semi_anti_parallel(
         .map(|b| (0..b.num_rows()).map(|_| AtomicBool::new(false)).collect())
         .collect();
 
-    // Process all probe batches in parallel
-    probe_batches.par_iter().try_for_each(|probe_batch| {
-        let probe_key_arrays: Result<Vec<ArrayRef>> = probe_key_exprs
-            .iter()
-            .map(|e| evaluate_expr(probe_batch, e))
+    // Try to compile the filter for fast direct evaluation
+    let build_schema = if !build_batches.is_empty() {
+        build_batches[0].schema()
+    } else {
+        Arc::new(Schema::empty())
+    };
+    let probe_schema = if !probe_batches.is_empty() {
+        probe_batches[0].schema()
+    } else {
+        Arc::new(Schema::empty())
+    };
+    let compiled_filter =
+        filter.and_then(|f| CompiledFilter::try_compile(f, &build_schema, &probe_schema, swapped));
+
+    // Use cached i64 hash table if available, otherwise build one
+    let local_i64_ht: Option<HashMap<i64, Vec<HashEntry>>> = if cached_i64_ht.is_some() {
+        None // Using cached, no need to build local
+    } else if probe_key_exprs.len() == 1 {
+        build_i64_hash_table(build_batches, &probe_key_exprs[0])
+    } else {
+        None
+    };
+    let i64_ht_ref: Option<&HashMap<i64, Vec<HashEntry>>> = cached_i64_ht.or(local_i64_ht.as_ref());
+
+    // Process all probe batches in parallel using chunked intra-batch parallelism
+    const CHUNK_SIZE: usize = 65536;
+    for probe_batch in probe_batches {
+        let probe_key_arr = if probe_key_exprs.len() == 1 {
+            Some(evaluate_expr(probe_batch, &probe_key_exprs[0])?)
+        } else {
+            None
+        };
+
+        // Get direct i64 values if available
+        let i64_values: Option<&[i64]> = probe_key_arr.as_ref().and_then(|arr| {
+            arr.as_any()
+                .downcast_ref::<Int64Array>()
+                .map(|a| a.values().as_ref())
+        });
+        let null_bitmap = probe_key_arr.as_ref().and_then(|arr| arr.nulls().cloned());
+
+        let n_rows = probe_batch.num_rows();
+        let chunks: Vec<std::ops::Range<usize>> = (0..n_rows)
+            .step_by(CHUNK_SIZE)
+            .map(|start| start..std::cmp::min(start + CHUNK_SIZE, n_rows))
             .collect();
-        let probe_key_arrays = probe_key_arrays?;
 
-        // Process each probe row
-        for probe_row in 0..probe_batch.num_rows() {
-            let key = extract_join_key(&probe_key_arrays, probe_row);
+        // Fall back to full key extraction if no i64 fast path
+        let probe_key_arrays: Option<Vec<ArrayRef>> =
+            if i64_values.is_none() || i64_ht_ref.is_none() {
+                let arrays: Result<Vec<ArrayRef>> = probe_key_exprs
+                    .iter()
+                    .map(|e| evaluate_expr(probe_batch, e))
+                    .collect();
+                Some(arrays?)
+            } else {
+                None
+            };
 
-            // Skip null keys
-            if key.values.iter().any(|v| matches!(v, JoinValue::Null)) {
-                continue;
-            }
+        chunks.par_iter().try_for_each(|range| {
+            for probe_row in range.clone() {
+                // Fast i64 path: direct array access, no JoinKey allocation
+                let entries_opt = if let (Some(vals), Some(ht)) = (i64_values, i64_ht_ref) {
+                    if let Some(ref nb) = null_bitmap {
+                        if !nb.is_valid(probe_row) {
+                            continue;
+                        }
+                    }
+                    ht.get(&vals[probe_row])
+                } else if let Some(ref key_arrays) = probe_key_arrays {
+                    let key = extract_join_key(key_arrays, probe_row);
+                    if key.values.iter().any(|v| matches!(v, JoinValue::Null)) {
+                        continue;
+                    }
+                    hash_table.get(&key)
+                } else {
+                    None
+                };
 
-            if let Some(entries) = hash_table.get(&key) {
-                // For SEMI join: we just need to find ONE matching entry
-                // For ANTI join: we need to know if ANY entry matches
-                for entry in entries {
-                    // Check if there's a filter to evaluate
-                    if let Some(filter_expr) = filter {
-                        // Create a mini-batch with just this pair for filter evaluation
-                        let build_row_batch = create_single_row_combined_batch(
-                            build_batches,
-                            entry.batch_idx,
-                            entry.row_idx,
-                            probe_batch,
-                            probe_row,
-                            swapped,
-                            combined_schema,
-                        )?;
-
-                        // Evaluate filter
-                        let filter_result = evaluate_expr(&build_row_batch, filter_expr)?;
-                        if let Some(bool_arr) = filter_result
-                            .as_any()
-                            .downcast_ref::<arrow::array::BooleanArray>()
-                        {
-                            if bool_arr.len() > 0 && bool_arr.value(0) {
-                                // Filter passed - mark build row as matched
+                if let Some(entries) = entries_opt {
+                    for entry in entries {
+                        if let Some(ref cf) = compiled_filter {
+                            let build_batch = &build_batches[entry.batch_idx];
+                            if cf.evaluate(build_batch, entry.row_idx, probe_batch, probe_row) {
                                 build_matched[entry.batch_idx][entry.row_idx]
                                     .store(true, Ordering::Relaxed);
-                                // For SEMI join, we can stop after finding one match per build row
-                                // but we still need to process all probe rows
                                 break;
                             }
+                        } else if let Some(filter_expr) = filter {
+                            let build_row_batch = create_single_row_combined_batch(
+                                build_batches,
+                                entry.batch_idx,
+                                entry.row_idx,
+                                probe_batch,
+                                probe_row,
+                                swapped,
+                                combined_schema,
+                            )?;
+                            let filter_result = evaluate_expr(&build_row_batch, filter_expr)?;
+                            if let Some(bool_arr) = filter_result
+                                .as_any()
+                                .downcast_ref::<arrow::array::BooleanArray>()
+                            {
+                                if bool_arr.len() > 0 && bool_arr.value(0) {
+                                    build_matched[entry.batch_idx][entry.row_idx]
+                                        .store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                            }
+                        } else {
+                            build_matched[entry.batch_idx][entry.row_idx]
+                                .store(true, Ordering::Relaxed);
+                            break;
                         }
-                    } else {
-                        // No filter - any hash match counts
-                        build_matched[entry.batch_idx][entry.row_idx]
-                            .store(true, Ordering::Relaxed);
-                        break;
                     }
                 }
             }
-        }
-        Ok::<(), crate::error::QueryError>(())
-    })?;
+            Ok::<(), crate::error::QueryError>(())
+        })?;
+    }
 
     // Convert atomic bools to regular bools and create output
     let matched_rows: Vec<(usize, usize)> = build_matched
@@ -738,6 +1246,7 @@ fn probe_hash_table(
     build_batches: &[RecordBatch],
     probe_batches: &[RecordBatch],
     hash_table: &HashMap<JoinKey, Vec<HashEntry>>,
+    i64_hash_table: Option<&HashMap<i64, Vec<HashEntry>>>,
     probe_key_exprs: &[Expr],
     join_type: JoinType,
     swapped: bool,
@@ -752,6 +1261,7 @@ fn probe_hash_table(
             build_batches,
             probe_batches,
             hash_table,
+            i64_hash_table,
             probe_key_exprs,
             join_type,
             swapped,
@@ -759,6 +1269,20 @@ fn probe_hash_table(
             filter,
             combined_schema,
         );
+    }
+
+    // Use parallel i64 fast path for inner joins with sufficient data
+    if matches!(join_type, JoinType::Inner) && filter.is_none() && total_probe_rows > 10_000 {
+        if let Some(i64_ht) = i64_hash_table {
+            return probe_inner_i64_parallel(
+                build_batches,
+                probe_batches,
+                i64_ht,
+                &probe_key_exprs[0],
+                swapped,
+                output_schema,
+            );
+        }
     }
 
     let mut results = Vec::new();
@@ -788,7 +1312,18 @@ fn probe_hash_table(
                 continue;
             }
 
-            if let Some(entries) = hash_table.get(&key) {
+            // Use i64 hash table if available, fall back to generic
+            let entries: Option<&Vec<HashEntry>> = if let Some(i64_ht) = i64_hash_table {
+                if let [JoinValue::Int64(val)] = key.values.as_slice() {
+                    i64_ht.get(val)
+                } else {
+                    hash_table.get(&key)
+                }
+            } else {
+                hash_table.get(&key)
+            };
+
+            if let Some(entries) = entries {
                 for entry in entries {
                     candidate_build_indices.push((entry.batch_idx, entry.row_idx));
                     candidate_probe_indices.push(probe_row);
@@ -1142,57 +1677,43 @@ fn gather_column(
     col_idx: usize,
     indices: &[(usize, usize)],
 ) -> Result<ArrayRef> {
-    // Build indices for each batch
-    let mut batch_indices: HashMap<usize, Vec<(usize, u32)>> = HashMap::new();
-    for (out_idx, &(batch_idx, row_idx)) in indices.iter().enumerate() {
-        if batch_idx != usize::MAX {
-            batch_indices
-                .entry(batch_idx)
-                .or_default()
-                .push((out_idx, row_idx as u32));
-        }
+    if indices.is_empty() {
+        let dt = batches[0].column(col_idx).data_type();
+        return Ok(arrow::array::new_null_array(dt, 0));
     }
 
-    // Create output array
-    let total_len = indices.len();
-    let dt = batches[0].column(col_idx).data_type();
-
-    // Gather from each batch
-    let mut builders_data: Vec<(usize, ArrayRef)> = Vec::new();
-
-    for (batch_idx, idx_list) in batch_indices {
-        let batch = &batches[batch_idx];
-        let col = batch.column(col_idx);
-
-        let take_indices: Vec<u32> = idx_list.iter().map(|(_, row)| *row).collect();
+    if batches.len() == 1 {
+        // Fast path: single batch - direct take()
+        let col = batches[0].column(col_idx);
+        let take_indices: Vec<u32> = indices.iter().map(|&(_, row_idx)| row_idx as u32).collect();
         let take_arr = UInt32Array::from(take_indices);
-
-        let taken = compute::take(col.as_ref(), &take_arr, None)?;
-
-        for (i, (out_idx, _)) in idx_list.iter().enumerate() {
-            builders_data.push((
-                *out_idx,
-                arrow::compute::take(&taken, &UInt32Array::from(vec![i as u32]), None)?,
-            ));
-        }
+        return compute::take(col.as_ref(), &take_arr, None).map_err(Into::into);
     }
 
-    // Sort by output index and concatenate
-    builders_data.sort_by_key(|(idx, _)| *idx);
-
-    if builders_data.is_empty() {
-        return Ok(arrow::array::new_null_array(dt, total_len));
+    // Multi-batch: compute batch offsets, then do a single take on concatenated array
+    let mut offsets = Vec::with_capacity(batches.len());
+    let mut offset = 0usize;
+    for batch in batches {
+        offsets.push(offset);
+        offset += batch.num_rows();
     }
 
-    // Simple approach: gather one at a time
-    let arrays: Vec<&dyn arrow::array::Array> =
-        builders_data.iter().map(|(_, arr)| arr.as_ref()).collect();
+    let all_arrays: Vec<&dyn arrow::array::Array> =
+        batches.iter().map(|b| b.column(col_idx).as_ref()).collect();
+    let concatenated = compute::concat(&all_arrays)?;
 
-    if arrays.is_empty() {
-        Ok(arrow::array::new_null_array(dt, total_len))
-    } else {
-        compute::concat(&arrays).map_err(Into::into)
-    }
+    let take_indices: Vec<u32> = indices
+        .iter()
+        .map(|&(batch_idx, row_idx)| {
+            if batch_idx == usize::MAX {
+                0 // null row marker - will be handled by null bitmap
+            } else {
+                (offsets[batch_idx] + row_idx) as u32
+            }
+        })
+        .collect();
+    let take_arr = UInt32Array::from(take_indices);
+    compute::take(concatenated.as_ref(), &take_arr, None).map_err(Into::into)
 }
 
 #[allow(dead_code)] // Reserved for join filter optimization

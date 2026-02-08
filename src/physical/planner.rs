@@ -10,6 +10,7 @@ use crate::physical::operators::{
 use crate::physical::PhysicalOperator;
 use crate::planner::{Expr, JoinType, LogicalPlan, PlanSchema};
 use arrow::datatypes::{Field, Schema, SchemaRef};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -23,6 +24,9 @@ pub struct PhysicalPlanner {
     memory_pool: Option<SharedMemoryPool>,
     /// Execution configuration for spillable operators
     config: Option<ExecutionConfig>,
+    /// Cache of full table scans to avoid re-reading the same table multiple times.
+    /// Key is table name, value is (full schema, all batches with no projection).
+    scan_cache: RefCell<HashMap<String, (SchemaRef, Vec<arrow::record_batch::RecordBatch>)>>,
 }
 
 impl Default for PhysicalPlanner {
@@ -39,6 +43,7 @@ impl PhysicalPlanner {
             subquery_executor: None,
             memory_pool: None,
             config: None,
+            scan_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -49,6 +54,7 @@ impl PhysicalPlanner {
             subquery_executor: None,
             memory_pool: Some(memory_pool),
             config: Some(config),
+            scan_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -148,8 +154,104 @@ impl PhysicalPlanner {
         self.subquery_executor = executor;
     }
 
+    /// Collect all scan projections for each table name in the plan.
+    /// Used to compute union projections for scan caching.
+    fn collect_scan_projections(
+        plan: &LogicalPlan,
+        table_scans: &mut HashMap<String, Vec<Option<Vec<usize>>>>,
+    ) {
+        match plan {
+            LogicalPlan::Scan(node) => {
+                table_scans
+                    .entry(node.table_name.clone())
+                    .or_default()
+                    .push(node.projection.clone());
+            }
+            _ => {
+                for child in plan.children() {
+                    Self::collect_scan_projections(child, table_scans);
+                }
+            }
+        }
+    }
+
+    /// Compute the union projection for a set of projections.
+    /// Returns None if any scan needs all columns (no projection).
+    fn union_projection(projections: &[Option<Vec<usize>>]) -> Option<Vec<usize>> {
+        let mut union_set = std::collections::BTreeSet::new();
+        for proj in projections {
+            match proj {
+                None => return None, // One scan needs all columns
+                Some(indices) => {
+                    for &i in indices {
+                        union_set.insert(i);
+                    }
+                }
+            }
+        }
+        Some(union_set.into_iter().collect())
+    }
+
+    /// Pre-scan tables that are accessed multiple times and cache the results.
+    fn prescan_shared_tables(&self, logical: &LogicalPlan) {
+        use rayon::prelude::*;
+
+        let mut table_scans: HashMap<String, Vec<Option<Vec<usize>>>> = HashMap::new();
+        Self::collect_scan_projections(logical, &mut table_scans);
+
+        // Build scan tasks: for each table, compute the union projection
+        let scan_tasks: Vec<_> = table_scans
+            .iter()
+            .filter_map(|(table_name, projections)| {
+                let provider = self.tables.get(table_name)?;
+                // For tables scanned multiple times, use union projection
+                // For single-scan tables, use the requested projection
+                let proj = if projections.len() > 1 {
+                    Self::union_projection(projections)
+                } else {
+                    projections[0].clone()
+                };
+                Some((table_name.clone(), provider.clone(), proj))
+            })
+            .collect();
+
+        // Execute all scans in parallel using rayon
+        let results: Vec<_> = scan_tasks
+            .par_iter()
+            .filter_map(|(table_name, provider, proj)| {
+                let batches = provider.scan(proj.as_deref()).ok()?;
+                let schema = match proj {
+                    Some(indices) => {
+                        let base_schema = provider.schema();
+                        let fields: Vec<_> = indices
+                            .iter()
+                            .map(|&i| base_schema.field(i).clone())
+                            .collect();
+                        Arc::new(Schema::new(fields))
+                    }
+                    None => provider.schema(),
+                };
+                Some((table_name.clone(), schema, batches))
+            })
+            .collect();
+
+        let mut cache = self.scan_cache.borrow_mut();
+        for (table_name, schema, batches) in results {
+            cache.insert(table_name, (schema, batches));
+        }
+    }
+
     /// Convert a logical plan to a physical plan
     pub fn create_physical_plan(&self, logical: &LogicalPlan) -> Result<Arc<dyn PhysicalOperator>> {
+        // Pre-scan tables that are accessed multiple times to avoid redundant parquet reads
+        self.prescan_shared_tables(logical);
+        self.create_physical_plan_inner(logical)
+    }
+
+    fn create_physical_plan_inner(
+        &self,
+        logical: &LogicalPlan,
+    ) -> Result<Arc<dyn PhysicalOperator>> {
         match logical {
             LogicalPlan::Scan(node) => {
                 let provider = self
@@ -159,12 +261,74 @@ impl PhysicalPlanner {
 
                 // Use the logical schema (with aliases) instead of the provider schema
                 let logical_schema = plan_schema_to_arrow(&node.schema);
-                let exec = MemoryTableExec::from_provider_with_schema(
-                    &node.table_name,
-                    provider.as_ref(),
-                    node.projection.clone(),
-                    logical_schema,
-                )?;
+
+                // Check scan cache for pre-scanned tables (shared across multiple aliases)
+                let cache = self.scan_cache.borrow();
+                let exec = if let Some((cached_schema, cached_batches)) =
+                    cache.get(&node.table_name)
+                {
+                    // Cache hit: project from cached union-projected scan
+                    let batches = if let Some(ref requested_indices) = node.projection {
+                        // Map requested projection indices to positions in cached batches
+                        // Cached batches use union projection indices
+                        let cached_fields: Vec<&str> = cached_schema
+                            .fields()
+                            .iter()
+                            .map(|f| f.name().as_str())
+                            .collect();
+                        let provider_schema = provider.schema();
+
+                        cached_batches
+                            .iter()
+                            .map(|batch| {
+                                let columns: Vec<arrow::array::ArrayRef> = requested_indices
+                                    .iter()
+                                    .map(|&orig_idx| {
+                                        // Find the position of this original column in the cached batches
+                                        let col_name = provider_schema.field(orig_idx).name();
+                                        let cached_pos = cached_fields
+                                            .iter()
+                                            .position(|&n| n == col_name.as_str())
+                                            .unwrap_or(orig_idx);
+                                        batch.column(cached_pos).clone()
+                                    })
+                                    .collect();
+                                let fields: Vec<_> = requested_indices
+                                    .iter()
+                                    .map(|&i| logical_schema.field(i).clone())
+                                    .collect();
+                                let schema = Arc::new(Schema::new(fields));
+                                arrow::record_batch::RecordBatch::try_new(schema, columns).map_err(
+                                    |e| QueryError::Execution(format!("Projection failed: {}", e)),
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()?
+                    } else {
+                        cached_batches.clone()
+                    };
+
+                    let schema = match &node.projection {
+                        Some(indices) => {
+                            let fields: Vec<_> = indices
+                                .iter()
+                                .map(|&i| logical_schema.field(i).clone())
+                                .collect();
+                            Arc::new(Schema::new(fields))
+                        }
+                        None => logical_schema,
+                    };
+                    MemoryTableExec::new(&node.table_name, schema, batches, None)
+                } else {
+                    // No cache: use original path
+                    drop(cache);
+                    let exec = MemoryTableExec::from_provider_with_schema(
+                        &node.table_name,
+                        provider.as_ref(),
+                        node.projection.clone(),
+                        logical_schema,
+                    )?;
+                    exec
+                };
 
                 // If there's a filter on the scan, wrap with FilterExec
                 match &node.filter {
@@ -177,13 +341,13 @@ impl PhysicalPlanner {
             }
 
             LogicalPlan::Filter(node) => {
-                let input = self.create_physical_plan(&node.input)?;
+                let input = self.create_physical_plan_inner(&node.input)?;
                 let filter = self.create_filter(input, node.predicate.clone());
                 Ok(Arc::new(filter))
             }
 
             LogicalPlan::Project(node) => {
-                let input = self.create_physical_plan(&node.input)?;
+                let input = self.create_physical_plan_inner(&node.input)?;
                 let schema = plan_schema_to_arrow(&node.schema);
                 let mut project = ProjectExec::new(input, node.exprs.clone(), schema);
                 // If any projection expression contains a subquery, attach executor
@@ -197,8 +361,8 @@ impl PhysicalPlanner {
             }
 
             LogicalPlan::Join(node) => {
-                let left = self.create_physical_plan(&node.left)?;
-                let right = self.create_physical_plan(&node.right)?;
+                let left = self.create_physical_plan_inner(&node.left)?;
+                let right = self.create_physical_plan_inner(&node.right)?;
 
                 // For Semi/Anti joins, the filter must be evaluated inside the join
                 // because the output doesn't include right-side columns
@@ -277,7 +441,7 @@ impl PhysicalPlanner {
                 }
 
                 // Fall back to regular execution
-                let input = self.create_physical_plan(&node.input)?;
+                let input = self.create_physical_plan_inner(&node.input)?;
 
                 if self.use_spillable() {
                     // Convert to spillable AggregateExpr type
@@ -309,7 +473,7 @@ impl PhysicalPlanner {
             }
 
             LogicalPlan::Sort(node) => {
-                let input = self.create_physical_plan(&node.input)?;
+                let input = self.create_physical_plan_inner(&node.input)?;
                 if self.use_spillable() {
                     let sort = ExternalSortExec::new(
                         input,
@@ -325,14 +489,14 @@ impl PhysicalPlanner {
             }
 
             LogicalPlan::Limit(node) => {
-                let input = self.create_physical_plan(&node.input)?;
+                let input = self.create_physical_plan_inner(&node.input)?;
                 let limit = LimitExec::new(input, node.skip, node.fetch);
                 Ok(Arc::new(limit))
             }
 
             LogicalPlan::Distinct(node) => {
                 // Implement distinct as group by all columns
-                let input = self.create_physical_plan(&node.input)?;
+                let input = self.create_physical_plan_inner(&node.input)?;
                 let input_schema = input.schema();
 
                 let group_by: Vec<Expr> = input_schema
@@ -365,7 +529,7 @@ impl PhysicalPlanner {
                 let physical_inputs: Result<Vec<_>> = node
                     .inputs
                     .iter()
-                    .map(|input| self.create_physical_plan(input))
+                    .map(|input| self.create_physical_plan_inner(input))
                     .collect();
                 let physical_inputs = physical_inputs?;
 
@@ -409,7 +573,7 @@ impl PhysicalPlanner {
 
             LogicalPlan::SubqueryAlias(node) => {
                 // Just pass through to input
-                self.create_physical_plan(&node.input)
+                self.create_physical_plan_inner(&node.input)
             }
 
             LogicalPlan::EmptyRelation(node) => {
@@ -440,7 +604,7 @@ impl PhysicalPlanner {
                 let delim_state = StdArc::new(crate::physical::operators::DelimState::new());
 
                 // Create the left (outer) side
-                let left = self.create_physical_plan(&node.left)?;
+                let left = self.create_physical_plan_inner(&node.left)?;
 
                 // For the right side, we need to find DelimGet nodes and connect them
                 // to the shared state.
@@ -522,7 +686,7 @@ impl PhysicalPlanner {
                 self.create_physical_plan_with_delim_state(&node.input, delim_state)
             }
             // For other node types, fall back to regular planning
-            _ => self.create_physical_plan(logical),
+            _ => self.create_physical_plan_inner(logical),
         }
     }
 }

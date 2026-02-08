@@ -112,6 +112,14 @@ impl PredicatePushdown {
                 let mut remaining = Vec::new();
 
                 for pred in predicates {
+                    // Never push subquery-containing predicates through joins.
+                    // They must stay at Filter level for SubqueryDecorrelation to
+                    // create Semi/Anti joins at the correct (top) level of the join tree.
+                    if pred.contains_subquery() {
+                        remaining.push(pred);
+                        continue;
+                    }
+
                     let pred_cols = self.extract_columns(&pred);
 
                     if self.columns_subset(&pred_cols, &left_cols)
