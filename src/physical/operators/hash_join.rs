@@ -224,9 +224,6 @@ impl PhysicalOperator for HashJoinExec {
                     build_side.name()
                 ));
 
-                // Memory safety: limit build side by bytes to prevent OOM crashes
-                const MAX_BUILD_BYTES: usize = 16 * 1024 * 1024 * 1024; // 16GB
-
                 // Collect all build partitions in parallel using tokio::spawn
                 let handles: Vec<_> = (0..build_partitions)
                     .map(|p| {
@@ -258,15 +255,6 @@ impl PhysicalOperator for HashJoinExec {
                         total_build_bytes += b.get_array_memory_size();
                     }
                     build_batches.extend(batches);
-                }
-                if total_build_bytes > MAX_BUILD_BYTES {
-                    return Err(crate::error::QueryError::Execution(format!(
-                        "Hash join build side exceeds {}GB (at {} bytes, {} rows). \
-                        Consider using spillable operators for larger datasets.",
-                        MAX_BUILD_BYTES / (1024 * 1024 * 1024),
-                        total_build_bytes,
-                        total_build_rows
-                    )));
                 }
                 debug_log(&format!(
                     "Build side collected: {} batches, {} total rows, {} bytes",
