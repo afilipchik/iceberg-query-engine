@@ -14,6 +14,7 @@ mod sort;
 pub mod spillable;
 mod subquery;
 mod union;
+pub mod vectorized_hash;
 
 pub use delim_join::{DelimGetExec, DelimJoinExec, DelimState};
 pub use filter::{evaluate_expr, FilterExec};

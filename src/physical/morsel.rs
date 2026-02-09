@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// Default morsel size (number of rows per morsel)
-pub const DEFAULT_MORSEL_SIZE: usize = 65536; // 64K rows
+pub const DEFAULT_MORSEL_SIZE: usize = 8192; // 8K rows - fits L2 cache for vectorized ops
 
 /// A morsel is a chunk of data that can be processed independently
 #[derive(Debug)]

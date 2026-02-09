@@ -110,7 +110,7 @@ impl ParquetTable {
 
         // For small files, use simple sequential reading
         if num_row_groups <= 4 {
-            let builder = builder.with_batch_size(1_048_576);
+            let builder = builder.with_batch_size(8_192);
             let reader = if let Some(indices) = projection {
                 let mask = parquet::arrow::ProjectionMask::roots(
                     builder.parquet_schema(),
@@ -147,7 +147,7 @@ impl ParquetTable {
                 ]);
 
                 let builder = builder
-                    .with_batch_size(1_048_576)
+                    .with_batch_size(8_192)
                     .with_row_selection(row_selection);
 
                 let reader = if let Some(ref indices) = projection {

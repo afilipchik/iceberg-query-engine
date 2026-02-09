@@ -2,6 +2,7 @@
 
 use crate::error::Result;
 use crate::physical::operators::filter::evaluate_expr;
+use crate::physical::operators::vectorized_hash;
 use crate::physical::{PhysicalOperator, RecordBatchStream};
 use crate::planner::{BinaryOp, Expr, JoinType};
 use arrow::array::{Array, ArrayRef, Int64Array, UInt32Array, UInt64Array};
@@ -39,6 +40,132 @@ struct BuildSideCache {
     hash_table: HashMap<JoinKey, Vec<HashEntry>>,
     /// Fast path: specialized i64 hash table for single-key Int64 joins
     i64_hash_table: Option<HashMap<i64, Vec<HashEntry>>>,
+    /// Vectorized hash table for batch-level probing (multi-type support)
+    vectorized_ht: Option<VectorizedHashTable>,
+}
+
+/// Vectorized hash table using open addressing with batch-level operations.
+/// Stores (batch_idx, row_idx) pairs indexed by hash of key columns.
+/// Eliminates per-row JoinKey allocation during both build and probe.
+struct VectorizedHashTable {
+    /// Bucket entries: buckets[hash & mask] = Vec<(batch_idx as u32, row_idx as u32)>
+    buckets: Vec<Vec<(u32, u32)>>,
+    /// Mask for bucket index (power-of-2 bucket count - 1)
+    mask: usize,
+    /// Pre-evaluated key arrays for each build batch: build_key_arrays[batch_idx][key_col] = ArrayRef
+    build_key_arrays: Vec<Vec<ArrayRef>>,
+}
+
+impl VectorizedHashTable {
+    /// Build the vectorized hash table from build-side batches.
+    fn build(batches: &[RecordBatch], key_exprs: &[Expr]) -> Result<Self> {
+        // Evaluate key expressions for each batch and check types
+        let mut build_key_arrays: Vec<Vec<ArrayRef>> = Vec::with_capacity(batches.len());
+        let mut total_rows = 0usize;
+
+        for batch in batches {
+            let key_arrays: Result<Vec<ArrayRef>> =
+                key_exprs.iter().map(|e| evaluate_expr(batch, e)).collect();
+            let key_arrays = key_arrays?;
+            // Verify we can vectorize these types
+            if !key_arrays.is_empty() && !vectorized_hash::can_vectorize_arrays(&key_arrays) {
+                return Err(crate::error::QueryError::Execution(
+                    "Cannot vectorize key types".into(),
+                ));
+            }
+            total_rows += batch.num_rows();
+            build_key_arrays.push(key_arrays);
+        }
+
+        // Size buckets to next_power_of_2(total_rows * 2) for ~50% load factor
+        let bucket_count = (total_rows * 2).max(16).next_power_of_two();
+        let mask = bucket_count - 1;
+        let mut buckets: Vec<Vec<(u32, u32)>> = vec![Vec::new(); bucket_count];
+
+        // Insert all rows
+        for (batch_idx, key_arrays) in build_key_arrays.iter().enumerate() {
+            if key_arrays.is_empty() {
+                continue;
+            }
+            let num_rows = batches[batch_idx].num_rows();
+            let hashes = vectorized_hash::hash_arrays(key_arrays, num_rows);
+
+            for row_idx in 0..num_rows {
+                // Skip rows with null keys
+                if vectorized_hash::has_null(key_arrays, row_idx) {
+                    continue;
+                }
+                let bucket = hashes[row_idx] as usize & mask;
+                buckets[bucket].push((batch_idx as u32, row_idx as u32));
+            }
+        }
+
+        Ok(VectorizedHashTable {
+            buckets,
+            mask,
+            build_key_arrays,
+        })
+    }
+
+    /// Probe the hash table with a batch of probe keys.
+    /// Returns matched (build_batch_idx, build_row_idx, probe_row_idx) triples.
+    #[inline]
+    fn probe_batch(&self, probe_key_arrays: &[ArrayRef], num_rows: usize) -> Vec<(u32, u32, u32)> {
+        let hashes = vectorized_hash::hash_arrays(probe_key_arrays, num_rows);
+        let mut matches = Vec::new();
+
+        for probe_row in 0..num_rows {
+            // Skip null probe keys
+            if vectorized_hash::has_null(probe_key_arrays, probe_row) {
+                continue;
+            }
+
+            let bucket = hashes[probe_row] as usize & self.mask;
+            for &(build_batch, build_row) in &self.buckets[bucket] {
+                // Verify equality (hash collision resolution)
+                let build_keys = &self.build_key_arrays[build_batch as usize];
+                if vectorized_hash::compare_row(
+                    build_keys,
+                    build_row as usize,
+                    probe_key_arrays,
+                    probe_row,
+                ) {
+                    matches.push((build_batch, build_row, probe_row as u32));
+                }
+            }
+        }
+
+        matches
+    }
+
+    /// Probe for Semi/Anti joins: returns a boolean mask per probe row indicating match.
+    #[inline]
+    fn probe_batch_semi(&self, probe_key_arrays: &[ArrayRef], num_rows: usize) -> Vec<bool> {
+        let hashes = vectorized_hash::hash_arrays(probe_key_arrays, num_rows);
+        let mut matched = vec![false; num_rows];
+
+        for probe_row in 0..num_rows {
+            if vectorized_hash::has_null(probe_key_arrays, probe_row) {
+                continue;
+            }
+
+            let bucket = hashes[probe_row] as usize & self.mask;
+            for &(build_batch, build_row) in &self.buckets[bucket] {
+                let build_keys = &self.build_key_arrays[build_batch as usize];
+                if vectorized_hash::compare_row(
+                    build_keys,
+                    build_row as usize,
+                    probe_key_arrays,
+                    probe_row,
+                ) {
+                    matched[probe_row] = true;
+                    break; // One match is enough for Semi/Anti
+                }
+            }
+        }
+
+        matched
+    }
 }
 
 /// Hash join execution operator
@@ -263,15 +390,25 @@ impl PhysicalOperator for HashJoinExec {
                     total_build_bytes
                 ));
 
-                // Try specialized i64 hash table first (much faster for Int64 keys)
+                // Try vectorized hash table first (supports all key types)
+                // Don't build for empty keys (cross joins) — they use the generic cartesian path.
+                let vectorized_ht = if !build_keys.is_empty() {
+                    VectorizedHashTable::build(&build_batches, &build_keys).ok()
+                } else {
+                    None
+                };
+
+                // Try specialized i64 hash table (for backward compatibility with Semi/Anti parallel path)
                 let i64_hash_table = if build_keys.len() == 1 {
                     build_i64_hash_table(&build_batches, &build_keys[0])
                 } else {
                     None
                 };
 
-                // Skip expensive generic hash table build when i64 fast path handles all lookups
-                let hash_table = if i64_hash_table.is_some() && can_skip_generic_ht {
+                // Skip expensive generic hash table build when vectorized or i64 fast path is available
+                let hash_table = if vectorized_ht.is_some()
+                    || (i64_hash_table.is_some() && can_skip_generic_ht)
+                {
                     HashMap::new()
                 } else {
                     build_hash_table(&build_batches, &build_keys)?
@@ -281,6 +418,7 @@ impl PhysicalOperator for HashJoinExec {
                     batches: build_batches,
                     hash_table,
                     i64_hash_table,
+                    vectorized_ht,
                 })
             })
             .await?;
@@ -316,6 +454,7 @@ impl PhysicalOperator for HashJoinExec {
             &probe_batches,
             &cache.hash_table,
             cache.i64_hash_table.as_ref(),
+            cache.vectorized_ht.as_ref(),
             probe_keys,
             self.join_type,
             swapped,
@@ -1229,6 +1368,302 @@ fn create_single_row_combined_batch(
     RecordBatch::try_new(combined_schema.clone(), all_columns).map_err(Into::into)
 }
 
+/// Vectorized probe: handles Inner, Left, Right, Semi, Anti, Full, Cross joins
+/// without per-row JoinKey allocation. Uses VectorizedHashTable for batch-level
+/// hash computation and comparison.
+#[allow(clippy::too_many_arguments)]
+fn probe_vectorized(
+    build_batches: &[RecordBatch],
+    probe_batches: &[RecordBatch],
+    vht: &VectorizedHashTable,
+    probe_key_exprs: &[Expr],
+    join_type: JoinType,
+    swapped: bool,
+    output_schema: &SchemaRef,
+) -> Result<Vec<RecordBatch>> {
+    let mut results = Vec::new();
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Track build-side matches for Semi/Anti/Full/Right joins
+    let needs_build_tracking = matches!(
+        join_type,
+        JoinType::Semi | JoinType::Anti | JoinType::Full | JoinType::Right
+    );
+    // Use atomic bools for Semi/Anti to enable parallel probe
+    let build_matched_atomic: Vec<Vec<AtomicBool>> = if needs_build_tracking {
+        build_batches
+            .iter()
+            .map(|b| (0..b.num_rows()).map(|_| AtomicBool::new(false)).collect())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // Non-atomic version for Left/Right/Full (sequential per probe batch)
+    let mut build_matched: Vec<Vec<bool>> =
+        if needs_build_tracking && !matches!(join_type, JoinType::Semi | JoinType::Anti) {
+            build_batches
+                .iter()
+                .map(|b| vec![false; b.num_rows()])
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+    // Chunk size for parallel processing
+    const CHUNK_SIZE: usize = 65536;
+
+    for probe_batch in probe_batches {
+        let probe_key_arrays: Result<Vec<ArrayRef>> = probe_key_exprs
+            .iter()
+            .map(|e| evaluate_expr(probe_batch, e))
+            .collect();
+        let probe_key_arrays = probe_key_arrays?;
+
+        let n_rows = probe_batch.num_rows();
+
+        match join_type {
+            JoinType::Inner | JoinType::Cross => {
+                // Parallel chunked probing for inner join
+                let chunks: Vec<std::ops::Range<usize>> = (0..n_rows)
+                    .step_by(CHUNK_SIZE)
+                    .map(|start| start..std::cmp::min(start + CHUNK_SIZE, n_rows))
+                    .collect();
+
+                let chunk_results: Vec<Vec<(u32, u32, u32)>> = chunks
+                    .par_iter()
+                    .map(|range| {
+                        // Create sliced key arrays for this chunk
+                        let chunk_len = range.end - range.start;
+                        let chunk_keys: Vec<ArrayRef> = probe_key_arrays
+                            .iter()
+                            .map(|a| a.slice(range.start, chunk_len))
+                            .collect();
+                        let mut matches = vht.probe_batch(&chunk_keys, chunk_len);
+                        // Adjust probe indices back to original batch coordinates
+                        for m in &mut matches {
+                            m.2 += range.start as u32;
+                        }
+                        matches
+                    })
+                    .collect();
+
+                // Merge all matches
+                let mut all_build_indices: Vec<(usize, usize)> = Vec::new();
+                let mut all_probe_indices: Vec<usize> = Vec::new();
+                for chunk_matches in chunk_results {
+                    for (bb, br, pr) in chunk_matches {
+                        all_build_indices.push((bb as usize, br as usize));
+                        all_probe_indices.push(pr as usize);
+                    }
+                }
+
+                if !all_build_indices.is_empty() {
+                    let batch = create_joined_batch(
+                        build_batches,
+                        probe_batch,
+                        &all_build_indices,
+                        &all_probe_indices,
+                        swapped,
+                        output_schema,
+                    )?;
+                    results.push(batch);
+                }
+            }
+
+            JoinType::Left => {
+                // For Left join: collect matches, then add unmatched probe rows with nulls
+                let matches = vht.probe_batch(&probe_key_arrays, n_rows);
+
+                let mut probe_matched = vec![false; n_rows];
+                let mut build_indices: Vec<(usize, usize)> = Vec::new();
+                let mut probe_indices: Vec<usize> = Vec::new();
+
+                for (bb, br, pr) in &matches {
+                    build_indices.push((*bb as usize, *br as usize));
+                    probe_indices.push(*pr as usize);
+                    probe_matched[*pr as usize] = true;
+                }
+
+                // Add unmatched probe rows
+                let (bi, pi) = if swapped {
+                    add_unmatched_probe(&build_indices, &probe_indices, &probe_matched, n_rows)
+                } else {
+                    (build_indices, probe_indices)
+                };
+
+                if !bi.is_empty() {
+                    let batch = create_joined_batch_with_nulls(
+                        build_batches,
+                        probe_batch,
+                        &bi,
+                        &pi,
+                        &probe_matched,
+                        swapped,
+                        output_schema,
+                        true,
+                    )?;
+                    results.push(batch);
+                }
+            }
+
+            JoinType::Right => {
+                // Right join: collect matches and track build-side matches
+                let matches = vht.probe_batch(&probe_key_arrays, n_rows);
+
+                let mut build_indices: Vec<(usize, usize)> = Vec::new();
+                let mut probe_indices: Vec<usize> = Vec::new();
+
+                for (bb, br, pr) in &matches {
+                    build_indices.push((*bb as usize, *br as usize));
+                    probe_indices.push(*pr as usize);
+                    if needs_build_tracking {
+                        build_matched[*bb as usize][*br as usize] = true;
+                    }
+                }
+
+                if !build_indices.is_empty() {
+                    let batch = create_joined_batch(
+                        build_batches,
+                        probe_batch,
+                        &build_indices,
+                        &probe_indices,
+                        swapped,
+                        output_schema,
+                    )?;
+                    results.push(batch);
+                }
+            }
+
+            JoinType::Full => {
+                let matches = vht.probe_batch(&probe_key_arrays, n_rows);
+
+                let mut build_indices: Vec<(usize, usize)> = Vec::new();
+                let mut probe_indices: Vec<usize> = Vec::new();
+
+                for (bb, br, pr) in &matches {
+                    build_indices.push((*bb as usize, *br as usize));
+                    probe_indices.push(*pr as usize);
+                    if needs_build_tracking {
+                        build_matched[*bb as usize][*br as usize] = true;
+                    }
+                }
+
+                if !build_indices.is_empty() {
+                    let batch = create_joined_batch(
+                        build_batches,
+                        probe_batch,
+                        &build_indices,
+                        &probe_indices,
+                        swapped,
+                        output_schema,
+                    )?;
+                    results.push(batch);
+                }
+            }
+
+            JoinType::Semi | JoinType::Anti => {
+                // Parallel vectorized Semi/Anti probe using rayon + atomic bools
+                let chunks: Vec<std::ops::Range<usize>> = (0..n_rows)
+                    .step_by(CHUNK_SIZE)
+                    .map(|start| start..std::cmp::min(start + CHUNK_SIZE, n_rows))
+                    .collect();
+
+                chunks.par_iter().for_each(|range| {
+                    let chunk_len = range.end - range.start;
+                    let chunk_keys: Vec<ArrayRef> = probe_key_arrays
+                        .iter()
+                        .map(|a| a.slice(range.start, chunk_len))
+                        .collect();
+
+                    let matches = vht.probe_batch(&chunk_keys, chunk_len);
+                    for (bb, br, _pr) in matches {
+                        build_matched_atomic[bb as usize][br as usize]
+                            .store(true, Ordering::Relaxed);
+                    }
+                });
+            }
+
+            JoinType::Single | JoinType::Mark => {
+                // Treat like Semi for now
+                let matches = vht.probe_batch(&probe_key_arrays, n_rows);
+                for (bb, br, _pr) in matches {
+                    if needs_build_tracking {
+                        build_matched[bb as usize][br as usize] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Post-processing for join types that need build-side scan
+    if matches!(join_type, JoinType::Right | JoinType::Full) && !swapped {
+        let unmatched_build = collect_unmatched_build(&build_matched);
+        if !unmatched_build.is_empty() {
+            let batch =
+                create_build_only_batch(build_batches, &unmatched_build, output_schema, swapped)?;
+            results.push(batch);
+        }
+    }
+
+    if matches!(join_type, JoinType::Left | JoinType::Full) && swapped {
+        let unmatched_build = collect_unmatched_build(&build_matched);
+        if !unmatched_build.is_empty() {
+            let batch =
+                create_build_only_batch(build_batches, &unmatched_build, output_schema, swapped)?;
+            results.push(batch);
+        }
+    }
+
+    if matches!(join_type, JoinType::Semi) {
+        // Read from atomic bools
+        let matched_build: Vec<(usize, usize)> = build_matched_atomic
+            .iter()
+            .enumerate()
+            .flat_map(|(batch_idx, rows)| {
+                rows.iter()
+                    .enumerate()
+                    .filter_map(move |(row_idx, matched)| {
+                        if matched.load(Ordering::Relaxed) {
+                            Some((batch_idx, row_idx))
+                        } else {
+                            None
+                        }
+                    })
+            })
+            .collect();
+        if !matched_build.is_empty() {
+            let batch = create_semi_anti_batch(build_batches, &matched_build, output_schema)?;
+            results.push(batch);
+        }
+    }
+
+    if matches!(join_type, JoinType::Anti) {
+        // Read from atomic bools
+        let unmatched_build: Vec<(usize, usize)> = build_matched_atomic
+            .iter()
+            .enumerate()
+            .flat_map(|(batch_idx, rows)| {
+                rows.iter()
+                    .enumerate()
+                    .filter_map(move |(row_idx, matched)| {
+                        if !matched.load(Ordering::Relaxed) {
+                            Some((batch_idx, row_idx))
+                        } else {
+                            None
+                        }
+                    })
+            })
+            .collect();
+        if !unmatched_build.is_empty() {
+            let batch = create_semi_anti_batch(build_batches, &unmatched_build, output_schema)?;
+            results.push(batch);
+        }
+    }
+
+    Ok(results)
+}
+
 #[allow(clippy::needless_range_loop)] // Index needed for parallel array access
 #[allow(clippy::too_many_arguments)]
 fn probe_hash_table(
@@ -1236,6 +1671,7 @@ fn probe_hash_table(
     probe_batches: &[RecordBatch],
     hash_table: &HashMap<JoinKey, Vec<HashEntry>>,
     i64_hash_table: Option<&HashMap<i64, Vec<HashEntry>>>,
+    vectorized_ht: Option<&VectorizedHashTable>,
     probe_key_exprs: &[Expr],
     join_type: JoinType,
     swapped: bool,
@@ -1243,8 +1679,25 @@ fn probe_hash_table(
     filter: Option<&Expr>,
     combined_schema: &SchemaRef,
 ) -> Result<Vec<RecordBatch>> {
-    // Use parallel path for SEMI/ANTI joins with sufficient data
     let total_probe_rows: usize = probe_batches.iter().map(|b| b.num_rows()).sum();
+
+    // Try vectorized path first (handles all key types, all join types except Cross)
+    // Cross joins have no join keys and must use the generic path.
+    if let Some(vht) = vectorized_ht {
+        if filter.is_none() && total_probe_rows > 0 && join_type != JoinType::Cross {
+            return probe_vectorized(
+                build_batches,
+                probe_batches,
+                vht,
+                probe_key_exprs,
+                join_type,
+                swapped,
+                output_schema,
+            );
+        }
+    }
+
+    // Use parallel path for SEMI/ANTI joins with sufficient data
     if matches!(join_type, JoinType::Semi | JoinType::Anti) && total_probe_rows > 1000 {
         return probe_semi_anti_parallel(
             build_batches,

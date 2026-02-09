@@ -2,6 +2,7 @@
 
 use crate::error::{QueryError, Result};
 use crate::physical::operators::filter::evaluate_expr;
+use crate::physical::operators::vectorized_hash;
 use crate::physical::{PhysicalOperator, RecordBatchStream};
 use crate::planner::{AggregateFunction, Expr, ScalarValue};
 use arrow::array::{
@@ -401,8 +402,695 @@ fn aggregate_batches(
         return aggregate_scalar_simd(&batches[0], &aggregates[0], schema);
     }
 
+    // Try vectorized path for supported aggregate functions
+    if can_vectorize_aggregation(group_by, aggregates, batches) {
+        if let Ok(result) = aggregate_batches_vectorized(batches, group_by, aggregates, schema) {
+            return Ok(result);
+        }
+    }
+
     // Regular hash-based aggregation for grouped queries
     aggregate_batches_hash(batches, group_by, aggregates, schema)
+}
+
+/// Check if we can use the vectorized aggregation path.
+fn can_vectorize_aggregation(
+    group_by: &[Expr],
+    aggregates: &[AggregateExpr],
+    batches: &[RecordBatch],
+) -> bool {
+    if batches.is_empty() || group_by.is_empty() {
+        return false; // Scalar aggs use SIMD path, empty inputs use hash path
+    }
+    let has_distinct = aggregates
+        .iter()
+        .any(|a| a.func == AggregateFunction::CountDistinct || a.distinct);
+    if has_distinct {
+        return false;
+    }
+    // Only vectorize common aggregate functions
+    aggregates.iter().all(|a| {
+        matches!(
+            a.func,
+            AggregateFunction::Count
+                | AggregateFunction::Sum
+                | AggregateFunction::Min
+                | AggregateFunction::Max
+                | AggregateFunction::Avg
+        )
+    })
+}
+
+/// Vectorized group table: stores groups by hash with flat accumulator arrays.
+/// Key arrays are stored separately to avoid borrow conflicts.
+struct VectorizedGroupTable {
+    /// buckets[hash & mask] = Vec<group_id>
+    buckets: Vec<Vec<u32>>,
+    mask: usize,
+    /// group_keys[group_id] = (batch_idx, row_idx) pointing to the first row of the group
+    group_key_refs: Vec<(usize, usize)>,
+    num_groups: usize,
+    // Flat accumulator arrays — one value per group per aggregate
+    counts: Vec<Vec<i64>>,
+    sums_i64: Vec<Vec<i64>>,
+    sums_f64: Vec<Vec<f64>>,
+    mins_i64: Vec<Vec<Option<i64>>>,
+    maxs_i64: Vec<Vec<Option<i64>>>,
+    mins_f64: Vec<Vec<Option<f64>>>,
+    maxs_f64: Vec<Vec<Option<f64>>>,
+    mins_str: Vec<Vec<Option<String>>>,
+    maxs_str: Vec<Vec<Option<String>>>,
+}
+
+impl VectorizedGroupTable {
+    fn new(num_aggregates: usize) -> Self {
+        let initial_capacity: usize = 1024;
+        let bucket_count = initial_capacity.next_power_of_two();
+        VectorizedGroupTable {
+            buckets: vec![Vec::new(); bucket_count],
+            mask: bucket_count - 1,
+            group_key_refs: Vec::with_capacity(initial_capacity),
+            num_groups: 0,
+            counts: (0..num_aggregates).map(|_| Vec::new()).collect(),
+            sums_i64: (0..num_aggregates).map(|_| Vec::new()).collect(),
+            sums_f64: (0..num_aggregates).map(|_| Vec::new()).collect(),
+            mins_i64: (0..num_aggregates).map(|_| Vec::new()).collect(),
+            maxs_i64: (0..num_aggregates).map(|_| Vec::new()).collect(),
+            mins_f64: (0..num_aggregates).map(|_| Vec::new()).collect(),
+            maxs_f64: (0..num_aggregates).map(|_| Vec::new()).collect(),
+            mins_str: (0..num_aggregates).map(|_| Vec::new()).collect(),
+            maxs_str: (0..num_aggregates).map(|_| Vec::new()).collect(),
+        }
+    }
+
+    fn add_group(&mut self, batch_idx: usize, row_idx: usize) -> u32 {
+        let group_id = self.num_groups as u32;
+        self.num_groups += 1;
+        self.group_key_refs.push((batch_idx, row_idx));
+        // Extend all accumulator arrays
+        for v in &mut self.counts {
+            v.push(0);
+        }
+        for v in &mut self.sums_i64 {
+            v.push(0);
+        }
+        for v in &mut self.sums_f64 {
+            v.push(0.0);
+        }
+        for v in &mut self.mins_i64 {
+            v.push(None);
+        }
+        for v in &mut self.maxs_i64 {
+            v.push(None);
+        }
+        for v in &mut self.mins_f64 {
+            v.push(None);
+        }
+        for v in &mut self.maxs_f64 {
+            v.push(None);
+        }
+        for v in &mut self.mins_str {
+            v.push(None);
+        }
+        for v in &mut self.maxs_str {
+            v.push(None);
+        }
+        group_id
+    }
+
+    /// Resize the hash table if load factor > 75%.
+    fn maybe_resize(&mut self, all_key_arrays: &[Vec<ArrayRef>]) {
+        if self.num_groups * 4 > (self.mask + 1) * 3 {
+            let new_size = (self.mask + 1) * 2;
+            let new_mask = new_size - 1;
+            let mut new_buckets = vec![Vec::new(); new_size];
+
+            // Rehash all groups
+            for group_id in 0..self.num_groups {
+                let (batch_idx, row_idx) = self.group_key_refs[group_id];
+                let key_arrays = &all_key_arrays[batch_idx];
+                let hashes = vectorized_hash::hash_arrays(key_arrays, row_idx + 1);
+                let bucket = hashes[row_idx] as usize & new_mask;
+                new_buckets[bucket].push(group_id as u32);
+            }
+
+            self.buckets = new_buckets;
+            self.mask = new_mask;
+        }
+    }
+}
+
+/// Vectorized aggregation: batch-level hashing and tight accumulator loops.
+fn aggregate_batches_vectorized(
+    batches: &[RecordBatch],
+    group_by: &[Expr],
+    aggregates: &[AggregateExpr],
+    schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    let num_aggs = aggregates.len();
+    let mut gt = VectorizedGroupTable::new(num_aggs);
+
+    // Pre-evaluate all key arrays and aggregate inputs
+    let mut all_key_arrays: Vec<Vec<ArrayRef>> = Vec::with_capacity(batches.len());
+    let mut all_agg_inputs: Vec<Vec<ArrayRef>> = Vec::with_capacity(batches.len());
+
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            all_key_arrays.push(Vec::new());
+            all_agg_inputs.push(Vec::new());
+            continue;
+        }
+        let key_arrays: Result<Vec<ArrayRef>> =
+            group_by.iter().map(|e| evaluate_expr(batch, e)).collect();
+        let key_arrays = key_arrays?;
+        if !vectorized_hash::can_vectorize_arrays(&key_arrays) {
+            return Err(QueryError::Execution("Cannot vectorize group keys".into()));
+        }
+        all_key_arrays.push(key_arrays);
+
+        let agg_inputs: Result<Vec<ArrayRef>> = aggregates
+            .iter()
+            .map(|a| evaluate_expr(batch, &a.input))
+            .collect();
+        all_agg_inputs.push(agg_inputs?);
+    }
+
+    for (batch_idx, batch) in batches.iter().enumerate() {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+
+        let num_rows = batch.num_rows();
+        let hashes = vectorized_hash::hash_arrays(&all_key_arrays[batch_idx], num_rows);
+
+        // Assign group IDs for each row
+        let mut group_ids = Vec::with_capacity(num_rows);
+        for row in 0..num_rows {
+            let bucket = hashes[row] as usize & gt.mask;
+            let mut found_group = None;
+
+            for &gid in &gt.buckets[bucket] {
+                let (ref_batch, ref_row) = gt.group_key_refs[gid as usize];
+                if vectorized_hash::compare_row(
+                    &all_key_arrays[ref_batch],
+                    ref_row,
+                    &all_key_arrays[batch_idx],
+                    row,
+                ) {
+                    found_group = Some(gid);
+                    break;
+                }
+            }
+
+            let gid = match found_group {
+                Some(gid) => gid,
+                None => {
+                    let gid = gt.add_group(batch_idx, row);
+                    let bucket = hashes[row] as usize & gt.mask;
+                    gt.buckets[bucket].push(gid);
+                    gt.maybe_resize(&all_key_arrays);
+                    gid
+                }
+            };
+            group_ids.push(gid as usize);
+        }
+
+        let agg_inputs = &all_agg_inputs[batch_idx];
+
+        // Now update accumulators in tight loops per aggregate
+        for (agg_idx, agg) in aggregates.iter().enumerate() {
+            let input = &agg_inputs[agg_idx];
+            let num_rows = batch.num_rows();
+
+            match agg.func {
+                AggregateFunction::Count => {
+                    let nulls = input.nulls();
+                    let counts = &mut gt.counts[agg_idx];
+                    for row in 0..num_rows {
+                        if nulls.map_or(true, |n| n.is_valid(row)) {
+                            counts[group_ids[row]] += 1;
+                        }
+                    }
+                }
+                AggregateFunction::Sum | AggregateFunction::Avg => {
+                    if let Some(arr) = input.as_any().downcast_ref::<Int64Array>() {
+                        let values = arr.values();
+                        let nulls = arr.nulls();
+                        let sums = &mut gt.sums_i64[agg_idx];
+                        let fsums = &mut gt.sums_f64[agg_idx];
+                        let counts = &mut gt.counts[agg_idx];
+                        for row in 0..num_rows {
+                            if nulls.map_or(true, |n| n.is_valid(row)) {
+                                let gid = group_ids[row];
+                                sums[gid] += values[row];
+                                fsums[gid] += values[row] as f64;
+                                counts[gid] += 1;
+                            }
+                        }
+                    } else if let Some(arr) = input.as_any().downcast_ref::<Float64Array>() {
+                        let values = arr.values();
+                        let nulls = arr.nulls();
+                        let fsums = &mut gt.sums_f64[agg_idx];
+                        let counts = &mut gt.counts[agg_idx];
+                        for row in 0..num_rows {
+                            if nulls.map_or(true, |n| n.is_valid(row)) {
+                                let gid = group_ids[row];
+                                fsums[gid] += values[row];
+                                counts[gid] += 1;
+                            }
+                        }
+                    } else if let Some(arr) =
+                        input.as_any().downcast_ref::<arrow::array::Int32Array>()
+                    {
+                        let values = arr.values();
+                        let nulls = arr.nulls();
+                        let sums = &mut gt.sums_i64[agg_idx];
+                        let fsums = &mut gt.sums_f64[agg_idx];
+                        let counts = &mut gt.counts[agg_idx];
+                        for row in 0..num_rows {
+                            if nulls.map_or(true, |n| n.is_valid(row)) {
+                                let gid = group_ids[row];
+                                sums[gid] += values[row] as i64;
+                                fsums[gid] += values[row] as f64;
+                                counts[gid] += 1;
+                            }
+                        }
+                    } else if let Some(arr) = input
+                        .as_any()
+                        .downcast_ref::<arrow::array::Decimal128Array>()
+                    {
+                        let nulls = arr.nulls();
+                        let sums = &mut gt.sums_i64[agg_idx];
+                        let fsums = &mut gt.sums_f64[agg_idx];
+                        let counts = &mut gt.counts[agg_idx];
+                        for row in 0..num_rows {
+                            if nulls.map_or(true, |n| n.is_valid(row)) {
+                                let gid = group_ids[row];
+                                sums[gid] += arr.value(row) as i64;
+                                fsums[gid] += arr.value(row) as f64;
+                                counts[gid] += 1;
+                            }
+                        }
+                    }
+                }
+                AggregateFunction::Min => {
+                    if let Some(arr) = input.as_any().downcast_ref::<Int64Array>() {
+                        let values = arr.values();
+                        let nulls = arr.nulls();
+                        let mins = &mut gt.mins_i64[agg_idx];
+                        for row in 0..num_rows {
+                            if nulls.map_or(true, |n| n.is_valid(row)) {
+                                let gid = group_ids[row];
+                                let val = values[row];
+                                mins[gid] = Some(mins[gid].map_or(val, |m: i64| m.min(val)));
+                            }
+                        }
+                    } else if let Some(arr) = input.as_any().downcast_ref::<Float64Array>() {
+                        let values = arr.values();
+                        let nulls = arr.nulls();
+                        let mins = &mut gt.mins_f64[agg_idx];
+                        for row in 0..num_rows {
+                            if nulls.map_or(true, |n| n.is_valid(row)) {
+                                let gid = group_ids[row];
+                                let val = values[row];
+                                mins[gid] = Some(mins[gid].map_or(val, |m: f64| m.min(val)));
+                            }
+                        }
+                    } else if let Some(arr) =
+                        input.as_any().downcast_ref::<arrow::array::StringArray>()
+                    {
+                        let nulls = arr.nulls();
+                        let mins = &mut gt.mins_str[agg_idx];
+                        for row in 0..num_rows {
+                            if nulls.map_or(true, |n| n.is_valid(row)) {
+                                let gid = group_ids[row];
+                                let val = arr.value(row);
+                                mins[gid] = Some(match &mins[gid] {
+                                    None => val.to_string(),
+                                    Some(m) => {
+                                        if val < m.as_str() {
+                                            val.to_string()
+                                        } else {
+                                            m.clone()
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    } else if let Some(arr) = input.as_any().downcast_ref::<Date32Array>() {
+                        let values = arr.values();
+                        let nulls = arr.nulls();
+                        let mins = &mut gt.mins_i64[agg_idx];
+                        for row in 0..num_rows {
+                            if nulls.map_or(true, |n| n.is_valid(row)) {
+                                let gid = group_ids[row];
+                                let val = values[row] as i64;
+                                mins[gid] = Some(mins[gid].map_or(val, |m: i64| m.min(val)));
+                            }
+                        }
+                    }
+                }
+                AggregateFunction::Max => {
+                    if let Some(arr) = input.as_any().downcast_ref::<Int64Array>() {
+                        let values = arr.values();
+                        let nulls = arr.nulls();
+                        let maxs = &mut gt.maxs_i64[agg_idx];
+                        for row in 0..num_rows {
+                            if nulls.map_or(true, |n| n.is_valid(row)) {
+                                let gid = group_ids[row];
+                                let val = values[row];
+                                maxs[gid] = Some(maxs[gid].map_or(val, |m: i64| m.max(val)));
+                            }
+                        }
+                    } else if let Some(arr) = input.as_any().downcast_ref::<Float64Array>() {
+                        let values = arr.values();
+                        let nulls = arr.nulls();
+                        let maxs = &mut gt.maxs_f64[agg_idx];
+                        for row in 0..num_rows {
+                            if nulls.map_or(true, |n| n.is_valid(row)) {
+                                let gid = group_ids[row];
+                                let val = values[row];
+                                maxs[gid] = Some(maxs[gid].map_or(val, |m: f64| m.max(val)));
+                            }
+                        }
+                    } else if let Some(arr) =
+                        input.as_any().downcast_ref::<arrow::array::StringArray>()
+                    {
+                        let nulls = arr.nulls();
+                        let maxs = &mut gt.maxs_str[agg_idx];
+                        for row in 0..num_rows {
+                            if nulls.map_or(true, |n| n.is_valid(row)) {
+                                let gid = group_ids[row];
+                                let val = arr.value(row);
+                                maxs[gid] = Some(match &maxs[gid] {
+                                    None => val.to_string(),
+                                    Some(m) => {
+                                        if val > m.as_str() {
+                                            val.to_string()
+                                        } else {
+                                            m.clone()
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    } else if let Some(arr) = input.as_any().downcast_ref::<Date32Array>() {
+                        let values = arr.values();
+                        let nulls = arr.nulls();
+                        let maxs = &mut gt.maxs_i64[agg_idx];
+                        for row in 0..num_rows {
+                            if nulls.map_or(true, |n| n.is_valid(row)) {
+                                let gid = group_ids[row];
+                                let val = values[row] as i64;
+                                maxs[gid] = Some(maxs[gid].map_or(val, |m: i64| m.max(val)));
+                            }
+                        }
+                    }
+                }
+                _ => {} // Handled by can_vectorize_aggregation check
+            }
+        }
+    }
+
+    // Handle empty result with scalar aggregates
+    if gt.num_groups == 0 {
+        return Err(QueryError::Execution(
+            "Vectorized aggregation produced no groups".into(),
+        ));
+    }
+
+    // Build output arrays
+    build_vectorized_output(&gt, &all_key_arrays, group_by, aggregates, schema)
+}
+
+/// Build the output RecordBatch from the vectorized group table.
+fn build_vectorized_output(
+    gt: &VectorizedGroupTable,
+    all_key_arrays: &[Vec<ArrayRef>],
+    group_by: &[Expr],
+    aggregates: &[AggregateExpr],
+    schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    let num_groups = gt.num_groups;
+    let mut output_arrays: Vec<ArrayRef> = Vec::new();
+
+    // Build group-by column arrays
+    for (col_idx, _) in group_by.iter().enumerate() {
+        let field = schema.field(col_idx);
+        let arr = build_vectorized_group_column(
+            gt,
+            all_key_arrays,
+            col_idx,
+            num_groups,
+            field.data_type(),
+        )?;
+        output_arrays.push(arr);
+    }
+
+    // Build aggregate column arrays
+    for (agg_idx, agg) in aggregates.iter().enumerate() {
+        let field = schema.field(group_by.len() + agg_idx);
+        let arr = build_vectorized_agg_column(gt, agg_idx, agg, num_groups, field.data_type())?;
+        output_arrays.push(arr);
+    }
+
+    RecordBatch::try_new(schema.clone(), output_arrays).map_err(Into::into)
+}
+
+/// Build a group-by column from the vectorized group table.
+fn build_vectorized_group_column(
+    gt: &VectorizedGroupTable,
+    all_key_arrays: &[Vec<ArrayRef>],
+    col_idx: usize,
+    num_groups: usize,
+    data_type: &DataType,
+) -> Result<ArrayRef> {
+    match data_type {
+        DataType::Int64 => {
+            let mut builder = Int64Builder::with_capacity(num_groups);
+            for gid in 0..num_groups {
+                let (batch_idx, row_idx) = gt.group_key_refs[gid];
+                let arr = &all_key_arrays[batch_idx][col_idx];
+                if arr.is_null(row_idx) {
+                    builder.append_null();
+                } else if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+                    builder.append_value(a.value(row_idx));
+                } else if let Some(a) = arr.as_any().downcast_ref::<arrow::array::Int32Array>() {
+                    builder.append_value(a.value(row_idx) as i64);
+                } else {
+                    builder.append_null();
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Int32 => {
+            let mut builder = arrow::array::Int32Builder::with_capacity(num_groups);
+            for gid in 0..num_groups {
+                let (batch_idx, row_idx) = gt.group_key_refs[gid];
+                let arr = &all_key_arrays[batch_idx][col_idx];
+                if arr.is_null(row_idx) {
+                    builder.append_null();
+                } else if let Some(a) = arr.as_any().downcast_ref::<arrow::array::Int32Array>() {
+                    builder.append_value(a.value(row_idx));
+                } else if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+                    builder.append_value(a.value(row_idx) as i32);
+                } else {
+                    builder.append_null();
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Float64 => {
+            let mut builder = Float64Builder::with_capacity(num_groups);
+            for gid in 0..num_groups {
+                let (batch_idx, row_idx) = gt.group_key_refs[gid];
+                let arr = &all_key_arrays[batch_idx][col_idx];
+                if arr.is_null(row_idx) {
+                    builder.append_null();
+                } else if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
+                    builder.append_value(a.value(row_idx));
+                } else {
+                    builder.append_null();
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Utf8 => {
+            let mut builder = StringBuilder::with_capacity(num_groups, num_groups * 16);
+            for gid in 0..num_groups {
+                let (batch_idx, row_idx) = gt.group_key_refs[gid];
+                let arr = &all_key_arrays[batch_idx][col_idx];
+                if arr.is_null(row_idx) {
+                    builder.append_null();
+                } else if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
+                    builder.append_value(a.value(row_idx));
+                } else {
+                    builder.append_null();
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Date32 => {
+            let mut builder = arrow::array::Date32Builder::with_capacity(num_groups);
+            for gid in 0..num_groups {
+                let (batch_idx, row_idx) = gt.group_key_refs[gid];
+                let arr = &all_key_arrays[batch_idx][col_idx];
+                if arr.is_null(row_idx) {
+                    builder.append_null();
+                } else if let Some(a) = arr.as_any().downcast_ref::<Date32Array>() {
+                    builder.append_value(a.value(row_idx));
+                } else if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+                    builder.append_value(a.value(row_idx) as i32);
+                } else {
+                    builder.append_null();
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Boolean => {
+            let mut builder = arrow::array::BooleanBuilder::with_capacity(num_groups);
+            for gid in 0..num_groups {
+                let (batch_idx, row_idx) = gt.group_key_refs[gid];
+                let arr = &all_key_arrays[batch_idx][col_idx];
+                if arr.is_null(row_idx) {
+                    builder.append_null();
+                } else if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
+                    builder.append_value(a.value(row_idx));
+                } else {
+                    builder.append_null();
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        _ => Err(QueryError::NotImplemented(format!(
+            "Vectorized group by type not supported: {:?}",
+            data_type
+        ))),
+    }
+}
+
+/// Build an aggregate output column from vectorized accumulators.
+fn build_vectorized_agg_column(
+    gt: &VectorizedGroupTable,
+    agg_idx: usize,
+    agg: &AggregateExpr,
+    num_groups: usize,
+    data_type: &DataType,
+) -> Result<ArrayRef> {
+    match (agg.func, data_type) {
+        (AggregateFunction::Count, DataType::Int64) => {
+            let values: Vec<i64> = gt.counts[agg_idx][..num_groups].to_vec();
+            Ok(Arc::new(Int64Array::from(values)))
+        }
+        (AggregateFunction::Sum, DataType::Int64) => {
+            let values: Vec<i64> = gt.sums_i64[agg_idx][..num_groups].to_vec();
+            Ok(Arc::new(Int64Array::from(values)))
+        }
+        (AggregateFunction::Sum, DataType::UInt64) => {
+            let values: Vec<u64> = gt.sums_i64[agg_idx][..num_groups]
+                .iter()
+                .map(|v| *v as u64)
+                .collect();
+            Ok(Arc::new(arrow::array::UInt64Array::from(values)))
+        }
+        (AggregateFunction::Sum, DataType::Float64) => {
+            let values: Vec<f64> = gt.sums_f64[agg_idx][..num_groups].to_vec();
+            Ok(Arc::new(Float64Array::from(values)))
+        }
+        (AggregateFunction::Sum, DataType::Decimal128(p, s)) => {
+            let mut builder = Decimal128Builder::with_capacity(num_groups);
+            for gid in 0..num_groups {
+                builder.append_value(gt.sums_i64[agg_idx][gid] as i128);
+            }
+            Ok(Arc::new(builder.finish().with_precision_and_scale(*p, *s)?))
+        }
+        (AggregateFunction::Avg, DataType::Float64) => {
+            let mut builder = Float64Builder::with_capacity(num_groups);
+            for gid in 0..num_groups {
+                let count = gt.counts[agg_idx][gid];
+                if count > 0 {
+                    builder.append_value(gt.sums_f64[agg_idx][gid] / count as f64);
+                } else {
+                    builder.append_null();
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        (AggregateFunction::Min, DataType::Int64) => {
+            let mut builder = Int64Builder::with_capacity(num_groups);
+            for gid in 0..num_groups {
+                match gt.mins_i64[agg_idx][gid] {
+                    Some(v) => builder.append_value(v),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        (AggregateFunction::Max, DataType::Int64) => {
+            let mut builder = Int64Builder::with_capacity(num_groups);
+            for gid in 0..num_groups {
+                match gt.maxs_i64[agg_idx][gid] {
+                    Some(v) => builder.append_value(v),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        (AggregateFunction::Min, DataType::Float64) => {
+            let mut builder = Float64Builder::with_capacity(num_groups);
+            for gid in 0..num_groups {
+                match gt.mins_f64[agg_idx][gid] {
+                    Some(v) => builder.append_value(v),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        (AggregateFunction::Max, DataType::Float64) => {
+            let mut builder = Float64Builder::with_capacity(num_groups);
+            for gid in 0..num_groups {
+                match gt.maxs_f64[agg_idx][gid] {
+                    Some(v) => builder.append_value(v),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        (AggregateFunction::Min | AggregateFunction::Max, DataType::Utf8) => {
+            let mut builder = StringBuilder::with_capacity(num_groups, num_groups * 16);
+            let vals = if agg.func == AggregateFunction::Min {
+                &gt.mins_str[agg_idx]
+            } else {
+                &gt.maxs_str[agg_idx]
+            };
+            for gid in 0..num_groups {
+                match &vals[gid] {
+                    Some(v) => builder.append_value(v),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        (AggregateFunction::Min | AggregateFunction::Max, DataType::Date32) => {
+            let mut builder = arrow::array::Date32Builder::with_capacity(num_groups);
+            let vals = if agg.func == AggregateFunction::Min {
+                &gt.mins_i64[agg_idx]
+            } else {
+                &gt.maxs_i64[agg_idx]
+            };
+            for gid in 0..num_groups {
+                match vals[gid] {
+                    Some(v) => builder.append_value(v as i32),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        _ => Err(QueryError::NotImplemented(format!(
+            "Vectorized {:?} with type {:?} not supported",
+            agg.func, data_type
+        ))),
+    }
 }
 
 /// Parallel aggregation using rayon for multi-core performance
@@ -418,6 +1106,13 @@ fn aggregate_batches_parallel(
         .any(|a| a.func == AggregateFunction::CountDistinct || a.distinct);
     if group_by.is_empty() && batches.len() == 1 && aggregates.len() == 1 && !has_distinct {
         return aggregate_scalar_simd(&batches[0], &aggregates[0], schema);
+    }
+
+    // Try vectorized path for supported aggregate functions
+    if can_vectorize_aggregation(group_by, aggregates, batches) {
+        if let Ok(result) = aggregate_batches_vectorized(batches, group_by, aggregates, schema) {
+            return Ok(result);
+        }
     }
 
     // Determine number of threads
