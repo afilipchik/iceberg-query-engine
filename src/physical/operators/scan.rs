@@ -10,6 +10,15 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Table statistics from a data source
+#[derive(Debug, Clone)]
+pub struct TableStatistics {
+    /// Exact row count from metadata
+    pub row_count: usize,
+    /// Total size in bytes (approximate)
+    pub total_byte_size: u64,
+}
+
 /// Table provider trait for accessing table data
 pub trait TableProvider: Send + Sync + fmt::Debug {
     /// Get the schema of the table
@@ -17,6 +26,22 @@ pub trait TableProvider: Send + Sync + fmt::Debug {
 
     /// Get all batches from the table
     fn scan(&self, projection: Option<&[usize]>) -> Result<Vec<RecordBatch>>;
+
+    /// Scan with an optional filter predicate for row group pruning.
+    /// Default implementation ignores the filter and delegates to `scan()`.
+    fn scan_with_filter(
+        &self,
+        projection: Option<&[usize]>,
+        _filter: Option<&crate::planner::Expr>,
+    ) -> Result<Vec<RecordBatch>> {
+        self.scan(projection)
+    }
+
+    /// Get table-level statistics (row count, byte size).
+    /// Returns None if statistics are not available.
+    fn statistics(&self) -> Option<TableStatistics> {
+        None
+    }
 
     /// Get Parquet file paths if this is a Parquet-based table
     /// Returns None for non-Parquet tables (e.g., MemoryTable)

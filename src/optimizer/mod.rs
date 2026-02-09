@@ -9,7 +9,9 @@ pub use cost::*;
 pub use rules::*;
 
 use crate::error::Result;
+use crate::physical::operators::TableStatistics;
 use crate::planner::LogicalPlan;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Optimizer trait for plan transformations
@@ -25,6 +27,8 @@ pub trait OptimizerRule: Send + Sync {
 pub struct Optimizer {
     rules: Vec<Arc<dyn OptimizerRule>>,
     max_iterations: usize,
+    /// Table statistics for statistics-based optimization
+    table_stats: HashMap<String, TableStatistics>,
 }
 
 impl Default for Optimizer {
@@ -47,13 +51,20 @@ impl Optimizer {
                 // Decorrelate subqueries to regular joins
                 Arc::new(rules::SubqueryDecorrelation),
                 // Reorder joins after decorrelation
-                Arc::new(rules::JoinReorder),
+                Arc::new(rules::JoinReorder::new()),
                 // Final predicate pushdown for any remaining opportunities
                 Arc::new(rules::PredicatePushdown),
                 Arc::new(rules::ProjectionPushdown),
             ],
             max_iterations: 10,
+            table_stats: HashMap::new(),
         }
+    }
+
+    /// Set table statistics for statistics-based join optimization
+    pub fn with_table_statistics(mut self, stats: HashMap<String, TableStatistics>) -> Self {
+        self.table_stats = stats;
+        self
     }
 
     /// Create optimizer with custom rules
@@ -61,11 +72,29 @@ impl Optimizer {
         Self {
             rules,
             max_iterations: 10,
+            table_stats: HashMap::new(),
         }
     }
 
     /// Optimize a logical plan
     pub fn optimize(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        // If we have table statistics, rebuild rules with stats-aware JoinReorder
+        if !self.table_stats.is_empty() {
+            let rules: Vec<Arc<dyn OptimizerRule>> = self
+                .rules
+                .iter()
+                .map(|rule| {
+                    if rule.name() == "JoinReorder" {
+                        Arc::new(rules::JoinReorder::with_table_statistics(
+                            self.table_stats.clone(),
+                        )) as Arc<dyn OptimizerRule>
+                    } else {
+                        rule.clone()
+                    }
+                })
+                .collect();
+            return Self::optimize_with_rules(plan, &rules, self.max_iterations, false);
+        }
         self.optimize_inner(plan, false)
     }
 
@@ -75,12 +104,21 @@ impl Optimizer {
     }
 
     fn optimize_inner(&self, plan: LogicalPlan, diag: bool) -> Result<LogicalPlan> {
+        Self::optimize_with_rules(plan, &self.rules, self.max_iterations, diag)
+    }
+
+    fn optimize_with_rules(
+        plan: LogicalPlan,
+        rules: &[Arc<dyn OptimizerRule>],
+        max_iterations: usize,
+        diag: bool,
+    ) -> Result<LogicalPlan> {
         let mut current = plan;
 
-        for iter in 0..self.max_iterations {
+        for iter in 0..max_iterations {
             let mut changed = false;
 
-            for rule in &self.rules {
+            for rule in rules {
                 let new_plan = rule.optimize(&current)?;
 
                 // Simple check if plan changed (by string representation)

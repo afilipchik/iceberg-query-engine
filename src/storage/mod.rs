@@ -5,6 +5,7 @@
 //! - Apache Iceberg tables (see `physical::operators::iceberg`)
 
 mod parquet;
+pub mod row_group_pruning;
 
 pub use parquet::{
     ParquetFileInfo, ParquetTable, StreamingParquetReader, StreamingParquetScanBuilder,

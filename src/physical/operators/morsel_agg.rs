@@ -96,12 +96,13 @@ impl PhysicalOperator for MorselAggregateExec {
             return Ok(Box::pin(stream::empty()));
         }
 
-        // Create the parallel Parquet source
-        let source = ParallelParquetSource::try_new(
+        // Create the parallel Parquet source with row group pruning
+        let source = ParallelParquetSource::try_new_with_filter(
             self.files.clone(),
             self.input_schema.clone(),
             self.projection.clone(),
             DEFAULT_MORSEL_SIZE,
+            self.filter.as_ref(),
         )?;
 
         // Determine input types for aggregates

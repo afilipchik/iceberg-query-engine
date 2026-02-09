@@ -92,15 +92,29 @@ impl ParallelParquetSource {
         projection: Option<Vec<usize>>,
         batch_size: usize,
     ) -> Result<Self> {
-        // Discover all row groups
+        Self::try_new_with_filter(files, schema, projection, batch_size, None)
+    }
+
+    /// Create a new parallel Parquet source with optional filter for row group pruning
+    pub fn try_new_with_filter(
+        files: Vec<PathBuf>,
+        schema: SchemaRef,
+        projection: Option<Vec<usize>>,
+        batch_size: usize,
+        filter: Option<&crate::planner::Expr>,
+    ) -> Result<Self> {
+        // Discover all row groups, pruning based on filter
         let mut work_queue = VecDeque::new();
 
         for (file_idx, file_path) in files.iter().enumerate() {
             let file = File::open(file_path)?;
             let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-            let metadata = builder.metadata();
+            let metadata = builder.metadata().clone();
 
-            for row_group_idx in 0..metadata.num_row_groups() {
+            let matching_rgs =
+                crate::storage::row_group_pruning::prune_row_groups(&metadata, &schema, filter);
+
+            for row_group_idx in matching_rgs {
                 work_queue.push_back(RowGroupWork {
                     file_path: file_path.clone(),
                     row_group_idx,

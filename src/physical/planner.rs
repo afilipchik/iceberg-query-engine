@@ -235,6 +235,52 @@ impl PhysicalPlanner {
         }
     }
 
+    /// Estimate the output row count of a logical plan using table statistics.
+    /// Returns None if statistics are not available.
+    fn estimate_output_rows(&self, plan: &LogicalPlan) -> Option<usize> {
+        match plan {
+            LogicalPlan::Scan(node) => {
+                let provider = self.tables.get(&node.table_name)?;
+                let stats = provider.statistics()?;
+                let rows = stats.row_count;
+                if node.filter.is_some() {
+                    Some((rows as f64 * 0.3) as usize) // Default selectivity
+                } else {
+                    Some(rows)
+                }
+            }
+            LogicalPlan::Filter(node) => {
+                let input_rows = self.estimate_output_rows(&node.input)?;
+                Some((input_rows as f64 * 0.3) as usize)
+            }
+            LogicalPlan::Project(node) => self.estimate_output_rows(&node.input),
+            LogicalPlan::SubqueryAlias(node) => self.estimate_output_rows(&node.input),
+            LogicalPlan::Join(node) => {
+                let left = self.estimate_output_rows(&node.left).unwrap_or(10_000);
+                let right = self.estimate_output_rows(&node.right).unwrap_or(10_000);
+                match node.join_type {
+                    JoinType::Semi | JoinType::Anti => Some(left / 2),
+                    JoinType::Inner => Some(std::cmp::max(left, right) / 10),
+                    JoinType::Left => Some(left),
+                    JoinType::Right => Some(right),
+                    _ => Some(std::cmp::max(left, right)),
+                }
+            }
+            LogicalPlan::Aggregate(node) => {
+                let input_rows = self.estimate_output_rows(&node.input).unwrap_or(10_000);
+                if node.group_by.is_empty() {
+                    Some(1)
+                } else {
+                    Some(input_rows / 10)
+                }
+            }
+            LogicalPlan::Limit(node) => node
+                .fetch
+                .or_else(|| self.estimate_output_rows(&node.input)),
+            _ => None,
+        }
+    }
+
     /// Convert a logical plan to a physical plan
     pub fn create_physical_plan(&self, logical: &LogicalPlan) -> Result<Arc<dyn PhysicalOperator>> {
         // Pre-scan tables that are accessed multiple times to avoid redundant parquet reads
@@ -313,15 +359,21 @@ impl PhysicalPlanner {
                     };
                     MemoryTableExec::new(&node.table_name, schema, batches, None)
                 } else {
-                    // No cache: use original path
+                    // No cache: use scan_with_filter for Parquet row group pruning
                     drop(cache);
-                    let exec = MemoryTableExec::from_provider_with_schema(
-                        &node.table_name,
-                        provider.as_ref(),
-                        node.projection.clone(),
-                        logical_schema,
-                    )?;
-                    exec
+                    let batches = provider
+                        .scan_with_filter(node.projection.as_deref(), node.filter.as_ref())?;
+                    let schema = match &node.projection {
+                        Some(indices) => {
+                            let fields: Vec<_> = indices
+                                .iter()
+                                .map(|&i| logical_schema.field(i).clone())
+                                .collect();
+                            Arc::new(Schema::new(fields))
+                        }
+                        None => logical_schema,
+                    };
+                    MemoryTableExec::new(&node.table_name, schema, batches, None)
                 };
 
                 // If there's a filter on the scan, wrap with FilterExec
@@ -355,8 +407,31 @@ impl PhysicalPlanner {
             }
 
             LogicalPlan::Join(node) => {
-                let left = self.create_physical_plan_inner(&node.left)?;
-                let right = self.create_physical_plan_inner(&node.right)?;
+                // For Inner joins, swap build/probe sides so smaller side is the build side.
+                // The left side of HashJoinExec is the build side (builds the hash table).
+                let should_swap = matches!(node.join_type, JoinType::Inner) && {
+                    let left_rows = self.estimate_output_rows(&node.left);
+                    let right_rows = self.estimate_output_rows(&node.right);
+                    match (left_rows, right_rows) {
+                        (Some(l), Some(r)) => l > r * 2, // Swap if left is 2x larger
+                        _ => false,
+                    }
+                };
+
+                let (left_plan, right_plan, on) = if should_swap {
+                    // Swap: right becomes build side (left), left becomes probe side (right)
+                    let swapped_on: Vec<(Expr, Expr)> = node
+                        .on
+                        .iter()
+                        .map(|(l, r)| (r.clone(), l.clone()))
+                        .collect();
+                    (&node.right, &node.left, swapped_on)
+                } else {
+                    (&node.left, &node.right, node.on.clone())
+                };
+
+                let left = self.create_physical_plan_inner(left_plan)?;
+                let right = self.create_physical_plan_inner(right_plan)?;
 
                 // For Semi/Anti joins, the filter must be evaluated inside the join
                 // because the output doesn't include right-side columns
@@ -368,7 +443,7 @@ impl PhysicalPlanner {
                     let join = HashJoinExec::with_filter(
                         left,
                         right,
-                        node.on.clone(),
+                        on,
                         node.join_type,
                         node.filter.clone(),
                     );
@@ -378,7 +453,7 @@ impl PhysicalPlanner {
                     let join = SpillableHashJoinExec::new(
                         left,
                         right,
-                        node.on.clone(),
+                        on,
                         node.join_type,
                         self.memory_pool.clone().unwrap(),
                         self.config.clone().unwrap(),
@@ -394,7 +469,7 @@ impl PhysicalPlanner {
                     }
                 } else {
                     // Use regular hash join (no memory management)
-                    let join = HashJoinExec::new(left, right, node.on.clone(), node.join_type);
+                    let join = HashJoinExec::new(left, right, on, node.join_type);
 
                     // Apply additional filter if present (for non-Semi/Anti joins)
                     match &node.filter {

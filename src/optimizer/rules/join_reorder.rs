@@ -6,12 +6,36 @@
 
 use crate::error::Result;
 use crate::optimizer::OptimizerRule;
+use crate::physical::operators::TableStatistics;
 use crate::planner::{BinaryOp, Expr, JoinNode, JoinType, LogicalPlan};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Join reordering optimization rule
-pub struct JoinReorder;
+pub struct JoinReorder {
+    /// Table statistics for statistics-based join ordering
+    table_stats: HashMap<String, TableStatistics>,
+}
+
+impl JoinReorder {
+    /// Create a new JoinReorder rule without statistics (uses heuristics)
+    pub fn new() -> Self {
+        Self {
+            table_stats: HashMap::new(),
+        }
+    }
+
+    /// Create a new JoinReorder rule with table statistics
+    pub fn with_table_statistics(stats: HashMap<String, TableStatistics>) -> Self {
+        Self { table_stats: stats }
+    }
+}
+
+impl Default for JoinReorder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl OptimizerRule for JoinReorder {
     fn name(&self) -> &str {
@@ -1147,14 +1171,56 @@ impl JoinReorder {
         }
     }
 
+    /// Get the row count for a relation from statistics, if available.
+    fn get_relation_row_count(&self, rel: &JoinRelation) -> Option<usize> {
+        let table_name = self.get_underlying_table_name(&rel.plan)?;
+        let stats = self.table_stats.get(&table_name)?;
+        Some(stats.row_count)
+    }
+
     /// Select the best starting relation for join ordering
     /// For hash joins, we want to start with SMALL dimension tables and join to larger tables.
     /// Prefers: small tables with filters > small tables > any
     fn select_start_relation(&self, relations: &[JoinRelation], edges: &[JoinEdge]) -> usize {
-        // Priority 1: Small dimension tables (nation, region, etc.)
-        // Priority 2: Tables with filters (selective)
-        // Priority 3: Avoid fact tables (lineitem, orders) as starting point
+        // If we have statistics, use row counts directly
+        if !self.table_stats.is_empty() {
+            let mut best_idx = 0;
+            let mut best_score = i64::MIN;
 
+            for (idx, rel) in relations.iter().enumerate() {
+                let mut score = 0i64;
+
+                // Use actual row counts: smaller tables get higher scores
+                if let Some(row_count) = self.get_relation_row_count(rel) {
+                    // Invert: fewer rows = higher score
+                    // Use log scale to avoid extreme differences
+                    score = -(row_count as i64);
+                }
+
+                // Check if this relation has a filter (indicates selectivity)
+                let has_filter = self.relation_has_filter(&rel.plan);
+                if has_filter {
+                    // Filtered relation likely smaller — boost heavily
+                    score = score / 3 + 1_000_000;
+                }
+
+                // Number of edges (connectivity) - slightly prefer connected tables
+                let edge_count = edges
+                    .iter()
+                    .filter(|e| e.left_idx == idx || e.right_idx == idx)
+                    .count() as i64;
+                score += edge_count * 10;
+
+                if score > best_score {
+                    best_score = score;
+                    best_idx = idx;
+                }
+            }
+
+            return best_idx;
+        }
+
+        // Fall back to name-based heuristics when no statistics available
         let mut best_idx = 0;
         let mut best_score = i32::MIN;
 
@@ -1328,6 +1394,22 @@ impl JoinReorder {
     /// Estimate a score for relation size (higher score = prefer to join next)
     /// Small tables get higher scores because they're better as hash table build sides
     fn estimate_relation_size_score(&self, rel: &JoinRelation) -> i32 {
+        // If we have statistics, use actual row counts
+        if !self.table_stats.is_empty() {
+            if let Some(row_count) = self.get_relation_row_count(rel) {
+                // Smaller tables get higher scores (better build sides)
+                // Scale: 25 rows -> ~8000, 150K rows -> ~3000, 6M rows -> ~800, 600M -> -3200
+                let score = 10000 - (row_count as f64).log2() as i32 * 500;
+                let score = if self.relation_has_filter(&rel.plan) {
+                    score + 1500
+                } else {
+                    score
+                };
+                return score;
+            }
+        }
+
+        // Fall back to name-based heuristics
         let name_lower = rel.name.to_lowercase();
         let underlying_name = self
             .get_underlying_table_name(&rel.plan)
@@ -1468,7 +1550,7 @@ mod tests {
             schema: abc_schema,
         });
 
-        let rule = JoinReorder;
+        let rule = JoinReorder::new();
         assert!(rule.needs_reordering(&inner_abc));
 
         let optimized = rule.optimize(&inner_abc).unwrap();

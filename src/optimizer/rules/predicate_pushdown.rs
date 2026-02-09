@@ -135,6 +135,36 @@ impl PredicatePushdown {
                     }
                 }
 
+                // Also decompose the join's own filter for Inner/Cross joins
+                // and push single-table predicates to their respective scans
+                let mut join_filter_remaining = Vec::new();
+                if let Some(ref filter) = node.filter {
+                    if matches!(node.join_type, JoinType::Inner | JoinType::Cross) {
+                        let mut filter_preds = Vec::new();
+                        self.split_conjunction(filter, &mut filter_preds);
+                        for pred in filter_preds {
+                            if pred.contains_subquery() {
+                                join_filter_remaining.push(pred);
+                                continue;
+                            }
+                            let pred_cols = self.extract_columns(&pred);
+                            if self.columns_subset(&pred_cols, &left_cols)
+                                && !self.columns_overlap(&pred_cols, &right_cols)
+                            {
+                                left_predicates.push(pred);
+                            } else if self.columns_subset(&pred_cols, &right_cols)
+                                && !self.columns_overlap(&pred_cols, &left_cols)
+                            {
+                                right_predicates.push(pred);
+                            } else {
+                                join_filter_remaining.push(pred);
+                            }
+                        }
+                    } else {
+                        join_filter_remaining.push(filter.clone());
+                    }
+                }
+
                 // For inner joins, we can push more aggressively
                 // For outer joins, we need to be careful
                 match node.join_type {
@@ -164,12 +194,19 @@ impl PredicatePushdown {
                                 node.join_type
                             };
 
+                        // Reconstruct the join's filter from remaining cross-side predicates
+                        let new_join_filter = if join_filter_remaining.is_empty() {
+                            None
+                        } else {
+                            Some(self.combine_predicates(join_filter_remaining))
+                        };
+
                         let join = LogicalPlan::Join(crate::planner::JoinNode {
                             left: Arc::new(left),
                             right: Arc::new(right),
                             join_type: new_join_type,
                             on: join_conditions,
-                            filter: node.filter.clone(),
+                            filter: new_join_filter,
                             schema: node.schema.clone(),
                         });
 
