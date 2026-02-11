@@ -30,5 +30,5 @@ pub use scan::{MemoryTable, MemoryTableExec, TableProvider, TableStatistics};
 pub use sort::SortExec;
 pub use spillable::{ExternalSortExec, SpillableHashAggregateExec, SpillableHashJoinExec};
 pub use streaming_parquet_scan::StreamingParquetScanExec;
-pub use subquery::{evaluate_subquery_expr, SubqueryExecutor};
+pub use subquery::{evaluate_subquery_expr, is_correlated_subquery_plan, SubqueryExecutor};
 pub use union::UnionExec;

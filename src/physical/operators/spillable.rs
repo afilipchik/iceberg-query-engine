@@ -52,6 +52,8 @@ pub struct SpillableHashJoinExec {
     schema: SchemaRef,
     memory_pool: SharedMemoryPool,
     config: ExecutionConfig,
+    /// When true, build hash table from right side (smaller) for Left joins.
+    build_right: bool,
 }
 
 impl fmt::Debug for SpillableHashJoinExec {
@@ -110,7 +112,14 @@ impl SpillableHashJoinExec {
             schema,
             memory_pool,
             config,
+            build_right: false,
         }
+    }
+
+    /// Set build_right flag: when true, build hash table from right side.
+    pub fn with_build_right(mut self, build_right: bool) -> Self {
+        self.build_right = build_right;
+        self
     }
 }
 
@@ -153,10 +162,12 @@ impl PhysicalOperator for SpillableHashJoinExec {
 
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
         // Determine build and probe sides
-        let (build_side, probe_side, swapped) = match self.join_type {
-            JoinType::Right => (&self.right, &self.left, true),
-            _ => (&self.left, &self.right, false),
-        };
+        let (build_side, probe_side, swapped) =
+            if self.build_right || matches!(self.join_type, JoinType::Right) {
+                (&self.right, &self.left, true)
+            } else {
+                (&self.left, &self.right, false)
+            };
 
         // Collect ALL build-side partitions
         let build_partitions = build_side.output_partitions().max(1);
@@ -194,7 +205,8 @@ impl PhysicalOperator for SpillableHashJoinExec {
                 right,
                 self.on.clone(),
                 self.join_type,
-            );
+            )
+            .with_build_right(self.build_right);
             return hash_join.execute(partition).await;
         }
 
@@ -801,6 +813,8 @@ pub struct ExternalSortExec {
     schema: SchemaRef,
     memory_pool: SharedMemoryPool,
     config: ExecutionConfig,
+    /// Optional limit for Top-K optimization
+    fetch: Option<usize>,
 }
 
 impl fmt::Debug for ExternalSortExec {
@@ -825,6 +839,26 @@ impl ExternalSortExec {
             schema,
             memory_pool,
             config,
+            fetch: None,
+        }
+    }
+
+    /// Create an external sort with a fetch limit (Top-K optimization).
+    pub fn with_fetch(
+        input: Arc<dyn PhysicalOperator>,
+        order_by: Vec<crate::planner::SortExpr>,
+        memory_pool: SharedMemoryPool,
+        config: ExecutionConfig,
+        fetch: usize,
+    ) -> Self {
+        let schema = input.schema();
+        Self {
+            input,
+            order_by,
+            schema,
+            memory_pool,
+            config,
+            fetch: Some(fetch),
         }
     }
 }
@@ -865,20 +899,22 @@ impl PhysicalOperator for ExternalSortExec {
 
         if total_size <= memory_threshold {
             // Data fits in memory — use the regular SortExec path for correctness
-            let sort = crate::physical::operators::SortExec::new(
-                self.input.clone(),
-                self.order_by.clone(),
-            );
-            // SortExec.execute(0) re-collects from input partitions, so we create
-            // a temporary MemoryTableExec with our already-collected data
+            // Create a temporary MemoryTableExec with our already-collected data
             let mem = crate::physical::operators::MemoryTableExec::new(
                 "sort_input",
                 self.schema.clone(),
                 all_batches,
                 None,
             );
-            let sort =
-                crate::physical::operators::SortExec::new(Arc::new(mem), self.order_by.clone());
+            let sort = if let Some(fetch) = self.fetch {
+                crate::physical::operators::SortExec::with_fetch(
+                    Arc::new(mem),
+                    self.order_by.clone(),
+                    fetch,
+                )
+            } else {
+                crate::physical::operators::SortExec::new(Arc::new(mem), self.order_by.clone())
+            };
             return sort.execute(0).await;
         }
 

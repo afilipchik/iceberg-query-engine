@@ -19,6 +19,8 @@ pub struct SortExec {
     input: Arc<dyn PhysicalOperator>,
     order_by: Vec<SortExpr>,
     schema: SchemaRef,
+    /// Optional limit for Top-K optimization: only return the first `fetch` rows
+    fetch: Option<usize>,
 }
 
 impl SortExec {
@@ -28,6 +30,23 @@ impl SortExec {
             input,
             order_by,
             schema,
+            fetch: None,
+        }
+    }
+
+    /// Create a sort with a fetch limit (Top-K optimization).
+    /// When set, `lexsort_to_indices` uses the limit to avoid sorting all rows.
+    pub fn with_fetch(
+        input: Arc<dyn PhysicalOperator>,
+        order_by: Vec<SortExpr>,
+        fetch: usize,
+    ) -> Self {
+        let schema = input.schema();
+        Self {
+            input,
+            order_by,
+            schema,
+            fetch: Some(fetch),
         }
     }
 }
@@ -79,7 +98,7 @@ impl PhysicalOperator for SortExec {
         let batch = concat_batches(&working_schema, &working_batches)?;
 
         // Sort
-        let sorted = sort_batch(&batch, &self.order_by)?;
+        let sorted = sort_batch(&batch, &self.order_by, self.fetch)?;
 
         let sorted = if needs_large_utf8 {
             demote_utf8_batch(&sorted)?
@@ -124,7 +143,11 @@ fn concat_batches(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<RecordB
     compute::concat_batches(schema, batches).map_err(Into::into)
 }
 
-fn sort_batch(batch: &RecordBatch, order_by: &[SortExpr]) -> Result<RecordBatch> {
+pub fn sort_batch(
+    batch: &RecordBatch,
+    order_by: &[SortExpr],
+    fetch: Option<usize>,
+) -> Result<RecordBatch> {
     if batch.num_rows() == 0 {
         return Ok(batch.clone());
     }
@@ -145,8 +168,8 @@ fn sort_batch(batch: &RecordBatch, order_by: &[SortExpr]) -> Result<RecordBatch>
         .collect();
     let sort_columns = sort_columns?;
 
-    // Get sort indices
-    let indices = compute::lexsort_to_indices(&sort_columns, None)?;
+    // Get sort indices — pass fetch as limit for Top-K optimization
+    let indices = compute::lexsort_to_indices(&sort_columns, fetch)?;
 
     // Reorder all columns
     let sorted_columns: Result<Vec<ArrayRef>> = batch

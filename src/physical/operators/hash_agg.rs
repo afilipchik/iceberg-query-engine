@@ -190,8 +190,10 @@ impl PhysicalOperator for HashAggregateExec {
         }
 
         // Build hash table from all collected batches
-        // For large batch counts, use parallel aggregation
-        let result = if all_batches.len() > 4 {
+        // Use parallel aggregation when there are enough batches OR enough total rows
+        let total_rows: usize = all_batches.iter().map(|b| b.num_rows()).sum();
+        let use_parallel = all_batches.len() > 4 || total_rows > 50_000;
+        let result = if use_parallel {
             aggregate_batches_parallel(
                 &all_batches,
                 &self.group_by,
@@ -1115,15 +1117,42 @@ fn aggregate_batches_parallel(
         }
     }
 
-    // Determine number of threads
-    let num_threads = rayon::current_num_threads().min(batches.len());
-    if num_threads <= 1 {
-        return aggregate_batches_hash(batches, group_by, aggregates, schema);
+    // When there are few large batches but many rows, split them for parallelism
+    let num_threads = rayon::current_num_threads();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+    let working_batches: Vec<RecordBatch>;
+    let batches_ref: &[RecordBatch] = if batches.len() < num_threads && total_rows > 50_000 {
+        // Split large batches into ~8K row chunks for better parallelism
+        const TARGET_CHUNK_ROWS: usize = 8192;
+        let mut split = Vec::new();
+        for batch in batches {
+            let n = batch.num_rows();
+            if n > TARGET_CHUNK_ROWS * 2 {
+                let mut offset = 0;
+                while offset < n {
+                    let len = (n - offset).min(TARGET_CHUNK_ROWS);
+                    split.push(batch.slice(offset, len));
+                    offset += len;
+                }
+            } else {
+                split.push(batch.clone());
+            }
+        }
+        working_batches = split;
+        &working_batches
+    } else {
+        batches
+    };
+
+    let effective_threads = num_threads.min(batches_ref.len());
+    if effective_threads <= 1 {
+        return aggregate_batches_hash(batches_ref, group_by, aggregates, schema);
     }
 
     // Split batches into chunks for parallel processing
-    let chunk_size = (batches.len() + num_threads - 1) / num_threads;
-    let chunks: Vec<_> = batches.chunks(chunk_size).collect();
+    let chunk_size = (batches_ref.len() + effective_threads - 1) / effective_threads;
+    let chunks: Vec<_> = batches_ref.chunks(chunk_size).collect();
 
     // Build partial hash tables in parallel
     let partial_results: Vec<Result<HashMap<GroupKey, Vec<AccumulatorState>>>> = chunks

@@ -181,6 +181,9 @@ pub struct HashJoinExec {
     combined_schema: SchemaRef,
     /// Cached build side - computed once, shared across all partition executions
     build_cache: OnceCell<BuildSideCache>,
+    /// When true, build hash table from right side (smaller) instead of left.
+    /// Used for Left joins where the right side is much smaller than the left.
+    build_right: bool,
 }
 
 impl std::fmt::Debug for HashJoinExec {
@@ -263,7 +266,15 @@ impl HashJoinExec {
             filter,
             combined_schema,
             build_cache: OnceCell::new(),
+            build_right: false,
         }
+    }
+
+    /// Set build_right flag: when true, build hash table from right side.
+    /// This is useful for Left joins where the right side is much smaller.
+    pub fn with_build_right(mut self, build_right: bool) -> Self {
+        self.build_right = build_right;
+        self
     }
 }
 
@@ -284,10 +295,15 @@ impl PhysicalOperator for HashJoinExec {
         ));
 
         // Determine build and probe sides
-        let (build_side, probe_side, swapped) = match self.join_type {
-            JoinType::Right => (&self.right, &self.left, true),
-            _ => (&self.left, &self.right, false),
-        };
+        // For Right join: always build from right.
+        // For Left join with build_right=true: build from right (smaller side).
+        // Otherwise: build from left.
+        let (build_side, probe_side, swapped) =
+            if self.build_right || matches!(self.join_type, JoinType::Right) {
+                (&self.right, &self.left, true)
+            } else {
+                (&self.left, &self.right, false)
+            };
 
         let (on_left, on_right): (Vec<_>, Vec<_>) = self.on.iter().cloned().unzip();
         let build_keys = if swapped {
@@ -1189,6 +1205,8 @@ fn probe_semi_anti_parallel(
 
     // Process all probe batches in parallel using chunked intra-batch parallelism
     const CHUNK_SIZE: usize = 65536;
+    let mut results = Vec::new();
+
     for probe_batch in probe_batches {
         let probe_key_arr = if probe_key_exprs.len() == 1 {
             Some(evaluate_expr(probe_batch, &probe_key_exprs[0])?)
@@ -1222,6 +1240,13 @@ fn probe_semi_anti_parallel(
                 None
             };
 
+        // Track probe-side matches when swapped (build=right, probe=left=output)
+        let probe_matched_batch: Vec<AtomicBool> = if swapped {
+            (0..n_rows).map(|_| AtomicBool::new(false)).collect()
+        } else {
+            vec![]
+        };
+
         chunks.par_iter().try_for_each(|range| {
             for probe_row in range.clone() {
                 // Fast i64 path: direct array access, no JoinKey allocation
@@ -1247,8 +1272,12 @@ fn probe_semi_anti_parallel(
                         if let Some(ref cf) = compiled_filter {
                             let build_batch = &build_batches[entry.batch_idx];
                             if cf.evaluate(build_batch, entry.row_idx, probe_batch, probe_row) {
-                                build_matched[entry.batch_idx][entry.row_idx]
-                                    .store(true, Ordering::Relaxed);
+                                if swapped {
+                                    probe_matched_batch[probe_row].store(true, Ordering::Relaxed);
+                                } else {
+                                    build_matched[entry.batch_idx][entry.row_idx]
+                                        .store(true, Ordering::Relaxed);
+                                }
                                 break;
                             }
                         } else if let Some(filter_expr) = filter {
@@ -1267,14 +1296,23 @@ fn probe_semi_anti_parallel(
                                 .downcast_ref::<arrow::array::BooleanArray>()
                             {
                                 if bool_arr.len() > 0 && bool_arr.value(0) {
-                                    build_matched[entry.batch_idx][entry.row_idx]
-                                        .store(true, Ordering::Relaxed);
+                                    if swapped {
+                                        probe_matched_batch[probe_row]
+                                            .store(true, Ordering::Relaxed);
+                                    } else {
+                                        build_matched[entry.batch_idx][entry.row_idx]
+                                            .store(true, Ordering::Relaxed);
+                                    }
                                     break;
                                 }
                             }
                         } else {
-                            build_matched[entry.batch_idx][entry.row_idx]
-                                .store(true, Ordering::Relaxed);
+                            if swapped {
+                                probe_matched_batch[probe_row].store(true, Ordering::Relaxed);
+                            } else {
+                                build_matched[entry.batch_idx][entry.row_idx]
+                                    .store(true, Ordering::Relaxed);
+                            }
                             break;
                         }
                     }
@@ -1282,9 +1320,36 @@ fn probe_semi_anti_parallel(
             }
             Ok::<(), crate::error::QueryError>(())
         })?;
+
+        // Output probe rows per-batch when swapped
+        if swapped {
+            let is_semi = matches!(join_type, JoinType::Semi);
+            let keep: Vec<u32> = (0..n_rows as u32)
+                .filter(|&i| probe_matched_batch[i as usize].load(Ordering::Relaxed) == is_semi)
+                .collect();
+            if !keep.is_empty() {
+                let take_idx = UInt32Array::from(keep);
+                let columns: std::result::Result<Vec<ArrayRef>, arrow::error::ArrowError> =
+                    probe_batch
+                        .columns()
+                        .iter()
+                        .map(|col| arrow::compute::take(col, &take_idx, None))
+                        .collect();
+                let batch = RecordBatch::try_new(
+                    output_schema.clone(),
+                    columns.map_err(|e| crate::error::QueryError::Execution(e.to_string()))?,
+                )?;
+                results.push(batch);
+            }
+        }
     }
 
-    // Convert atomic bools to regular bools and create output
+    // When swapped, probe-side output was already collected per-batch
+    if swapped {
+        return Ok(results);
+    }
+
+    // Convert atomic bools to regular bools and create output from build side
     let matched_rows: Vec<(usize, usize)> = build_matched
         .iter()
         .enumerate()
@@ -1317,7 +1382,6 @@ fn probe_semi_anti_parallel(
         })
         .collect();
 
-    let mut results = Vec::new();
     if matches!(join_type, JoinType::Semi) && !matched_rows.is_empty() {
         let batch = create_semi_anti_batch(build_batches, &matched_rows, output_schema)?;
         results.push(batch);
@@ -1410,6 +1474,105 @@ fn probe_vectorized(
             Vec::new()
         };
 
+    // Batch-level parallel probing for Inner/Left joins with many probe batches.
+    // With 8K-row Parquet batches, intra-batch chunk parallelism is ineffective.
+    // Process entire batches in parallel across rayon threads instead.
+    const MIN_BATCHES_FOR_PARALLEL: usize = 32;
+    if probe_batches.len() >= MIN_BATCHES_FOR_PARALLEL
+        && matches!(join_type, JoinType::Inner | JoinType::Left)
+    {
+        if join_type == JoinType::Inner || join_type == JoinType::Cross {
+            let batch_results: Vec<Result<Option<RecordBatch>>> = probe_batches
+                .par_iter()
+                .map(|probe_batch| {
+                    let probe_key_arrays: Result<Vec<ArrayRef>> = probe_key_exprs
+                        .iter()
+                        .map(|e| evaluate_expr(probe_batch, e))
+                        .collect();
+                    let probe_key_arrays = probe_key_arrays?;
+                    let n_rows = probe_batch.num_rows();
+                    let matches = vht.probe_batch(&probe_key_arrays, n_rows);
+                    if matches.is_empty() {
+                        return Ok(None);
+                    }
+                    let mut build_indices: Vec<(usize, usize)> = Vec::with_capacity(matches.len());
+                    let mut probe_indices: Vec<usize> = Vec::with_capacity(matches.len());
+                    for (bb, br, pr) in matches {
+                        build_indices.push((bb as usize, br as usize));
+                        probe_indices.push(pr as usize);
+                    }
+                    let batch = create_joined_batch(
+                        build_batches,
+                        probe_batch,
+                        &build_indices,
+                        &probe_indices,
+                        swapped,
+                        output_schema,
+                    )?;
+                    Ok(Some(batch))
+                })
+                .collect();
+            for result in batch_results {
+                if let Some(batch) = result? {
+                    results.push(batch);
+                }
+            }
+        } else {
+            // Left join: each probe batch independently tracks its own unmatched rows
+            let batch_results: Vec<Result<Option<RecordBatch>>> = probe_batches
+                .par_iter()
+                .map(|probe_batch| {
+                    let probe_key_arrays: Result<Vec<ArrayRef>> = probe_key_exprs
+                        .iter()
+                        .map(|e| evaluate_expr(probe_batch, e))
+                        .collect();
+                    let probe_key_arrays = probe_key_arrays?;
+                    let n_rows = probe_batch.num_rows();
+                    let matches = vht.probe_batch(&probe_key_arrays, n_rows);
+                    let mut probe_matched = vec![false; n_rows];
+                    let mut build_indices: Vec<(usize, usize)> = Vec::new();
+                    let mut probe_indices: Vec<usize> = Vec::new();
+                    for (bb, br, pr) in &matches {
+                        build_indices.push((*bb as usize, *br as usize));
+                        probe_indices.push(*pr as usize);
+                        probe_matched[*pr as usize] = true;
+                    }
+                    let (bi, pi) = if swapped {
+                        add_unmatched_probe(&build_indices, &probe_indices, &probe_matched, n_rows)
+                    } else {
+                        (build_indices, probe_indices)
+                    };
+                    if bi.is_empty() && !probe_matched.iter().any(|&m| !m) {
+                        return Ok(None);
+                    }
+                    let batch = create_joined_batch_with_nulls(
+                        build_batches,
+                        probe_batch,
+                        &bi,
+                        &pi,
+                        &probe_matched,
+                        swapped,
+                        output_schema,
+                        true,
+                    )?;
+                    Ok(Some(batch))
+                })
+                .collect();
+            for result in batch_results {
+                if let Some(batch) = result? {
+                    results.push(batch);
+                }
+            }
+        }
+
+        // Note: Left join with swapped=true handles unmatched probe (left) rows per-batch,
+        // so no post-processing is needed here. Unmatched build (right) rows are NOT
+        // emitted for Left join (only Full join needs that).
+
+        return Ok(results);
+    }
+
+    // Original sequential path for small batch counts and other join types
     // Chunk size for parallel processing
     const CHUNK_SIZE: usize = 65536;
 
@@ -1563,25 +1726,71 @@ fn probe_vectorized(
             }
 
             JoinType::Semi | JoinType::Anti => {
-                // Parallel vectorized Semi/Anti probe using rayon + atomic bools
-                let chunks: Vec<std::ops::Range<usize>> = (0..n_rows)
-                    .step_by(CHUNK_SIZE)
-                    .map(|start| start..std::cmp::min(start + CHUNK_SIZE, n_rows))
-                    .collect();
+                if swapped {
+                    // When swapped: build=right, probe=left=output
+                    // Track which probe rows found matches and output probe rows directly
+                    let is_semi = join_type == JoinType::Semi;
+                    let probe_matched: Vec<AtomicBool> =
+                        (0..n_rows).map(|_| AtomicBool::new(false)).collect();
 
-                chunks.par_iter().for_each(|range| {
-                    let chunk_len = range.end - range.start;
-                    let chunk_keys: Vec<ArrayRef> = probe_key_arrays
-                        .iter()
-                        .map(|a| a.slice(range.start, chunk_len))
+                    let chunks: Vec<std::ops::Range<usize>> = (0..n_rows)
+                        .step_by(CHUNK_SIZE)
+                        .map(|start| start..std::cmp::min(start + CHUNK_SIZE, n_rows))
                         .collect();
 
-                    let matches = vht.probe_batch(&chunk_keys, chunk_len);
-                    for (bb, br, _pr) in matches {
-                        build_matched_atomic[bb as usize][br as usize]
-                            .store(true, Ordering::Relaxed);
+                    chunks.par_iter().for_each(|range| {
+                        let chunk_len = range.end - range.start;
+                        let chunk_keys: Vec<ArrayRef> = probe_key_arrays
+                            .iter()
+                            .map(|a| a.slice(range.start, chunk_len))
+                            .collect();
+
+                        let matches = vht.probe_batch(&chunk_keys, chunk_len);
+                        for (_bb, _br, pr) in matches {
+                            probe_matched[range.start + pr as usize].store(true, Ordering::Relaxed);
+                        }
+                    });
+
+                    let keep: Vec<u32> = (0..n_rows as u32)
+                        .filter(|&i| probe_matched[i as usize].load(Ordering::Relaxed) == is_semi)
+                        .collect();
+
+                    if !keep.is_empty() {
+                        let take_idx = UInt32Array::from(keep);
+                        let columns: std::result::Result<Vec<ArrayRef>, arrow::error::ArrowError> =
+                            probe_batch
+                                .columns()
+                                .iter()
+                                .map(|col| arrow::compute::take(col, &take_idx, None))
+                                .collect();
+                        let batch = RecordBatch::try_new(
+                            output_schema.clone(),
+                            columns
+                                .map_err(|e| crate::error::QueryError::Execution(e.to_string()))?,
+                        )?;
+                        results.push(batch);
                     }
-                });
+                } else {
+                    // Parallel vectorized Semi/Anti probe using rayon + atomic bools
+                    let chunks: Vec<std::ops::Range<usize>> = (0..n_rows)
+                        .step_by(CHUNK_SIZE)
+                        .map(|start| start..std::cmp::min(start + CHUNK_SIZE, n_rows))
+                        .collect();
+
+                    chunks.par_iter().for_each(|range| {
+                        let chunk_len = range.end - range.start;
+                        let chunk_keys: Vec<ArrayRef> = probe_key_arrays
+                            .iter()
+                            .map(|a| a.slice(range.start, chunk_len))
+                            .collect();
+
+                        let matches = vht.probe_batch(&chunk_keys, chunk_len);
+                        for (bb, br, _pr) in matches {
+                            build_matched_atomic[bb as usize][br as usize]
+                                .store(true, Ordering::Relaxed);
+                        }
+                    });
+                }
             }
 
             JoinType::Single | JoinType::Mark => {
@@ -1606,7 +1815,10 @@ fn probe_vectorized(
         }
     }
 
-    if matches!(join_type, JoinType::Left | JoinType::Full) && swapped {
+    // For Full join with swapped sides, emit unmatched build (right) rows.
+    // Note: Left+swapped does NOT emit unmatched build rows — Left join only preserves
+    // the left/probe side, and unmatched probe rows are handled per-batch.
+    if matches!(join_type, JoinType::Full) && swapped {
         let unmatched_build = collect_unmatched_build(&build_matched);
         if !unmatched_build.is_empty() {
             let batch =
@@ -1615,7 +1827,7 @@ fn probe_vectorized(
         }
     }
 
-    if matches!(join_type, JoinType::Semi) {
+    if matches!(join_type, JoinType::Semi) && !swapped {
         // Read from atomic bools
         let matched_build: Vec<(usize, usize)> = build_matched_atomic
             .iter()
@@ -1638,7 +1850,7 @@ fn probe_vectorized(
         }
     }
 
-    if matches!(join_type, JoinType::Anti) {
+    if matches!(join_type, JoinType::Anti) && !swapped {
         // Read from atomic bools
         let unmatched_build: Vec<(usize, usize)> = build_matched_atomic
             .iter()
@@ -1884,8 +2096,30 @@ fn probe_hash_table(
                 }
             }
             JoinType::Semi | JoinType::Anti => {
-                // Semi and Anti joins are handled after processing all probe batches
-                // since we need to know which build rows matched across all probes
+                if swapped {
+                    // When swapped: build=right, probe=left=output
+                    // Output matching/unmatching probe rows per-batch
+                    let is_semi = join_type == JoinType::Semi;
+                    let keep: Vec<u32> = (0..probe_batch.num_rows() as u32)
+                        .filter(|&i| probe_matched[i as usize] == is_semi)
+                        .collect();
+                    if !keep.is_empty() {
+                        let take_idx = UInt32Array::from(keep);
+                        let columns: std::result::Result<Vec<ArrayRef>, arrow::error::ArrowError> =
+                            probe_batch
+                                .columns()
+                                .iter()
+                                .map(|col| arrow::compute::take(col, &take_idx, None))
+                                .collect();
+                        let batch = RecordBatch::try_new(
+                            output_schema.clone(),
+                            columns
+                                .map_err(|e| crate::error::QueryError::Execution(e.to_string()))?,
+                        )?;
+                        results.push(batch);
+                    }
+                }
+                // When !swapped, handled after processing all probe batches
             }
             JoinType::Single | JoinType::Mark => {
                 // Single and Mark joins are similar to Semi/Anti - handle after all probes
@@ -1920,7 +2154,7 @@ fn probe_hash_table(
         }
     }
 
-    if matches!(join_type, JoinType::Left | JoinType::Full) && swapped {
+    if matches!(join_type, JoinType::Full) && swapped {
         let unmatched_build = collect_unmatched_build(&build_matched);
         if !unmatched_build.is_empty() {
             let batch =
@@ -1930,7 +2164,8 @@ fn probe_hash_table(
     }
 
     // Handle Semi and Anti joins - return build (left) rows based on match status
-    if matches!(join_type, JoinType::Semi) {
+    // When swapped, probe-side output was already handled per-batch above
+    if matches!(join_type, JoinType::Semi) && !swapped {
         // Semi join: return build rows that have at least one match
         let matched_build = collect_matched_build(&build_matched);
         if !matched_build.is_empty() {
@@ -1939,7 +2174,7 @@ fn probe_hash_table(
         }
     }
 
-    if matches!(join_type, JoinType::Anti) {
+    if matches!(join_type, JoinType::Anti) && !swapped {
         // Anti join: return build rows that have no matches
         let unmatched_build = collect_unmatched_build(&build_matched);
         if !unmatched_build.is_empty() {
@@ -2124,12 +2359,34 @@ fn gather_column(
         return Ok(arrow::array::new_null_array(dt, 0));
     }
 
+    // Check if any indices are NULL sentinels (usize::MAX = unmatched row in outer join)
+    let has_null_sentinels = indices
+        .iter()
+        .any(|&(batch_idx, _)| batch_idx == usize::MAX);
+
     if batches.len() == 1 {
         // Fast path: single batch - direct take()
         let col = batches[0].column(col_idx);
-        let take_indices: Vec<u32> = indices.iter().map(|&(_, row_idx)| row_idx as u32).collect();
-        let take_arr = UInt32Array::from(take_indices);
-        return compute::take(col.as_ref(), &take_arr, None).map_err(Into::into);
+        if has_null_sentinels {
+            // Use nullable take indices so sentinel rows produce NULL output
+            let take_indices: Vec<Option<u32>> = indices
+                .iter()
+                .map(|&(batch_idx, row_idx)| {
+                    if batch_idx == usize::MAX {
+                        None
+                    } else {
+                        Some(row_idx as u32)
+                    }
+                })
+                .collect();
+            let take_arr = UInt32Array::from(take_indices);
+            return compute::take(col.as_ref(), &take_arr, None).map_err(Into::into);
+        } else {
+            let take_indices: Vec<u32> =
+                indices.iter().map(|&(_, row_idx)| row_idx as u32).collect();
+            let take_arr = UInt32Array::from(take_indices);
+            return compute::take(col.as_ref(), &take_arr, None).map_err(Into::into);
+        }
     }
 
     // Multi-batch: compute batch offsets, then do a single take on concatenated array
@@ -2168,18 +2425,28 @@ fn gather_column(
     let all_refs: Vec<&dyn arrow::array::Array> = all_arrays.iter().map(|a| a.as_ref()).collect();
     let concatenated = compute::concat(&all_refs)?;
 
-    let take_indices: Vec<u32> = indices
-        .iter()
-        .map(|&(batch_idx, row_idx)| {
-            if batch_idx == usize::MAX {
-                0 // null row marker - will be handled by null bitmap
-            } else {
-                (offsets[batch_idx] + row_idx) as u32
-            }
-        })
-        .collect();
-    let take_arr = UInt32Array::from(take_indices);
-    let result = compute::take(concatenated.as_ref(), &take_arr, None)?;
+    let result = if has_null_sentinels {
+        // Use nullable take indices so sentinel rows produce NULL output
+        let take_indices: Vec<Option<u32>> = indices
+            .iter()
+            .map(|&(batch_idx, row_idx)| {
+                if batch_idx == usize::MAX {
+                    None
+                } else {
+                    Some((offsets[batch_idx] + row_idx) as u32)
+                }
+            })
+            .collect();
+        let take_arr = UInt32Array::from(take_indices);
+        compute::take(concatenated.as_ref(), &take_arr, None)?
+    } else {
+        let take_indices: Vec<u32> = indices
+            .iter()
+            .map(|&(batch_idx, row_idx)| (offsets[batch_idx] + row_idx) as u32)
+            .collect();
+        let take_arr = UInt32Array::from(take_indices);
+        compute::take(concatenated.as_ref(), &take_arr, None)?
+    };
 
     // Cast back to Utf8 if we promoted
     if needs_large_utf8 {

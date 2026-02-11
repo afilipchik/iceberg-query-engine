@@ -580,6 +580,11 @@ fn plan_has_outer_references(
 }
 
 /// Check if a subquery is correlated (references columns from outer scope)
+/// Check if a subquery plan references outer columns (is correlated).
+pub fn is_correlated_subquery_plan(subquery: &LogicalPlan) -> bool {
+    is_correlated_subquery(subquery)
+}
+
 fn is_correlated_subquery(subquery: &LogicalPlan) -> bool {
     let local_tables = collect_table_aliases(subquery);
     plan_has_outer_references(subquery, &local_tables)

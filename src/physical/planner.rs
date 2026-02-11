@@ -8,7 +8,7 @@ use crate::physical::operators::{
     SpillableHashJoinExec, SubqueryExecutor, TableProvider, UnionExec,
 };
 use crate::physical::PhysicalOperator;
-use crate::planner::{Expr, JoinType, LogicalPlan, PlanSchema};
+use crate::planner::{BinaryOp, Expr, JoinType, LogicalPlan, PlanSchema};
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -120,13 +120,173 @@ impl PhysicalPlanner {
     /// Helper to create a FilterExec with subquery executor if needed
     fn create_filter(&self, input: Arc<dyn PhysicalOperator>, predicate: Expr) -> FilterExec {
         let has_subquery = predicate.contains_subquery();
+        // Pre-compute uncorrelated scalar subqueries as literal values
+        let predicate = if has_subquery {
+            if let Some(ref executor) = self.subquery_executor {
+                Self::precompute_uncorrelated_scalars(predicate, executor)
+            } else {
+                predicate
+            }
+        } else {
+            predicate
+        };
+        let still_has_subquery = predicate.contains_subquery();
         let filter = FilterExec::new(input, predicate);
-        if has_subquery {
+        if still_has_subquery {
             if let Some(ref executor) = self.subquery_executor {
                 return filter.with_subquery_executor(executor.clone());
             }
         }
         filter
+    }
+
+    /// Replace uncorrelated scalar subqueries with their computed literal values.
+    fn precompute_uncorrelated_scalars(expr: Expr, executor: &SubqueryExecutor) -> Expr {
+        match expr {
+            Expr::ScalarSubquery(ref plan) => {
+                let is_correlated = crate::physical::operators::is_correlated_subquery_plan(plan);
+                if !is_correlated {
+                    match executor.execute_scalar(plan) {
+                        Ok(scalar) => Expr::Literal(scalar),
+                        Err(_) => expr,
+                    }
+                } else {
+                    expr
+                }
+            }
+            Expr::BinaryExpr { left, op, right } => {
+                let left = Self::precompute_uncorrelated_scalars(*left, executor);
+                let right = Self::precompute_uncorrelated_scalars(*right, executor);
+                Expr::BinaryExpr {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                }
+            }
+            Expr::UnaryExpr { op, expr: inner } => {
+                let inner = Self::precompute_uncorrelated_scalars(*inner, executor);
+                Expr::UnaryExpr {
+                    op,
+                    expr: Box::new(inner),
+                }
+            }
+            Expr::Cast {
+                expr: inner,
+                data_type,
+            } => {
+                let inner = Self::precompute_uncorrelated_scalars(*inner, executor);
+                Expr::Cast {
+                    expr: Box::new(inner),
+                    data_type,
+                }
+            }
+            Expr::Alias { expr: inner, name } => {
+                let inner = Self::precompute_uncorrelated_scalars(*inner, executor);
+                Expr::Alias {
+                    expr: Box::new(inner),
+                    name,
+                }
+            }
+            Expr::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
+                let operand =
+                    operand.map(|o| Box::new(Self::precompute_uncorrelated_scalars(*o, executor)));
+                let when_then = when_then
+                    .into_iter()
+                    .map(|(w, t)| {
+                        (
+                            Self::precompute_uncorrelated_scalars(w, executor),
+                            Self::precompute_uncorrelated_scalars(t, executor),
+                        )
+                    })
+                    .collect();
+                let else_expr = else_expr
+                    .map(|e| Box::new(Self::precompute_uncorrelated_scalars(*e, executor)));
+                Expr::Case {
+                    operand,
+                    when_then,
+                    else_expr,
+                }
+            }
+            Expr::ScalarFunc { func, args } => {
+                let args = args
+                    .into_iter()
+                    .map(|a| Self::precompute_uncorrelated_scalars(a, executor))
+                    .collect();
+                Expr::ScalarFunc { func, args }
+            }
+            Expr::InList {
+                expr: inner,
+                list,
+                negated,
+            } => {
+                let inner = Self::precompute_uncorrelated_scalars(*inner, executor);
+                let list = list
+                    .into_iter()
+                    .map(|e| Self::precompute_uncorrelated_scalars(e, executor))
+                    .collect();
+                Expr::InList {
+                    expr: Box::new(inner),
+                    list,
+                    negated,
+                }
+            }
+            Expr::Between {
+                expr: inner,
+                low,
+                high,
+                negated,
+            } => {
+                let inner = Self::precompute_uncorrelated_scalars(*inner, executor);
+                let low = Self::precompute_uncorrelated_scalars(*low, executor);
+                let high = Self::precompute_uncorrelated_scalars(*high, executor);
+                Expr::Between {
+                    expr: Box::new(inner),
+                    low: Box::new(low),
+                    high: Box::new(high),
+                    negated,
+                }
+            }
+            Expr::Exists { subquery, negated } => {
+                if !crate::physical::operators::is_correlated_subquery_plan(&subquery) {
+                    match executor.execute_exists(&subquery) {
+                        Ok(exists) => {
+                            let result = if negated { !exists } else { exists };
+                            Expr::Literal(crate::planner::ScalarValue::Boolean(result))
+                        }
+                        Err(_) => Expr::Exists { subquery, negated },
+                    }
+                } else {
+                    Expr::Exists { subquery, negated }
+                }
+            }
+            Expr::InSubquery {
+                expr: inner,
+                subquery,
+                negated,
+            } => {
+                if !crate::physical::operators::is_correlated_subquery_plan(&subquery) {
+                    // Precompute the inner expression first
+                    let inner = Self::precompute_uncorrelated_scalars(*inner, executor);
+                    // Keep InSubquery as-is but with precomputed inner expr
+                    Expr::InSubquery {
+                        expr: Box::new(inner),
+                        subquery,
+                        negated,
+                    }
+                } else {
+                    Expr::InSubquery {
+                        expr: inner,
+                        subquery,
+                        negated,
+                    }
+                }
+            }
+            _ => expr,
+        }
     }
 
     /// Register a table provider
@@ -235,6 +395,16 @@ impl PhysicalPlanner {
         }
     }
 
+    /// Check if a plan subtree contains an Aggregate (looking through Project/SubqueryAlias).
+    fn plan_contains_aggregate(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Aggregate(_) => true,
+            LogicalPlan::Project(p) => Self::plan_contains_aggregate(&p.input),
+            LogicalPlan::SubqueryAlias(s) => Self::plan_contains_aggregate(&s.input),
+            _ => false,
+        }
+    }
+
     /// Estimate the output row count of a logical plan using table statistics.
     /// Returns None if statistics are not available.
     fn estimate_output_rows(&self, plan: &LogicalPlan) -> Option<usize> {
@@ -243,15 +413,21 @@ impl PhysicalPlanner {
                 let provider = self.tables.get(&node.table_name)?;
                 let stats = provider.statistics()?;
                 let rows = stats.row_count;
-                if node.filter.is_some() {
-                    Some((rows as f64 * 0.3) as usize) // Default selectivity
+                if let Some(ref filter) = node.filter {
+                    let sel = Self::estimate_leaf_selectivity(filter);
+                    Some(std::cmp::max((rows as f64 * sel) as usize, 1))
                 } else {
                     Some(rows)
                 }
             }
             LogicalPlan::Filter(node) => {
                 let input_rows = self.estimate_output_rows(&node.input)?;
-                Some((input_rows as f64 * 0.3) as usize)
+                let sel = if matches!(*node.input, LogicalPlan::Scan(_)) {
+                    Self::estimate_leaf_selectivity(&node.predicate)
+                } else {
+                    0.3
+                };
+                Some(std::cmp::max((input_rows as f64 * sel) as usize, 1))
             }
             LogicalPlan::Project(node) => self.estimate_output_rows(&node.input),
             LogicalPlan::SubqueryAlias(node) => self.estimate_output_rows(&node.input),
@@ -278,6 +454,77 @@ impl PhysicalPlanner {
                 .fetch
                 .or_else(|| self.estimate_output_rows(&node.input)),
             _ => None,
+        }
+    }
+
+    /// Estimate selectivity for leaf-level filters (on scans).
+    /// Only uses compound selectivity for 3+ AND conjuncts to avoid
+    /// underestimating common 2-condition range filters.
+    fn estimate_leaf_selectivity(expr: &Expr) -> f64 {
+        let n = Self::count_and_conjuncts(expr);
+        if n >= 3 {
+            Self::estimate_expr_selectivity(expr).max(0.01)
+        } else {
+            0.3
+        }
+    }
+
+    fn count_and_conjuncts(expr: &Expr) -> usize {
+        match expr {
+            Expr::BinaryExpr {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => Self::count_and_conjuncts(left) + Self::count_and_conjuncts(right),
+            _ => 1,
+        }
+    }
+
+    fn estimate_expr_selectivity(expr: &Expr) -> f64 {
+        match expr {
+            Expr::BinaryExpr {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => Self::estimate_expr_selectivity(left) * Self::estimate_expr_selectivity(right),
+            Expr::BinaryExpr {
+                op: BinaryOp::Or,
+                left,
+                right,
+            } => {
+                let l = Self::estimate_expr_selectivity(left);
+                let r = Self::estimate_expr_selectivity(right);
+                (l + r - l * r).min(1.0)
+            }
+            Expr::BinaryExpr {
+                op: BinaryOp::Eq, ..
+            } => 0.1,
+            Expr::BinaryExpr {
+                op: BinaryOp::Gt | BinaryOp::Lt | BinaryOp::GtEq | BinaryOp::LtEq,
+                ..
+            } => 0.33,
+            Expr::BinaryExpr {
+                op: BinaryOp::Like, ..
+            } => 0.1,
+            Expr::BinaryExpr {
+                op: BinaryOp::NotEq,
+                ..
+            } => 0.9,
+            Expr::InList { list, negated, .. } => {
+                if *negated {
+                    0.9
+                } else {
+                    (list.len() as f64 * 0.05).min(0.5)
+                }
+            }
+            Expr::Between { negated, .. } => {
+                if *negated {
+                    0.75
+                } else {
+                    0.25
+                }
+            }
+            _ => 0.3,
         }
     }
 
@@ -418,6 +665,32 @@ impl PhysicalPlanner {
                     }
                 };
 
+                // For Left/Semi/Anti joins, we can't swap children (it would change semantics),
+                // but we CAN build the hash table from the right (smaller) side.
+                // This is especially important for decorrelated Left joins where:
+                //   left = large join result, right = grouped aggregate (much smaller)
+                // For Semi/Anti: when right is small (e.g., filtered dimension table),
+                // building from right and probing with left outputs matching/unmatching
+                // probe (left) rows directly per-batch.
+                let build_right_for_left = matches!(
+                    node.join_type,
+                    JoinType::Left | JoinType::Semi | JoinType::Anti
+                ) && {
+                    let left_rows = self.estimate_output_rows(&node.left);
+                    let right_rows = self.estimate_output_rows(&node.right);
+                    let right_is_aggregate = Self::plan_contains_aggregate(&node.right);
+                    match (left_rows, right_rows) {
+                        (Some(l), Some(r)) => {
+                            if right_is_aggregate {
+                                l > (r / 10).max(1) * 2
+                            } else {
+                                l > r * 2
+                            }
+                        }
+                        _ => false,
+                    }
+                };
+
                 let (left_plan, right_plan, on) = if should_swap {
                     // Swap: right becomes build side (left), left becomes probe side (right)
                     let swapped_on: Vec<(Expr, Expr)> = node
@@ -457,7 +730,8 @@ impl PhysicalPlanner {
                         node.join_type,
                         self.memory_pool.clone().unwrap(),
                         self.config.clone().unwrap(),
-                    );
+                    )
+                    .with_build_right(build_right_for_left);
 
                     // Apply additional filter if present
                     match &node.filter {
@@ -469,7 +743,8 @@ impl PhysicalPlanner {
                     }
                 } else {
                     // Use regular hash join (no memory management)
-                    let join = HashJoinExec::new(left, right, on, node.join_type);
+                    let join = HashJoinExec::new(left, right, on, node.join_type)
+                        .with_build_right(build_right_for_left);
 
                     // Apply additional filter if present (for non-Semi/Anti joins)
                     match &node.filter {
@@ -558,6 +833,32 @@ impl PhysicalPlanner {
             }
 
             LogicalPlan::Limit(node) => {
+                // Top-K optimization: fuse Sort+Limit into a single SortExec with fetch
+                if node.skip == 0 {
+                    if let Some(fetch) = node.fetch {
+                        if let LogicalPlan::Sort(sort_node) = node.input.as_ref() {
+                            // Fuse: create SortExec with fetch limit
+                            let sort_input = self.create_physical_plan_inner(&sort_node.input)?;
+                            if self.use_spillable() {
+                                let sort = ExternalSortExec::with_fetch(
+                                    sort_input,
+                                    sort_node.order_by.clone(),
+                                    self.memory_pool.clone().unwrap(),
+                                    self.config.clone().unwrap(),
+                                    fetch,
+                                );
+                                return Ok(Arc::new(sort));
+                            } else {
+                                let sort = SortExec::with_fetch(
+                                    sort_input,
+                                    sort_node.order_by.clone(),
+                                    fetch,
+                                );
+                                return Ok(Arc::new(sort));
+                            }
+                        }
+                    }
+                }
                 let input = self.create_physical_plan_inner(&node.input)?;
                 let limit = LimitExec::new(input, node.skip, node.fetch);
                 Ok(Arc::new(limit))
