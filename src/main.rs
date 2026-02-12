@@ -337,7 +337,11 @@ async fn main() {
             // Auto-detect scale factor from path name if not specified
             let sf = sf.unwrap_or_else(|| {
                 let path_str = path.to_string_lossy().to_lowercase();
-                if path_str.contains("10gb") || path_str.contains("sf10") {
+                if path_str.contains("1000gb") || path_str.contains("sf1000") {
+                    1000.0
+                } else if path_str.contains("100gb") || path_str.contains("sf100") {
+                    100.0
+                } else if path_str.contains("10gb") || path_str.contains("sf10") {
                     10.0
                 } else if path_str.contains("1gb") || path_str.contains("sf1") {
                     1.0
@@ -357,8 +361,11 @@ async fn main() {
             println!();
 
             let start = Instant::now();
-            // Scale memory limit with SF to avoid unnecessary spilling
-            let memory_limit = ((sf * 4.0).max(1.0) as usize) * 1024 * 1024 * 1024;
+            // Hard cap at 64GB to prevent OOM on large SF values
+            const MAX_MEMORY: usize = 64 * 1024 * 1024 * 1024; // 64GB
+            let memory_limit =
+                (((sf * 4.0).max(1.0) as usize) * 1024 * 1024 * 1024).min(MAX_MEMORY);
+            println!("Memory limit: {} GB", memory_limit / (1024 * 1024 * 1024));
             let mut ctx = ExecutionContext::with_memory_limit(memory_limit);
 
             // Load all TPC-H tables from Parquet files

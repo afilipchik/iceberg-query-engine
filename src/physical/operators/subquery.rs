@@ -42,6 +42,14 @@ fn run_subquery_blocking(
     })
 }
 
+/// Execute a physical plan synchronously, collecting all output batches.
+/// Used for materializing CTEs and similar operations.
+pub fn run_subquery_plan(
+    physical: Arc<dyn crate::physical::PhysicalOperator>,
+) -> Result<Vec<RecordBatch>> {
+    run_subquery_blocking(physical)
+}
+
 /// Subquery executor - handles execution of subqueries during filter evaluation
 #[derive(Clone)]
 pub struct SubqueryExecutor {
@@ -57,6 +65,12 @@ struct SubqueryExecutorInner {
     cache: parking_lot::Mutex<HashMap<usize, SubqueryResult>>,
     /// Cached results for correlated subqueries (keyed by plan hash + correlation key values)
     correlated_cache: parking_lot::Mutex<HashMap<CorrelatedCacheKey, SubqueryResult>>,
+    /// Shared CTE materialization cache from the main planner
+    cte_cache: parking_lot::Mutex<Option<crate::physical::planner::SharedCteCache>>,
+    /// Memory pool for spillable operators in subquery plans
+    memory_pool: Option<crate::execution::SharedMemoryPool>,
+    /// Execution config for spillable operators in subquery plans
+    config: Option<crate::execution::ExecutionConfig>,
 }
 
 /// Cache key for correlated subqueries: plan hash + correlation values
@@ -97,6 +111,27 @@ impl SubqueryExecutor {
                 tables: parking_lot::Mutex::new(tables),
                 cache: parking_lot::Mutex::new(HashMap::new()),
                 correlated_cache: parking_lot::Mutex::new(HashMap::new()),
+                cte_cache: parking_lot::Mutex::new(None),
+                memory_pool: None,
+                config: None,
+            }),
+        }
+    }
+
+    /// Create a new subquery executor with memory management support
+    pub fn from_tables_with_config(
+        tables: HashMap<String, Arc<dyn TableProvider>>,
+        memory_pool: crate::execution::SharedMemoryPool,
+        config: crate::execution::ExecutionConfig,
+    ) -> Self {
+        Self {
+            inner: Arc::new(SubqueryExecutorInner {
+                tables: parking_lot::Mutex::new(tables),
+                cache: parking_lot::Mutex::new(HashMap::new()),
+                correlated_cache: parking_lot::Mutex::new(HashMap::new()),
+                cte_cache: parking_lot::Mutex::new(None),
+                memory_pool: Some(memory_pool),
+                config: Some(config),
             }),
         }
     }
@@ -187,14 +222,29 @@ impl SubqueryExecutor {
         self.inner.tables.lock().insert(name, provider);
     }
 
+    /// Set the shared CTE cache from the main planner so subquery planners can
+    /// access materialized CTEs.
+    pub fn set_cte_cache(&self, cache: crate::physical::planner::SharedCteCache) {
+        *self.inner.cte_cache.lock() = Some(cache);
+    }
+
     /// Create a physical planner for subquery execution
     fn create_planner(&self) -> PhysicalPlanner {
-        let mut planner = PhysicalPlanner::new();
+        let mut planner = match (&self.inner.memory_pool, &self.inner.config) {
+            (Some(pool), Some(config)) => {
+                PhysicalPlanner::with_config(pool.clone(), config.clone())
+            }
+            _ => PhysicalPlanner::new(),
+        };
         for (name, provider) in self.inner.tables.lock().iter() {
             planner.register_table(name.clone(), provider.clone());
         }
         // Pass this executor to the planner for nested subquery support
         planner.set_subquery_executor(Some(self.clone()));
+        // Share the CTE cache so subquery planners can access materialized CTEs
+        if let Some(ref cache) = *self.inner.cte_cache.lock() {
+            planner.set_cte_cache(Arc::clone(cache));
+        }
         planner
     }
 
@@ -932,6 +982,7 @@ fn substitute_columns_in_plan(
                 input: Arc::new(new_input),
                 alias: node.alias.clone(),
                 schema: node.schema.clone(),
+                cte_name: node.cte_name.clone(),
             }))
         }
         LogicalPlan::Union(node) => {

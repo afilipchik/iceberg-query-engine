@@ -3,9 +3,9 @@
 use crate::error::{QueryError, Result};
 use crate::execution::{ExecutionConfig, SharedMemoryPool};
 use crate::physical::operators::{
-    AggregateExpr, ExternalSortExec, FilterExec, HashAggregateExec, HashJoinExec, LimitExec,
-    MemoryTableExec, MorselAggregateExec, ProjectExec, SortExec, SpillableHashAggregateExec,
-    SpillableHashJoinExec, SubqueryExecutor, TableProvider, UnionExec,
+    run_subquery_plan, AggregateExpr, ExternalSortExec, FilterExec, HashAggregateExec,
+    HashJoinExec, LimitExec, MemoryTableExec, MorselAggregateExec, ProjectExec, SortExec,
+    SpillableHashAggregateExec, SpillableHashJoinExec, SubqueryExecutor, TableProvider, UnionExec,
 };
 use crate::physical::PhysicalOperator;
 use crate::planner::{BinaryOp, Expr, JoinType, LogicalPlan, PlanSchema};
@@ -13,6 +13,11 @@ use arrow::datatypes::{Field, Schema, SchemaRef};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Shared CTE materialization cache. Allows SubqueryExecutor planners to access
+/// CTEs materialized by the main planner.
+pub type SharedCteCache =
+    Arc<parking_lot::Mutex<HashMap<usize, (SchemaRef, Vec<arrow::record_batch::RecordBatch>)>>>;
 
 /// Physical planner that converts logical plans to physical execution plans
 pub struct PhysicalPlanner {
@@ -27,6 +32,11 @@ pub struct PhysicalPlanner {
     /// Cache of full table scans to avoid re-reading the same table multiple times.
     /// Key is table name, value is (full schema, all batches with no projection).
     scan_cache: RefCell<HashMap<String, (SchemaRef, Vec<arrow::record_batch::RecordBatch>)>>,
+    /// Cache for materialized CTEs. When a CTE is referenced multiple times (same Arc pointer),
+    /// we materialize it once to ensure identical results (avoids floating-point non-determinism).
+    /// Key is the raw pointer of the Arc<LogicalPlan>, value is materialized batches.
+    /// Shared via Arc so SubqueryExecutor planners can access the same cache.
+    cte_cache: SharedCteCache,
 }
 
 impl Default for PhysicalPlanner {
@@ -44,6 +54,7 @@ impl PhysicalPlanner {
             memory_pool: None,
             config: None,
             scan_cache: RefCell::new(HashMap::new()),
+            cte_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 
@@ -55,6 +66,7 @@ impl PhysicalPlanner {
             memory_pool: Some(memory_pool),
             config: Some(config),
             scan_cache: RefCell::new(HashMap::new()),
+            cte_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 
@@ -304,12 +316,27 @@ impl PhysicalPlanner {
     pub fn enable_subquery_execution(&mut self) {
         // Clone the tables HashMap for the subquery executor
         let tables = self.tables.clone();
-        self.subquery_executor = Some(SubqueryExecutor::from_tables(tables));
+        self.subquery_executor = Some(match (&self.memory_pool, &self.config) {
+            (Some(pool), Some(config)) => {
+                SubqueryExecutor::from_tables_with_config(tables, pool.clone(), config.clone())
+            }
+            _ => SubqueryExecutor::from_tables(tables),
+        });
     }
 
     /// Set the subquery executor (used by subquery executor to pass itself for nested subqueries)
     pub fn set_subquery_executor(&mut self, executor: Option<SubqueryExecutor>) {
         self.subquery_executor = executor;
+    }
+
+    /// Share the CTE cache with this planner (used by SubqueryExecutor planners).
+    pub fn set_cte_cache(&mut self, cache: SharedCteCache) {
+        self.cte_cache = cache;
+    }
+
+    /// Get a clone of the CTE cache Arc for sharing with subquery planners.
+    pub fn cte_cache_ref(&self) -> SharedCteCache {
+        Arc::clone(&self.cte_cache)
     }
 
     /// Collect all scan projections for each table name in the plan.
@@ -392,6 +419,169 @@ impl PhysicalPlanner {
         let mut cache = self.scan_cache.borrow_mut();
         for (table_name, schema, batches) in results {
             cache.insert(table_name, (schema, batches));
+        }
+    }
+
+    /// Pre-materialize CTEs that are referenced multiple times. This ensures both
+    /// references get identical data, avoiding floating-point non-determinism from
+    /// parallel aggregation computing slightly different sums.
+    fn materialize_shared_ctes(&self, logical: &LogicalPlan) -> Result<()> {
+        // Count how many times each CTE name appears as a SubqueryAlias input
+        let mut cte_counts: HashMap<String, usize> = HashMap::new();
+        Self::count_cte_refs(logical, &mut cte_counts);
+
+        // Materialize CTEs referenced 2+ times
+        if cte_counts.values().all(|&c| c < 2) {
+            return Ok(());
+        }
+
+        // Collect the first SubqueryAlias node for each CTE that needs materialization
+        let mut cte_plans: HashMap<String, &LogicalPlan> = HashMap::new();
+        Self::collect_cte_plans(logical, &cte_counts, &mut cte_plans);
+
+        for (name, plan) in &cte_plans {
+            let physical = self.create_physical_plan_inner(plan)?;
+            let schema = physical.schema();
+            let batches: Vec<arrow::record_batch::RecordBatch> = run_subquery_plan(physical)?;
+            // Use a hash of the CTE name as the key
+            let key = Self::cte_name_key(name);
+            self.cte_cache.lock().insert(key, (schema, batches));
+        }
+        Ok(())
+    }
+
+    /// Hash a CTE name to a usize key for the cache.
+    fn cte_name_key(name: &str) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        name.hash(&mut hasher);
+        hasher.finish() as usize
+    }
+
+    /// Walk the logical plan tree and count CTE references by name.
+    /// Also walks into subquery expressions (ScalarSubquery, Exists, InSubquery).
+    fn count_cte_refs(plan: &LogicalPlan, counts: &mut HashMap<String, usize>) {
+        match plan {
+            LogicalPlan::SubqueryAlias(node) => {
+                if let Some(ref cte_name) = node.cte_name {
+                    *counts.entry(cte_name.clone()).or_insert(0) += 1;
+                }
+                Self::count_cte_refs(&node.input, counts);
+            }
+            LogicalPlan::Filter(node) => {
+                Self::count_cte_refs_in_expr(&node.predicate, counts);
+                Self::count_cte_refs(&node.input, counts);
+            }
+            LogicalPlan::Project(node) => {
+                for expr in &node.exprs {
+                    Self::count_cte_refs_in_expr(expr, counts);
+                }
+                Self::count_cte_refs(&node.input, counts);
+            }
+            LogicalPlan::Join(node) => {
+                if let Some(ref filter) = node.filter {
+                    Self::count_cte_refs_in_expr(filter, counts);
+                }
+                Self::count_cte_refs(&node.left, counts);
+                Self::count_cte_refs(&node.right, counts);
+            }
+            LogicalPlan::Aggregate(node) => {
+                for expr in &node.aggregates {
+                    Self::count_cte_refs_in_expr(expr, counts);
+                }
+                Self::count_cte_refs(&node.input, counts);
+            }
+            _ => {
+                for child in plan.children() {
+                    Self::count_cte_refs(child, counts);
+                }
+            }
+        }
+    }
+
+    /// Walk an expression tree to find subquery plans that contain CTE references.
+    fn count_cte_refs_in_expr(expr: &Expr, counts: &mut HashMap<String, usize>) {
+        match expr {
+            Expr::ScalarSubquery(plan) => {
+                Self::count_cte_refs(plan, counts);
+            }
+            Expr::Exists { subquery, .. } => {
+                Self::count_cte_refs(subquery, counts);
+            }
+            Expr::InSubquery { subquery, expr, .. } => {
+                Self::count_cte_refs(subquery, counts);
+                Self::count_cte_refs_in_expr(expr, counts);
+            }
+            Expr::BinaryExpr { left, right, .. } => {
+                Self::count_cte_refs_in_expr(left, counts);
+                Self::count_cte_refs_in_expr(right, counts);
+            }
+            Expr::UnaryExpr { expr: inner, .. }
+            | Expr::Cast { expr: inner, .. }
+            | Expr::Alias { expr: inner, .. } => {
+                Self::count_cte_refs_in_expr(inner, counts);
+            }
+            _ => {}
+        }
+    }
+
+    /// Collect the first logical plan for each CTE that needs materialization.
+    fn collect_cte_plans<'a>(
+        plan: &'a LogicalPlan,
+        needed: &HashMap<String, usize>,
+        plans: &mut HashMap<String, &'a LogicalPlan>,
+    ) {
+        match plan {
+            LogicalPlan::SubqueryAlias(node) => {
+                if let Some(ref cte_name) = node.cte_name {
+                    if needed.get(cte_name).copied().unwrap_or(0) >= 2
+                        && !plans.contains_key(cte_name)
+                    {
+                        plans.insert(cte_name.clone(), &node.input);
+                    }
+                }
+                Self::collect_cte_plans(&node.input, needed, plans);
+            }
+            LogicalPlan::Filter(node) => {
+                Self::collect_cte_plans_in_expr(&node.predicate, needed, plans);
+                Self::collect_cte_plans(&node.input, needed, plans);
+            }
+            LogicalPlan::Project(node) => {
+                for expr in &node.exprs {
+                    Self::collect_cte_plans_in_expr(expr, needed, plans);
+                }
+                Self::collect_cte_plans(&node.input, needed, plans);
+            }
+            _ => {
+                for child in plan.children() {
+                    Self::collect_cte_plans(child, needed, plans);
+                }
+            }
+        }
+    }
+
+    fn collect_cte_plans_in_expr<'a>(
+        expr: &'a Expr,
+        needed: &HashMap<String, usize>,
+        plans: &mut HashMap<String, &'a LogicalPlan>,
+    ) {
+        match expr {
+            Expr::ScalarSubquery(plan) => Self::collect_cte_plans(plan, needed, plans),
+            Expr::Exists { subquery, .. } => Self::collect_cte_plans(subquery, needed, plans),
+            Expr::InSubquery { subquery, expr, .. } => {
+                Self::collect_cte_plans(subquery, needed, plans);
+                Self::collect_cte_plans_in_expr(expr, needed, plans);
+            }
+            Expr::BinaryExpr { left, right, .. } => {
+                Self::collect_cte_plans_in_expr(left, needed, plans);
+                Self::collect_cte_plans_in_expr(right, needed, plans);
+            }
+            Expr::UnaryExpr { expr: inner, .. }
+            | Expr::Cast { expr: inner, .. }
+            | Expr::Alias { expr: inner, .. } => {
+                Self::collect_cte_plans_in_expr(inner, needed, plans);
+            }
+            _ => {}
         }
     }
 
@@ -532,6 +722,16 @@ impl PhysicalPlanner {
     pub fn create_physical_plan(&self, logical: &LogicalPlan) -> Result<Arc<dyn PhysicalOperator>> {
         // Pre-scan tables that are accessed multiple times to avoid redundant parquet reads
         self.prescan_shared_tables(logical);
+        // Pre-materialize CTEs that are referenced multiple times to ensure
+        // identical results (avoids floating-point non-determinism from parallel aggregation)
+        self.materialize_shared_ctes(logical)?;
+        // Share the CTE cache with the SubqueryExecutor so its planners can access
+        // materialized CTEs (ensures scalar subqueries referencing CTEs get identical data)
+        if !self.cte_cache.lock().is_empty() {
+            if let Some(ref executor) = self.subquery_executor {
+                executor.set_cte_cache(self.cte_cache_ref());
+            }
+        }
         self.create_physical_plan_inner(logical)
     }
 
@@ -710,20 +910,9 @@ impl PhysicalPlanner {
                 // because the output doesn't include right-side columns
                 let is_semi_anti = matches!(node.join_type, JoinType::Semi | JoinType::Anti);
 
-                if is_semi_anti && node.filter.is_some() {
-                    // SpillableHashJoinExec doesn't support with_filter yet,
-                    // use regular HashJoinExec for this case
-                    let join = HashJoinExec::with_filter(
-                        left,
-                        right,
-                        on,
-                        node.join_type,
-                        node.filter.clone(),
-                    );
-                    Ok(Arc::new(join))
-                } else if self.use_spillable() {
+                if self.use_spillable() {
                     // Use spillable hash join with memory management
-                    let join = SpillableHashJoinExec::new(
+                    let mut join = SpillableHashJoinExec::new(
                         left,
                         right,
                         on,
@@ -733,13 +922,19 @@ impl PhysicalPlanner {
                     )
                     .with_build_right(build_right_for_left);
 
-                    // Apply additional filter if present
-                    match &node.filter {
-                        Some(predicate) => {
-                            let filter = self.create_filter(Arc::new(join), predicate.clone());
-                            Ok(Arc::new(filter))
+                    // For Semi/Anti, pass filter into the join operator;
+                    // for other join types, apply as a post-filter
+                    if is_semi_anti && node.filter.is_some() {
+                        join = join.with_filter(node.filter.clone());
+                        Ok(Arc::new(join))
+                    } else {
+                        match &node.filter {
+                            Some(predicate) => {
+                                let filter = self.create_filter(Arc::new(join), predicate.clone());
+                                Ok(Arc::new(filter))
+                            }
+                            None => Ok(Arc::new(join)),
                         }
-                        None => Ok(Arc::new(join)),
                     }
                 } else {
                     // Use regular hash join (no memory management)
@@ -942,7 +1137,21 @@ impl PhysicalPlanner {
             }
 
             LogicalPlan::SubqueryAlias(node) => {
-                // Just pass through to input
+                // Check if this CTE was pre-materialized
+                if let Some(ref cte_name) = node.cte_name {
+                    let key = Self::cte_name_key(cte_name);
+                    let cache = self.cte_cache.lock();
+                    if let Some((schema, batches)) = cache.get(&key) {
+                        let exec = MemoryTableExec::new(
+                            &node.alias,
+                            schema.clone(),
+                            batches.clone(),
+                            None,
+                        );
+                        return Ok(Arc::new(exec));
+                    }
+                }
+                // Not cached, pass through to input
                 self.create_physical_plan_inner(&node.input)
             }
 

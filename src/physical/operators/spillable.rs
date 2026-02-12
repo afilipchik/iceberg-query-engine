@@ -28,6 +28,7 @@ use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio::sync::OnceCell;
 
 /// Unique counter for spill directory names to avoid conflicts between concurrent operators
 static SPILL_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -54,6 +55,10 @@ pub struct SpillableHashJoinExec {
     config: ExecutionConfig,
     /// When true, build hash table from right side (smaller) for Left joins.
     build_right: bool,
+    /// Optional join filter (e.g., for Semi/Anti with additional predicates)
+    filter: Option<Expr>,
+    /// Cached build decision — computed once, shared across all partition executions
+    build_decision: OnceCell<BuildDecision>,
 }
 
 impl fmt::Debug for SpillableHashJoinExec {
@@ -63,6 +68,17 @@ impl fmt::Debug for SpillableHashJoinExec {
             .field("on", &self.on)
             .finish()
     }
+}
+
+/// Cached decision about whether the build side fits in memory
+enum BuildDecision {
+    /// Build fits in memory — use cached HashJoinExec for parallel probe
+    InMemory(Arc<crate::physical::operators::HashJoinExec>),
+    /// Build exceeds memory — spill path (only partition 0 processes)
+    Spill {
+        /// Build batches stored for partition 0 to consume once.
+        build_batches: std::sync::Mutex<Option<Vec<RecordBatch>>>,
+    },
 }
 
 impl SpillableHashJoinExec {
@@ -113,12 +129,20 @@ impl SpillableHashJoinExec {
             memory_pool,
             config,
             build_right: false,
+            filter: None,
+            build_decision: OnceCell::new(),
         }
     }
 
     /// Set build_right flag: when true, build hash table from right side.
     pub fn with_build_right(mut self, build_right: bool) -> Self {
         self.build_right = build_right;
+        self
+    }
+
+    /// Set join filter (for Semi/Anti joins with additional predicates).
+    pub fn with_filter(mut self, filter: Option<Expr>) -> Self {
+        self.filter = filter;
         self
     }
 }
@@ -160,6 +184,20 @@ impl PhysicalOperator for SpillableHashJoinExec {
         vec![self.left.clone(), self.right.clone()]
     }
 
+    fn output_partitions(&self) -> usize {
+        match self.join_type {
+            JoinType::Semi | JoinType::Anti => 1,
+            _ => {
+                let probe_side = if self.build_right || matches!(self.join_type, JoinType::Right) {
+                    &self.left
+                } else {
+                    &self.right
+                };
+                probe_side.output_partitions().max(1)
+            }
+        }
+    }
+
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
         // Determine build and probe sides
         let (build_side, probe_side, swapped) =
@@ -169,55 +207,138 @@ impl PhysicalOperator for SpillableHashJoinExec {
                 (&self.left, &self.right, false)
             };
 
-        // Collect ALL build-side partitions
-        let build_partitions = build_side.output_partitions().max(1);
-        let mut build_batches = Vec::new();
-        for p in 0..build_partitions {
-            let build_stream = build_side.execute(p).await?;
-            let batches: Vec<RecordBatch> = build_stream.try_collect().await?;
-            build_batches.extend(batches);
+        // Get or compute the build decision (computed ONCE, shared across all partitions)
+        let decision = self
+            .build_decision
+            .get_or_try_init(|| async {
+                // Streaming collection: check memory incrementally during collection.
+                // If build side exceeds the threshold mid-stream, enter spill path
+                // without waiting for all partitions to finish.
+                let build_partitions = build_side.output_partitions().max(1);
+                let mut build_batches = Vec::new();
+                let mut build_size: usize = 0;
+                let memory_threshold =
+                    (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
+                let mut exceeded = false;
+
+                for p in 0..build_partitions {
+                    let build_stream = build_side.execute(p).await?;
+                    let mut batch_stream = build_stream;
+                    while let Some(batch) = batch_stream.try_next().await? {
+                        let batch_mem = estimate_batch_size(&batch);
+                        build_size += batch_mem;
+                        build_batches.push(batch);
+
+                        if build_size > memory_threshold {
+                            // Collect remaining batches from this partition stream
+                            let remaining: Vec<RecordBatch> = batch_stream.try_collect().await?;
+                            build_size += remaining
+                                .iter()
+                                .map(|b| estimate_batch_size(b))
+                                .sum::<usize>();
+                            build_batches.extend(remaining);
+                            exceeded = true;
+                            break;
+                        }
+                    }
+                    if exceeded {
+                        // Collect remaining partitions into build_batches too (they need to be spilled)
+                        for p2 in (p + 1)..build_partitions {
+                            let s = build_side.execute(p2).await?;
+                            let batches: Vec<RecordBatch> = s.try_collect().await?;
+                            build_size += batches
+                                .iter()
+                                .map(|b| estimate_batch_size(b))
+                                .sum::<usize>();
+                            build_batches.extend(batches);
+                        }
+                        break;
+                    }
+                }
+
+                if !exceeded {
+                    // Build side fits in memory — create a reusable HashJoinExec
+                    let build_schema = build_batches
+                        .first()
+                        .map(|b| b.schema())
+                        .unwrap_or_else(|| build_side.schema());
+                    let build_mem = Arc::new(crate::physical::operators::MemoryTableExec::new(
+                        "join_build",
+                        build_schema,
+                        build_batches,
+                        None,
+                    ));
+                    let (left, right): (Arc<dyn PhysicalOperator>, Arc<dyn PhysicalOperator>) =
+                        if swapped {
+                            (self.left.clone(), build_mem as Arc<dyn PhysicalOperator>)
+                        } else {
+                            (build_mem as Arc<dyn PhysicalOperator>, self.right.clone())
+                        };
+                    let hash_join = if self.filter.is_some() {
+                        Arc::new(
+                            crate::physical::operators::HashJoinExec::with_filter(
+                                left,
+                                right,
+                                self.on.clone(),
+                                self.join_type,
+                                self.filter.clone(),
+                            )
+                            .with_build_right(self.build_right),
+                        )
+                    } else {
+                        Arc::new(
+                            crate::physical::operators::HashJoinExec::new(
+                                left,
+                                right,
+                                self.on.clone(),
+                                self.join_type,
+                            )
+                            .with_build_right(self.build_right),
+                        )
+                    };
+                    Ok::<_, QueryError>(BuildDecision::InMemory(hash_join))
+                } else {
+                    Ok(BuildDecision::Spill {
+                        build_batches: std::sync::Mutex::new(Some(build_batches)),
+                    })
+                }
+            })
+            .await?;
+
+        match decision {
+            BuildDecision::InMemory(hash_join) => {
+                // Delegate directly — HashJoinExec has its own OnceCell for the hash table
+                hash_join.execute(partition).await
+            }
+            BuildDecision::Spill { build_batches } => {
+                // Spill path runs everything through partition 0
+                if partition > 0 {
+                    return Ok(Box::pin(stream::empty()));
+                }
+                let batches = build_batches.lock().unwrap().take().unwrap_or_default();
+                self.execute_spill_path(batches, probe_side, swapped).await
+            }
         }
+    }
 
-        // Check if build side fits in memory — if so, delegate to HashJoinExec
-        let build_size: usize = build_batches.iter().map(|b| estimate_batch_size(b)).sum();
-        let memory_threshold =
-            (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
+    fn name(&self) -> &str {
+        "SpillableHashJoin"
+    }
+}
 
-        if build_size <= memory_threshold {
-            // Build side fits in memory — use the proven HashJoinExec
-            let build_schema = build_batches
-                .first()
-                .map(|b| b.schema())
-                .unwrap_or_else(|| build_side.schema());
-            let build_mem = Arc::new(crate::physical::operators::MemoryTableExec::new(
-                "join_build",
-                build_schema,
-                build_batches,
-                None,
-            ));
-            let (left, right) = if swapped {
-                (self.left.clone(), build_mem as Arc<dyn PhysicalOperator>)
-            } else {
-                (build_mem as Arc<dyn PhysicalOperator>, self.right.clone())
-            };
-            let hash_join = crate::physical::operators::HashJoinExec::new(
-                left,
-                right,
-                self.on.clone(),
-                self.join_type,
-            )
-            .with_build_right(self.build_right);
-            return hash_join.execute(partition).await;
-        }
-
-        // Build side exceeds memory — use spillable path
+impl SpillableHashJoinExec {
+    /// Execute the spill path when build side exceeds memory limit.
+    /// Only called from partition 0.
+    async fn execute_spill_path(
+        &self,
+        build_batches: Vec<RecordBatch>,
+        probe_side: &Arc<dyn PhysicalOperator>,
+        swapped: bool,
+    ) -> Result<RecordBatchStream> {
         self.config.ensure_spill_dir()?;
 
         let spill_id = SPILL_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let spill_dir = self
-            .config
-            .spill_path
-            .join(format!("join_{}_{}", partition, spill_id));
+        let spill_dir = self.config.spill_path.join(format!("join_0_{}", spill_id));
         std::fs::create_dir_all(&spill_dir).map_err(|e| {
             QueryError::Execution(format!("Failed to create spill directory: {}", e))
         })?;
@@ -286,12 +407,6 @@ impl PhysicalOperator for SpillableHashJoinExec {
         Ok(Box::pin(stream::iter(all_results.into_iter().map(Ok))))
     }
 
-    fn name(&self) -> &str {
-        "SpillableHashJoin"
-    }
-}
-
-impl SpillableHashJoinExec {
     async fn build_with_partitioning(
         &self,
         mut build_stream: RecordBatchStream,
@@ -544,21 +659,50 @@ impl PhysicalOperator for SpillableHashAggregateExec {
             return Ok(Box::pin(stream::empty()));
         }
 
-        // Collect from ALL input partitions (input may split data across partitions)
+        // Streaming collection: check memory incrementally and enter spill path early
         let input_partitions = self.input.output_partitions().max(1);
         let mut all_batches = Vec::new();
-        for p in 0..input_partitions {
-            let input_stream = self.input.execute(p).await?;
-            let batches: Vec<RecordBatch> = input_stream.try_collect().await?;
-            all_batches.extend(batches);
-        }
-
-        // Check total memory usage
-        let total_size: usize = all_batches.iter().map(|b| estimate_batch_size(b)).sum();
+        let mut total_size: usize = 0;
         let memory_threshold =
             (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
+        let mut exceeded = false;
 
-        if total_size <= memory_threshold {
+        for p in 0..input_partitions {
+            let input_stream = self.input.execute(p).await?;
+            let mut batch_stream = input_stream;
+            while let Some(batch) = batch_stream.try_next().await? {
+                let batch_mem = estimate_batch_size(&batch);
+                total_size += batch_mem;
+                all_batches.push(batch);
+
+                if total_size > memory_threshold {
+                    // Collect remaining from this stream
+                    let remaining: Vec<RecordBatch> = batch_stream.try_collect().await?;
+                    total_size += remaining
+                        .iter()
+                        .map(|b| estimate_batch_size(b))
+                        .sum::<usize>();
+                    all_batches.extend(remaining);
+                    exceeded = true;
+                    break;
+                }
+            }
+            if exceeded {
+                // Collect remaining partitions
+                for p2 in (p + 1)..input_partitions {
+                    let s = self.input.execute(p2).await?;
+                    let batches: Vec<RecordBatch> = s.try_collect().await?;
+                    total_size += batches
+                        .iter()
+                        .map(|b| estimate_batch_size(b))
+                        .sum::<usize>();
+                    all_batches.extend(batches);
+                }
+                break;
+            }
+        }
+
+        if !exceeded {
             // Data fits in memory — delegate to the proven HashAggregateExec
             let hash_aggs: Vec<crate::physical::operators::hash_agg::AggregateExpr> = self
                 .aggregates
@@ -879,25 +1023,53 @@ impl PhysicalOperator for ExternalSortExec {
             return Ok(Box::pin(stream::empty()));
         }
 
-        // Collect from ALL input partitions (input may split data across partitions)
+        // Streaming collection: check memory incrementally and enter spill path early
         let input_partitions = self.input.output_partitions().max(1);
         let mut all_batches = Vec::new();
+        let mut total_size: usize = 0;
+        let memory_threshold =
+            (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
+        let mut exceeded = false;
+
         for p in 0..input_partitions {
             let input_stream = self.input.execute(p).await?;
-            let batches: Vec<RecordBatch> = input_stream.try_collect().await?;
-            all_batches.extend(batches);
+            let mut batch_stream = input_stream;
+            while let Some(batch) = batch_stream.try_next().await? {
+                let batch_mem = estimate_batch_size(&batch);
+                total_size += batch_mem;
+                all_batches.push(batch);
+
+                if total_size > memory_threshold {
+                    // Collect remaining from this stream
+                    let remaining: Vec<RecordBatch> = batch_stream.try_collect().await?;
+                    total_size += remaining
+                        .iter()
+                        .map(|b| estimate_batch_size(b))
+                        .sum::<usize>();
+                    all_batches.extend(remaining);
+                    exceeded = true;
+                    break;
+                }
+            }
+            if exceeded {
+                for p2 in (p + 1)..input_partitions {
+                    let s = self.input.execute(p2).await?;
+                    let batches: Vec<RecordBatch> = s.try_collect().await?;
+                    total_size += batches
+                        .iter()
+                        .map(|b| estimate_batch_size(b))
+                        .sum::<usize>();
+                    all_batches.extend(batches);
+                }
+                break;
+            }
         }
 
         if all_batches.is_empty() {
             return Ok(Box::pin(stream::empty()));
         }
 
-        // Check total memory usage
-        let total_size: usize = all_batches.iter().map(|b| estimate_batch_size(b)).sum();
-        let memory_threshold =
-            (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
-
-        if total_size <= memory_threshold {
+        if !exceeded {
             // Data fits in memory — use the regular SortExec path for correctness
             // Create a temporary MemoryTableExec with our already-collected data
             let mem = crate::physical::operators::MemoryTableExec::new(
