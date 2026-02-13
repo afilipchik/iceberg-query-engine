@@ -1706,13 +1706,34 @@ impl fmt::Display for Expr {
 }
 
 /// Coerce numeric types for binary operations
+/// This must match the behavior of coerce_arrays in filter.rs
 fn coerce_numeric_types(left: &ArrowDataType, right: &ArrowDataType) -> ArrowDataType {
     use ArrowDataType::*;
 
     match (left, right) {
         (Float64, _) | (_, Float64) => Float64,
         (Float32, _) | (_, Float32) => Float64,
-        (Decimal128(_, _), _) | (_, Decimal128(_, _)) => Decimal128(38, 10),
+        // Decimal128 arithmetic: try to match Arrow's precision calculation
+        // For add/sub: precision = max(p1, p2), scale = max(s1, s2) (when same precision)
+        // For mul: precision = p1 + p2 + 1, scale = s1 + s2
+        (Decimal128(p1, s1), Decimal128(p2, s2)) => {
+            // For multiply (worst case for precision)
+            let result_precision = (*p1 + *p2 + 1).min(38);
+            let result_scale = (*s1 + *s2).min(38);
+            Decimal128(result_precision, result_scale)
+        }
+        // Decimal128 with Int: filter.rs casts Int to match decimal's precision
+        // After casting: Decimal(p, s) op Decimal(p, s)
+        // - add/sub: Decimal(p, s) (same precision)
+        // - mul: Decimal(2p+1, 2s)
+        // We don't know the operation, so preserve the decimal type
+        (Decimal128(p, s), Int64 | Int32) | (Int64 | Int32, Decimal128(p, s)) => {
+            // Just return the decimal type as-is (for add/sub)
+            // Multiplication will be handled in subsequent operations
+            Decimal128(*p, *s)
+        }
+        // Single Decimal128: preserve it
+        (Decimal128(p, s), _) | (_, Decimal128(p, s)) => Decimal128(*p, *s),
         (Int64, _) | (_, Int64) => Int64,
         (Int32, _) | (_, Int32) => Int64,
         (Int16, _) | (_, Int16) => Int32,

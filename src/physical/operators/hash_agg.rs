@@ -5,8 +5,8 @@ use crate::physical::operators::filter::evaluate_expr;
 use crate::physical::{PhysicalOperator, RecordBatchStream};
 use crate::planner::{AggregateFunction, Expr, ScalarValue};
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Builder, Float64Array, Float64Builder,
-    Int64Array, Int64Builder, StringArray, StringBuilder, UInt64Builder,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Decimal128Builder, Float64Array,
+    Float64Builder, Int64Array, Int64Builder, StringArray, StringBuilder, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -245,6 +245,7 @@ enum GroupValue {
     Float64(ordered_float::OrderedFloat<f64>),
     String(String),
     Date32(i32),
+    Decimal128(i128, i8), // (raw value, scale) - Arrow uses i8 for scale
 }
 
 impl PartialEq for GroupKey {
@@ -262,6 +263,9 @@ impl PartialEq for GroupKey {
                 (GroupValue::Float64(a), GroupValue::Float64(b)) => a == b,
                 (GroupValue::String(a), GroupValue::String(b)) => a == b,
                 (GroupValue::Date32(a), GroupValue::Date32(b)) => a == b,
+                (GroupValue::Decimal128(a1, s1), GroupValue::Decimal128(a2, s2)) => {
+                    a1 == a2 && s1 == s2
+                }
                 _ => false,
             })
     }
@@ -293,6 +297,11 @@ impl Hash for GroupKey {
                 GroupValue::Date32(d) => {
                     5u8.hash(state);
                     d.hash(state);
+                }
+                GroupValue::Decimal128(val, scale) => {
+                    6u8.hash(state);
+                    val.hash(state);
+                    scale.hash(state);
                 }
             }
         }
@@ -659,6 +668,21 @@ fn aggregate_scalar_simd(
                     .iter()
                     .fold(0i64, |acc, &x| acc.saturating_add(x as i64));
                 Arc::new(Int64Array::from(vec![sum]))
+            } else if let Some(a) = input.as_any().downcast_ref::<Decimal128Array>() {
+                // For Decimal128 SUM, we need to preserve precision and scale
+                let sum = a
+                    .iter()
+                    .flatten()
+                    .fold(0i128, |acc, x| acc.saturating_add(x));
+                let precision = a.precision();
+                let scale = a.scale();
+                Arc::new(
+                    Decimal128Array::from(vec![sum])
+                        .with_precision_and_scale(precision, scale)
+                        .map_err(|e| {
+                            QueryError::Execution(format!("Decimal128 precision error: {}", e))
+                        })?,
+                )
             } else {
                 return Err(QueryError::NotImplemented(format!(
                     "SUM not implemented for type {:?}",
@@ -705,6 +729,17 @@ fn aggregate_scalar_simd(
             } else if let Some(a) = input.as_any().downcast_ref::<Date32Array>() {
                 let min = a.iter().flatten().min().unwrap_or(i32::MAX);
                 Arc::new(Date32Array::from(vec![min]))
+            } else if let Some(a) = input.as_any().downcast_ref::<Decimal128Array>() {
+                let min = a.iter().flatten().min().unwrap_or(i128::MAX);
+                let precision = a.precision();
+                let scale = a.scale();
+                Arc::new(
+                    Decimal128Array::from(vec![min])
+                        .with_precision_and_scale(precision, scale)
+                        .map_err(|e| {
+                            QueryError::Execution(format!("Decimal128 precision error: {}", e))
+                        })?,
+                )
             } else {
                 return Err(QueryError::NotImplemented(format!(
                     "MIN not implemented for type {:?}",
@@ -732,6 +767,17 @@ fn aggregate_scalar_simd(
             } else if let Some(a) = input.as_any().downcast_ref::<Date32Array>() {
                 let max = a.iter().flatten().max().unwrap_or(i32::MIN);
                 Arc::new(Date32Array::from(vec![max]))
+            } else if let Some(a) = input.as_any().downcast_ref::<Decimal128Array>() {
+                let max = a.iter().flatten().max().unwrap_or(i128::MIN);
+                let precision = a.precision();
+                let scale = a.scale();
+                Arc::new(
+                    Decimal128Array::from(vec![max])
+                        .with_precision_and_scale(precision, scale)
+                        .map_err(|e| {
+                            QueryError::Execution(format!("Decimal128 precision error: {}", e))
+                        })?,
+                )
             } else {
                 return Err(QueryError::NotImplemented(format!(
                     "MAX not implemented for type {:?}",
@@ -1257,6 +1303,11 @@ fn extract_group_value(arr: &ArrayRef, row: usize) -> GroupValue {
     if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
         return GroupValue::Bool(a.value(row));
     }
+    if let Some(a) = arr.as_any().downcast_ref::<Decimal128Array>() {
+        // Extract raw value and scale from Decimal128
+        let scale = a.scale();
+        return GroupValue::Decimal128(a.value(row), scale);
+    }
 
     GroupValue::Null
 }
@@ -1613,6 +1664,26 @@ fn build_group_array(
                 }
             }
             Ok(Arc::new(builder.finish()))
+        }
+        DataType::Decimal128(precision, scale) => {
+            let mut builder = Decimal128Builder::with_capacity(num_groups);
+            for key in groups.keys() {
+                match &key.values[col_idx] {
+                    GroupValue::Decimal128(v, _s) => builder.append_value(*v),
+                    GroupValue::Null => builder.append_null(),
+                    _ => builder.append_null(),
+                }
+            }
+            let array = builder
+                .finish()
+                .with_precision_and_scale(*precision, *scale)
+                .map_err(|e| {
+                    QueryError::Execution(format!(
+                        "Failed to set Decimal128 precision/scale: {}",
+                        e
+                    ))
+                })?;
+            Ok(Arc::new(array))
         }
         _ => Err(QueryError::NotImplemented(format!(
             "Group by type not supported: {:?}",

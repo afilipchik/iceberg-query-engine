@@ -486,7 +486,33 @@ fn coerce_arrays(left: &ArrayRef, right: &ArrayRef) -> Result<(ArrayRef, ArrayRe
         return Ok((left.clone(), right.clone()));
     }
 
-    // Numeric type coercion
+    // Special case: Decimal128 + Int/Float
+    // Cast the int/float to match the decimal's precision and scale
+    match (left_type, right_type) {
+        (DataType::Decimal128(p, s), DataType::Int64 | DataType::Int32) => {
+            // Cast right (int) to match left (decimal)
+            let right_cast = compute::cast(right, &DataType::Decimal128(*p, *s))?;
+            return Ok((left.clone(), right_cast));
+        }
+        (DataType::Int64 | DataType::Int32, DataType::Decimal128(p, s)) => {
+            // Cast left (int) to match right (decimal)
+            let left_cast = compute::cast(left, &DataType::Decimal128(*p, *s))?;
+            return Ok((left_cast, right.clone()));
+        }
+        (DataType::Decimal128(p, s), DataType::Float64 | DataType::Float32) => {
+            // Cast decimal to float for decimal/float ops
+            let left_cast = compute::cast(left, &DataType::Float64)?;
+            return Ok((left_cast, right.clone()));
+        }
+        (DataType::Float64 | DataType::Float32, DataType::Decimal128(_, _)) => {
+            // Cast decimal to float for float/decimal ops
+            let right_cast = compute::cast(right, &DataType::Float64)?;
+            return Ok((left.clone(), right_cast));
+        }
+        _ => {}
+    }
+
+    // Numeric type coercion for other types
     let common_type = coerce_numeric_types(left_type, right_type)?;
 
     let left = if left_type != &common_type {
@@ -510,6 +536,9 @@ fn coerce_numeric_types(left: &DataType, right: &DataType) -> Result<DataType> {
     match (left, right) {
         // Same types
         (a, b) if a == b => Ok(a.clone()),
+
+        // Decimal128 preservation - when one operand is decimal, keep decimal
+        (Decimal128(p, s), _) | (_, Decimal128(p, s)) => Ok(Decimal128(*p, *s)),
 
         // Float64 dominates
         (Float64, _) | (_, Float64) => Ok(Float64),

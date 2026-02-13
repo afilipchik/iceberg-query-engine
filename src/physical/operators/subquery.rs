@@ -4,7 +4,7 @@ use crate::error::{QueryError, Result};
 use crate::physical::operators::TableProvider;
 use crate::physical::PhysicalPlanner;
 use crate::planner::{Expr, LogicalPlan, ScalarValue};
-use arrow::array::{Array, ArrayRef, BooleanArray};
+use arrow::array::{Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array};
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 use std::collections::HashMap;
@@ -435,6 +435,16 @@ fn array_ref_to_scalar(array: &ArrayRef, index: usize) -> Result<ScalarValue> {
                 .downcast_ref::<Date32Array>()
                 .ok_or_else(|| QueryError::Type("Expected Date32Array".into()))?;
             ScalarValue::Date32(arr.value(index))
+        }
+        arrow::datatypes::DataType::Decimal128(_precision, scale) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| QueryError::Type("Expected Decimal128Array".into()))?;
+            let raw_value = arr.value(index);
+            // Convert to rust_decimal::Decimal using the scale
+            let decimal = rust_decimal::Decimal::from_i128_with_scale(raw_value, *scale as u32);
+            ScalarValue::Decimal128(decimal)
         }
         dt => {
             return Err(QueryError::NotImplemented(format!(
