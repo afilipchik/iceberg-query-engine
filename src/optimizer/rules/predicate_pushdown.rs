@@ -400,6 +400,26 @@ impl PredicatePushdown {
                     }))
                 }
             }
+            LogicalPlan::MultiDelimJoin(node) => {
+                // MultiDelimJoin - predicates can be pushed to left side (outer)
+                // Inner sides are EXISTS/NOT EXISTS and shouldn't receive outer predicates
+                let left = self.pushdown(&node.left, predicates)?;
+                let inner_sides: Result<Vec<_>> = node
+                    .inner_sides
+                    .iter()
+                    .map(|inner| self.pushdown(inner, vec![]).map(Arc::new))
+                    .collect();
+                Ok(LogicalPlan::MultiDelimJoin(
+                    crate::planner::MultiDelimJoinNode {
+                        left: Arc::new(left),
+                        inner_sides: inner_sides?,
+                        join_types: node.join_types.clone(),
+                        delim_columns: node.delim_columns.clone(),
+                        on: node.on.clone(),
+                        schema: node.schema.clone(),
+                    },
+                ))
+            }
         }
     }
 

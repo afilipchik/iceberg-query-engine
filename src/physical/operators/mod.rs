@@ -14,7 +14,7 @@ pub mod spillable;
 mod subquery;
 mod union;
 
-pub use delim_join::{DelimGetExec, DelimJoinExec, DelimState};
+pub use delim_join::{DelimGetExec, DelimJoinExec, DelimState, MultiDelimJoinExec};
 pub use filter::{evaluate_expr, FilterExec};
 pub use hash_agg::{AggregateExpr, HashAggregateExec};
 pub use hash_join::HashJoinExec;

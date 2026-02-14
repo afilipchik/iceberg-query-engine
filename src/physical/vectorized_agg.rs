@@ -315,7 +315,7 @@ impl VectorizedParquetSource {
     }
 
     pub fn get_work(&self) -> Option<RowGroupWorkWithStats> {
-        let mut queue = self.work_queue.lock().unwrap();
+        let mut queue = self.work_queue.lock().expect("work queue lock poisoned");
         queue.pop()
     }
 

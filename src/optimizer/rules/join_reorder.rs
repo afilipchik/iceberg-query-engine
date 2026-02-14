@@ -168,6 +168,25 @@ impl JoinReorder {
             }
 
             LogicalPlan::DelimGet(node) => Ok(LogicalPlan::DelimGet(node.clone())),
+            LogicalPlan::MultiDelimJoin(node) => {
+                // Recursively optimize the left side and all inner sides
+                let left = self.optimize(&node.left)?;
+                let inner_sides: Result<Vec<_>> = node
+                    .inner_sides
+                    .iter()
+                    .map(|inner| self.optimize(inner).map(Arc::new))
+                    .collect();
+                Ok(LogicalPlan::MultiDelimJoin(
+                    crate::planner::MultiDelimJoinNode {
+                        left: Arc::new(left),
+                        inner_sides: inner_sides?,
+                        join_types: node.join_types.clone(),
+                        delim_columns: node.delim_columns.clone(),
+                        on: node.on.clone(),
+                        schema: node.schema.clone(),
+                    },
+                ))
+            }
         }
     }
 

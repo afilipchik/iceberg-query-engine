@@ -92,6 +92,12 @@ impl ProjectionPushdown {
                 self.collect_recursive(&node.right, required);
             }
             LogicalPlan::DelimGet(_) => {}
+            LogicalPlan::MultiDelimJoin(node) => {
+                self.collect_recursive(&node.left, required);
+                for inner in &node.inner_sides {
+                    self.collect_recursive(inner, required);
+                }
+            }
         }
     }
 
@@ -513,6 +519,30 @@ impl ProjectionPushdown {
             }
 
             LogicalPlan::DelimGet(node) => Ok(LogicalPlan::DelimGet(node.clone())),
+            LogicalPlan::MultiDelimJoin(node) => {
+                // Push projections to left side (inner sides are EXISTS/NOT EXISTS)
+                let left = self.pushdown(&node.left, required)?;
+                // For inner sides, collect required columns from join conditions
+                let mut inner_required = HashSet::new();
+                for (_, r) in &node.on {
+                    self.extract_columns_from_expr(r, &mut inner_required);
+                }
+                let inner_sides: Result<Vec<_>> = node
+                    .inner_sides
+                    .iter()
+                    .map(|inner| self.pushdown(inner, &inner_required).map(Arc::new))
+                    .collect();
+                Ok(LogicalPlan::MultiDelimJoin(
+                    crate::planner::MultiDelimJoinNode {
+                        left: Arc::new(left),
+                        inner_sides: inner_sides?,
+                        join_types: node.join_types.clone(),
+                        delim_columns: node.delim_columns.clone(),
+                        on: node.on.clone(),
+                        schema: node.schema.clone(),
+                    },
+                ))
+            }
         }
     }
 }

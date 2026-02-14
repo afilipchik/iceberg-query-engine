@@ -387,6 +387,36 @@ impl PhysicalPlanner {
                         .to_string(),
                 ))
             }
+
+            LogicalPlan::MultiDelimJoin(node) => {
+                // Create physical plan for MultiDelimJoin
+                let left = self.create_physical_plan(&node.left)?;
+
+                // Create shared state for all inner sides
+                let delim_state =
+                    std::sync::Arc::new(crate::physical::operators::DelimState::new());
+
+                // Create physical operators for each inner side
+                let inner_sides: Result<Vec<_>> = node
+                    .inner_sides
+                    .iter()
+                    .map(|inner| self.create_physical_plan_with_delim_state(inner, &delim_state))
+                    .collect();
+
+                let schema = plan_schema_to_arrow(&node.schema);
+
+                let multi_delim_join = crate::physical::operators::MultiDelimJoinExec::new(
+                    left,
+                    inner_sides?,
+                    node.join_types.clone(),
+                    node.delim_columns.clone(),
+                    node.on.clone(),
+                    schema,
+                    delim_state,
+                );
+
+                Ok(Arc::new(multi_delim_join))
+            }
         }
     }
 

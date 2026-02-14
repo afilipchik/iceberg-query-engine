@@ -12,8 +12,8 @@ use crate::error::Result;
 use crate::optimizer::OptimizerRule;
 use crate::planner::{
     AggregateNode, BinaryOp, DelimGetNode, DelimJoinNode, DistinctNode, Expr, FilterNode, JoinNode,
-    JoinType, LimitNode, LogicalPlan, PlanSchema, ProjectNode, SchemaField, SortNode,
-    SubqueryAliasNode, UnionNode,
+    JoinType, LimitNode, LogicalPlan, MultiDelimJoinNode, PlanSchema, ProjectNode, SchemaField,
+    SortNode, SubqueryAliasNode, UnionNode,
 };
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -133,6 +133,108 @@ fn flatten_plan(plan: &LogicalPlan) -> Result<LogicalPlan> {
     Ok(plan)
 }
 
+/// Try to flatten multiple EXISTS/NOT EXISTS with same correlation into MultiDelimJoin
+///
+/// This is the key optimization for Q21-style queries: `EXISTS(...) AND NOT EXISTS(...)`
+/// where both subqueries correlate on the same columns from the outer query.
+fn try_flatten_multi_exists(
+    outer: &LogicalPlan,
+    subquery_exprs: &[Expr],
+    other_predicates: &[Expr],
+) -> Result<Option<LogicalPlan>> {
+    // 1. Check all are EXISTS/NOT EXISTS (not IN or scalar)
+    let mut all_exists: Vec<(bool, &LogicalPlan)> = Vec::new();
+    for expr in subquery_exprs {
+        if let Expr::Exists { subquery, negated } = expr {
+            all_exists.push((*negated, subquery.as_ref()));
+        } else {
+            return Ok(None); // Can't handle mixed types
+        }
+    }
+
+    // 2. Extract correlation from each subquery
+    let outer_columns = collect_plan_column_names(outer);
+    let mut correlations: Vec<(bool, Vec<CorrelationColumn>, LogicalPlan)> = Vec::new();
+
+    for (negated, subquery) in &all_exists {
+        let (corr_columns, decorrelated) = extract_correlation_info(subquery, &outer_columns)?;
+
+        if corr_columns.is_empty() {
+            return Ok(None); // Not correlated, can't use DelimJoin
+        }
+
+        correlations.push((*negated, corr_columns, decorrelated));
+    }
+
+    // 3. Check all share the SAME correlation columns (by outer expression)
+    let first_corr = correlations[0].1.clone();
+    for (_, corr_cols, _) in &correlations[1..] {
+        if corr_cols.len() != first_corr.len() {
+            return Ok(None);
+        }
+        // Check each correlation column matches (by comparing string representations)
+        for (a, b) in first_corr.iter().zip(corr_cols.iter()) {
+            if format!("{:?}", a.outer_expr) != format!("{:?}", b.outer_expr) {
+                return Ok(None);
+            }
+        }
+    }
+
+    // 4. Create DelimGet node
+    let delim_id = next_delim_id();
+    let delim_schema = build_delim_schema(&first_corr);
+    let delim_get = LogicalPlan::DelimGet(DelimGetNode {
+        columns: first_corr.iter().map(|c| c.outer_expr.clone()).collect(),
+        schema: delim_schema,
+        delim_id,
+    });
+
+    // 5. Rewrite each inner subquery to probe DelimGet
+    let mut inner_sides = Vec::new();
+    let mut join_types = Vec::new();
+
+    for (negated, corr_cols, decorrelated) in correlations {
+        let rewritten = rewrite_with_delim_get(&decorrelated, &corr_cols, &delim_get, false)?;
+        inner_sides.push(Arc::new(rewritten));
+        join_types.push(if negated {
+            JoinType::Anti
+        } else {
+            JoinType::Semi
+        });
+    }
+
+    // 6. Create MultiDelimJoin
+    let delim_columns: Vec<Expr> = first_corr.iter().map(|c| c.outer_expr.clone()).collect();
+    let join_on: Vec<(Expr, Expr)> = first_corr
+        .iter()
+        .map(|c| {
+            let outer_expr = c.outer_expr.clone();
+            let inner_expr = Expr::column(&c.inner_col);
+            (outer_expr, inner_expr)
+        })
+        .collect();
+
+    let multi_delim = LogicalPlan::MultiDelimJoin(MultiDelimJoinNode {
+        left: Arc::new(outer.clone()),
+        inner_sides,
+        join_types,
+        delim_columns,
+        on: join_on,
+        schema: outer.schema(),
+    });
+
+    // 7. Apply remaining predicates if any
+    if other_predicates.is_empty() {
+        Ok(Some(multi_delim))
+    } else {
+        let combined = combine_predicates(other_predicates.to_vec());
+        Ok(Some(LogicalPlan::Filter(FilterNode {
+            input: Arc::new(multi_delim),
+            predicate: combined,
+        })))
+    }
+}
+
 /// Try to flatten a filter with correlated subqueries into DelimJoin
 ///
 /// This handles:
@@ -140,10 +242,8 @@ fn flatten_plan(plan: &LogicalPlan) -> Result<LogicalPlan> {
 /// - Single IN/NOT IN subqueries → DelimJoin (Mark)
 /// - Single scalar subquery comparisons → DelimJoin (Single)
 ///
-/// For multiple subqueries (e.g., `EXISTS(...) AND NOT EXISTS(...)`), we fall
-/// back to SubqueryDecorrelation because sequential processing corrupts the schema.
-/// Each DelimJoin transforms the plan, and the next subquery's correlation detection
-/// fails because the "outer" columns are no longer available in the same form.
+/// For multiple subqueries (e.g., `EXISTS(...) AND NOT EXISTS(...)`), we use
+/// MultiDelimJoin to handle all subqueries simultaneously with a shared DelimGet.
 fn try_flatten_filter(node: &FilterNode) -> Result<Option<LogicalPlan>> {
     // Extract subquery expressions from the predicate
     let (subquery_exprs, other_predicates) = extract_subquery_predicates(&node.predicate);
@@ -152,18 +252,14 @@ fn try_flatten_filter(node: &FilterNode) -> Result<Option<LogicalPlan>> {
         return Ok(None);
     }
 
-    // For multiple subqueries, fall through to SubqueryDecorrelation.
-    // Sequential processing doesn't work because:
-    // 1. First DelimJoin has schema = outer.schema (correct for Semi/Anti)
-    // 2. Second subquery's correlation detection expects the original multi-join schema
-    // 3. But the DelimJoin doesn't expose the same columns as the original join
-    //
-    // Example: Q21 has EXISTS(l2) AND NOT EXISTS(l3) both correlating on l1.l_orderkey
-    // After flattening EXISTS(l2), the plan becomes DelimJoin(outer, inner2)
-    // The NOT EXISTS(l3) then tries to correlate on l1.l_orderkey, but l1 is no longer
-    // directly accessible - it's embedded in the DelimJoin structure.
+    // NEW: Try multi-EXISTS first using MultiDelimJoin
     if subquery_exprs.len() > 1 {
-        return Ok(None);
+        if let Some(plan) =
+            try_flatten_multi_exists(&(*node.input), &subquery_exprs, &other_predicates)?
+        {
+            return Ok(Some(plan));
+        }
+        // If multi-EXISTS doesn't apply, fall through to single subquery handling
     }
 
     let subquery_expr = &subquery_exprs[0];

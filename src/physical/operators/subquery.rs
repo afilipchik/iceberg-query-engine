@@ -4,9 +4,10 @@ use crate::error::{QueryError, Result};
 use crate::physical::operators::TableProvider;
 use crate::physical::PhysicalPlanner;
 use crate::planner::{Expr, LogicalPlan, ScalarValue};
-use arrow::array::{Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array};
+use arrow::array::{Array, ArrayRef, BooleanArray};
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -705,36 +706,32 @@ pub fn evaluate_subquery_expr(
 }
 
 /// Execute a correlated scalar subquery for each row in the batch
+/// Uses batched execution: pre-computes results for all distinct correlation values
 fn execute_correlated_scalar_subquery(
     batch: &RecordBatch,
     plan: &LogicalPlan,
     executor: &SubqueryExecutor,
 ) -> Result<ArrayRef> {
     let num_rows = batch.num_rows();
-    let mut results = Vec::with_capacity(num_rows);
-
-    // Compute plan hash once for cache key
     let plan_hash = executor.plan_hash(plan);
 
-    // For each row, we need to:
-    // 1. Extract correlation key values
-    // 2. Check cache for existing result
-    // 3. If not cached, substitute columns and execute
-    // 4. Cache the result
+    // PHASE 1: Collect all distinct correlation values from the batch
+    let mut distinct_values: std::collections::HashMap<Vec<CorrelationValue>, usize> =
+        std::collections::HashMap::new();
 
     for row in 0..num_rows {
-        // Extract correlation values for this row (used as cache key)
         let correlation_values = executor.extract_correlation_values(batch, row);
+        distinct_values.entry(correlation_values).or_insert(row);
+    }
 
-        // Check cache first
-        if let Some(SubqueryResult::Scalar(cached)) =
-            executor.get_correlated_cache(plan_hash, &correlation_values)
-        {
-            results.push(cached);
-            continue;
-        }
+    // PHASE 2: Pre-populate cache for all uncached distinct values
+    let uncached: Vec<(Vec<CorrelationValue>, usize)> = distinct_values
+        .iter()
+        .filter(|(values, _)| executor.get_correlated_cache(plan_hash, values).is_none())
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
 
-        // Cache miss - execute the subquery
+    for (correlation_values, row) in uncached {
         let substituted_plan = substitute_correlated_columns(plan, batch, row)?;
 
         let scalar = match executor.execute_scalar(&substituted_plan) {
@@ -742,20 +739,36 @@ fn execute_correlated_scalar_subquery(
             Err(_e) => crate::planner::ScalarValue::Null,
         };
 
-        // Cache the result
         executor.set_correlated_cache(
             plan_hash,
             correlation_values,
-            SubqueryResult::Scalar(scalar.clone()),
+            SubqueryResult::Scalar(scalar),
         );
-        results.push(scalar);
     }
+
+    // PHASE 3: Pure lookup per row
+    let results: Vec<ScalarValue> = (0..num_rows)
+        .map(|row| {
+            let correlation_values = executor.extract_correlation_values(batch, row);
+            executor
+                .get_correlated_cache(plan_hash, &correlation_values)
+                .and_then(|r| {
+                    if let SubqueryResult::Scalar(s) = r {
+                        Some(s)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(ScalarValue::Null)
+        })
+        .collect();
 
     // Convert results to an array
     results_array_from_scalars(&results, num_rows)
 }
 
 /// Execute a correlated EXISTS subquery for each row in the batch
+/// Uses batched execution with parallel processing for distinct correlation values
 fn execute_correlated_exists_subquery(
     batch: &RecordBatch,
     subquery: &LogicalPlan,
@@ -763,38 +776,77 @@ fn execute_correlated_exists_subquery(
     executor: &SubqueryExecutor,
 ) -> Result<ArrayRef> {
     let num_rows = batch.num_rows();
-    let mut results = Vec::with_capacity(num_rows);
-
-    // Compute plan hash once for cache key
     let plan_hash = executor.plan_hash(subquery);
 
+    // PHASE 1: Collect all distinct correlation values from the batch
+    // This maps correlation values to the first row index that has them
+    let mut distinct_values: std::collections::HashMap<Vec<CorrelationValue>, usize> =
+        std::collections::HashMap::new();
+
     for row in 0..num_rows {
-        // Extract correlation values for this row (used as cache key)
         let correlation_values = executor.extract_correlation_values(batch, row);
+        distinct_values.entry(correlation_values).or_insert(row);
+    }
 
-        // Check cache first
-        if let Some(SubqueryResult::Boolean(cached)) =
-            executor.get_correlated_cache(plan_hash, &correlation_values)
-        {
-            results.push(if negated { !cached } else { cached });
-            continue;
-        }
+    // PHASE 2: Pre-populate cache for all distinct values
+    // Check which ones are not already cached, then execute
+    let uncached: Vec<(Vec<CorrelationValue>, usize)> = distinct_values
+        .iter()
+        .filter(|(values, _)| executor.get_correlated_cache(plan_hash, values).is_none())
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
 
-        // Cache miss - execute the subquery
-        let substituted_plan = substitute_correlated_columns(subquery, batch, row)?;
+    // Execute subqueries in parallel using rayon for better performance
+    // Each execution is independent, so we can safely parallelize
+    let results: Vec<(Vec<CorrelationValue>, bool)> = uncached
+        .into_par_iter()
+        .map(|(correlation_values, row)| {
+            // Clone what we need for the closure
+            let subquery_clone = subquery.clone();
+            let batch_clone = batch.clone();
 
-        let exists = executor
-            .execute_exists(&substituted_plan)
-            .unwrap_or_default();
+            let substituted_plan =
+                substitute_correlated_columns(&subquery_clone, &batch_clone, row);
 
-        // Cache the result (before applying negation)
+            let exists = match substituted_plan {
+                Ok(plan) => executor.execute_exists(&plan).unwrap_or_default(),
+                Err(_) => false,
+            };
+
+            (correlation_values, exists)
+        })
+        .collect();
+
+    // Store all results in cache
+    for (correlation_values, exists) in results {
         executor.set_correlated_cache(
             plan_hash,
             correlation_values,
             SubqueryResult::Boolean(exists),
         );
-        results.push(if negated { !exists } else { exists });
     }
+
+    // PHASE 3: Now all results are cached - pure lookup per row
+    let results: Vec<bool> = (0..num_rows)
+        .map(|row| {
+            let correlation_values = executor.extract_correlation_values(batch, row);
+            let exists = executor
+                .get_correlated_cache(plan_hash, &correlation_values)
+                .and_then(|r| {
+                    if let SubqueryResult::Boolean(b) = r {
+                        Some(b)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(false);
+            if negated {
+                !exists
+            } else {
+                exists
+            }
+        })
+        .collect();
 
     Ok(Arc::new(BooleanArray::from(results)))
 }
@@ -1016,6 +1068,37 @@ fn substitute_columns_in_plan(
         }
 
         LogicalPlan::DelimGet(node) => Ok(LogicalPlan::DelimGet(node.clone())),
+
+        LogicalPlan::MultiDelimJoin(node) => {
+            let new_on: Vec<(Expr, Expr)> = node
+                .on
+                .iter()
+                .map(|(l, r)| {
+                    (
+                        substitute_columns_in_expr(l, column_values, local_tables),
+                        substitute_columns_in_expr(r, column_values, local_tables),
+                    )
+                })
+                .collect();
+            let new_left = substitute_columns_in_plan(&node.left, column_values, local_tables)?;
+            let new_inner_sides: Result<Vec<_>> = node
+                .inner_sides
+                .iter()
+                .map(|inner| {
+                    substitute_columns_in_plan(inner, column_values, local_tables).map(Arc::new)
+                })
+                .collect();
+            Ok(LogicalPlan::MultiDelimJoin(
+                crate::planner::MultiDelimJoinNode {
+                    left: Arc::new(new_left),
+                    inner_sides: new_inner_sides?,
+                    join_types: node.join_types.clone(),
+                    delim_columns: node.delim_columns.clone(),
+                    on: new_on,
+                    schema: node.schema.clone(),
+                },
+            ))
+        }
     }
 }
 

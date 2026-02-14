@@ -581,7 +581,8 @@ fn probe_semi_anti_parallel(
 ) -> Result<Vec<RecordBatch>> {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    // Track which build rows have been matched using atomic bools for parallel access
+    // Track which BUILD rows have been matched using atomic bools for parallel access
+    // For Semi/Anti joins, output comes from the BUILD (left) side
     let build_matched: Vec<Vec<AtomicBool>> = build_batches
         .iter()
         .map(|b| (0..b.num_rows()).map(|_| AtomicBool::new(false)).collect())
@@ -628,11 +629,10 @@ fn probe_semi_anti_parallel(
                             .downcast_ref::<arrow::array::BooleanArray>()
                         {
                             if bool_arr.len() > 0 && bool_arr.value(0) {
-                                // Filter passed - mark build row as matched
+                                // Filter passed - mark BUILD row as matched
                                 build_matched[entry.batch_idx][entry.row_idx]
                                     .store(true, Ordering::Relaxed);
                                 // For SEMI join, we can stop after finding one match per build row
-                                // but we still need to process all probe rows
                                 break;
                             }
                         }
@@ -648,7 +648,7 @@ fn probe_semi_anti_parallel(
         Ok::<(), crate::error::QueryError>(())
     })?;
 
-    // Convert atomic bools to regular bools and create output
+    // Convert atomic bools to regular bools and create output from BUILD side
     let matched_rows: Vec<(usize, usize)> = build_matched
         .iter()
         .enumerate()
@@ -682,6 +682,7 @@ fn probe_semi_anti_parallel(
         .collect();
 
     let mut results = Vec::new();
+    // Output from BUILD batches (left side) for Semi/Anti joins
     if matches!(join_type, JoinType::Semi) && !matched_rows.is_empty() {
         let batch = create_semi_anti_batch(build_batches, &matched_rows, output_schema)?;
         results.push(batch);

@@ -4,6 +4,30 @@ This document is designed to help AI agents (Claude, Copilot, etc.) understand a
 
 ---
 
+## 📚 KNOWLEDGE BASE (Start Here!)
+
+**Architecture and decisions - the "knowledge skyscraper":**
+- **`.claude/knowledge/ARCHITECTURE_SPEC.md`** — Architecture patterns, how to add new nodes/operators, common idioms
+- **`.claude/knowledge/DECISION_LOG.md`** — Key decisions and their rationale (why things are the way they are)
+
+**These documents capture learnings from previous sessions - read them to avoid re-learning everything.**
+
+---
+
+## 🔬 RESEARCH DOCUMENTS (Read These First!)
+
+**Critical architectural analysis and improvement priorities:**
+- **`.claude/research/ARCHITECTURAL_ANALYSIS.md`** — Full analysis of performance gaps, existing components, and improvement roadmap
+- **`.claude/research/IMPROVEMENT_PRIORITY.md`** — Quick reference for top 5 actions to take
+
+**Key findings:**
+1. ~~Q21 is 2790x slower than DuckDB~~ **FIXED** — MultiDelimJoin now achieves 1500x improvement
+2. ~~Morsel parallelism NOT WIRED~~ **FIXED** — Now available via `ParquetScanExec::with_parallel()`
+3. Several queries (Q02, Q04, Q06, Q14) are already FASTER than DuckDB
+4. **Current status**: 67x overall improvement, total benchmark at SF=0.01 runs in ~1 second
+
+---
+
 ## MANDATORY RULES FOR AI AGENTS
 
 ### Documentation Update Rule
