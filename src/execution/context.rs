@@ -112,6 +112,19 @@ impl ExecutionContext {
         }
     }
 
+    /// Collect table statistics from all registered table providers
+    fn collect_table_statistics(
+        &self,
+    ) -> HashMap<String, crate::physical::operators::TableStatistics> {
+        let mut stats = HashMap::new();
+        for (name, provider) in &self.tables {
+            if let Some(table_stats) = provider.statistics() {
+                stats.insert(name.clone(), table_stats);
+            }
+        }
+        stats
+    }
+
     /// Get the memory pool
     pub fn memory_pool(&self) -> &SharedMemoryPool {
         &self.memory_pool
@@ -216,9 +229,16 @@ impl ExecutionContext {
         let logical = binder.bind(&stmt)?;
         metrics.plan_time = plan_start.elapsed();
 
-        // Optimize
+        // Optimize (with table statistics for better join planning)
         let optimize_start = Instant::now();
-        let optimized = self.optimizer.optimize(logical)?;
+        let table_stats = self.collect_table_statistics();
+        let optimized = if table_stats.is_empty() {
+            self.optimizer.optimize(logical)?
+        } else {
+            // Create a temporary optimizer with stats for this query
+            let optimizer = Optimizer::new().with_table_statistics(table_stats);
+            optimizer.optimize(logical)?
+        };
         metrics.optimize_time = optimize_start.elapsed();
 
         // Physical planning with spillable operators for memory safety

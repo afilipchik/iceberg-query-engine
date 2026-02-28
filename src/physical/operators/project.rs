@@ -1,7 +1,8 @@
 //! Projection operator
 
 use crate::error::Result;
-use crate::physical::operators::filter::evaluate_expr;
+use crate::physical::operators::filter::{evaluate_expr, evaluate_expr_with_subquery};
+use crate::physical::operators::subquery::SubqueryExecutor;
 use crate::physical::{PhysicalOperator, RecordBatchStream};
 use crate::planner::Expr;
 use arrow::datatypes::{Field, Schema, SchemaRef};
@@ -12,11 +13,21 @@ use std::fmt;
 use std::sync::Arc;
 
 /// Projection execution operator
-#[derive(Debug)]
 pub struct ProjectExec {
     input: Arc<dyn PhysicalOperator>,
     exprs: Vec<Expr>,
     schema: SchemaRef,
+    /// Optional subquery executor for handling subqueries in projection expressions
+    subquery_executor: Option<SubqueryExecutor>,
+}
+
+impl fmt::Debug for ProjectExec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProjectExec")
+            .field("exprs", &self.exprs)
+            .field("has_subquery_executor", &self.subquery_executor.is_some())
+            .finish()
+    }
 }
 
 impl ProjectExec {
@@ -25,7 +36,14 @@ impl ProjectExec {
             input,
             exprs,
             schema,
+            subquery_executor: None,
         }
+    }
+
+    /// Set the subquery executor for this projection
+    pub fn with_subquery_executor(mut self, executor: SubqueryExecutor) -> Self {
+        self.subquery_executor = Some(executor);
+        self
     }
 
     pub fn try_new(input: Arc<dyn PhysicalOperator>, exprs: Vec<Expr>) -> Result<Self> {
@@ -48,6 +66,7 @@ impl ProjectExec {
             input,
             exprs,
             schema,
+            subquery_executor: None,
         })
     }
 }
@@ -66,11 +85,13 @@ impl PhysicalOperator for ProjectExec {
         let input_stream = self.input.execute(partition).await?;
         let exprs = self.exprs.clone();
         let schema = self.schema.clone();
+        let subquery_exec = self.subquery_executor.clone();
 
         let projected = input_stream.and_then(move |batch| {
             let exprs = exprs.clone();
             let schema = schema.clone();
-            async move { project_batch(&batch, &exprs, &schema) }
+            let subquery_exec = subquery_exec.clone();
+            async move { project_batch(&batch, &exprs, &schema, subquery_exec.as_ref()) }
         });
 
         Ok(Box::pin(projected))
@@ -93,10 +114,21 @@ impl fmt::Display for ProjectExec {
     }
 }
 
-fn project_batch(batch: &RecordBatch, exprs: &[Expr], schema: &SchemaRef) -> Result<RecordBatch> {
+fn project_batch(
+    batch: &RecordBatch,
+    exprs: &[Expr],
+    schema: &SchemaRef,
+    subquery_exec: Option<&SubqueryExecutor>,
+) -> Result<RecordBatch> {
     let columns: Result<Vec<_>> = exprs
         .iter()
-        .map(|expr| evaluate_expr(batch, expr))
+        .map(|expr| {
+            if subquery_exec.is_some() {
+                evaluate_expr_with_subquery(batch, expr, subquery_exec)
+            } else {
+                evaluate_expr(batch, expr)
+            }
+        })
         .collect();
 
     RecordBatch::try_new(schema.clone(), columns?).map_err(Into::into)

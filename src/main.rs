@@ -100,6 +100,14 @@ enum Commands {
         /// Number of iterations
         #[arg(short, long, default_value = "1")]
         iterations: usize,
+
+        /// Run only a specific query number (1-22)
+        #[arg(short, long)]
+        query: Option<usize>,
+
+        /// Scale factor (for Q11 threshold adjustment). Auto-detected from path if not specified.
+        #[arg(short, long)]
+        sf: Option<f64>,
     },
 
     /// Start interactive SQL shell (REPL)
@@ -320,14 +328,38 @@ async fn main() {
             }
         }
 
-        Commands::BenchmarkParquet { path, iterations } => {
-            println!("Running TPC-H benchmark from Parquet files");
+        Commands::BenchmarkParquet {
+            path,
+            iterations,
+            query,
+            sf,
+        } => {
+            // Auto-detect scale factor from path name if not specified
+            let sf = sf.unwrap_or_else(|| {
+                let path_str = path.to_string_lossy().to_lowercase();
+                if path_str.contains("10gb") || path_str.contains("sf10") {
+                    10.0
+                } else if path_str.contains("1gb") || path_str.contains("sf1") {
+                    1.0
+                } else if path_str.contains("100mb") || path_str.contains("sf0.1") {
+                    0.1
+                } else if path_str.contains("10mb") || path_str.contains("sf0.01") {
+                    0.01
+                } else if path_str.contains("1mb") || path_str.contains("sf0.001") {
+                    0.001
+                } else {
+                    1.0 // default to SF=1
+                }
+            });
+            println!("Running TPC-H benchmark from Parquet files (SF={})", sf);
             println!("Path: {}", path.display());
             println!("Iterations: {}", iterations);
             println!();
 
             let start = Instant::now();
-            let mut ctx = ExecutionContext::new();
+            // Scale memory limit with SF to avoid unnecessary spilling
+            let memory_limit = ((sf * 4.0).max(1.0) as usize) * 1024 * 1024 * 1024;
+            let mut ctx = ExecutionContext::with_memory_limit(memory_limit);
 
             // Load all TPC-H tables from Parquet files
             let tables = [
@@ -355,6 +387,17 @@ async fn main() {
                 start.elapsed()
             );
 
+            // Determine which queries to run
+            let queries: Vec<usize> = if let Some(q) = query {
+                if !(1..=22).contains(&q) {
+                    eprintln!("Invalid query number {}. Valid range: 1-22", q);
+                    std::process::exit(1);
+                }
+                vec![q]
+            } else {
+                tpch::ALL_QUERIES.to_vec()
+            };
+
             let mut total_time = std::time::Duration::ZERO;
             let mut results = Vec::new();
 
@@ -365,10 +408,10 @@ async fn main() {
 
                 let iter_start = Instant::now();
 
-                for q in tpch::ALL_QUERIES {
-                    if let Some(sql) = tpch::get_query(q) {
+                for &q in &queries {
+                    if let Some(sql) = tpch::get_query_for_sf(q, sf) {
                         let query_start = Instant::now();
-                        match ctx.sql(sql).await {
+                        match ctx.sql(&sql).await {
                             Ok(result) => {
                                 let elapsed = query_start.elapsed();
                                 println!(
