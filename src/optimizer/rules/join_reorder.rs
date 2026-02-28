@@ -214,6 +214,8 @@ impl JoinReorder {
             Expr::Column(_) | Expr::Literal(_) | Expr::Wildcard | Expr::QualifiedWildcard(_) => {
                 Ok(expr.clone())
             }
+            // Window expressions are opaque to join reordering
+            Expr::WindowFunc { .. } => Ok(expr.clone()),
         }
     }
 
@@ -383,6 +385,15 @@ impl JoinReorder {
                         schema: node.schema.clone(),
                     },
                 ))
+            }
+            LogicalPlan::Window(node) => {
+                let input = self.reorder(&node.input)?;
+                Ok(LogicalPlan::Window(crate::planner::WindowNode {
+                    input: Arc::new(input),
+                    window_exprs: node.window_exprs.clone(),
+                    output_names: node.output_names.clone(),
+                    schema: node.schema.clone(),
+                }))
             }
         }
     }

@@ -98,6 +98,31 @@ impl ProjectionPushdown {
                     self.collect_recursive(inner, required);
                 }
             }
+            LogicalPlan::Window(node) => {
+                // Extract columns from each window expression's args, partition_by, order_by.
+                // We cannot use extract_columns_from_expr directly on WindowFunc since it
+                // falls through to the _ => {} arm and doesn't recurse into sub-expressions.
+                for wf_expr in &node.window_exprs {
+                    if let Expr::WindowFunc {
+                        args,
+                        partition_by,
+                        order_by,
+                        ..
+                    } = wf_expr
+                    {
+                        for arg in args {
+                            self.extract_columns_from_expr(arg, required);
+                        }
+                        for pb in partition_by {
+                            self.extract_columns_from_expr(pb, required);
+                        }
+                        for ob in order_by {
+                            self.extract_columns_from_expr(&ob.expr, required);
+                        }
+                    }
+                }
+                self.collect_recursive(&node.input, required);
+            }
         }
     }
 
@@ -542,6 +567,16 @@ impl ProjectionPushdown {
                         schema: node.schema.clone(),
                     },
                 ))
+            }
+            LogicalPlan::Window(node) => {
+                // Window functions are opaque to projection pushdown
+                let input = self.pushdown(&node.input, required)?;
+                Ok(LogicalPlan::Window(crate::planner::WindowNode {
+                    input: Arc::new(input),
+                    window_exprs: node.window_exprs.clone(),
+                    output_names: node.output_names.clone(),
+                    schema: node.schema.clone(),
+                }))
             }
         }
     }

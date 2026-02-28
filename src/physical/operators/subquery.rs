@@ -1066,6 +1066,16 @@ fn substitute_columns_in_plan(
                 },
             ))
         }
+
+        LogicalPlan::Window(node) => {
+            let new_input = substitute_columns_in_plan(&node.input, column_values, local_tables)?;
+            Ok(LogicalPlan::Window(crate::planner::WindowNode {
+                input: Arc::new(new_input),
+                window_exprs: node.window_exprs.clone(),
+                output_names: node.output_names.clone(),
+                schema: node.schema.clone(),
+            }))
+        }
     }
 }
 

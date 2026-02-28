@@ -16,6 +16,7 @@ mod streaming_parquet_scan;
 mod subquery;
 mod union;
 pub mod vectorized_hash;
+mod window;
 
 pub use delim_join::{DelimGetExec, DelimJoinExec, DelimState, MultiDelimJoinExec};
 pub use filter::{evaluate_expr, FilterExec};
@@ -32,3 +33,4 @@ pub use spillable::{ExternalSortExec, SpillableHashAggregateExec, SpillableHashJ
 pub use streaming_parquet_scan::StreamingParquetScanExec;
 pub use subquery::{evaluate_subquery_expr, is_correlated_subquery_plan, SubqueryExecutor};
 pub use union::UnionExec;
+pub use window::WindowExec;

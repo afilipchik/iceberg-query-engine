@@ -265,6 +265,11 @@ impl CostEstimator {
                 // MultiDelimJoin - estimate based on left side (Semi/Anti preserves outer schema)
                 self.estimate_statistics(&node.left)
             }
+
+            LogicalPlan::Window(node) => {
+                // Window preserves the same number of rows as input (adds columns)
+                self.estimate_statistics(&node.input)
+            }
         }
     }
 
@@ -408,6 +413,21 @@ impl CostEstimator {
                         left_rows * num_inner * self.hash_join_probe_cost,
                         0.0,
                         left_rows * 16.0 * num_inner,
+                    )
+            }
+
+            LogicalPlan::Window(node) => {
+                // Window requires collecting and sorting all rows - O(n log n) cost
+                let input_cost = self.estimate(&node.input);
+                let input_rows = self
+                    .estimate_statistics(&node.input)
+                    .row_count
+                    .unwrap_or(self.default_row_count) as f64;
+                input_cost
+                    + Cost::new(
+                        input_rows * self.sort_cost_per_row * (input_rows.ln().max(1.0)),
+                        0.0,
+                        input_rows * 16.0,
                     )
             }
         }

@@ -5,7 +5,7 @@ use crate::execution::{ExecutionConfig, SharedMemoryPool};
 use crate::physical::operators::{
     AggregateExpr, ExternalSortExec, FilterExec, HashAggregateExec, HashJoinExec, LimitExec,
     MemoryTableExec, MorselAggregateExec, ProjectExec, SortExec, SpillableHashAggregateExec,
-    SpillableHashJoinExec, SubqueryExecutor, TableProvider, UnionExec,
+    SpillableHashJoinExec, SubqueryExecutor, TableProvider, UnionExec, WindowExec,
 };
 use crate::physical::PhysicalOperator;
 use crate::planner::{BinaryOp, Expr, JoinType, LogicalPlan, PlanSchema};
@@ -1033,6 +1033,41 @@ impl PhysicalPlanner {
                 );
 
                 Ok(Arc::new(multi_delim_join))
+            }
+
+            LogicalPlan::Window(node) => {
+                let input = self.create_physical_plan_inner(&node.input)?;
+                // Build output schema from actual (post-optimization) input schema + window columns.
+                // We cannot use node.schema here because projection pushdown may have stripped
+                // columns from the input that are no longer in the physical input schema.
+                let input_schema = input.schema();
+                let mut fields: Vec<Field> = input_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.as_ref().clone())
+                    .collect();
+                for (wf_expr, col_name) in node.window_exprs.iter().zip(node.output_names.iter()) {
+                    use crate::planner::WindowFunction;
+                    let dt = match wf_expr {
+                        Expr::WindowFunc { func, .. } => match func {
+                            WindowFunction::RowNumber
+                            | WindowFunction::Rank
+                            | WindowFunction::DenseRank
+                            | WindowFunction::Count => arrow::datatypes::DataType::Int64,
+                            _ => arrow::datatypes::DataType::Float64,
+                        },
+                        _ => arrow::datatypes::DataType::Int64,
+                    };
+                    fields.push(Field::new(col_name.as_str(), dt, true));
+                }
+                let output_schema = Arc::new(arrow::datatypes::Schema::new(fields));
+                let exec = WindowExec::new(
+                    input,
+                    node.window_exprs.clone(),
+                    node.output_names.clone(),
+                    output_schema,
+                );
+                Ok(Arc::new(exec))
             }
         }
     }

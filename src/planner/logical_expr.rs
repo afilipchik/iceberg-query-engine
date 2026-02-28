@@ -222,6 +222,44 @@ pub enum AggregateFunction {
     MinBy,
 }
 
+/// Window function type for OVER clause expressions
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum WindowFunction {
+    /// ROW_NUMBER() - sequential row number within partition
+    RowNumber,
+    /// RANK() - rank with gaps for ties
+    Rank,
+    /// DENSE_RANK() - rank without gaps for ties
+    DenseRank,
+    /// LAG(expr, offset, default) - value from previous row
+    Lag,
+    /// LEAD(expr, offset, default) - value from next row
+    Lead,
+    /// Aggregate window functions
+    Sum,
+    Min,
+    Max,
+    Avg,
+    Count,
+}
+
+impl fmt::Display for WindowFunction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WindowFunction::RowNumber => write!(f, "ROW_NUMBER"),
+            WindowFunction::Rank => write!(f, "RANK"),
+            WindowFunction::DenseRank => write!(f, "DENSE_RANK"),
+            WindowFunction::Lag => write!(f, "LAG"),
+            WindowFunction::Lead => write!(f, "LEAD"),
+            WindowFunction::Sum => write!(f, "SUM"),
+            WindowFunction::Min => write!(f, "MIN"),
+            WindowFunction::Max => write!(f, "MAX"),
+            WindowFunction::Avg => write!(f, "AVG"),
+            WindowFunction::Count => write!(f, "COUNT"),
+        }
+    }
+}
+
 impl fmt::Display for AggregateFunction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -946,6 +984,17 @@ pub enum Expr {
 
     /// Qualified wildcard (table.*)
     QualifiedWildcard(String),
+
+    /// Window function expression (e.g., ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...))
+    WindowFunc {
+        func: WindowFunction,
+        /// Function arguments (empty for ROW_NUMBER/RANK/DENSE_RANK, 1+ for LAG/LEAD/SUM/etc.)
+        args: Vec<Expr>,
+        /// PARTITION BY expressions
+        partition_by: Vec<Expr>,
+        /// ORDER BY expressions
+        order_by: Vec<SortExpr>,
+    },
 }
 
 impl Expr {
@@ -1099,6 +1148,7 @@ impl Expr {
             Expr::InSubquery { expr, .. } => format!("{} IN (subquery)", expr.output_name()),
             Expr::Wildcard => "*".to_string(),
             Expr::QualifiedWildcard(table) => format!("{}.*", table),
+            Expr::WindowFunc { func, .. } => format!("{}", func),
         }
     }
 
@@ -1579,6 +1629,28 @@ impl Expr {
             Expr::Wildcard | Expr::QualifiedWildcard(_) => Err(QueryError::Internal(
                 "Cannot determine type of wildcard".to_string(),
             )),
+            Expr::WindowFunc { func, args, .. } => match func {
+                WindowFunction::RowNumber | WindowFunction::Rank | WindowFunction::DenseRank => {
+                    Ok(ArrowDataType::Int64)
+                }
+                WindowFunction::Lag | WindowFunction::Lead => {
+                    // Return type matches the first argument's type
+                    if let Some(arg) = args.first() {
+                        arg.data_type(schema)
+                    } else {
+                        Ok(ArrowDataType::Int64)
+                    }
+                }
+                WindowFunction::Sum | WindowFunction::Avg => Ok(ArrowDataType::Float64),
+                WindowFunction::Count => Ok(ArrowDataType::Int64),
+                WindowFunction::Min | WindowFunction::Max => {
+                    if let Some(arg) = args.first() {
+                        arg.data_type(schema)
+                    } else {
+                        Ok(ArrowDataType::Float64)
+                    }
+                }
+            },
         }
     }
 
@@ -1620,6 +1692,7 @@ impl Expr {
                     || else_expr.as_ref().is_some_and(|e| e.contains_aggregate())
             }
             Expr::Alias { expr, .. } => expr.contains_aggregate(),
+            Expr::WindowFunc { .. } => false, // window funcs are not aggregates
             _ => false,
         }
     }
@@ -1725,6 +1798,26 @@ impl fmt::Display for Expr {
             Expr::Alias { expr, name } => write!(f, "{} AS {}", expr, name),
             Expr::Wildcard => write!(f, "*"),
             Expr::QualifiedWildcard(table) => write!(f, "{}.*", table),
+            Expr::WindowFunc {
+                func,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                write!(f, "{} OVER (", func)?;
+                if !partition_by.is_empty() {
+                    let pb: Vec<String> = partition_by.iter().map(|e| e.to_string()).collect();
+                    write!(f, "PARTITION BY {}", pb.join(", "))?;
+                    if !order_by.is_empty() {
+                        write!(f, " ")?;
+                    }
+                }
+                if !order_by.is_empty() {
+                    let ob: Vec<String> = order_by.iter().map(|e| format!("{}", e.expr)).collect();
+                    write!(f, "ORDER BY {}", ob.join(", "))?;
+                }
+                write!(f, ")")
+            }
         }
     }
 }

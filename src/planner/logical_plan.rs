@@ -71,6 +71,8 @@ pub enum LogicalPlan {
     DelimGet(DelimGetNode),
     /// Multi-DelimJoin - Handles multiple EXISTS/NOT EXISTS with same correlation
     MultiDelimJoin(MultiDelimJoinNode),
+    /// Window function computation (ROW_NUMBER, RANK, etc. with OVER clause)
+    Window(WindowNode),
 }
 
 impl LogicalPlan {
@@ -92,6 +94,7 @@ impl LogicalPlan {
             LogicalPlan::DelimJoin(node) => node.schema.clone(),
             LogicalPlan::DelimGet(node) => node.schema.clone(),
             LogicalPlan::MultiDelimJoin(node) => node.schema.clone(),
+            LogicalPlan::Window(node) => node.schema.clone(),
         }
     }
 
@@ -117,6 +120,7 @@ impl LogicalPlan {
                 }
                 children
             }
+            LogicalPlan::Window(node) => vec![&node.input],
         }
     }
 
@@ -199,6 +203,12 @@ impl LogicalPlan {
                     schema: node.schema.clone(),
                 })
             }
+            LogicalPlan::Window(node) => LogicalPlan::Window(WindowNode {
+                input: children.into_iter().next().unwrap(),
+                window_exprs: node.window_exprs.clone(),
+                output_names: node.output_names.clone(),
+                schema: node.schema.clone(),
+            }),
         }
     }
 
@@ -387,6 +397,10 @@ impl LogicalPlan {
                     writeln!(f, "{}  [inner side {}]", prefix, i)?;
                     inner.fmt_indent(f, indent + 2)?;
                 }
+            }
+            LogicalPlan::Window(node) => {
+                writeln!(f, "{}Window: [{}]", prefix, node.output_names.join(", "))?;
+                node.input.fmt_indent(f, indent + 1)?;
             }
         }
         Ok(())
@@ -578,6 +592,19 @@ pub struct MultiDelimJoinNode {
     /// Join conditions for each inner side (shared across all)
     pub on: Vec<(Expr, Expr)>,
     /// Output schema (same as left schema for Semi/Anti joins)
+    pub schema: PlanSchema,
+}
+
+/// Window node - computes window function results (ROW_NUMBER, RANK, etc.)
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowNode {
+    /// Input plan providing data
+    pub input: Arc<LogicalPlan>,
+    /// Window function expressions (always Expr::WindowFunc variants)
+    pub window_exprs: Vec<crate::planner::Expr>,
+    /// Output column names corresponding to each window expr
+    pub output_names: Vec<String>,
+    /// Output schema: input schema + one column per window expr
     pub schema: PlanSchema,
 }
 
