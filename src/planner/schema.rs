@@ -1,7 +1,7 @@
 //! Schema types for the query engine
 
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// A column in a schema
@@ -90,9 +90,9 @@ impl SchemaField {
 pub struct PlanSchema {
     fields: Vec<SchemaField>,
     /// Map from column name to field index (for unqualified lookups)
-    name_index: HashMap<String, Vec<usize>>,
+    name_index: BTreeMap<String, Vec<usize>>,
     /// Map from qualified name to field index
-    qualified_index: HashMap<String, usize>,
+    qualified_index: BTreeMap<String, usize>,
 }
 
 impl PartialEq for PlanSchema {
@@ -103,8 +103,8 @@ impl PartialEq for PlanSchema {
 
 impl PlanSchema {
     pub fn new(fields: Vec<SchemaField>) -> Self {
-        let mut name_index: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut qualified_index = HashMap::new();
+        let mut name_index: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        let mut qualified_index = BTreeMap::new();
 
         for (i, field) in fields.iter().enumerate() {
             name_index.entry(field.name.clone()).or_default().push(i);

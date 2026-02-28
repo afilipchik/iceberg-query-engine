@@ -118,29 +118,6 @@ fn try_decorrelate_filter(node: &FilterNode) -> Result<Option<LogicalPlan>> {
     // Check if the predicate contains a correlated subquery
     let (subquery_exprs, other_predicates) = extract_subquery_predicates(&node.predicate);
 
-    #[cfg(debug_assertions)]
-    if !subquery_exprs.is_empty() {
-        eprintln!(
-            "[DECORRELATE] Found {} subquery expressions in filter",
-            subquery_exprs.len()
-        );
-        for (i, expr) in subquery_exprs.iter().enumerate() {
-            match expr {
-                Expr::Exists { negated, .. } => {
-                    eprintln!("  [{}] {}EXISTS", i, if *negated { "NOT " } else { "" })
-                }
-                Expr::InSubquery { negated, .. } => {
-                    eprintln!("  [{}] {}IN", i, if *negated { "NOT " } else { "" })
-                }
-                Expr::ScalarSubquery(_) => eprintln!("  [{}] Scalar subquery", i),
-                Expr::BinaryExpr { op, .. } => {
-                    eprintln!("  [{}] BinaryExpr {:?} with subquery", i, op)
-                }
-                _ => eprintln!("  [{}] Other: {:?}", i, std::mem::discriminant(expr)),
-            }
-        }
-    }
-
     if subquery_exprs.is_empty() {
         return Ok(None);
     }
@@ -280,18 +257,6 @@ fn decorrelate_exists(
     let (correlation_predicates, decorrelated_subquery) =
         extract_correlation_predicates(subquery, outer)?;
 
-    #[cfg(debug_assertions)]
-    if !correlation_predicates.is_empty() {
-        eprintln!(
-            "[DECORRELATE] Found {} correlation predicates for {} EXISTS",
-            correlation_predicates.len(),
-            if negated { "NOT" } else { "" }
-        );
-        for pred in &correlation_predicates {
-            eprintln!("  - {:?} {:?} {}", pred.outer_expr, pred.op, pred.inner_col);
-        }
-    }
-
     if correlation_predicates.is_empty() {
         // Not a correlated subquery - can't decorrelate
         return Ok(None);
@@ -309,16 +274,7 @@ fn decorrelate_exists(
     // Build the equi-join conditions
     let join_on = build_join_conditions(&eq_predicates, outer, &join_right)?;
 
-    #[cfg(debug_assertions)]
-    eprintln!(
-        "[DECORRELATE] Built {} join conditions, {} non-eq predicates",
-        join_on.len(),
-        non_eq_predicates.len()
-    );
-
     if join_on.is_empty() {
-        #[cfg(debug_assertions)]
-        eprintln!("[DECORRELATE] FAILED - no equi-join conditions");
         // Couldn't build equi-join conditions
         return Ok(None);
     }
@@ -349,31 +305,6 @@ fn decorrelate_exists(
     // Build the join schema (for Semi/Anti, it's just the left schema)
     let schema = outer.schema();
 
-    #[cfg(debug_assertions)]
-    {
-        eprintln!("[DECORRELATE] Creating {} join", join_type);
-        eprintln!(
-            "[DECORRELATE] Outer schema: {:?}",
-            outer
-                .schema()
-                .fields()
-                .iter()
-                .map(|f| f.qualified_name())
-                .collect::<Vec<_>>()
-        );
-        eprintln!(
-            "[DECORRELATE] Right schema: {:?}",
-            join_right
-                .schema()
-                .fields()
-                .iter()
-                .map(|f| f.qualified_name())
-                .collect::<Vec<_>>()
-        );
-        eprintln!("[DECORRELATE] Join ON: {:?}", join_on);
-        eprintln!("[DECORRELATE] Join Filter: {:?}", join_filter);
-    }
-
     let join = LogicalPlan::Join(JoinNode {
         left: Arc::new(outer.clone()),
         right: Arc::new(join_right),
@@ -395,26 +326,8 @@ fn build_filter_expr(
     let outer_schema = outer.schema();
     let inner_schema = inner.schema();
 
-    #[cfg(debug_assertions)]
-    {
-        eprintln!(
-            "[BUILD_FILTER] Predicate: {:?} {:?} {}",
-            pred.outer_expr, pred.op, pred.inner_col
-        );
-        eprintln!(
-            "[BUILD_FILTER] Inner schema fields: {:?}",
-            inner_schema
-                .fields()
-                .iter()
-                .map(|f| f.qualified_name())
-                .collect::<Vec<_>>()
-        );
-    }
-
     // Validate outer expression
     if !expr_references_schema(&pred.outer_expr, &outer_schema) {
-        #[cfg(debug_assertions)]
-        eprintln!("[BUILD_FILTER] outer_expr doesn't reference outer schema");
         return None;
     }
 
@@ -434,12 +347,6 @@ fn build_filter_expr(
             || f.qualified_name() == *inner_col_name
     });
 
-    #[cfg(debug_assertions)]
-    eprintln!(
-        "[BUILD_FILTER] Found inner field: {:?}",
-        inner_field.map(|f| f.qualified_name())
-    );
-
     let inner_field = inner_field?;
 
     // Use the relation qualifier if available for proper column resolution
@@ -448,12 +355,6 @@ fn build_filter_expr(
     } else {
         Expr::column(&inner_field.name)
     };
-
-    #[cfg(debug_assertions)]
-    eprintln!(
-        "[BUILD_FILTER] Built filter: {:?} {:?} {:?}",
-        inner_expr, pred.op, pred.outer_expr
-    );
 
     Some(Expr::BinaryExpr {
         left: Box::new(inner_expr),
@@ -559,12 +460,6 @@ fn decorrelate_scalar_subquery(
     let (correlation_predicates, decorrelated_subquery) =
         extract_correlation_predicates(subquery, outer)?;
 
-    #[cfg(debug_assertions)]
-    eprintln!(
-        "[SCALAR_DECORR] Found {} correlation predicates",
-        correlation_predicates.len()
-    );
-
     if correlation_predicates.is_empty() {
         // Not a correlated subquery - can't decorrelate with this method
         return Ok(None);
@@ -585,23 +480,16 @@ fn decorrelate_scalar_subquery(
     let join_right =
         ensure_grouped_by_correlation(&decorrelated_subquery, &correlation_predicates)?;
 
-    #[cfg(debug_assertions)]
-    eprintln!(
-        "[SCALAR_DECORR] After ensure_grouped_by_correlation, schema: {:?}",
-        join_right
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.name.as_str())
-            .collect::<Vec<_>>()
-    );
+    // Semi-join reduction: if the outer plan has a filtered small table providing the
+    // correlation key, add a Semi Join to reduce the aggregate's input.
+    // E.g., for Q17: aggregate scans ALL lineitem (60M rows) but only ~200 filtered parts
+    // are relevant. Adding Semi Join(lineitem, Filter(part)) reduces input to ~60K rows.
+    let join_right = add_semi_join_reduction(join_right, outer, &correlation_predicates);
 
     // Build the join conditions using the updated schema
     let join_on = build_join_conditions(&correlation_predicates, outer, &join_right)?;
 
     if join_on.is_empty() {
-        #[cfg(debug_assertions)]
-        eprintln!("[SCALAR_DECORR] No join conditions built, cannot decorrelate");
         return Ok(None);
     }
 
@@ -660,12 +548,6 @@ fn decorrelate_scalar_subquery(
     join_fields.extend(wrapper_fields);
     let join_schema = PlanSchema::new(join_fields);
 
-    #[cfg(debug_assertions)]
-    eprintln!(
-        "[SCALAR_DECORR] Creating Left Join with result column '{}', original='{}'",
-        result_col_name, scalar_field.name
-    );
-
     // Create Left Join (to preserve outer rows even if subquery has no match)
     let join = LogicalPlan::Join(JoinNode {
         left: Arc::new(outer.clone()),
@@ -702,22 +584,9 @@ fn ensure_grouped_by_correlation(
     subquery: &LogicalPlan,
     correlation_predicates: &[CorrelationPredicate],
 ) -> Result<LogicalPlan> {
-    #[cfg(debug_assertions)]
-    eprintln!(
-        "[ENSURE_GROUPED] subquery type: {:?}, predicates: {:?}",
-        std::mem::discriminant(subquery),
-        correlation_predicates
-            .iter()
-            .map(|p| &p.inner_col)
-            .collect::<Vec<_>>()
-    );
-
     // Handle Project wrapping Aggregate (common pattern: SELECT expr * AGG(...))
     if let LogicalPlan::Project(proj_node) = subquery {
         if let LogicalPlan::Aggregate(_) = proj_node.input.as_ref() {
-            #[cfg(debug_assertions)]
-            eprintln!("[ENSURE_GROUPED] Found Project over Aggregate");
-
             // Recursively process the aggregate
             let new_agg = ensure_grouped_by_correlation(&proj_node.input, correlation_predicates)?;
             let new_agg_schema = new_agg.schema();
@@ -772,16 +641,6 @@ fn ensure_grouped_by_correlation(
 
             let new_schema = PlanSchema::new(new_proj_fields);
 
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "[ENSURE_GROUPED] New project schema: {:?}",
-                new_schema
-                    .fields()
-                    .iter()
-                    .map(|f| f.name.as_str())
-                    .collect::<Vec<_>>()
-            );
-
             return Ok(LogicalPlan::Project(ProjectNode {
                 input: Arc::new(new_agg),
                 exprs: new_exprs,
@@ -799,16 +658,6 @@ fn ensure_grouped_by_correlation(
         // Get the input schema once to avoid temporary lifetime issues
         let input_schema = agg_node.input.schema();
 
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[ENSURE_GROUPED] Aggregate input schema: {:?}",
-            input_schema
-                .fields()
-                .iter()
-                .map(|f| f.name.as_str())
-                .collect::<Vec<_>>()
-        );
-
         for pred in correlation_predicates {
             // Parse the inner column name to get the unqualified name
             let inner_col = &pred.inner_col;
@@ -818,12 +667,6 @@ fn ensure_grouped_by_correlation(
                 inner_col.as_str()
             };
 
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "[ENSURE_GROUPED] Looking for inner_col={}, unqualified={}",
-                inner_col, unqualified_name
-            );
-
             // Find the actual column in the input schema
             let input_field = input_schema.fields().iter().find(|f| {
                 f.name == *inner_col
@@ -831,12 +674,6 @@ fn ensure_grouped_by_correlation(
                     || inner_col.ends_with(&format!(".{}", f.name))
                     || f.name.ends_with(&format!(".{}", unqualified_name))
             });
-
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "[ENSURE_GROUPED] Found field: {:?}",
-                input_field.map(|f| f.name.as_str())
-            );
 
             if let Some(field) = input_field {
                 // Use the actual field name from the input schema
@@ -882,6 +719,221 @@ fn ensure_grouped_by_correlation(
     Ok(subquery.clone())
 }
 
+/// Add a semi-join to the aggregate's input to reduce the number of rows processed.
+/// This optimization detects when the outer plan has a filtered dimension table providing
+/// the correlation key, and adds a Semi Join to the aggregate's input to filter it down.
+fn add_semi_join_reduction(
+    agg_plan: LogicalPlan,
+    outer: &LogicalPlan,
+    correlation_predicates: &[CorrelationPredicate],
+) -> LogicalPlan {
+    // Unwrap Project wrapping Aggregate (common pattern: SELECT expr * AGG(...))
+    if let LogicalPlan::Project(proj) = &agg_plan {
+        if let LogicalPlan::Aggregate(_) = proj.input.as_ref() {
+            let new_inner =
+                add_semi_join_reduction((*proj.input).clone(), outer, correlation_predicates);
+            return LogicalPlan::Project(ProjectNode {
+                input: Arc::new(new_inner),
+                exprs: proj.exprs.clone(),
+                schema: proj.schema.clone(),
+            });
+        }
+        return agg_plan;
+    }
+
+    let agg = match &agg_plan {
+        LogicalPlan::Aggregate(a) => a,
+        _ => return agg_plan,
+    };
+
+    // Collect semi-join conditions and find a common source from the outer plan
+    let mut semi_on = Vec::new();
+    let mut source: Option<LogicalPlan> = None;
+
+    for pred in correlation_predicates {
+        // Get the outer column name (unqualified)
+        let outer_col_name = match &pred.outer_expr {
+            Expr::Column(c) => c.name.clone(),
+            _ => {
+                continue;
+            }
+        };
+
+        // Find the filtered scan/sub-plan in outer that provides this column
+        let found_source = match extract_correlation_source(outer, &outer_col_name) {
+            Some(s) if has_selectivity(&s) => s,
+            _ => continue,
+        };
+
+        // Find inner column in aggregate input schema
+        let inner_col = &pred.inner_col;
+        let unq_inner = if let Some(dot) = inner_col.rfind('.') {
+            &inner_col[dot + 1..]
+        } else {
+            inner_col.as_str()
+        };
+
+        let agg_input_schema = agg.input.schema();
+        let inner_field = agg_input_schema.fields().iter().find(|f| {
+            f.name == *inner_col
+                || f.name == unq_inner
+                || inner_col.ends_with(&format!(".{}", f.name))
+                || f.name.ends_with(&format!(".{}", unq_inner))
+        });
+
+        // Find outer column in source schema
+        let source_schema = found_source.schema();
+        let outer_field = source_schema.fields().iter().find(|f| {
+            f.name == outer_col_name
+                || outer_col_name.ends_with(&format!(".{}", f.name))
+                || f.name.ends_with(&format!(".{}", outer_col_name))
+        });
+
+        if let (Some(inf), Some(outf)) = (inner_field, outer_field) {
+            semi_on.push((Expr::column(&inf.name), Expr::column(&outf.name)));
+            if source.is_none() {
+                source = Some(found_source);
+            }
+        }
+    }
+
+    if let (Some(source_plan), true) = (source, !semi_on.is_empty()) {
+        // Use Inner Join instead of Semi Join because the physical planner's
+        // should_swap logic correctly builds from the smaller (right) side.
+        // The aggregate above ignores the extra columns from the source table.
+        let agg_input_schema = agg.input.schema();
+        let source_schema = source_plan.schema();
+        let mut join_fields = agg_input_schema.fields().to_vec();
+        join_fields.extend(source_schema.fields().iter().cloned());
+        let join_schema = PlanSchema::new(join_fields);
+
+        let inner_join = LogicalPlan::Join(JoinNode {
+            left: agg.input.clone(),
+            right: Arc::new(source_plan),
+            join_type: JoinType::Inner,
+            on: semi_on,
+            filter: None,
+            schema: join_schema,
+        });
+
+        return LogicalPlan::Aggregate(AggregateNode {
+            input: Arc::new(inner_join),
+            group_by: agg.group_by.clone(),
+            aggregates: agg.aggregates.clone(),
+            schema: agg.schema.clone(),
+        });
+    }
+
+    agg_plan
+}
+
+/// Extract a sub-plan from the outer plan that produces the given correlation column.
+/// Walks the plan tree to find the scan containing the column, preserving any
+/// filters and semi-joins along the path (these reduce cardinality).
+fn extract_correlation_source(plan: &LogicalPlan, col_name: &str) -> Option<LogicalPlan> {
+    match plan {
+        LogicalPlan::Scan(scan) => {
+            let has_col = scan.schema.fields().iter().any(|f| {
+                f.name == col_name
+                    || f.name.ends_with(&format!(".{}", col_name))
+                    || col_name.ends_with(&format!(".{}", f.name))
+            });
+            if has_col {
+                Some(plan.clone())
+            } else {
+                None
+            }
+        }
+        LogicalPlan::Filter(f) => {
+            let inner = extract_correlation_source(&f.input, col_name)?;
+            // Keep filter only if all its column references exist in the inner schema
+            let inner_schema = inner.schema();
+            if expr_columns_in_schema(&f.predicate, &inner_schema) {
+                Some(LogicalPlan::Filter(FilterNode {
+                    input: Arc::new(inner),
+                    predicate: f.predicate.clone(),
+                }))
+            } else {
+                Some(inner)
+            }
+        }
+        LogicalPlan::Join(j) => {
+            let in_left = extract_correlation_source(&j.left, col_name);
+            let in_right = extract_correlation_source(&j.right, col_name);
+
+            match (in_left, in_right) {
+                (Some(source), None) => {
+                    // Column is on left side. If Semi/Anti join, preserve it as filter.
+                    if matches!(j.join_type, JoinType::Semi | JoinType::Anti) {
+                        let source_schema = source.schema();
+                        Some(LogicalPlan::Join(JoinNode {
+                            left: Arc::new(source),
+                            right: j.right.clone(),
+                            join_type: j.join_type,
+                            on: j.on.clone(),
+                            filter: j.filter.clone(),
+                            schema: source_schema,
+                        }))
+                    } else {
+                        Some(source)
+                    }
+                }
+                (None, Some(source)) => Some(source),
+                _ => None,
+            }
+        }
+        LogicalPlan::SubqueryAlias(s) => extract_correlation_source(&s.input, col_name),
+        LogicalPlan::Project(p) => extract_correlation_source(&p.input, col_name),
+        _ => None,
+    }
+}
+
+/// Check if all column references in an expression exist in the given schema
+fn expr_columns_in_schema(expr: &Expr, schema: &PlanSchema) -> bool {
+    match expr {
+        Expr::Column(c) => {
+            let name = &c.name;
+            schema.fields().iter().any(|f| {
+                f.name == *name
+                    || f.name.ends_with(&format!(".{}", name))
+                    || name.ends_with(&format!(".{}", f.name))
+            })
+        }
+        Expr::BinaryExpr { left, right, .. } => {
+            expr_columns_in_schema(left, schema) && expr_columns_in_schema(right, schema)
+        }
+        Expr::UnaryExpr { expr, .. } => expr_columns_in_schema(expr, schema),
+        Expr::Literal(_) => true,
+        Expr::Cast { expr, .. } | Expr::Alias { expr, .. } => expr_columns_in_schema(expr, schema),
+        Expr::InList { expr, list, .. } => {
+            expr_columns_in_schema(expr, schema)
+                && list.iter().all(|l| expr_columns_in_schema(l, schema))
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_columns_in_schema(expr, schema)
+                && expr_columns_in_schema(low, schema)
+                && expr_columns_in_schema(high, schema)
+        }
+        Expr::ScalarFunc { args, .. } => args.iter().all(|a| expr_columns_in_schema(a, schema)),
+        _ => false, // Conservative: don't include filter for unknown expressions
+    }
+}
+
+/// Check if a plan has any selectivity (filters or semi/anti joins that reduce cardinality)
+fn has_selectivity(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Scan(s) => s.filter.is_some(), // Scan-level pushed-down filter
+        LogicalPlan::Filter(_) => true,
+        LogicalPlan::Join(j) if matches!(j.join_type, JoinType::Semi | JoinType::Anti) => true,
+        LogicalPlan::Join(j) => has_selectivity(&j.left) || has_selectivity(&j.right),
+        LogicalPlan::Project(p) => has_selectivity(&p.input),
+        LogicalPlan::SubqueryAlias(s) => has_selectivity(&s.input),
+        _ => false,
+    }
+}
+
 /// A correlation predicate extracted from a subquery
 #[derive(Debug, Clone)]
 struct CorrelationPredicate {
@@ -899,16 +951,6 @@ fn extract_correlation_predicates(
     // Use collect_plan_column_names for both to include table aliases
     let outer_columns = collect_plan_column_names(outer);
     let inner_columns = collect_plan_column_names(subquery);
-
-    #[cfg(debug_assertions)]
-    {
-        let mut outer_list: Vec<_> = outer_columns.iter().cloned().collect();
-        outer_list.sort();
-        let mut inner_list: Vec<_> = inner_columns.iter().cloned().collect();
-        inner_list.sort();
-        eprintln!("[DECORRELATE] Outer columns: {:?}", outer_list);
-        eprintln!("[DECORRELATE] Inner columns: {:?}", inner_list);
-    }
 
     let mut correlation_predicates = Vec::new();
     let decorrelated = extract_from_plan(
@@ -1135,11 +1177,6 @@ fn try_extract_correlation(
 
     if left_exclusively_outer && right_has_inner {
         if let Some(inner_col) = get_column_name(right) {
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "[TRY_EXTRACT] Case 1: left exclusively outer, right has inner: {:?} {:?} {}",
-                left, op, inner_col
-            );
             return Some(CorrelationPredicate {
                 outer_expr: left.clone(),
                 inner_col,
@@ -1154,13 +1191,6 @@ fn try_extract_correlation(
 
     if right_exclusively_outer && left_has_inner {
         if let Some(inner_col) = get_column_name(left) {
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "[TRY_EXTRACT] Case 2: right exclusively outer, left has inner: {} {:?} {:?}",
-                inner_col,
-                flip_op(op),
-                right
-            );
             return Some(CorrelationPredicate {
                 outer_expr: right.clone(),
                 inner_col,
@@ -1175,26 +1205,12 @@ fn try_extract_correlation(
 
     if left_only_outer && right_only_inner {
         if let Some(inner_col) = get_column_name(right) {
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "[TRY_EXTRACT] Case 3: standard - left only outer, right only inner: {:?} {:?} {}",
-                left, op, inner_col
-            );
             return Some(CorrelationPredicate {
                 outer_expr: left.clone(),
                 inner_col,
                 op,
             });
         }
-    }
-
-    #[cfg(debug_assertions)]
-    {
-        eprintln!(
-            "[TRY_EXTRACT] No match: left_in_outer={}, left_in_inner={}, right_in_outer={}, right_in_inner={}",
-            left_in_outer, left_in_inner, right_in_outer, right_in_inner
-        );
-        eprintln!("  left={:?}, right={:?}", left, right);
     }
 
     None
@@ -1260,18 +1276,6 @@ fn build_join_conditions(
     let outer_schema = outer.schema();
     let inner_schema = inner.schema();
 
-    #[cfg(debug_assertions)]
-    {
-        eprintln!(
-            "[BUILD_JOIN_COND] Inner schema fields: {:?}",
-            inner_schema
-                .fields()
-                .iter()
-                .map(|f| f.qualified_name())
-                .collect::<Vec<_>>()
-        );
-    }
-
     for pred in predicates {
         // Only support equality for now
         if pred.op != BinaryOp::Eq {
@@ -1280,11 +1284,6 @@ fn build_join_conditions(
 
         // Validate that outer_expr references a column in outer schema
         if !expr_references_schema(&pred.outer_expr, &outer_schema) {
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "[BUILD_JOIN_COND] outer_expr {:?} doesn't reference outer schema",
-                pred.outer_expr
-            );
             continue;
         }
 
@@ -1306,11 +1305,6 @@ fn build_join_conditions(
         });
 
         if inner_field.is_none() {
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "[BUILD_JOIN_COND] inner column {} not found in schema",
-                inner_col_name
-            );
             continue;
         }
 
@@ -1322,12 +1316,6 @@ fn build_join_conditions(
         } else {
             Expr::column(&inner_field.name)
         };
-
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[BUILD_JOIN_COND] Created condition: {:?} = {:?}",
-            pred.outer_expr, inner_expr
-        );
 
         conditions.push((pred.outer_expr.clone(), inner_expr));
     }

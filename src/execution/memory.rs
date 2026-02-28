@@ -179,7 +179,11 @@ impl SpillMetrics {
     }
 }
 
-/// Configuration for query execution
+/// Configuration for query execution.
+///
+/// Spillable operators (SpillableHashJoinExec, SpillableHashAggregateExec, ExternalSortExec)
+/// are always active. The engine is memory-safe by default — being slow on larger-than-memory
+/// datasets is acceptable, but OOM is not.
 #[derive(Debug, Clone)]
 pub struct ExecutionConfig {
     /// Maximum memory for query execution (bytes)
@@ -203,9 +207,9 @@ pub struct ExecutionConfig {
     /// Memory threshold (0.0-1.0) at which to start spilling
     pub spill_threshold: f64,
 
-    /// Enable spillable operators for larger-than-memory datasets
-    /// When false (default), uses regular operators with memory limit checks
-    pub enable_spilling: bool,
+    /// Enable morsel-driven parallel execution for aggregations over Parquet
+    /// When true (default), uses optimized parallel aggregation for Parquet scans
+    pub enable_morsel_execution: bool,
 }
 
 impl Default for ExecutionConfig {
@@ -219,8 +223,8 @@ impl Default for ExecutionConfig {
             prefer_sort_merge_join: false,
             enable_stats_pruning: true,
             spill_threshold: 0.8,
-            // Spillable operators disabled by default until bugs are fixed
-            enable_spilling: false,
+            // Morsel execution enabled by default for better performance
+            enable_morsel_execution: true,
         }
     }
 }
@@ -272,9 +276,9 @@ impl ExecutionConfig {
         self
     }
 
-    /// Enable spillable operators for larger-than-memory datasets
-    pub fn with_spilling(mut self, enabled: bool) -> Self {
-        self.enable_spilling = enabled;
+    /// Enable morsel-driven parallel execution for aggregations over Parquet
+    pub fn with_morsel_execution(mut self, enabled: bool) -> Self {
+        self.enable_morsel_execution = enabled;
         self
     }
 

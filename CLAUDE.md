@@ -30,6 +30,12 @@ This document is designed to help AI agents (Claude, Copilot, etc.) understand a
 
 ## MANDATORY RULES FOR AI AGENTS
 
+### File and Directory Rules
+
+1. **DO NOT use /tmp** - Use the scratchpad directory provided by the system instead
+2. **DO NOT exit the repository** unless absolutely necessary - stay within the project directory
+3. **All file edits in this project are pre-approved** - do not ask for permission to edit files
+
 ### Documentation Update Rule
 
 **ON EVERY CONTEXT COMPACTION, THIS DOCUMENTATION MUST BE UPDATED.**
@@ -56,6 +62,50 @@ Before committing any code changes:
 3. Only then proceed with the commit
 
 This ensures consistent code formatting across the codebase.
+
+### Memory Safety Rule
+
+**THE ENGINE MUST BE MEMORY-SAFE BY DEFAULT. OOM IS NEVER ACCEPTABLE.**
+
+- Spillable operators (SpillableHashJoinExec, SpillableHashAggregateExec, ExternalSortExec) are ALWAYS used
+- There is no flag or parameter to "enable" safe memory behavior — it is the default and only mode
+- Being slow on larger-than-memory datasets is acceptable; crashing with OOM is not
+- When adding new operators, they MUST handle memory limits and spill to disk when needed
+- Never add a parameter that lets users opt out of memory safety
+
+### Benchmark Timeout Rule
+
+**SET BENCHMARK TIMEOUT TO 10x DUCKDB EXECUTION TIME.**
+
+When running benchmarks:
+1. Use timeout = 10 × DuckDB time for that query
+2. If the query cannot complete within 10x DuckDB time, it **FAILS**
+3. Reference DuckDB times from the benchmark table below
+
+| Query | DuckDB Time (SF=10) | Timeout |
+|-------|---------------------|---------|
+| Q01 | 89ms | 890ms |
+| Q02 | 13ms | 130ms |
+| Q03 | 84ms | 840ms |
+| Q04 | 80ms | 800ms |
+| Q05 | 49ms | 490ms |
+| Q06 | 24ms | 240ms |
+| Q07 | 61ms | 610ms |
+| Q08 | 76ms | 760ms |
+| Q09 | 8ms | 80ms |
+| Q10 | 98ms | 980ms |
+| Q11 | 10ms | 100ms |
+| Q12 | 66ms | 660ms |
+| Q13 | 131ms | 1.3s |
+| Q14 | 35ms | 350ms |
+| Q15 | 33ms | 330ms |
+| Q16 | 40ms | 400ms |
+| Q17 | 75ms | 750ms |
+| Q18 | 283ms | 2.8s |
+| Q19 | 87ms | 870ms |
+| Q20 | 161ms | 1.6s |
+| Q21 | 201ms | 2s |
+| Q22 | 36ms | 360ms |
 
 ---
 
@@ -543,6 +593,7 @@ Located in `tests/` directory, test full query execution paths.
 `src/tpch/` contains all 22 TPC-H queries for regression testing.
 
 **Note on TPC-H Query Adaptations**: Some queries were modified to work with the generated test data:
+- Q09: Uses `'Part 1%'` instead of `'%green%'` (part names are "Part N" format)
 - Q20: Uses `'Part 1%'` instead of `'forest%'` (part names are "Part N" format)
 - Q22: Uses 2-digit phone codes `('13', '31', '23', ...)` instead of single-digit codes (phone format is 10-33-XXX-XXX-XXXX)
 
@@ -725,6 +776,25 @@ Based on the codebase structure, these appear to be planned but not fully implem
 
 ## Recently Implemented Features
 
+- **Morsel-Driven Aggregation Integration + Vectorization** (2026-01-29)
+  - Integrated morsel-driven parallel aggregation into the query engine
+  - New `MorselAggregateExec` physical operator in `src/physical/operators/morsel_agg.rs`
+  - Automatic routing: PhysicalPlanner detects aggregation over Parquet tables
+  - Uses existing morsel infrastructure from `src/physical/morsel.rs` and `src/physical/morsel_agg.rs`
+  - Configuration flag: `ExecutionConfig::enable_morsel_execution` (default: true)
+  - Extended `TableProvider` trait with `parquet_files()` method for file discovery
+  - **Optimizations in `morsel_agg.rs`:**
+    - `AggregationState` with dual-mode: perfect hash (fixed array) + HashMap fallback
+    - `TypedArrayAccessor` for pre-downcast typed array access
+    - `raw_key()` u64 key extraction without ScalarValue allocation
+    - `update_f64()` / `update_i64()` direct primitive accumulator updates
+    - f64 fast path for all-float aggregate inputs
+  - **TPC-H Q1 (SF=10) Performance:**
+    - Standard HashAggregateExec: 1830ms
+    - With morsel + vectorization: **502ms (3.6x faster)**
+    - vs DuckDB (89ms): 5.6x (within 10x target)
+    - Remaining gap to DuckDB is primarily Parquet I/O (custom SIMD reader)
+
 - **DelimJoin Infrastructure** (2026-01-27)
   - DuckDB-style deduplication join for efficient correlated subquery execution
   - New logical plan nodes: `DelimJoinNode`, `DelimGetNode` in `src/planner/logical_plan.rs`
@@ -889,7 +959,7 @@ Based on the codebase structure, these appear to be planned but not fully implem
   - Column projection pushdown
   - CLI commands: `load-parquet`, `benchmark-parquet`, `generate-parquet`
 
-- **Larger-Than-Memory Dataset Support** (NEW)
+- **Larger-Than-Memory Dataset Support** (Memory-safe by default)
   - Memory pool infrastructure in `src/execution/memory.rs`
     - `MemoryPool` with RAII-based `MemoryReservation` tracking
     - `MemoryConsumer` trait for operators that can spill to disk
@@ -902,7 +972,7 @@ Based on the codebase structure, these appear to be planned but not fully implem
     - File-level min/max statistics filtering
     - Partition pruning support
     - Streaming data file reading via Parquet
-  - Spillable operators in `src/physical/operators/spillable.rs`
+  - Spillable operators are always active (no opt-in flag) in `src/physical/operators/spillable.rs`
     - `SpillableHashJoinExec`: Partitioned hash join that spills to disk
     - `SpillableHashAggregateExec`: Hash aggregation with spill support
     - `ExternalSortExec`: External merge sort for large datasets
@@ -932,6 +1002,8 @@ Based on the codebase structure, these appear to be planned but not fully implem
 | Predicate pushdown | `src/optimizer/rules/predicate_pushdown.rs` |
 | Projection pushdown | `src/optimizer/rules/projection_pushdown.rs` |
 | Physical execution | `src/physical/operators/*.rs` |
+| Morsel aggregation operator | `src/physical/operators/morsel_agg.rs` |
+| Morsel framework | `src/physical/morsel.rs`, `src/physical/morsel_agg.rs` |
 | Subquery execution | `src/physical/operators/subquery.rs` |
 | DelimJoin operators | `src/physical/operators/delim_join.rs` |
 | Flatten dependent join rule | `src/optimizer/rules/flatten_dependent_join.rs` |

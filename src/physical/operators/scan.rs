@@ -7,7 +7,17 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use futures::stream;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Table statistics from a data source
+#[derive(Debug, Clone)]
+pub struct TableStatistics {
+    /// Exact row count from metadata
+    pub row_count: usize,
+    /// Total size in bytes (approximate)
+    pub total_byte_size: u64,
+}
 
 /// Table provider trait for accessing table data
 pub trait TableProvider: Send + Sync + fmt::Debug {
@@ -16,6 +26,28 @@ pub trait TableProvider: Send + Sync + fmt::Debug {
 
     /// Get all batches from the table
     fn scan(&self, projection: Option<&[usize]>) -> Result<Vec<RecordBatch>>;
+
+    /// Scan with an optional filter predicate for row group pruning.
+    /// Default implementation ignores the filter and delegates to `scan()`.
+    fn scan_with_filter(
+        &self,
+        projection: Option<&[usize]>,
+        _filter: Option<&crate::planner::Expr>,
+    ) -> Result<Vec<RecordBatch>> {
+        self.scan(projection)
+    }
+
+    /// Get table-level statistics (row count, byte size).
+    /// Returns None if statistics are not available.
+    fn statistics(&self) -> Option<TableStatistics> {
+        None
+    }
+
+    /// Get Parquet file paths if this is a Parquet-based table
+    /// Returns None for non-Parquet tables (e.g., MemoryTable)
+    fn parquet_files(&self) -> Option<Vec<PathBuf>> {
+        None
+    }
 }
 
 /// In-memory table provider
@@ -186,7 +218,23 @@ impl PhysicalOperator for MemoryTableExec {
                     RecordBatch::try_new(self.schema.clone(), columns).map_err(Into::into)
                 })
                 .collect::<Result<Vec<_>>>()?,
-            None => partition_batches,
+            None => {
+                // Re-wrap batches with the logical schema to preserve qualified names
+                // (e.g., "n1.n_name" vs "n2.n_name" for self-joins)
+                partition_batches
+                    .into_iter()
+                    .map(|batch| {
+                        if batch.schema() != self.schema
+                            && batch.num_columns() == self.schema.fields().len()
+                        {
+                            RecordBatch::try_new(self.schema.clone(), batch.columns().to_vec())
+                                .map_err(Into::into)
+                        } else {
+                            Ok(batch)
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
         };
 
         let stream = stream::iter(batches.into_iter().map(Ok));

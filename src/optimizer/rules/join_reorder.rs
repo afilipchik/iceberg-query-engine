@@ -6,12 +6,36 @@
 
 use crate::error::Result;
 use crate::optimizer::OptimizerRule;
+use crate::physical::operators::TableStatistics;
 use crate::planner::{BinaryOp, Expr, JoinNode, JoinType, LogicalPlan};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Join reordering optimization rule
-pub struct JoinReorder;
+pub struct JoinReorder {
+    /// Table statistics for statistics-based join ordering
+    table_stats: HashMap<String, TableStatistics>,
+}
+
+impl JoinReorder {
+    /// Create a new JoinReorder rule without statistics (uses heuristics)
+    pub fn new() -> Self {
+        Self {
+            table_stats: HashMap::new(),
+        }
+    }
+
+    /// Create a new JoinReorder rule with table statistics
+    pub fn with_table_statistics(stats: HashMap<String, TableStatistics>) -> Self {
+        Self { table_stats: stats }
+    }
+}
+
+impl Default for JoinReorder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl OptimizerRule for JoinReorder {
     fn name(&self) -> &str {
@@ -31,8 +55,6 @@ struct JoinRelation {
     name: String,
     /// All column names available from this relation
     columns: HashSet<String>,
-    /// Estimated row count for this relation
-    estimated_rows: usize,
 }
 
 /// Represents a join edge in the graph
@@ -46,6 +68,160 @@ struct JoinEdge {
 }
 
 impl JoinReorder {
+    /// Recursively reorder subquery plans inside an expression.
+    /// This ensures cross joins within scalar subqueries, EXISTS, and IN subqueries
+    /// are also optimized.
+    fn reorder_expr(&self, expr: &Expr) -> Result<Expr> {
+        match expr {
+            Expr::ScalarSubquery(subquery) => {
+                let reordered = self.reorder(subquery)?;
+                Ok(Expr::ScalarSubquery(Arc::new(reordered)))
+            }
+            Expr::Exists { subquery, negated } => {
+                let reordered = self.reorder(subquery)?;
+                Ok(Expr::Exists {
+                    subquery: Arc::new(reordered),
+                    negated: *negated,
+                })
+            }
+            Expr::InSubquery {
+                expr: inner_expr,
+                subquery,
+                negated,
+            } => {
+                let reordered_expr = self.reorder_expr(inner_expr)?;
+                let reordered_plan = self.reorder(subquery)?;
+                Ok(Expr::InSubquery {
+                    expr: Box::new(reordered_expr),
+                    subquery: Arc::new(reordered_plan),
+                    negated: *negated,
+                })
+            }
+            Expr::BinaryExpr { left, op, right } => {
+                let new_left = self.reorder_expr(left)?;
+                let new_right = self.reorder_expr(right)?;
+                Ok(Expr::BinaryExpr {
+                    left: Box::new(new_left),
+                    op: *op,
+                    right: Box::new(new_right),
+                })
+            }
+            Expr::UnaryExpr { op, expr: inner } => {
+                let new_inner = self.reorder_expr(inner)?;
+                Ok(Expr::UnaryExpr {
+                    op: *op,
+                    expr: Box::new(new_inner),
+                })
+            }
+            Expr::Alias { expr: inner, name } => {
+                let new_inner = self.reorder_expr(inner)?;
+                Ok(Expr::Alias {
+                    expr: Box::new(new_inner),
+                    name: name.clone(),
+                })
+            }
+            Expr::Cast {
+                expr: inner,
+                data_type,
+            } => {
+                let new_inner = self.reorder_expr(inner)?;
+                Ok(Expr::Cast {
+                    expr: Box::new(new_inner),
+                    data_type: data_type.clone(),
+                })
+            }
+            Expr::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
+                let new_operand = operand
+                    .as_ref()
+                    .map(|e| self.reorder_expr(e).map(Box::new))
+                    .transpose()?;
+                let new_when_then = when_then
+                    .iter()
+                    .map(|(w, t)| Ok((self.reorder_expr(w)?, self.reorder_expr(t)?)))
+                    .collect::<Result<Vec<_>>>()?;
+                let new_else = else_expr
+                    .as_ref()
+                    .map(|e| self.reorder_expr(e).map(Box::new))
+                    .transpose()?;
+                Ok(Expr::Case {
+                    operand: new_operand,
+                    when_then: new_when_then,
+                    else_expr: new_else,
+                })
+            }
+            Expr::ScalarFunc { func, args } => {
+                let new_args = args
+                    .iter()
+                    .map(|a| self.reorder_expr(a))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Expr::ScalarFunc {
+                    func: func.clone(),
+                    args: new_args,
+                })
+            }
+            Expr::Aggregate {
+                func,
+                args,
+                distinct,
+            } => {
+                let new_args = args
+                    .iter()
+                    .map(|a| self.reorder_expr(a))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Expr::Aggregate {
+                    func: func.clone(),
+                    args: new_args,
+                    distinct: *distinct,
+                })
+            }
+            Expr::InList {
+                expr: inner,
+                list,
+                negated,
+            } => {
+                let new_inner = self.reorder_expr(inner)?;
+                let new_list = list
+                    .iter()
+                    .map(|e| self.reorder_expr(e))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Expr::InList {
+                    expr: Box::new(new_inner),
+                    list: new_list,
+                    negated: *negated,
+                })
+            }
+            Expr::Between {
+                expr: inner,
+                low,
+                high,
+                negated,
+            } => {
+                let new_inner = self.reorder_expr(inner)?;
+                let new_low = self.reorder_expr(low)?;
+                let new_high = self.reorder_expr(high)?;
+                Ok(Expr::Between {
+                    expr: Box::new(new_inner),
+                    low: Box::new(new_low),
+                    high: Box::new(new_high),
+                    negated: *negated,
+                })
+            }
+            // Leaf expressions — no subqueries possible
+            Expr::Column(_) | Expr::Literal(_) | Expr::Wildcard | Expr::QualifiedWildcard(_) => {
+                Ok(expr.clone())
+            }
+        }
+    }
+
+    /// Reorder expressions in a vec, recursing into subqueries
+    fn reorder_exprs(&self, exprs: &[Expr]) -> Result<Vec<Expr>> {
+        exprs.iter().map(|e| self.reorder_expr(e)).collect()
+    }
+
     fn reorder(&self, plan: &LogicalPlan) -> Result<LogicalPlan> {
         match plan {
             LogicalPlan::Filter(node) => {
@@ -55,22 +231,41 @@ impl JoinReorder {
                     return self.reorder_filter_with_join(node);
                 }
                 let input = self.reorder(&node.input)?;
+                let predicate = self.reorder_expr(&node.predicate)?;
                 Ok(LogicalPlan::Filter(crate::planner::FilterNode {
                     input: Arc::new(input),
-                    predicate: node.predicate.clone(),
+                    predicate,
                 }))
             }
 
             LogicalPlan::Project(node) => {
                 let input = self.reorder(&node.input)?;
+                let exprs = self.reorder_exprs(&node.exprs)?;
                 Ok(LogicalPlan::Project(crate::planner::ProjectNode {
                     input: Arc::new(input),
-                    exprs: node.exprs.clone(),
+                    exprs,
                     schema: node.schema.clone(),
                 }))
             }
 
             LogicalPlan::Join(node) => {
+                // Semi/Anti/Single/Mark: preserve structure, reorder children independently
+                if matches!(
+                    node.join_type,
+                    JoinType::Semi | JoinType::Anti | JoinType::Single | JoinType::Mark
+                ) {
+                    let left = self.reorder(&node.left)?;
+                    let right = self.reorder(&node.right)?;
+                    return Ok(LogicalPlan::Join(JoinNode {
+                        left: Arc::new(left),
+                        right: Arc::new(right),
+                        join_type: node.join_type,
+                        on: node.on.clone(),
+                        filter: node.filter.clone(),
+                        schema: node.schema.clone(),
+                    }));
+                }
+
                 // Check if this is a join tree that needs reordering
                 // Only reorder if we have cross joins or inner joins without proper conditions
                 if self.needs_reordering(plan) {
@@ -92,10 +287,12 @@ impl JoinReorder {
 
             LogicalPlan::Aggregate(node) => {
                 let input = self.reorder(&node.input)?;
+                let group_by = self.reorder_exprs(&node.group_by)?;
+                let aggregates = self.reorder_exprs(&node.aggregates)?;
                 Ok(LogicalPlan::Aggregate(crate::planner::AggregateNode {
                     input: Arc::new(input),
-                    group_by: node.group_by.clone(),
-                    aggregates: node.aggregates.clone(),
+                    group_by,
+                    aggregates,
                     schema: node.schema.clone(),
                 }))
             }
@@ -190,18 +387,23 @@ impl JoinReorder {
         }
     }
 
-    /// Check if this join tree needs reordering (has cross joins)
+    /// Check if this join tree needs reordering (has cross joins or multi-way inner joins)
     fn needs_reordering(&self, plan: &LogicalPlan) -> bool {
+        // A tree with 3+ tables (2+ joins) in Cross/Inner chain benefits from reordering
+        self.count_flattenable_joins(plan) >= 2
+    }
+
+    /// Count how many flattenable (Cross/Inner) joins exist in a chain.
+    /// Stops at Semi/Anti/Left/Right/Full boundaries.
+    fn count_flattenable_joins(&self, plan: &LogicalPlan) -> usize {
         match plan {
-            LogicalPlan::Join(node) => {
-                // If this is a cross join, it needs reordering
-                if node.join_type == JoinType::Cross {
-                    return true;
-                }
-                // Also check children
-                self.needs_reordering(&node.left) || self.needs_reordering(&node.right)
+            LogicalPlan::Join(node)
+                if matches!(node.join_type, JoinType::Cross | JoinType::Inner) =>
+            {
+                1 + self.count_flattenable_joins(&node.left)
+                    + self.count_flattenable_joins(&node.right)
             }
-            _ => false,
+            _ => 0,
         }
     }
 
@@ -314,7 +516,7 @@ impl JoinReorder {
 
         while joined.len() < relations.len() {
             let mut best_edge: Option<(usize, usize)> = None;
-            let mut best_score: i32 = -1;
+            let mut best_score: i32 = i32::MIN;
 
             for (edge_idx, edge) in edges.iter().enumerate() {
                 if used_edges.contains(&edge_idx) {
@@ -325,13 +527,32 @@ impl JoinReorder {
                 let right_in = joined.contains(&edge.right_idx);
 
                 if left_in && !right_in {
-                    let score = edge.conditions.len() as i32;
+                    // Score based on: prefer small tables (dimension tables) to join early
+                    // This reduces intermediate result sizes
+                    let size_score = self.estimate_relation_size_score(&relations[edge.right_idx]);
+                    let cond_score = edge.conditions.len() as i32 * 100;
+                    // Penalize M:N same-dimension FK joins heavily
+                    let mn_penalty = if self.is_same_dimension_fk_edge(edge, relations) {
+                        -5000
+                    } else {
+                        0
+                    };
+                    let score = size_score + cond_score + mn_penalty;
                     if score > best_score {
                         best_score = score;
                         best_edge = Some((edge_idx, edge.right_idx));
                     }
                 } else if !left_in && right_in {
-                    let score = edge.conditions.len() as i32;
+                    // Score based on: prefer small tables (dimension tables) to join early
+                    let size_score = self.estimate_relation_size_score(&relations[edge.left_idx]);
+                    let cond_score = edge.conditions.len() as i32 * 100;
+                    // Penalize M:N same-dimension FK joins heavily
+                    let mn_penalty = if self.is_same_dimension_fk_edge(edge, relations) {
+                        -5000
+                    } else {
+                        0
+                    };
+                    let score = size_score + cond_score + mn_penalty;
                     if score > best_score {
                         best_score = score;
                         best_edge = Some((edge_idx, edge.left_idx));
@@ -347,10 +568,32 @@ impl JoinReorder {
                 let current = result_plan.take().unwrap();
                 let new_rel = relations[new_rel_idx].plan.clone();
 
-                let (left, right, on) = if edge.left_idx == new_rel_idx {
-                    (new_rel, current, edge.conditions.clone())
+                // Orient conditions so left=current, right=new_rel
+                let on_current_left = if edge.right_idx == new_rel_idx {
+                    edge.conditions.clone()
                 } else {
-                    (current, new_rel, edge.conditions.clone())
+                    edge.conditions
+                        .iter()
+                        .map(|(l, r)| (r.clone(), l.clone()))
+                        .collect()
+                };
+
+                // Decide build/probe: prefer the smaller side as build (left).
+                // If the accumulated result has 2+ tables and the new relation is
+                // a small dimension table, swap so new_rel is build.
+                let accumulated_tables = self.count_joined_tables(&current);
+                let new_rel_is_small = !self.is_large_table(&relations[new_rel_idx]);
+                let swap_build_probe = accumulated_tables >= 2 && new_rel_is_small;
+
+                let (left, right, on) = if swap_build_probe {
+                    // new_rel as build (left), accumulated as probe (right)
+                    let swapped_on: Vec<(Expr, Expr)> = on_current_left
+                        .iter()
+                        .map(|(l, r)| (r.clone(), l.clone()))
+                        .collect();
+                    (new_rel, current, swapped_on)
+                } else {
+                    (current, new_rel, on_current_left)
                 };
 
                 let mut schema_fields = left.schema().fields().to_vec();
@@ -365,6 +608,42 @@ impl JoinReorder {
                     filter: None,
                     schema,
                 }));
+
+                // Check for additional edges from the newly joined relation to already-joined relations
+                // These need to be added as filters
+                for (other_edge_idx, other_edge) in edges.iter().enumerate() {
+                    if used_edges.contains(&other_edge_idx) {
+                        continue;
+                    }
+
+                    let connects_new =
+                        other_edge.left_idx == new_rel_idx || other_edge.right_idx == new_rel_idx;
+                    let other_side = if other_edge.left_idx == new_rel_idx {
+                        other_edge.right_idx
+                    } else {
+                        other_edge.left_idx
+                    };
+                    let other_in_result = joined.contains(&other_side);
+
+                    if connects_new && other_in_result {
+                        // This edge adds more conditions between already-joined relations
+                        // Add as filter on top
+                        used_edges.insert(other_edge_idx);
+                        used_condition_indices.insert(other_edge_idx);
+                        let conditions = &other_edge.conditions;
+                        for (l, r) in conditions {
+                            let filter_expr = Expr::BinaryExpr {
+                                left: Box::new(l.clone()),
+                                op: BinaryOp::Eq,
+                                right: Box::new(r.clone()),
+                            };
+                            result_plan = Some(LogicalPlan::Filter(crate::planner::FilterNode {
+                                input: Arc::new(result_plan.take().unwrap()),
+                                predicate: filter_expr,
+                            }));
+                        }
+                    }
+                }
             } else {
                 // No edge found - need cross join (shouldn't happen if conditions exist)
                 let next_rel = (0..relations.len()).find(|i| !joined.contains(i)).unwrap();
@@ -541,7 +820,7 @@ impl JoinReorder {
         while joined.len() < relations.len() {
             // Find the best edge to use (connects to current result, with join condition)
             let mut best_edge: Option<(usize, usize)> = None; // (edge_idx, new_relation_idx)
-            let mut best_score: i32 = -1;
+            let mut best_score: i32 = i32::MIN;
 
             for (edge_idx, edge) in edges.iter().enumerate() {
                 if used_edges.contains(&edge_idx) {
@@ -553,14 +832,30 @@ impl JoinReorder {
 
                 if left_in && !right_in {
                     // Can add right relation
-                    let score = edge.conditions.len() as i32;
+                    let base_score = edge.conditions.len() as i32 * 100;
+                    let size_score = self.estimate_relation_size_score(&relations[edge.right_idx]);
+                    // Penalize M:N same-dimension FK joins heavily
+                    let mn_penalty = if self.is_same_dimension_fk_edge(edge, &relations) {
+                        -5000
+                    } else {
+                        0
+                    };
+                    let score = base_score + size_score + mn_penalty;
                     if score > best_score {
                         best_score = score;
                         best_edge = Some((edge_idx, edge.right_idx));
                     }
                 } else if !left_in && right_in {
                     // Can add left relation
-                    let score = edge.conditions.len() as i32;
+                    let base_score = edge.conditions.len() as i32 * 100;
+                    let size_score = self.estimate_relation_size_score(&relations[edge.left_idx]);
+                    // Penalize M:N same-dimension FK joins heavily
+                    let mn_penalty = if self.is_same_dimension_fk_edge(edge, &relations) {
+                        -5000
+                    } else {
+                        0
+                    };
+                    let score = base_score + size_score + mn_penalty;
                     if score > best_score {
                         best_score = score;
                         best_edge = Some((edge_idx, edge.left_idx));
@@ -577,36 +872,40 @@ impl JoinReorder {
                 let new_rel = &relations[new_idx];
                 let current = result_plan.take().unwrap();
 
-                // Determine which side of the condition goes where
-                let base_conditions = if edge.right_idx == new_idx {
+                // Orient conditions so left=current, right=new_rel
+                let on_current_left = if edge.right_idx == new_idx {
                     edge.conditions.clone()
                 } else {
-                    // Swap left/right in conditions
                     edge.conditions
                         .iter()
                         .map(|(l, r)| (r.clone(), l.clone()))
                         .collect()
                 };
 
-                // Hash join optimization: smaller table should be BUILD (left) side
-                // New relation is likely smaller (dimension table), so put it as BUILD
-                // This means: new_rel (left/build) JOIN current (right/probe)
-                // Swap the conditions to match the new order
-                let conditions: Vec<(Expr, Expr)> = base_conditions
-                    .iter()
-                    .map(|(l, r)| (r.clone(), l.clone()))
-                    .collect();
+                // Decide build/probe: prefer the smaller side as build (left).
+                let accumulated_tables = self.count_joined_tables(&current);
+                let new_rel_is_small = !self.is_large_table(new_rel);
+                let swap_build_probe = accumulated_tables >= 2 && new_rel_is_small;
 
-                // Build the combined schema with new relation first
-                let new_schema = new_rel.plan.schema();
-                let current_schema = current.schema();
-                let combined_schema = new_schema.merge(&current_schema);
+                let (left, right, on) = if swap_build_probe {
+                    let swapped_on: Vec<(Expr, Expr)> = on_current_left
+                        .iter()
+                        .map(|(l, r)| (r.clone(), l.clone()))
+                        .collect();
+                    (new_rel.plan.clone(), current, swapped_on)
+                } else {
+                    (current, new_rel.plan.clone(), on_current_left)
+                };
+
+                let left_schema = left.schema();
+                let right_schema = right.schema();
+                let combined_schema = left_schema.merge(&right_schema);
 
                 result_plan = Some(LogicalPlan::Join(JoinNode {
-                    left: Arc::new(new_rel.plan.clone()), // New (smaller) as build
-                    right: Arc::new(current),             // Current (larger) as probe
+                    left: Arc::new(left),
+                    right: Arc::new(right),
                     join_type: JoinType::Inner,
-                    on: conditions,
+                    on,
                     filter: None,
                     schema: combined_schema,
                 }));
@@ -697,41 +996,15 @@ impl JoinReorder {
                     self.collect_relations_and_conditions(&node.left, relations, conditions);
                     self.collect_relations_and_conditions(&node.right, relations, conditions);
                 } else {
-                    // For LeftJoin/RightJoin/Semi/Anti, we still need to process the left child
-                    // to find any Cross joins there, but NOT include the join's ON conditions
-                    // in the reorder pool (those are for the outer join semantics)
-                    //
-                    // Check if left child has Cross joins that need reordering
-                    if self.needs_reordering(&node.left) {
-                        // Collect from left child only - we'll keep this join structure
-                        self.collect_relations_and_conditions(&node.left, relations, conditions);
-                        // Right child becomes an opaque relation
-                        let right_schema = node.right.schema();
-                        let right_columns: HashSet<String> = right_schema
-                            .fields()
-                            .iter()
-                            .map(|f| f.name.clone())
-                            .collect();
-                        let estimated_rows = self.estimate_row_count(&node.right);
-                        relations.push(JoinRelation {
-                            plan: (*node.right).clone(),
-                            name: format!("{:?}_right", node.join_type),
-                            columns: right_columns,
-                            estimated_rows,
-                        });
-                    } else {
-                        // Treat the whole join as an opaque relation
-                        let schema = plan.schema();
-                        let columns: HashSet<String> =
-                            schema.fields().iter().map(|f| f.name.clone()).collect();
-                        let estimated_rows = self.estimate_row_count(plan);
-                        relations.push(JoinRelation {
-                            plan: plan.clone(),
-                            name: format!("{:?}_join", node.join_type),
-                            columns,
-                            estimated_rows,
-                        });
-                    }
+                    // Left/Right/Full/Semi/Anti/Single/Mark: treat entire join as opaque relation
+                    let schema = plan.schema();
+                    let columns: HashSet<String> =
+                        schema.fields().iter().map(|f| f.name.clone()).collect();
+                    relations.push(JoinRelation {
+                        plan: plan.clone(),
+                        name: format!("{:?}_join", node.join_type),
+                        columns,
+                    });
                 }
             }
 
@@ -743,13 +1016,10 @@ impl JoinReorder {
                     .map(|f| f.name.clone())
                     .collect();
 
-                let estimated_rows = self.estimate_row_count(plan);
-
                 relations.push(JoinRelation {
                     plan: plan.clone(),
                     name: node.table_name.clone(),
                     columns,
-                    estimated_rows,
                 });
             }
 
@@ -761,13 +1031,10 @@ impl JoinReorder {
                     .map(|f| f.name.clone())
                     .collect();
 
-                let estimated_rows = self.estimate_row_count(plan);
-
                 relations.push(JoinRelation {
                     plan: plan.clone(),
                     name: node.alias.clone(),
                     columns,
-                    estimated_rows,
                 });
             }
 
@@ -792,13 +1059,10 @@ impl JoinReorder {
                     _ => "relation".to_string(),
                 };
 
-                let estimated_rows = self.estimate_row_count(plan);
-
                 relations.push(JoinRelation {
                     plan: plan.clone(),
                     name,
                     columns,
-                    estimated_rows,
                 });
             }
         }
@@ -915,165 +1179,131 @@ impl JoinReorder {
         relations.into_iter().collect()
     }
 
-    /// Estimate the row count for a plan node
-    /// Uses heuristics based on node type and available metadata
-    fn estimate_row_count(&self, plan: &LogicalPlan) -> usize {
+    /// Get the underlying table name from a relation plan (handles SubqueryAlias)
+    fn get_underlying_table_name(&self, plan: &LogicalPlan) -> Option<String> {
         match plan {
-            LogicalPlan::Scan(node) => {
-                // Try to get actual row count from Parquet metadata if available
-                // For now, use heuristic based on table name
-                let table_name = node.table_name.to_lowercase();
-                match table_name.as_str() {
-                    "lineitem" => 6_000_000, // TPC-H SF=1 baseline
-                    "orders" => 1_500_000,
-                    "customer" => 150_000,
-                    "part" => 200_000,
-                    "partsupp" => 800_000,
-                    "supplier" => 10_000,
-                    "nation" => 25,
-                    "region" => 5,
-                    _ => 100_000, // Default estimate
-                }
-            }
-            LogicalPlan::Filter(_) => {
-                // Filters reduce cardinality - assume 10% selectivity as a heuristic
-                // Recursively estimate from child
-                if let Some(child) = plan.children().first() {
-                    (self.estimate_row_count(child) / 10).max(1)
-                } else {
-                    1000
-                }
-            }
-            LogicalPlan::Join(node) => {
-                // Estimate join result size based on join type
-                let left_rows = self.estimate_row_count(&node.left);
-                let right_rows = self.estimate_row_count(&node.right);
-
-                match node.join_type {
-                    JoinType::Inner => {
-                        // For inner joins with conditions, assume 1% selectivity (heuristic)
-                        // Without conditions (cross join), it's the product
-                        if node.on.is_empty() {
-                            left_rows.saturating_mul(right_rows)
-                        } else {
-                            // With join conditions, assume significant reduction
-                            // Use geometric mean as a heuristic
-                            ((left_rows as f64 * right_rows as f64).sqrt() as usize).max(1)
-                        }
-                    }
-                    JoinType::Left | JoinType::Right => {
-                        // Outer joins preserve at least the outer side
-                        left_rows.max(right_rows)
-                    }
-                    JoinType::Semi => {
-                        // Semi join returns at most left_rows
-                        // Assume 50% match rate
-                        (left_rows / 2).max(1)
-                    }
-                    JoinType::Anti => {
-                        // Anti join returns rows without match
-                        // Assume 30% don't match
-                        (left_rows * 3 / 10).max(1)
-                    }
-                    JoinType::Cross => {
-                        // Cross join is the full product
-                        left_rows.saturating_mul(right_rows)
-                    }
-                    _ => left_rows.max(right_rows),
-                }
-            }
-            LogicalPlan::Aggregate(_) => {
-                // Aggregates reduce to distinct groups
-                // Assume 10% of input as groups (heuristic)
-                if let Some(child) = plan.children().first() {
-                    (self.estimate_row_count(child) / 10).max(1)
-                } else {
-                    100
-                }
-            }
-            LogicalPlan::Project(_) | LogicalPlan::SubqueryAlias(_) => {
-                // These don't change cardinality
-                if let Some(child) = plan.children().first() {
-                    self.estimate_row_count(child)
-                } else {
-                    1000
-                }
-            }
-            LogicalPlan::Limit(node) => {
-                // Limit caps the output
-                let fetch = node.fetch.unwrap_or(usize::MAX);
-                if let Some(child) = plan.children().first() {
-                    self.estimate_row_count(child).min(fetch)
-                } else {
-                    fetch
-                }
-            }
-            _ => {
-                // Default estimate for other node types
-                if let Some(child) = plan.children().first() {
-                    self.estimate_row_count(child)
-                } else {
-                    1000
-                }
-            }
+            LogicalPlan::Scan(node) => Some(node.table_name.clone()),
+            LogicalPlan::SubqueryAlias(node) => self.get_underlying_table_name(&node.input),
+            LogicalPlan::Filter(node) => self.get_underlying_table_name(&node.input),
+            LogicalPlan::Project(node) => self.get_underlying_table_name(&node.input),
+            _ => None,
         }
     }
 
-    /// Select the best starting relation for join ordering
-    /// Now uses cardinality estimates to prefer smaller dimension tables first
-    fn select_start_relation(&self, relations: &[JoinRelation], edges: &[JoinEdge]) -> usize {
-        // Priority 1: Relations with filters (most selective) - small estimated_rows
-        // Priority 2: Small relations (dimension tables) - prefer smaller estimated_rows
-        // Priority 3: Most connected relation (for star schema optimization)
+    /// Get the row count for a relation from statistics, if available.
+    fn get_relation_row_count(&self, rel: &JoinRelation) -> Option<usize> {
+        let table_name = self.get_underlying_table_name(&rel.plan)?;
+        let stats = self.table_stats.get(&table_name)?;
+        Some(stats.row_count)
+    }
 
+    /// Select the best starting relation for join ordering
+    /// For hash joins, we want to start with SMALL dimension tables and join to larger tables.
+    /// Prefers: small tables with filters > small tables > any
+    fn select_start_relation(&self, relations: &[JoinRelation], edges: &[JoinEdge]) -> usize {
+        // If we have statistics, use row counts directly
+        if !self.table_stats.is_empty() {
+            let mut best_idx = 0;
+            let mut best_score = i64::MIN;
+
+            for (idx, rel) in relations.iter().enumerate() {
+                let mut score = 0i64;
+
+                // Use actual row counts: smaller tables get higher scores
+                if let Some(row_count) = self.get_relation_row_count(rel) {
+                    // Invert: fewer rows = higher score
+                    // Use log scale to avoid extreme differences
+                    score = -(row_count as i64);
+                }
+
+                // Check if this relation has a filter (indicates selectivity)
+                let has_filter = self.relation_has_filter(&rel.plan);
+                if has_filter {
+                    // Filtered relation likely smaller — boost heavily
+                    score = score / 3 + 1_000_000;
+                }
+
+                // Number of edges (connectivity) - slightly prefer connected tables
+                let edge_count = edges
+                    .iter()
+                    .filter(|e| e.left_idx == idx || e.right_idx == idx)
+                    .count() as i64;
+                score += edge_count * 10;
+
+                if score > best_score {
+                    best_score = score;
+                    best_idx = idx;
+                }
+            }
+
+            return best_idx;
+        }
+
+        // Fall back to name-based heuristics when no statistics available
         let mut best_idx = 0;
         let mut best_score = i32::MIN;
 
         for (idx, rel) in relations.iter().enumerate() {
             let mut score = 0i32;
 
+            // Estimate table size based on table name heuristics
+            // Smaller tables get HIGHER scores (we want to start with small tables)
+            // Check both the alias name and the underlying table name
+            let name_lower = rel.name.to_lowercase();
+            let underlying_name = self
+                .get_underlying_table_name(&rel.plan)
+                .map(|s| s.to_lowercase())
+                .unwrap_or_default();
+
+            // Fact tables are large - penalize them heavily
+            // Check both alias name and underlying table name
+            let is_lineitem =
+                name_lower.contains("lineitem") || underlying_name.contains("lineitem");
+            let is_orders = name_lower.contains("orders")
+                || underlying_name.contains("orders")
+                || name_lower.contains("sales")
+                || underlying_name.contains("sales");
+            let is_partsupp =
+                name_lower.contains("partsupp") || underlying_name.contains("partsupp");
+            let is_customer =
+                name_lower.contains("customer") || underlying_name.contains("customer");
+            let is_part = name_lower.contains("part") || underlying_name.contains("part");
+            let is_supplier =
+                name_lower.contains("supplier") || underlying_name.contains("supplier");
+            let is_nation = name_lower.contains("nation") || underlying_name.contains("nation");
+            let is_region = name_lower.contains("region") || underlying_name.contains("region");
+
+            if is_lineitem {
+                score -= 10000; // Largest table - avoid starting with it
+            } else if is_orders {
+                score -= 5000; // Large fact tables
+            } else if is_partsupp {
+                score -= 3000; // Medium-large
+            } else if is_customer || (is_part && !is_partsupp) {
+                score -= 1000; // Medium
+            } else if is_supplier {
+                score += 2000; // Small dimension table
+            } else if is_nation || is_region {
+                score += 5000; // Very small dimension tables - great starting point
+            }
+
             // Check if this relation has a filter (indicates selectivity)
             let has_filter = self.relation_has_filter(&rel.plan);
             if has_filter {
-                score += 100000; // Very strong preference for filtered relations
+                score += 3000; // Filtered relations are smaller - good starting point
             }
 
-            // NEW: Use estimated row count - prefer smaller tables (dimension tables)
-            // Invert the row count with log to avoid overflow, prefer smaller tables
-            let size_score = if rel.estimated_rows > 0 {
-                // Use 1M as baseline, log scale
-                10000 - (rel.estimated_rows as f64).log10().floor() as i32 * 1000
-            } else {
-                5000
-            };
-            score += size_score.max(0);
-
-            // Number of edges (connectivity) - prefer highly connected tables
+            // Number of edges (connectivity) - slightly prefer connected tables
+            // but not as much as size consideration
             let edge_count = edges
                 .iter()
                 .filter(|e| e.left_idx == idx || e.right_idx == idx)
                 .count() as i32;
-            score += edge_count * 100;
+            score += edge_count * 10;
 
-            // Number of columns (heuristic for fact tables which have more columns)
-            // But this is now secondary to actual row count estimates
+            // Number of columns - fewer columns often means dimension table
             let col_count = rel.columns.len() as i32;
-            score += col_count;
-
-            // Prefer tables whose name suggests they're fact tables (ONLY if row count unavailable)
-            // But with actual estimates, this should be less important
-            let name_lower = rel.name.to_lowercase();
-            if name_lower.contains("nation")
-                || name_lower.contains("region")
-                || name_lower.contains("supplier")
-            {
-                score += 2000; // Small dimension tables
-            } else if name_lower.contains("lineitem")
-                || name_lower.contains("orders")
-                || name_lower.contains("sales")
-            {
-                score -= 1000; // Penalize fact tables (want to join them last)
-            }
+            score -= col_count * 5; // Penalize tables with many columns
 
             if score > best_score {
                 best_score = score;
@@ -1082,6 +1312,92 @@ impl JoinReorder {
         }
 
         best_idx
+    }
+
+    /// Check if an edge's conditions are all "same-dimension FK" patterns.
+    /// E.g., `c_nationkey = s_nationkey` — both reference the `nation` dimension
+    /// but neither table IS the nation table. This creates M:N join explosions.
+    fn is_same_dimension_fk_edge(&self, edge: &JoinEdge, relations: &[JoinRelation]) -> bool {
+        if edge.conditions.is_empty() {
+            return false;
+        }
+        // All conditions on this edge must be same-dimension FK
+        edge.conditions.iter().all(|(left_expr, right_expr)| {
+            self.is_same_dimension_fk_condition(left_expr, right_expr, relations, edge)
+        })
+    }
+
+    /// Check if a single condition is a same-dimension FK pattern.
+    /// Detects `X.foo_key = Y.foo_key` where both columns reference the same
+    /// dimension (e.g., nationkey → nation) but neither relation IS that dimension.
+    fn is_same_dimension_fk_condition(
+        &self,
+        left_expr: &Expr,
+        right_expr: &Expr,
+        relations: &[JoinRelation],
+        edge: &JoinEdge,
+    ) -> bool {
+        // Extract the raw column names
+        let left_name = self.extract_column_name(left_expr);
+        let right_name = self.extract_column_name(right_expr);
+        let (left_name, right_name) = match (left_name, right_name) {
+            (Some(l), Some(r)) => (l, r),
+            _ => return false,
+        };
+
+        // Strip single-char prefix + underscore: c_nationkey → nationkey, s_nationkey → nationkey
+        let left_base = strip_prefix(&left_name);
+        let right_base = strip_prefix(&right_name);
+
+        // Both base names must match
+        if left_base != right_base {
+            return false;
+        }
+
+        // The base name should end with "key" to indicate a foreign key pattern
+        if !left_base.ends_with("key") {
+            return false;
+        }
+
+        // Extract dimension name: "nationkey" → "nation", "partkey" → "part"
+        let dimension = left_base.trim_end_matches("key");
+        if dimension.is_empty() {
+            return false;
+        }
+
+        // Check if neither relation IS the dimension table
+        let left_rel = &relations[edge.left_idx];
+        let right_rel = &relations[edge.right_idx];
+        let left_table = self
+            .get_underlying_table_name(&left_rel.plan)
+            .unwrap_or_else(|| left_rel.name.clone())
+            .to_lowercase();
+        let right_table = self
+            .get_underlying_table_name(&right_rel.plan)
+            .unwrap_or_else(|| right_rel.name.clone())
+            .to_lowercase();
+
+        // If either table IS the dimension table, this is a normal FK→PK join (fine)
+        // Use starts_with to handle naming conventions: "supp" matches "supplier",
+        // "cust" matches "customer", "order" matches "orders", etc.
+        if left_table == dimension
+            || right_table == dimension
+            || left_table.starts_with(dimension)
+            || right_table.starts_with(dimension)
+        {
+            return false;
+        }
+
+        // Neither table is the dimension → same-dimension FK → M:N explosion risk
+        true
+    }
+
+    /// Extract the unqualified column name from a simple column expression
+    fn extract_column_name(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Column(col) => Some(col.name.clone()),
+            _ => None,
+        }
     }
 
     /// Check if a logical plan has a filter predicate
@@ -1093,6 +1409,111 @@ impl JoinReorder {
             _ => false,
         }
     }
+
+    /// Estimate a score for relation size (higher score = prefer to join next)
+    /// Small tables get higher scores because they're better as hash table build sides
+    fn estimate_relation_size_score(&self, rel: &JoinRelation) -> i32 {
+        // If we have statistics, use actual row counts
+        if !self.table_stats.is_empty() {
+            if let Some(row_count) = self.get_relation_row_count(rel) {
+                // Smaller tables get higher scores (better build sides)
+                // Scale: 25 rows -> ~8000, 150K rows -> ~3000, 6M rows -> ~800, 600M -> -3200
+                let score = 10000 - (row_count as f64).log2() as i32 * 500;
+                let score = if self.relation_has_filter(&rel.plan) {
+                    score + 1500
+                } else {
+                    score
+                };
+                return score;
+            }
+        }
+
+        // Fall back to name-based heuristics
+        let name_lower = rel.name.to_lowercase();
+        let underlying_name = self
+            .get_underlying_table_name(&rel.plan)
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+        let mut score = 0i32;
+
+        // Check both alias name and underlying table name
+        let is_lineitem = name_lower.contains("lineitem") || underlying_name.contains("lineitem");
+        let is_orders = name_lower.contains("orders")
+            || underlying_name.contains("orders")
+            || name_lower.contains("sales")
+            || underlying_name.contains("sales");
+        let is_partsupp = name_lower.contains("partsupp") || underlying_name.contains("partsupp");
+        let is_customer = name_lower.contains("customer") || underlying_name.contains("customer");
+        let is_part = name_lower.contains("part") || underlying_name.contains("part");
+        let is_supplier = name_lower.contains("supplier") || underlying_name.contains("supplier");
+        let is_nation = name_lower.contains("nation") || underlying_name.contains("nation");
+        let is_region = name_lower.contains("region") || underlying_name.contains("region");
+
+        // Fact tables are large - prefer to join them later (lower score)
+        if is_lineitem {
+            score -= 5000;
+        } else if is_orders {
+            score -= 3000;
+        } else if is_partsupp {
+            score -= 2000;
+        } else if is_customer || (is_part && !is_partsupp) {
+            score -= 500;
+        } else if is_supplier {
+            score += 1000;
+        } else if is_nation || is_region {
+            score += 2000;
+        }
+
+        // Tables with filters are smaller (more selective)
+        if self.relation_has_filter(&rel.plan) {
+            score += 1500;
+        }
+
+        score
+    }
+
+    /// Count the number of leaf tables in a join tree
+    fn count_joined_tables(&self, plan: &LogicalPlan) -> usize {
+        match plan {
+            LogicalPlan::Join(node) => {
+                self.count_joined_tables(&node.left) + self.count_joined_tables(&node.right)
+            }
+            LogicalPlan::Filter(node) => self.count_joined_tables(&node.input),
+            LogicalPlan::Project(node) => self.count_joined_tables(&node.input),
+            LogicalPlan::SubqueryAlias(node) => self.count_joined_tables(&node.input),
+            _ => 1,
+        }
+    }
+
+    /// Check if a relation involves a large table (lineitem, orders, partsupp)
+    fn is_large_table(&self, rel: &JoinRelation) -> bool {
+        let name_lower = rel.name.to_lowercase();
+        let underlying_name = self
+            .get_underlying_table_name(&rel.plan)
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+
+        let is_lineitem = name_lower.contains("lineitem") || underlying_name.contains("lineitem");
+        let is_orders = name_lower.contains("orders") || underlying_name.contains("orders");
+        let is_partsupp = name_lower.contains("partsupp") || underlying_name.contains("partsupp");
+
+        is_lineitem || is_orders || is_partsupp
+    }
+}
+
+/// Strip a single-char prefix + underscore from a column name.
+/// E.g., "c_nationkey" → "nationkey", "s_nationkey" → "nationkey",
+/// "ps_partkey" → "partkey", "l_orderkey" → "orderkey"
+fn strip_prefix(name: &str) -> &str {
+    // Handle 2-char prefixes like "ps_"
+    if name.len() > 3 && name.as_bytes()[2] == b'_' {
+        return &name[3..];
+    }
+    // Handle 1-char prefixes like "c_", "s_", "l_", "o_", "n_", "r_"
+    if name.len() > 2 && name.as_bytes()[1] == b'_' {
+        return &name[2..];
+    }
+    name
 }
 
 #[cfg(test)]
@@ -1148,12 +1569,24 @@ mod tests {
             schema: abc_schema,
         });
 
-        let rule = JoinReorder;
+        let rule = JoinReorder::new();
         assert!(rule.needs_reordering(&inner_abc));
 
         let optimized = rule.optimize(&inner_abc).unwrap();
 
         // After optimization, there should be no cross joins
-        assert!(!rule.needs_reordering(&optimized));
+        assert!(!has_cross_joins(&optimized));
+    }
+
+    fn has_cross_joins(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Join(node) => {
+                if node.join_type == JoinType::Cross {
+                    return true;
+                }
+                has_cross_joins(&node.left) || has_cross_joins(&node.right)
+            }
+            _ => false,
+        }
     }
 }

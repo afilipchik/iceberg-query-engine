@@ -6,7 +6,7 @@ use crate::physical::{PhysicalOperator, RecordBatchStream};
 use crate::planner::{SortDirection, SortExpr};
 use arrow::array::ArrayRef;
 use arrow::compute::{self, SortColumn, SortOptions};
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, Field, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use futures::stream::{self, TryStreamExt};
@@ -19,6 +19,8 @@ pub struct SortExec {
     input: Arc<dyn PhysicalOperator>,
     order_by: Vec<SortExpr>,
     schema: SchemaRef,
+    /// Optional limit for Top-K optimization: only return the first `fetch` rows
+    fetch: Option<usize>,
 }
 
 impl SortExec {
@@ -28,6 +30,23 @@ impl SortExec {
             input,
             order_by,
             schema,
+            fetch: None,
+        }
+    }
+
+    /// Create a sort with a fetch limit (Top-K optimization).
+    /// When set, `lexsort_to_indices` uses the limit to avoid sorting all rows.
+    pub fn with_fetch(
+        input: Arc<dyn PhysicalOperator>,
+        order_by: Vec<SortExpr>,
+        fetch: usize,
+    ) -> Self {
+        let schema = input.schema();
+        Self {
+            input,
+            order_by,
+            schema,
+            fetch: Some(fetch),
         }
     }
 }
@@ -43,20 +62,49 @@ impl PhysicalOperator for SortExec {
     }
 
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
-        let input_stream = self.input.execute(partition).await?;
-
-        // Collect all batches
-        let batches: Vec<RecordBatch> = input_stream.try_collect().await?;
-
-        // Concatenate into single batch
-        if batches.is_empty() {
+        // Sort always produces a single partition by collecting from all input partitions
+        if partition != 0 {
             return Ok(Box::pin(stream::empty()));
         }
 
-        let batch = concat_batches(&self.schema, &batches)?;
+        // Collect from ALL input partitions (input may split data across partitions)
+        let input_partitions = self.input.output_partitions().max(1);
+        let mut all_batches = Vec::new();
+        for p in 0..input_partitions {
+            let input_stream = self.input.execute(p).await?;
+            let batches: Vec<RecordBatch> = input_stream.try_collect().await?;
+            all_batches.extend(batches);
+        }
+
+        // Concatenate into single batch
+        if all_batches.is_empty() {
+            return Ok(Box::pin(stream::empty()));
+        }
+
+        // Check if Utf8 columns risk exceeding the 2GB i32 offset limit
+        let needs_large_utf8 = check_string_overflow_risk(&self.schema, &all_batches);
+
+        let (working_schema, working_batches) = if needs_large_utf8 {
+            let schema = promote_utf8_schema(&self.schema);
+            let batches = all_batches
+                .iter()
+                .map(|b| promote_utf8_batch(b))
+                .collect::<Result<Vec<_>>>()?;
+            (schema, batches)
+        } else {
+            (self.schema.clone(), all_batches)
+        };
+
+        let batch = concat_batches(&working_schema, &working_batches)?;
 
         // Sort
-        let sorted = sort_batch(&batch, &self.order_by)?;
+        let sorted = sort_batch(&batch, &self.order_by, self.fetch)?;
+
+        let sorted = if needs_large_utf8 {
+            demote_utf8_batch(&sorted)?
+        } else {
+            sorted
+        };
 
         Ok(Box::pin(stream::once(async { Ok(sorted) })))
     }
@@ -95,7 +143,11 @@ fn concat_batches(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<RecordB
     compute::concat_batches(schema, batches).map_err(Into::into)
 }
 
-fn sort_batch(batch: &RecordBatch, order_by: &[SortExpr]) -> Result<RecordBatch> {
+pub fn sort_batch(
+    batch: &RecordBatch,
+    order_by: &[SortExpr],
+    fetch: Option<usize>,
+) -> Result<RecordBatch> {
     if batch.num_rows() == 0 {
         return Ok(batch.clone());
     }
@@ -116,8 +168,8 @@ fn sort_batch(batch: &RecordBatch, order_by: &[SortExpr]) -> Result<RecordBatch>
         .collect();
     let sort_columns = sort_columns?;
 
-    // Get sort indices
-    let indices = compute::lexsort_to_indices(&sort_columns, None)?;
+    // Get sort indices — pass fetch as limit for Top-K optimization
+    let indices = compute::lexsort_to_indices(&sort_columns, fetch)?;
 
     // Reorder all columns
     let sorted_columns: Result<Vec<ArrayRef>> = batch
@@ -127,6 +179,96 @@ fn sort_batch(batch: &RecordBatch, order_by: &[SortExpr]) -> Result<RecordBatch>
         .collect();
 
     RecordBatch::try_new(batch.schema(), sorted_columns?).map_err(Into::into)
+}
+
+/// Check if concatenating batches would risk exceeding the 2GB i32 offset limit
+/// for any Utf8 column. Returns true if any string column's total data exceeds 1.5GB.
+fn check_string_overflow_risk(schema: &SchemaRef, batches: &[RecordBatch]) -> bool {
+    const THRESHOLD: usize = 1_500_000_000; // 1.5GB
+
+    for (col_idx, field) in schema.fields().iter().enumerate() {
+        if *field.data_type() == DataType::Utf8 {
+            let total_bytes: usize = batches
+                .iter()
+                .map(|b| {
+                    if col_idx < b.num_columns() {
+                        b.column(col_idx).get_array_memory_size()
+                    } else {
+                        0
+                    }
+                })
+                .sum();
+            if total_bytes > THRESHOLD {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Create a new schema with Utf8 fields promoted to LargeUtf8
+fn promote_utf8_schema(schema: &SchemaRef) -> SchemaRef {
+    let fields: Vec<Arc<Field>> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            if *f.data_type() == DataType::Utf8 {
+                Arc::new(Field::new(f.name(), DataType::LargeUtf8, f.is_nullable()))
+            } else {
+                f.clone()
+            }
+        })
+        .collect();
+    Arc::new(arrow::datatypes::Schema::new(fields))
+}
+
+/// Cast Utf8 columns to LargeUtf8 in a batch
+fn promote_utf8_batch(batch: &RecordBatch) -> Result<RecordBatch> {
+    let new_schema = promote_utf8_schema(&batch.schema());
+    let columns: Result<Vec<ArrayRef>> = batch
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(i, col)| {
+            if *batch.schema().field(i).data_type() == DataType::Utf8 {
+                compute::cast(col.as_ref(), &DataType::LargeUtf8).map_err(Into::into)
+            } else {
+                Ok(col.clone())
+            }
+        })
+        .collect();
+    RecordBatch::try_new(new_schema, columns?).map_err(Into::into)
+}
+
+/// Cast LargeUtf8 columns back to Utf8 in a batch
+fn demote_utf8_batch(batch: &RecordBatch) -> Result<RecordBatch> {
+    let fields: Vec<Arc<Field>> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| {
+            if *f.data_type() == DataType::LargeUtf8 {
+                Arc::new(Field::new(f.name(), DataType::Utf8, f.is_nullable()))
+            } else {
+                f.clone()
+            }
+        })
+        .collect();
+    let new_schema = Arc::new(arrow::datatypes::Schema::new(fields));
+
+    let columns: Result<Vec<ArrayRef>> = batch
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(i, col)| {
+            if *batch.schema().field(i).data_type() == DataType::LargeUtf8 {
+                compute::cast(col.as_ref(), &DataType::Utf8).map_err(Into::into)
+            } else {
+                Ok(col.clone())
+            }
+        })
+        .collect();
+    RecordBatch::try_new(new_schema, columns?).map_err(Into::into)
 }
 
 #[cfg(test)]

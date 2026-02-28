@@ -11,6 +11,38 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Shared runtime for subquery execution. Created once, reused across all subquery
+/// evaluations. This eliminates the overhead of creating a new runtime per subquery.
+fn subquery_runtime() -> &'static tokio::runtime::Runtime {
+    use std::sync::OnceLock;
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("Failed to create subquery runtime")
+    })
+}
+
+/// Execute an async physical plan, reusing a shared runtime instead of creating
+/// a new one per subquery evaluation.
+fn run_subquery_blocking(
+    physical: Arc<dyn crate::physical::PhysicalOperator>,
+) -> Result<Vec<RecordBatch>> {
+    let rt = subquery_runtime();
+    std::thread::spawn(move || {
+        let stream = rt.block_on(physical.execute(0))?;
+        rt.block_on(async { stream.try_collect().await })
+    })
+    .join()
+    .unwrap_or_else(|_| {
+        Err(QueryError::Execution(
+            "Subquery execution thread panicked".into(),
+        ))
+    })
+}
+
 /// Subquery executor - handles execution of subqueries during filter evaluation
 #[derive(Clone)]
 pub struct SubqueryExecutor {
@@ -180,33 +212,9 @@ impl SubqueryExecutor {
 
         let planner = self.create_planner();
         let physical = planner.create_physical_plan(plan)?;
-        let _plan_clone = plan.clone();
 
-        // Run the async code in a blocking way
-        let batches = if let Ok(_handle) = tokio::runtime::Handle::try_current() {
-            // We're inside a tokio runtime, use spawn_blocking
-            std::thread::spawn(move || {
-                let runtime = tokio::runtime::Runtime::new().map_err(|e| {
-                    QueryError::Execution(format!("Failed to create runtime: {}", e))
-                })?;
-                let stream = runtime.block_on(physical.execute(0))?;
-                let result: Result<Vec<RecordBatch>> =
-                    runtime.block_on(async { stream.try_collect().await });
-                result
-            })
-            .join()
-            .unwrap_or_else(|_| {
-                Err(QueryError::Execution(
-                    "Subquery execution thread panicked".into(),
-                ))
-            })?
-        } else {
-            // No existing runtime, create a new one and use it directly
-            let runtime = tokio::runtime::Runtime::new()
-                .map_err(|e| QueryError::Execution(format!("Failed to create runtime: {}", e)))?;
-            let stream = runtime.block_on(physical.execute(0))?;
-            runtime.block_on(async { stream.try_collect().await })?
-        };
+        // Run the async code reusing the existing runtime when possible
+        let batches = run_subquery_blocking(physical)?;
 
         if batches.is_empty() || batches[0].num_rows() == 0 {
             let result = ScalarValue::Null;
@@ -249,31 +257,8 @@ impl SubqueryExecutor {
         let planner = self.create_planner();
         let physical = planner.create_physical_plan(plan)?;
 
-        // Run the async code in a blocking way
-        let batches = if let Ok(_handle) = tokio::runtime::Handle::try_current() {
-            // We're inside a tokio runtime, use a dedicated thread
-            std::thread::spawn(move || {
-                let runtime = tokio::runtime::Runtime::new().map_err(|e| {
-                    QueryError::Execution(format!("Failed to create runtime: {}", e))
-                })?;
-                let stream = runtime.block_on(physical.execute(0))?;
-                let result: Result<Vec<RecordBatch>> =
-                    runtime.block_on(async { stream.try_collect().await });
-                result
-            })
-            .join()
-            .unwrap_or_else(|_| {
-                Err(QueryError::Execution(
-                    "Subquery execution thread panicked".into(),
-                ))
-            })?
-        } else {
-            // No existing runtime, create a new one and use it directly
-            let runtime = tokio::runtime::Runtime::new()
-                .map_err(|e| QueryError::Execution(format!("Failed to create runtime: {}", e)))?;
-            let stream = runtime.block_on(physical.execute(0))?;
-            runtime.block_on(async { stream.try_collect().await })?
-        };
+        // Run the async code reusing the existing runtime when possible
+        let batches = run_subquery_blocking(physical)?;
 
         if batches.is_empty() {
             let result = new_empty_array(
@@ -321,31 +306,8 @@ impl SubqueryExecutor {
         let planner = self.create_planner();
         let physical = planner.create_physical_plan(plan)?;
 
-        // Run the async code in a blocking way
-        let batches = if let Ok(_handle) = tokio::runtime::Handle::try_current() {
-            // We're inside a tokio runtime, use a dedicated thread
-            std::thread::spawn(move || {
-                let runtime = tokio::runtime::Runtime::new().map_err(|e| {
-                    QueryError::Execution(format!("Failed to create runtime: {}", e))
-                })?;
-                let stream = runtime.block_on(physical.execute(0))?;
-                let result: Result<Vec<RecordBatch>> =
-                    runtime.block_on(async { stream.try_collect().await });
-                result
-            })
-            .join()
-            .unwrap_or_else(|_| {
-                Err(QueryError::Execution(
-                    "Subquery execution thread panicked".into(),
-                ))
-            })?
-        } else {
-            // No existing runtime, create a new one and use it directly
-            let runtime = tokio::runtime::Runtime::new()
-                .map_err(|e| QueryError::Execution(format!("Failed to create runtime: {}", e)))?;
-            let stream = runtime.block_on(physical.execute(0))?;
-            runtime.block_on(async { stream.try_collect().await })?
-        };
+        // Run the async code reusing the existing runtime when possible
+        let batches = run_subquery_blocking(physical)?;
 
         let has_rows = batches.iter().any(|b| b.num_rows() > 0);
 
@@ -629,6 +591,11 @@ fn plan_has_outer_references(
 }
 
 /// Check if a subquery is correlated (references columns from outer scope)
+/// Check if a subquery plan references outer columns (is correlated).
+pub fn is_correlated_subquery_plan(subquery: &LogicalPlan) -> bool {
+    is_correlated_subquery(subquery)
+}
+
 fn is_correlated_subquery(subquery: &LogicalPlan) -> bool {
     let local_tables = collect_table_aliases(subquery);
     plan_has_outer_references(subquery, &local_tables)
