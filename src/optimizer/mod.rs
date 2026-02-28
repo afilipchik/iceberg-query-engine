@@ -55,6 +55,7 @@ impl Optimizer {
                 // Final predicate pushdown for any remaining opportunities
                 Arc::new(rules::PredicatePushdown),
                 Arc::new(rules::ProjectionPushdown),
+                Arc::new(rules::PredicateReordering::default()),
             ],
             max_iterations: 10,
             table_stats: HashMap::new(),

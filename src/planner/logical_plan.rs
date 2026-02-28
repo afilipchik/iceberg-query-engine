@@ -69,6 +69,10 @@ pub enum LogicalPlan {
     /// DelimGet - Scan of deduplicated outer values inside a decorrelated subquery
     /// Receives correlation values from parent DelimJoin
     DelimGet(DelimGetNode),
+    /// Multi-DelimJoin - Handles multiple EXISTS/NOT EXISTS with same correlation
+    MultiDelimJoin(MultiDelimJoinNode),
+    /// Window function computation (ROW_NUMBER, RANK, etc. with OVER clause)
+    Window(WindowNode),
 }
 
 impl LogicalPlan {
@@ -89,6 +93,8 @@ impl LogicalPlan {
             LogicalPlan::Values(node) => node.schema.clone(),
             LogicalPlan::DelimJoin(node) => node.schema.clone(),
             LogicalPlan::DelimGet(node) => node.schema.clone(),
+            LogicalPlan::MultiDelimJoin(node) => node.schema.clone(),
+            LogicalPlan::Window(node) => node.schema.clone(),
         }
     }
 
@@ -107,6 +113,14 @@ impl LogicalPlan {
             LogicalPlan::SubqueryAlias(node) => vec![&node.input],
             LogicalPlan::DelimJoin(node) => vec![&node.left, &node.right],
             LogicalPlan::DelimGet(_) => vec![], // DelimGet is a source, no children
+            LogicalPlan::MultiDelimJoin(node) => {
+                let mut children: Vec<&LogicalPlan> = vec![&node.left];
+                for inner in &node.inner_sides {
+                    children.push(inner);
+                }
+                children
+            }
+            LogicalPlan::Window(node) => vec![&node.input],
         }
     }
 
@@ -176,6 +190,25 @@ impl LogicalPlan {
                 })
             }
             LogicalPlan::DelimGet(node) => LogicalPlan::DelimGet(node.clone()),
+            LogicalPlan::MultiDelimJoin(node) => {
+                let mut iter = children.into_iter();
+                let left = iter.next().unwrap();
+                let inner_sides: Vec<Arc<LogicalPlan>> = iter.collect();
+                LogicalPlan::MultiDelimJoin(MultiDelimJoinNode {
+                    left,
+                    inner_sides,
+                    join_types: node.join_types.clone(),
+                    delim_columns: node.delim_columns.clone(),
+                    on: node.on.clone(),
+                    schema: node.schema.clone(),
+                })
+            }
+            LogicalPlan::Window(node) => LogicalPlan::Window(WindowNode {
+                input: children.into_iter().next().unwrap(),
+                window_exprs: node.window_exprs.clone(),
+                output_names: node.output_names.clone(),
+                schema: node.schema.clone(),
+            }),
         }
     }
 
@@ -348,6 +381,27 @@ impl LogicalPlan {
                 let cols: Vec<String> = node.columns.iter().map(|e| e.to_string()).collect();
                 writeln!(f, "{}DelimGet: columns=[{}]", prefix, cols.join(", "))?;
             }
+            LogicalPlan::MultiDelimJoin(node) => {
+                let types: Vec<String> = node.join_types.iter().map(|t| t.to_string()).collect();
+                writeln!(f, "{}MultiDelimJoin: types=[{}]", prefix, types.join(", "))?;
+                let on_str: Vec<String> = node
+                    .on
+                    .iter()
+                    .map(|(l, r)| format!("{} = {}", l, r))
+                    .collect();
+                if !on_str.is_empty() {
+                    writeln!(f, "{}  on: {}", prefix, on_str.join(" AND "))?;
+                }
+                node.left.fmt_indent(f, indent + 1)?;
+                for (i, inner) in node.inner_sides.iter().enumerate() {
+                    writeln!(f, "{}  [inner side {}]", prefix, i)?;
+                    inner.fmt_indent(f, indent + 2)?;
+                }
+            }
+            LogicalPlan::Window(node) => {
+                writeln!(f, "{}Window: [{}]", prefix, node.output_names.join(", "))?;
+                node.input.fmt_indent(f, indent + 1)?;
+            }
         }
         Ok(())
     }
@@ -509,6 +563,49 @@ pub struct DelimGetNode {
     pub schema: PlanSchema,
     /// Unique identifier to link with parent DelimJoin (set during planning)
     pub delim_id: u64,
+}
+
+/// Multi-DelimJoin node - Handles multiple EXISTS/NOT EXISTS with same correlation
+///
+/// Example: WHERE EXISTS(SELECT * FROM l2 WHERE l2.key = l1.key AND l2.x = y)
+///               AND NOT EXISTS(SELECT * FROM l3 WHERE l3.key = l1.key)
+///
+/// This creates a single distinct set of l1.key values that all inner
+/// subqueries can probe against, avoiding O(n²) execution.
+///
+/// Execution:
+/// 1. Collect distinct correlation values from left (outer) side
+/// 2. Pass them to ALL inner sides via a shared DelimGet
+/// 3. Evaluate each inner side independently
+/// 4. Combine results: row matches if all EXISTS match AND all NOT EXISTS don't match
+#[derive(Debug, Clone, PartialEq)]
+pub struct MultiDelimJoinNode {
+    /// The outer (left) side of the join
+    pub left: Arc<LogicalPlan>,
+    /// Inner sides - one per EXISTS/NOT EXISTS
+    /// Each is a subquery rewritten to probe DelimGet
+    pub inner_sides: Vec<Arc<LogicalPlan>>,
+    /// Join type for each inner side (Semi for EXISTS, Anti for NOT EXISTS)
+    pub join_types: Vec<JoinType>,
+    /// Columns to deduplicate from outer side
+    pub delim_columns: Vec<Expr>,
+    /// Join conditions for each inner side (shared across all)
+    pub on: Vec<(Expr, Expr)>,
+    /// Output schema (same as left schema for Semi/Anti joins)
+    pub schema: PlanSchema,
+}
+
+/// Window node - computes window function results (ROW_NUMBER, RANK, etc.)
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowNode {
+    /// Input plan providing data
+    pub input: Arc<LogicalPlan>,
+    /// Window function expressions (always Expr::WindowFunc variants)
+    pub window_exprs: Vec<crate::planner::Expr>,
+    /// Output column names corresponding to each window expr
+    pub output_names: Vec<String>,
+    /// Output schema: input schema + one column per window expr
+    pub schema: PlanSchema,
 }
 
 /// Builder for creating logical plans

@@ -92,6 +92,37 @@ impl ProjectionPushdown {
                 self.collect_recursive(&node.right, required);
             }
             LogicalPlan::DelimGet(_) => {}
+            LogicalPlan::MultiDelimJoin(node) => {
+                self.collect_recursive(&node.left, required);
+                for inner in &node.inner_sides {
+                    self.collect_recursive(inner, required);
+                }
+            }
+            LogicalPlan::Window(node) => {
+                // Extract columns from each window expression's args, partition_by, order_by.
+                // We cannot use extract_columns_from_expr directly on WindowFunc since it
+                // falls through to the _ => {} arm and doesn't recurse into sub-expressions.
+                for wf_expr in &node.window_exprs {
+                    if let Expr::WindowFunc {
+                        args,
+                        partition_by,
+                        order_by,
+                        ..
+                    } = wf_expr
+                    {
+                        for arg in args {
+                            self.extract_columns_from_expr(arg, required);
+                        }
+                        for pb in partition_by {
+                            self.extract_columns_from_expr(pb, required);
+                        }
+                        for ob in order_by {
+                            self.extract_columns_from_expr(&ob.expr, required);
+                        }
+                    }
+                }
+                self.collect_recursive(&node.input, required);
+            }
         }
     }
 
@@ -513,6 +544,40 @@ impl ProjectionPushdown {
             }
 
             LogicalPlan::DelimGet(node) => Ok(LogicalPlan::DelimGet(node.clone())),
+            LogicalPlan::MultiDelimJoin(node) => {
+                // Push projections to left side (inner sides are EXISTS/NOT EXISTS)
+                let left = self.pushdown(&node.left, required)?;
+                // For inner sides, collect required columns from join conditions
+                let mut inner_required = HashSet::new();
+                for (_, r) in &node.on {
+                    self.extract_columns_from_expr(r, &mut inner_required);
+                }
+                let inner_sides: Result<Vec<_>> = node
+                    .inner_sides
+                    .iter()
+                    .map(|inner| self.pushdown(inner, &inner_required).map(Arc::new))
+                    .collect();
+                Ok(LogicalPlan::MultiDelimJoin(
+                    crate::planner::MultiDelimJoinNode {
+                        left: Arc::new(left),
+                        inner_sides: inner_sides?,
+                        join_types: node.join_types.clone(),
+                        delim_columns: node.delim_columns.clone(),
+                        on: node.on.clone(),
+                        schema: node.schema.clone(),
+                    },
+                ))
+            }
+            LogicalPlan::Window(node) => {
+                // Window functions are opaque to projection pushdown
+                let input = self.pushdown(&node.input, required)?;
+                Ok(LogicalPlan::Window(crate::planner::WindowNode {
+                    input: Arc::new(input),
+                    window_exprs: node.window_exprs.clone(),
+                    output_names: node.output_names.clone(),
+                    schema: node.schema.clone(),
+                }))
+            }
         }
     }
 }

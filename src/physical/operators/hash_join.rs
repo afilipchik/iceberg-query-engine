@@ -1173,7 +1173,8 @@ fn probe_semi_anti_parallel(
 ) -> Result<Vec<RecordBatch>> {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    // Track which build rows have been matched using atomic bools for parallel access
+    // Track which BUILD rows have been matched using atomic bools for parallel access
+    // For Semi/Anti joins, output comes from the BUILD (left) side
     let build_matched: Vec<Vec<AtomicBool>> = build_batches
         .iter()
         .map(|b| (0..b.num_rows()).map(|_| AtomicBool::new(false)).collect())

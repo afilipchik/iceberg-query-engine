@@ -445,6 +445,54 @@ impl PredicatePushdown {
                     }))
                 }
             }
+            LogicalPlan::MultiDelimJoin(node) => {
+                // MultiDelimJoin - predicates can be pushed to left side (outer)
+                // Inner sides are EXISTS/NOT EXISTS and shouldn't receive outer predicates
+                let left = self.pushdown(&node.left, predicates)?;
+                let inner_sides: Result<Vec<_>> = node
+                    .inner_sides
+                    .iter()
+                    .map(|inner| self.pushdown(inner, vec![]).map(Arc::new))
+                    .collect();
+                Ok(LogicalPlan::MultiDelimJoin(
+                    crate::planner::MultiDelimJoinNode {
+                        left: Arc::new(left),
+                        inner_sides: inner_sides?,
+                        join_types: node.join_types.clone(),
+                        delim_columns: node.delim_columns.clone(),
+                        on: node.on.clone(),
+                        schema: node.schema.clone(),
+                    },
+                ))
+            }
+
+            LogicalPlan::Window(node) => {
+                // Predicates cannot be pushed through window functions
+                // Apply predicates as a Filter above the Window node
+                let input = self.pushdown(&node.input, vec![])?;
+                let window = LogicalPlan::Window(crate::planner::WindowNode {
+                    input: Arc::new(input),
+                    window_exprs: node.window_exprs.clone(),
+                    output_names: node.output_names.clone(),
+                    schema: node.schema.clone(),
+                });
+                if predicates.is_empty() {
+                    Ok(window)
+                } else {
+                    let combined = predicates
+                        .into_iter()
+                        .reduce(|a, b| Expr::BinaryExpr {
+                            left: Box::new(a),
+                            right: Box::new(b),
+                            op: crate::planner::BinaryOp::And,
+                        })
+                        .unwrap();
+                    Ok(LogicalPlan::Filter(crate::planner::FilterNode {
+                        input: Arc::new(window),
+                        predicate: combined,
+                    }))
+                }
+            }
         }
     }
 

@@ -7,6 +7,7 @@
 //! - Parallel row group reading
 
 use crate::error::{QueryError, Result};
+use crate::physical::morsel::ParallelParquetSource;
 use crate::physical::{PhysicalOperator, RecordBatchStream};
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
@@ -14,6 +15,7 @@ use async_trait::async_trait;
 use futures::stream;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
+use parquet::arrow::ProjectionMask;
 use std::fmt;
 use std::fs::File;
 use std::path::PathBuf;
@@ -64,16 +66,45 @@ pub struct ParquetScanExec {
     path: PathBuf,
     schema: SchemaRef,
     projection: Option<Vec<usize>>,
+    /// Enable parallel reading using morsel-driven parallelism
+    parallel: bool,
+    /// Batch size for reading (default 64K rows)
+    batch_size: usize,
 }
 
 impl ParquetScanExec {
-    /// Create a new Parquet scan operator
+    /// Create a new Parquet scan operator (sequential reading)
     pub fn new(path: PathBuf, schema: SchemaRef, projection: Option<Vec<usize>>) -> Self {
         Self {
             path,
             schema,
             projection,
+            parallel: false,
+            batch_size: 65536, // 64K rows
         }
+    }
+
+    /// Create a new Parquet scan operator with parallel reading enabled
+    pub fn new_parallel(
+        path: PathBuf,
+        schema: SchemaRef,
+        projection: Option<Vec<usize>>,
+        batch_size: usize,
+    ) -> Self {
+        Self {
+            path,
+            schema,
+            projection,
+            parallel: true,
+            batch_size,
+        }
+    }
+
+    /// Enable parallel reading on an existing scan
+    pub fn with_parallel(mut self, batch_size: usize) -> Self {
+        self.parallel = true;
+        self.batch_size = batch_size;
+        self
     }
 }
 
@@ -88,46 +119,70 @@ impl PhysicalOperator for ParquetScanExec {
     }
 
     async fn execute(&self, _partition: usize) -> Result<RecordBatchStream> {
-        let file = File::open(&self.path).map_err(|e| {
-            QueryError::Execution(format!(
-                "Failed to open Parquet file {:?}: {}",
-                self.path, e
-            ))
-        })?;
+        if self.parallel {
+            // Use morsel-driven parallel reading
+            let source = ParallelParquetSource::try_from_path(
+                &self.path,
+                self.projection.clone(),
+                self.batch_size,
+            )?;
 
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
-            QueryError::Execution(format!("Failed to create Parquet reader builder: {}", e))
-        })?;
+            // Read all data in parallel
+            let morsels = source.read_all_parallel()?;
 
-        // Note: Column projection (reading only needed columns) is a key optimization
-        // For now, we read all columns and project later
-        // TODO: Implement proper ProjectionMask using SchemaDescriptor
+            // Convert morsels to batches
+            let batches: Vec<RecordBatch> = morsels.into_iter().map(|m| m.batch).collect();
 
-        let mut reader = builder
-            .build()
-            .map_err(|e| QueryError::Execution(format!("Failed to build Parquet reader: {}", e)))?;
+            let stream = stream::iter(batches.into_iter().map(Ok));
+            Ok(Box::pin(stream))
+        } else {
+            // Sequential reading (original implementation)
+            let file = File::open(&self.path).map_err(|e| {
+                QueryError::Execution(format!(
+                    "Failed to open Parquet file {:?}: {}",
+                    self.path, e
+                ))
+            })?;
 
-        let mut batches = Vec::new();
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
+                QueryError::Execution(format!("Failed to create Parquet reader builder: {}", e))
+            })?;
 
-        // Read all batches using the iterator interface
-        use std::iter::Iterator;
-        loop {
-            match reader.next() {
-                Some(Ok(batch)) => {
-                    batches.push(batch);
+            // Apply column projection to read only needed columns
+            // This is a key I/O optimization - reads only the columns that are needed
+            let builder = if let Some(ref indices) = self.projection {
+                let mask = ProjectionMask::roots(builder.parquet_schema(), indices.iter().copied());
+                builder.with_projection(mask)
+            } else {
+                builder
+            };
+
+            let mut reader = builder.build().map_err(|e| {
+                QueryError::Execution(format!("Failed to build Parquet reader: {}", e))
+            })?;
+
+            let mut batches = Vec::new();
+
+            // Read all batches using the iterator interface
+            use std::iter::Iterator;
+            loop {
+                match reader.next() {
+                    Some(Ok(batch)) => {
+                        batches.push(batch);
+                    }
+                    Some(Err(e)) => {
+                        return Err(QueryError::Execution(format!(
+                            "Failed to read Parquet batch: {}",
+                            e
+                        )));
+                    }
+                    None => break,
                 }
-                Some(Err(e)) => {
-                    return Err(QueryError::Execution(format!(
-                        "Failed to read Parquet batch: {}",
-                        e
-                    )));
-                }
-                None => break,
             }
-        }
 
-        let stream = stream::iter(batches.into_iter().map(Ok));
-        Ok(Box::pin(stream))
+            let stream = stream::iter(batches.into_iter().map(Ok));
+            Ok(Box::pin(stream))
+        }
     }
 
     fn name(&self) -> &str {
@@ -138,6 +193,9 @@ impl PhysicalOperator for ParquetScanExec {
 impl fmt::Display for ParquetScanExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "ParquetScan: {:?}", self.path)?;
+        if self.parallel {
+            write!(f, " [parallel, batch_size={}]", self.batch_size)?;
+        }
         if let Some(proj) = &self.projection {
             write!(f, " projection={:?}", proj)?;
         }

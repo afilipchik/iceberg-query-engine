@@ -6,7 +6,7 @@ use crate::planner::{
     AggregateFunction, AggregateNode, BinaryOp, Column, DistinctNode, Expr, FilterNode, JoinNode,
     JoinType, LimitNode, LogicalPlan, NullOrdering, PlanSchema, ProjectNode, ScalarFunction,
     ScalarValue, ScanNode, SchemaField, SortDirection, SortExpr, SortNode, SubqueryAliasNode,
-    UnaryOp,
+    UnaryOp, WindowFunction, WindowNode,
 };
 use arrow::datatypes::DataType as ArrowDataType;
 use ordered_float::OrderedFloat;
@@ -382,12 +382,10 @@ impl<'a> Binder<'a> {
             });
         }
 
-        // 5. SELECT projection
+        // 5. SELECT projection (with optional window function extraction)
         let proj_schema = plan.schema();
 
-        // If we have an aggregate, we need to rewrite the projection expressions
-        // to reference the aggregate's output columns by name instead of re-evaluating
-        // the aggregate expressions.
+        // Bind projection expressions (detecting window functions)
         let (proj_exprs, proj_fields) = if has_aggregates || !group_by.is_empty() {
             self.bind_projection_after_aggregate(
                 &select.projection,
@@ -400,9 +398,60 @@ impl<'a> Binder<'a> {
             self.bind_projection(&select.projection, &proj_schema)?
         };
 
+        // 5a. Extract window functions and insert Window node if any present
+        let mut window_exprs: Vec<Expr> = Vec::new();
+        let mut window_names: Vec<String> = Vec::new();
+        let proj_exprs_final: Vec<Expr> = proj_exprs
+            .into_iter()
+            .map(|e| {
+                match e {
+                    // Aliased window function: ROW_NUMBER() OVER (...) AS rn
+                    Expr::Alias {
+                        ref name,
+                        expr: ref inner,
+                    } if matches!(inner.as_ref(), Expr::WindowFunc { .. }) => {
+                        let wf_name = name.clone();
+                        let wf_expr = match e {
+                            Expr::Alias { expr, .. } => *expr,
+                            _ => unreachable!(),
+                        };
+                        window_names.push(wf_name.clone());
+                        window_exprs.push(wf_expr);
+                        Expr::Column(Column::new(wf_name))
+                    }
+                    // Bare window function: ROW_NUMBER() OVER (...)
+                    Expr::WindowFunc { .. } => {
+                        let wf_name = e.output_name();
+                        window_names.push(wf_name.clone());
+                        window_exprs.push(e);
+                        Expr::Column(Column::new(wf_name))
+                    }
+                    other => other,
+                }
+            })
+            .collect();
+
+        if !window_exprs.is_empty() {
+            // Build Window node schema = input schema + window output columns
+            let input_schema_for_window = plan.schema();
+            let mut window_schema_fields = input_schema_for_window.fields().to_vec();
+            for (wf_expr, wf_name) in window_exprs.iter().zip(window_names.iter()) {
+                let dt = wf_expr
+                    .data_type(&input_schema_for_window)
+                    .unwrap_or(arrow::datatypes::DataType::Int64);
+                window_schema_fields.push(SchemaField::new(wf_name.clone(), dt));
+            }
+            plan = LogicalPlan::Window(WindowNode {
+                input: Arc::new(plan),
+                window_exprs,
+                output_names: window_names,
+                schema: PlanSchema::new(window_schema_fields),
+            });
+        }
+
         plan = LogicalPlan::Project(ProjectNode {
             input: Arc::new(plan),
-            exprs: proj_exprs,
+            exprs: proj_exprs_final,
             schema: PlanSchema::new(proj_fields),
         });
 
@@ -1535,6 +1584,58 @@ impl<'a> Binder<'a> {
             })
             .collect();
         let args = args?;
+
+        // Check for window function (OVER clause)
+        if let Some(ast::WindowType::WindowSpec(spec)) = &func.over {
+            let window_func = match name.as_str() {
+                "ROW_NUMBER" => Some(WindowFunction::RowNumber),
+                "RANK" => Some(WindowFunction::Rank),
+                "DENSE_RANK" => Some(WindowFunction::DenseRank),
+                "LAG" => Some(WindowFunction::Lag),
+                "LEAD" => Some(WindowFunction::Lead),
+                "SUM" => Some(WindowFunction::Sum),
+                "MIN" => Some(WindowFunction::Min),
+                "MAX" => Some(WindowFunction::Max),
+                "AVG" => Some(WindowFunction::Avg),
+                "COUNT" => Some(WindowFunction::Count),
+                _ => None,
+            };
+
+            if let Some(wf) = window_func {
+                let partition_by: Result<Vec<Expr>> = spec
+                    .partition_by
+                    .iter()
+                    .map(|e| self.bind_expr(e, schema))
+                    .collect();
+                let order_by: Result<Vec<SortExpr>> = spec
+                    .order_by
+                    .iter()
+                    .map(|o| {
+                        let expr = self.bind_expr(&o.expr, schema)?;
+                        let direction = match o.asc {
+                            Some(false) => SortDirection::Desc,
+                            _ => SortDirection::Asc,
+                        };
+                        let nulls = match o.nulls_first {
+                            Some(true) => NullOrdering::NullsFirst,
+                            Some(false) => NullOrdering::NullsLast,
+                            None => NullOrdering::NullsFirst,
+                        };
+                        Ok(SortExpr {
+                            expr,
+                            direction,
+                            nulls,
+                        })
+                    })
+                    .collect();
+                return Ok(Expr::WindowFunc {
+                    func: wf,
+                    args,
+                    partition_by: partition_by?,
+                    order_by: order_by?,
+                });
+            }
+        }
 
         // Check for DISTINCT in function args
         let distinct = match &func.args {

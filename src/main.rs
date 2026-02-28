@@ -74,6 +74,10 @@ enum Commands {
         /// Scale factor (for TPC-H tables)
         #[arg(short, long, default_value = "0.01")]
         sf: f64,
+
+        /// Path to TPC-H Parquet files (if provided, loads from files instead of in-memory)
+        #[arg(long)]
+        tpch_path: Option<PathBuf>,
     },
 
     /// Load Parquet file(s) and run a query
@@ -270,13 +274,35 @@ async fn main() {
             println!("Successful queries: {}/{}", successful, results.len());
         }
 
-        Commands::Sql { query, sf } => {
+        Commands::Sql {
+            query,
+            sf,
+            tpch_path,
+        } => {
             let mut ctx = ExecutionContext::new();
-            let mut gen = TpchGenerator::new(sf);
-            gen.generate_all(&mut ctx);
 
-            println!("Running query: {}", query);
-            println!();
+            if let Some(path) = tpch_path {
+                // Load TPC-H tables from Parquet files
+                let tables = [
+                    "nation", "region", "part", "supplier", "partsupp", "customer", "orders",
+                    "lineitem",
+                ];
+
+                for table in &tables {
+                    let file_path = path.join(format!("{}.parquet", table));
+                    match ctx.register_parquet(*table, &file_path) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            eprintln!("Error loading {}: {}", table, e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            } else {
+                // Generate in-memory TPC-H data
+                let mut gen = TpchGenerator::new(sf);
+                gen.generate_all(&mut ctx);
+            }
 
             match ctx.sql(&query).await {
                 Ok(result) => {
@@ -284,6 +310,7 @@ async fn main() {
                 }
                 Err(e) => {
                     eprintln!("Error: {}", e);
+                    std::process::exit(1);
                 }
             }
         }

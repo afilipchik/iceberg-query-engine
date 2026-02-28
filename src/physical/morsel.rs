@@ -187,7 +187,7 @@ impl ParallelParquetSource {
 
     /// Get work from the queue
     pub fn get_work(&self) -> Option<RowGroupWork> {
-        let mut queue = self.work_queue.lock().unwrap();
+        let mut queue = self.work_queue.lock().expect("work queue lock poisoned");
         queue.pop_front()
     }
 

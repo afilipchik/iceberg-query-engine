@@ -5,7 +5,7 @@ use crate::execution::{ExecutionConfig, SharedMemoryPool};
 use crate::physical::operators::{
     AggregateExpr, ExternalSortExec, FilterExec, HashAggregateExec, HashJoinExec, LimitExec,
     MemoryTableExec, MorselAggregateExec, ProjectExec, SortExec, SpillableHashAggregateExec,
-    SpillableHashJoinExec, SubqueryExecutor, TableProvider, UnionExec,
+    SpillableHashJoinExec, SubqueryExecutor, TableProvider, UnionExec, WindowExec,
 };
 use crate::physical::PhysicalOperator;
 use crate::planner::{BinaryOp, Expr, JoinType, LogicalPlan, PlanSchema};
@@ -1003,6 +1003,71 @@ impl PhysicalPlanner {
                      Ensure the logical plan is correctly structured."
                         .to_string(),
                 ))
+            }
+
+            LogicalPlan::MultiDelimJoin(node) => {
+                // Create physical plan for MultiDelimJoin
+                let left = self.create_physical_plan(&node.left)?;
+
+                // Create shared state for all inner sides
+                let delim_state =
+                    std::sync::Arc::new(crate::physical::operators::DelimState::new());
+
+                // Create physical operators for each inner side
+                let inner_sides: Result<Vec<_>> = node
+                    .inner_sides
+                    .iter()
+                    .map(|inner| self.create_physical_plan_with_delim_state(inner, &delim_state))
+                    .collect();
+
+                let schema = plan_schema_to_arrow(&node.schema);
+
+                let multi_delim_join = crate::physical::operators::MultiDelimJoinExec::new(
+                    left,
+                    inner_sides?,
+                    node.join_types.clone(),
+                    node.delim_columns.clone(),
+                    node.on.clone(),
+                    schema,
+                    delim_state,
+                );
+
+                Ok(Arc::new(multi_delim_join))
+            }
+
+            LogicalPlan::Window(node) => {
+                let input = self.create_physical_plan_inner(&node.input)?;
+                // Build output schema from actual (post-optimization) input schema + window columns.
+                // We cannot use node.schema here because projection pushdown may have stripped
+                // columns from the input that are no longer in the physical input schema.
+                let input_schema = input.schema();
+                let mut fields: Vec<Field> = input_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.as_ref().clone())
+                    .collect();
+                for (wf_expr, col_name) in node.window_exprs.iter().zip(node.output_names.iter()) {
+                    use crate::planner::WindowFunction;
+                    let dt = match wf_expr {
+                        Expr::WindowFunc { func, .. } => match func {
+                            WindowFunction::RowNumber
+                            | WindowFunction::Rank
+                            | WindowFunction::DenseRank
+                            | WindowFunction::Count => arrow::datatypes::DataType::Int64,
+                            _ => arrow::datatypes::DataType::Float64,
+                        },
+                        _ => arrow::datatypes::DataType::Int64,
+                    };
+                    fields.push(Field::new(col_name.as_str(), dt, true));
+                }
+                let output_schema = Arc::new(arrow::datatypes::Schema::new(fields));
+                let exec = WindowExec::new(
+                    input,
+                    node.window_exprs.clone(),
+                    node.output_names.clone(),
+                    output_schema,
+                );
+                Ok(Arc::new(exec))
             }
         }
     }

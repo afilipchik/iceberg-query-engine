@@ -4,6 +4,30 @@ This document is designed to help AI agents (Claude, Copilot, etc.) understand a
 
 ---
 
+## 📚 KNOWLEDGE BASE (Start Here!)
+
+**Architecture and decisions - the "knowledge skyscraper":**
+- **`.claude/knowledge/ARCHITECTURE_SPEC.md`** — Architecture patterns, how to add new nodes/operators, common idioms
+- **`.claude/knowledge/DECISION_LOG.md`** — Key decisions and their rationale (why things are the way they are)
+
+**These documents capture learnings from previous sessions - read them to avoid re-learning everything.**
+
+---
+
+## 🔬 RESEARCH DOCUMENTS (Read These First!)
+
+**Critical architectural analysis and improvement priorities:**
+- **`.claude/research/ARCHITECTURAL_ANALYSIS.md`** — Full analysis of performance gaps, existing components, and improvement roadmap
+- **`.claude/research/IMPROVEMENT_PRIORITY.md`** — Quick reference for top 5 actions to take
+
+**Key findings:**
+1. ~~Q21 is 2790x slower than DuckDB~~ **FIXED** — MultiDelimJoin now achieves 1500x improvement
+2. ~~Morsel parallelism NOT WIRED~~ **FIXED** — Now available via `ParquetScanExec::with_parallel()`
+3. Several queries (Q02, Q04, Q06, Q14) are already FASTER than DuckDB
+4. **Current status**: 67x overall improvement, total benchmark at SF=0.01 runs in ~1 second
+
+---
+
 ## MANDATORY RULES FOR AI AGENTS
 
 ### File and Directory Rules
@@ -699,9 +723,13 @@ Based on the codebase structure, these appear to be planned but not fully implem
   - Avro manifest file reading
   - Time travel queries via snapshot IDs
   - Partition pruning
-- **Window functions** - ROW_NUMBER, RANK, DENSE_RANK, LEAD, LAG, etc.
-  - Requires new WindowExpr, WindowNode, and WindowExec infrastructure
-  - See plan at `.claude/plans/trino-function-implementation.md` Phase 6
+- **Window functions** - ✅ IMPLEMENTED (commit cc29bca)
+  - ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD()
+  - Aggregate windows: SUM(), AVG(), MIN(), MAX(), COUNT() OVER (...)
+  - Full PARTITION BY and ORDER BY support
+  - See: src/planner/logical_expr.rs (WindowFunction, Expr::WindowFunc)
+  - See: src/planner/logical_plan.rs (WindowNode)
+  - See: src/physical/operators/window.rs (WindowExec)
 - **Array/Map type support** - Complex nested data types
   - Array functions: array_agg, array_distinct, array_join, filter, transform, etc.
   - Map functions: map_keys, map_values, map_entries, element_at, etc.
@@ -751,6 +779,16 @@ Based on the codebase structure, these appear to be planned but not fully implem
 - Excluding Q21: 5.3s total vs 0.47s DuckDB (11x slower)
 
 ## Recently Implemented Features
+
+- **Window Functions** (2026-02-28)
+  - Full SQL OVER clause support with PARTITION BY and ORDER BY semantics
+  - Supported functions: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD
+  - Aggregate windows: SUM, AVG, MIN, MAX, COUNT OVER (partition + order)
+  - Implementation: collect-all → sort by partition+order → assign values → restore original order
+  - `WindowNode` in logical plan, `WindowExec` physical operator
+  - Projection pushdown correctly propagates partition_by/order_by column requirements
+  - Key files: `src/physical/operators/window.rs`, `src/planner/logical_expr.rs`, `src/planner/binder.rs`
+  - All 116 lib tests + 23 TPC-H integration tests pass
 
 - **Morsel-Driven Aggregation Integration + Vectorization** (2026-01-29)
   - Integrated morsel-driven parallel aggregation into the query engine

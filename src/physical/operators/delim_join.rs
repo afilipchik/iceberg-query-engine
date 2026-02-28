@@ -42,18 +42,27 @@ impl DelimState {
 
     /// Set the distinct values (called by DelimJoinExec after collecting outer side)
     pub fn set_distinct_values(&self, batch: RecordBatch, schema: SchemaRef) {
-        *self.distinct_values.write().unwrap() = Some(batch);
-        *self.schema.write().unwrap() = Some(schema);
+        *self
+            .distinct_values
+            .write()
+            .expect("distinct_values write lock poisoned") = Some(batch);
+        *self.schema.write().expect("schema write lock poisoned") = Some(schema);
     }
 
     /// Get the distinct values (called by DelimGetExec during execution)
     pub fn get_distinct_values(&self) -> Option<RecordBatch> {
-        self.distinct_values.read().unwrap().clone()
+        self.distinct_values
+            .read()
+            .expect("distinct_values read lock poisoned")
+            .clone()
     }
 
     /// Get the schema
     pub fn get_schema(&self) -> Option<SchemaRef> {
-        self.schema.read().unwrap().clone()
+        self.schema
+            .read()
+            .expect("schema read lock poisoned")
+            .clone()
     }
 }
 
@@ -254,6 +263,234 @@ impl PhysicalOperator for DelimGetExec {
 
         Ok(Box::pin(stream::once(async move { Ok(batch) })))
     }
+}
+
+/// MultiDelimJoinExec - Physical operator for MultiDelimJoin
+///
+/// Executes multiple EXISTS/NOT EXISTS checks using shared distinct values.
+/// This is the key optimization for Q21-style queries with multiple correlated subqueries.
+#[derive(Debug)]
+pub struct MultiDelimJoinExec {
+    /// Left input (outer query)
+    left: Arc<dyn PhysicalOperator>,
+    /// Inner sides - one per EXISTS/NOT EXISTS
+    inner_sides: Vec<Arc<dyn PhysicalOperator>>,
+    /// Join type for each inner side (Semi for EXISTS, Anti for NOT EXISTS)
+    join_types: Vec<JoinType>,
+    /// Columns to deduplicate from outer side
+    delim_columns: Vec<Expr>,
+    /// Join conditions (outer_col, inner_col)
+    on: Vec<(Expr, Expr)>,
+    /// Output schema
+    schema: SchemaRef,
+    /// Shared state with DelimGet nodes in inner sides
+    delim_state: Arc<DelimState>,
+}
+
+impl MultiDelimJoinExec {
+    pub fn new(
+        left: Arc<dyn PhysicalOperator>,
+        inner_sides: Vec<Arc<dyn PhysicalOperator>>,
+        join_types: Vec<JoinType>,
+        delim_columns: Vec<Expr>,
+        on: Vec<(Expr, Expr)>,
+        schema: SchemaRef,
+        delim_state: Arc<DelimState>,
+    ) -> Self {
+        Self {
+            left,
+            inner_sides,
+            join_types,
+            delim_columns,
+            on,
+            schema,
+            delim_state,
+        }
+    }
+}
+
+#[async_trait]
+impl PhysicalOperator for MultiDelimJoinExec {
+    fn name(&self) -> &str {
+        "MultiDelimJoinExec"
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn children(&self) -> Vec<Arc<dyn PhysicalOperator>> {
+        let mut children = vec![Arc::clone(&self.left)];
+        for inner in &self.inner_sides {
+            children.push(Arc::clone(inner));
+        }
+        children
+    }
+
+    fn output_partitions(&self) -> usize {
+        1 // MultiDelimJoin materializes everything, outputs single partition
+    }
+
+    async fn execute(&self, _partition: usize) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+        // Step 1: Collect all rows from the outer side
+        let mut outer_batches = Vec::new();
+        let outer_stream = self.left.execute(0).await?;
+        let collected: Vec<Result<RecordBatch>> = outer_stream.collect().await;
+        for batch_result in collected {
+            outer_batches.push(batch_result?);
+        }
+
+        if outer_batches.is_empty() {
+            return Ok(Box::pin(stream::empty()));
+        }
+
+        // Step 2: Extract distinct correlation values
+        let distinct_batch =
+            extract_distinct_values(&outer_batches, &self.delim_columns, &self.on)?;
+
+        // Step 3: Store in shared state for DelimGet to use
+        self.delim_state
+            .set_distinct_values(distinct_batch.clone(), distinct_batch.schema());
+
+        // Step 4: Execute each inner side and build hash tables
+        let mut match_sets: Vec<hashbrown::HashSet<u64>> = Vec::new();
+
+        for inner_op in &self.inner_sides {
+            let mut inner_batches = Vec::new();
+            let inner_stream = inner_op.execute(0).await?;
+            let collected: Vec<Result<RecordBatch>> = inner_stream.collect().await;
+            for batch_result in collected {
+                inner_batches.push(batch_result?);
+            }
+
+            // Build hash set of matching correlation keys
+            let matches = build_match_hash_set(&inner_batches, &self.on)?;
+            match_sets.push(matches);
+        }
+
+        // Step 5: Filter outer rows based on all conditions
+        // A row passes if:
+        // - For Semi joins (EXISTS): the key is in the corresponding match set
+        // - For Anti joins (NOT EXISTS): the key is NOT in the corresponding match set
+        let result_batches = filter_multi_delim(
+            &outer_batches,
+            &self.delim_columns,
+            &match_sets,
+            &self.join_types,
+            &self.on,
+            &self.schema,
+        )?;
+
+        Ok(Box::pin(stream::iter(result_batches.into_iter().map(Ok))))
+    }
+}
+
+/// Build a hash set of correlation keys from inner batches
+fn build_match_hash_set(
+    batches: &[RecordBatch],
+    on: &[(Expr, Expr)],
+) -> Result<hashbrown::HashSet<u64>> {
+    let mut matches = hashbrown::HashSet::new();
+
+    for batch in batches {
+        // Get the inner column (second element of each pair)
+        for (_, inner_expr) in on {
+            if let Expr::Column(col) = inner_expr {
+                // Find the column in the batch
+                for (i, field) in batch.schema().fields().iter().enumerate() {
+                    if field.name() == &col.name || field.name().ends_with(&col.name) {
+                        let array = batch.column(i);
+                        // Hash each value and add to set
+                        for row_idx in 0..array.len() {
+                            let hash = compute_array_hash(array, row_idx);
+                            matches.insert(hash);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(matches)
+}
+
+/// Compute a hash for a single array value (wrapper around existing function)
+fn compute_array_hash(array: &dyn Array, row_idx: usize) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    hash_array_value(array, row_idx, &mut hasher);
+    hasher.finish()
+}
+
+/// Filter outer rows based on multiple EXISTS/NOT EXISTS conditions
+fn filter_multi_delim(
+    outer_batches: &[RecordBatch],
+    delim_columns: &[Expr],
+    match_sets: &[hashbrown::HashSet<u64>],
+    join_types: &[JoinType],
+    on: &[(Expr, Expr)],
+    schema: &SchemaRef,
+) -> Result<Vec<RecordBatch>> {
+    let mut result_batches = Vec::new();
+
+    for batch in outer_batches {
+        // Compute hash for each row's correlation columns
+        let mut keep_mask = vec![true; batch.num_rows()];
+
+        // Get the outer column values and hash them
+        for (inner_idx, (matches, join_type)) in
+            match_sets.iter().zip(join_types.iter()).enumerate()
+        {
+            // Get the outer column expression
+            if let Some((outer_expr, _)) = on.get(inner_idx).or(on.first()) {
+                if let Expr::Column(col) = outer_expr {
+                    // Find the column in the batch
+                    for (i, field) in batch.schema().fields().iter().enumerate() {
+                        if field.name() == &col.name || field.name().ends_with(&col.name) {
+                            let array = batch.column(i);
+                            for row_idx in 0..array.len() {
+                                if !keep_mask[row_idx] {
+                                    continue; // Already filtered out
+                                }
+                                let hash = compute_array_hash(array, row_idx);
+                                let is_match = matches.contains(&hash);
+
+                                // For Semi (EXISTS): keep if match
+                                // For Anti (NOT EXISTS): keep if NOT match
+                                let should_keep = match join_type {
+                                    JoinType::Semi => is_match,
+                                    JoinType::Anti => !is_match,
+                                    _ => true,
+                                };
+
+                                if !should_keep {
+                                    keep_mask[row_idx] = false;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Apply the filter mask
+        let keep_array = BooleanArray::from(keep_mask);
+        let filtered_columns: Vec<ArrayRef> = batch
+            .columns()
+            .iter()
+            .map(|col| compute::filter(col, &keep_array).unwrap())
+            .collect();
+
+        if !filtered_columns.is_empty() && filtered_columns[0].len() > 0 {
+            let filtered_batch = RecordBatch::try_new(Arc::clone(schema), filtered_columns)?;
+            result_batches.push(filtered_batch);
+        }
+    }
+
+    Ok(result_batches)
 }
 
 // Helper functions

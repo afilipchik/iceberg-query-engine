@@ -261,6 +261,15 @@ impl CostEstimator {
                     column_stats: vec![],
                 }
             }
+            LogicalPlan::MultiDelimJoin(node) => {
+                // MultiDelimJoin - estimate based on left side (Semi/Anti preserves outer schema)
+                self.estimate_statistics(&node.left)
+            }
+
+            LogicalPlan::Window(node) => {
+                // Window preserves the same number of rows as input (adds columns)
+                self.estimate_statistics(&node.input)
+            }
         }
     }
 
@@ -384,6 +393,42 @@ impl CostEstimator {
             LogicalPlan::DelimGet(_) => {
                 // DelimGet is a source that receives data from parent - minimal cost
                 Cost::new(row_count * 0.1, 0.0, row_count * 8.0)
+            }
+            LogicalPlan::MultiDelimJoin(node) => {
+                // MultiDelimJoin cost = left cost + sum of inner costs + join costs
+                let left_stats = self.estimate_statistics(&node.left);
+                let left_rows = left_stats.row_count.unwrap_or(self.default_row_count) as f64;
+                let left_cost = self.estimate(&node.left);
+
+                let mut total_inner_cost = Cost::default();
+                for inner in &node.inner_sides {
+                    total_inner_cost = total_inner_cost + self.estimate(inner);
+                }
+
+                // Each inner side is a hash join (Semi or Anti)
+                let num_inner = node.inner_sides.len().max(1) as f64;
+                left_cost
+                    + total_inner_cost
+                    + Cost::new(
+                        left_rows * num_inner * self.hash_join_probe_cost,
+                        0.0,
+                        left_rows * 16.0 * num_inner,
+                    )
+            }
+
+            LogicalPlan::Window(node) => {
+                // Window requires collecting and sorting all rows - O(n log n) cost
+                let input_cost = self.estimate(&node.input);
+                let input_rows = self
+                    .estimate_statistics(&node.input)
+                    .row_count
+                    .unwrap_or(self.default_row_count) as f64;
+                input_cost
+                    + Cost::new(
+                        input_rows * self.sort_cost_per_row * (input_rows.ln().max(1.0)),
+                        0.0,
+                        input_rows * 16.0,
+                    )
             }
         }
     }

@@ -2,7 +2,7 @@
 //!
 //! This rule reorders joins to avoid Cartesian products by ensuring every join
 //! has at least one equality condition. It builds a join graph and finds an
-//! ordering that minimizes intermediate result sizes.
+//! ordering that minimizes intermediate result sizes using cardinality estimates.
 
 use crate::error::Result;
 use crate::optimizer::OptimizerRule;
@@ -47,7 +47,7 @@ impl OptimizerRule for JoinReorder {
     }
 }
 
-/// Represents a table/scan in the join graph
+/// Represents a table/scan in the join graph with cardinality estimate
 #[derive(Debug, Clone)]
 struct JoinRelation {
     plan: LogicalPlan,
@@ -214,6 +214,8 @@ impl JoinReorder {
             Expr::Column(_) | Expr::Literal(_) | Expr::Wildcard | Expr::QualifiedWildcard(_) => {
                 Ok(expr.clone())
             }
+            // Window expressions are opaque to join reordering
+            Expr::WindowFunc { .. } => Ok(expr.clone()),
         }
     }
 
@@ -365,6 +367,34 @@ impl JoinReorder {
             }
 
             LogicalPlan::DelimGet(node) => Ok(LogicalPlan::DelimGet(node.clone())),
+            LogicalPlan::MultiDelimJoin(node) => {
+                // Recursively optimize the left side and all inner sides
+                let left = self.optimize(&node.left)?;
+                let inner_sides: Result<Vec<_>> = node
+                    .inner_sides
+                    .iter()
+                    .map(|inner| self.optimize(inner).map(Arc::new))
+                    .collect();
+                Ok(LogicalPlan::MultiDelimJoin(
+                    crate::planner::MultiDelimJoinNode {
+                        left: Arc::new(left),
+                        inner_sides: inner_sides?,
+                        join_types: node.join_types.clone(),
+                        delim_columns: node.delim_columns.clone(),
+                        on: node.on.clone(),
+                        schema: node.schema.clone(),
+                    },
+                ))
+            }
+            LogicalPlan::Window(node) => {
+                let input = self.reorder(&node.input)?;
+                Ok(LogicalPlan::Window(crate::planner::WindowNode {
+                    input: Arc::new(input),
+                    window_exprs: node.window_exprs.clone(),
+                    output_names: node.output_names.clone(),
+                    schema: node.schema.clone(),
+                }))
+            }
         }
     }
 

@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Query Engine Architecture Study Guide</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: #f5f5f5;
+        }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        h1 { color: #2c3e50; margin-bottom: 20px; }
+        h2 { color: #34495e; margin: 30px 0 15px; border-bottom: 2px solid #3498db; padding-bottom: 10px; }
+        h3 { color: #7f8c8d; margin: 20px 0 10px; }
+        .card {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 15px 0;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .insight {
+            background: #e8f4f8;
+            border-left: 4px solid #3498db;
+            padding: 15px;
+            margin: 15px 0;
+        }
+        .warning {
+            background: #fdf2f2;
+            border-left: 4px solid #e74c3c;
+            padding: 15px;
+            margin: 15px 0;
+        }
+        .success {
+            background: #e8f8e8;
+            border-left: 4px solid #27ae60;
+            padding: 15px;
+            margin: 15px 0;
+        }
+        table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background: #3498db; color: white; }
+        tr:hover { background: #f5f5f5; }
+        code { background: #f4f4f4; padding: 2px 6px; border-radius: 4px; font-family: 'Fira Code', monospace; }
+        pre { background: #2c3e50; color: #ecf0f1; padding: 15px; border-radius: 8px; overflow-x: auto; }
+        .phase {
+            border: 2px solid #3498db;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+            position: relative;
+        }
+        .phase::before {
+            content: attr(data-phase);
+            position: absolute;
+            top: -12px;
+            left: 20px;
+            background: #3498db;
+            color: white;
+            padding: 2px 10px;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        .dependency-graph {
+            background: #2c3e50;
+            padding: 20px;
+            border-radius: 8px;
+            color: #ecf0f1;
+            font-family: monospace;
+            white-space: pre;
+            overflow-x: auto;
+        }
+        .roi-high { color: #27ae60; font-weight: bold; }
+        .roi-medium { color: #f39c12; font-weight: bold; }
+        .roi-low { color: #95a5a6; }
+        .nav {
+            background: #2c3e50;
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+        }
+        .nav a { color: #ecf0f1; margin-right: 20px; text-decoration: none; }
+        .nav a:hover { color: #3498db; }
+        .interactive { cursor: pointer; }
+        .interactive:hover { background: #f0f0f0; }
+        .hidden { display: none; }
+        .tag {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            margin: 2px;
+        }
+        .tag-bug { background: #e74c3c; color: white; }
+        .tag-perf { background: #3498db; color: white; }
+        .tag-opt { background: #9b59b6; color: white; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚀 Query Engine Architecture Study Guide</h1>
+
+        <nav class="nav">
+            <a href="#overview">Overview</a>
+            <a href="#bugs">Bugs</a>
+            <a href="#dependencies">Dependencies</a>
+            <a href="#roi">ROI Order</a>
+            <a href="#lessons">Lessons</a>
+        </nav>
+
+        <!-- SECTION: Overview -->
+        <section id="overview">
+            <h2>📖 Overview: The Big Picture</h2>
+
+            <div class="card">
+                <h3>What Are We Building?</h3>
+                <p>A high-performance SQL query engine in Rust that processes columnar data (Apache Arrow) and targets TPC-H benchmark performance comparable to DuckDB.</p>
+
+                <div class="insight">
+                    <strong>🎓 Key Insight:</strong> We're currently 136x slower than DuckDB overall, but this is dominated by a single query (Q21 at 2790x). Fix Q21, and we drop to 11x slower. That's the power of understanding your bottleneck.
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>The Query Processing Pipeline</h3>
+                <pre>
+SQL String
+    │
+    ▼
+┌─────────────────┐
+│     Parser      │  ← sqlparser-rs (ANTLR equivalent)
+└────────┬────────┘
+         │ AST
+         ▼
+┌─────────────────┐
+│     Binder      │  ← Resolves table/column names
+└────────┬────────┘
+         │ LogicalPlan
+         ▼
+┌─────────────────┐
+│    Optimizer    │  ← Predicate pushdown, join reordering
+└────────┬────────┘
+         │ Optimized Plan
+         ▼
+┌─────────────────┐
+│Physical Planner │  ← Choose execution algorithms
+└────────┬────────┘
+         │ PhysicalOperator tree
+         ▼
+┌─────────────────┐
+│   Execution     │  ← Streaming async operators
+└────────┬────────┘
+         │ RecordBatch stream
+         ▼
+    Results
+                </pre>
+            </div>
+        </section>
+
+        <!-- SECTION: Bugs -->
+        <section id="bugs">
+            <h2>🐛 Layer 0: Bugs & Foundation</h2>
+
+            <div class="warning">
+                <strong>⚠️ Critical Rule:</strong> Fix bugs BEFORE optimizations. Optimizing buggy code doesn't make bugs faster—it makes them harder to find and more damaging when they hit.
+            </div>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Issue</th>
+                        <th>Impact</th>
+                        <th>Blocks</th>
+                        <th>Fix</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr class="interactive" onclick="toggleDetails('b1')">
+                        <td><span class="tag tag-bug">B1</span></td>
+                        <td>Lock <code>.unwrap()</code> panics</td>
+                        <td>Runtime crashes</td>
+                        <td>All parallel work</td>
+                        <td>Replace with <code>expect()</code></td>
+                    </tr>
+                    <tr id="b1-details" class="hidden">
+                        <td colspan="5">
+                            <div class="insight">
+                                <strong>🎓 Why This Matters:</strong><br>
+                                When a thread panics while holding a lock, the lock becomes "poisoned." Any subsequent <code>.lock().unwrap()</code> will panic, cascading the failure. In parallel code, this can bring down the entire query.<br><br>
+                                <strong>Locations:</strong> <code>morsel.rs:176</code>, <code>vectorized_agg.rs:242</code>, <code>delim_join.rs:45-56</code>
+                            </div>
+                        </td>
+                    </tr>
+                    <tr class="interactive" onclick="toggleDetails('b2')">
+                        <td><span class="tag tag-bug">B2</span></td>
+                        <td>Spilling disabled</td>
+                        <td>Can't handle >memory</td>
+                        <td>SF10+ benchmarks</td>
+                        <td>Debug and re-enable</td>
+                    </tr>
+                    <tr id="b2-details" class="hidden">
+                        <td colspan="5">
+                            <div class="insight">
+                                <strong>🎓 Spilling Explained:</strong><br>
+                                When data exceeds memory, operators must "spill" to disk and merge later. This is disabled in <code>memory.rs:222</code> with comment "until bugs are fixed." Without it, SF10 queries will OOM crash.
+                            </div>
+                        </td>
+                    </tr>
+                    <tr class="interactive" onclick="toggleDetails('b3')">
+                        <td><span class="tag tag-bug">B3</span></td>
+                        <td>Parquet reads ALL columns</td>
+                        <td>Wasted I/O</td>
+                        <td>Row-group filtering</td>
+                        <td>Implement ProjectionMask</td>
+                    </tr>
+                    <tr id="b3-details" class="hidden">
+                        <td colspan="5">
+                            <div class="insight">
+                                <strong>🎓 Column Projection:</strong><br>
+                                If a query only needs 3 columns but the table has 50, we're reading 47 unnecessary columns. The TODO is at <code>parquet.rs:104</code>. Parquet supports <code>ProjectionMask</code> to read only needed columns—this is a 10-50% win before any algorithmic changes.
+                            </div>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td><span class="tag tag-bug">B4</span></td>
+                        <td><code>.bak</code> file with Q21 code</td>
+                        <td>Confusion, lost work</td>
+                        <td>Q21 fix</td>
+                        <td>Merge or delete</td>
+                    </tr>
+                    <tr>
+                        <td><span class="tag tag-bug">B5</span></td>
+                        <td>LIMIT bug (#11)</td>
+                        <td>Wrong results</td>
+                        <td>Benchmark validity</td>
+                        <td>Investigate limit.rs</td>
+                    </tr>
+                </tbody>
+            </table>
+        </section>
+
+        <!-- SECTION: Dependencies -->
+        <section id="dependencies">
+            <h2>🔗 Dependency Graph</h2>
+
+            <div class="card">
+                <h3>Why Dependencies Matter</h3>
+                <p>Changes aren't independent. Some require others first. Some multiply benefits when combined. Understanding this prevents wasted effort.</p>
+
+                <div class="dependency-graph">
+Layer 0: Bugs (Foundation)
+    │
+    ├── B1: Fix lock panics ──────────────────┐
+    │                                          │
+    │                                          ▼
+Layer 1: I/O                           Layer 2: Parallelism
+    │                                          │
+    ├── B3: ProjectionMask ◄───────┐    ┌─────P1: Wire Morsel
+    │        │                     │    │         │
+    │        ▼                     │    │         │
+    │   P2: Row-group filtering ◄──┘    │         │
+    │        │                          │         │
+    │        └──────────────────────────┼─────────┘
+    │                                   │
+    ▼                                   ▼
+Layer 3: Query Optimization
+    │
+    ├── Q1: Complete DelimJoin ◄── B4: Merge .bak
+    │        │
+    │        ▼
+    └── Q2: Multi-way join fix
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>Interaction Types</h3>
+                <table>
+                    <tr>
+                        <th>Type</th>
+                        <th>Symbol</th>
+                        <th>Meaning</th>
+                        <th>Example</th>
+                    </tr>
+                    <tr>
+                        <td class="roi-high">Additive</td>
+                        <td>✅</td>
+                        <td>Benefits multiply</td>
+                        <td>Morsel + Row-group = 4x × 2x = 8x</td>
+                    </tr>
+                    <tr>
+                        <td class="roi-medium">Depends</td>
+                        <td>⚠️</td>
+                        <td>Must do dependency first</td>
+                        <td>Can't do row-group without ProjectionMask</td>
+                    </tr>
+                    <tr>
+                        <td class="roi-medium">Parallel</td>
+                        <td>⚠️</td>
+                        <td>Need to coordinate threading</td>
+                        <td>Morsel + Dictionary both use threading</td>
+                    </tr>
+                    <tr>
+                        <td class="roi-low">Independent</td>
+                        <td>—</td>
+                        <td>No interaction</td>
+                        <td>DelimJoin and Dictionary don't interact</td>
+                    </tr>
+                </table>
+            </div>
+        </section>
+
+        <!-- SECTION: ROI -->
+        <section id="roi">
+            <h2>📊 True ROI (Accounting for Dependencies)</h2>
+
+            <div class="insight">
+                <strong>🎓 ROI Calculation:</strong> Raw ROI × Dependency Factor = True ROI<br>
+                If something has 10x raw ROI but depends on a 2-day fix, its true ROI is discounted by the dependency cost.
+            </div>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Rank</th>
+                        <th>Change</th>
+                        <th>Raw ROI</th>
+                        <th>Dependencies</th>
+                        <th>True ROI</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>1</td>
+                        <td><strong>Q1: Complete DelimJoin</strong></td>
+                        <td class="roi-high">12x</td>
+                        <td>B4 cleanup</td>
+                        <td class="roi-high">10x</td>
+                    </tr>
+                    <tr>
+                        <td>2</td>
+                        <td><strong>P1: Wire Morsel</strong></td>
+                        <td class="roi-high">4-8x</td>
+                        <td>B1 fix locks</td>
+                        <td class="roi-high">5x</td>
+                    </tr>
+                    <tr>
+                        <td>3</td>
+                        <td><strong>P2: Row-group filtering</strong></td>
+                        <td class="roi-medium">2-5x</td>
+                        <td>P3 ProjectionMask</td>
+                        <td class="roi-medium">3x</td>
+                    </tr>
+                    <tr>
+                        <td>4</td>
+                        <td><strong>P3: ProjectionMask</strong></td>
+                        <td class="roi-medium">1.5-2x</td>
+                        <td>None</td>
+                        <td class="roi-medium">2x</td>
+                    </tr>
+                    <tr>
+                        <td>5</td>
+                        <td><strong>B1: Fix lock panics</strong></td>
+                        <td>Safety</td>
+                        <td>None</td>
+                        <td><strong>Required</strong></td>
+                    </tr>
+                    <tr>
+                        <td>6</td>
+                        <td><strong>Q2: Multi-way joins</strong></td>
+                        <td class="roi-medium">2-5x</td>
+                        <td>P1, P2, Q1</td>
+                        <td class="roi-medium">5x (compound)</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <div class="phase" data-phase="Phase 0: Foundation (1-2 days)">
+                <h3>Required Before Anything Else</h3>
+                <ul>
+                    <li><span class="tag tag-bug">B1</span> Fix lock panics → <strong>Required for P1</strong></li>
+                    <li><span class="tag tag-bug">B3</span> ProjectionMask → <strong>Required for P2</strong></li>
+                    <li><span class="tag tag-bug">B4</span> Merge/delete .bak → <strong>Required for Q1</strong></li>
+                    <li><span class="tag tag-bug">B5</span> Fix LIMIT bug → <strong>Required for correctness</strong></li>
+                </ul>
+            </div>
+
+            <div class="phase" data-phase="Phase 1: I/O (2-3 days)">
+                <h3>Reduce Data Movement</h3>
+                <ul>
+                    <li><span class="tag tag-perf">P3</span> Column projection</li>
+                    <li><span class="tag tag-perf">P2</span> Row-group filtering (after P3)</li>
+                </ul>
+            </div>
+
+            <div class="phase" data-phase="Phase 2: Parallelism (3-5 days)">
+                <h3>Use All Cores</h3>
+                <ul>
+                    <li><span class="tag tag-perf">P1</span> Wire morsel parallelism</li>
+                </ul>
+            </div>
+
+            <div class="phase" data-phase="Phase 3: Query Opt (5-7 days)">
+                <h3>Fix the Big Bottlenecks</h3>
+                <ul>
+                    <li><span class="tag tag-opt">Q1</span> Complete DelimJoin → <strong>12x overall</strong></li>
+                    <li><span class="tag tag-opt">Q2</span> Multi-way join fix</li>
+                </ul>
+            </div>
+        </section>
+
+        <!-- SECTION: Lessons -->
+        <section id="lessons">
+            <h2>🎓 Lessons Learned</h2>
+
+            <div class="success">
+                <h3>Lesson 1: Dependencies Matter</h3>
+                <p>Can't safely parallelize with panicking locks. The dependency graph tells you what order to do things.</p>
+            </div>
+
+            <div class="success">
+                <h3>Lesson 2: Chains Compound</h3>
+                <p>ProjectionMask → Row-group → Joins = multiplicative gains. If each step gives 2x, the chain gives 8x (2³).</p>
+            </div>
+
+            <div class="success">
+                <h3>Lesson 3: Fix Bottlenecks, Not Everything</h3>
+                <p>Q21 alone is 92% of total time. Fixing it gives 12x overall improvement. This is better than ten 20% improvements.</p>
+            </div>
+
+            <div class="success">
+                <h3>Lesson 4: Verify Continuously</h3>
+                <p>After each change: run tests, run TPC-H, compare to baseline. Catch regressions early when they're cheap to fix.</p>
+            </div>
+
+            <div class="card">
+                <h3>The Compound Effect Formula</h3>
+                <pre>
+If improvements are ADDITIVE:
+    Total = Sum of individual improvements
+
+If improvements are MULTIPLICATIVE (independent):
+    Total = Product of individual improvements
+
+Example:
+    P1 (4x) × P2 (2x) × Q1 (10x) = 80x (if independent)
+    But P2 depends on P1, so:
+    P1 (4x) × P2 (2x) = 8x chain, then Q1 (10x) = 80x total
+                </pre>
+            </div>
+        </section>
+
+        <!-- Footer -->
+        <footer style="text-align: center; margin-top: 40px; color: #7f8c8d;">
+            <p>Generated: 2026-02-12 | <a href="../decisions/IMPACT_ANALYSIS.md">View Source</a></p>
+        </footer>
+    </div>
+
+    <script>
+        function toggleDetails(id) {
+            const details = document.getElementById(id + '-details');
+            if (details) {
+                details.classList.toggle('hidden');
+            }
+        }
+
+        // Add keyboard navigation
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                document.querySelectorAll('.hidden').forEach(el => {
+                    if (el.id.endsWith('-details')) {
+                        el.classList.add('hidden');
+                    }
+                });
+            }
+        });
+    </script>
+</body>
+</html>
