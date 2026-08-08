@@ -1516,6 +1516,15 @@ impl<'a> Binder<'a> {
     fn bind_function(&mut self, func: &ast::Function, schema: &PlanSchema) -> Result<Expr> {
         let name = func.name.to_string().to_uppercase();
 
+        // Window functions are not supported. Without this check, SUM(x) OVER (...)
+        // would silently bind as a plain aggregate and return wrong results.
+        if func.over.is_some() {
+            return Err(QueryError::NotImplemented(format!(
+                "Window functions ({} OVER ...)",
+                name
+            )));
+        }
+
         // Extract arguments from the FunctionArguments
         let func_args: Vec<&ast::FunctionArg> = match &func.args {
             ast::FunctionArguments::None => vec![],

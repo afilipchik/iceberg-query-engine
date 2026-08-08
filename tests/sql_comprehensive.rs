@@ -1436,8 +1436,27 @@ mod complex_queries {
             FROM users
         "#;
         let result = ctx.sql(sql).await;
-        // Window functions might not be implemented yet
-        let _ = result;
+        // Window functions are not implemented. The binder must reject them
+        // explicitly — silently binding OVER(...) as a plain aggregate would
+        // return wrong results.
+        let err = result.expect_err("window functions must be rejected, not silently mis-bound");
+        assert!(
+            err.to_string().contains("Window functions"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_over_rejected() {
+        let ctx = create_test_context();
+        let result = ctx
+            .sql("SELECT SUM(age) OVER (PARTITION BY active) FROM users")
+            .await;
+        let err = result.expect_err("SUM(x) OVER (...) must be rejected, not silently mis-bound");
+        assert!(
+            err.to_string().contains("Window functions"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
