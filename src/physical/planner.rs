@@ -416,11 +416,27 @@ impl PhysicalPlanner {
 
         // Build scan tasks: only prescan tables that are accessed 2+ times.
         // Single-use tables will be read on-demand, reducing peak memory.
+        // Large tables are ALSO skipped: their scans stay lazy/streaming
+        // where runtime join filters can prune decode at the parquet layer,
+        // and morsel aggregation reads the files directly regardless — the
+        // shared decode was frequently pure waste (Q17 decoded 60M lineitem
+        // rows into cache while both consumers needed ~66K of them).
+        const PRESCAN_MAX_BYTES: u64 = 400_000_000;
         let scan_tasks: Vec<_> = table_scans
             .iter()
             .filter(|(_, projections)| projections.len() > 1) // Only shared tables
             .filter_map(|(table_name, projections)| {
                 let provider = self.tables.get(table_name)?;
+                if let Some(files) = provider.parquet_files() {
+                    let total: u64 = files
+                        .iter()
+                        .filter_map(|f| std::fs::metadata(f).ok())
+                        .map(|m| m.len())
+                        .sum();
+                    if total > PRESCAN_MAX_BYTES {
+                        return None;
+                    }
+                }
                 let proj = Self::union_projection(projections);
                 Some((table_name.clone(), provider.clone(), proj))
             })
