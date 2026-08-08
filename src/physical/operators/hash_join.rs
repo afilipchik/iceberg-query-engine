@@ -462,10 +462,14 @@ impl PhysicalOperator for HashJoinExec {
                 };
                 if timing {
                     eprintln!(
-                        "[hj] build drain: {} rows, {} batches; vht build: {:?}",
+                        "[hj] build drain: {} rows, {} batches; vht build: {:?}; vht={} build_keys={:?} on={:?} swapped={}",
                         total_build_rows,
                         build_batches.len(),
-                        t_vht.elapsed()
+                        t_vht.elapsed(),
+                        vectorized_ht.is_some(),
+                        build_keys.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
+                        self.on.iter().map(|(l, r)| format!("{}={}", l, r)).collect::<Vec<_>>(),
+                        swapped
                     );
                 }
 

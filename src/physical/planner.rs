@@ -854,16 +854,14 @@ impl PhysicalPlanner {
             }
 
             LogicalPlan::Join(node) => {
-                // For Inner joins, swap build/probe sides so smaller side is the build side.
-                // The left side of HashJoinExec is the build side (builds the hash table).
-                let should_swap = matches!(node.join_type, JoinType::Inner) && {
-                    let left_rows = self.estimate_output_rows(&node.left);
-                    let right_rows = self.estimate_output_rows(&node.right);
-                    match (left_rows, right_rows) {
-                        (Some(l), Some(r)) => l > r * 2, // Swap if left is 2x larger
-                        _ => false,
-                    }
-                };
+                // Trust the optimizer's orientation for Inner joins: both the
+                // DPsize enumerator and the greedy fallback deliberately place
+                // the intended build side LEFT using footer statistics. The
+                // planner's own estimate_output_rows() guesses join outputs as
+                // max(l,r)/10, and re-swapping based on that undid the
+                // optimizer's choice (Q09: re-swapped an 8M-row partsupp build
+                // into a 133M-row intermediate build -> 65GB peak).
+                let should_swap = false;
 
                 // For Left/Semi/Anti joins, we can't swap children (it would change semantics),
                 // but we CAN build the hash table from the right (smaller) side.

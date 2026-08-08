@@ -695,19 +695,25 @@ impl JoinReorder {
             .map(|rel| self.estimate_base_rows(rel))
             .collect();
 
-        // Per-condition equi-join selectivity: 1 / max(ndv_left, ndv_right).
-        // NDV comes from footer stats of the owning base relation, capped by
-        // that relation's (filtered) row estimate.
-        let cond_selectivity = |rel_a: usize, rel_b: usize, l: &Expr, r: &Expr| -> f64 {
-            let ndv_l = self
-                .column_ndv(&relations[rel_a], l)
-                .unwrap_or(base_rows[rel_a].max(10.0))
-                .min(base_rows[rel_a].max(1.0));
-            let ndv_r = self
-                .column_ndv(&relations[rel_b], r)
-                .unwrap_or(base_rows[rel_b].max(10.0))
-                .min(base_rows[rel_b].max(1.0));
-            1.0 / ndv_l.max(ndv_r).max(1.0)
+        // Per-edge equi-join selectivity: 1 / max(combined_ndv_left, combined_ndv_right)
+        // where each side's combined NDV over all the edge's key columns is the
+        // product of per-column NDVs CAPPED BY the side's row count. Multiplying
+        // per-condition selectivities independently wildly underestimates
+        // composite-key joins (e.g. lineitem x partsupp on (suppkey, partkey)
+        // came out at ~600 rows instead of 10^8), which then made huge
+        // intermediates look like great build sides.
+        let side_combined_ndv = |rel: usize, exprs: &[&Expr]| -> f64 {
+            let mut prod = 1.0f64;
+            for e in exprs {
+                let ndv = self
+                    .column_ndv(&relations[rel], e)
+                    .unwrap_or(base_rows[rel].max(10.0));
+                prod *= ndv.max(1.0);
+                if prod > 1e18 {
+                    break;
+                }
+            }
+            prod.min(base_rows[rel].max(1.0))
         };
 
         // Precompute each edge's endpoint masks and combined selectivity
@@ -719,15 +725,14 @@ impl JoinReorder {
         let edge_infos: Vec<EdgeInfo> = edges
             .iter()
             .map(|e| {
-                let sel: f64 = e
-                    .conditions
-                    .iter()
-                    .map(|(l, r)| cond_selectivity(e.left_idx, e.right_idx, l, r))
-                    .product();
+                let left_exprs: Vec<&Expr> = e.conditions.iter().map(|(l, _)| l).collect();
+                let right_exprs: Vec<&Expr> = e.conditions.iter().map(|(_, r)| r).collect();
+                let ndv_l = side_combined_ndv(e.left_idx, &left_exprs);
+                let ndv_r = side_combined_ndv(e.right_idx, &right_exprs);
                 EdgeInfo {
                     mask_a: 1 << e.left_idx,
                     mask_b: 1 << e.right_idx,
-                    selectivity: sel.clamp(1e-12, 1.0),
+                    selectivity: (1.0 / ndv_l.max(ndv_r).max(1.0)).clamp(1e-12, 1.0),
                 }
             })
             .collect();
@@ -821,11 +826,32 @@ impl JoinReorder {
         let r_entry = dp[r_mask as usize]?;
 
         // Smaller side becomes the LEFT child (hash join build side).
-        let (build_mask, probe_mask) = if l_entry.rows <= r_entry.rows {
+        // Cardinality estimates for multi-join subtrees are far less reliable
+        // than base-table row counts (correlated keys break the independence
+        // assumption badly — Q09's partsupp join is 16x off). When one side is
+        // a base relation and the estimates are within 4x, trust the base
+        // relation as the build side: materializing an underestimated
+        // intermediate as build (concat + hash table) is how Q09 hit 65GB.
+        // Discount confidence in derived estimates by 4x per additional joined
+        // relation (capped): a base table's row count is exact, a 5-way join
+        // estimate can be orders of magnitude off.
+        let uncertainty = |mask: u32, rows: f64| -> f64 {
+            let extra_rels = mask.count_ones().saturating_sub(1);
+            rows * 4f64.powi(extra_rels.min(5) as i32)
+        };
+        let l_score = uncertainty(l_mask, l_entry.rows);
+        let r_score = uncertainty(r_mask, r_entry.rows);
+        let (build_mask, probe_mask) = if l_score <= r_score {
             (l_mask, r_mask)
         } else {
             (r_mask, l_mask)
         };
+        if std::env::var("DP_DEBUG").is_ok() {
+            eprintln!(
+                "[dp] split {:b}: l={:b} rows={:.0} score={:.0} | r={:b} rows={:.0} score={:.0} -> build={:b}",
+                mask, l_mask, l_entry.rows, l_score, r_mask, r_entry.rows, r_score, build_mask
+            );
+        }
 
         let build = self.dp_build_plan(build_mask, dp, relations, edges)?;
         let probe = self.dp_build_plan(probe_mask, dp, relations, edges)?;
@@ -1064,6 +1090,25 @@ impl JoinReorder {
             } else {
                 // Condition spans more than 2 relations or none - keep for later
                 remaining_conditions.push((left_expr.clone(), right_expr.clone()));
+            }
+        }
+
+        // Step 4a: Cost-based enumeration first (same as build_optimized_join_tree).
+        // Falls back to the greedy heuristic for wide or disconnected graphs.
+        if relations.len() >= 2 && relations.len() <= 12 {
+            if let Some(mut plan) = self.build_join_tree_dpsize(&relations, &edges) {
+                // Re-apply conditions that didn't become join edges as filters
+                for (l, r) in &remaining_conditions {
+                    plan = LogicalPlan::Filter(crate::planner::FilterNode {
+                        input: Arc::new(plan),
+                        predicate: Expr::BinaryExpr {
+                            left: Box::new(l.clone()),
+                            op: BinaryOp::Eq,
+                            right: Box::new(r.clone()),
+                        },
+                    });
+                }
+                return Ok(plan);
             }
         }
 

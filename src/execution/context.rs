@@ -326,7 +326,15 @@ impl ExecutionContext {
     /// Get the optimized logical plan for a query (for debugging)
     pub fn optimized_plan(&self, query: &str) -> Result<LogicalPlan> {
         let logical = self.logical_plan(query)?;
-        self.optimizer.optimize(logical)
+        // Use the same statistics-aware optimizer as sql(), otherwise the
+        // debug view shows a different (stats-blind) plan than execution uses.
+        let table_stats = self.collect_table_statistics();
+        if table_stats.is_empty() {
+            self.optimizer.optimize(logical)
+        } else {
+            let optimizer = Optimizer::new().with_table_statistics(table_stats);
+            optimizer.optimize(logical)
+        }
     }
 
     /// Get the physical plan for a query (for debugging)
