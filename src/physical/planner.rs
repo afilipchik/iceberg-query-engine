@@ -41,6 +41,18 @@ pub struct PhysicalPlanner {
     /// Aggregate child so the aggregate can filter per shard BEFORE
     /// materializing output arrays (Q18 builds 650K rows instead of 15M).
     pending_agg_filter: RefCell<Option<Expr>>,
+    /// Streaming scans created in this plan, keyed by operator address:
+    /// (runtime-filter config handle, provider schema). Joins link runtime
+    /// key filters to their probe-side scans through this registry.
+    streaming_scans: RefCell<
+        HashMap<
+            usize,
+            (
+                crate::physical::operators::streaming_parquet_scan::RuntimeFilterConfig,
+                SchemaRef,
+            ),
+        >,
+    >,
 }
 
 impl Default for PhysicalPlanner {
@@ -60,6 +72,7 @@ impl PhysicalPlanner {
             scan_cache: RefCell::new(HashMap::new()),
             cte_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             pending_agg_filter: RefCell::new(None),
+            streaming_scans: RefCell::new(HashMap::new()),
         }
     }
 
@@ -73,6 +86,7 @@ impl PhysicalPlanner {
             scan_cache: RefCell::new(HashMap::new()),
             cte_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             pending_agg_filter: RefCell::new(None),
+            streaming_scans: RefCell::new(HashMap::new()),
         }
     }
 
@@ -786,7 +800,13 @@ impl PhysicalPlanner {
                             None,
                             &provider.schema(),
                         )?;
-                        return Ok(Arc::new(exec));
+                        let cfg = exec.runtime_filter_config();
+                        let arc: Arc<dyn PhysicalOperator> = Arc::new(exec);
+                        self.streaming_scans.borrow_mut().insert(
+                            Arc::as_ptr(&arc) as *const () as usize,
+                            (cfg, provider.schema()),
+                        );
+                        return Ok(arc);
                     }
                 }
 
@@ -949,6 +969,36 @@ impl PhysicalPlanner {
                 // because the output doesn't include right-side columns
                 let is_semi_anti = matches!(node.join_type, JoinType::Semi | JoinType::Anti);
 
+                // Runtime join-key filter: Inner joins with a single plain
+                // probe-key column over a streaming parquet scan decode only
+                // rows whose key exists in the (small) build side.
+                let probe_rt_filter = if matches!(node.join_type, JoinType::Inner) && on.len() == 1
+                {
+                    if let Expr::Column(c) = &on[0].1 {
+                        let key = Arc::as_ptr(&right) as *const () as usize;
+                        let scans = self.streaming_scans.borrow();
+                        scans.get(&key).and_then(|(cfg, pschema)| {
+                            pschema
+                                .fields()
+                                .iter()
+                                .position(|f| f.name().eq_ignore_ascii_case(&c.name))
+                                .map(|idx| {
+                                    let slot: crate::physical::operators::SharedRuntimeFilter =
+                                        Default::default();
+                                    *cfg.lock() = Some((idx, Arc::clone(&slot)));
+                                    if std::env::var("RT_DEBUG").is_ok() {
+                                        eprintln!("[rt] linked col {} ({})", idx, c.name);
+                                    }
+                                    slot
+                                })
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 if self.use_spillable() {
                     // Use spillable hash join with memory management
                     let mut join = SpillableHashJoinExec::new(
@@ -960,6 +1010,7 @@ impl PhysicalPlanner {
                         self.config.clone().unwrap(),
                     )
                     .with_build_right(build_right_for_left);
+                    join.probe_runtime_filter = probe_rt_filter.clone();
 
                     // For Semi/Anti, pass filter into the join operator;
                     // for other join types, apply as a post-filter

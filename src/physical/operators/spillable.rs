@@ -94,6 +94,8 @@ pub(crate) async fn collect_input_partitions_concurrently(
 /// and spills partitions to disk. During the probe phase, spilled partitions
 /// are processed one at a time.
 pub struct SpillableHashJoinExec {
+    /// Runtime probe-scan key filter (Inner joins), passed to the delegate.
+    pub probe_runtime_filter: Option<crate::physical::operators::SharedRuntimeFilter>,
     left: Arc<dyn PhysicalOperator>,
     right: Arc<dyn PhysicalOperator>,
     on: Vec<(Expr, Expr)>,
@@ -179,6 +181,7 @@ impl SpillableHashJoinExec {
             build_right: false,
             filter: None,
             build_decision: OnceCell::new(),
+            probe_runtime_filter: None,
         }
     }
 
@@ -287,26 +290,26 @@ impl PhysicalOperator for SpillableHashJoinExec {
                             (build_mem as Arc<dyn PhysicalOperator>, self.right.clone())
                         };
                     let hash_join = if self.filter.is_some() {
-                        Arc::new(
-                            crate::physical::operators::HashJoinExec::with_filter(
-                                left,
-                                right,
-                                self.on.clone(),
-                                self.join_type,
-                                self.filter.clone(),
-                            )
-                            .with_build_right(self.build_right),
+                        let mut hj = crate::physical::operators::HashJoinExec::with_filter(
+                            left,
+                            right,
+                            self.on.clone(),
+                            self.join_type,
+                            self.filter.clone(),
                         )
+                        .with_build_right(self.build_right);
+                        hj.probe_runtime_filter = self.probe_runtime_filter.clone();
+                        Arc::new(hj)
                     } else {
-                        Arc::new(
-                            crate::physical::operators::HashJoinExec::new(
-                                left,
-                                right,
-                                self.on.clone(),
-                                self.join_type,
-                            )
-                            .with_build_right(self.build_right),
+                        let mut hj = crate::physical::operators::HashJoinExec::new(
+                            left,
+                            right,
+                            self.on.clone(),
+                            self.join_type,
                         )
+                        .with_build_right(self.build_right);
+                        hj.probe_runtime_filter = self.probe_runtime_filter.clone();
+                        Arc::new(hj)
                     };
                     Ok::<_, QueryError>(BuildDecision::InMemory(hash_join))
                 } else {

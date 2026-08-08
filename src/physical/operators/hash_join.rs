@@ -276,6 +276,10 @@ pub struct HashJoinExec {
     on: Vec<(Expr, Expr)>,
     join_type: JoinType,
     schema: SchemaRef,
+    /// Runtime filter slot on the probe-side scan: after the build side is
+    /// hashed, publish the key set so the scan decodes only matching rows.
+    /// Inner joins only (planner-gated).
+    pub probe_runtime_filter: Option<crate::physical::operators::SharedRuntimeFilter>,
     /// Optional filter to evaluate during the join (required for Semi/Anti joins with filters)
     filter: Option<Expr>,
     /// Schema combining left and right for filter evaluation
@@ -368,6 +372,7 @@ impl HashJoinExec {
             combined_schema,
             build_cache: OnceCell::new(),
             build_right: false,
+            probe_runtime_filter: None,
         }
     }
 
@@ -506,6 +511,42 @@ impl PhysicalOperator for HashJoinExec {
                     total_build_rows,
                     total_build_bytes
                 ));
+
+                // Publish the build keys as a runtime filter for the probe-side
+                // scan (Inner joins, single i64 key, reasonably small builds):
+                // the scan then decodes only rows whose key can match.
+                if let Some(slot) = &self.probe_runtime_filter {
+                    if build_keys.len() == 1 && total_build_rows <= 4_000_000 {
+                        let mut set: hashbrown::HashSet<i64> =
+                            hashbrown::HashSet::with_capacity(total_build_rows);
+                        let mut ok = true;
+                        'outer_rt: for batch in &build_batches {
+                            match crate::physical::operators::evaluate_expr(batch, &build_keys[0])
+                            {
+                                Ok(arr) => match arr.as_any().downcast_ref::<Int64Array>() {
+                                    Some(a) => {
+                                        for i in 0..a.len() {
+                                            if !a.is_null(i) {
+                                                set.insert(a.value(i));
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        ok = false;
+                                        break 'outer_rt;
+                                    }
+                                },
+                                Err(_) => {
+                                    ok = false;
+                                    break 'outer_rt;
+                                }
+                            }
+                        }
+                        if ok {
+                            *slot.lock() = Some(std::sync::Arc::new(set));
+                        }
+                    }
+                }
 
                 // Concatenate the build side into a single batch ONCE.
                 // gather_column's multi-batch path re-concatenates the ENTIRE

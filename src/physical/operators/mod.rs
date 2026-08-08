@@ -12,7 +12,7 @@ mod project;
 mod scan;
 mod sort;
 pub mod spillable;
-mod streaming_parquet_scan;
+pub mod streaming_parquet_scan;
 mod subquery;
 mod union;
 pub mod vectorized_hash;
@@ -29,7 +29,7 @@ pub use project::ProjectExec;
 pub use scan::{ColumnStatistics, MemoryTable, MemoryTableExec, TableProvider, TableStatistics};
 pub use sort::SortExec;
 pub use spillable::{ExternalSortExec, SpillableHashAggregateExec, SpillableHashJoinExec};
-pub use streaming_parquet_scan::StreamingParquetScanExec;
+pub use streaming_parquet_scan::{SharedRuntimeFilter, StreamingParquetScanExec};
 pub use subquery::{
     evaluate_subquery_expr, is_correlated_subquery_plan, run_subquery_plan, SubqueryExecutor,
 };
