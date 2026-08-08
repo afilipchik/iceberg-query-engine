@@ -34,6 +34,182 @@ fn debug_log(_msg: &str) {
     // }
 }
 
+/// Row-major build-side payload for Inner-join gather: `data` packs every
+/// build column of row r at `data[r * stride ..]`, each column at its fixed
+/// byte offset (little-endian). For eligible builds this REPLACES the
+/// columnar concat — the same single copy at build time, but the
+/// joined-batch gather then touches ONE packed row per matched row instead
+/// of doing one random read per matched row PER COLUMN (DuckDB TupleData /
+/// Velox RowContainer pattern). Built exactly once inside the build-cache
+/// init closure; never lazily, never keyed by pointer identity.
+struct RowStore {
+    stride: usize,
+    data: Vec<u8>,
+    /// (byte offset in row, width in bytes, column type) per build column,
+    /// in build batch column order.
+    cols: Vec<(usize, u8, arrow::datatypes::DataType)>,
+    nrows: usize,
+}
+
+impl RowStore {
+    /// Build the row store plus the per-batch global-row offsets from the
+    /// (unconcatenated) build batches, so a hash-table entry's
+    /// (batch_idx, row_idx) maps to row `row_offsets[batch_idx] + row_idx`.
+    /// Caller guarantees every column is fixed-width
+    /// (Int64/Float64/Int32/Date32) and null-free.
+    fn build(batches: &[RecordBatch]) -> (Self, Vec<usize>) {
+        use arrow::datatypes::DataType;
+        let mut cols: Vec<(usize, u8, DataType)> = Vec::with_capacity(batches[0].num_columns());
+        let mut stride = 0usize;
+        for col in batches[0].columns() {
+            let dt = col.data_type().clone();
+            let w: u8 = match dt {
+                DataType::Int64 | DataType::Float64 => 8,
+                DataType::Int32 | DataType::Date32 => 4,
+                _ => unreachable!("row-store eligibility admits only fixed-width columns"),
+            };
+            cols.push((stride, w, dt));
+            stride += w as usize;
+        }
+        let nrows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let mut row_offsets = Vec::with_capacity(batches.len());
+        let mut base = 0usize;
+        for b in batches {
+            row_offsets.push(base);
+            base += b.num_rows();
+        }
+        let mut data = vec![0u8; nrows * stride];
+        // Each batch owns a disjoint region of `data`; fill them in parallel.
+        let mut slices: Vec<(&RecordBatch, &mut [u8])> = Vec::with_capacity(batches.len());
+        let mut rest: &mut [u8] = data.as_mut_slice();
+        for b in batches {
+            let (chunk, r) = std::mem::take(&mut rest).split_at_mut(b.num_rows() * stride);
+            slices.push((b, chunk));
+            rest = r;
+        }
+        let cols_ref = &cols;
+        slices
+            .par_iter_mut()
+            .for_each(|(batch, chunk)| fill_row_store_chunk(batch, chunk, cols_ref, stride));
+        (
+            RowStore {
+                stride,
+                data,
+                cols,
+                nrows,
+            },
+            row_offsets,
+        )
+    }
+}
+
+/// Pack one batch's rows into its region of the row store. Row-major write
+/// order: the destination is written sequentially while each source column
+/// is read sequentially.
+fn fill_row_store_chunk(
+    batch: &RecordBatch,
+    chunk: &mut [u8],
+    cols: &[(usize, u8, arrow::datatypes::DataType)],
+    stride: usize,
+) {
+    use arrow::datatypes::DataType;
+    enum Src<'a> {
+        I64(&'a [i64]),
+        F64(&'a [f64]),
+        I32(&'a [i32]),
+    }
+    let srcs: Vec<Src> = batch
+        .columns()
+        .iter()
+        .map(|c| match c.data_type() {
+            DataType::Int64 => Src::I64(c.as_any().downcast_ref::<Int64Array>().unwrap().values()),
+            DataType::Float64 => Src::F64(
+                c.as_any()
+                    .downcast_ref::<arrow::array::Float64Array>()
+                    .unwrap()
+                    .values(),
+            ),
+            DataType::Int32 => Src::I32(
+                c.as_any()
+                    .downcast_ref::<arrow::array::Int32Array>()
+                    .unwrap()
+                    .values(),
+            ),
+            DataType::Date32 => Src::I32(
+                c.as_any()
+                    .downcast_ref::<arrow::array::Date32Array>()
+                    .unwrap()
+                    .values(),
+            ),
+            _ => unreachable!("row-store eligibility admits only fixed-width columns"),
+        })
+        .collect();
+    for r in 0..batch.num_rows() {
+        let base = r * stride;
+        for (k, src) in srcs.iter().enumerate() {
+            let off = base + cols[k].0;
+            match src {
+                Src::I64(v) => chunk[off..off + 8].copy_from_slice(&v[r].to_le_bytes()),
+                Src::F64(v) => chunk[off..off + 8].copy_from_slice(&v[r].to_le_bytes()),
+                Src::I32(v) => chunk[off..off + 4].copy_from_slice(&v[r].to_le_bytes()),
+            }
+        }
+    }
+}
+
+/// Gather build columns row-wise from the row store: one packed-row read per
+/// matched row. Output column order matches the build batch column order.
+/// Caller guarantees `build_indices` contains no usize::MAX null sentinels.
+fn gather_build_from_row_store(
+    store: &RowStore,
+    row_offsets: &[usize],
+    build_indices: &[(usize, usize)],
+) -> Vec<ArrayRef> {
+    use arrow::datatypes::DataType;
+    enum Buf {
+        I64(Vec<i64>),
+        F64(Vec<f64>),
+        I32(Vec<i32>),
+        D32(Vec<i32>),
+    }
+    let n = build_indices.len();
+    let mut bufs: Vec<Buf> = store
+        .cols
+        .iter()
+        .map(|(_, _, dt)| match dt {
+            DataType::Int64 => Buf::I64(Vec::with_capacity(n)),
+            DataType::Float64 => Buf::F64(Vec::with_capacity(n)),
+            DataType::Int32 => Buf::I32(Vec::with_capacity(n)),
+            DataType::Date32 => Buf::D32(Vec::with_capacity(n)),
+            _ => unreachable!("row-store eligibility admits only fixed-width columns"),
+        })
+        .collect();
+    let stride = store.stride;
+    for &(batch_idx, row_idx) in build_indices {
+        let row = row_offsets[batch_idx] + row_idx;
+        debug_assert!(row < store.nrows);
+        let base = row * stride;
+        for (k, &(off, _, _)) in store.cols.iter().enumerate() {
+            let p = base + off;
+            match &mut bufs[k] {
+                Buf::I64(v) => v.push(i64::from_le_bytes(store.data[p..p + 8].try_into().unwrap())),
+                Buf::F64(v) => v.push(f64::from_le_bytes(store.data[p..p + 8].try_into().unwrap())),
+                Buf::I32(v) | Buf::D32(v) => {
+                    v.push(i32::from_le_bytes(store.data[p..p + 4].try_into().unwrap()))
+                }
+            }
+        }
+    }
+    bufs.into_iter()
+        .map(|buf| match buf {
+            Buf::I64(v) => Arc::new(Int64Array::from(v)) as ArrayRef,
+            Buf::F64(v) => Arc::new(arrow::array::Float64Array::from(v)) as ArrayRef,
+            Buf::I32(v) => Arc::new(arrow::array::Int32Array::from(v)) as ArrayRef,
+            Buf::D32(v) => Arc::new(arrow::array::Date32Array::from(v)) as ArrayRef,
+        })
+        .collect()
+}
+
 /// Cached build side data - collected once, reused across partitions
 struct BuildSideCache {
     batches: Vec<RecordBatch>,
@@ -51,6 +227,13 @@ struct BuildSideCache {
     /// Number of probe partitions that finished; the last one emits the
     /// unmatched build rows.
     completed_partitions: std::sync::atomic::AtomicUsize,
+    /// Row-major copy of the build side for Inner-join gather, plus the
+    /// per-batch offsets mapping (batch_idx, row_idx) -> global row. Present
+    /// only for eligible builds (Inner, no filter, fixed-width null-free
+    /// columns); when present the columnar concat was skipped and `batches`
+    /// keeps the unconcatenated originals (still needed for the hash tables'
+    /// key buffers and fallback paths).
+    row_store: Option<(RowStore, Vec<usize>)>,
 }
 
 /// Vectorized hash table using open addressing with batch-level operations.
@@ -690,6 +873,33 @@ impl PhysicalOperator for HashJoinExec {
                     }
                 }
 
+                // Row-store eligibility: Inner join, no join filter, build
+                // side not swapped, every build column fixed-width
+                // (Int64/Float64/Int32/Date32) and null-free across all
+                // batches, and a build side big enough for gather locality to
+                // matter. When eligible the columnar concat below is REPLACED
+                // by a row-major store: the same single copy at build time,
+                // but the joined-batch gather then costs one random read per
+                // matched ROW instead of one per matched row PER COLUMN.
+                let row_store_eligible = self.join_type == JoinType::Inner
+                    && self.filter.is_none()
+                    && !swapped
+                    && total_build_rows >= 100_000
+                    && !build_batches.is_empty()
+                    && build_batches[0].num_columns() > 0
+                    && build_batches.iter().all(|b| {
+                        b.columns().iter().all(|c| {
+                            c.null_count() == 0
+                                && matches!(
+                                    c.data_type(),
+                                    arrow::datatypes::DataType::Int64
+                                        | arrow::datatypes::DataType::Float64
+                                        | arrow::datatypes::DataType::Int32
+                                        | arrow::datatypes::DataType::Date32
+                                )
+                        })
+                    });
+
                 // Concatenate the build side into a single batch ONCE.
                 // gather_column's multi-batch path re-concatenates the ENTIRE
                 // build side per output batch per column — with a 15M-row build
@@ -698,7 +908,10 @@ impl PhysicalOperator for HashJoinExec {
                 // sends every downstream gather through the direct-take fast
                 // path. On concat failure (e.g. >2GB Utf8 offset overflow) keep
                 // the chunked layout; the slow-but-correct path still works.
-                let build_batches = if build_batches.len() > 1 {
+                // Row-store-eligible builds skip the concat entirely: the hash
+                // tables index the unconcatenated batches and the row store
+                // serves the build-column gather instead.
+                let build_batches = if !row_store_eligible && build_batches.len() > 1 {
                     match arrow::compute::concat_batches(&build_batches[0].schema(), &build_batches)
                     {
                         Ok(single) => vec![single],
@@ -706,6 +919,35 @@ impl PhysicalOperator for HashJoinExec {
                     }
                 } else {
                     build_batches
+                };
+
+                if std::env::var("RS_DEBUG").is_ok() && !row_store_eligible {
+                    eprintln!(
+                        "[rs] ineligible: inner={} filter_none={} swapped={} rows={} cols={:?} nulls={:?}",
+                        self.join_type == JoinType::Inner,
+                        self.filter.is_none(),
+                        swapped,
+                        total_build_rows,
+                        build_batches
+                            .first()
+                            .map(|b| b
+                                .columns()
+                                .iter()
+                                .map(|c| c.data_type().clone())
+                                .collect::<Vec<_>>()),
+                        build_batches
+                            .first()
+                            .map(|b| b
+                                .columns()
+                                .iter()
+                                .map(|c| c.null_count())
+                                .collect::<Vec<_>>()),
+                    );
+                }
+                let row_store = if row_store_eligible {
+                    Some(RowStore::build(&build_batches))
+                } else {
+                    None
                 };
 
                 // Try vectorized hash table first (supports all key types)
@@ -719,11 +961,12 @@ impl PhysicalOperator for HashJoinExec {
                 };
                 if timing {
                     eprintln!(
-                        "[hj] build drain: {} rows, {} batches; vht build: {:?}; vht={} build_keys={:?} on={:?} swapped={}",
+                        "[hj] build drain: {} rows, {} batches; vht build: {:?}; vht={} row_store={} build_keys={:?} on={:?} swapped={}",
                         total_build_rows,
                         build_batches.len(),
                         t_vht.elapsed(),
                         vectorized_ht.is_some(),
+                        row_store.is_some(),
                         build_keys.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
                         self.on.iter().map(|(l, r)| format!("{}={}", l, r)).collect::<Vec<_>>(),
                         swapped
@@ -780,6 +1023,7 @@ impl PhysicalOperator for HashJoinExec {
                     vectorized_ht,
                     build_matched,
                     completed_partitions: std::sync::atomic::AtomicUsize::new(0),
+                    row_store,
                 })
             })
             .await?;
@@ -811,6 +1055,7 @@ impl PhysicalOperator for HashJoinExec {
         }
 
         let t_probe = std::time::Instant::now();
+        let row_store = cache.row_store.as_ref().map(|(rs, ro)| (rs, ro.as_slice()));
         let mut result = probe_hash_table(
             &cache.batches,
             &probe_batches,
@@ -824,6 +1069,7 @@ impl PhysicalOperator for HashJoinExec {
             self.filter.as_ref(),
             &self.combined_schema,
             cache.build_matched.as_deref(),
+            row_store,
         )?;
 
         // Emit unmatched BUILD rows exactly once: the last probe partition to
@@ -1449,6 +1695,7 @@ fn resolve_column_in_combined(
 /// Parallel probe for INNER joins using specialized i64 hash table.
 /// Processes probe rows in parallel chunks using rayon, with direct Int64 array access
 /// to avoid per-row JoinKey allocation overhead.
+#[allow(clippy::too_many_arguments)]
 fn probe_inner_i64_parallel(
     build_batches: &[RecordBatch],
     probe_batches: &[RecordBatch],
@@ -1456,6 +1703,7 @@ fn probe_inner_i64_parallel(
     probe_key_expr: &Expr,
     swapped: bool,
     output_schema: &SchemaRef,
+    row_store: Option<(&RowStore, &[usize])>,
 ) -> Result<Vec<RecordBatch>> {
     const CHUNK_SIZE: usize = 65536;
 
@@ -1531,6 +1779,7 @@ fn probe_inner_i64_parallel(
                 &all_probe_indices,
                 swapped,
                 output_schema,
+                row_store,
             )?;
             results.push(batch);
         }
@@ -1827,6 +2076,7 @@ fn create_single_row_combined_batch(
 /// without per-row JoinKey allocation. Uses VectorizedHashTable for batch-level
 /// hash computation and comparison.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn probe_vectorized(
     build_batches: &[RecordBatch],
     probe_batches: &[RecordBatch],
@@ -1836,6 +2086,7 @@ fn probe_vectorized(
     swapped: bool,
     output_schema: &SchemaRef,
     shared_build_matched: Option<&[Vec<std::sync::atomic::AtomicBool>]>,
+    row_store: Option<(&RowStore, &[usize])>,
 ) -> Result<Vec<RecordBatch>> {
     let mut results = Vec::new();
 
@@ -1900,6 +2151,7 @@ fn probe_vectorized(
                         &probe_indices,
                         swapped,
                         output_schema,
+                        row_store,
                     )?;
                     Ok(Some(batch))
                 })
@@ -2021,6 +2273,7 @@ fn probe_vectorized(
                         &all_probe_indices,
                         swapped,
                         output_schema,
+                        row_store,
                     )?;
                     results.push(batch);
                 }
@@ -2091,6 +2344,7 @@ fn probe_vectorized(
                         &probe_indices,
                         swapped,
                         output_schema,
+                        None,
                     )?;
                     results.push(batch);
                 }
@@ -2121,6 +2375,7 @@ fn probe_vectorized(
                         &probe_indices,
                         swapped,
                         output_schema,
+                        None,
                     )?;
                     results.push(batch);
                 }
@@ -2286,6 +2541,7 @@ fn probe_hash_table(
     filter: Option<&Expr>,
     combined_schema: &SchemaRef,
     shared_build_matched: Option<&[Vec<std::sync::atomic::AtomicBool>]>,
+    row_store: Option<(&RowStore, &[usize])>,
 ) -> Result<Vec<RecordBatch>> {
     let total_probe_rows: usize = probe_batches.iter().map(|b| b.num_rows()).sum();
 
@@ -2302,6 +2558,7 @@ fn probe_hash_table(
                 swapped,
                 output_schema,
                 shared_build_matched,
+                row_store,
             );
         }
     }
@@ -2332,6 +2589,7 @@ fn probe_hash_table(
                 &probe_key_exprs[0],
                 swapped,
                 output_schema,
+                row_store,
             );
         }
     }
@@ -2446,6 +2704,7 @@ fn probe_hash_table(
                         &probe_indices,
                         swapped,
                         output_schema,
+                        row_store,
                     )?;
                     results.push(batch);
                 }
@@ -2488,6 +2747,7 @@ fn probe_hash_table(
                         &probe_indices,
                         swapped,
                         output_schema,
+                        None,
                     )?;
                     results.push(batch);
                 }
@@ -2534,6 +2794,7 @@ fn probe_hash_table(
                         &probe_indices,
                         swapped,
                         output_schema,
+                        None,
                     )?;
                     results.push(batch);
                 }
@@ -2649,14 +2910,32 @@ fn create_joined_batch(
     probe_indices: &[usize],
     swapped: bool,
     output_schema: &SchemaRef,
+    row_store: Option<(&RowStore, &[usize])>,
 ) -> Result<RecordBatch> {
     let _num_rows = build_indices.len();
 
-    // Gather build columns. Single-batch builds (the concat-once cache)
-    // share ONE take-index array across every column — gather_column was
-    // rebuilding the u32 index vec per column.
+    // Gather build columns. When a row store is present (eligible Inner
+    // builds), gather all build columns row-wise from it: one packed-row
+    // read per matched row instead of one arrow take per column. Otherwise:
+    // single-batch builds (the concat-once cache) share ONE take-index array
+    // across every column — gather_column was rebuilding the u32 index vec
+    // per column.
     let build_columns: Result<Vec<ArrayRef>> = if build_batches.is_empty() {
         Ok(vec![])
+    } else if let Some((store, row_offsets)) = row_store {
+        if build_indices.iter().any(|&(b, _)| b == usize::MAX) {
+            // Null sentinels (defensive: not produced on Inner paths) —
+            // fall back to the columnar gather.
+            (0..build_batches[0].num_columns())
+                .map(|col_idx| gather_column(build_batches, col_idx, build_indices))
+                .collect()
+        } else {
+            Ok(gather_build_from_row_store(
+                store,
+                row_offsets,
+                build_indices,
+            ))
+        }
     } else if build_batches.len() == 1 {
         let has_null_sentinels = build_indices.iter().any(|&(b, _)| b == usize::MAX);
         let take_arr: UInt32Array = if has_null_sentinels {
@@ -2733,6 +3012,7 @@ fn create_joined_batch_with_nulls(
         probe_indices,
         swapped,
         output_schema,
+        None,
     )
 }
 
