@@ -178,14 +178,57 @@ impl PhysicalOperator for MorselAggregateExec {
             })
             .collect();
 
-        // Merge all thread states
-        let mut final_state = AggregationState::new(agg_funcs.clone(), input_types);
-        for result in thread_states {
-            let state = result?;
-            final_state.merge(&state);
+        let states: Vec<AggregationState> =
+            thread_states.into_iter().collect::<Result<Vec<_>>>()?;
+
+        // High-cardinality aggregations (e.g. GROUP BY l_orderkey: 15M groups at
+        // SF=10) were bottlenecked on this merge: folding 32 thread-local maps
+        // into one sequentially, then building one giant output batch. Above the
+        // threshold, shard every state's groups by key hash and merge + build
+        // output per shard in parallel — same key always lands in the same
+        // shard, so shards are independent.
+        const PARALLEL_MERGE_MIN_GROUPS: usize = 65_536;
+        let total_groups: usize = states.iter().map(|s| s.group_count()).sum();
+
+        if states.len() > 1 && total_groups > PARALLEL_MERGE_MIN_GROUPS {
+            let p = rayon::current_num_threads().clamp(2, 64);
+            let per_state_shards: Vec<_> = states
+                .into_par_iter()
+                .map(|s| s.into_shards(p))
+                .collect::<Vec<_>>();
+
+            // Transpose to shard-major
+            let mut shard_major: Vec<Vec<_>> = (0..p).map(|_| Vec::new()).collect();
+            for state_shards in per_state_shards {
+                for (pi, shard) in state_shards.into_iter().enumerate() {
+                    shard_major[pi].push(shard);
+                }
+            }
+
+            let batches: Vec<RecordBatch> = shard_major
+                .into_par_iter()
+                .map(|lists| {
+                    let map = crate::physical::morsel_agg::merge_entries_into_map(lists);
+                    if map.is_empty() {
+                        return Ok(None);
+                    }
+                    let state =
+                        AggregationState::from_groups(agg_funcs.clone(), input_types.clone(), map);
+                    state.build_output(&output_schema).map(Some)
+                })
+                .collect::<Result<Vec<Option<RecordBatch>>>>()?
+                .into_iter()
+                .flatten()
+                .collect();
+
+            return Ok(Box::pin(stream::iter(batches.into_iter().map(Ok))));
         }
 
-        // Build output
+        // Low-cardinality: sequential merge (cheap) into a single output batch
+        let mut final_state = AggregationState::new(agg_funcs.clone(), input_types);
+        for state in states {
+            final_state.merge(&state);
+        }
         let result = final_state.build_output(&output_schema)?;
         Ok(Box::pin(stream::once(async { Ok(result) })))
     }

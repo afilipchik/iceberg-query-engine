@@ -18,13 +18,38 @@ use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use hashbrown::HashMap;
 use rayon::prelude::*;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
+/// Merge per-thread entry lists (all belonging to the same key shard) into a
+/// single groups map. Duplicate keys across threads have their accumulator
+/// states merged pairwise.
+pub(crate) fn merge_entries_into_map(
+    lists: Vec<Vec<(GroupKey, Vec<AccumulatorState>)>>,
+) -> HashMap<GroupKey, Vec<AccumulatorState>> {
+    let cap: usize = lists.iter().map(|l| l.len()).sum();
+    let mut map: HashMap<GroupKey, Vec<AccumulatorState>> = HashMap::with_capacity(cap);
+    for list in lists {
+        for (key, accs) in list {
+            match map.entry(key) {
+                hashbrown::hash_map::Entry::Occupied(mut e) => {
+                    for (a, b) in e.get_mut().iter_mut().zip(accs.iter()) {
+                        a.merge(b);
+                    }
+                }
+                hashbrown::hash_map::Entry::Vacant(v) => {
+                    v.insert(accs);
+                }
+            }
+        }
+    }
+    map
+}
+
 /// Group key for hash table
 #[derive(Clone)]
-struct GroupKey {
+pub(crate) struct GroupKey {
     values: Vec<ScalarValue>,
 }
 
@@ -84,7 +109,7 @@ fn hash_scalar_value<H: Hasher>(value: &ScalarValue, state: &mut H) {
 
 /// Accumulator state for a single aggregate
 #[derive(Clone, Debug)]
-enum AccumulatorState {
+pub(crate) enum AccumulatorState {
     Count(i64),
     Sum(f64),
     SumInt(i64),
@@ -1068,6 +1093,49 @@ impl AggregationState {
             }
         }
         self.key_order.clear();
+    }
+
+    /// Number of distinct groups currently held (for merge-strategy selection).
+    pub fn group_count(&self) -> usize {
+        let perfect = if !self.overflowed {
+            self.perfect_accs
+                .iter()
+                .enumerate()
+                .filter(|(idx, accs)| {
+                    *idx < self.key_order.len() && Self::slot_has_data(&self.key_order[*idx], accs)
+                })
+                .count()
+        } else {
+            0
+        };
+        perfect + self.groups.len()
+    }
+
+    /// Consume this state, sharding its groups by key hash into `p` buckets.
+    /// Used by the parallel partitioned merge: entries for the same key always
+    /// land in the same bucket regardless of which thread produced them.
+    pub(crate) fn into_shards(mut self, p: usize) -> Vec<Vec<(GroupKey, Vec<AccumulatorState>)>> {
+        self.drain_perfect_to_hashmap();
+        let mut shards: Vec<Vec<(GroupKey, Vec<AccumulatorState>)>> =
+            (0..p).map(|_| Vec::new()).collect();
+        for (key, accs) in self.groups.drain() {
+            let mut hasher = hashbrown::hash_map::DefaultHashBuilder::default().build_hasher();
+            key.hash(&mut hasher);
+            shards[(hasher.finish() as usize) % p].push((key, accs));
+        }
+        shards
+    }
+
+    /// Build a state that holds pre-merged groups (parallel merge output path).
+    pub(crate) fn from_groups(
+        agg_funcs: Vec<AggregateFunction>,
+        input_types: Vec<DataType>,
+        groups: HashMap<GroupKey, Vec<AccumulatorState>>,
+    ) -> Self {
+        let mut state = Self::new(agg_funcs, input_types);
+        state.overflowed = true;
+        state.groups = groups;
+        state
     }
 
     /// Merge another state into this one
