@@ -764,6 +764,26 @@ impl PhysicalPlanner {
                 // Use the logical schema (with aliases) instead of the provider schema
                 let logical_schema = plan_schema_to_arrow(&node.schema);
 
+                // Unfiltered single-use parquet scans stream lazily, partitioned
+                // by row group: decode overlaps with the consumer (join probes,
+                // sorts) instead of materializing the whole table at plan time.
+                // Filtered scans keep the eager path (decoder-level RowFilter);
+                // prescanned shared tables use the cache below.
+                if node.filter.is_none() && !self.scan_cache.borrow().contains_key(&node.table_name)
+                {
+                    if let Some(files) = provider.parquet_files() {
+                        let exec = crate::physical::operators::StreamingParquetScanExec::try_new(
+                            &node.table_name,
+                            &files,
+                            logical_schema.clone(),
+                            node.projection.clone(),
+                            None,
+                            &provider.schema(),
+                        )?;
+                        return Ok(Arc::new(exec));
+                    }
+                }
+
                 // Check scan cache for pre-scanned tables (shared across multiple aliases)
                 let cache = self.scan_cache.borrow();
                 let exec = if let Some((cached_schema, cached_batches)) =
