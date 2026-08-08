@@ -1321,6 +1321,19 @@ impl AggregationState {
                         _ => unreachable!(),
                     }
                 };
+                // Pre-extract f64 value slices when every aggregate input is
+                // a null-free Float64 column: the per-row update is then a
+                // direct slice load + accumulator add.
+                let f64_slices: Option<Vec<&[f64]>> = agg_accessors
+                    .iter()
+                    .map(|a| match a {
+                        TypedArrayAccessor::Float64(arr) if arr.null_count() == 0 => {
+                            Some(arr.values().as_ref())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+
                 let mut row = start_row;
                 while row < end_row {
                     let (is_null, raw) = key_at(row);
@@ -1350,9 +1363,17 @@ impl AggregationState {
                                 .collect()
                         })
                     };
-                    for r in row..run_end {
-                        for (i, acc) in accumulators.iter_mut().enumerate() {
-                            agg_accessors[i].update_accumulator(r, acc);
+                    if let Some(slices) = &f64_slices {
+                        for r in row..run_end {
+                            for (i, acc) in accumulators.iter_mut().enumerate() {
+                                acc.update_f64(slices[i][r]);
+                            }
+                        }
+                    } else {
+                        for r in row..run_end {
+                            for (i, acc) in accumulators.iter_mut().enumerate() {
+                                agg_accessors[i].update_accumulator(r, acc);
+                            }
                         }
                     }
                     row = run_end;
