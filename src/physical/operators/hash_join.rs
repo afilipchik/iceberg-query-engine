@@ -48,8 +48,16 @@ struct BuildSideCache {
 /// Stores (batch_idx, row_idx) pairs indexed by hash of key columns.
 /// Eliminates per-row JoinKey allocation during both build and probe.
 struct VectorizedHashTable {
-    /// Bucket entries: buckets[hash & mask] = Vec<(batch_idx as u32, row_idx as u32)>
-    buckets: Vec<Vec<(u32, u32)>>,
+    /// heads[hash & mask] = index of the first chain entry, or u32::MAX if empty.
+    /// Flat chained layout: one contiguous allocation each for heads/next/entries
+    /// instead of a Vec per bucket — with multi-million-row build sides the
+    /// per-bucket-Vec layout meant one heap allocation per occupied bucket and a
+    /// pointer chase per probe, which dominated large joins.
+    heads: Vec<u32>,
+    /// next[entry] = next entry index in the same bucket's chain, or u32::MAX
+    next: Vec<u32>,
+    /// entries[entry] = (build_batch_idx, build_row_idx)
+    entries: Vec<(u32, u32)>,
     /// Mask for bucket index (power-of-2 bucket count - 1)
     mask: usize,
     /// Pre-evaluated key arrays for each build batch: build_key_arrays[batch_idx][key_col] = ArrayRef
@@ -77,12 +85,20 @@ impl VectorizedHashTable {
             build_key_arrays.push(key_arrays);
         }
 
+        if total_rows >= u32::MAX as usize {
+            return Err(crate::error::QueryError::Execution(
+                "Build side too large for vectorized hash table".into(),
+            ));
+        }
+
         // Size buckets to next_power_of_2(total_rows * 2) for ~50% load factor
         let bucket_count = (total_rows * 2).max(16).next_power_of_two();
         let mask = bucket_count - 1;
-        let mut buckets: Vec<Vec<(u32, u32)>> = vec![Vec::new(); bucket_count];
+        let mut heads: Vec<u32> = vec![u32::MAX; bucket_count];
+        let mut next: Vec<u32> = Vec::with_capacity(total_rows);
+        let mut entries: Vec<(u32, u32)> = Vec::with_capacity(total_rows);
 
-        // Insert all rows
+        // Insert all rows: prepend each entry to its bucket's chain
         for (batch_idx, key_arrays) in build_key_arrays.iter().enumerate() {
             if key_arrays.is_empty() {
                 continue;
@@ -96,12 +112,17 @@ impl VectorizedHashTable {
                     continue;
                 }
                 let bucket = hashes[row_idx] as usize & mask;
-                buckets[bucket].push((batch_idx as u32, row_idx as u32));
+                let entry_idx = entries.len() as u32;
+                entries.push((batch_idx as u32, row_idx as u32));
+                next.push(heads[bucket]);
+                heads[bucket] = entry_idx;
             }
         }
 
         Ok(VectorizedHashTable {
-            buckets,
+            heads,
+            next,
+            entries,
             mask,
             build_key_arrays,
         })
@@ -121,7 +142,9 @@ impl VectorizedHashTable {
             }
 
             let bucket = hashes[probe_row] as usize & self.mask;
-            for &(build_batch, build_row) in &self.buckets[bucket] {
+            let mut entry = self.heads[bucket];
+            while entry != u32::MAX {
+                let (build_batch, build_row) = self.entries[entry as usize];
                 // Verify equality (hash collision resolution)
                 let build_keys = &self.build_key_arrays[build_batch as usize];
                 if vectorized_hash::compare_row(
@@ -132,6 +155,7 @@ impl VectorizedHashTable {
                 ) {
                     matches.push((build_batch, build_row, probe_row as u32));
                 }
+                entry = self.next[entry as usize];
             }
         }
 
@@ -150,7 +174,9 @@ impl VectorizedHashTable {
             }
 
             let bucket = hashes[probe_row] as usize & self.mask;
-            for &(build_batch, build_row) in &self.buckets[bucket] {
+            let mut entry = self.heads[bucket];
+            while entry != u32::MAX {
+                let (build_batch, build_row) = self.entries[entry as usize];
                 let build_keys = &self.build_key_arrays[build_batch as usize];
                 if vectorized_hash::compare_row(
                     build_keys,
@@ -161,6 +187,7 @@ impl VectorizedHashTable {
                     matched[probe_row] = true;
                     break; // One match is enough for Semi/Anti
                 }
+                entry = self.next[entry as usize];
             }
         }
 
@@ -406,16 +433,48 @@ impl PhysicalOperator for HashJoinExec {
                     total_build_bytes
                 ));
 
+                // Concatenate the build side into a single batch ONCE.
+                // gather_column's multi-batch path re-concatenates the ENTIRE
+                // build side per output batch per column — with a 15M-row build
+                // side and thousands of probe batches that alone accounted for
+                // ~50s on lineitem x orders at SF=10. A single build batch also
+                // sends every downstream gather through the direct-take fast
+                // path. On concat failure (e.g. >2GB Utf8 offset overflow) keep
+                // the chunked layout; the slow-but-correct path still works.
+                let build_batches = if build_batches.len() > 1 {
+                    match arrow::compute::concat_batches(&build_batches[0].schema(), &build_batches)
+                    {
+                        Ok(single) => vec![single],
+                        Err(_) => build_batches,
+                    }
+                } else {
+                    build_batches
+                };
+
                 // Try vectorized hash table first (supports all key types)
                 // Don't build for empty keys (cross joins) — they use the generic cartesian path.
+                let timing = std::env::var("HJ_TIMING").is_ok();
+                let t_vht = std::time::Instant::now();
                 let vectorized_ht = if !build_keys.is_empty() {
                     VectorizedHashTable::build(&build_batches, &build_keys).ok()
                 } else {
                     None
                 };
+                if timing {
+                    eprintln!(
+                        "[hj] build drain: {} rows, {} batches; vht build: {:?}",
+                        total_build_rows,
+                        build_batches.len(),
+                        t_vht.elapsed()
+                    );
+                }
 
-                // Try specialized i64 hash table (for backward compatibility with Semi/Anti parallel path)
-                let i64_hash_table = if build_keys.len() == 1 {
+                // Specialized i64 hash table: only needed on paths the vectorized
+                // table doesn't serve (VHT probe requires filter.is_none()). It is a
+                // HashMap with one heap-allocated Vec per distinct key — on a 15M-row
+                // build side that's tens of seconds of pure waste if never probed.
+                let i64_needed = vectorized_ht.is_none() || self.filter.is_some();
+                let i64_hash_table = if i64_needed && build_keys.len() == 1 {
                     build_i64_hash_table(&build_batches, &build_keys[0])
                 } else {
                     None
@@ -465,6 +524,7 @@ impl PhysicalOperator for HashJoinExec {
             }
         }
 
+        let t_probe = std::time::Instant::now();
         let result = probe_hash_table(
             &cache.batches,
             &probe_batches,
@@ -478,6 +538,14 @@ impl PhysicalOperator for HashJoinExec {
             self.filter.as_ref(),
             &self.combined_schema,
         )?;
+        if std::env::var("HJ_TIMING").is_ok() {
+            eprintln!(
+                "[hj] partition {} probe: {} rows in {:?}",
+                partition,
+                probe_rows,
+                t_probe.elapsed()
+            );
+        }
 
         Ok(Box::pin(stream::iter(result.into_iter().map(Ok))))
     }

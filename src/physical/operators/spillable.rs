@@ -259,50 +259,14 @@ impl PhysicalOperator for SpillableHashJoinExec {
         let decision = self
             .build_decision
             .get_or_try_init(|| async {
-                // Streaming collection: check memory incrementally during collection.
-                // If build side exceeds the threshold mid-stream, enter spill path
-                // without waiting for all partitions to finish.
-                let build_partitions = build_side.output_partitions().max(1);
-                let mut build_batches = Vec::new();
-                let mut build_size: usize = 0;
+                // Drain all build partitions concurrently — the sequential await
+                // loop serialized a parallel scan beneath the build side onto one
+                // core (same fix as the agg/sort pipeline breakers).
                 let memory_threshold =
                     (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
-                let mut exceeded = false;
-
-                for p in 0..build_partitions {
-                    let build_stream = build_side.execute(p).await?;
-                    let mut batch_stream = build_stream;
-                    while let Some(batch) = batch_stream.try_next().await? {
-                        let batch_mem = estimate_batch_size(&batch);
-                        build_size += batch_mem;
-                        build_batches.push(batch);
-
-                        if build_size > memory_threshold {
-                            // Collect remaining batches from this partition stream
-                            let remaining: Vec<RecordBatch> = batch_stream.try_collect().await?;
-                            build_size += remaining
-                                .iter()
-                                .map(|b| estimate_batch_size(b))
-                                .sum::<usize>();
-                            build_batches.extend(remaining);
-                            exceeded = true;
-                            break;
-                        }
-                    }
-                    if exceeded {
-                        // Collect remaining partitions into build_batches too (they need to be spilled)
-                        for p2 in (p + 1)..build_partitions {
-                            let s = build_side.execute(p2).await?;
-                            let batches: Vec<RecordBatch> = s.try_collect().await?;
-                            build_size += batches
-                                .iter()
-                                .map(|b| estimate_batch_size(b))
-                                .sum::<usize>();
-                            build_batches.extend(batches);
-                        }
-                        break;
-                    }
-                }
+                let (build_batches, build_size) =
+                    collect_input_partitions_concurrently(build_side).await?;
+                let exceeded = build_size > memory_threshold;
 
                 if !exceeded {
                     // Build side fits in memory — create a reusable HashJoinExec
