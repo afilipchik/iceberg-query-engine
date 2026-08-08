@@ -1117,6 +1117,109 @@ fn build_vectorized_agg_column(
     }
 }
 
+/// Grouped aggregation over already-materialized batches using the morsel
+/// aggregation core: thread-local AggregationStates over batch chunks, then a
+/// parallel partitioned merge (same-key entries always land in the same shard).
+fn aggregate_batches_morsel_parallel(
+    batches: &[RecordBatch],
+    group_by: &[Expr],
+    aggregates: &[AggregateExpr],
+    schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    use crate::physical::morsel_agg::{self, AggregationState};
+
+    if batches.is_empty() {
+        return Ok(RecordBatch::new_empty(schema.clone()));
+    }
+
+    let plan_schema = crate::planner::PlanSchema::from(batches[0].schema().as_ref());
+    let input_types: Vec<DataType> = aggregates
+        .iter()
+        .map(|a| a.input.data_type(&plan_schema).unwrap_or(DataType::Float64))
+        .collect();
+    let agg_funcs: Vec<AggregateFunction> = aggregates.iter().map(|a| a.func).collect();
+    let agg_inputs: Vec<Expr> = aggregates.iter().map(|a| a.input.clone()).collect();
+
+    // Split large batches into ~8K-row slices so work distributes evenly.
+    // (Primitive array slicing keeps values()/nulls() views consistent.)
+    const TARGET_CHUNK_ROWS: usize = 8192;
+    let mut work: Vec<RecordBatch> = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let n = batch.num_rows();
+        if n > TARGET_CHUNK_ROWS * 2 {
+            let mut offset = 0;
+            while offset < n {
+                let len = (n - offset).min(TARGET_CHUNK_ROWS);
+                work.push(batch.slice(offset, len));
+                offset += len;
+            }
+        } else if n > 0 {
+            work.push(batch.clone());
+        }
+    }
+    if work.is_empty() {
+        return Ok(RecordBatch::new_empty(schema.clone()));
+    }
+
+    let num_threads = rayon::current_num_threads().max(1);
+    let chunk_size = work.len().div_ceil(num_threads);
+    let states: Vec<AggregationState> = work
+        .par_chunks(chunk_size)
+        .map(|chunk| {
+            let mut state = AggregationState::new(agg_funcs.clone(), input_types.clone());
+            for batch in chunk {
+                state.process_batch(batch, group_by, &agg_inputs)?;
+            }
+            Ok(state)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let total_groups: usize = states.iter().map(|s| s.group_count()).sum();
+    const PARALLEL_MERGE_MIN_GROUPS: usize = 65_536;
+
+    if states.len() > 1 && total_groups > PARALLEL_MERGE_MIN_GROUPS {
+        let p = rayon::current_num_threads().clamp(2, 64);
+        let per_state_shards: Vec<_> = states
+            .into_par_iter()
+            .map(|s| s.into_shards(p))
+            .collect::<Vec<_>>();
+
+        let mut shard_major: Vec<Vec<_>> = (0..p).map(|_| Vec::new()).collect();
+        for state_shards in per_state_shards {
+            for (pi, shard) in state_shards.into_iter().enumerate() {
+                shard_major[pi].push(shard);
+            }
+        }
+
+        let shard_batches: Vec<RecordBatch> = shard_major
+            .into_par_iter()
+            .map(|lists| {
+                let map = morsel_agg::merge_entries_into_map(lists);
+                if map.is_empty() {
+                    return Ok(None);
+                }
+                let state =
+                    AggregationState::from_groups(agg_funcs.clone(), input_types.clone(), map);
+                state.build_output(schema).map(Some)
+            })
+            .collect::<Result<Vec<Option<RecordBatch>>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+
+        if shard_batches.is_empty() {
+            return Ok(RecordBatch::new_empty(schema.clone()));
+        }
+        return arrow::compute::concat_batches(schema, &shard_batches).map_err(Into::into);
+    }
+
+    let mut final_state = AggregationState::new(agg_funcs.clone(), input_types);
+    for state in states {
+        final_state.merge(&state);
+    }
+    final_state.build_output(schema)
+}
+
 /// Parallel aggregation using rayon for multi-core performance
 fn aggregate_batches_parallel(
     batches: &[RecordBatch],
@@ -1132,16 +1235,49 @@ fn aggregate_batches_parallel(
         return aggregate_scalar_simd(&batches[0], &aggregates[0], schema);
     }
 
-    // Try vectorized path for supported aggregate functions
-    if can_vectorize_aggregation(group_by, aggregates, batches) {
-        if let Ok(result) = aggregate_batches_vectorized(batches, group_by, aggregates, schema) {
+    let timing = std::env::var("AGG_TIMING").is_ok();
+    let num_threads = rayon::current_num_threads();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+    // Large grouped aggregations: thread-local morsel aggregation states with a
+    // parallel partitioned merge. The single-threaded VectorizedGroupTable pass
+    // below took 54s on a 34M-row / 4M-group input (Q20's inner aggregate);
+    // this path does the same work in parallel.
+    if !group_by.is_empty()
+        && total_rows > 100_000
+        && can_vectorize_aggregation(group_by, aggregates, batches)
+    {
+        let t = std::time::Instant::now();
+        let result = aggregate_batches_morsel_parallel(batches, group_by, aggregates, schema);
+        if timing {
+            eprintln!(
+                "[agg] morsel-parallel over {} rows: ok={} in {:?}",
+                total_rows,
+                result.is_ok(),
+                t.elapsed()
+            );
+        }
+        if let Ok(result) = result {
             return Ok(result);
         }
     }
 
-    // When there are few large batches but many rows, split them for parallelism
-    let num_threads = rayon::current_num_threads();
-    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    // Try vectorized path for supported aggregate functions
+    if can_vectorize_aggregation(group_by, aggregates, batches) {
+        let t = std::time::Instant::now();
+        let r = aggregate_batches_vectorized(batches, group_by, aggregates, schema);
+        if timing {
+            eprintln!(
+                "[agg] vectorized attempt over {} rows: ok={} in {:?}",
+                total_rows,
+                r.is_ok(),
+                t.elapsed()
+            );
+        }
+        if let Ok(result) = r {
+            return Ok(result);
+        }
+    }
 
     let working_batches: Vec<RecordBatch>;
     let batches_ref: &[RecordBatch] = if batches.len() < num_threads && total_rows > 50_000 {
