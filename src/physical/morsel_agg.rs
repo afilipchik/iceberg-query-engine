@@ -1305,8 +1305,12 @@ impl AggregationState {
                     self.raw_type = Some(rt);
                     self.normalize_raw();
                 }
-                for row in start_row..end_row {
-                    let (is_null, raw) = match &group_accessors[0] {
+                // Run detection: clustered keys (lineitem is ordered by
+                // l_orderkey) produce runs of equal values — one map lookup
+                // per RUN instead of per row. Unclustered data degrades
+                // gracefully to runs of length 1.
+                let key_at = |row: usize| -> (bool, u64) {
+                    match &group_accessors[0] {
                         TypedArrayAccessor::Int64(a) => (a.is_null(row), a.value(row) as u64),
                         TypedArrayAccessor::Int32(a) => {
                             (a.is_null(row), a.value(row) as i64 as u64)
@@ -1315,7 +1319,20 @@ impl AggregationState {
                             (a.is_null(row), a.value(row) as i64 as u64)
                         }
                         _ => unreachable!(),
-                    };
+                    }
+                };
+                let mut row = start_row;
+                while row < end_row {
+                    let (is_null, raw) = key_at(row);
+                    // Find the end of this run of identical keys
+                    let mut run_end = row + 1;
+                    while run_end < end_row {
+                        let (n2, r2) = key_at(run_end);
+                        if n2 != is_null || (!is_null && r2 != raw) {
+                            break;
+                        }
+                        run_end += 1;
+                    }
                     let accumulators = if is_null {
                         self.raw_null.get_or_insert_with(|| {
                             self.agg_funcs
@@ -1333,9 +1350,12 @@ impl AggregationState {
                                 .collect()
                         })
                     };
-                    for (i, acc) in accumulators.iter_mut().enumerate() {
-                        agg_accessors[i].update_accumulator(row, acc);
+                    for r in row..run_end {
+                        for (i, acc) in accumulators.iter_mut().enumerate() {
+                            agg_accessors[i].update_accumulator(r, acc);
+                        }
                     }
+                    row = run_end;
                 }
                 return;
             }

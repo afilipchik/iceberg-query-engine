@@ -71,6 +71,10 @@ struct VectorizedHashTable {
     mask: usize,
     /// Pre-evaluated key arrays for each build batch: build_key_arrays[batch_idx][key_col] = ArrayRef
     build_key_arrays: Vec<Vec<ArrayRef>>,
+    /// Zero-copy i64 views of the build keys ([col][batch]) when every key
+    /// column is non-null-free Int64-typed: chain-walk comparisons then use
+    /// raw i64 loads instead of per-candidate dynamic downcasts.
+    i64_key_bufs: Option<Vec<Vec<arrow::buffer::ScalarBuffer<i64>>>>,
 }
 
 impl VectorizedHashTable {
@@ -128,12 +132,41 @@ impl VectorizedHashTable {
             }
         }
 
+        // Zero-copy i64 buffers for fast chain comparisons (columns first,
+        // batches second). Only when EVERY key column in EVERY batch is Int64.
+        let n_cols = build_key_arrays.first().map(|k| k.len()).unwrap_or(0);
+        let mut i64_key_bufs: Option<Vec<Vec<arrow::buffer::ScalarBuffer<i64>>>> = {
+            let mut cols: Vec<Vec<arrow::buffer::ScalarBuffer<i64>>> =
+                (0..n_cols).map(|_| Vec::new()).collect();
+            let mut ok = n_cols > 0;
+            'outer: for key_arrays in &build_key_arrays {
+                for (col, arr) in key_arrays.iter().enumerate() {
+                    match arr.as_any().downcast_ref::<Int64Array>() {
+                        Some(a) => cols[col].push(a.values().clone()),
+                        None => {
+                            ok = false;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            if ok {
+                Some(cols)
+            } else {
+                None
+            }
+        };
+        if build_key_arrays.is_empty() {
+            i64_key_bufs = None;
+        }
+
         Ok(VectorizedHashTable {
             heads,
             next,
             entries,
             mask,
             build_key_arrays,
+            i64_key_bufs,
         })
     }
 
@@ -143,6 +176,38 @@ impl VectorizedHashTable {
     fn probe_batch(&self, probe_key_arrays: &[ArrayRef], num_rows: usize) -> Vec<(u32, u32, u32)> {
         let hashes = vectorized_hash::hash_arrays(probe_key_arrays, num_rows);
         let mut matches = Vec::new();
+
+        // Fast path: raw i64 comparisons, no per-candidate downcasts.
+        if let Some(build_bufs) = &self.i64_key_bufs {
+            let probe_bufs: Option<Vec<&Int64Array>> = probe_key_arrays
+                .iter()
+                .map(|a| a.as_any().downcast_ref::<Int64Array>())
+                .collect();
+            if let Some(probe_arrs) = probe_bufs {
+                for probe_row in 0..num_rows {
+                    if probe_arrs.iter().any(|a| a.is_null(probe_row)) {
+                        continue;
+                    }
+                    let bucket = hashes[probe_row] as usize & self.mask;
+                    let mut entry = self.heads[bucket];
+                    while entry != u32::MAX {
+                        let (bb, br) = self.entries[entry as usize];
+                        let mut eq = true;
+                        for (col, pa) in probe_arrs.iter().enumerate() {
+                            if build_bufs[col][bb as usize][br as usize] != pa.value(probe_row) {
+                                eq = false;
+                                break;
+                            }
+                        }
+                        if eq {
+                            matches.push((bb, br, probe_row as u32));
+                        }
+                        entry = self.next[entry as usize];
+                    }
+                }
+                return matches;
+            }
+        }
 
         for probe_row in 0..num_rows {
             // Skip null probe keys
