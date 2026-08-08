@@ -250,6 +250,9 @@ impl SubqueryExecutor {
 
     /// Execute a scalar subquery and return the scalar value
     pub fn execute_scalar(&self, plan: &LogicalPlan) -> Result<ScalarValue> {
+        if std::env::var("CTE_DEBUG").is_ok() {
+            eprintln!("[cte] execute_scalar enter");
+        }
         let key = self.plan_hash(plan);
 
         {

@@ -59,6 +59,8 @@ impl Optimizer {
                 Arc::new(rules::JoinReorder::new()),
                 // Final predicate pushdown for any remaining opportunities
                 Arc::new(rules::PredicatePushdown),
+                // Share the pipeline between HAVING totals and the aggregate
+                Arc::new(rules::HavingTotalCse),
                 // Collapse FD-redundant group keys to the unique key column
                 Arc::new(rules::GroupKeyReduction::new()),
                 // Pre-aggregate duplicated join inputs (needs footer stats)

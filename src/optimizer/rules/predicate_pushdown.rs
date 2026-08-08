@@ -463,6 +463,28 @@ impl PredicatePushdown {
             }
 
             LogicalPlan::SubqueryAlias(node) => {
+                // Named CTEs are materialization boundaries: they may be
+                // referenced from several places sharing ONE materialized
+                // result, so pushing one consumer's predicate inside would
+                // specialize (and corrupt) the shared plan — materialize-once
+                // collects the FIRST alias's input for every reference.
+                if node.cte_name.is_some() {
+                    let input = self.pushdown(&node.input, vec![])?;
+                    let alias = LogicalPlan::SubqueryAlias(crate::planner::SubqueryAliasNode {
+                        input: Arc::new(input),
+                        alias: node.alias.clone(),
+                        schema: node.schema.clone(),
+                        cte_name: node.cte_name.clone(),
+                    });
+                    if predicates.is_empty() {
+                        return Ok(alias);
+                    }
+                    let combined = self.combine_predicates(predicates);
+                    return Ok(LogicalPlan::Filter(FilterNode {
+                        input: Arc::new(alias),
+                        predicate: combined,
+                    }));
+                }
                 let input = self.pushdown(&node.input, predicates)?;
                 Ok(LogicalPlan::SubqueryAlias(
                     crate::planner::SubqueryAliasNode {

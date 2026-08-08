@@ -489,11 +489,21 @@ impl PhysicalPlanner {
         Self::collect_cte_plans(logical, &cte_counts, &mut cte_plans);
 
         for (name, plan) in &cte_plans {
+            if std::env::var("CTE_DEBUG").is_ok() {
+                eprintln!(
+                    "[cte] materializing {} from node: {}",
+                    name,
+                    &format!("{}", plan).lines().next().unwrap_or("?")
+                );
+            }
             let physical = self.create_physical_plan_inner(plan)?;
             let schema = physical.schema();
             let batches: Vec<arrow::record_batch::RecordBatch> = run_subquery_plan(physical)?;
             // Use a hash of the CTE name as the key
             let key = Self::cte_name_key(name);
+            if std::env::var("CTE_DEBUG").is_ok() {
+                eprintln!("[cte] materialized {} (key {})", name, key);
+            }
             self.cte_cache.lock().insert(key, (schema, batches));
         }
         Ok(())
@@ -773,16 +783,17 @@ impl PhysicalPlanner {
         // identical results (avoids floating-point non-determinism from parallel aggregation).
         // Must run BEFORE the shared-table prescan so tables that only appear
         // inside a now-materialized CTE aren't pointlessly pre-read.
+        // Share the CTE cache with the SubqueryExecutor FIRST — subquery
+        // planners created at any later point must see CTEs materialized
+        // below (gating on non-empty raced: an executor set up before
+        // materialization kept its own empty cache and re-ran the shared
+        // pipeline).
+        if let Some(ref executor) = self.subquery_executor {
+            executor.set_cte_cache(self.cte_cache_ref());
+        }
         self.materialize_shared_ctes(logical)?;
         // Pre-scan tables that are accessed multiple times to avoid redundant parquet reads
         self.prescan_shared_tables(logical);
-        // Share the CTE cache with the SubqueryExecutor so its planners can access
-        // materialized CTEs (ensures scalar subqueries referencing CTEs get identical data)
-        if !self.cte_cache.lock().is_empty() {
-            if let Some(ref executor) = self.subquery_executor {
-                executor.set_cte_cache(self.cte_cache_ref());
-            }
-        }
         self.create_physical_plan_inner(logical)
     }
 
@@ -1343,6 +1354,19 @@ impl PhysicalPlanner {
                 if let Some(ref cte_name) = node.cte_name {
                     let key = Self::cte_name_key(cte_name);
                     let cache = self.cte_cache.lock();
+                    if std::env::var("CTE_DEBUG").is_ok() {
+                        eprintln!(
+                            "[cte] alias {} (key {}) cache {} (len {})",
+                            cte_name,
+                            key,
+                            if cache.contains_key(&key) {
+                                "HIT"
+                            } else {
+                                "MISS"
+                            },
+                            cache.len()
+                        );
+                    }
                     if let Some((schema, batches)) = cache.get(&key) {
                         let exec = MemoryTableExec::new(
                             &node.alias,
