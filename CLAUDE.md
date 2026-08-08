@@ -729,8 +729,12 @@ Based on the codebase structure, these appear to be planned but not fully implem
   against parquet produced by the current `src/tpch/generator.rs`. If the generator
   changes, regenerate the data AND the CSVs (`scripts/generate_expected_results.py`)
   in the same commit.
-- **Spill path is untested**: no test sets `memory_limit`; `SpillableHashJoinExec`
-  still materializes the build side before spilling (known hole, see ROADMAP).
+- **Spill tests**: `tests/spill_tests.rs` forces join/agg/sort spills at tiny
+  memory limits (uses `data/tpch-10mb`) and compares against unlimited runs.
+  The join spill path supports INNER joins only — non-inner joins whose build
+  side exceeds the budget fail loudly instead of returning wrong results.
+  `SpillableHashJoinExec` still materializes the build side before deciding to
+  spill (known hole, fixed by the Phase-5 streaming spill rewrite, see ROADMAP).
 
 ## TPC-H Benchmark Baseline (SF=10, 2026-08-07, 48G cgroup)
 

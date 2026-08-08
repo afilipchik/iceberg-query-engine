@@ -1262,6 +1262,18 @@ fn merge_accumulator_states(
     source: &AccumulatorState,
     func: &AggregateFunction,
 ) {
+    // DISTINCT-tracking aggregates (COUNT(DISTINCT), SUM(DISTINCT),
+    // APPROX_DISTINCT) carry their value set here; it must be UNIONED across
+    // partial states. Finalization reads distinct_set.len(), so merging only
+    // the scalar count left the target partition's set — and one partition's
+    // distinct count — as the final answer.
+    if let Some(src_set) = &source.distinct_set {
+        match &mut target.distinct_set {
+            Some(dst_set) => dst_set.extend(src_set.iter().cloned()),
+            None => target.distinct_set = Some(src_set.clone()),
+        }
+    }
+
     match func {
         AggregateFunction::Count | AggregateFunction::CountDistinct => {
             target.count += source.count;

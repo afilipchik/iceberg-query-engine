@@ -31,10 +31,13 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Generate TPC-H test data
-        # tests/duckdb_validated.rs and friends read data/tpch-1mb (gitignored).
-        # The generator is seeded and byte-for-byte deterministic, so regenerated
-        # data matches the checked-in expected-result CSVs exactly.
-        run: cargo run -- generate-parquet --sf 0.001 --output ./data/tpch-1mb
+        # tests/duckdb_validated.rs reads data/tpch-1mb and tests/spill_tests.rs
+        # reads data/tpch-10mb (both gitignored). The generator is seeded and
+        # byte-for-byte deterministic, so regenerated data matches the
+        # checked-in expected-result CSVs exactly.
+        run: |
+          cargo run -- generate-parquet --sf 0.001 --output ./data/tpch-1mb
+          cargo run -- generate-parquet --sf 0.01 --output ./data/tpch-10mb
 
       - name: Run tests
         run: cargo test --all-features

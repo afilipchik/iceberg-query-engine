@@ -383,6 +383,20 @@ impl SpillableHashJoinExec {
         probe_side: &Arc<dyn PhysicalOperator>,
         swapped: bool,
     ) -> Result<RecordBatchStream> {
+        // The partitioned spill path currently implements INNER join semantics
+        // only (probe_partition ignores join_type). Producing silently-wrong
+        // results for other join types is worse than failing, and falling back
+        // to the in-memory join would risk OOM. Fail loudly until the streaming
+        // spill rewrite implements the remaining join types.
+        if !matches!(self.join_type, JoinType::Inner) {
+            return Err(QueryError::Execution(format!(
+                "{} join build side exceeds the memory budget, but the join spill \
+                 path currently supports only INNER joins. Raise the memory limit \
+                 for this query.",
+                self.join_type
+            )));
+        }
+
         self.config.ensure_spill_dir()?;
 
         let spill_id = SPILL_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -426,7 +440,7 @@ impl SpillableHashJoinExec {
         }
         let probe_stream: RecordBatchStream =
             Box::pin(stream::iter(probe_batches.into_iter().map(Ok)));
-        let results = self
+        let (results, mut probe_spill_files) = self
             .probe_with_spilling(
                 probe_stream,
                 probe_keys,
@@ -437,6 +451,16 @@ impl SpillableHashJoinExec {
                 swapped,
             )
             .await?;
+
+        // Attach each partition's probe spill file before processing: without
+        // this, spilled build partitions are probed against an EMPTY probe side
+        // and every one of their matches is silently dropped.
+        let mut spilled_partitions = spilled_partitions;
+        for (idx, spilled) in spilled_partitions.iter_mut().enumerate() {
+            if let Some(sp) = spilled {
+                sp.probe_file = probe_spill_files[idx].take();
+            }
+        }
 
         // Process spilled partitions
         let mut all_results = results;
@@ -522,7 +546,7 @@ impl SpillableHashJoinExec {
         spilled_partitions: &[Option<SpilledPartition>],
         spill_dir: &PathBuf,
         swapped: bool,
-    ) -> Result<Vec<RecordBatch>> {
+    ) -> Result<(Vec<RecordBatch>, Vec<Option<PathBuf>>)> {
         let mut results = Vec::new();
         let mut probe_spill_files: Vec<Option<PathBuf>> =
             (0..NUM_PARTITIONS).map(|_| None).collect();
@@ -549,6 +573,7 @@ impl SpillableHashJoinExec {
                         }
                     } else if spilled_partitions[idx].is_some() {
                         // Spill probe batch for this partition
+                        self.memory_pool.record_spill(estimate_batch_size(&pb));
                         let probe_path = probe_spill_files[idx].get_or_insert_with(|| {
                             spill_dir.join(format!("probe_{}.parquet", idx))
                         });
@@ -558,10 +583,7 @@ impl SpillableHashJoinExec {
             }
         }
 
-        // Update spilled partitions with probe files
-        // (In a real implementation, we'd update the SpilledPartition struct)
-
-        Ok(results)
+        Ok((results, probe_spill_files))
     }
 
     async fn process_spilled_partition(
@@ -764,111 +786,61 @@ impl PhysicalOperator for SpillableHashAggregateExec {
             .aggregate_with_spilling(input_stream, &spill_dir)
             .await?;
 
-        // Aggregate in-memory partitions
+        // Each partition holds RAW input rows hash-partitioned by group key, so
+        // a given group lives in exactly one partition — possibly split between
+        // a spill file and the in-memory remainder that accumulated after the
+        // eviction. Aggregate each partition's spilled + in-memory rows TOGETHER,
+        // once. Partition results are then disjoint group sets and are simply
+        // concatenated. (Re-aggregating partial outputs with the original
+        // functions is wrong: COUNT over partial counts returns the number of
+        // partials, AVG over partial averages loses the weights.)
+        //
+        // With an empty GROUP BY every row hashes to the same partition, so the
+        // single-result concatenation below is also correct for global aggregates.
+        let agg_exprs: Vec<crate::physical::operators::hash_agg::AggregateExpr> = self
+            .aggregates
+            .iter()
+            .map(|a| crate::physical::operators::hash_agg::AggregateExpr {
+                func: a.func,
+                input: a.input.clone(),
+                distinct: a.distinct,
+                second_arg: a.second_arg.clone(),
+            })
+            .collect();
+
         let mut all_results = Vec::new();
-
-        for part in in_memory_partitions.into_iter().flatten() {
-            if !part.batches.is_empty() {
-                let result = crate::physical::operators::hash_agg::aggregate_batches_external(
-                    &part.batches,
-                    &self.group_by,
-                    &self
-                        .aggregates
-                        .iter()
-                        .map(|a| crate::physical::operators::hash_agg::AggregateExpr {
-                            func: a.func,
-                            input: a.input.clone(),
-                            distinct: a.distinct,
-                            second_arg: a.second_arg.clone(),
-                        })
-                        .collect::<Vec<_>>(),
-                    &self.schema,
-                )?;
-                all_results.push(result);
+        for (idx, part) in in_memory_partitions.into_iter().enumerate() {
+            let mut batches: Vec<RecordBatch> = Vec::new();
+            if let Some(path) = &spilled_files[idx] {
+                batches.extend(read_parquet(path)?);
             }
-        }
-
-        // Process spilled partitions one at a time to limit memory
-        for spill_file in &spilled_files {
-            if let Some(path) = spill_file {
-                let batches = read_parquet(path)?;
-                if !batches.is_empty() {
-                    let result = crate::physical::operators::hash_agg::aggregate_batches_external(
-                        &batches,
-                        &self.group_by,
-                        &self
-                            .aggregates
-                            .iter()
-                            .map(|a| crate::physical::operators::hash_agg::AggregateExpr {
-                                func: a.func,
-                                input: a.input.clone(),
-                                distinct: a.distinct,
-                                second_arg: a.second_arg.clone(),
-                            })
-                            .collect::<Vec<_>>(),
-                        &self.schema,
-                    )?;
-                    all_results.push(result);
-                }
+            if let Some(part) = part {
+                batches.extend(part.batches);
+            }
+            if batches.is_empty() {
+                continue;
+            }
+            let result = crate::physical::operators::hash_agg::aggregate_batches_external(
+                &batches,
+                &self.group_by,
+                &agg_exprs,
+                &self.schema,
+            )?;
+            if result.num_rows() > 0 {
+                all_results.push(result);
             }
         }
 
         // Clean up spill directory
         let _ = std::fs::remove_dir_all(&spill_dir);
 
-        // If we have results from multiple partitions, we need a final merge
-        // For now, concatenate all partial results (works for most aggregates)
         if all_results.is_empty() {
             // Return empty result with correct schema
             let empty_batch = RecordBatch::new_empty(self.schema.clone());
             return Ok(Box::pin(stream::once(async { Ok(empty_batch) })));
         }
 
-        // If only one partition had data, return it directly
-        if all_results.len() == 1 {
-            return Ok(Box::pin(stream::once(
-                async move { Ok(all_results.remove(0)) },
-            )));
-        }
-
-        // Multiple partitions: need to re-aggregate the partial results.
-        // Partial results use the output schema, so aggregate inputs must reference
-        // the output column names (e.g., "SUM(value)") not the original input columns.
-        let num_groups = self.group_by.len();
-        let merge_aggs: Vec<crate::physical::operators::hash_agg::AggregateExpr> = self
-            .aggregates
-            .iter()
-            .enumerate()
-            .map(|(i, a)| {
-                let output_col_name = self.schema.field(num_groups + i).name().clone();
-                crate::physical::operators::hash_agg::AggregateExpr {
-                    func: a.func,
-                    input: Expr::Column(crate::planner::Column::new(output_col_name)),
-                    distinct: a.distinct,
-                    second_arg: a.second_arg.clone(),
-                }
-            })
-            .collect();
-
-        // Group-by expressions also need to reference output column names
-        let merge_group_by: Vec<Expr> = self
-            .group_by
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let col_name = self.schema.field(i).name().clone();
-                Expr::Column(crate::planner::Column::new(col_name))
-            })
-            .collect();
-
-        let final_result = crate::physical::operators::hash_agg::aggregate_batches_external(
-            &all_results,
-            &merge_group_by,
-            &merge_aggs,
-            &self.schema,
-        )?;
-
-        Ok(Box::pin(stream::once(async { Ok(final_result) })))
+        Ok(Box::pin(stream::iter(all_results.into_iter().map(Ok))))
     }
 
     fn name(&self) -> &str {
@@ -1139,11 +1111,15 @@ impl ExternalSortExec {
             buffer_size += batch_size;
         }
 
-        // Flush remaining buffer
+        // Flush remaining buffer. This is still a spill — the run is written to
+        // disk — so it must be recorded, otherwise a sort whose input arrives in
+        // a single batch spills without ever reporting it in QueryMetrics.
         if !buffer.is_empty() {
             let run_path = spill_dir.join(format!("run_{}.parquet", runs.len()));
             self.flush_run(&buffer, &run_path)?;
             runs.push(run_path);
+
+            self.memory_pool.record_spill(buffer_size);
         }
 
         Ok(runs)

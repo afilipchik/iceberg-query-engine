@@ -17,7 +17,7 @@ pub mod tpch;
 // Re-export main types
 pub use arrow_ffi::*;
 pub use error::{QueryError, Result};
-pub use execution::{ExecutionContext, QueryResult};
+pub use execution::{ExecutionConfig, ExecutionContext, QueryResult};
 pub use metastore::{BranchingMetastoreClient, MetastoreCatalog};
 pub use planner::{Binder, InMemoryCatalog, LogicalPlan};
 pub use storage::ParquetTable;
