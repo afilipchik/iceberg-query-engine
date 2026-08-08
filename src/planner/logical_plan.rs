@@ -245,6 +245,9 @@ impl LogicalPlan {
                         .collect::<Vec<_>>()
                         .join(", ")
                 )?;
+                if let Some(proj) = &node.projection {
+                    writeln!(f, "{}  projection: {:?}", prefix, proj)?;
+                }
                 if let Some(filter) = &node.filter {
                     writeln!(f, "{}  filter: {}", prefix, filter)?;
                 }

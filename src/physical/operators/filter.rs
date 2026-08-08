@@ -225,6 +225,31 @@ fn evaluate_expr_internal(
             negated,
         } => {
             let value = evaluate_expr_internal(batch, expr, subquery_executor)?;
+            // Single-pass set membership for all-literal string lists instead
+            // of one full compare pass per list element.
+            if let Some(str_arr) = value.as_any().downcast_ref::<StringArray>() {
+                let mut literals: Vec<&str> = Vec::with_capacity(list.len());
+                let all_utf8_literals = list.iter().all(|e| match e {
+                    Expr::Literal(ScalarValue::Utf8(s)) => {
+                        literals.push(s.as_str());
+                        true
+                    }
+                    _ => false,
+                });
+                if all_utf8_literals {
+                    let set: std::collections::HashSet<&str> = literals.into_iter().collect();
+                    let result: BooleanArray = (0..str_arr.len())
+                        .map(|i| {
+                            if str_arr.is_null(i) {
+                                None
+                            } else {
+                                Some(set.contains(str_arr.value(i)) != *negated)
+                            }
+                        })
+                        .collect();
+                    return Ok(Arc::new(result));
+                }
+            }
             let list_values: Result<Vec<ArrayRef>> = list
                 .iter()
                 .map(|e| evaluate_expr_internal(batch, e, subquery_executor))
@@ -742,6 +767,31 @@ fn evaluate_scalar_func(
 
             let start_arr = &evaluated_args[1];
             let len_arr = evaluated_args.get(2);
+
+            // Vectorized path: constant start (and optional constant length)
+            // via arrow's substring_by_char kernel — one output buffer instead
+            // of a String allocation per row.
+            let const_start = constant_int_value(&args[1], start_arr);
+            let const_len = match (args.get(2), len_arr) {
+                (Some(a), Some(arr)) => match constant_int_value(a, arr) {
+                    Some(v) => Some(Some(v)),
+                    None => None, // non-constant length: fall back
+                },
+                _ => Some(None), // no length argument
+            };
+            // Only the well-defined case (start >= 1, len >= 0) — negative or
+            // zero start/len keep the row loop's exact legacy semantics.
+            if let (Some(start), Some(len)) = (const_start, const_len) {
+                if start >= 1 && len.map(|l| l >= 0).unwrap_or(true) {
+                    let result = arrow::compute::kernels::substring::substring_by_char(
+                        str_arr,
+                        start - 1,
+                        len.map(|l| l as u64),
+                    )
+                    .map_err(QueryError::Arrow)?;
+                    return Ok(Arc::new(result));
+                }
+            }
 
             let result: StringArray = (0..str_arr.len())
                 .map(|i| {
@@ -5420,6 +5470,23 @@ fn get_float_array(arr: &ArrayRef) -> Result<Vec<Option<f64>>> {
     }
 
     Err(QueryError::Type("Expected numeric array".into()))
+}
+
+/// Extract a compile-time-constant integer from a function argument:
+/// either the expression is a literal, or the evaluated array is a
+/// single-value literal broadcast. Returns None for row-varying args.
+fn constant_int_value(expr: &crate::planner::Expr, arr: &ArrayRef) -> Option<i64> {
+    if let crate::planner::Expr::Literal(sv) = expr {
+        return match sv {
+            ScalarValue::Int64(v) => Some(*v),
+            ScalarValue::Int32(v) => Some(*v as i64),
+            _ => None,
+        };
+    }
+    if arr.len() == 1 {
+        return get_int_value(arr, 0);
+    }
+    None
 }
 
 fn get_int_value(arr: &ArrayRef, idx: usize) -> Option<i64> {
