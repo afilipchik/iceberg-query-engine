@@ -105,6 +105,12 @@ impl PhysicalOperator for MorselAggregateExec {
             return Ok(Box::pin(stream::empty()));
         }
 
+        // Dense direct-address fast path: single bounded int group key with
+        // simple aggregates skips hash tables AND the merge.
+        if let Some(stream) = self.try_execute_dense_direct()? {
+            return Ok(stream);
+        }
+
         // Create the parallel Parquet source with row group pruning
         let source = ParallelParquetSource::try_new_with_filter(
             self.files.clone(),
@@ -250,5 +256,393 @@ impl fmt::Display for MorselAggregateExec {
             groups.join(", "),
             aggs.join(", ")
         )
+    }
+}
+
+enum DenseAgg {
+    SumF64,
+    SumI64,
+    Count,
+    Avg,
+}
+
+impl MorselAggregateExec {
+    /// Dense direct-address aggregation. Applies when the group key is one
+    /// plain Int64/Int32/Date32 column whose footer min/max span at most
+    /// 64M values, and every aggregate is COUNT / SUM / AVG over a plain
+    /// null-free column (or COUNT(*)). One shared atomic accumulator array
+    /// indexed by key-min replaces hash tables and the merge entirely.
+    /// Returns None to fall back to the generic morsel path.
+    fn try_execute_dense_direct(&self) -> Result<Option<RecordBatchStream>> {
+        use arrow::array::{Date32Array, Float64Array, Int32Array, Int64Array};
+        use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+
+        if self.group_by.len() != 1 || self.filter.is_some() {
+            return Ok(None);
+        }
+        let key_name = match &self.group_by[0] {
+            Expr::Column(c) => c.name.clone(),
+            Expr::Alias { expr, .. } => match &**expr {
+                Expr::Column(c) => c.name.clone(),
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        let key_idx = match self
+            .input_schema
+            .fields()
+            .iter()
+            .position(|f| f.name().eq_ignore_ascii_case(&key_name))
+        {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        if !matches!(
+            self.input_schema.field(key_idx).data_type(),
+            DataType::Int64 | DataType::Int32 | DataType::Date32
+        ) {
+            return Ok(None);
+        }
+        // Aggregate kinds
+        let mut kinds: Vec<(DenseAgg, Option<usize>)> = Vec::new();
+        for a in &self.aggregates {
+            if a.distinct || a.second_arg.is_some() {
+                return Ok(None);
+            }
+            let col_idx = |e: &Expr| -> Option<usize> {
+                match e {
+                    Expr::Column(c) => self
+                        .input_schema
+                        .fields()
+                        .iter()
+                        .position(|f| f.name().eq_ignore_ascii_case(&c.name)),
+                    _ => None,
+                }
+            };
+            match a.func {
+                AggregateFunction::Count => match &a.input {
+                    Expr::Wildcard => kinds.push((DenseAgg::Count, None)),
+                    e => match col_idx(e) {
+                        Some(i) => kinds.push((DenseAgg::Count, Some(i))),
+                        None => return Ok(None),
+                    },
+                },
+                AggregateFunction::Sum | AggregateFunction::Avg => {
+                    let Some(i) = col_idx(&a.input) else {
+                        return Ok(None);
+                    };
+                    let k = match (&a.func, self.input_schema.field(i).data_type()) {
+                        (AggregateFunction::Sum, DataType::Float64) => DenseAgg::SumF64,
+                        (AggregateFunction::Sum, DataType::Int64) => DenseAgg::SumI64,
+                        (AggregateFunction::Avg, DataType::Float64) => DenseAgg::Avg,
+                        _ => return Ok(None),
+                    };
+                    kinds.push((k, Some(i)));
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        // Key bounds from parquet footers
+        let mut kmin = i64::MAX;
+        let mut kmax = i64::MIN;
+        for f in &self.files {
+            let file = match std::fs::File::open(f) {
+                Ok(f) => f,
+                Err(_) => return Ok(None),
+            };
+            let reader = match parquet::file::reader::SerializedFileReader::new(file) {
+                Ok(r) => r,
+                Err(_) => return Ok(None),
+            };
+            use parquet::file::reader::FileReader;
+            let meta = reader.metadata();
+            for rg in meta.row_groups() {
+                let col = rg.column(key_idx);
+                let Some(stats) = col.statistics() else {
+                    return Ok(None);
+                };
+                use parquet::file::statistics::Statistics;
+                let (lo, hi) = match stats {
+                    Statistics::Int64(s) => match (s.min_opt(), s.max_opt()) {
+                        (Some(a), Some(b)) => (*a, *b),
+                        _ => return Ok(None),
+                    },
+                    Statistics::Int32(s) => match (s.min_opt(), s.max_opt()) {
+                        (Some(a), Some(b)) => (*a as i64, *b as i64),
+                        _ => return Ok(None),
+                    },
+                    _ => return Ok(None),
+                };
+                kmin = kmin.min(lo);
+                kmax = kmax.max(hi);
+            }
+        }
+        if kmin > kmax {
+            return Ok(None);
+        }
+        let width_u = (kmax as i128 - kmin as i128 + 1) as u64;
+        if width_u > 64_000_000 {
+            return Ok(None);
+        }
+        let width = width_u as usize;
+
+        // Shared atomic accumulator arrays (zeroed lazily by the allocator)
+        let presence: Vec<AtomicU64> = (0..width.div_ceil(64)).map(|_| AtomicU64::new(0)).collect();
+        let acc_f64: Vec<Vec<AtomicU64>> = kinds
+            .iter()
+            .map(|(k, _)| match k {
+                DenseAgg::SumF64 | DenseAgg::Avg => (0..width).map(|_| AtomicU64::new(0)).collect(),
+                _ => Vec::new(),
+            })
+            .collect();
+        let acc_i64: Vec<Vec<AtomicI64>> = kinds
+            .iter()
+            .map(|(k, _)| match k {
+                DenseAgg::SumI64 | DenseAgg::Count | DenseAgg::Avg => {
+                    (0..width).map(|_| AtomicI64::new(0)).collect()
+                }
+                _ => Vec::new(),
+            })
+            .collect();
+
+        let source = ParallelParquetSource::try_new_with_filter(
+            self.files.clone(),
+            self.input_schema.clone(),
+            self.projection.clone(),
+            DEFAULT_MORSEL_SIZE,
+            None,
+        )?;
+        // Column positions AFTER projection
+        let proj_pos = |file_idx: usize| -> Option<usize> {
+            match &self.projection {
+                Some(p) => p.iter().position(|&i| i == file_idx),
+                None => Some(file_idx),
+            }
+        };
+        let Some(key_pos) = proj_pos(key_idx) else {
+            return Ok(None);
+        };
+        let mut agg_pos: Vec<Option<usize>> = Vec::new();
+        for (_, idx) in &kinds {
+            match idx {
+                Some(i) => match proj_pos(*i) {
+                    Some(p) => agg_pos.push(Some(p)),
+                    None => return Ok(None),
+                },
+                None => agg_pos.push(None),
+            }
+        }
+
+        let num_threads = rayon::current_num_threads();
+        let results: Vec<Result<()>> = (0..num_threads)
+            .into_par_iter()
+            .map(|_| {
+                while let Some(work) = source.get_work() {
+                    let batches = source.read_row_group(&work)?;
+                    for batch in batches {
+                        let key_arr = batch.column(key_pos);
+                        if key_arr.null_count() > 0 {
+                            return Err(QueryError::Execution(
+                                "dense agg: null group keys unsupported".into(),
+                            ));
+                        }
+                        let keys_i64: Vec<i64> = match key_arr.data_type() {
+                            DataType::Int64 => key_arr
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap()
+                                .values()
+                                .to_vec(),
+                            DataType::Int32 => key_arr
+                                .as_any()
+                                .downcast_ref::<Int32Array>()
+                                .unwrap()
+                                .values()
+                                .iter()
+                                .map(|&v| v as i64)
+                                .collect(),
+                            DataType::Date32 => key_arr
+                                .as_any()
+                                .downcast_ref::<Date32Array>()
+                                .unwrap()
+                                .values()
+                                .iter()
+                                .map(|&v| v as i64)
+                                .collect(),
+                            _ => {
+                                return Err(QueryError::Execution(
+                                    "dense agg: unexpected key type".into(),
+                                ))
+                            }
+                        };
+                        for (ai, ((kind, _), pos)) in kinds.iter().zip(agg_pos.iter()).enumerate() {
+                            match kind {
+                                DenseAgg::Count => {
+                                    if let Some(p) = pos {
+                                        let arr = batch.column(*p);
+                                        for (r, &k) in keys_i64.iter().enumerate() {
+                                            if !arr.is_null(r) {
+                                                acc_i64[ai][(k - kmin) as usize]
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                            }
+                                        }
+                                    } else {
+                                        for &k in &keys_i64 {
+                                            acc_i64[ai][(k - kmin) as usize]
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                }
+                                DenseAgg::SumI64 => {
+                                    let arr = batch
+                                        .column(pos.unwrap())
+                                        .as_any()
+                                        .downcast_ref::<Int64Array>()
+                                        .unwrap();
+                                    if arr.null_count() > 0 {
+                                        return Err(QueryError::Execution(
+                                            "dense agg: null sum input".into(),
+                                        ));
+                                    }
+                                    let vals = arr.values();
+                                    for (r, &k) in keys_i64.iter().enumerate() {
+                                        acc_i64[ai][(k - kmin) as usize]
+                                            .fetch_add(vals[r], Ordering::Relaxed);
+                                    }
+                                }
+                                DenseAgg::SumF64 | DenseAgg::Avg => {
+                                    let arr = batch
+                                        .column(pos.unwrap())
+                                        .as_any()
+                                        .downcast_ref::<Float64Array>()
+                                        .unwrap();
+                                    if arr.null_count() > 0 {
+                                        return Err(QueryError::Execution(
+                                            "dense agg: null sum input".into(),
+                                        ));
+                                    }
+                                    let vals = arr.values();
+                                    for (r, &k) in keys_i64.iter().enumerate() {
+                                        let cell = &acc_f64[ai][(k - kmin) as usize];
+                                        let mut cur = cell.load(Ordering::Relaxed);
+                                        loop {
+                                            let nv = f64::from_bits(cur) + vals[r];
+                                            match cell.compare_exchange_weak(
+                                                cur,
+                                                nv.to_bits(),
+                                                Ordering::Relaxed,
+                                                Ordering::Relaxed,
+                                            ) {
+                                                Ok(_) => break,
+                                                Err(a) => cur = a,
+                                            }
+                                        }
+                                        if matches!(kind, DenseAgg::Avg) {
+                                            acc_i64[ai][(k - kmin) as usize]
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        for &k in &keys_i64 {
+                            let off = (k - kmin) as usize;
+                            presence[off >> 6].fetch_or(1u64 << (off & 63), Ordering::Relaxed);
+                        }
+                    }
+                    source.complete_work();
+                }
+                Ok(())
+            })
+            .collect();
+        for r in results {
+            r?;
+        }
+
+        // Parallel bitmap walk -> output batches per chunk of the key space
+        let key_dt = self.schema.field(0).data_type().clone();
+        let out_dt: Vec<DataType> = (1..self.schema.fields().len())
+            .map(|i| self.schema.field(i).data_type().clone())
+            .collect();
+        const WORDS_PER_CHUNK: usize = 16_384;
+        let n_chunks = presence.len().div_ceil(WORDS_PER_CHUNK);
+        let mut batches: Vec<RecordBatch> = (0..n_chunks)
+            .into_par_iter()
+            .map(|ci| -> Result<Option<RecordBatch>> {
+                let w0 = ci * WORDS_PER_CHUNK;
+                let w1 = (w0 + WORDS_PER_CHUNK).min(presence.len());
+                let mut keys: Vec<i64> = Vec::new();
+                for w in w0..w1 {
+                    let mut bits = presence[w].load(Ordering::Relaxed);
+                    while bits != 0 {
+                        let b = bits.trailing_zeros() as usize;
+                        keys.push(kmin + ((w << 6) + b) as i64);
+                        bits &= bits - 1;
+                    }
+                }
+                if keys.is_empty() {
+                    return Ok(None);
+                }
+                let mut arrays: Vec<ArrayRef> = Vec::with_capacity(1 + kinds.len());
+                let key_array: ArrayRef = match key_dt {
+                    DataType::Int32 => Arc::new(arrow::array::Int32Array::from_iter_values(
+                        keys.iter().map(|&k| k as i32),
+                    )),
+                    DataType::Date32 => Arc::new(arrow::array::Date32Array::from_iter_values(
+                        keys.iter().map(|&k| k as i32),
+                    )),
+                    _ => Arc::new(Int64Array::from_iter_values(keys.iter().copied())),
+                };
+                arrays.push(key_array);
+                for (ai, (kind, _)) in kinds.iter().enumerate() {
+                    let arr: ArrayRef = match kind {
+                        DenseAgg::Count => {
+                            Arc::new(Int64Array::from_iter_values(keys.iter().map(|&k| {
+                                acc_i64[ai][(k - kmin) as usize].load(Ordering::Relaxed)
+                            })))
+                        }
+                        DenseAgg::SumI64 => {
+                            let it = keys
+                                .iter()
+                                .map(|&k| acc_i64[ai][(k - kmin) as usize].load(Ordering::Relaxed));
+                            match &out_dt[ai] {
+                                DataType::Float64 => {
+                                    Arc::new(arrow::array::Float64Array::from_iter_values(
+                                        it.map(|v| v as f64),
+                                    ))
+                                }
+                                _ => Arc::new(Int64Array::from_iter_values(it)),
+                            }
+                        }
+                        DenseAgg::SumF64 => Arc::new(arrow::array::Float64Array::from_iter_values(
+                            keys.iter().map(|&k| {
+                                f64::from_bits(
+                                    acc_f64[ai][(k - kmin) as usize].load(Ordering::Relaxed),
+                                )
+                            }),
+                        )),
+                        DenseAgg::Avg => Arc::new(arrow::array::Float64Array::from_iter_values(
+                            keys.iter().map(|&k| {
+                                let off = (k - kmin) as usize;
+                                let s = f64::from_bits(acc_f64[ai][off].load(Ordering::Relaxed));
+                                let c = acc_i64[ai][off].load(Ordering::Relaxed);
+                                s / c as f64
+                            }),
+                        )),
+                    };
+                    arrays.push(arr);
+                }
+                Ok(Some(RecordBatch::try_new(self.schema.clone(), arrays)?))
+            })
+            .collect::<Result<Vec<Option<RecordBatch>>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+
+        if let Some(pred) = &self.post_filter {
+            batches = crate::physical::operators::filter_batches(batches, pred)?;
+        }
+        Ok(Some(Box::pin(stream::iter(batches.into_iter().map(Ok)))))
     }
 }
