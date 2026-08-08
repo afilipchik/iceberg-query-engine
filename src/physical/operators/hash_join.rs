@@ -2405,16 +2405,23 @@ fn create_joined_batch(
     };
     let build_columns = build_columns?;
 
-    // Gather probe columns
-    let probe_indices_arr: Vec<u32> = probe_indices.iter().map(|&i| i as u32).collect();
-    let probe_index_arr = UInt32Array::from(probe_indices_arr);
-
-    let probe_columns: Result<Vec<ArrayRef>> = probe_batch
-        .columns()
-        .iter()
-        .map(|col| compute::take(col.as_ref(), &probe_index_arr, None).map_err(Into::into))
-        .collect();
-    let probe_columns = probe_columns?;
+    // Gather probe columns. FK-shaped joins (every probe row matches exactly
+    // once, in order) produce identity indices — reuse the probe columns
+    // as-is instead of take()-copying them (Q09 was re-copying a 133M-row
+    // intermediate through this path).
+    let identity = probe_indices.len() == probe_batch.num_rows()
+        && probe_indices.iter().enumerate().all(|(i, &p)| p == i);
+    let probe_columns: Vec<ArrayRef> = if identity {
+        probe_batch.columns().to_vec()
+    } else {
+        let probe_indices_arr: Vec<u32> = probe_indices.iter().map(|&i| i as u32).collect();
+        let probe_index_arr = UInt32Array::from(probe_indices_arr);
+        probe_batch
+            .columns()
+            .iter()
+            .map(|col| compute::take(col.as_ref(), &probe_index_arr, None).map_err(Into::into))
+            .collect::<Result<Vec<ArrayRef>>>()?
+    };
 
     // Combine in correct order
     let columns: Vec<ArrayRef> = if swapped {
