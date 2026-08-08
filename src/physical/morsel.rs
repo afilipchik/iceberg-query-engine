@@ -267,9 +267,9 @@ impl ParallelParquetSource {
 
     /// Read a single row group and return batches
     pub fn read_row_group(&self, work: &RowGroupWork) -> Result<Vec<RecordBatch>> {
-        let file = File::open(&work.file_path)?;
         let builder = match &self.dict_schema {
             Some(schema) => {
+                let file = File::open(&work.file_path)?;
                 let opts = parquet::arrow::arrow_reader::ArrowReaderOptions::new()
                     .with_schema(schema.clone());
                 match parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new_with_options(
@@ -282,7 +282,7 @@ impl ParallelParquetSource {
                     }
                 }
             }
-            None => ParquetRecordBatchReaderBuilder::try_new(file)?,
+            None => crate::storage::metadata_cache::cached_reader_builder(&work.file_path)?,
         };
 
         // Apply projection if specified

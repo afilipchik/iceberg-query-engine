@@ -10,3 +10,5 @@ pub mod row_group_pruning;
 pub use parquet::{
     ParquetFileInfo, ParquetTable, StreamingParquetReader, StreamingParquetScanBuilder,
 };
+
+pub mod metadata_cache;

@@ -281,38 +281,23 @@ impl PhysicalOperator for StreamingParquetScanExec {
 
                 // Open next row group
                 let work = work_iter.next()?;
-                let file = match File::open(&work.file_path) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        return Some((
-                            Err(QueryError::Io(e)),
-                            (
-                                work_iter,
-                                projection,
-                                batch_size,
-                                schema,
-                                None,
-                                (runtime_cfg, filter_spec),
-                            ),
-                        ))
-                    }
-                };
-                let builder = match ParquetRecordBatchReaderBuilder::try_new(file) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        return Some((
-                            Err(QueryError::Parquet(e)),
-                            (
-                                work_iter,
-                                projection,
-                                batch_size,
-                                schema,
-                                None,
-                                (runtime_cfg, filter_spec),
-                            ),
-                        ))
-                    }
-                };
+                let builder =
+                    match crate::storage::metadata_cache::cached_reader_builder(&work.file_path) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            return Some((
+                                Err(e),
+                                (
+                                    work_iter,
+                                    projection,
+                                    batch_size,
+                                    schema,
+                                    None,
+                                    (runtime_cfg, filter_spec),
+                                ),
+                            ))
+                        }
+                    };
 
                 let builder = builder
                     .with_batch_size(batch_size)

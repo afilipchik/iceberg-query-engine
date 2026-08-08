@@ -244,9 +244,7 @@ impl ParquetTable {
         let batches: Vec<Vec<RecordBatch>> = (0..num_row_groups)
             .into_par_iter()
             .map(|rg_idx| {
-                let file = File::open(&path)
-                    .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))?;
-                let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+                let builder = crate::storage::metadata_cache::cached_reader_builder(&path)
                     .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))?;
 
                 // Select only this row group
@@ -343,9 +341,7 @@ impl ParquetTable {
 
         let read_row_group =
             |rg_idx: usize| -> std::result::Result<Vec<RecordBatch>, arrow::error::ArrowError> {
-                let file = File::open(&path)
-                    .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))?;
-                let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+                let builder = crate::storage::metadata_cache::cached_reader_builder(&path)
                     .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))?;
 
                 let builder = builder.with_batch_size(8_192).with_row_groups(vec![rg_idx]);
