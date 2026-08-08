@@ -516,7 +516,9 @@ impl PhysicalOperator for HashJoinExec {
                 // scan (Inner joins, single i64 key, reasonably small builds):
                 // the scan then decodes only rows whose key can match.
                 if let Some(slot) = &self.probe_runtime_filter {
-                    if build_keys.len() == 1 && total_build_rows <= 4_000_000 {
+                    // Bitmap filters stay cheap far beyond the HashSet cap:
+                    // 16M keys over a <=64M domain is an 8MB bitmap.
+                    if build_keys.len() == 1 && total_build_rows <= 16_000_000 {
                         let mut keys: Vec<i64> = Vec::with_capacity(total_build_rows);
                         let mut ok = true;
                         'outer_rt: for batch in &build_batches {
@@ -545,19 +547,26 @@ impl PhysicalOperator for HashJoinExec {
                             use crate::physical::operators::streaming_parquet_scan::RuntimeFilterPayload;
                             let min = keys.iter().copied().min().unwrap();
                             let max = keys.iter().copied().max().unwrap();
+                            // Too wide for a bitmap and too many keys for a
+                            // cheap set: publish nothing.
+                            let skip = (max - min) >= 64_000_000 && keys.len() > 4_000_000;
                             // Bitmap for bounded domains: 64M bits = 8MB cap
-                            let payload = if (max - min) < 64_000_000 {
+                            let payload = if skip {
+                                None
+                            } else if (max - min) < 64_000_000 {
                                 let width = (max - min) as usize + 1;
                                 let mut bits = vec![0u64; width.div_ceil(64)];
                                 for k in &keys {
                                     let off = (k - min) as usize;
                                     bits[off >> 6] |= 1u64 << (off & 63);
                                 }
-                                RuntimeFilterPayload::Bitmap { min, bits }
+                                Some(RuntimeFilterPayload::Bitmap { min, bits })
                             } else {
-                                RuntimeFilterPayload::Set(keys.into_iter().collect())
+                                Some(RuntimeFilterPayload::Set(keys.into_iter().collect()))
                             };
-                            *slot.lock() = Some(std::sync::Arc::new(payload));
+                            if let Some(p) = payload {
+                                *slot.lock() = Some(std::sync::Arc::new(p));
+                            }
                         }
                     }
                 }
