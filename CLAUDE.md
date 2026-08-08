@@ -738,22 +738,22 @@ Based on the codebase structure, these appear to be planned but not fully implem
 
 ## TPC-H Benchmark Status (SF=10, 2026-08-08, 48G cgroup)
 
-Log: `logs/safe_benchmark_20260808_025723.log`. Spec queries, spec-generator data.
-**22/22 pass the benchmark runner; total 23.8s vs native-table DuckDB 2.94s (8.0x).**
+Log: `logs/safe_benchmark_20260808_035906.log`. Spec queries, spec-generator data.
+**22/22 pass the benchmark runner; total 23.2s vs native-table DuckDB 2.94s (7.8x); 15/22 within 10x.**
 Like-for-like (DuckDB reading the SAME parquet files via views: 4.49s total):
 **5.2x aggregate, every query within 10x except Q11.**
 
 | Query | Engine | vs native | | Query | Engine | vs native |
 |-------|--------|-------|-|-------|--------|-------|
 | Q01 | ~480ms | 4.5x | | Q12 | 297ms | 3.4x |
-| Q02 | 185ms | 8.4x | | Q13 | 1.00s | 10.1x |
+| Q02 | 185ms | 8.4x | | Q13 | 765ms | 7.7x |
 | Q03 | 602ms | 7.3x | | Q14 | 174ms | 4.4x |
 | Q04 | 532ms | 9.3x | | Q15 | 423ms | 13.6x |
-| Q05 | 946ms | 19.7x | | Q16 | 358ms | 9.1x |
+| Q05 | 892ms | 18.5x | | Q16 | 358ms | 9.1x |
 | Q06 | 178ms | 7.3x | | Q17 | 737ms | 8.4x |
-| Q07 | 484ms | 6.7x | | Q18 | 3.64s | 15.6x |
+| Q07 | 484ms | 6.7x | | Q18 | 3.52s | 15.1x |
 | Q08 | 1.10s | 15.4x | | Q19 | 366ms | 4.1x |
-| Q09 | 6.68s | 5.3x | | Q20 | 1.59s | 9.9x |
+| Q09 | 6.68s | 5.3x | | Q20 | 1.50s | 9.3x |
 | Q10 | 1.16s | 12.7x | | Q21 | 1.81s | 8.5x |
 | Q11 | 435ms | 31.0x | | Q22 | 613ms | 18.0x |
 
