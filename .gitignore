@@ -6,3 +6,7 @@
 
 # Generated test data
 /data/
+
+# Logs and local envs
+/logs/
+/.venv/

@@ -108,6 +108,10 @@ enum Commands {
         /// Scale factor (for Q11 threshold adjustment). Auto-detected from path if not specified.
         #[arg(short, long)]
         sf: Option<f64>,
+
+        /// Save query results as CSV files to this directory
+        #[arg(long)]
+        save_csv: Option<PathBuf>,
     },
 
     /// Start interactive SQL shell (REPL)
@@ -333,6 +337,7 @@ async fn main() {
             iterations,
             query,
             sf,
+            save_csv,
         } => {
             // Auto-detect scale factor from path name if not specified
             let sf = sf.unwrap_or_else(|| {
@@ -429,6 +434,19 @@ async fn main() {
                                 );
                                 if iter == 0 {
                                     results.push((q, result.row_count, elapsed));
+                                    // Save CSV if requested
+                                    if let Some(ref csv_dir) = save_csv {
+                                        std::fs::create_dir_all(csv_dir).ok();
+                                        let csv_path = csv_dir.join(format!("q{:02}.csv", q));
+                                        if let Ok(file) = std::fs::File::create(&csv_path) {
+                                            let mut writer = arrow::csv::WriterBuilder::new()
+                                                .with_header(true)
+                                                .build(file);
+                                            for batch in &result.batches {
+                                                writer.write(batch).ok();
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             Err(e) => {
