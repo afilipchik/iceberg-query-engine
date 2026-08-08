@@ -191,6 +191,19 @@ fn evaluate_expr_internal(
 
         Expr::BinaryExpr { left, op, right } => {
             let left_arr = evaluate_expr_internal(batch, left, subquery_executor)?;
+            // Dictionary-string comparisons against literals evaluate once
+            // over the (tiny) values array, then expand by keys — instead
+            // of materializing and comparing per row.
+            if let (Some(dict), Expr::Literal(ScalarValue::Utf8(lit))) = (
+                left_arr
+                    .as_any()
+                    .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int32Type>>(),
+                &**right,
+            ) {
+                if let Some(mask) = dict_literal_mask(dict, *op, lit)? {
+                    return Ok(mask);
+                }
+            }
             let right_arr = evaluate_expr_internal(batch, right, subquery_executor)?;
             evaluate_binary_op(&left_arr, *op, &right_arr)
         }
@@ -225,6 +238,42 @@ fn evaluate_expr_internal(
             negated,
         } => {
             let value = evaluate_expr_internal(batch, expr, subquery_executor)?;
+            // Dictionary input: membership over the values array, expanded
+            // by keys.
+            if let Some(dict) = value
+                .as_any()
+                .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int32Type>>()
+            {
+                let mut literals: Vec<&str> = Vec::with_capacity(list.len());
+                let all_utf8 = list.iter().all(|e| match e {
+                    Expr::Literal(ScalarValue::Utf8(s)) => {
+                        literals.push(s.as_str());
+                        true
+                    }
+                    _ => false,
+                });
+                if all_utf8 {
+                    let set: std::collections::HashSet<&str> = literals.into_iter().collect();
+                    if let Some(values) = dict.values().as_any().downcast_ref::<StringArray>() {
+                        let vmask: Vec<bool> = (0..values.len())
+                            .map(|i| {
+                                !values.is_null(i) && (set.contains(values.value(i)) != *negated)
+                            })
+                            .collect();
+                        let keys = dict.keys();
+                        let result: BooleanArray = (0..keys.len())
+                            .map(|i| {
+                                if dict.is_null(i) {
+                                    None
+                                } else {
+                                    Some(vmask[keys.value(i) as usize])
+                                }
+                            })
+                            .collect();
+                        return Ok(Arc::new(result));
+                    }
+                }
+            }
             // Single-pass set membership for all-literal string lists instead
             // of one full compare pass per list element.
             if let Some(str_arr) = value.as_any().downcast_ref::<StringArray>() {
@@ -406,6 +455,55 @@ fn scalar_to_array(value: &ScalarValue, num_rows: usize) -> ArrayRef {
             Arc::new(StringArray::from(vec![json_str.as_str(); num_rows]))
         }
     }
+}
+
+/// Evaluate `dict_col <op> 'literal'` at the dictionary-values level and
+/// expand the boolean by keys. Returns Ok(None) for unsupported ops.
+fn dict_literal_mask(
+    dict: &arrow::array::DictionaryArray<arrow::datatypes::Int32Type>,
+    op: BinaryOp,
+    lit: &str,
+) -> Result<Option<ArrayRef>> {
+    let values = match dict.values().as_any().downcast_ref::<StringArray>() {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let vmask: Vec<Option<bool>> = match op {
+        BinaryOp::Eq => (0..values.len())
+            .map(|i| (!values.is_null(i)).then(|| values.value(i) == lit))
+            .collect(),
+        BinaryOp::NotEq => (0..values.len())
+            .map(|i| (!values.is_null(i)).then(|| values.value(i) != lit))
+            .collect(),
+        BinaryOp::Like | BinaryOp::NotLike => {
+            let lit_arr = StringArray::from(vec![lit; 1]);
+            let mut out = Vec::with_capacity(values.len());
+            for i in 0..values.len() {
+                if values.is_null(i) {
+                    out.push(None);
+                    continue;
+                }
+                let v_arr = StringArray::from(vec![values.value(i); 1]);
+                let m = arrow::compute::kernels::comparison::like(&v_arr, &lit_arr)
+                    .map_err(|e| QueryError::Execution(e.to_string()))?;
+                let hit = m.value(0);
+                out.push(Some(if op == BinaryOp::NotLike { !hit } else { hit }));
+            }
+            out
+        }
+        _ => return Ok(None),
+    };
+    let keys = dict.keys();
+    let result: BooleanArray = (0..keys.len())
+        .map(|i| {
+            if dict.is_null(i) {
+                None
+            } else {
+                vmask[keys.value(i) as usize]
+            }
+        })
+        .collect();
+    Ok(Some(Arc::new(result)))
 }
 
 fn evaluate_binary_op(left: &ArrayRef, op: BinaryOp, right: &ArrayRef) -> Result<ArrayRef> {

@@ -82,6 +82,10 @@ pub struct StreamingParquetScanExec {
     runtime_filter: RuntimeFilterConfig,
     /// Static predicate applied at the decoder (expr, provider column indices)
     filter_spec: Option<(Expr, Vec<usize>)>,
+    /// Schema override coercing dict-safe filter string columns
+    dict_filter_schema: Option<SchemaRef>,
+    /// Post-projection column positions to cast back to Utf8 on emission
+    coerce_back: Vec<usize>,
 }
 
 impl fmt::Debug for StreamingParquetScanExec {
@@ -112,6 +116,73 @@ impl StreamingParquetScanExec {
     ) -> Result<Self> {
         let table_name = table_name.into();
         let batch_size = 8_192;
+
+        // Dictionary coercion for filter string columns: when every
+        // reference to a Utf8 column in the predicate is dictionary-safe
+        // (=, <>, LIKE, IN over literals), read it as Dictionary(Int32,Utf8)
+        // — the RowFilter then evaluates over the values array and never
+        // expands 60M shipmode strings (filter.rs has the dict fast paths).
+        let dict_filter_schema: Option<SchemaRef> = filter.and_then(|expr| {
+            let mut safe: Vec<String> = Vec::new();
+            let mut unsafe_cols: Vec<String> = Vec::new();
+            collect_dict_safety(expr, &mut safe, &mut unsafe_cols);
+            let safe: Vec<String> = safe
+                .into_iter()
+                .filter(|c| !unsafe_cols.iter().any(|u| u.eq_ignore_ascii_case(c)))
+                .collect();
+            if safe.is_empty() {
+                return None;
+            }
+            let mut changed = false;
+            let fields: Vec<arrow::datatypes::Field> = provider_schema
+                .fields()
+                .iter()
+                .map(|f| {
+                    if f.data_type() == &arrow::datatypes::DataType::Utf8
+                        && safe.iter().any(|c| c.eq_ignore_ascii_case(f.name()))
+                    {
+                        changed = true;
+                        arrow::datatypes::Field::new(
+                            f.name(),
+                            arrow::datatypes::DataType::Dictionary(
+                                Box::new(arrow::datatypes::DataType::Int32),
+                                Box::new(arrow::datatypes::DataType::Utf8),
+                            ),
+                            f.is_nullable(),
+                        )
+                    } else {
+                        f.as_ref().clone()
+                    }
+                })
+                .collect();
+            changed.then(|| std::sync::Arc::new(arrow::datatypes::Schema::new(fields)))
+        });
+        // Output positions (post-projection) of coerced columns: batches
+        // cast these back to Utf8 after the RowFilter, so only surviving
+        // rows materialize strings and the output schema stays Utf8.
+        let coerce_back: Vec<usize> = match &dict_filter_schema {
+            None => Vec::new(),
+            Some(ds) => {
+                let dict_positions: Vec<usize> = ds
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, f)| {
+                        matches!(f.data_type(), arrow::datatypes::DataType::Dictionary(_, _))
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                match &projection {
+                    Some(p) => p
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, file_idx)| dict_positions.contains(file_idx))
+                        .map(|(out_idx, _)| out_idx)
+                        .collect(),
+                    None => dict_positions,
+                }
+            }
+        };
 
         // Static predicate pushdown: decode predicate columns first and
         // materialize the rest only for matching rows. Requires every
@@ -186,6 +257,8 @@ impl StreamingParquetScanExec {
             batch_size,
             runtime_filter: RuntimeFilterConfig::default(),
             filter_spec,
+            dict_filter_schema,
+            coerce_back,
         })
     }
 
@@ -220,6 +293,8 @@ impl PhysicalOperator for StreamingParquetScanExec {
         // probes drained concurrently) would otherwise never see it.
         let runtime_cfg = std::sync::Arc::clone(&self.runtime_filter);
         let filter_spec = std::sync::Arc::new(self.filter_spec.clone());
+        let dict_schema = self.dict_filter_schema.clone();
+        let coerce_back = std::sync::Arc::new(self.coerce_back.clone());
 
         // Create a stream that lazily reads row groups
         let stream = futures::stream::unfold(
@@ -229,25 +304,16 @@ impl PhysicalOperator for StreamingParquetScanExec {
                 batch_size,
                 schema,
                 None::<parquet::arrow::arrow_reader::ParquetRecordBatchReader>,
-                (runtime_cfg, filter_spec),
+                (runtime_cfg, filter_spec, dict_schema, coerce_back),
             ),
             |(mut work_iter, projection, batch_size, schema, current_reader, rt_state)| async move {
-                let (runtime_cfg, filter_spec) = rt_state;
+                let (runtime_cfg, filter_spec, dict_schema, coerce_back) = rt_state;
                 // Try to get next batch from current reader
                 if let Some(mut reader) = current_reader {
                     match reader.next() {
                         Some(Ok(batch)) => {
                             // Re-wrap with logical schema if needed
-                            let result = if batch.schema() != schema
-                                && batch.num_columns() == schema.fields().len()
-                            {
-                                RecordBatch::try_new(schema.clone(), batch.columns().to_vec())
-                                    .map_err(|e| {
-                                        QueryError::Execution(format!("Schema mismatch: {}", e))
-                                    })
-                            } else {
-                                Ok(batch)
-                            };
+                            let result = wrap_batch(batch, &schema, &coerce_back);
                             return Some((
                                 result,
                                 (
@@ -256,7 +322,7 @@ impl PhysicalOperator for StreamingParquetScanExec {
                                     batch_size,
                                     schema,
                                     Some(reader),
-                                    (runtime_cfg, filter_spec),
+                                    (runtime_cfg, filter_spec, dict_schema, coerce_back),
                                 ),
                             ));
                         }
@@ -269,7 +335,7 @@ impl PhysicalOperator for StreamingParquetScanExec {
                                     batch_size,
                                     schema,
                                     None,
-                                    (runtime_cfg, filter_spec),
+                                    (runtime_cfg, filter_spec, dict_schema, coerce_back),
                                 ),
                             ));
                         }
@@ -281,23 +347,28 @@ impl PhysicalOperator for StreamingParquetScanExec {
 
                 // Open next row group
                 let work = work_iter.next()?;
-                let builder =
-                    match crate::storage::metadata_cache::cached_reader_builder(&work.file_path) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            return Some((
-                                Err(e),
-                                (
-                                    work_iter,
-                                    projection,
-                                    batch_size,
-                                    schema,
-                                    None,
-                                    (runtime_cfg, filter_spec),
-                                ),
-                            ))
-                        }
-                    };
+                let builder = match match &dict_schema {
+                    Some(ds) => crate::storage::metadata_cache::cached_reader_builder_with_schema(
+                        &work.file_path,
+                        ds.clone(),
+                    ),
+                    None => crate::storage::metadata_cache::cached_reader_builder(&work.file_path),
+                } {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return Some((
+                            Err(e),
+                            (
+                                work_iter,
+                                projection,
+                                batch_size,
+                                schema,
+                                None,
+                                (runtime_cfg, filter_spec, dict_schema, coerce_back),
+                            ),
+                        ))
+                    }
+                };
 
                 let builder = builder
                     .with_batch_size(batch_size)
@@ -391,7 +462,7 @@ impl PhysicalOperator for StreamingParquetScanExec {
                                 batch_size,
                                 schema,
                                 None,
-                                (runtime_cfg, filter_spec),
+                                (runtime_cfg, filter_spec, dict_schema, coerce_back),
                             ),
                         ))
                     }
@@ -400,15 +471,7 @@ impl PhysicalOperator for StreamingParquetScanExec {
                 // Get first batch from this reader
                 match reader.next() {
                     Some(Ok(batch)) => {
-                        let result = if batch.schema() != schema
-                            && batch.num_columns() == schema.fields().len()
-                        {
-                            RecordBatch::try_new(schema.clone(), batch.columns().to_vec()).map_err(
-                                |e| QueryError::Execution(format!("Schema mismatch: {}", e)),
-                            )
-                        } else {
-                            Ok(batch)
-                        };
+                        let result = wrap_batch(batch, &schema, &coerce_back);
                         Some((
                             result,
                             (
@@ -417,7 +480,7 @@ impl PhysicalOperator for StreamingParquetScanExec {
                                 batch_size,
                                 schema,
                                 Some(reader),
-                                (runtime_cfg, filter_spec),
+                                (runtime_cfg, filter_spec, dict_schema, coerce_back),
                             ),
                         ))
                     }
@@ -429,7 +492,7 @@ impl PhysicalOperator for StreamingParquetScanExec {
                             batch_size,
                             schema,
                             None,
-                            (runtime_cfg, filter_spec),
+                            (runtime_cfg, filter_spec, dict_schema, coerce_back),
                         ),
                     )),
                     None => {
@@ -467,4 +530,91 @@ impl fmt::Display for StreamingParquetScanExec {
         }
         Ok(())
     }
+}
+
+/// Classify Utf8 column references in a predicate: `safe` collects columns
+/// whose reference is a dict-evaluable shape (col = lit, col <> lit,
+/// col LIKE/NOT LIKE lit, col IN (literals)); `unsafe_cols` collects string
+/// columns referenced any other way (SUBSTRING(col), comparisons between
+/// columns, ...), which veto coercion.
+fn collect_dict_safety(expr: &Expr, safe: &mut Vec<String>, unsafe_cols: &mut Vec<String>) {
+    use crate::planner::BinaryOp;
+    match expr {
+        Expr::BinaryExpr { left, op, right } => match op {
+            BinaryOp::And | BinaryOp::Or => {
+                collect_dict_safety(left, safe, unsafe_cols);
+                collect_dict_safety(right, safe, unsafe_cols);
+            }
+            BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Like | BinaryOp::NotLike => {
+                match (&**left, &**right) {
+                    (Expr::Column(c), Expr::Literal(crate::planner::ScalarValue::Utf8(_))) => {
+                        safe.push(c.name.clone())
+                    }
+                    _ => {
+                        mark_string_cols(left, unsafe_cols);
+                        mark_string_cols(right, unsafe_cols);
+                    }
+                }
+            }
+            _ => {
+                mark_string_cols(left, unsafe_cols);
+                mark_string_cols(right, unsafe_cols);
+            }
+        },
+        Expr::InList { expr: e, list, .. } => {
+            let all_lit = list
+                .iter()
+                .all(|l| matches!(l, Expr::Literal(crate::planner::ScalarValue::Utf8(_))));
+            match &**e {
+                Expr::Column(c) if all_lit => safe.push(c.name.clone()),
+                _ => mark_string_cols(e, unsafe_cols),
+            }
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            mark_string_cols(e, unsafe_cols);
+            mark_string_cols(low, unsafe_cols);
+            mark_string_cols(high, unsafe_cols);
+        }
+        other => mark_string_cols(other, unsafe_cols),
+    }
+}
+
+/// Conservatively mark every column referenced by `expr` as dict-unsafe.
+fn mark_string_cols(expr: &Expr, out: &mut Vec<String>) {
+    let mut names = Vec::new();
+    crate::physical::morsel::collect_expr_columns(expr, &mut names);
+    out.extend(names);
+}
+
+/// Wrap a decoded batch with the logical schema, casting coerced
+/// dictionary filter columns back to Utf8 (survivors only — the RowFilter
+/// already dropped non-matching rows).
+fn wrap_batch(
+    batch: RecordBatch,
+    schema: &SchemaRef,
+    coerce_back: &[usize],
+) -> Result<RecordBatch> {
+    let needs_cast = !coerce_back.is_empty();
+    if !needs_cast && (batch.schema() == *schema || batch.num_columns() != schema.fields().len()) {
+        return Ok(batch);
+    }
+    if batch.num_columns() != schema.fields().len() {
+        return Ok(batch);
+    }
+    let mut cols = batch.columns().to_vec();
+    for &i in coerce_back {
+        if i < cols.len() {
+            if matches!(
+                cols[i].data_type(),
+                arrow::datatypes::DataType::Dictionary(_, _)
+            ) {
+                cols[i] = arrow::compute::cast(&cols[i], &arrow::datatypes::DataType::Utf8)
+                    .map_err(|e| QueryError::Execution(e.to_string()))?;
+            }
+        }
+    }
+    RecordBatch::try_new(schema.clone(), cols)
+        .map_err(|e| QueryError::Execution(format!("Schema mismatch: {}", e)))
 }

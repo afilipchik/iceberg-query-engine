@@ -46,3 +46,42 @@ pub fn cached_reader_builder(path: &Path) -> Result<ParquetRecordBatchReaderBuil
     let file = File::open(path)?;
     Ok(ParquetRecordBatchReaderBuilder::new_with_metadata(file, md))
 }
+
+static SCHEMA_CACHE: parking_lot::RwLock<
+    Option<HashMap<(PathBuf, usize), (SystemTime, ArrowReaderMetadata)>>,
+> = parking_lot::RwLock::new(None);
+
+/// Reader builder with a coercion schema override (e.g. dictionary string
+/// columns), footer parsed once per (path, schema-identity).
+pub fn cached_reader_builder_with_schema(
+    path: &Path,
+    schema: arrow::datatypes::SchemaRef,
+) -> Result<ParquetRecordBatchReaderBuilder<File>> {
+    let key = (path.to_path_buf(), std::sync::Arc::as_ptr(&schema) as usize);
+    let mtime = std::fs::metadata(path)?.modified()?;
+    {
+        let guard = SCHEMA_CACHE.read();
+        if let Some(map) = guard.as_ref() {
+            if let Some((t, md)) = map.get(&key) {
+                if *t == mtime {
+                    let file = File::open(path)?;
+                    return Ok(ParquetRecordBatchReaderBuilder::new_with_metadata(
+                        file,
+                        md.clone(),
+                    ));
+                }
+            }
+        }
+    }
+    let mut file = File::open(path)?;
+    let md = ArrowReaderMetadata::load(
+        &mut file,
+        ArrowReaderOptions::new().with_schema(schema.clone()),
+    )?;
+    SCHEMA_CACHE
+        .write()
+        .get_or_insert_with(HashMap::new)
+        .insert(key, (mtime, md.clone()));
+    let file = File::open(path)?;
+    Ok(ParquetRecordBatchReaderBuilder::new_with_metadata(file, md))
+}
