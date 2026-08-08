@@ -888,6 +888,9 @@ enum TypedArrayAccessor<'a> {
     Float64(&'a Float64Array),
     String(&'a StringArray),
     Date32(&'a Date32Array),
+    /// Dictionary-encoded strings: group keys use the dictionary INDEX
+    /// (values only touched when a group's scalar must materialize).
+    DictString(&'a arrow::array::DictionaryArray<arrow::datatypes::Int32Type>),
     Other(ArrayRef),
 }
 
@@ -911,6 +914,15 @@ impl<'a> TypedArrayAccessor<'a> {
             }
             DataType::Date32 => {
                 TypedArrayAccessor::Date32(array.as_any().downcast_ref::<Date32Array>().unwrap())
+            }
+            DataType::Dictionary(k, v) if **k == DataType::Int32 && **v == DataType::Utf8 => {
+                TypedArrayAccessor::DictString(
+                    array
+                        .as_any()
+                        .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int32Type>>(
+                        )
+                        .unwrap(),
+                )
             }
             _ => TypedArrayAccessor::Other(array.clone()),
         }
@@ -946,7 +958,9 @@ impl<'a> TypedArrayAccessor<'a> {
                     acc.update_i64(arr.value(row) as i64);
                 }
             }
-            TypedArrayAccessor::String(_) | TypedArrayAccessor::Date32(_) => {
+            TypedArrayAccessor::String(_)
+            | TypedArrayAccessor::Date32(_)
+            | TypedArrayAccessor::DictString(_) => {
                 // For non-numeric types, fall back to ScalarValue path
                 let value = self.extract_scalar(row);
                 acc.update(&value);
@@ -964,6 +978,24 @@ impl<'a> TypedArrayAccessor<'a> {
     #[inline]
     fn raw_key(&self, row: usize) -> u64 {
         match self {
+            TypedArrayAccessor::DictString(arr) => {
+                if arr.is_null(row) {
+                    u64::MAX
+                } else {
+                    // Key on the VALUE bytes, not the index: different row
+                    // groups/files may carry different dictionaries. Value
+                    // lookup is one indirection; bytes-pack matches the
+                    // String arm so mixed dict/plain states merge cleanly.
+                    let values = arr.values().as_any().downcast_ref::<StringArray>().unwrap();
+                    let s = values.value(arr.key(row).unwrap_or(0));
+                    let b = s.as_bytes();
+                    let mut key = (b.len() as u64) << 56;
+                    for (i, &byte) in b.iter().take(7).enumerate() {
+                        key |= (byte as u64) << (i * 8);
+                    }
+                    key
+                }
+            }
             TypedArrayAccessor::Int64(arr) => {
                 if arr.is_null(row) {
                     u64::MAX
@@ -1033,6 +1065,14 @@ impl<'a> TypedArrayAccessor<'a> {
     /// Extract ScalarValue (slow path, needed for group keys)
     fn extract_scalar(&self, row: usize) -> ScalarValue {
         match self {
+            TypedArrayAccessor::DictString(arr) => {
+                if arr.is_null(row) {
+                    ScalarValue::Null
+                } else {
+                    let values = arr.values().as_any().downcast_ref::<StringArray>().unwrap();
+                    ScalarValue::Utf8(values.value(arr.key(row).unwrap_or(0)).to_string())
+                }
+            }
             TypedArrayAccessor::Int64(arr) => {
                 if arr.is_null(row) {
                     ScalarValue::Null
@@ -1192,7 +1232,9 @@ impl AggregationState {
                 self.raw_key_values[col].push(accessor.extract_scalar(row));
             } else if matches!(
                 accessor,
-                TypedArrayAccessor::String(_) | TypedArrayAccessor::Other(_)
+                TypedArrayAccessor::String(_)
+                    | TypedArrayAccessor::Other(_)
+                    | TypedArrayAccessor::DictString(_)
             ) {
                 // Raw keys for strings/other types are lossy encodings — verify
                 // the hit against the registered value; on collision, fall back
@@ -2569,4 +2611,82 @@ pub fn execute_morsel_aggregation(
 
     // Build output
     final_state.build_output(&output_schema)
+}
+
+#[cfg(test)]
+mod dict_accessor_tests {
+    use super::*;
+    use arrow::array::{DictionaryArray, Float64Array, StringArray};
+    use arrow::datatypes::{DataType as ADataType, Field, Int32Type, Schema};
+    use std::sync::Arc as StdArc;
+
+    /// Dictionary-encoded group keys aggregate identically to plain strings,
+    /// including across batches with DIFFERENT dictionaries for equal values.
+    #[test]
+    fn dictionary_group_keys_match_plain_strings() {
+        let schema = StdArc::new(Schema::new(vec![
+            Field::new(
+                "flag",
+                ADataType::Dictionary(Box::new(ADataType::Int32), Box::new(ADataType::Utf8)),
+                true,
+            ),
+            Field::new("v", ADataType::Float64, true),
+        ]));
+
+        // Batch 1: dict ["A", "B"], keys A,B,A
+        let d1: DictionaryArray<Int32Type> =
+            vec![Some("A"), Some("B"), Some("A")].into_iter().collect();
+        let b1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                StdArc::new(d1),
+                StdArc::new(Float64Array::from(vec![1.0, 10.0, 2.0])),
+            ],
+        )
+        .unwrap();
+        // Batch 2: dict ["B", "A"] (reversed indices!), keys B,A
+        let values = StringArray::from(vec!["B", "A"]);
+        let keys = arrow::array::Int32Array::from(vec![0, 1]);
+        let d2 = DictionaryArray::<Int32Type>::try_new(keys, StdArc::new(values)).unwrap();
+        let b2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                StdArc::new(d2),
+                StdArc::new(Float64Array::from(vec![100.0, 4.0])),
+            ],
+        )
+        .unwrap();
+
+        let group_exprs = vec![Expr::column("flag")];
+        let agg_exprs = vec![Expr::column("v")];
+        let mut state =
+            AggregationState::new(vec![AggregateFunction::Sum], vec![DataType::Float64]);
+        state.process_batch(&b1, &group_exprs, &agg_exprs).unwrap();
+        state.process_batch(&b2, &group_exprs, &agg_exprs).unwrap();
+
+        let out_schema = StdArc::new(Schema::new(vec![
+            Field::new("flag", ADataType::Utf8, true),
+            Field::new("SUM(v)", ADataType::Float64, true),
+        ]));
+        let batch = state.build_output(&out_schema).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        let flags = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let sums = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let mut got: Vec<(String, f64)> = (0..2)
+            .map(|i| (flags.value(i).to_string(), sums.value(i)))
+            .collect();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(got[0].0, "A");
+        assert!((got[0].1 - 7.0).abs() < 1e-9);
+        assert_eq!(got[1].0, "B");
+        assert!((got[1].1 - 110.0).abs() < 1e-9);
+    }
 }
