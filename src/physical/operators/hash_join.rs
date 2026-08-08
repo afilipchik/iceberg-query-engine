@@ -42,6 +42,15 @@ struct BuildSideCache {
     i64_hash_table: Option<HashMap<i64, Vec<HashEntry>>>,
     /// Vectorized hash table for batch-level probing (multi-type support)
     vectorized_ht: Option<VectorizedHashTable>,
+    /// Shared matched-bit per build row (indexed per batch), for join types
+    /// that must emit unmatched BUILD rows exactly once across all probe
+    /// partitions (Left build-left, Right build-right, Full). Without this,
+    /// multi-partition probes silently dropped unmatched build rows — Q13's
+    /// zero-order customers vanished at SF=10.
+    build_matched: Option<Vec<Vec<std::sync::atomic::AtomicBool>>>,
+    /// Number of probe partitions that finished; the last one emits the
+    /// unmatched build rows.
+    completed_partitions: std::sync::atomic::AtomicUsize,
 }
 
 /// Vectorized hash table using open addressing with batch-level operations.
@@ -493,11 +502,36 @@ impl PhysicalOperator for HashJoinExec {
                     build_hash_table(&build_batches, &build_keys)?
                 };
 
+                // Join types whose BUILD side rows must survive unmatched:
+                // Left with build=left, Right with build=right, Full always.
+                let needs_build_tracking = match self.join_type {
+                    JoinType::Left => !swapped,
+                    JoinType::Right => swapped,
+                    JoinType::Full => true,
+                    _ => false,
+                };
+                let build_matched = if needs_build_tracking {
+                    Some(
+                        build_batches
+                            .iter()
+                            .map(|b| {
+                                (0..b.num_rows())
+                                    .map(|_| std::sync::atomic::AtomicBool::new(false))
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                } else {
+                    None
+                };
+
                 Ok::<_, crate::error::QueryError>(BuildSideCache {
                     batches: build_batches,
                     hash_table,
                     i64_hash_table,
                     vectorized_ht,
+                    build_matched,
+                    completed_partitions: std::sync::atomic::AtomicUsize::new(0),
                 })
             })
             .await?;
@@ -529,7 +563,7 @@ impl PhysicalOperator for HashJoinExec {
         }
 
         let t_probe = std::time::Instant::now();
-        let result = probe_hash_table(
+        let mut result = probe_hash_table(
             &cache.batches,
             &probe_batches,
             &cache.hash_table,
@@ -541,7 +575,35 @@ impl PhysicalOperator for HashJoinExec {
             &self.schema,
             self.filter.as_ref(),
             &self.combined_schema,
+            cache.build_matched.as_deref(),
         )?;
+
+        // Emit unmatched BUILD rows exactly once: the last probe partition to
+        // finish scans the shared matched bits.
+        if let Some(matched) = &cache.build_matched {
+            let done = cache
+                .completed_partitions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if done == self.output_partitions().max(1) {
+                let mut unmatched: Vec<(usize, usize)> = Vec::new();
+                for (batch_idx, flags) in matched.iter().enumerate() {
+                    for (row_idx, flag) in flags.iter().enumerate() {
+                        if !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                            unmatched.push((batch_idx, row_idx));
+                        }
+                    }
+                }
+                if !unmatched.is_empty() {
+                    result.push(create_build_only_batch(
+                        &cache.batches,
+                        &unmatched,
+                        &self.schema,
+                        swapped,
+                    )?);
+                }
+            }
+        }
         if std::env::var("HJ_TIMING").is_ok() {
             eprintln!(
                 "[hj] partition {} probe: {} rows in {:?}",
@@ -1516,6 +1578,7 @@ fn probe_vectorized(
     join_type: JoinType,
     swapped: bool,
     output_schema: &SchemaRef,
+    shared_build_matched: Option<&[Vec<std::sync::atomic::AtomicBool>]>,
 ) -> Result<Vec<RecordBatch>> {
     let mut results = Vec::new();
 
@@ -1718,6 +1781,9 @@ fn probe_vectorized(
                     build_indices.push((*bb as usize, *br as usize));
                     probe_indices.push(*pr as usize);
                     probe_matched[*pr as usize] = true;
+                    if let Some(shared) = shared_build_matched {
+                        shared[*bb as usize][*br as usize].store(true, Ordering::Relaxed);
+                    }
                 }
 
                 // Add unmatched probe rows
@@ -1755,6 +1821,9 @@ fn probe_vectorized(
                     if needs_build_tracking {
                         build_matched[*bb as usize][*br as usize] = true;
                     }
+                    if let Some(shared) = shared_build_matched {
+                        shared[*bb as usize][*br as usize].store(true, Ordering::Relaxed);
+                    }
                 }
 
                 if !build_indices.is_empty() {
@@ -1781,6 +1850,9 @@ fn probe_vectorized(
                     probe_indices.push(*pr as usize);
                     if needs_build_tracking {
                         build_matched[*bb as usize][*br as usize] = true;
+                    }
+                    if let Some(shared) = shared_build_matched {
+                        shared[*bb as usize][*br as usize].store(true, Ordering::Relaxed);
                     }
                 }
 
@@ -1877,25 +1949,19 @@ fn probe_vectorized(
         }
     }
 
-    // Post-processing for join types that need build-side scan
-    if matches!(join_type, JoinType::Right | JoinType::Full) && !swapped {
-        let unmatched_build = collect_unmatched_build(&build_matched);
-        if !unmatched_build.is_empty() {
-            let batch =
-                create_build_only_batch(build_batches, &unmatched_build, output_schema, swapped)?;
-            results.push(batch);
-        }
-    }
-
-    // For Full join with swapped sides, emit unmatched build (right) rows.
-    // Note: Left+swapped does NOT emit unmatched build rows — Left join only preserves
-    // the left/probe side, and unmatched probe rows are handled per-batch.
-    if matches!(join_type, JoinType::Full) && swapped {
-        let unmatched_build = collect_unmatched_build(&build_matched);
-        if !unmatched_build.is_empty() {
-            let batch =
-                create_build_only_batch(build_batches, &unmatched_build, output_schema, swapped)?;
-            results.push(batch);
+    // Publish local matched bits for Right/Full into the SHARED tracker: the
+    // last probe partition emits unmatched build rows exactly once in
+    // execute(). (Per-call emission here duplicated unmatched rows whenever
+    // the probe side had multiple partitions.)
+    if matches!(join_type, JoinType::Right | JoinType::Full) {
+        if let Some(shared) = shared_build_matched {
+            for (batch_idx, flags) in build_matched.iter().enumerate() {
+                for (row_idx, &m) in flags.iter().enumerate() {
+                    if m {
+                        shared[batch_idx][row_idx].store(true, Ordering::Relaxed);
+                    }
+                }
+            }
         }
     }
 
@@ -1962,6 +2028,7 @@ fn probe_hash_table(
     output_schema: &SchemaRef,
     filter: Option<&Expr>,
     combined_schema: &SchemaRef,
+    shared_build_matched: Option<&[Vec<std::sync::atomic::AtomicBool>]>,
 ) -> Result<Vec<RecordBatch>> {
     let total_probe_rows: usize = probe_batches.iter().map(|b| b.num_rows()).sum();
 
@@ -1977,6 +2044,7 @@ fn probe_hash_table(
                 join_type,
                 swapped,
                 output_schema,
+                shared_build_matched,
             );
         }
     }

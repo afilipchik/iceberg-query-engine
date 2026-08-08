@@ -274,3 +274,23 @@ async fn tiny_query_under_limit_still_correct() {
     let rows = result_rows(&result);
     assert_eq!(rows, vec![vec!["25".to_string()]]);
 }
+
+/// Regression: a LEFT JOIN whose build side is the LEFT input must emit
+/// unmatched build rows exactly once across all probe partitions. Before the
+/// shared matched-bit fix, multi-partition probes dropped them entirely
+/// (TPC-H Q13's zero-order-customer bucket vanished at SF=10) — and Right/Full
+/// joins duplicated them instead. Expected values verified against DuckDB.
+#[tokio::test]
+async fn left_join_unmatched_build_rows_preserved() {
+    let ctx = unlimited_ctx();
+    let result = ctx
+        .sql(
+            "SELECT COUNT(*) AS c FROM orders LEFT JOIN \
+             (SELECT l_orderkey FROM lineitem WHERE l_quantity > 49.0) t \
+             ON o_orderkey = t.l_orderkey",
+        )
+        .await
+        .expect("left join failed");
+    let rows = result_rows(&result);
+    assert_eq!(rows, vec![vec!["15078".to_string()]]);
+}
