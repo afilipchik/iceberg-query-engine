@@ -832,12 +832,13 @@ impl JoinReorder {
         // a base relation and the estimates are within 4x, trust the base
         // relation as the build side: materializing an underestimated
         // intermediate as build (concat + hash table) is how Q09 hit 65GB.
-        // Discount confidence in derived estimates by 4x per additional joined
+        // Discount confidence in derived estimates by 2x per additional joined
         // relation (capped): a base table's row count is exact, a 5-way join
-        // estimate can be orders of magnitude off.
+        // estimate can be orders of magnitude off. (4x/rel over-corrected: Q10
+        // chose a 20M-row filtered lineitem build over a 539K intermediate.)
         let uncertainty = |mask: u32, rows: f64| -> f64 {
             let extra_rels = mask.count_ones().saturating_sub(1);
-            rows * 4f64.powi(extra_rels.min(5) as i32)
+            rows * 2f64.powi(extra_rels.min(6) as i32)
         };
         let l_score = uncertainty(l_mask, l_entry.rows);
         let r_score = uncertainty(r_mask, r_entry.rows);
@@ -890,41 +891,116 @@ impl JoinReorder {
     /// heuristic selectivity for any attached filter predicates.
     fn estimate_base_rows(&self, rel: &JoinRelation) -> f64 {
         let base = self.get_relation_row_count(rel).unwrap_or(10_000).max(1) as f64;
-        (base * Self::plan_filter_selectivity(&rel.plan)).max(1.0)
+        let stats = self
+            .get_underlying_table_name(&rel.plan)
+            .and_then(|t| self.table_stats.get(&t));
+        (base * Self::plan_filter_selectivity_with_stats(&rel.plan, stats)).max(1.0)
+    }
+
+    /// Range-aware selectivity for a comparison of an integer/date column
+    /// against a literal, using footer min/max. Returns None when stats or
+    /// literal types don't allow it.
+    fn range_selectivity(
+        stats: Option<&TableStatistics>,
+        col: &Expr,
+        op: &BinaryOp,
+        lit: &Expr,
+        flipped: bool,
+    ) -> Option<f64> {
+        let stats = stats?;
+        let name = match col {
+            Expr::Column(c) => c.name.to_lowercase(),
+            _ => return None,
+        };
+        let cs = stats.column_stats.get(&name)?;
+        let (min, max) = (cs.min_i64? as f64, cs.max_i64? as f64);
+        if max <= min {
+            return None;
+        }
+        use crate::planner::ScalarValue;
+        let v = match lit {
+            Expr::Literal(ScalarValue::Int8(v)) => *v as f64,
+            Expr::Literal(ScalarValue::Int16(v)) => *v as f64,
+            Expr::Literal(ScalarValue::Int32(v)) => *v as f64,
+            Expr::Literal(ScalarValue::Int64(v)) => *v as f64,
+            Expr::Literal(ScalarValue::Date32(v)) => *v as f64,
+            Expr::Literal(ScalarValue::Date64(v)) => *v as f64,
+            Expr::Literal(ScalarValue::Float64(v)) => v.into_inner(),
+            _ => return None,
+        };
+        let width = max - min;
+        // Normalize direction: `flipped` means the literal was on the left.
+        let op = if flipped {
+            match op {
+                BinaryOp::Lt => BinaryOp::Gt,
+                BinaryOp::LtEq => BinaryOp::GtEq,
+                BinaryOp::Gt => BinaryOp::Lt,
+                BinaryOp::GtEq => BinaryOp::LtEq,
+                other => *other,
+            }
+        } else {
+            *op
+        };
+        let sel = match op {
+            BinaryOp::Lt | BinaryOp::LtEq => (v - min) / width,
+            BinaryOp::Gt | BinaryOp::GtEq => (max - v) / width,
+            BinaryOp::Eq => 1.0 / cs.ndv_est.unwrap_or(100).max(1) as f64,
+            _ => return None,
+        };
+        Some(sel.clamp(0.0005, 1.0))
     }
 
     /// Multiply the selectivities of all filters attached beneath a relation
     /// (both Filter nodes and predicates pushed into ScanNode.filter).
-    fn plan_filter_selectivity(plan: &LogicalPlan) -> f64 {
+    fn plan_filter_selectivity_with_stats(
+        plan: &LogicalPlan,
+        stats: Option<&TableStatistics>,
+    ) -> f64 {
         match plan {
             LogicalPlan::Filter(node) => {
-                Self::predicate_selectivity(&node.predicate)
-                    * Self::plan_filter_selectivity(&node.input)
+                Self::predicate_selectivity(&node.predicate, stats)
+                    * Self::plan_filter_selectivity_with_stats(&node.input, stats)
             }
             LogicalPlan::Scan(node) => node
                 .filter
                 .as_ref()
-                .map(Self::predicate_selectivity)
+                .map(|f| Self::predicate_selectivity(f, stats))
                 .unwrap_or(1.0),
-            LogicalPlan::SubqueryAlias(node) => Self::plan_filter_selectivity(&node.input),
-            LogicalPlan::Project(node) => Self::plan_filter_selectivity(&node.input),
+            LogicalPlan::SubqueryAlias(node) => {
+                Self::plan_filter_selectivity_with_stats(&node.input, stats)
+            }
+            LogicalPlan::Project(node) => {
+                Self::plan_filter_selectivity_with_stats(&node.input, stats)
+            }
             _ => 1.0,
         }
     }
 
-    /// Textbook per-predicate selectivity guesses (System-R style).
-    fn predicate_selectivity(expr: &Expr) -> f64 {
+    /// Per-predicate selectivity: exact range fractions from footer min/max
+    /// where possible, System-R-style guesses otherwise.
+    fn predicate_selectivity(expr: &Expr, stats: Option<&TableStatistics>) -> f64 {
         let sel = match expr {
             Expr::BinaryExpr { left, op, right } => match op {
                 BinaryOp::And => {
-                    Self::predicate_selectivity(left) * Self::predicate_selectivity(right)
+                    Self::predicate_selectivity(left, stats)
+                        * Self::predicate_selectivity(right, stats)
                 }
-                BinaryOp::Or => (Self::predicate_selectivity(left)
-                    + Self::predicate_selectivity(right))
+                BinaryOp::Or => (Self::predicate_selectivity(left, stats)
+                    + Self::predicate_selectivity(right, stats))
                 .min(1.0),
-                BinaryOp::Eq => 0.1,
+                BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => {
+                    // Try footer-stats range estimation for col-vs-literal
+                    if let Some(sel) = Self::range_selectivity(stats, left, op, right, false)
+                        .or_else(|| Self::range_selectivity(stats, right, op, left, true))
+                    {
+                        sel
+                    } else if *op == BinaryOp::Eq {
+                        0.1
+                    } else {
+                        0.3
+                    }
+                }
                 BinaryOp::NotEq => 0.9,
-                BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => 0.3,
                 BinaryOp::Like => 0.25,
                 BinaryOp::NotLike => 0.75,
                 _ => 0.25,
