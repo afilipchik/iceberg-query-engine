@@ -43,8 +43,8 @@ Full plan with per-task files/verification:
 |-------|------|----------------|
 | 0 (done) | Stabilize tree, commit WIP, fix CI, re-baseline | all suites green; honest baseline logged |
 | 1 (done) | Spill tests (caught 4 real bugs, fixed in `f7960da`); A/B of `3eb2b5a` → **KEEP** (Q02 −49%, Q11 −43%, rest neutral; logs `230905` vs `231007`); OVER() rejected | spill tests in CI |
-| 2 | Cost-based join ordering (stats from Parquet footers, DPsize) | Q05/Q07/Q08/Q09 ≤10x |
-| 3 | Parallelism above joins (multi-partition join output, parallel agg) | Q03/Q10/Q12/Q13/Q14/Q18/Q19 ≤10x |
+| 2 (done 2026-08-08) | CBO join ordering (DPsize + footer stats + range selectivity); join build-side concat-once fix; planner trusts optimizer orientation; parallel agg merge | 20/22 complete, 9 ≤10x, aggregate 32.3s vs 2.94s (log `20260808_011334`) |
+| 3 | Parallelism above joins; semi-join pushdown (Q18); parallel HashAggregateExec merge | Q03/Q10/Q13/Q15/Q17/Q18 ≤10x |
 | 4 | DelimJoin re-enable + decorrelation robustness | 22/22 finish, ≥18/22 ≤10x |
 | 5 | True streaming spill + SF=100 certification (regen tpch-100gb first!) | 0 OOM under cgroup; 22/22 SF=100 correct |
 | 6 | Iceberg reads via iceberg-rust (parallel track) | real Iceberg table incl. deletes queryable |

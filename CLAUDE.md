@@ -736,47 +736,40 @@ Based on the codebase structure, these appear to be planned but not fully implem
   `SpillableHashJoinExec` still materializes the build side before deciding to
   spill (known hole, fixed by the Phase-5 streaming spill rewrite, see ROADMAP).
 
-## TPC-H Benchmark Baseline (SF=10, 2026-08-07, 48G cgroup)
+## TPC-H Benchmark Status (SF=10, 2026-08-08, 48G cgroup)
 
-Log: `logs/safe_benchmark_20260807_222225.log`. Spec queries, spec-generator data.
-**10/22 pass the 10x rule**; 12 timeout at 10x budget.
+Log: `logs/safe_benchmark_20260808_011334.log`. Spec queries, spec-generator data.
+**20/22 complete, 9 within the 10x rule.** Total 32.3s vs DuckDB 2.94s.
+(24h earlier this was: 10/22 complete, only Q01 within 10x, Q05/Q07/Q09/Q18
+never finishing at 1000x budgets.)
 
-| Query | Engine | DuckDB | Ratio | Status |
-|-------|--------|--------|-------|--------|
-| Q01 | 443ms | 105ms | 4.2x | PASS |
-| Q02 | 773ms | 22ms | 35.1x | over |
-| Q03 | 12.7s | 82ms | 155x | over |
-| Q04 | 669ms | 57ms | 11.7x | borderline |
-| Q05 | **>48s** | 48ms | >1000x | NEVER FINISHES |
-| Q06 | 352ms | 24ms | 14.6x | over |
-| Q07 | **>72s** | 72ms | >1000x | NEVER FINISHES |
-| Q08 | 22.1s | 71ms | 312x | over |
-| Q09 | **>250s** | 1249ms | >200x | NEVER FINISHES |
-| Q10 | 29.6s | 91ms | 326x | over |
-| Q11 | 811ms | 14ms | 57.9x | over |
-| Q12 | 6.6s | 87ms | 75.6x | over |
-| Q13 | 4.7s | 99ms | 47.8x | over |
-| Q14 | 20.5s | 39ms | 526x | over |
-| Q15 | 926ms | 31ms | 29.8x | over |
-| Q16 | 1003ms | 39ms | 25.7x | over |
-| Q17 | 955ms | 87ms | 10.9x | borderline |
-| Q18 | **>232s** | 232ms | >1000x | NEVER FINISHES |
-| Q19 | 17.9s | 88ms | 203x | over |
-| Q20 | 24.9s | 160ms | 156x | over |
-| Q21 | 16.4s | 213ms | 76.9x | over |
-| Q22 | 907ms | 34ms | 26.6x | over |
+| Query | Engine | Ratio | | Query | Engine | Ratio |
+|-------|--------|-------|-|-------|--------|-------|
+| Q01 | 624ms | 5.9x | | Q12 | 688ms | 7.9x |
+| Q02 | 174ms | 7.9x | | Q13 | 3.9s | 39.2x |
+| Q03 | 1.0s | 12.2x | | Q14 | 339ms | 8.6x |
+| Q04 | 491ms | 8.6x | | Q15 | 750ms | 24.1x |
+| Q05 | 883ms | 18.4x | | Q16 | 325ms | 8.3x |
+| Q06 | 313ms | 13.0x | | Q17 | 2.8s | 32.5x |
+| Q07 | 1.1s | 14.8x | | Q18 | 6.9s | TIMEOUT (5s budget) |
+| Q08 | 1.2s | 16.2x | | Q19 | 633ms | 7.1x |
+| Q09 | 12.2s | 9.7x | | Q20 | >5s | TIMEOUT |
+| Q10 | 2.3s | 24.9x | | Q21 | 1.7s | 7.8x |
+| Q11 | 453ms | 32.3x | | Q22 | 527ms | 15.4x |
 
-(Extended-budget times from `logs/safe_benchmark_20260807_222410.log` and
-`_223235.log`, same data/tree, 1000x/200x budgets.) Only Q01 currently passes
-the 10x rule; Q04/Q17 are borderline.
+**What fixed the never-finishers (2026-08-08):** build side concatenated once
+in the join build cache (gather_column had re-concatenated the whole build side
+per output batch per column); DPsize cost-based join ordering from footer stats
+(both reorder paths); physical planner no longer re-swaps Inner join sides;
+parallel partitioned merge for high-cardinality morsel aggregation.
 
-**Current bottleneck order** (see `.claude/plans/ROADMAP.md` for the plan):
-1. Never-finishers **Q05/Q07/Q09/Q18** — join ordering (Q05/Q07/Q09) and
-   IN-subquery planning (Q18).
-2. 100x-500x queries Q03/Q08/Q10/Q14/Q19/Q20 — join order + build-side selection
-   + post-join parallelism.
-3. 25-80x queries Q02/Q06/Q11/Q12/Q13/Q15/Q16/Q21/Q22 — parallel post-join
-   aggregation, DelimJoin (Q21), scan improvements.
+**Remaining bottleneck order** (see `.claude/plans/ROADMAP.md`):
+1. Q18 (6.9s vs 5s): Semi join applies after all inner joins — needs semi-join
+   pushdown to the orders side. Q20: correlated subquery planning (Phase 4).
+2. 24-40x band Q10/Q11/Q13/Q15/Q17 — parallel post-join aggregation
+   (HashAggregateExec path), DelimJoin for Q17-style scalar subqueries.
+3. 12-18x band Q03/Q05/Q06/Q07/Q08/Q22 — post-join pipeline parallelism,
+   scan speed.
 
 ## Recently Implemented Features
 
