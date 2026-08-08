@@ -47,6 +47,58 @@ pub(crate) fn merge_entries_into_map(
     map
 }
 
+/// Merge thread-local aggregation states into output batches, in parallel
+/// when the group count is large. Shared by MorselAggregateExec,
+/// HashAggregateExec's morsel-parallel path, and the fused streaming path in
+/// SpillableHashAggregateExec.
+pub(crate) fn merge_states_to_batches(
+    states: Vec<AggregationState>,
+    agg_funcs: &[AggregateFunction],
+    input_types: &[DataType],
+    schema: &SchemaRef,
+) -> Result<Vec<RecordBatch>> {
+    const PARALLEL_MERGE_MIN_GROUPS: usize = 65_536;
+    let total_groups: usize = states.iter().map(|s| s.group_count()).sum();
+
+    if states.len() > 1 && total_groups > PARALLEL_MERGE_MIN_GROUPS {
+        let p = rayon::current_num_threads().clamp(2, 64);
+        let per_state_shards: Vec<_> = states
+            .into_par_iter()
+            .map(|s| s.into_shards(p))
+            .collect::<Vec<_>>();
+
+        let mut shard_major: Vec<Vec<_>> = (0..p).map(|_| Vec::new()).collect();
+        for state_shards in per_state_shards {
+            for (pi, shard) in state_shards.into_iter().enumerate() {
+                shard_major[pi].push(shard);
+            }
+        }
+
+        let batches: Vec<RecordBatch> = shard_major
+            .into_par_iter()
+            .map(|lists| {
+                let map = merge_entries_into_map(lists);
+                if map.is_empty() {
+                    return Ok(None);
+                }
+                let state =
+                    AggregationState::from_groups(agg_funcs.to_vec(), input_types.to_vec(), map);
+                state.build_output(schema).map(Some)
+            })
+            .collect::<Result<Vec<Option<RecordBatch>>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        return Ok(batches);
+    }
+
+    let mut final_state = AggregationState::new(agg_funcs.to_vec(), input_types.to_vec());
+    for state in states {
+        final_state.merge(&state);
+    }
+    Ok(vec![final_state.build_output(schema)?])
+}
+
 /// Raw-key classification for normalize_raw / scalar_to_raw.
 enum RawKey {
     Value(u64),
@@ -525,6 +577,7 @@ fn scalar_to_raw_key(value: &ScalarValue) -> u64 {
     match value {
         ScalarValue::Null => u64::MAX,
         ScalarValue::Int64(v) => *v as u64,
+        ScalarValue::Int32(v) => *v as u64,
         ScalarValue::Float64(v) => v.into_inner().to_bits(),
         ScalarValue::Date32(v) => *v as u64,
         ScalarValue::Utf8(s) => {
@@ -557,6 +610,7 @@ fn scalar_to_i64(value: &ScalarValue) -> Option<i64> {
 /// Typed array accessor for fast value extraction without ScalarValue allocation
 enum TypedArrayAccessor<'a> {
     Int64(&'a Int64Array),
+    Int32(&'a arrow::array::Int32Array),
     Float64(&'a Float64Array),
     String(&'a StringArray),
     Date32(&'a Date32Array),
@@ -569,6 +623,12 @@ impl<'a> TypedArrayAccessor<'a> {
             DataType::Int64 => {
                 TypedArrayAccessor::Int64(array.as_any().downcast_ref::<Int64Array>().unwrap())
             }
+            DataType::Int32 => TypedArrayAccessor::Int32(
+                array
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int32Array>()
+                    .unwrap(),
+            ),
             DataType::Float64 => {
                 TypedArrayAccessor::Float64(array.as_any().downcast_ref::<Float64Array>().unwrap())
             }
@@ -594,6 +654,11 @@ impl<'a> TypedArrayAccessor<'a> {
             TypedArrayAccessor::Int64(arr) => {
                 if !arr.is_null(row) {
                     acc.update_i64(arr.value(row));
+                }
+            }
+            TypedArrayAccessor::Int32(arr) => {
+                if !arr.is_null(row) {
+                    acc.update_i64(arr.value(row) as i64);
                 }
             }
             TypedArrayAccessor::String(_) | TypedArrayAccessor::Date32(_) => {
@@ -651,6 +716,13 @@ impl<'a> TypedArrayAccessor<'a> {
                     arr.value(row) as u64
                 }
             }
+            TypedArrayAccessor::Int32(arr) => {
+                if arr.is_null(row) {
+                    u64::MAX
+                } else {
+                    arr.value(row) as i64 as u64
+                }
+            }
             TypedArrayAccessor::Other(arr) => {
                 // Fallback: use hash of ScalarValue
                 let val = extract_scalar(arr, row);
@@ -658,6 +730,18 @@ impl<'a> TypedArrayAccessor<'a> {
                 hash_scalar_value(&val, &mut hasher);
                 std::hash::Hasher::finish(&hasher)
             }
+        }
+    }
+
+    /// Compare the value at `row` with a ScalarValue without allocating.
+    fn value_equals_scalar(&self, row: usize, expected: &ScalarValue) -> bool {
+        match self {
+            TypedArrayAccessor::String(arr) => match expected {
+                ScalarValue::Utf8(s) => !arr.is_null(row) && arr.value(row) == s.as_str(),
+                ScalarValue::Null => arr.is_null(row),
+                _ => false,
+            },
+            _ => self.extract_scalar(row) == *expected,
         }
     }
 
@@ -692,6 +776,13 @@ impl<'a> TypedArrayAccessor<'a> {
                     ScalarValue::Date32(arr.value(row))
                 }
             }
+            TypedArrayAccessor::Int32(arr) => {
+                if arr.is_null(row) {
+                    ScalarValue::Null
+                } else {
+                    ScalarValue::Int32(arr.value(row))
+                }
+            }
             TypedArrayAccessor::Other(arr) => extract_scalar(arr, row),
         }
     }
@@ -714,6 +805,10 @@ pub struct AggregationState {
     /// Map from raw key (u64) → perfect hash index (one per group-by column)
     /// Uses u64 keys to avoid ScalarValue allocation in the hot path
     raw_key_maps: Vec<HashMap<u64, u8>>,
+    /// Actual values per column, id-indexed — used to VERIFY raw-key hits for
+    /// collision-prone key encodings (strings pack only 8 bytes + length:
+    /// "Supplier#000000001" and "...002" collide and would merge groups).
+    raw_key_values: Vec<Vec<ScalarValue>>,
     /// Map from ScalarValue → perfect hash index (for merge operations)
     key_maps: Vec<HashMap<ScalarValue, u8>>,
     /// Strides for computing the flat index from per-column indices
@@ -746,6 +841,7 @@ impl Default for AggregationState {
         Self {
             perfect_accs: Vec::new(),
             raw_key_maps: Vec::new(),
+            raw_key_values: Vec::new(),
             key_maps: Vec::new(),
             key_strides: Vec::new(),
             key_order: Vec::new(),
@@ -775,6 +871,7 @@ impl AggregationState {
     fn init_perfect_hash(&mut self, num_group_cols: usize) {
         self.num_group_cols = num_group_cols;
         self.raw_key_maps = (0..num_group_cols).map(|_| HashMap::new()).collect();
+        self.raw_key_values = (0..num_group_cols).map(|_| Vec::new()).collect();
         self.key_maps = (0..num_group_cols).map(|_| HashMap::new()).collect();
         self.key_strides = vec![1; num_group_cols];
     }
@@ -807,6 +904,18 @@ impl AggregationState {
             ids[col] = id;
             if id == next_id {
                 any_new = true;
+                self.raw_key_values[col].push(accessor.extract_scalar(row));
+            } else if matches!(
+                accessor,
+                TypedArrayAccessor::String(_) | TypedArrayAccessor::Other(_)
+            ) {
+                // Raw keys for strings/other types are lossy encodings — verify
+                // the hit against the registered value; on collision, fall back
+                // to the exact HashMap path for this whole state.
+                if !accessor.value_equals_scalar(row, &self.raw_key_values[col][id as usize]) {
+                    self.overflowed = true;
+                    return None;
+                }
             }
         }
 
@@ -1058,6 +1167,7 @@ impl AggregationState {
         if group_accessors.len() == 1 {
             let raw_type = match &group_accessors[0] {
                 TypedArrayAccessor::Int64(_) => Some(DataType::Int64),
+                TypedArrayAccessor::Int32(_) => Some(DataType::Int32),
                 TypedArrayAccessor::Date32(_) => Some(DataType::Date32),
                 _ => None,
             };
@@ -1069,6 +1179,9 @@ impl AggregationState {
                 for row in start_row..end_row {
                     let (is_null, raw) = match &group_accessors[0] {
                         TypedArrayAccessor::Int64(a) => (a.is_null(row), a.value(row) as u64),
+                        TypedArrayAccessor::Int32(a) => {
+                            (a.is_null(row), a.value(row) as i64 as u64)
+                        }
                         TypedArrayAccessor::Date32(a) => {
                             (a.is_null(row), a.value(row) as i64 as u64)
                         }
@@ -1125,6 +1238,7 @@ impl AggregationState {
     fn raw_key_to_scalar(&self, raw: u64) -> ScalarValue {
         match self.raw_type {
             Some(DataType::Date32) => ScalarValue::Date32(raw as i64 as i32),
+            Some(DataType::Int32) => ScalarValue::Int32(raw as i64 as i32),
             _ => ScalarValue::Int64(raw as i64),
         }
     }
@@ -1137,6 +1251,7 @@ impl AggregationState {
         match (&key.values[0], &self.raw_type) {
             (ScalarValue::Null, _) => Some(RawKey::Null),
             (ScalarValue::Int64(v), Some(DataType::Int64)) => Some(RawKey::Value(*v as u64)),
+            (ScalarValue::Int32(v), Some(DataType::Int32)) => Some(RawKey::Value(*v as i64 as u64)),
             (ScalarValue::Date32(v), Some(DataType::Date32)) => {
                 Some(RawKey::Value(*v as i64 as u64))
             }

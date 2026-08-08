@@ -1174,50 +1174,12 @@ fn aggregate_batches_morsel_parallel(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let total_groups: usize = states.iter().map(|s| s.group_count()).sum();
-    const PARALLEL_MERGE_MIN_GROUPS: usize = 65_536;
-
-    if states.len() > 1 && total_groups > PARALLEL_MERGE_MIN_GROUPS {
-        let p = rayon::current_num_threads().clamp(2, 64);
-        let per_state_shards: Vec<_> = states
-            .into_par_iter()
-            .map(|s| s.into_shards(p))
-            .collect::<Vec<_>>();
-
-        let mut shard_major: Vec<Vec<_>> = (0..p).map(|_| Vec::new()).collect();
-        for state_shards in per_state_shards {
-            for (pi, shard) in state_shards.into_iter().enumerate() {
-                shard_major[pi].push(shard);
-            }
-        }
-
-        let shard_batches: Vec<RecordBatch> = shard_major
-            .into_par_iter()
-            .map(|lists| {
-                let map = morsel_agg::merge_entries_into_map(lists);
-                if map.is_empty() {
-                    return Ok(None);
-                }
-                let state =
-                    AggregationState::from_groups(agg_funcs.clone(), input_types.clone(), map);
-                state.build_output(schema).map(Some)
-            })
-            .collect::<Result<Vec<Option<RecordBatch>>>>()?
-            .into_iter()
-            .flatten()
-            .collect();
-
-        if shard_batches.is_empty() {
-            return Ok(RecordBatch::new_empty(schema.clone()));
-        }
-        return arrow::compute::concat_batches(schema, &shard_batches).map_err(Into::into);
+    let shard_batches =
+        morsel_agg::merge_states_to_batches(states, &agg_funcs, &input_types, schema)?;
+    if shard_batches.is_empty() {
+        return Ok(RecordBatch::new_empty(schema.clone()));
     }
-
-    let mut final_state = AggregationState::new(agg_funcs.clone(), input_types);
-    for state in states {
-        final_state.merge(&state);
-    }
-    final_state.build_output(schema)
+    arrow::compute::concat_batches(schema, &shard_batches).map_err(Into::into)
 }
 
 /// Parallel aggregation using rayon for multi-core performance
