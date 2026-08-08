@@ -1979,18 +1979,49 @@ impl AggregationState {
         };
         arrays.push(key_array);
 
-        // Aggregate columns
+        // Aggregate columns: build typed arrays directly from finalize()
+        // results, skipping the intermediate Vec<ScalarValue> +
+        // build_scalar_array double-dispatch (visible in Q18 profiles).
         for agg_idx in 0..self.agg_funcs.len() {
             let func = &self.agg_funcs[agg_idx];
-            let mut values: Vec<ScalarValue> = Vec::with_capacity(num_groups);
-            for (_, accs) in &entries {
-                values.push(accs[agg_idx].finalize(func));
-            }
-            if let Some(null_accs) = &self.raw_null {
-                values.push(null_accs[agg_idx].finalize(func));
-            }
             let field = schema.field(1 + agg_idx);
-            arrays.push(build_scalar_array(&values, field.data_type())?);
+            let finalize_iter = entries
+                .iter()
+                .map(|(_, accs)| accs[agg_idx].finalize(func))
+                .chain(
+                    self.raw_null
+                        .as_ref()
+                        .map(|accs| accs[agg_idx].finalize(func)),
+                );
+            let array: ArrayRef = match field.data_type() {
+                DataType::Int64 => {
+                    let mut b = Int64Builder::with_capacity(num_groups);
+                    for v in finalize_iter {
+                        match v {
+                            ScalarValue::Int64(x) => b.append_value(x),
+                            ScalarValue::Null => b.append_null(),
+                            other => b.append_option(scalar_to_i64(&other)),
+                        }
+                    }
+                    Arc::new(b.finish())
+                }
+                DataType::Float64 => {
+                    let mut b = Float64Builder::with_capacity(num_groups);
+                    for v in finalize_iter {
+                        match v {
+                            ScalarValue::Float64(x) => b.append_value(x.into_inner()),
+                            ScalarValue::Null => b.append_null(),
+                            other => b.append_option(scalar_to_f64(&other)),
+                        }
+                    }
+                    Arc::new(b.finish())
+                }
+                _ => {
+                    let values: Vec<ScalarValue> = finalize_iter.collect();
+                    build_scalar_array(&values, field.data_type())?
+                }
+            };
+            arrays.push(array);
         }
 
         RecordBatch::try_new(schema.clone(), arrays)
