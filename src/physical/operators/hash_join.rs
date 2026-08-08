@@ -517,8 +517,7 @@ impl PhysicalOperator for HashJoinExec {
                 // the scan then decodes only rows whose key can match.
                 if let Some(slot) = &self.probe_runtime_filter {
                     if build_keys.len() == 1 && total_build_rows <= 4_000_000 {
-                        let mut set: hashbrown::HashSet<i64> =
-                            hashbrown::HashSet::with_capacity(total_build_rows);
+                        let mut keys: Vec<i64> = Vec::with_capacity(total_build_rows);
                         let mut ok = true;
                         'outer_rt: for batch in &build_batches {
                             match crate::physical::operators::evaluate_expr(batch, &build_keys[0])
@@ -527,7 +526,7 @@ impl PhysicalOperator for HashJoinExec {
                                     Some(a) => {
                                         for i in 0..a.len() {
                                             if !a.is_null(i) {
-                                                set.insert(a.value(i));
+                                                keys.push(a.value(i));
                                             }
                                         }
                                     }
@@ -542,8 +541,23 @@ impl PhysicalOperator for HashJoinExec {
                                 }
                             }
                         }
-                        if ok {
-                            *slot.lock() = Some(std::sync::Arc::new(set));
+                        if ok && !keys.is_empty() {
+                            use crate::physical::operators::streaming_parquet_scan::RuntimeFilterPayload;
+                            let min = keys.iter().copied().min().unwrap();
+                            let max = keys.iter().copied().max().unwrap();
+                            // Bitmap for bounded domains: 64M bits = 8MB cap
+                            let payload = if (max - min) < 64_000_000 {
+                                let width = (max - min) as usize + 1;
+                                let mut bits = vec![0u64; width.div_ceil(64)];
+                                for k in &keys {
+                                    let off = (k - min) as usize;
+                                    bits[off >> 6] |= 1u64 << (off & 63);
+                                }
+                                RuntimeFilterPayload::Bitmap { min, bits }
+                            } else {
+                                RuntimeFilterPayload::Set(keys.into_iter().collect())
+                            };
+                            *slot.lock() = Some(std::sync::Arc::new(payload));
                         }
                     }
                 }
