@@ -75,6 +75,12 @@ struct VectorizedHashTable {
     /// column is non-null-free Int64-typed: chain-walk comparisons then use
     /// raw i64 loads instead of per-candidate dynamic downcasts.
     i64_key_bufs: Option<Vec<Vec<arrow::buffer::ScalarBuffer<i64>>>>,
+    /// Direct-address mode: for a single i64 key whose build domain spans a
+    /// dense range, `heads` is indexed by (key - min) instead of hash&mask.
+    /// Chains then contain EXACTLY equal keys, so probing needs no hashing
+    /// and no key comparison at all (dimension-table PK builds: customer,
+    /// part, supplier).
+    direct: Option<(i64, i64)>,
 }
 
 impl VectorizedHashTable {
@@ -160,6 +166,53 @@ impl VectorizedHashTable {
             i64_key_bufs = None;
         }
 
+        // Direct-address upgrade: single i64 key over a dense domain.
+        let mut direct: Option<(i64, i64)> = None;
+        if n_cols == 1 {
+            if let Some(bufs) = &i64_key_bufs {
+                let mut kmin = i64::MAX;
+                let mut kmax = i64::MIN;
+                let mut n_keys = 0usize;
+                for (batch_idx, key_arrays) in build_key_arrays.iter().enumerate() {
+                    let arr = key_arrays[0].as_any().downcast_ref::<Int64Array>().unwrap();
+                    let vals = &bufs[0][batch_idx];
+                    for row in 0..vals.len() {
+                        if !arr.is_null(row) {
+                            let v = vals[row];
+                            kmin = kmin.min(v);
+                            kmax = kmax.max(v);
+                            n_keys += 1;
+                        }
+                    }
+                }
+                const DIRECT_MAX_RANGE: i64 = 16_000_000;
+                if n_keys > 0 && kmax.saturating_sub(kmin) < DIRECT_MAX_RANGE {
+                    let range = (kmax - kmin + 1) as usize;
+                    let mut dheads: Vec<u32> = vec![u32::MAX; range];
+                    let mut dnext: Vec<u32> = Vec::with_capacity(n_keys);
+                    let mut dentries: Vec<(u32, u32)> = Vec::with_capacity(n_keys);
+                    for (batch_idx, key_arrays) in build_key_arrays.iter().enumerate() {
+                        let arr = key_arrays[0].as_any().downcast_ref::<Int64Array>().unwrap();
+                        let vals = &bufs[0][batch_idx];
+                        for row in 0..vals.len() {
+                            if arr.is_null(row) {
+                                continue;
+                            }
+                            let slot = (vals[row] - kmin) as usize;
+                            let entry_idx = dentries.len() as u32;
+                            dentries.push((batch_idx as u32, row as u32));
+                            dnext.push(dheads[slot]);
+                            dheads[slot] = entry_idx;
+                        }
+                    }
+                    heads = dheads;
+                    next = dnext;
+                    entries = dentries;
+                    direct = Some((kmin, kmax));
+                }
+            }
+        }
+
         Ok(VectorizedHashTable {
             heads,
             next,
@@ -167,6 +220,7 @@ impl VectorizedHashTable {
             mask,
             build_key_arrays,
             i64_key_bufs,
+            direct,
         })
     }
 
@@ -174,8 +228,36 @@ impl VectorizedHashTable {
     /// Returns matched (build_batch_idx, build_row_idx, probe_row_idx) triples.
     #[inline]
     fn probe_batch(&self, probe_key_arrays: &[ArrayRef], num_rows: usize) -> Vec<(u32, u32, u32)> {
-        let hashes = vectorized_hash::hash_arrays(probe_key_arrays, num_rows);
         let mut matches = Vec::new();
+
+        // Direct-address probe: bounds check + slot load; chain entries are
+        // exactly equal keys, so no hashing and no comparisons.
+        if let Some((kmin, kmax)) = self.direct {
+            if let Some(pa) = probe_key_arrays[0].as_any().downcast_ref::<Int64Array>() {
+                let vals = pa.values();
+                let nulls = pa.nulls();
+                for probe_row in 0..num_rows {
+                    if let Some(nb) = nulls {
+                        if !nb.is_valid(probe_row) {
+                            continue;
+                        }
+                    }
+                    let k = vals[probe_row];
+                    if k < kmin || k > kmax {
+                        continue;
+                    }
+                    let mut entry = self.heads[(k - kmin) as usize];
+                    while entry != u32::MAX {
+                        let (bb, br) = self.entries[entry as usize];
+                        matches.push((bb, br, probe_row as u32));
+                        entry = self.next[entry as usize];
+                    }
+                }
+                return matches;
+            }
+        }
+
+        let hashes = vectorized_hash::hash_arrays(probe_key_arrays, num_rows);
 
         // Fast path: raw i64 comparisons, no per-candidate downcasts.
         if let Some(build_bufs) = &self.i64_key_bufs {
@@ -239,8 +321,29 @@ impl VectorizedHashTable {
     /// Probe for Semi/Anti joins: returns a boolean mask per probe row indicating match.
     #[inline]
     fn probe_batch_semi(&self, probe_key_arrays: &[ArrayRef], num_rows: usize) -> Vec<bool> {
-        let hashes = vectorized_hash::hash_arrays(probe_key_arrays, num_rows);
         let mut matched = vec![false; num_rows];
+
+        // Direct-address: membership = slot occupancy, no hash/compare.
+        if let Some((kmin, kmax)) = self.direct {
+            if let Some(pa) = probe_key_arrays[0].as_any().downcast_ref::<Int64Array>() {
+                let vals = pa.values();
+                let nulls = pa.nulls();
+                for probe_row in 0..num_rows {
+                    if let Some(nb) = nulls {
+                        if !nb.is_valid(probe_row) {
+                            continue;
+                        }
+                    }
+                    let k = vals[probe_row];
+                    if k >= kmin && k <= kmax {
+                        matched[probe_row] = self.heads[(k - kmin) as usize] != u32::MAX;
+                    }
+                }
+                return matched;
+            }
+        }
+
+        let hashes = vectorized_hash::hash_arrays(probe_key_arrays, num_rows);
 
         for probe_row in 0..num_rows {
             if vectorized_hash::has_null(probe_key_arrays, probe_row) {
