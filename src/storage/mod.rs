@@ -11,4 +11,5 @@ pub use parquet::{
     ParquetFileInfo, ParquetTable, StreamingParquetReader, StreamingParquetScanBuilder,
 };
 
+pub mod ipc_cache;
 pub mod metadata_cache;

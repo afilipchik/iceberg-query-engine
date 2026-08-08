@@ -75,6 +75,8 @@ pub struct ParallelParquetSource {
     completed: AtomicUsize,
     /// Total number of row groups
     total_row_groups: usize,
+    /// Per-file IPC sidecar dirs (index = file_idx) when the cache is on.
+    ipc_dirs: Vec<Option<std::path::PathBuf>>,
     /// Pre-built schema override requesting Dictionary(Int32, Utf8) for
     /// chosen string columns (constructed ONCE from the provider schema —
     /// a per-row-group probe re-parsed the footer and cost more than the
@@ -116,6 +118,14 @@ impl ParallelParquetSource {
         // Discover all row groups, pruning based on filter
         let mut work_queue = VecDeque::new();
 
+        let ipc_dirs: Vec<Option<std::path::PathBuf>> = if crate::storage::ipc_cache::enabled() {
+            files
+                .iter()
+                .map(|f| crate::storage::ipc_cache::ensure_sidecar(f))
+                .collect()
+        } else {
+            vec![None; files.len()]
+        };
         for (file_idx, file_path) in files.iter().enumerate() {
             let md = crate::storage::metadata_cache::cached_metadata(file_path)?;
             let metadata = md.metadata().clone();
@@ -174,6 +184,7 @@ impl ParallelParquetSource {
             completed: AtomicUsize::new(0),
             total_row_groups,
             row_filter,
+            ipc_dirs,
             dict_schema: None,
         })
     }
@@ -281,6 +292,24 @@ impl ParallelParquetSource {
 
     /// Read a single row group and return batches
     pub fn read_row_group(&self, work: &RowGroupWork) -> Result<Vec<RecordBatch>> {
+        // IPC sidecar: decode-free read of the row group; the scan filter
+        // (if any) applies vectorized post-load unless zone maps proved it
+        // ALWAYS_TRUE. Dictionary-coercion scans keep the parquet path.
+        if self.dict_schema.is_none() {
+            if let Some(Some(dir)) = self.ipc_dirs.get(work.file_idx) {
+                let mut batches = crate::storage::ipc_cache::read_row_group(
+                    dir,
+                    work.row_group_idx,
+                    self.projection.as_deref(),
+                )?;
+                if let Some((expr, _)) = &self.row_filter {
+                    if !work.filter_all_true {
+                        batches = crate::physical::operators::filter_batches(batches, expr)?;
+                    }
+                }
+                return Ok(batches);
+            }
+        }
         let builder = match &self.dict_schema {
             Some(schema) => {
                 let file = File::open(&work.file_path)?;
