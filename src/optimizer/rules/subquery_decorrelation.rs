@@ -804,15 +804,21 @@ fn add_semi_join_reduction(
         // The aggregate above ignores the extra columns from the source table.
         let agg_input_schema = agg.input.schema();
         let source_schema = source_plan.schema();
-        let mut join_fields = agg_input_schema.fields().to_vec();
-        join_fields.extend(source_schema.fields().iter().cloned());
+        // Reduction source LEFT: the physical planner builds the hash table
+        // from the left side, and the filtered dimension source is orders of
+        // magnitude smaller than the aggregate's input (Q20 built an 8.5M-row
+        // lineitem table to probe 1.1M partsupp rows when oriented the other
+        // way — the old orientation relied on the now-disabled should_swap).
+        let mut join_fields = source_schema.fields().to_vec();
+        join_fields.extend(agg_input_schema.fields().iter().cloned());
         let join_schema = PlanSchema::new(join_fields);
 
+        let swapped_on: Vec<(Expr, Expr)> = semi_on.into_iter().map(|(i, o)| (o, i)).collect();
         let inner_join = LogicalPlan::Join(JoinNode {
-            left: agg.input.clone(),
-            right: Arc::new(source_plan),
+            left: Arc::new(source_plan),
+            right: agg.input.clone(),
             join_type: JoinType::Inner,
-            on: semi_on,
+            on: swapped_on,
             filter: None,
             schema: join_schema,
         });
