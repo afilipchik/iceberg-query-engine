@@ -551,6 +551,9 @@ impl PhysicalOperator for HashJoinExec {
                                 }
                             }
                         }
+                        if std::env::var("RT_DEBUG").is_ok() && (!ok || keys.is_empty()) {
+                            eprintln!("[rt] publish FAILED: ok={} keys={}", ok, keys.len());
+                        }
                         if ok && !keys.is_empty() {
                             use crate::physical::operators::streaming_parquet_scan::RuntimeFilterPayload;
                             let min = keys.iter().copied().min().unwrap();
@@ -572,6 +575,9 @@ impl PhysicalOperator for HashJoinExec {
                             } else {
                                 Some(RuntimeFilterPayload::Set(keys.into_iter().collect()))
                             };
+                            if std::env::var("RT_DEBUG").is_ok() {
+                                eprintln!("[rt] publish: skip={}", payload.is_none());
+                            }
                             if let Some(p) = payload {
                                 *slot.lock() = Some(std::sync::Arc::new(p));
                             }
