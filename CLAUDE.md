@@ -736,28 +736,28 @@ Based on the codebase structure, these appear to be planned but not fully implem
   `SpillableHashJoinExec` still materializes the build side before deciding to
   spill (known hole, fixed by the Phase-5 streaming spill rewrite, see ROADMAP).
 
-## TPC-H Benchmark Status (SF=10, 2026-08-08 evening, 48G cgroup)
+## TPC-H Benchmark Status (SF=10, 2026-08-08 night, 48G cgroup)
 
 Log: `logs/safe_benchmark_20260808_*.log`. Spec queries, spec-generator data.
-**22/22 pass; 13.00s total vs native-table DuckDB 2.94s = 4.4x; 18/22 within 10x.**
-**Like-for-like (DuckDB reading the SAME parquet via views: 4.45s) = 2.9x.**
+**22/22 pass; 11.71s total vs native-table DuckDB 2.94s = 3.9x; 20/22 within 10x.**
+**Like-for-like (DuckDB reading the SAME parquet via views: 4.45s) = 2.6x.**
 All 22 queries validate CELL-EXACT against DuckDB at SF=10 after every change
 (pattern: `benchmark-parquet --save-csv` + `.venv/bin/python` DuckDB views
 comparison; see `.scratch/validate22.py` pattern in memory).
 
 | Query | Engine | vs native | | Query | Engine | vs native |
 |-------|--------|-------|-|-------|--------|-------|
-| Q01 | 417ms | 3.9x | | Q12 | 282ms | 3.2x |
-| Q02 | 129ms | 5.8x | | Q13 | 585ms | 5.9x |
-| Q03 | 512ms | 6.2x | | Q14 | 150ms | 3.8x |
-| Q04 | 386ms | 6.7x | | Q15 | 331ms | 10.6x |
-| Q05 | 466ms | 9.7x | | Q16 | 291ms | 7.4x |
-| Q06 | 133ms | 5.5x | | Q17 | 616ms | 7.0x |
-| Q07 | 393ms | 5.4x | | Q18 | 1.52s | 6.5x |
-| Q08 | 395ms | 5.5x | | Q19 | 363ms | 4.1x |
-| Q09 | 1.69s | **1.3x** | | Q20 | 1.20s | 7.4x |
-| Q10 | 942ms | 10.3x | | Q21 | 1.54s | 7.2x |
-| Q11 | 204ms | 14.5x | | Q22 | 457ms | 13.4x |
+| Q01 | 427ms | 4.0x | | Q12 | 274ms | 3.1x |
+| Q02 | 122ms | 5.5x | | Q13 | 563ms | 5.6x |
+| Q03 | 492ms | 5.9x | | Q14 | 147ms | 3.7x |
+| Q04 | 393ms | 6.8x | | Q15 | 307ms | 9.9x |
+| Q05 | 424ms | 8.8x | | Q16 | 286ms | 7.3x |
+| Q06 | 122ms | 5.0x | | Q17 | 580ms | 6.6x |
+| Q07 | 402ms | 5.5x | | Q18 | 1.43s | 6.1x |
+| Q08 | 389ms | 5.4x | | Q19 | 353ms | 4.0x |
+| Q09 | 1.51s | **1.2x** | | Q20 | 1.11s | 6.9x |
+| Q10 | 894ms | 9.8x | | Q21 | 868ms | 4.0x |
+| Q11 | 178ms | 12.6x | | Q22 | 431ms | 12.6x |
 
 **What got the engine here (2026-08-08)**: mimalloc global allocator (glibc
 free/consolidate stalls cost 550ms on a single aggregate teardown); DPsize CBO
@@ -766,7 +766,9 @@ NDVs); EagerAggregation rule (pre-aggregate duplicated join inputs with packed
 int keys — Q09 4.1s -> 1.69s); per-shard HAVING filtering inside the parallel
 aggregate merge; build side concatenated once in the join build cache; morsel
 parallel aggregation + raw u64 group keys; SemiJoinPushdown; DeriveOrPredicates;
-arrow RowFilter pushdown; vectorized SUBSTRING + single-pass string IN-lists.
+arrow RowFilter pushdown; vectorized SUBSTRING + single-pass string IN-lists;
+batch-level parallel Semi/Anti probes; GroupKeyReduction rule (FD-redundant
+group columns collapse to the unique key + ANY_VALUE).
 
 **Remaining gaps**: Q10/Q11/Q15/Q22 exceed 10x native on small absolute times
 (fixed pipeline overhead, double scans, string-heavy group keys). Next levers
