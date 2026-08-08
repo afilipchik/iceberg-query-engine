@@ -1443,99 +1443,75 @@ fn probe_semi_anti_parallel(
     };
     let i64_ht_ref: Option<&HashMap<i64, Vec<HashEntry>>> = cached_i64_ht.or(local_i64_ht.as_ref());
 
-    // Process all probe batches in parallel using chunked intra-batch parallelism
-    const CHUNK_SIZE: usize = 65536;
-    let mut results = Vec::new();
-
-    for probe_batch in probe_batches {
-        let probe_key_arr = if probe_key_exprs.len() == 1 {
-            Some(evaluate_expr(probe_batch, &probe_key_exprs[0])?)
-        } else {
-            None
-        };
-
-        // Get direct i64 values if available
-        let i64_values: Option<&[i64]> = probe_key_arr.as_ref().and_then(|arr| {
-            arr.as_any()
-                .downcast_ref::<Int64Array>()
-                .map(|a| a.values().as_ref())
-        });
-        let null_bitmap = probe_key_arr.as_ref().and_then(|arr| arr.nulls().cloned());
-
-        let n_rows = probe_batch.num_rows();
-        let chunks: Vec<std::ops::Range<usize>> = (0..n_rows)
-            .step_by(CHUNK_SIZE)
-            .map(|start| start..std::cmp::min(start + CHUNK_SIZE, n_rows))
-            .collect();
-
-        // Fall back to full key extraction if no i64 fast path
-        let probe_key_arrays: Option<Vec<ArrayRef>> =
-            if i64_values.is_none() || i64_ht_ref.is_none() {
-                let arrays: Result<Vec<ArrayRef>> = probe_key_exprs
-                    .iter()
-                    .map(|e| evaluate_expr(probe_batch, e))
-                    .collect();
-                Some(arrays?)
+    // Process probe BATCHES in parallel: 8K-row parquet batches are smaller
+    // than any useful intra-batch chunk, so chunking within a batch left the
+    // whole probe on one thread (Q21's 60M-row semi probe starved 32 fused
+    // aggregation workers behind it). Both output modes are batch-independent:
+    // non-swapped only sets shared atomic build_matched bits, swapped emits
+    // one output batch per probe batch.
+    let batch_results: Vec<Result<Option<RecordBatch>>> = probe_batches
+        .par_iter()
+        .map(|probe_batch| {
+            let probe_key_arr = if probe_key_exprs.len() == 1 {
+                Some(evaluate_expr(probe_batch, &probe_key_exprs[0])?)
             } else {
                 None
             };
 
-        // Track probe-side matches when swapped (build=right, probe=left=output)
-        let probe_matched_batch: Vec<AtomicBool> = if swapped {
-            (0..n_rows).map(|_| AtomicBool::new(false)).collect()
-        } else {
-            vec![]
-        };
+            // Get direct i64 values if available
+            let i64_values: Option<&[i64]> = probe_key_arr.as_ref().and_then(|arr| {
+                arr.as_any()
+                    .downcast_ref::<Int64Array>()
+                    .map(|a| a.values().as_ref())
+            });
+            let null_bitmap = probe_key_arr.as_ref().and_then(|arr| arr.nulls().cloned());
 
-        chunks.par_iter().try_for_each(|range| {
-            for probe_row in range.clone() {
-                // Fast i64 path: direct array access, no JoinKey allocation
-                let entries_opt = if let (Some(vals), Some(ht)) = (i64_values, i64_ht_ref) {
-                    if let Some(ref nb) = null_bitmap {
-                        if !nb.is_valid(probe_row) {
-                            continue;
-                        }
-                    }
-                    ht.get(&vals[probe_row])
-                } else if let Some(ref key_arrays) = probe_key_arrays {
-                    let key = extract_join_key(key_arrays, probe_row);
-                    if key.values.iter().any(|v| matches!(v, JoinValue::Null)) {
-                        continue;
-                    }
-                    hash_table.get(&key)
+            let n_rows = probe_batch.num_rows();
+
+            // Fall back to full key extraction if no i64 fast path
+            let probe_key_arrays: Option<Vec<ArrayRef>> =
+                if i64_values.is_none() || i64_ht_ref.is_none() {
+                    let arrays: Result<Vec<ArrayRef>> = probe_key_exprs
+                        .iter()
+                        .map(|e| evaluate_expr(probe_batch, e))
+                        .collect();
+                    Some(arrays?)
                 } else {
                     None
                 };
 
-                if let Some(entries) = entries_opt {
-                    for entry in entries {
-                        if let Some(ref cf) = compiled_filter {
-                            let build_batch = &build_batches[entry.batch_idx];
-                            if cf.evaluate(build_batch, entry.row_idx, probe_batch, probe_row) {
-                                if swapped {
-                                    probe_matched_batch[probe_row].store(true, Ordering::Relaxed);
-                                } else {
-                                    build_matched[entry.batch_idx][entry.row_idx]
-                                        .store(true, Ordering::Relaxed);
-                                }
-                                break;
+            // Track probe-side matches when swapped (build=right, probe=left=output)
+            let probe_matched_batch: Vec<AtomicBool> = if swapped {
+                (0..n_rows).map(|_| AtomicBool::new(false)).collect()
+            } else {
+                vec![]
+            };
+
+            {
+                for probe_row in 0..n_rows {
+                    // Fast i64 path: direct array access, no JoinKey allocation
+                    let entries_opt = if let (Some(vals), Some(ht)) = (i64_values, i64_ht_ref) {
+                        if let Some(ref nb) = null_bitmap {
+                            if !nb.is_valid(probe_row) {
+                                continue;
                             }
-                        } else if let Some(filter_expr) = filter {
-                            let build_row_batch = create_single_row_combined_batch(
-                                build_batches,
-                                entry.batch_idx,
-                                entry.row_idx,
-                                probe_batch,
-                                probe_row,
-                                swapped,
-                                combined_schema,
-                            )?;
-                            let filter_result = evaluate_expr(&build_row_batch, filter_expr)?;
-                            if let Some(bool_arr) = filter_result
-                                .as_any()
-                                .downcast_ref::<arrow::array::BooleanArray>()
-                            {
-                                if bool_arr.len() > 0 && bool_arr.value(0) {
+                        }
+                        ht.get(&vals[probe_row])
+                    } else if let Some(ref key_arrays) = probe_key_arrays {
+                        let key = extract_join_key(key_arrays, probe_row);
+                        if key.values.iter().any(|v| matches!(v, JoinValue::Null)) {
+                            continue;
+                        }
+                        hash_table.get(&key)
+                    } else {
+                        None
+                    };
+
+                    if let Some(entries) = entries_opt {
+                        for entry in entries {
+                            if let Some(ref cf) = compiled_filter {
+                                let build_batch = &build_batches[entry.batch_idx];
+                                if cf.evaluate(build_batch, entry.row_idx, probe_batch, probe_row) {
                                     if swapped {
                                         probe_matched_batch[probe_row]
                                             .store(true, Ordering::Relaxed);
@@ -1545,42 +1521,75 @@ fn probe_semi_anti_parallel(
                                     }
                                     break;
                                 }
-                            }
-                        } else {
-                            if swapped {
-                                probe_matched_batch[probe_row].store(true, Ordering::Relaxed);
+                            } else if let Some(filter_expr) = filter {
+                                let build_row_batch = create_single_row_combined_batch(
+                                    build_batches,
+                                    entry.batch_idx,
+                                    entry.row_idx,
+                                    probe_batch,
+                                    probe_row,
+                                    swapped,
+                                    combined_schema,
+                                )?;
+                                let filter_result = evaluate_expr(&build_row_batch, filter_expr)?;
+                                if let Some(bool_arr) = filter_result
+                                    .as_any()
+                                    .downcast_ref::<arrow::array::BooleanArray>(
+                                ) {
+                                    if bool_arr.len() > 0 && bool_arr.value(0) {
+                                        if swapped {
+                                            probe_matched_batch[probe_row]
+                                                .store(true, Ordering::Relaxed);
+                                        } else {
+                                            build_matched[entry.batch_idx][entry.row_idx]
+                                                .store(true, Ordering::Relaxed);
+                                        }
+                                        break;
+                                    }
+                                }
                             } else {
-                                build_matched[entry.batch_idx][entry.row_idx]
-                                    .store(true, Ordering::Relaxed);
+                                if swapped {
+                                    probe_matched_batch[probe_row].store(true, Ordering::Relaxed);
+                                } else {
+                                    build_matched[entry.batch_idx][entry.row_idx]
+                                        .store(true, Ordering::Relaxed);
+                                }
+                                break;
                             }
-                            break;
                         }
                     }
                 }
             }
-            Ok::<(), crate::error::QueryError>(())
-        })?;
 
-        // Output probe rows per-batch when swapped
-        if swapped {
-            let is_semi = matches!(join_type, JoinType::Semi);
-            let keep: Vec<u32> = (0..n_rows as u32)
-                .filter(|&i| probe_matched_batch[i as usize].load(Ordering::Relaxed) == is_semi)
-                .collect();
-            if !keep.is_empty() {
-                let take_idx = UInt32Array::from(keep);
-                let columns: std::result::Result<Vec<ArrayRef>, arrow::error::ArrowError> =
-                    probe_batch
-                        .columns()
-                        .iter()
-                        .map(|col| arrow::compute::take(col, &take_idx, None))
-                        .collect();
-                let batch = RecordBatch::try_new(
-                    output_schema.clone(),
-                    columns.map_err(|e| crate::error::QueryError::Execution(e.to_string()))?,
-                )?;
-                results.push(batch);
+            // Output probe rows per-batch when swapped
+            if swapped {
+                let is_semi = matches!(join_type, JoinType::Semi);
+                let keep: Vec<u32> = (0..n_rows as u32)
+                    .filter(|&i| probe_matched_batch[i as usize].load(Ordering::Relaxed) == is_semi)
+                    .collect();
+                if !keep.is_empty() {
+                    let take_idx = UInt32Array::from(keep);
+                    let columns: std::result::Result<Vec<ArrayRef>, arrow::error::ArrowError> =
+                        probe_batch
+                            .columns()
+                            .iter()
+                            .map(|col| arrow::compute::take(col, &take_idx, None))
+                            .collect();
+                    let batch = RecordBatch::try_new(
+                        output_schema.clone(),
+                        columns.map_err(|e| crate::error::QueryError::Execution(e.to_string()))?,
+                    )?;
+                    return Ok(Some(batch));
+                }
             }
+            Ok(None)
+        })
+        .collect();
+
+    let mut results = Vec::new();
+    for r in batch_results {
+        if let Some(b) = r? {
+            results.push(b);
         }
     }
 
