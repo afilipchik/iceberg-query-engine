@@ -43,6 +43,9 @@ impl Optimizer {
             rules: vec![
                 // First pass: push predicates and fold constants before decorrelation
                 Arc::new(rules::ConstantFolding),
+                // Derive per-column IN-lists implied by OR predicates so they
+                // can push to scans (Q07 nation pair, Q19 brand/container)
+                Arc::new(rules::DeriveOrPredicates),
                 Arc::new(rules::PredicatePushdown), // Push join conditions before decorrelation
                 // FlattenDependentJoin: DelimJoin-based subquery flattening
                 // Only handles simple single-EXISTS cases; complex patterns (Q21, Q22)
