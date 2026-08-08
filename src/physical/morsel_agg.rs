@@ -355,6 +355,8 @@ pub(crate) enum AccumulatorState {
     Max(Option<ScalarValue>),
     BoolAnd(Option<bool>),
     BoolOr(Option<bool>),
+    /// ANY_VALUE / ARBITRARY: first non-null value wins
+    First(Option<ScalarValue>),
     /// Online variance using Welford's algorithm: (count, mean, M2)
     /// Finalize: population variance = M2/count, sample variance = M2/(count-1)
     Variance {
@@ -381,6 +383,9 @@ impl AccumulatorState {
             AggregateFunction::Max => AccumulatorState::Max(None),
             AggregateFunction::BoolAnd => AccumulatorState::BoolAnd(None),
             AggregateFunction::BoolOr => AccumulatorState::BoolOr(None),
+            AggregateFunction::AnyValue | AggregateFunction::Arbitrary => {
+                AccumulatorState::First(None)
+            }
             AggregateFunction::Stddev
             | AggregateFunction::StddevPop
             | AggregateFunction::StddevSamp
@@ -417,6 +422,11 @@ impl AccumulatorState {
                 if let Some(v) = scalar_to_f64(value) {
                     *sum += v;
                     *count += 1;
+                }
+            }
+            AccumulatorState::First(v) => {
+                if v.is_none() && !matches!(value, ScalarValue::Null) {
+                    *v = Some(value.clone());
                 }
             }
             AccumulatorState::Min(min) => {
@@ -477,6 +487,11 @@ impl AccumulatorState {
                 *sum += value;
                 *count += 1;
             }
+            AccumulatorState::First(v) => {
+                if v.is_none() {
+                    *v = Some(ScalarValue::Float64(value.into()));
+                }
+            }
             AccumulatorState::Min(min) => {
                 let new_val = ScalarValue::Float64(ordered_float::OrderedFloat(value));
                 match min {
@@ -527,6 +542,11 @@ impl AccumulatorState {
             AccumulatorState::Avg { sum, count } => {
                 *sum += value as f64;
                 *count += 1;
+            }
+            AccumulatorState::First(v) => {
+                if v.is_none() {
+                    *v = Some(ScalarValue::Int64(value));
+                }
             }
             AccumulatorState::Min(min) => {
                 let new_val = ScalarValue::Int64(value);
@@ -588,6 +608,11 @@ impl AccumulatorState {
             ) => {
                 *s1 += s2;
                 *c1 += c2;
+            }
+            (AccumulatorState::First(a), AccumulatorState::First(b)) => {
+                if a.is_none() {
+                    *a = b.clone();
+                }
             }
             (AccumulatorState::Min(a), AccumulatorState::Min(b)) => {
                 if let Some(b_val) = b {
@@ -666,6 +691,7 @@ impl AccumulatorState {
                 }
             }
             AccumulatorState::Min(v) => v.clone().unwrap_or(ScalarValue::Null),
+            AccumulatorState::First(v) => v.clone().unwrap_or(ScalarValue::Null),
             AccumulatorState::Max(v) => v.clone().unwrap_or(ScalarValue::Null),
             AccumulatorState::BoolAnd(v) => match v {
                 Some(val) => ScalarValue::Boolean(*val),
@@ -821,6 +847,17 @@ impl<'a> TypedArrayAccessor<'a> {
     /// Update accumulator directly without creating ScalarValue
     #[inline]
     fn update_accumulator(&self, row: usize, acc: &mut AccumulatorState) {
+        // ANY_VALUE short-circuit: once set, skip value extraction entirely
+        // (a per-row ScalarValue for a string column is an allocation).
+        if let AccumulatorState::First(v) = acc {
+            if v.is_none() {
+                let value = self.extract_scalar(row);
+                if !matches!(value, ScalarValue::Null) {
+                    *v = Some(value);
+                }
+            }
+            return;
+        }
         match self {
             TypedArrayAccessor::Float64(arr) => {
                 if !arr.is_null(row) {
@@ -1532,6 +1569,7 @@ impl AggregationState {
             AccumulatorState::Max(v) => v.is_some(),
             AccumulatorState::BoolAnd(v) => v.is_some(),
             AccumulatorState::BoolOr(v) => v.is_some(),
+            AccumulatorState::First(v) => v.is_some(),
             AccumulatorState::Variance { count, .. } => *count > 0,
         })
     }

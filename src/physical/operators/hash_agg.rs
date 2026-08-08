@@ -439,6 +439,8 @@ fn can_vectorize_aggregation(
                 | AggregateFunction::Min
                 | AggregateFunction::Max
                 | AggregateFunction::Avg
+                | AggregateFunction::AnyValue
+                | AggregateFunction::Arbitrary
         )
     })
 }

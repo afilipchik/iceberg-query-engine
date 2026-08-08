@@ -672,7 +672,10 @@ impl SpillableHashAggregateExec {
             && self.aggregates.iter().all(|a| {
                 !a.distinct
                     && a.second_arg.is_none()
-                    && matches!(a.func, F::Count | F::Sum | F::Min | F::Max | F::Avg)
+                    && matches!(
+                        a.func,
+                        F::Count | F::Sum | F::Min | F::Max | F::Avg | F::AnyValue | F::Arbitrary
+                    )
             })
     }
 

@@ -59,6 +59,8 @@ impl Optimizer {
                 Arc::new(rules::JoinReorder::new()),
                 // Final predicate pushdown for any remaining opportunities
                 Arc::new(rules::PredicatePushdown),
+                // Collapse FD-redundant group keys to the unique key column
+                Arc::new(rules::GroupKeyReduction::new()),
                 // Pre-aggregate duplicated join inputs (needs footer stats)
                 Arc::new(rules::EagerAggregation::new()),
                 Arc::new(rules::ProjectionPushdown),
@@ -97,6 +99,10 @@ impl Optimizer {
                         )) as Arc<dyn OptimizerRule>
                     } else if rule.name() == "EagerAggregation" {
                         Arc::new(rules::EagerAggregation::with_table_statistics(
+                            self.table_stats.clone(),
+                        )) as Arc<dyn OptimizerRule>
+                    } else if rule.name() == "GroupKeyReduction" {
+                        Arc::new(rules::GroupKeyReduction::with_table_statistics(
                             self.table_stats.clone(),
                         )) as Arc<dyn OptimizerRule>
                     } else {
