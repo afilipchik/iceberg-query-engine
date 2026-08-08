@@ -10,3 +10,4 @@
 # Logs and local envs
 /logs/
 /.venv/
+__pycache__/
