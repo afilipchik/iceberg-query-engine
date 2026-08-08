@@ -47,6 +47,12 @@ pub(crate) fn merge_entries_into_map(
     map
 }
 
+/// Raw-key classification for normalize_raw / scalar_to_raw.
+enum RawKey {
+    Value(u64),
+    Null,
+}
+
 /// Group key for hash table
 #[derive(Clone)]
 pub(crate) struct GroupKey {
@@ -721,6 +727,12 @@ pub struct AggregationState {
 
     /// HashMap fallback: group key -> accumulator states
     groups: HashMap<GroupKey, Vec<AccumulatorState>>,
+    /// Raw-key fallback for a single Int64/Date32 group column: avoids the
+    /// per-row GroupKey/ScalarValue allocation of `groups` (u64 is the
+    /// bit-pattern of the value; nulls tracked separately).
+    raw_groups: HashMap<u64, Vec<AccumulatorState>>,
+    raw_null: Option<Vec<AccumulatorState>>,
+    raw_type: Option<DataType>,
     /// Aggregate functions
     agg_funcs: Vec<AggregateFunction>,
     /// Input types for aggregates
@@ -740,6 +752,9 @@ impl Default for AggregationState {
             perfect_capacity: 0,
             overflowed: false,
             groups: HashMap::new(),
+            raw_groups: HashMap::new(),
+            raw_null: None,
+            raw_type: None,
             agg_funcs: Vec::new(),
             input_types: Vec::new(),
             num_group_cols: 0,
@@ -1038,6 +1053,52 @@ impl AggregationState {
         group_accessors: &[TypedArrayAccessor],
         agg_accessors: &[TypedArrayAccessor],
     ) {
+        // Raw fast path for a single Int64/Date32 group column: key the map by
+        // the value's bit pattern instead of allocating a GroupKey per ROW.
+        if group_accessors.len() == 1 {
+            let raw_type = match &group_accessors[0] {
+                TypedArrayAccessor::Int64(_) => Some(DataType::Int64),
+                TypedArrayAccessor::Date32(_) => Some(DataType::Date32),
+                _ => None,
+            };
+            if let Some(rt) = raw_type {
+                if self.raw_type.is_none() {
+                    self.raw_type = Some(rt);
+                    self.normalize_raw();
+                }
+                for row in start_row..end_row {
+                    let (is_null, raw) = match &group_accessors[0] {
+                        TypedArrayAccessor::Int64(a) => (a.is_null(row), a.value(row) as u64),
+                        TypedArrayAccessor::Date32(a) => {
+                            (a.is_null(row), a.value(row) as i64 as u64)
+                        }
+                        _ => unreachable!(),
+                    };
+                    let accumulators = if is_null {
+                        self.raw_null.get_or_insert_with(|| {
+                            self.agg_funcs
+                                .iter()
+                                .zip(&self.input_types)
+                                .map(|(func, dt)| AccumulatorState::new(func, dt))
+                                .collect()
+                        })
+                    } else {
+                        self.raw_groups.entry(raw).or_insert_with(|| {
+                            self.agg_funcs
+                                .iter()
+                                .zip(&self.input_types)
+                                .map(|(func, dt)| AccumulatorState::new(func, dt))
+                                .collect()
+                        })
+                    };
+                    for (i, acc) in accumulators.iter_mut().enumerate() {
+                        agg_accessors[i].update_accumulator(row, acc);
+                    }
+                }
+                return;
+            }
+        }
+
         for row in start_row..end_row {
             let key = GroupKey {
                 values: group_accessors
@@ -1056,6 +1117,67 @@ impl AggregationState {
 
             for (i, acc) in accumulators.iter_mut().enumerate() {
                 agg_accessors[i].update_accumulator(row, acc);
+            }
+        }
+    }
+
+    /// Convert a raw u64 key back into the GroupKey scalar it encodes.
+    fn raw_key_to_scalar(&self, raw: u64) -> ScalarValue {
+        match self.raw_type {
+            Some(DataType::Date32) => ScalarValue::Date32(raw as i64 as i32),
+            _ => ScalarValue::Int64(raw as i64),
+        }
+    }
+
+    /// Encode a single-scalar GroupKey as a raw u64 (when it matches raw_type).
+    fn scalar_to_raw(&self, key: &GroupKey) -> Option<RawKey> {
+        if key.values.len() != 1 {
+            return None;
+        }
+        match (&key.values[0], &self.raw_type) {
+            (ScalarValue::Null, _) => Some(RawKey::Null),
+            (ScalarValue::Int64(v), Some(DataType::Int64)) => Some(RawKey::Value(*v as u64)),
+            (ScalarValue::Date32(v), Some(DataType::Date32)) => {
+                Some(RawKey::Value(*v as i64 as u64))
+            }
+            _ => None,
+        }
+    }
+
+    /// Move any GroupKey-keyed entries that encode raw-compatible keys into the
+    /// raw maps so a group never lives in both maps at once.
+    fn normalize_raw(&mut self) {
+        if self.raw_type.is_none() || self.groups.is_empty() {
+            return;
+        }
+        let keys: Vec<GroupKey> = self.groups.keys().cloned().collect();
+        for key in keys {
+            match self.scalar_to_raw(&key) {
+                Some(RawKey::Value(raw)) => {
+                    let accs = self.groups.remove(&key).unwrap();
+                    match self.raw_groups.entry(raw) {
+                        hashbrown::hash_map::Entry::Occupied(mut e) => {
+                            for (a, b) in e.get_mut().iter_mut().zip(accs.iter()) {
+                                a.merge(b);
+                            }
+                        }
+                        hashbrown::hash_map::Entry::Vacant(v) => {
+                            v.insert(accs);
+                        }
+                    }
+                }
+                Some(RawKey::Null) => {
+                    let accs = self.groups.remove(&key).unwrap();
+                    match &mut self.raw_null {
+                        Some(existing) => {
+                            for (a, b) in existing.iter_mut().zip(accs.iter()) {
+                                a.merge(b);
+                            }
+                        }
+                        None => self.raw_null = Some(accs),
+                    }
+                }
+                None => {}
             }
         }
     }
@@ -1108,7 +1230,7 @@ impl AggregationState {
         } else {
             0
         };
-        perfect + self.groups.len()
+        perfect + self.groups.len() + self.raw_groups.len() + usize::from(self.raw_null.is_some())
     }
 
     /// Consume this state, sharding its groups by key hash into `p` buckets.
@@ -1118,10 +1240,30 @@ impl AggregationState {
         self.drain_perfect_to_hashmap();
         let mut shards: Vec<Vec<(GroupKey, Vec<AccumulatorState>)>> =
             (0..p).map(|_| Vec::new()).collect();
-        for (key, accs) in self.groups.drain() {
+        let mut push = |key: GroupKey, accs: Vec<AccumulatorState>| {
             let mut hasher = hashbrown::hash_map::DefaultHashBuilder::default().build_hasher();
             key.hash(&mut hasher);
             shards[(hasher.finish() as usize) % p].push((key, accs));
+        };
+        let raw_entries: Vec<(u64, Vec<AccumulatorState>)> = self.raw_groups.drain().collect();
+        for (raw, accs) in raw_entries {
+            push(
+                GroupKey {
+                    values: vec![self.raw_key_to_scalar(raw)],
+                },
+                accs,
+            );
+        }
+        if let Some(accs) = self.raw_null.take() {
+            push(
+                GroupKey {
+                    values: vec![ScalarValue::Null],
+                },
+                accs,
+            );
+        }
+        for (key, accs) in self.groups.drain() {
+            push(key, accs);
         }
         shards
     }
@@ -1140,6 +1282,19 @@ impl AggregationState {
 
     /// Merge another state into this one
     pub fn merge(&mut self, other: &AggregationState) {
+        // Raw-mode reconciliation: if either side holds raw-keyed groups, both
+        // sides must abandon the perfect-hash arrays (a key must never live in
+        // two places) and converge into the raw maps via normalize_raw below.
+        let raw_involved = self.raw_type.is_some() || other.raw_type.is_some();
+        if raw_involved {
+            if self.raw_type.is_none() {
+                self.raw_type = other.raw_type.clone();
+            }
+            if !self.overflowed {
+                self.drain_perfect_to_hashmap();
+                self.overflowed = true;
+            }
+        }
         // If other used perfect hash, merge into our perfect hash or groups
         if !other.overflowed && !other.perfect_accs.is_empty() {
             for (idx, other_accs) in other.perfect_accs.iter().enumerate() {
@@ -1258,6 +1413,34 @@ impl AggregationState {
             for (acc, other_acc) in accs.iter_mut().zip(other_accs.iter()) {
                 acc.merge(other_acc);
             }
+        }
+
+        // Merge raw-keyed entries
+        for (raw, other_accs) in &other.raw_groups {
+            match self.raw_groups.entry(*raw) {
+                hashbrown::hash_map::Entry::Occupied(mut e) => {
+                    for (a, b) in e.get_mut().iter_mut().zip(other_accs.iter()) {
+                        a.merge(b);
+                    }
+                }
+                hashbrown::hash_map::Entry::Vacant(v) => {
+                    v.insert(other_accs.clone());
+                }
+            }
+        }
+        if let Some(other_null) = &other.raw_null {
+            match &mut self.raw_null {
+                Some(existing) => {
+                    for (a, b) in existing.iter_mut().zip(other_null.iter()) {
+                        a.merge(b);
+                    }
+                }
+                None => self.raw_null = Some(other_null.clone()),
+            }
+        }
+        // Unify any GroupKey-shaped entries that encode raw keys
+        if raw_involved {
+            self.normalize_raw();
         }
     }
 
@@ -1398,7 +1581,18 @@ impl AggregationState {
     pub fn build_output(&self, schema: &SchemaRef) -> Result<RecordBatch> {
         let num_group_cols = schema.fields().len() - self.agg_funcs.len();
 
-        // Collect all groups from both perfect hash and HashMap
+        // Collect all groups from perfect hash, HashMap, and raw maps.
+        // Raw keys are materialized as GroupKeys once, here at output time.
+        let raw_keys: Vec<GroupKey> = self
+            .raw_groups
+            .keys()
+            .map(|raw| GroupKey {
+                values: vec![self.raw_key_to_scalar(*raw)],
+            })
+            .collect();
+        let null_key = GroupKey {
+            values: vec![ScalarValue::Null],
+        };
         let mut all_groups: Vec<(&GroupKey, &Vec<AccumulatorState>)> = Vec::new();
 
         // From perfect hash
@@ -1416,6 +1610,14 @@ impl AggregationState {
         // From HashMap
         for (key, accs) in &self.groups {
             all_groups.push((key, accs));
+        }
+
+        // From raw maps (raw_keys is ordered identically to the iteration here)
+        for (gk, (_raw, accs)) in raw_keys.iter().zip(self.raw_groups.iter()) {
+            all_groups.push((gk, accs));
+        }
+        if let Some(accs) = &self.raw_null {
+            all_groups.push((&null_key, accs));
         }
 
         let num_groups = all_groups.len();
