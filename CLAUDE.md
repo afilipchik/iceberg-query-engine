@@ -773,6 +773,11 @@ arrow RowFilter pushdown; vectorized SUBSTRING + single-pass string IN-lists;
 batch-level parallel Semi/Anti probes; GroupKeyReduction rule (FD-redundant
 group columns collapse to the unique key + ANY_VALUE).
 
+**Path to parity**: see `.claude/plans/PARITY-PLAN.md` — three scoped
+rewrites (dictionary-aware strings, fused join->aggregate, decode path)
+with designs, gates, and expected payoffs from recorded profiling. The
+round-by-round evidence log lives in the project memory file.
+
 **Remaining gaps**: Q10/Q11/Q15/Q22 exceed 10x native on small absolute times
 (fixed pipeline overhead, double scans, string-heavy group keys). Next levers
 in memory: FD-based group-by reduction (Q10's 7-column group key has a unique
