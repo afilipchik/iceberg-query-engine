@@ -50,6 +50,8 @@ impl Optimizer {
                 Arc::new(rules::FlattenDependentJoin),
                 // Decorrelate subqueries to regular joins
                 Arc::new(rules::SubqueryDecorrelation),
+                // Push Semi/Anti joins below inner joins so they filter early
+                Arc::new(rules::SemiJoinPushdown),
                 // Reorder joins after decorrelation
                 Arc::new(rules::JoinReorder::new()),
                 // Final predicate pushdown for any remaining opportunities
