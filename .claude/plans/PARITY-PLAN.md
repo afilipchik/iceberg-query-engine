@@ -46,7 +46,21 @@ processes dictionary columns without materializing strings.
 **Gates**: start with scans feeding MorselAggregateExec only (Q01/Q16);
 expand to join probe sides last. Cell-exact validation after each expansion.
 
-## Rewrite 2 — Late materialization / fused join→aggregate (est. −0.8 to −1.2s)
+## Rewrite 2 — Late materialization / fused join→aggregate (REVISED: est. −0.2 to −0.4s for 2a; 2b carries the rest)
+
+**Estimate correction (2026-08-09, after rounds 35–36)**: the original
+−0.8/−1.2s figure conflated the gather with must-do work. The fused
+streaming aggregate ALREADY consumes join batches without an intermediate
+materialization barrier; expressions must evaluate over joined data
+regardless; and the join output schemas are already projection-minimal.
+Fusing the aggregate into the probe (2a) saves only the joined-batch
+allocation + one channel hop — real but small. The larger remaining
+mechanism is DuckDB-style selection-vector execution (operators pass
+(batch, sel) pairs and never compact between filter/join stages), which
+is 2b generalized and a substantially bigger rewrite. Round 35 also
+proved the OUTPUT-repartitioning variant is a net loss — fuse INTO the
+probe or don't bother.
+
 
 **Evidence**: Q21's orders⋈lineitem join materializes ~30M gathered rows that
 feed straight into an aggregate; Q09 gathers 6.6M rows through three
