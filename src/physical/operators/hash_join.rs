@@ -113,30 +113,11 @@ impl VectorizedHashTable {
         // Size buckets to next_power_of_2(total_rows * 2) for ~50% load factor
         let bucket_count = (total_rows * 2).max(16).next_power_of_two();
         let mask = bucket_count - 1;
-        let mut heads: Vec<u32> = vec![u32::MAX; bucket_count];
+        // Inserts happen AFTER the mode decision below: building the hash
+        // layout and then rebuilding direct-address doubled build cost.
+        let mut heads: Vec<u32> = Vec::new();
         let mut next: Vec<u32> = Vec::with_capacity(total_rows);
         let mut entries: Vec<(u32, u32)> = Vec::with_capacity(total_rows);
-
-        // Insert all rows: prepend each entry to its bucket's chain
-        for (batch_idx, key_arrays) in build_key_arrays.iter().enumerate() {
-            if key_arrays.is_empty() {
-                continue;
-            }
-            let num_rows = batches[batch_idx].num_rows();
-            let hashes = vectorized_hash::hash_arrays(key_arrays, num_rows);
-
-            for row_idx in 0..num_rows {
-                // Skip rows with null keys
-                if vectorized_hash::has_null(key_arrays, row_idx) {
-                    continue;
-                }
-                let bucket = hashes[row_idx] as usize & mask;
-                let entry_idx = entries.len() as u32;
-                entries.push((batch_idx as u32, row_idx as u32));
-                next.push(heads[bucket]);
-                heads[bucket] = entry_idx;
-            }
-        }
 
         // Zero-copy i64 buffers for fast chain comparisons (columns first,
         // batches second). Only when EVERY key column in EVERY batch is Int64.
@@ -209,6 +190,27 @@ impl VectorizedHashTable {
                     next = dnext;
                     entries = dentries;
                     direct = Some((kmin, kmax));
+                }
+            }
+        }
+
+        if direct.is_none() {
+            heads = vec![u32::MAX; bucket_count];
+            for (batch_idx, key_arrays) in build_key_arrays.iter().enumerate() {
+                if key_arrays.is_empty() {
+                    continue;
+                }
+                let num_rows = batches[batch_idx].num_rows();
+                let hashes = vectorized_hash::hash_arrays(key_arrays, num_rows);
+                for row_idx in 0..num_rows {
+                    if vectorized_hash::has_null(key_arrays, row_idx) {
+                        continue;
+                    }
+                    let bucket = hashes[row_idx] as usize & mask;
+                    let entry_idx = entries.len() as u32;
+                    entries.push((batch_idx as u32, row_idx as u32));
+                    next.push(heads[bucket]);
+                    heads[bucket] = entry_idx;
                 }
             }
         }
