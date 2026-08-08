@@ -739,8 +739,8 @@ Based on the codebase structure, these appear to be planned but not fully implem
 ## TPC-H Benchmark Status (SF=10, 2026-08-08 night, 48G cgroup)
 
 Log: `logs/safe_benchmark_20260808_*.log`. Spec queries, spec-generator data.
-**22/22 pass; ~11.2s total vs native-table DuckDB 2.94s = 3.8x; 20/22 within 10x.**
-**Like-for-like (DuckDB reading the SAME parquet via views: 4.45s) = 2.5x.**
+**22/22 pass; 10.79s total vs native-table DuckDB 2.94s = 3.7x; 20/22 within 10x.**
+**Like-for-like (DuckDB reading the SAME parquet via views: 4.45s) = 2.4x.**
 Recent additions: deferred decoration joins (TopK before wide-column joins),
 band-aware AND selectivity, referential-integrity-gated join pruning,
 dense-range direct-address aggregation merge.
