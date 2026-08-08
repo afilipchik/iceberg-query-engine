@@ -95,6 +95,11 @@ impl EagerAggregation {
     }
 
     fn try_rewrite_agg_join(&self, agg: &AggregateNode, join: &JoinNode) -> Option<LogicalPlan> {
+        if join.join_type == JoinType::Left && join.filter.is_none() {
+            if let Some(p) = self.try_rewrite_left_count(agg, join) {
+                return Some(p);
+            }
+        }
         if join.join_type != JoinType::Inner || join.filter.is_some() {
             return None;
         }
@@ -105,6 +110,149 @@ impl EagerAggregation {
             }
         }
         None
+    }
+
+    /// LEFT-join count pushdown: `Aggregate(group=[k], COUNT(r_col)) over
+    /// LEFT Join(L, R) on k = fk` with k a unique null-free key of L becomes
+    ///
+    ///   Project [k, COALESCE(cnt, 0)]
+    ///     LEFT Join on k = fk
+    ///       L
+    ///       Aggregate(R, group=[fk], COUNT(r_col) AS cnt)
+    ///
+    /// Each L row yields exactly one group (k unique), so the outer
+    /// aggregate disappears entirely — Q13 counted 16.5M joined rows into
+    /// 1.5M groups when orders could be counted by o_custkey first.
+    fn try_rewrite_left_count(&self, agg: &AggregateNode, join: &JoinNode) -> Option<LogicalPlan> {
+        if agg.group_by.len() != 1 || agg.aggregates.len() != 1 || join.on.len() != 1 {
+            return None;
+        }
+        let Expr::Column(k) = &agg.group_by[0] else {
+            return None;
+        };
+        let (l_on, r_on) = &join.on[0];
+        let (Expr::Column(l_col), Expr::Column(r_col)) = (l_on, r_on) else {
+            return None;
+        };
+        // Group key must be the left join key and a unique key of the
+        // left-side base table
+        if l_col.name.to_lowercase() != k.name.to_lowercase() {
+            return None;
+        }
+        let l_schema = join.left.schema();
+        let r_schema = join.right.schema();
+        if !column_in_schema(l_col, &l_schema) || !column_in_schema(r_col, &r_schema) {
+            return None;
+        }
+        let l_table = {
+            let mut found = None;
+            for (t, st) in &self.table_stats {
+                if st.column_stats.contains_key(&k.name.to_lowercase()) {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(t.clone());
+                }
+            }
+            found?
+        };
+        {
+            let st = self.table_stats.get(&l_table)?;
+            let cs = st.column_stats.get(&k.name.to_lowercase())?;
+            if cs.null_count != Some(0)
+                || cs
+                    .ndv_est
+                    .map(|n| (n as usize) < st.row_count)
+                    .unwrap_or(true)
+            {
+                return None;
+            }
+        }
+        // The single aggregate must be COUNT over an R-side column
+        let (out_alias, count_arg) = match strip_alias(&agg.aggregates[0]) {
+            Expr::Aggregate {
+                func: AggregateFunction::Count,
+                args,
+                distinct: false,
+            } => match args.first() {
+                Some(Expr::Column(c)) if column_in_schema(c, &r_schema) => {
+                    let alias = match &agg.aggregates[0] {
+                        Expr::Alias { name, .. } => Some(name.clone()),
+                        _ => None,
+                    };
+                    (alias, c.clone())
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+
+        // Pre-aggregate R by its join key
+        let pre_fields = vec![
+            SchemaField {
+                name: r_col.name.clone(),
+                data_type: DataType::Int64,
+                nullable: true,
+                relation: None,
+            },
+            SchemaField {
+                name: "__ea_cnt".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+                relation: None,
+            },
+        ];
+        let pre_agg = LogicalPlan::Aggregate(AggregateNode {
+            input: join.right.clone(),
+            group_by: vec![r_on.clone()],
+            aggregates: vec![Expr::Alias {
+                expr: Box::new(Expr::Aggregate {
+                    func: AggregateFunction::Count,
+                    args: vec![Expr::Column(count_arg)],
+                    distinct: false,
+                }),
+                name: "__ea_cnt".to_string(),
+            }],
+            schema: PlanSchema::new(pre_fields),
+        });
+
+        let pre_schema = pre_agg.schema().clone();
+        let new_join_schema = join.left.schema().merge(&pre_schema);
+        let new_join = LogicalPlan::Join(JoinNode {
+            left: join.left.clone(),
+            right: Arc::new(pre_agg),
+            join_type: JoinType::Left,
+            on: join.on.clone(),
+            filter: None,
+            schema: new_join_schema,
+        });
+
+        // Restore the original aggregate output schema
+        let count_expr = Expr::ScalarFunc {
+            func: crate::planner::ScalarFunction::Coalesce,
+            args: vec![
+                Expr::Column(crate::planner::Column {
+                    relation: None,
+                    name: "__ea_cnt".to_string(),
+                }),
+                Expr::Literal(crate::planner::ScalarValue::Int64(0)),
+            ],
+        };
+        let count_out = match out_alias {
+            Some(name) => Expr::Alias {
+                expr: Box::new(count_expr),
+                name,
+            },
+            None => Expr::Alias {
+                expr: Box::new(count_expr),
+                name: agg.schema.fields()[1].name.clone(),
+            },
+        };
+        Some(LogicalPlan::Project(crate::planner::ProjectNode {
+            input: Arc::new(new_join),
+            exprs: vec![agg.group_by[0].clone(), count_out],
+            schema: agg.schema.clone(),
+        }))
     }
 
     fn try_rewrite_side(
