@@ -805,15 +805,52 @@ impl PhysicalPlanner {
                 // sorts) instead of materializing the whole table at plan time.
                 // Filtered scans keep the eager path (decoder-level RowFilter);
                 // prescanned shared tables use the cache below.
-                if node.filter.is_none() && !self.scan_cache.borrow().contains_key(&node.table_name)
-                {
+                // Filtered scans also stream when the predicate is fully
+                // decodable at the parquet layer (subquery-free, all columns
+                // resolve in the provider schema) — the decoder RowFilter
+                // applies it completely, so no FilterExec is needed and the
+                // scan can additionally take runtime join-key filters.
+                let filter_streams = node.filter.as_ref().is_none_or(|f| {
+                    if f.contains_subquery() {
+                        return false;
+                    }
+                    // Small tables keep the eager path: it already pushes a
+                    // decoder RowFilter and reads row groups with better
+                    // parallelism than a lazy stream (Q16's part scan lost
+                    // 180ms as a filtered stream).
+                    let big = provider
+                        .parquet_files()
+                        .map(|files| {
+                            files
+                                .iter()
+                                .filter_map(|f| std::fs::metadata(f).ok())
+                                .map(|m| m.len())
+                                .sum::<u64>()
+                                > 400_000_000
+                        })
+                        .unwrap_or(false);
+                    if !big {
+                        return false;
+                    }
+                    let mut cols: Vec<String> = Vec::new();
+                    crate::physical::morsel::collect_expr_columns(f, &mut cols);
+                    !cols.is_empty()
+                        && cols.iter().all(|c| {
+                            provider
+                                .schema()
+                                .fields()
+                                .iter()
+                                .any(|pf| pf.name().eq_ignore_ascii_case(c))
+                        })
+                });
+                if filter_streams && !self.scan_cache.borrow().contains_key(&node.table_name) {
                     if let Some(files) = provider.parquet_files() {
                         let exec = crate::physical::operators::StreamingParquetScanExec::try_new(
                             &node.table_name,
                             &files,
                             logical_schema.clone(),
                             node.projection.clone(),
-                            None,
+                            node.filter.as_ref(),
                             &provider.schema(),
                         )?;
                         let cfg = exec.runtime_filter_config();
@@ -1032,6 +1069,14 @@ impl PhysicalPlanner {
                         }
                         let key = Arc::as_ptr(&probe_leaf) as *const () as usize;
                         let scans = self.streaming_scans.borrow();
+                        if std::env::var("RT_DEBUG").is_ok() && !scans.contains_key(&key) {
+                            eprintln!(
+                                "[rt] no link: jt={:?} probe_leaf={} col={}",
+                                node.join_type,
+                                probe_leaf.name(),
+                                c.name
+                            );
+                        }
                         scans.get(&key).and_then(|(cfg, pschema)| {
                             pschema
                                 .fields()

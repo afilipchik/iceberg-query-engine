@@ -50,6 +50,8 @@ pub struct StreamingParquetScanExec {
     batch_size: usize,
     /// Runtime filter configuration (written by the planner when a join links)
     runtime_filter: RuntimeFilterConfig,
+    /// Static predicate applied at the decoder (expr, provider column indices)
+    filter_spec: Option<(Expr, Vec<usize>)>,
 }
 
 impl fmt::Debug for StreamingParquetScanExec {
@@ -80,6 +82,31 @@ impl StreamingParquetScanExec {
     ) -> Result<Self> {
         let table_name = table_name.into();
         let batch_size = 8_192;
+
+        // Static predicate pushdown: decode predicate columns first and
+        // materialize the rest only for matching rows. Requires every
+        // referenced column to resolve in the provider schema.
+        let filter_spec: Option<(Expr, Vec<usize>)> = filter.and_then(|expr| {
+            if expr.contains_subquery() {
+                return None;
+            }
+            let mut cols: Vec<String> = Vec::new();
+            crate::physical::morsel::collect_expr_columns(expr, &mut cols);
+            if cols.is_empty() {
+                return None;
+            }
+            let mut indices = Vec::with_capacity(cols.len());
+            for c in &cols {
+                let idx = provider_schema
+                    .fields()
+                    .iter()
+                    .position(|f| f.name().eq_ignore_ascii_case(c))?;
+                if !indices.contains(&idx) {
+                    indices.push(idx);
+                }
+            }
+            Some((expr.clone(), indices))
+        });
 
         // Discover matching row groups from all files
         let mut all_work = Vec::new();
@@ -128,6 +155,7 @@ impl StreamingParquetScanExec {
             partitioned_work,
             batch_size,
             runtime_filter: RuntimeFilterConfig::default(),
+            filter_spec,
         })
     }
 
@@ -161,6 +189,7 @@ impl PhysicalOperator for StreamingParquetScanExec {
         // its build side drains — a scan that started earlier (semi/anti
         // probes drained concurrently) would otherwise never see it.
         let runtime_cfg = std::sync::Arc::clone(&self.runtime_filter);
+        let filter_spec = std::sync::Arc::new(self.filter_spec.clone());
 
         // Create a stream that lazily reads row groups
         let stream = futures::stream::unfold(
@@ -170,9 +199,10 @@ impl PhysicalOperator for StreamingParquetScanExec {
                 batch_size,
                 schema,
                 None::<parquet::arrow::arrow_reader::ParquetRecordBatchReader>,
-                runtime_cfg,
+                (runtime_cfg, filter_spec),
             ),
-            |(mut work_iter, projection, batch_size, schema, current_reader, runtime_cfg)| async move {
+            |(mut work_iter, projection, batch_size, schema, current_reader, rt_state)| async move {
+                let (runtime_cfg, filter_spec) = rt_state;
                 // Try to get next batch from current reader
                 if let Some(mut reader) = current_reader {
                     match reader.next() {
@@ -196,14 +226,21 @@ impl PhysicalOperator for StreamingParquetScanExec {
                                     batch_size,
                                     schema,
                                     Some(reader),
-                                    runtime_cfg,
+                                    (runtime_cfg, filter_spec),
                                 ),
                             ));
                         }
                         Some(Err(e)) => {
                             return Some((
                                 Err(QueryError::Arrow(e)),
-                                (work_iter, projection, batch_size, schema, None, runtime_cfg),
+                                (
+                                    work_iter,
+                                    projection,
+                                    batch_size,
+                                    schema,
+                                    None,
+                                    (runtime_cfg, filter_spec),
+                                ),
                             ));
                         }
                         None => {
@@ -219,7 +256,14 @@ impl PhysicalOperator for StreamingParquetScanExec {
                     Err(e) => {
                         return Some((
                             Err(QueryError::Io(e)),
-                            (work_iter, projection, batch_size, schema, None, runtime_cfg),
+                            (
+                                work_iter,
+                                projection,
+                                batch_size,
+                                schema,
+                                None,
+                                (runtime_cfg, filter_spec),
+                            ),
                         ))
                     }
                 };
@@ -228,7 +272,14 @@ impl PhysicalOperator for StreamingParquetScanExec {
                     Err(e) => {
                         return Some((
                             Err(QueryError::Parquet(e)),
-                            (work_iter, projection, batch_size, schema, None, runtime_cfg),
+                            (
+                                work_iter,
+                                projection,
+                                batch_size,
+                                schema,
+                                None,
+                                (runtime_cfg, filter_spec),
+                            ),
                         ))
                     }
                 };
@@ -242,35 +293,66 @@ impl PhysicalOperator for StreamingParquetScanExec {
                     .lock()
                     .as_ref()
                     .and_then(|(idx, slot)| slot.lock().clone().map(|set| (*idx, set)));
-                let builder = if let Some((col_idx, set)) = &runtime {
+                let mut predicates: Vec<Box<dyn parquet::arrow::arrow_reader::ArrowPredicate>> =
+                    Vec::new();
+                if let Some((expr, indices)) = filter_spec.as_ref() {
+                    let mask = parquet::arrow::ProjectionMask::roots(
+                        builder.parquet_schema(),
+                        indices.iter().copied(),
+                    );
+                    let expr = expr.clone();
+                    predicates.push(Box::new(
+                        parquet::arrow::arrow_reader::ArrowPredicateFn::new(
+                            mask,
+                            move |batch: RecordBatch| {
+                                let arr = crate::physical::operators::evaluate_expr(&batch, &expr)
+                                    .map_err(|e| {
+                                        arrow::error::ArrowError::ComputeError(e.to_string())
+                                    })?;
+                                arr.as_any()
+                                    .downcast_ref::<arrow::array::BooleanArray>()
+                                    .cloned()
+                                    .ok_or_else(|| {
+                                        arrow::error::ArrowError::ComputeError(
+                                            "scan filter did not evaluate to boolean".into(),
+                                        )
+                                    })
+                            },
+                        ),
+                    ));
+                }
+                if let Some((col_idx, set)) = &runtime {
                     let mask =
                         parquet::arrow::ProjectionMask::roots(builder.parquet_schema(), [*col_idx]);
                     let set = std::sync::Arc::clone(set);
-                    let pred = parquet::arrow::arrow_reader::ArrowPredicateFn::new(
-                        mask,
-                        move |batch: RecordBatch| {
-                            let arr = batch
-                                .column(0)
-                                .as_any()
-                                .downcast_ref::<arrow::array::Int64Array>()
-                                .ok_or_else(|| {
-                                    arrow::error::ArrowError::ComputeError(
-                                        "runtime filter column is not Int64".into(),
-                                    )
-                                })?;
-                            use arrow::array::Array;
-                            let mut b = arrow::array::BooleanBuilder::with_capacity(arr.len());
-                            for i in 0..arr.len() {
-                                b.append_value(!arr.is_null(i) && set.contains(&arr.value(i)));
-                            }
-                            Ok(b.finish())
-                        },
-                    );
-                    builder.with_row_filter(parquet::arrow::arrow_reader::RowFilter::new(vec![
-                        Box::new(pred),
-                    ]))
+                    predicates.push(Box::new(
+                        parquet::arrow::arrow_reader::ArrowPredicateFn::new(
+                            mask,
+                            move |batch: RecordBatch| {
+                                let arr = batch
+                                    .column(0)
+                                    .as_any()
+                                    .downcast_ref::<arrow::array::Int64Array>()
+                                    .ok_or_else(|| {
+                                        arrow::error::ArrowError::ComputeError(
+                                            "runtime filter column is not Int64".into(),
+                                        )
+                                    })?;
+                                use arrow::array::Array;
+                                let mut b = arrow::array::BooleanBuilder::with_capacity(arr.len());
+                                for i in 0..arr.len() {
+                                    b.append_value(!arr.is_null(i) && set.contains(&arr.value(i)));
+                                }
+                                Ok(b.finish())
+                            },
+                        ),
+                    ));
+                }
+                let builder = if predicates.is_empty() {
+                    builder
                 } else {
                     builder
+                        .with_row_filter(parquet::arrow::arrow_reader::RowFilter::new(predicates))
                 };
 
                 let builder = if let Some(ref indices) = projection {
@@ -288,7 +370,14 @@ impl PhysicalOperator for StreamingParquetScanExec {
                     Err(e) => {
                         return Some((
                             Err(QueryError::Parquet(e)),
-                            (work_iter, projection, batch_size, schema, None, runtime_cfg),
+                            (
+                                work_iter,
+                                projection,
+                                batch_size,
+                                schema,
+                                None,
+                                (runtime_cfg, filter_spec),
+                            ),
                         ))
                     }
                 };
@@ -313,13 +402,20 @@ impl PhysicalOperator for StreamingParquetScanExec {
                                 batch_size,
                                 schema,
                                 Some(reader),
-                                runtime_cfg,
+                                (runtime_cfg, filter_spec),
                             ),
                         ))
                     }
                     Some(Err(e)) => Some((
                         Err(QueryError::Arrow(e)),
-                        (work_iter, projection, batch_size, schema, None, runtime_cfg),
+                        (
+                            work_iter,
+                            projection,
+                            batch_size,
+                            schema,
+                            None,
+                            (runtime_cfg, filter_spec),
+                        ),
                     )),
                     None => {
                         // Empty row group, try next (recursive via unfold)
