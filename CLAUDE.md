@@ -738,38 +738,38 @@ Based on the codebase structure, these appear to be planned but not fully implem
 
 ## TPC-H Benchmark Status (SF=10, 2026-08-08, 48G cgroup)
 
-Log: `logs/safe_benchmark_20260808_011334.log`. Spec queries, spec-generator data.
-**20/22 complete, 9 within the 10x rule.** Total 32.3s vs DuckDB 2.94s.
-(24h earlier this was: 10/22 complete, only Q01 within 10x, Q05/Q07/Q09/Q18
-never finishing at 1000x budgets.)
+Log: `logs/safe_benchmark_20260808_025723.log`. Spec queries, spec-generator data.
+**22/22 pass the benchmark runner; total 23.8s vs native-table DuckDB 2.94s (8.0x).**
+Like-for-like (DuckDB reading the SAME parquet files via views: 4.49s total):
+**5.2x aggregate, every query within 10x except Q11.**
 
-| Query | Engine | Ratio | | Query | Engine | Ratio |
+| Query | Engine | vs native | | Query | Engine | vs native |
 |-------|--------|-------|-|-------|--------|-------|
-| Q01 | 624ms | 5.9x | | Q12 | 688ms | 7.9x |
-| Q02 | 174ms | 7.9x | | Q13 | 3.9s | 39.2x |
-| Q03 | 1.0s | 12.2x | | Q14 | 339ms | 8.6x |
-| Q04 | 491ms | 8.6x | | Q15 | 750ms | 24.1x |
-| Q05 | 883ms | 18.4x | | Q16 | 325ms | 8.3x |
-| Q06 | 313ms | 13.0x | | Q17 | 2.8s | 32.5x |
-| Q07 | 1.1s | 14.8x | | Q18 | 6.9s | TIMEOUT (5s budget) |
-| Q08 | 1.2s | 16.2x | | Q19 | 633ms | 7.1x |
-| Q09 | 12.2s | 9.7x | | Q20 | >5s | TIMEOUT |
-| Q10 | 2.3s | 24.9x | | Q21 | 1.7s | 7.8x |
-| Q11 | 453ms | 32.3x | | Q22 | 527ms | 15.4x |
+| Q01 | ~480ms | 4.5x | | Q12 | 297ms | 3.4x |
+| Q02 | 185ms | 8.4x | | Q13 | 1.00s | 10.1x |
+| Q03 | 602ms | 7.3x | | Q14 | 174ms | 4.4x |
+| Q04 | 532ms | 9.3x | | Q15 | 423ms | 13.6x |
+| Q05 | 946ms | 19.7x | | Q16 | 358ms | 9.1x |
+| Q06 | 178ms | 7.3x | | Q17 | 737ms | 8.4x |
+| Q07 | 484ms | 6.7x | | Q18 | 3.64s | 15.6x |
+| Q08 | 1.10s | 15.4x | | Q19 | 366ms | 4.1x |
+| Q09 | 6.68s | 5.3x | | Q20 | 1.59s | 9.9x |
+| Q10 | 1.16s | 12.7x | | Q21 | 1.81s | 8.5x |
+| Q11 | 435ms | 31.0x | | Q22 | 613ms | 18.0x |
 
-**What fixed the never-finishers (2026-08-08):** build side concatenated once
-in the join build cache (gather_column had re-concatenated the whole build side
-per output batch per column); DPsize cost-based join ordering from footer stats
-(both reorder paths); physical planner no longer re-swaps Inner join sides;
-parallel partitioned merge for high-cardinality morsel aggregation.
+**What got the engine here (2026-08-08)**: build side concatenated once in the
+join build cache; DPsize CBO from footer stats (all reorder paths, incl.
+single joins); planner trusts optimizer orientation; morsel-core parallel
+aggregation in HashAggregateExec + parallel partitioned merge; SemiJoinPushdown
+rule; DeriveOrPredicates rule (OR-implied IN-lists); arrow RowFilter pushdown
+into parquet decode; raw u64 group keys for single int group columns.
 
-**Remaining bottleneck order** (see `.claude/plans/ROADMAP.md`):
-1. Q18 (6.9s vs 5s): Semi join applies after all inner joins — needs semi-join
-   pushdown to the orders side. Q20: correlated subquery planning (Phase 4).
-2. 24-40x band Q10/Q11/Q13/Q15/Q17 — parallel post-join aggregation
-   (HashAggregateExec path), DelimJoin for Q17-style scalar subqueries.
-3. 12-18x band Q03/Q05/Q06/Q07/Q08/Q22 — post-join pipeline parallelism,
-   scan speed.
+**Remaining gaps (all architectural, see ROADMAP)**: queries >10x vs the
+native-table baseline are scan/materialization-bound (we re-read parquet and
+materialize between stages; DuckDB benchmarks ran on its native storage and
+streams morsels through operators). Q11 additionally runs its HAVING-threshold
+scalar as a second full pipeline; Q09's data has a 4x lineitem-partsupp fanout
+(generator gives partsupp duplicate (partkey,suppkey) pairs — DuckDB-verified).
 
 ## Recently Implemented Features
 
