@@ -45,6 +45,8 @@ pub struct MorselAggregateExec {
     schema: SchemaRef,
     /// Input schema from Parquet files
     input_schema: SchemaRef,
+    /// HAVING predicate applied per output batch (references output columns)
+    post_filter: Option<Expr>,
 }
 
 impl fmt::Debug for MorselAggregateExec {
@@ -76,7 +78,14 @@ impl MorselAggregateExec {
             aggregates,
             schema,
             input_schema,
+            post_filter: None,
         }
+    }
+
+    /// Attach a HAVING predicate applied to output batches before returning.
+    pub fn with_post_filter(mut self, post_filter: Option<Expr>) -> Self {
+        self.post_filter = post_filter;
+        self
     }
 }
 
@@ -189,12 +198,15 @@ impl PhysicalOperator for MorselAggregateExec {
 
         // Shared merge: parallel shard merge above 64K groups (raw-u64 pipeline
         // for single integer group columns), sequential fold below.
-        let batches = crate::physical::morsel_agg::merge_states_to_batches(
+        let mut batches = crate::physical::morsel_agg::merge_states_to_batches(
             states,
             &agg_funcs,
             &input_types,
             &output_schema,
         )?;
+        if let Some(pred) = &self.post_filter {
+            batches = crate::physical::operators::filter_batches(batches, pred)?;
+        }
         Ok(Box::pin(stream::iter(batches.into_iter().map(Ok))))
     }
 

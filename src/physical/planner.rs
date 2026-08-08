@@ -37,6 +37,10 @@ pub struct PhysicalPlanner {
     /// Key is the raw pointer of the Arc<LogicalPlan>, value is materialized batches.
     /// Shared via Arc so SubqueryExecutor planners can access the same cache.
     cte_cache: SharedCteCache,
+    /// HAVING-style predicate handed from a Filter node to its immediate
+    /// Aggregate child so the aggregate can filter per shard BEFORE
+    /// materializing output arrays (Q18 builds 650K rows instead of 15M).
+    pending_agg_filter: RefCell<Option<Expr>>,
 }
 
 impl Default for PhysicalPlanner {
@@ -55,6 +59,7 @@ impl PhysicalPlanner {
             config: None,
             scan_cache: RefCell::new(HashMap::new()),
             cte_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            pending_agg_filter: RefCell::new(None),
         }
     }
 
@@ -67,6 +72,7 @@ impl PhysicalPlanner {
             config: Some(config),
             scan_cache: RefCell::new(HashMap::new()),
             cte_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            pending_agg_filter: RefCell::new(None),
         }
     }
 
@@ -1007,7 +1013,8 @@ impl PhysicalPlanner {
                             node.group_by.clone(),
                             aggregates,
                             schema,
-                        );
+                        )
+                        .with_post_filter(self.pending_agg_filter.borrow_mut().take());
                         return Ok(Arc::new(morsel_agg));
                     }
                 }
@@ -1035,7 +1042,8 @@ impl PhysicalPlanner {
                         schema,
                         self.memory_pool.clone().unwrap(),
                         self.config.clone().unwrap(),
-                    );
+                    )
+                    .with_post_filter(self.pending_agg_filter.borrow_mut().take());
                     Ok(Arc::new(agg))
                 } else {
                     let agg =
@@ -1265,6 +1273,22 @@ impl PhysicalPlanner {
                 Ok(Arc::new(delim_get))
             }
             LogicalPlan::Filter(node) => {
+                // HAVING pushdown: a subquery-free predicate directly above an
+                // Aggregate filters per shard inside the aggregate instead of
+                // materializing every group first.
+                if matches!(&*node.input, LogicalPlan::Aggregate(_))
+                    && !node.predicate.contains_subquery()
+                {
+                    *self.pending_agg_filter.borrow_mut() = Some(node.predicate.clone());
+                    let agg =
+                        self.create_physical_plan_with_delim_state(&node.input, delim_state)?;
+                    if self.pending_agg_filter.borrow_mut().take().is_none() {
+                        // consumed by the aggregate operator
+                        return Ok(agg);
+                    }
+                    let filter = self.create_filter(agg, node.predicate.clone());
+                    return Ok(Arc::new(filter));
+                }
                 let input = self.create_physical_plan_with_delim_state(&node.input, delim_state)?;
                 let filter = self.create_filter(input, node.predicate.clone());
                 Ok(Arc::new(filter))

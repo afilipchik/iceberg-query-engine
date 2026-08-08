@@ -5959,3 +5959,33 @@ mod tests {
         assert_eq!(results[0].num_rows(), 3); // 20, 30, 40
     }
 }
+
+/// Apply a boolean predicate to a set of batches (vectorized), dropping
+/// non-matching rows and empty batches. Used for HAVING pushdown into
+/// aggregation operators.
+pub fn filter_batches(
+    batches: Vec<RecordBatch>,
+    predicate: &crate::planner::Expr,
+) -> Result<Vec<RecordBatch>> {
+    let mut out = Vec::with_capacity(batches.len());
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let mask = evaluate_expr(&batch, predicate)?;
+        let mask = mask
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .ok_or_else(|| {
+                crate::error::QueryError::Execution(
+                    "HAVING predicate did not evaluate to boolean".into(),
+                )
+            })?;
+        let filtered = arrow::compute::filter_record_batch(&batch, mask)
+            .map_err(|e| crate::error::QueryError::Execution(e.to_string()))?;
+        if filtered.num_rows() > 0 {
+            out.push(filtered);
+        }
+    }
+    Ok(out)
+}

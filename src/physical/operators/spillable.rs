@@ -612,6 +612,8 @@ pub struct SpillableHashAggregateExec {
     schema: SchemaRef,
     memory_pool: SharedMemoryPool,
     config: ExecutionConfig,
+    /// HAVING predicate applied per output batch (references output columns)
+    post_filter: Option<Expr>,
 }
 
 /// Aggregate expression with function and input
@@ -648,7 +650,14 @@ impl SpillableHashAggregateExec {
             schema,
             memory_pool,
             config,
+            post_filter: None,
         }
+    }
+
+    /// Attach a HAVING predicate applied to output batches before returning.
+    pub fn with_post_filter(mut self, post_filter: Option<Expr>) -> Self {
+        self.post_filter = post_filter;
+        self
     }
 
     /// The fused streaming path supports the simple accumulator functions the
@@ -780,7 +789,10 @@ impl SpillableHashAggregateExec {
             return Ok(None);
         }
 
-        let batches = merge_states_to_batches(states, &agg_funcs, &input_types, &self.schema)?;
+        let mut batches = merge_states_to_batches(states, &agg_funcs, &input_types, &self.schema)?;
+        if let Some(pred) = &self.post_filter {
+            batches = crate::physical::operators::filter_batches(batches, pred)?;
+        }
         Ok(Some(Box::pin(stream::iter(batches.into_iter().map(Ok)))))
     }
 }
@@ -873,7 +885,13 @@ impl PhysicalOperator for SpillableHashAggregateExec {
                 hash_aggs,
                 self.schema.clone(),
             );
-            return hash_agg.execute(0).await;
+            let stream = hash_agg.execute(0).await?;
+            if let Some(pred) = &self.post_filter {
+                let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                let batches = crate::physical::operators::filter_batches(batches, pred)?;
+                return Ok(Box::pin(stream::iter(batches.into_iter().map(Ok))));
+            }
+            return Ok(stream);
         }
 
         // Data exceeds memory — use spillable aggregation path
@@ -950,6 +968,11 @@ impl PhysicalOperator for SpillableHashAggregateExec {
             return Ok(Box::pin(stream::once(async { Ok(empty_batch) })));
         }
 
+        let all_results = if let Some(pred) = &self.post_filter {
+            crate::physical::operators::filter_batches(all_results, pred)?
+        } else {
+            all_results
+        };
         Ok(Box::pin(stream::iter(all_results.into_iter().map(Ok))))
     }
 

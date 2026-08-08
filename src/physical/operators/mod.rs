@@ -18,7 +18,7 @@ mod union;
 pub mod vectorized_hash;
 
 pub use delim_join::{DelimGetExec, DelimJoinExec, DelimState};
-pub use filter::{evaluate_expr, FilterExec};
+pub use filter::{evaluate_expr, filter_batches, FilterExec};
 pub use hash_agg::{AggregateExpr, HashAggregateExec};
 pub use hash_join::HashJoinExec;
 pub use iceberg::{IcebergScanExec, PartitionFilter};
