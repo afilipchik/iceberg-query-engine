@@ -22,7 +22,35 @@ fn main() {
     let sql =
         std::env::var("SQL").unwrap_or_else(|_| tpch::get_query_for_sf(qnum, sf).expect("query"));
     match ctx.optimized_plan(&sql) {
-        Ok(p) => println!("{}", p),
+        Ok(p) => {
+            println!("{}", p);
+            print_subqueries(&p);
+        }
         Err(e) => println!("ERROR: {}", e),
+    }
+}
+
+fn print_subqueries(plan: &query_engine::LogicalPlan) {
+    use query_engine::planner::Expr;
+    fn walk_expr(e: &Expr) {
+        match e {
+            Expr::ScalarSubquery(p) => {
+                println!("--- scalar subquery plan ---\n{}", p);
+                print_subqueries(p);
+            }
+            Expr::BinaryExpr { left, right, .. } => {
+                walk_expr(left);
+                walk_expr(right);
+            }
+            Expr::UnaryExpr { expr, .. } => walk_expr(expr),
+            Expr::Alias { expr, .. } => walk_expr(expr),
+            _ => {}
+        }
+    }
+    if let query_engine::LogicalPlan::Filter(node) = plan {
+        walk_expr(&node.predicate);
+    }
+    for child in plan.children() {
+        print_subqueries(child);
     }
 }

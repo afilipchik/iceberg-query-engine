@@ -15,11 +15,124 @@ impl OptimizerRule for PredicatePushdown {
     }
 
     fn optimize(&self, plan: &LogicalPlan) -> Result<LogicalPlan> {
-        self.pushdown(plan, vec![])
+        // First push predicates inside uncorrelated subquery plans (their own
+        // filters otherwise stay stuck above their joins: Q11's threshold
+        // subquery probed all 100K suppliers because n_name = 'GERMANY' never
+        // reached its nation scan). Correlated subqueries are left alone —
+        // outer references make naive pushdown unsafe.
+        let plan = self.optimize_subplans(plan)?;
+        self.pushdown(&plan, vec![])
     }
 }
 
 impl PredicatePushdown {
+    /// Recursively rewrite subquery plans held inside expressions.
+    fn optimize_subplans(&self, plan: &LogicalPlan) -> Result<LogicalPlan> {
+        use std::sync::Arc;
+        let children: Vec<Arc<LogicalPlan>> = plan
+            .children()
+            .iter()
+            .map(|c| self.optimize_subplans(c).map(Arc::new))
+            .collect::<Result<Vec<_>>>()?;
+        let plan = if children.is_empty() {
+            plan.clone()
+        } else {
+            plan.with_new_children(children)
+        };
+
+        match &plan {
+            LogicalPlan::Filter(node) => {
+                let predicate = self.optimize_subqueries_in_expr(&node.predicate)?;
+                Ok(LogicalPlan::Filter(crate::planner::FilterNode {
+                    input: Arc::clone(&node.input),
+                    predicate,
+                }))
+            }
+            LogicalPlan::Project(node) => {
+                let exprs = node
+                    .exprs
+                    .iter()
+                    .map(|e| self.optimize_subqueries_in_expr(e))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(LogicalPlan::Project(crate::planner::ProjectNode {
+                    input: Arc::clone(&node.input),
+                    exprs,
+                    schema: node.schema.clone(),
+                }))
+            }
+            _ => Ok(plan),
+        }
+    }
+
+    /// Outer references excluding synthesized aggregate-output names
+    /// (relation-less columns like "SUM(x * y)" are the subquery's own
+    /// aggregate results, not references to outer tables).
+    fn real_outer_refs(&self, subplan: &LogicalPlan) -> HashSet<Column> {
+        let mut outer = HashSet::new();
+        self.extract_outer_columns_from_subquery(subplan, &mut outer);
+        outer
+            .into_iter()
+            .filter(|c| !(c.relation.is_none() && c.name.contains('(')))
+            .collect()
+    }
+
+    /// Apply pushdown inside uncorrelated subquery plans within an expression.
+    fn optimize_subqueries_in_expr(&self, expr: &Expr) -> Result<Expr> {
+        use std::sync::Arc;
+        Ok(match expr {
+            Expr::ScalarSubquery(subplan) => {
+                let outer = self.real_outer_refs(subplan);
+                if std::env::var("PP_DEBUG").is_ok() {
+                    eprintln!("[pp] scalar subquery outer refs: {:?}", outer);
+                }
+                if outer.is_empty() {
+                    Expr::ScalarSubquery(Arc::new(self.pushdown(subplan, vec![])?))
+                } else {
+                    expr.clone()
+                }
+            }
+            Expr::Exists { subquery, negated } => {
+                if self.real_outer_refs(subquery).is_empty() {
+                    Expr::Exists {
+                        subquery: Arc::new(self.pushdown(subquery, vec![])?),
+                        negated: *negated,
+                    }
+                } else {
+                    expr.clone()
+                }
+            }
+            Expr::InSubquery {
+                expr: inner,
+                subquery,
+                negated,
+            } => {
+                if self.real_outer_refs(subquery).is_empty() {
+                    Expr::InSubquery {
+                        expr: inner.clone(),
+                        subquery: Arc::new(self.pushdown(subquery, vec![])?),
+                        negated: *negated,
+                    }
+                } else {
+                    expr.clone()
+                }
+            }
+            Expr::BinaryExpr { left, op, right } => Expr::BinaryExpr {
+                left: Box::new(self.optimize_subqueries_in_expr(left)?),
+                op: *op,
+                right: Box::new(self.optimize_subqueries_in_expr(right)?),
+            },
+            Expr::UnaryExpr { op, expr: inner } => Expr::UnaryExpr {
+                op: *op,
+                expr: Box::new(self.optimize_subqueries_in_expr(inner)?),
+            },
+            Expr::Alias { expr: inner, name } => Expr::Alias {
+                expr: Box::new(self.optimize_subqueries_in_expr(inner)?),
+                name: name.clone(),
+            },
+            _ => expr.clone(),
+        })
+    }
+
     fn pushdown(&self, plan: &LogicalPlan, predicates: Vec<Expr>) -> Result<LogicalPlan> {
         match plan {
             LogicalPlan::Filter(node) => {
