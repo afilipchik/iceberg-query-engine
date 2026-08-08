@@ -383,8 +383,12 @@ impl JoinReorder {
 
     /// Check if this join tree needs reordering (has cross joins or multi-way inner joins)
     fn needs_reordering(&self, plan: &LogicalPlan) -> bool {
-        // A tree with 3+ tables (2+ joins) in Cross/Inner chain benefits from reordering
-        self.count_flattenable_joins(plan) >= 2
+        // Even a single Inner join goes through the enumerator: it decides the
+        // BUILD side (smaller estimated side goes left), and the physical
+        // planner deliberately trusts that orientation instead of re-guessing.
+        // Without this, `FROM lineitem, part WHERE ...` kept SQL order and
+        // built a 60M-row hash table probed by 30K rows (Q17).
+        self.count_flattenable_joins(plan) >= 1
     }
 
     /// Count how many flattenable (Cross/Inner) joins exist in a chain.
@@ -412,7 +416,13 @@ impl JoinReorder {
         self.extract_join_conditions(&filter.predicate, &mut all_conditions);
 
         // Then collect from the join tree
-        self.collect_relations_and_conditions(&filter.input, &mut relations, &mut all_conditions);
+        let mut extra_join_filters: Vec<Expr> = Vec::new();
+        self.collect_relations_and_conditions(
+            &filter.input,
+            &mut relations,
+            &mut all_conditions,
+            &mut extra_join_filters,
+        );
 
         if relations.len() <= 1 {
             // Not a multi-table join, just recurse normally
@@ -431,13 +441,22 @@ impl JoinReorder {
         let remaining_filter =
             self.rebuild_filter_without_join_conditions(&filter.predicate, &used_conditions);
 
+        let mut plan = join_result;
+        // Join-node filter expressions collected during flattening must be
+        // re-applied — dropping them turns joins into cross products.
+        for f in &extra_join_filters {
+            plan = LogicalPlan::Filter(crate::planner::FilterNode {
+                input: Arc::new(plan),
+                predicate: f.clone(),
+            });
+        }
         if let Some(remaining) = remaining_filter {
             Ok(LogicalPlan::Filter(crate::planner::FilterNode {
-                input: Arc::new(join_result),
+                input: Arc::new(plan),
                 predicate: remaining,
             }))
         } else {
-            Ok(join_result)
+            Ok(plan)
         }
     }
 
@@ -1102,7 +1121,13 @@ impl JoinReorder {
         let mut relations: Vec<JoinRelation> = Vec::new();
         let mut all_conditions: Vec<(Expr, Expr)> = Vec::new();
 
-        self.collect_relations_and_conditions(plan, &mut relations, &mut all_conditions);
+        let mut extra_join_filters: Vec<Expr> = Vec::new();
+        self.collect_relations_and_conditions(
+            plan,
+            &mut relations,
+            &mut all_conditions,
+            &mut extra_join_filters,
+        );
 
         if relations.len() <= 1 {
             return Ok(plan.clone());
@@ -1182,6 +1207,12 @@ impl JoinReorder {
                             op: BinaryOp::Eq,
                             right: Box::new(r.clone()),
                         },
+                    });
+                }
+                for f in &extra_join_filters {
+                    plan = LogicalPlan::Filter(crate::planner::FilterNode {
+                        input: Arc::new(plan),
+                        predicate: f.clone(),
                     });
                 }
                 return Ok(plan);
@@ -1360,7 +1391,27 @@ impl JoinReorder {
             }
         }
 
-        Ok(result_plan.unwrap())
+        // Re-apply conditions that didn't become join edges (e.g. expression
+        // conditions like `a.n + 1 = b.n`, or ambiguous self-join columns).
+        // Dropping them silently turns a join into a cross product.
+        let mut plan = result_plan.unwrap();
+        for (l, r) in &remaining_conditions {
+            plan = LogicalPlan::Filter(crate::planner::FilterNode {
+                input: Arc::new(plan),
+                predicate: Expr::BinaryExpr {
+                    left: Box::new(l.clone()),
+                    op: BinaryOp::Eq,
+                    right: Box::new(r.clone()),
+                },
+            });
+        }
+        for f in &extra_join_filters {
+            plan = LogicalPlan::Filter(crate::planner::FilterNode {
+                input: Arc::new(plan),
+                predicate: f.clone(),
+            });
+        }
+        Ok(plan)
     }
 
     /// Collect all base relations and join conditions from a join tree
@@ -1369,6 +1420,7 @@ impl JoinReorder {
         plan: &LogicalPlan,
         relations: &mut Vec<JoinRelation>,
         conditions: &mut Vec<(Expr, Expr)>,
+        extra_filters: &mut Vec<Expr>,
     ) {
         match plan {
             LogicalPlan::Join(node) => {
@@ -1377,10 +1429,26 @@ impl JoinReorder {
                 if node.join_type == JoinType::Cross || node.join_type == JoinType::Inner {
                     // Collect conditions from this join
                     conditions.extend(node.on.iter().cloned());
+                    // A join filter (e.g. expression conditions like a.n + 1 = b.n
+                    // that the binder can't split into an equi pair) must survive
+                    // flattening or the join silently becomes a cross product.
+                    if let Some(f) = &node.filter {
+                        extra_filters.push(f.clone());
+                    }
 
                     // Recursively collect from children
-                    self.collect_relations_and_conditions(&node.left, relations, conditions);
-                    self.collect_relations_and_conditions(&node.right, relations, conditions);
+                    self.collect_relations_and_conditions(
+                        &node.left,
+                        relations,
+                        conditions,
+                        extra_filters,
+                    );
+                    self.collect_relations_and_conditions(
+                        &node.right,
+                        relations,
+                        conditions,
+                        extra_filters,
+                    );
                 } else {
                     // Left/Right/Full/Semi/Anti/Single/Mark: treat entire join as opaque relation
                     let schema = plan.schema();
@@ -1425,12 +1493,43 @@ impl JoinReorder {
             }
 
             LogicalPlan::Filter(node) => {
-                // For filters, we need to keep them attached to their input
-                // But also extract any equality conditions that might be join conditions
-                self.extract_join_conditions(&node.predicate, conditions);
-
-                // Collect from input
-                self.collect_relations_and_conditions(&node.input, relations, conditions);
+                let over_flattenable_join = matches!(
+                    &*node.input,
+                    LogicalPlan::Join(j)
+                        if j.join_type == JoinType::Cross || j.join_type == JoinType::Inner
+                );
+                if over_flattenable_join {
+                    // Filter over a join being flattened: equality conjuncts may
+                    // become join edges; everything else must be re-applied by
+                    // the caller (extra_filters) or it is silently dropped —
+                    // Q20's l_shipdate range vanished exactly this way.
+                    self.extract_join_conditions(&node.predicate, conditions);
+                    Self::collect_non_eq_conjuncts(&node.predicate, extra_filters);
+                    self.collect_relations_and_conditions(
+                        &node.input,
+                        relations,
+                        conditions,
+                        extra_filters,
+                    );
+                } else {
+                    // Filter over a base relation: keep it glued so selectivity
+                    // stays with the relation (and nothing is lost).
+                    let columns: HashSet<String> = node
+                        .input
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| f.name.clone())
+                        .collect();
+                    let name = self
+                        .get_underlying_table_name(&node.input)
+                        .unwrap_or_else(|| "relation".to_string());
+                    relations.push(JoinRelation {
+                        plan: plan.clone(),
+                        name,
+                        columns,
+                    });
+                }
             }
 
             _ => {
@@ -1451,6 +1550,25 @@ impl JoinReorder {
                     columns,
                 });
             }
+        }
+    }
+
+    /// Collect the non-equality conjuncts of a predicate (the parts that can
+    /// never become join edges and must be re-applied as filters).
+    fn collect_non_eq_conjuncts(expr: &Expr, out: &mut Vec<Expr>) {
+        match expr {
+            Expr::BinaryExpr {
+                left,
+                op: BinaryOp::And,
+                right,
+            } => {
+                Self::collect_non_eq_conjuncts(left, out);
+                Self::collect_non_eq_conjuncts(right, out);
+            }
+            Expr::BinaryExpr {
+                op: BinaryOp::Eq, ..
+            } => {}
+            other => out.push(other.clone()),
         }
     }
 
