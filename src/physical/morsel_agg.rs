@@ -1410,7 +1410,84 @@ impl AggregationState {
             .map(TypedArrayAccessor::from_array)
             .collect();
 
+        // Combined-dictionary fast path: when every group column is a
+        // dictionary-encoded string with a small dictionary, resolve the
+        // perfect-hash index ONCE per distinct key combination per batch
+        // (packed table lookup per row afterwards).
         if !self.overflowed && !group_by_exprs.is_empty() {
+            let dicts: Option<Vec<&arrow::array::DictionaryArray<arrow::datatypes::Int32Type>>> =
+                group_accessors
+                    .iter()
+                    .map(|a| match a {
+                        TypedArrayAccessor::DictString(d)
+                            if d.values().len() <= 64 && d.null_count() == 0 =>
+                        {
+                            Some(*d)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+            if let Some(dicts) = dicts {
+                if dicts.len() <= 2 {
+                    let shift = 6 * (dicts.len() - 1);
+                    let table_size = 1usize << (6 * dicts.len());
+                    let mut table: Vec<u16> = vec![u16::MAX; table_size];
+                    let keys0 = dicts[0].keys().values();
+                    let keys1 = dicts.get(1).map(|d| d.keys().values());
+                    let all_f64_inputs = agg_accessors
+                        .iter()
+                        .all(|a| matches!(a, TypedArrayAccessor::Float64(_)));
+                    let f64_slices: Option<Vec<&[f64]>> = if all_f64_inputs {
+                        Some(
+                            agg_accessors
+                                .iter()
+                                .map(|a| match a {
+                                    TypedArrayAccessor::Float64(arr) => arr.values().as_ref(),
+                                    _ => unreachable!(),
+                                })
+                                .collect(),
+                        )
+                    } else {
+                        None
+                    };
+                    for row in 0..num_rows {
+                        let packed = match keys1 {
+                            Some(k1) => ((keys0[row] as usize) << shift) | (k1[row] as usize),
+                            None => keys0[row] as usize,
+                        };
+                        let mut idx = table[packed] as usize;
+                        if idx == u16::MAX as usize {
+                            match self.get_or_assign_perfect_index(&group_accessors, row) {
+                                Some(i) => {
+                                    table[packed] = i as u16;
+                                    idx = i;
+                                }
+                                None => {
+                                    self.drain_perfect_to_hashmap();
+                                    self.process_rows_hashmap(
+                                        row,
+                                        num_rows,
+                                        &group_accessors,
+                                        &agg_accessors,
+                                    );
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        let accs = &mut self.perfect_accs[idx];
+                        if let Some(slices) = &f64_slices {
+                            for (i, acc) in accs.iter_mut().enumerate() {
+                                acc.update_f64(slices[i][row]);
+                            }
+                        } else {
+                            for (i, acc) in accs.iter_mut().enumerate() {
+                                agg_accessors[i].update_accumulator(row, acc);
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+            }
             // Perfect hash fast path
             // Check if all aggregate inputs are f64 for the fastest possible path
             let all_f64_inputs = agg_accessors

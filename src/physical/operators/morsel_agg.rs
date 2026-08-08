@@ -111,6 +111,46 @@ impl PhysicalOperator for MorselAggregateExec {
             return Ok(stream);
         }
 
+        // Dictionary reads for string GROUP columns nothing else touches:
+        // dictionaries then flow only into the group-key accessors.
+        let mut other_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Some(f) = &self.filter {
+            let mut names = Vec::new();
+            crate::physical::morsel::collect_expr_columns(f, &mut names);
+            other_cols.extend(names.into_iter().map(|n| n.to_lowercase()));
+        }
+        for a in &self.aggregates {
+            let mut names = Vec::new();
+            crate::physical::morsel::collect_expr_columns(&a.input, &mut names);
+            other_cols.extend(names.into_iter().map(|n| n.to_lowercase()));
+        }
+        let mut dict_cols: Vec<usize> = Vec::new();
+        let mut all_string_groups = !self.group_by.is_empty();
+        for g in &self.group_by {
+            match g {
+                Expr::Column(c) => {
+                    match self
+                        .input_schema
+                        .fields()
+                        .iter()
+                        .position(|f| f.name().eq_ignore_ascii_case(&c.name))
+                    {
+                        Some(i)
+                            if self.input_schema.field(i).data_type() == &DataType::Utf8
+                                && !other_cols.contains(&c.name.to_lowercase()) =>
+                        {
+                            dict_cols.push(i)
+                        }
+                        _ => all_string_groups = false,
+                    }
+                }
+                _ => all_string_groups = false,
+            }
+        }
+        if !all_string_groups {
+            dict_cols.clear();
+        }
+
         // Create the parallel Parquet source with row group pruning
         let source = ParallelParquetSource::try_new_with_filter(
             self.files.clone(),
@@ -118,7 +158,8 @@ impl PhysicalOperator for MorselAggregateExec {
             self.projection.clone(),
             DEFAULT_MORSEL_SIZE,
             self.filter.as_ref(),
-        )?;
+        )?
+        .with_dict_strings(dict_cols);
 
         // Determine input types for aggregates
         let plan_schema = crate::planner::PlanSchema::from(source.schema().as_ref());

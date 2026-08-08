@@ -73,6 +73,11 @@ pub struct ParallelParquetSource {
     completed: AtomicUsize,
     /// Total number of row groups
     total_row_groups: usize,
+    /// Pre-built schema override requesting Dictionary(Int32, Utf8) for
+    /// chosen string columns (constructed ONCE from the provider schema —
+    /// a per-row-group probe re-parsed the footer and cost more than the
+    /// dictionary reads saved).
+    dict_schema: Option<SchemaRef>,
     /// Filter to push into the parquet decoder as an arrow RowFilter.
     /// Some((expr, column indices in the FULL file schema)) when eligible.
     row_filter: Option<(crate::planner::Expr, Vec<usize>)>,
@@ -155,11 +160,41 @@ impl ParallelParquetSource {
             completed: AtomicUsize::new(0),
             total_row_groups,
             row_filter,
+            dict_schema: None,
         })
     }
 
     /// True when the filter is applied inside the parquet decoder — callers
     /// must not re-apply it.
+    /// Request dictionary reads for the given file-schema column indices.
+    pub fn with_dict_strings(mut self, cols: Vec<usize>) -> Self {
+        if cols.is_empty() {
+            return self;
+        }
+        let fields: Vec<arrow::datatypes::Field> = self
+            .schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                if cols.contains(&i) && f.data_type() == &arrow::datatypes::DataType::Utf8 {
+                    arrow::datatypes::Field::new(
+                        f.name(),
+                        arrow::datatypes::DataType::Dictionary(
+                            Box::new(arrow::datatypes::DataType::Int32),
+                            Box::new(arrow::datatypes::DataType::Utf8),
+                        ),
+                        f.is_nullable(),
+                    )
+                } else {
+                    f.as_ref().clone()
+                }
+            })
+            .collect();
+        self.dict_schema = Some(std::sync::Arc::new(arrow::datatypes::Schema::new(fields)));
+        self
+    }
+
     pub fn filter_pushed_down(&self) -> bool {
         self.row_filter.is_some()
     }
@@ -233,7 +268,22 @@ impl ParallelParquetSource {
     /// Read a single row group and return batches
     pub fn read_row_group(&self, work: &RowGroupWork) -> Result<Vec<RecordBatch>> {
         let file = File::open(&work.file_path)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let builder = match &self.dict_schema {
+            Some(schema) => {
+                let opts = parquet::arrow::arrow_reader::ArrowReaderOptions::new()
+                    .with_schema(schema.clone());
+                match parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new_with_options(
+                    file, opts,
+                ) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        let file = File::open(&work.file_path)?;
+                        ParquetRecordBatchReaderBuilder::try_new(file)?
+                    }
+                }
+            }
+            None => ParquetRecordBatchReaderBuilder::try_new(file)?,
+        };
 
         // Apply projection if specified
         let builder = if let Some(ref indices) = self.projection {
