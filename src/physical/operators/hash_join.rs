@@ -2652,9 +2652,32 @@ fn create_joined_batch(
 ) -> Result<RecordBatch> {
     let _num_rows = build_indices.len();
 
-    // Gather build columns
+    // Gather build columns. Single-batch builds (the concat-once cache)
+    // share ONE take-index array across every column — gather_column was
+    // rebuilding the u32 index vec per column.
     let build_columns: Result<Vec<ArrayRef>> = if build_batches.is_empty() {
         Ok(vec![])
+    } else if build_batches.len() == 1 {
+        let has_null_sentinels = build_indices.iter().any(|&(b, _)| b == usize::MAX);
+        let take_arr: UInt32Array = if has_null_sentinels {
+            build_indices
+                .iter()
+                .map(|&(b, r)| {
+                    if b == usize::MAX {
+                        None
+                    } else {
+                        Some(r as u32)
+                    }
+                })
+                .collect()
+        } else {
+            build_indices.iter().map(|&(_, r)| r as u32).collect()
+        };
+        build_batches[0]
+            .columns()
+            .iter()
+            .map(|col| compute::take(col.as_ref(), &take_arr, None).map_err(Into::into))
+            .collect()
     } else {
         (0..build_batches[0].num_columns())
             .map(|col_idx| gather_column(build_batches, col_idx, build_indices))
@@ -2723,9 +2746,32 @@ fn create_build_only_batch(
         return Ok(RecordBatch::new_empty(output_schema.clone()));
     }
 
-    let build_columns: Result<Vec<ArrayRef>> = (0..build_batches[0].num_columns())
-        .map(|col_idx| gather_column(build_batches, col_idx, indices))
-        .collect();
+    let build_columns: Result<Vec<ArrayRef>> = if build_batches.len() == 1 {
+        let has_null_sentinels = indices.iter().any(|&(b, _)| b == usize::MAX);
+        let take_arr: UInt32Array = if has_null_sentinels {
+            indices
+                .iter()
+                .map(|&(b, r)| {
+                    if b == usize::MAX {
+                        None
+                    } else {
+                        Some(r as u32)
+                    }
+                })
+                .collect()
+        } else {
+            indices.iter().map(|&(_, r)| r as u32).collect()
+        };
+        build_batches[0]
+            .columns()
+            .iter()
+            .map(|col| compute::take(col.as_ref(), &take_arr, None).map_err(Into::into))
+            .collect()
+    } else {
+        (0..build_batches[0].num_columns())
+            .map(|col_idx| gather_column(build_batches, col_idx, indices))
+            .collect()
+    };
     let build_columns = build_columns?;
 
     // Create null arrays for probe side
