@@ -1048,7 +1048,27 @@ impl JoinReorder {
     fn column_ndv(&self, rel: &JoinRelation, expr: &Expr) -> Option<f64> {
         let col = match expr {
             Expr::Column(c) => c.name.to_lowercase(),
-            _ => return None,
+            // Expression keys (e.g. packed composite keys from eager
+            // aggregation): NDV = max over the referenced columns' NDVs —
+            // the same full-correlation assumption as multi-column keys.
+            // Returning None here made the caller substitute the relation's
+            // row count, which UNDERestimated the join output and buried
+            // fanout joins at the bottom of the tree.
+            _ => {
+                let mut names: Vec<String> = Vec::new();
+                crate::physical::morsel::collect_expr_columns(expr, &mut names);
+                let mut best: Option<f64> = None;
+                for name in names {
+                    let col_expr = Expr::Column(crate::planner::Column {
+                        relation: None,
+                        name,
+                    });
+                    if let Some(v) = self.column_ndv(rel, &col_expr) {
+                        best = Some(best.map_or(v, |b: f64| b.max(v)));
+                    }
+                }
+                return best;
+            }
         };
         let table = self.get_underlying_table_name(&rel.plan)?;
         let stats = self.table_stats.get(&table)?;
@@ -1695,10 +1715,56 @@ impl JoinReorder {
     }
 
     /// Get the row count for a relation from statistics, if available.
+    /// An Aggregate relation (e.g. an eager pre-aggregate or a decorrelated
+    /// subquery aggregate over a single table) is estimated as its group-key
+    /// NDV, capped by the underlying table's row count. Without this, such
+    /// relations fell back to the 10K default and the DP scheduled fanout
+    /// joins against them far too early.
     fn get_relation_row_count(&self, rel: &JoinRelation) -> Option<usize> {
-        let table_name = self.get_underlying_table_name(&rel.plan)?;
-        let stats = self.table_stats.get(&table_name)?;
-        Some(stats.row_count)
+        self.plan_row_estimate(&rel.plan)
+    }
+
+    fn plan_row_estimate(&self, plan: &LogicalPlan) -> Option<usize> {
+        match plan {
+            LogicalPlan::SubqueryAlias(node) => self.plan_row_estimate(&node.input),
+            LogicalPlan::Project(node) => self.plan_row_estimate(&node.input),
+            LogicalPlan::Aggregate(node) => {
+                let input_rows = self.plan_row_estimate(&node.input)?;
+                if node.group_by.is_empty() {
+                    return Some(1);
+                }
+                let table = self.get_underlying_table_name(&node.input)?;
+                let stats = self.table_stats.get(&table)?;
+                // NDV per group expr: max over referenced columns (full
+                // correlation); independence ACROSS group exprs (product).
+                let mut groups = 1f64;
+                for g in &node.group_by {
+                    let mut names: Vec<String> = Vec::new();
+                    crate::physical::morsel::collect_expr_columns(g, &mut names);
+                    let mut ndv = 0f64;
+                    for name in names {
+                        if let Some(cs) = stats.column_stats.get(&name.to_lowercase()) {
+                            if let Some(v) = cs.ndv_est {
+                                ndv = ndv.max(v as f64);
+                            }
+                        }
+                    }
+                    if ndv == 0.0 {
+                        return Some(input_rows); // unknown: assume no collapse
+                    }
+                    groups *= ndv;
+                    if groups > input_rows as f64 {
+                        return Some(input_rows);
+                    }
+                }
+                Some((groups as usize).min(input_rows).max(1))
+            }
+            _ => {
+                let table_name = self.get_underlying_table_name(plan)?;
+                let stats = self.table_stats.get(&table_name)?;
+                Some(stats.row_count)
+            }
+        }
     }
 
     /// Select the best starting relation for join ordering

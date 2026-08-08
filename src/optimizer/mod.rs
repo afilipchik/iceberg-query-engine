@@ -59,6 +59,8 @@ impl Optimizer {
                 Arc::new(rules::JoinReorder::new()),
                 // Final predicate pushdown for any remaining opportunities
                 Arc::new(rules::PredicatePushdown),
+                // Pre-aggregate duplicated join inputs (needs footer stats)
+                Arc::new(rules::EagerAggregation::new()),
                 Arc::new(rules::ProjectionPushdown),
             ],
             max_iterations: 10,
@@ -91,6 +93,10 @@ impl Optimizer {
                 .map(|rule| {
                     if rule.name() == "JoinReorder" {
                         Arc::new(rules::JoinReorder::with_table_statistics(
+                            self.table_stats.clone(),
+                        )) as Arc<dyn OptimizerRule>
+                    } else if rule.name() == "EagerAggregation" {
+                        Arc::new(rules::EagerAggregation::with_table_statistics(
                             self.table_stats.clone(),
                         )) as Arc<dyn OptimizerRule>
                     } else {
