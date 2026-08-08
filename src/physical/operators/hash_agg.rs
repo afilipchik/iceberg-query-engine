@@ -2846,6 +2846,37 @@ fn build_agg_array(
                     }
                     Ok(Arc::new(builder.finish()))
                 }
+                DataType::Date32 => {
+                    let mut builder = arrow::array::Date32Builder::with_capacity(num_groups);
+                    for states in groups.values() {
+                        match &states[agg_idx].any_value {
+                            Some(GroupValue::Date32(v)) => builder.append_value(*v),
+                            Some(GroupValue::Int64(v)) => builder.append_value(*v as i32),
+                            _ => builder.append_null(),
+                        }
+                    }
+                    Ok(Arc::new(builder.finish()))
+                }
+                DataType::Int32 => {
+                    let mut builder = arrow::array::Int32Builder::with_capacity(num_groups);
+                    for states in groups.values() {
+                        match &states[agg_idx].any_value {
+                            Some(GroupValue::Int64(v)) => builder.append_value(*v as i32),
+                            _ => builder.append_null(),
+                        }
+                    }
+                    Ok(Arc::new(builder.finish()))
+                }
+                DataType::Boolean => {
+                    let mut builder = arrow::array::BooleanBuilder::with_capacity(num_groups);
+                    for states in groups.values() {
+                        match &states[agg_idx].any_value {
+                            Some(GroupValue::Bool(v)) => builder.append_value(*v),
+                            _ => builder.append_null(),
+                        }
+                    }
+                    Ok(Arc::new(builder.finish()))
+                }
                 _ => Err(QueryError::NotImplemented(format!(
                     "ANY_VALUE with type {:?} not supported",
                     data_type

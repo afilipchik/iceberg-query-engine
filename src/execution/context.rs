@@ -240,6 +240,9 @@ impl ExecutionContext {
             optimizer.optimize(logical)?
         };
         metrics.optimize_time = optimize_start.elapsed();
+        if std::env::var("PLAN_DEBUG").is_ok() {
+            eprintln!("[plan]\n{}", optimized);
+        }
 
         // Physical planning with spillable operators for memory safety
         let physical_start = Instant::now();

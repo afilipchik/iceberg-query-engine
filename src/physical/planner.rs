@@ -1004,6 +1004,7 @@ impl PhysicalPlanner {
                                 .fields()
                                 .iter()
                                 .position(|f| f.name().eq_ignore_ascii_case(&c.name))
+                                .filter(|_| std::env::var("RT_DISABLE").is_err())
                                 .map(|idx| {
                                     let slot: crate::physical::operators::SharedRuntimeFilter =
                                         Default::default();

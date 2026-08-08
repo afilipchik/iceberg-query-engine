@@ -1001,8 +1001,11 @@ impl JoinReorder {
         let sel = match expr {
             Expr::BinaryExpr { left, op, right } => match op {
                 BinaryOp::And => {
-                    Self::predicate_selectivity(left, stats)
-                        * Self::predicate_selectivity(right, stats)
+                    // Band-aware conjunction: `col >= a AND col < b` is one
+                    // band of width (b-a)/(max-min), not the product of two
+                    // one-sided fractions (a 3-month order-date window came
+                    // out at 22% instead of 3.8%, flipping build sides).
+                    return Self::conjunction_selectivity(expr, stats);
                 }
                 BinaryOp::Or => (Self::predicate_selectivity(left, stats)
                     + Self::predicate_selectivity(right, stats))
@@ -1040,6 +1043,105 @@ impl JoinReorder {
             // Subquery predicates and anything opaque: assume moderate
             _ => 0.5,
         };
+        sel.clamp(1e-4, 1.0)
+    }
+
+    /// Literal numeric value for range estimation.
+    fn range_literal_value(e: &Expr) -> Option<f64> {
+        use crate::planner::ScalarValue;
+        match e {
+            Expr::Literal(ScalarValue::Int8(v)) => Some(*v as f64),
+            Expr::Literal(ScalarValue::Int16(v)) => Some(*v as f64),
+            Expr::Literal(ScalarValue::Int32(v)) => Some(*v as f64),
+            Expr::Literal(ScalarValue::Int64(v)) => Some(*v as f64),
+            Expr::Literal(ScalarValue::Date32(v)) => Some(*v as f64),
+            Expr::Literal(ScalarValue::Date64(v)) => Some(*v as f64),
+            Expr::Literal(ScalarValue::Float64(v)) => Some(v.into_inner()),
+            _ => None,
+        }
+    }
+
+    /// AND-conjunction selectivity with per-column band intersection.
+    fn conjunction_selectivity(expr: &Expr, stats: Option<&TableStatistics>) -> f64 {
+        fn flatten<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+            if let Expr::BinaryExpr { left, op, right } = e {
+                if *op == BinaryOp::And {
+                    flatten(left, out);
+                    flatten(right, out);
+                    return;
+                }
+            }
+            out.push(e);
+        }
+        let mut conjuncts = Vec::new();
+        flatten(expr, &mut conjuncts);
+
+        // col -> (lo, hi) bounds accumulated across the conjunction
+        let mut bands: std::collections::HashMap<String, (f64, f64)> =
+            std::collections::HashMap::new();
+        let mut sel = 1.0f64;
+        for c in conjuncts {
+            let mut banded = false;
+            if let (Some(st), Expr::BinaryExpr { left, op, right }) = (stats, c) {
+                // Normalize to col-op-literal
+                let norm = match (&**left, &**right) {
+                    (Expr::Column(col), _) => {
+                        Self::range_literal_value(right).map(|v| (col, *op, v))
+                    }
+                    (_, Expr::Column(col)) => Self::range_literal_value(left).map(|v| {
+                        let flipped = match op {
+                            BinaryOp::Lt => BinaryOp::Gt,
+                            BinaryOp::LtEq => BinaryOp::GtEq,
+                            BinaryOp::Gt => BinaryOp::Lt,
+                            BinaryOp::GtEq => BinaryOp::LtEq,
+                            other => *other,
+                        };
+                        (col, flipped, v)
+                    }),
+                    _ => None,
+                };
+                if let Some((col, op, v)) = norm {
+                    let name = col.name.to_lowercase();
+                    if let Some(cs) = st.column_stats.get(&name) {
+                        if let (Some(min), Some(max)) = (cs.min_i64, cs.max_i64) {
+                            if max > min {
+                                let entry = bands.entry(name).or_insert((min as f64, max as f64));
+                                match op {
+                                    BinaryOp::Gt | BinaryOp::GtEq => {
+                                        entry.0 = entry.0.max(v);
+                                        banded = true;
+                                    }
+                                    BinaryOp::Lt | BinaryOp::LtEq => {
+                                        entry.1 = entry.1.min(v);
+                                        banded = true;
+                                    }
+                                    BinaryOp::Eq => {
+                                        entry.0 = entry.0.max(v);
+                                        entry.1 = entry.1.min(v);
+                                        banded = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !banded {
+                sel *= Self::predicate_selectivity(c, stats);
+            }
+        }
+        if let Some(st) = stats {
+            for (name, (lo, hi)) in bands {
+                if let Some(cs) = st.column_stats.get(&name) {
+                    if let (Some(min), Some(max)) = (cs.min_i64, cs.max_i64) {
+                        let width = (max - min) as f64;
+                        let band = ((hi - lo) / width).clamp(1e-4, 1.0);
+                        sel *= band;
+                    }
+                }
+            }
+        }
         sel.clamp(1e-4, 1.0)
     }
 
