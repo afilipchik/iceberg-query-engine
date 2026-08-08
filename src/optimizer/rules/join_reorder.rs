@@ -716,23 +716,23 @@ impl JoinReorder {
 
         // Per-edge equi-join selectivity: 1 / max(combined_ndv_left, combined_ndv_right)
         // where each side's combined NDV over all the edge's key columns is the
-        // product of per-column NDVs CAPPED BY the side's row count. Multiplying
-        // per-condition selectivities independently wildly underestimates
-        // composite-key joins (e.g. lineitem x partsupp on (suppkey, partkey)
-        // came out at ~600 rows instead of 10^8), which then made huge
-        // intermediates look like great build sides.
+        // MAX of per-column NDVs (full-correlation assumption), capped by the
+        // side's row count. Multiplying per-column NDVs assumes independence
+        // and overestimates composite-key NDV whenever the key columns are
+        // correlated: partsupp's (suppkey, partkey) pairs are 4x duplicated,
+        // so product-NDV said |lineitem x partsupp| = 8M when the true output
+        // is 240M — the DP then buried a 240M-row intermediate at the bottom
+        // of Q09's plan. Full correlation is the conservative direction: it
+        // can only overestimate join outputs, never hide a blow-up.
         let side_combined_ndv = |rel: usize, exprs: &[&Expr]| -> f64 {
-            let mut prod = 1.0f64;
+            let mut max_ndv = 1.0f64;
             for e in exprs {
                 let ndv = self
                     .column_ndv(&relations[rel], e)
                     .unwrap_or(base_rows[rel].max(10.0));
-                prod *= ndv.max(1.0);
-                if prod > 1e18 {
-                    break;
-                }
+                max_ndv = max_ndv.max(ndv);
             }
-            prod.min(base_rows[rel].max(1.0))
+            max_ndv.min(base_rows[rel].max(1.0))
         };
 
         // Precompute each edge's endpoint masks and combined selectivity
