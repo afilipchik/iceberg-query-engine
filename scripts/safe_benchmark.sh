@@ -18,12 +18,15 @@ USE_CGROUP=true
 ITERATIONS=1
 BINARY="./target/release/query_engine"
 
-# DuckDB reference times (milliseconds) at SF=10
+# DuckDB reference times (milliseconds) at SF=10.
+# Measured 2026-08-07 on the spec-compliant queries + spec-generator data
+# via scripts/duckdb_rebaseline.py (native tables, 16 threads, best of 3).
+# Re-run that script and update this block whenever queries or data change.
 declare -A DUCKDB_MS=(
-    [1]=89   [2]=13   [3]=84   [4]=80   [5]=49   [6]=24
-    [7]=61   [8]=76   [9]=8    [10]=98  [11]=10  [12]=66
-    [13]=131 [14]=35  [15]=33  [16]=40  [17]=75  [18]=283
-    [19]=87  [20]=161 [21]=201 [22]=36
+    [1]=105  [2]=22   [3]=82   [4]=57   [5]=48   [6]=24
+    [7]=72   [8]=71   [9]=1249 [10]=91  [11]=14  [12]=87
+    [13]=99  [14]=39  [15]=31  [16]=39  [17]=87  [18]=232
+    [19]=88  [20]=160 [21]=213 [22]=34
 )
 
 # ── Colors ────────────────────────────────────────────────────────────────────
