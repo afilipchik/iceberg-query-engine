@@ -650,6 +650,139 @@ impl SpillableHashAggregateExec {
             config,
         }
     }
+
+    /// The fused streaming path supports the simple accumulator functions the
+    /// morsel aggregation core implements.
+    fn fused_streaming_eligible(&self) -> bool {
+        use crate::planner::AggregateFunction as F;
+        !self.group_by.is_empty()
+            && !self.aggregates.is_empty()
+            && self.aggregates.iter().all(|a| {
+                !a.distinct
+                    && a.second_arg.is_none()
+                    && matches!(a.func, F::Count | F::Sum | F::Min | F::Max | F::Avg)
+            })
+    }
+
+    /// Stream every input partition into a bounded channel consumed by
+    /// balanced aggregation worker threads (work distribution is by
+    /// availability, not by partition, so skewed partitions don't serialize).
+    /// Returns Ok(None) to fall back to the materializing path when a worker
+    /// can't process a batch or the group-count budget trips — the input is
+    /// re-executed there.
+    async fn execute_fused_streaming(&self) -> Result<Option<RecordBatchStream>> {
+        use crate::physical::morsel_agg::{merge_states_to_batches, AggregationState};
+        use crate::planner::AggregateFunction;
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        let plan_schema = crate::planner::PlanSchema::from(self.input.schema().as_ref());
+        let input_types: Vec<arrow::datatypes::DataType> = self
+            .aggregates
+            .iter()
+            .map(|a| {
+                a.input
+                    .data_type(&plan_schema)
+                    .unwrap_or(arrow::datatypes::DataType::Float64)
+            })
+            .collect();
+        let agg_funcs: Vec<AggregateFunction> = self.aggregates.iter().map(|a| a.func).collect();
+        let agg_inputs: Vec<Expr> = self.aggregates.iter().map(|a| a.input.clone()).collect();
+
+        // Group-state budget: a worker aborts the fused attempt if its state
+        // estimate exceeds an equal share of the memory budget.
+        let n_workers = rayon::current_num_threads().clamp(2, 32);
+        let per_group_bytes = 64 + 48 * self.aggregates.len();
+        let memory_threshold =
+            (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
+        let group_limit = ((memory_threshold / n_workers) / per_group_bytes).max(64);
+
+        let (tx, rx) = crossbeam::channel::bounded::<RecordBatch>(n_workers * 8);
+        let abort = Arc::new(AtomicBool::new(false));
+
+        // Aggregation workers: dedicated OS threads pulling from the channel.
+        let mut workers = Vec::with_capacity(n_workers);
+        for _ in 0..n_workers {
+            let rx = rx.clone();
+            let abort = Arc::clone(&abort);
+            let agg_funcs = agg_funcs.clone();
+            let input_types = input_types.clone();
+            let agg_inputs = agg_inputs.clone();
+            let group_by = self.group_by.clone();
+            workers.push(std::thread::spawn(move || {
+                let mut state = AggregationState::new(agg_funcs, input_types);
+                let mut batches_seen = 0usize;
+                while let Ok(batch) = rx.recv() {
+                    if abort.load(AtomicOrdering::Relaxed) {
+                        continue; // keep draining so senders never block forever
+                    }
+                    if state.process_batch(&batch, &group_by, &agg_inputs).is_err() {
+                        abort.store(true, AtomicOrdering::Relaxed);
+                        continue;
+                    }
+                    batches_seen += 1;
+                    if batches_seen % 16 == 0 && state.group_count() > group_limit {
+                        abort.store(true, AtomicOrdering::Relaxed);
+                    }
+                }
+                if state.group_count() > group_limit {
+                    abort.store(true, AtomicOrdering::Relaxed);
+                }
+                state
+            }));
+        }
+        drop(rx);
+
+        // Drain tasks: one per input partition, sending into the channel.
+        let input_partitions = self.input.output_partitions().max(1);
+        let mut drains = Vec::with_capacity(input_partitions);
+        for p in 0..input_partitions {
+            let input = self.input.clone();
+            let tx = tx.clone();
+            let abort = Arc::clone(&abort);
+            drains.push(tokio::spawn(async move {
+                let mut stream = input.execute(p).await?;
+                while let Some(batch) = stream.try_next().await? {
+                    if abort.load(AtomicOrdering::Relaxed) {
+                        break;
+                    }
+                    let tx = tx.clone();
+                    // Bounded send provides backpressure; run it off the async
+                    // reactor so a full channel doesn't stall other tasks.
+                    let send_res =
+                        tokio::task::spawn_blocking(move || tx.send(batch).is_err()).await;
+                    match send_res {
+                        Ok(false) => {}
+                        _ => break, // channel closed or join error
+                    }
+                }
+                Ok::<_, QueryError>(())
+            }));
+        }
+        drop(tx);
+
+        let mut drain_failed = false;
+        for d in drains {
+            match d.await {
+                Ok(Ok(())) => {}
+                _ => drain_failed = true,
+            }
+        }
+
+        let mut states = Vec::with_capacity(workers.len());
+        for w in workers {
+            match w.join() {
+                Ok(state) => states.push(state),
+                Err(_) => drain_failed = true,
+            }
+        }
+
+        if drain_failed || abort.load(AtomicOrdering::Relaxed) {
+            return Ok(None);
+        }
+
+        let batches = merge_states_to_batches(states, &agg_funcs, &input_types, &self.schema)?;
+        Ok(Some(Box::pin(stream::iter(batches.into_iter().map(Ok)))))
+    }
 }
 
 /// State for an aggregate partition during processing
@@ -691,6 +824,19 @@ impl PhysicalOperator for SpillableHashAggregateExec {
         // Aggregation always produces a single partition by collecting from all input partitions
         if partition != 0 {
             return Ok(Box::pin(stream::empty()));
+        }
+
+        // Fused streaming aggregation: input batches flow through a bounded
+        // channel into balanced aggregation workers — the input is never
+        // materialized (Q09 collected a 133M-row join output before a single
+        // group was aggregated) and aggregation overlaps with join output
+        // production. Bounded channel + group-count budget keep memory safe;
+        // ineligible shapes or a tripped budget fall through to the
+        // collect-then-decide path below.
+        if self.fused_streaming_eligible() {
+            if let Some(result) = self.execute_fused_streaming().await? {
+                return Ok(result);
+            }
         }
 
         // Drain all input partitions concurrently so a parallel scan/join beneath this
