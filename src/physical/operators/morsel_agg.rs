@@ -277,7 +277,7 @@ impl MorselAggregateExec {
         use arrow::array::{Date32Array, Float64Array, Int32Array, Int64Array};
         use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
-        if self.group_by.len() != 1 || self.filter.is_some() {
+        if self.group_by.len() != 1 {
             return Ok(None);
         }
         let key_name = match &self.group_by[0] {
@@ -303,41 +303,29 @@ impl MorselAggregateExec {
         ) {
             return Ok(None);
         }
-        // Aggregate kinds
-        let mut kinds: Vec<(DenseAgg, Option<usize>)> = Vec::new();
+        // Aggregate kinds: inputs are arbitrary expressions evaluated per
+        // batch (Q15 sums l_extendedprice * (1 - l_discount)); the value
+        // type comes from the plan schema.
+        let plan_schema = crate::planner::PlanSchema::from(self.input_schema.as_ref());
+        let mut kinds: Vec<(DenseAgg, Option<Expr>)> = Vec::new();
         for a in &self.aggregates {
             if a.distinct || a.second_arg.is_some() {
                 return Ok(None);
             }
-            let col_idx = |e: &Expr| -> Option<usize> {
-                match e {
-                    Expr::Column(c) => self
-                        .input_schema
-                        .fields()
-                        .iter()
-                        .position(|f| f.name().eq_ignore_ascii_case(&c.name)),
-                    _ => None,
-                }
-            };
             match a.func {
                 AggregateFunction::Count => match &a.input {
                     Expr::Wildcard => kinds.push((DenseAgg::Count, None)),
-                    e => match col_idx(e) {
-                        Some(i) => kinds.push((DenseAgg::Count, Some(i))),
-                        None => return Ok(None),
-                    },
+                    e => kinds.push((DenseAgg::Count, Some(e.clone()))),
                 },
                 AggregateFunction::Sum | AggregateFunction::Avg => {
-                    let Some(i) = col_idx(&a.input) else {
-                        return Ok(None);
-                    };
-                    let k = match (&a.func, self.input_schema.field(i).data_type()) {
+                    let dt = a.input.data_type(&plan_schema).unwrap_or(DataType::Float64);
+                    let k = match (&a.func, &dt) {
                         (AggregateFunction::Sum, DataType::Float64) => DenseAgg::SumF64,
                         (AggregateFunction::Sum, DataType::Int64) => DenseAgg::SumI64,
                         (AggregateFunction::Avg, DataType::Float64) => DenseAgg::Avg,
                         _ => return Ok(None),
                     };
-                    kinds.push((k, Some(i)));
+                    kinds.push((k, Some(a.input.clone())));
                 }
                 _ => return Ok(None),
             }
@@ -411,8 +399,13 @@ impl MorselAggregateExec {
             self.input_schema.clone(),
             self.projection.clone(),
             DEFAULT_MORSEL_SIZE,
-            None,
+            self.filter.as_ref(),
         )?;
+        // A filter is only safe here when the parquet decoder applies it
+        // fully (RowFilter pushdown) — this path never re-evaluates it.
+        if self.filter.is_some() && !source.filter_pushed_down() {
+            return Ok(None);
+        }
         // Column positions AFTER projection
         let proj_pos = |file_idx: usize| -> Option<usize> {
             match &self.projection {
@@ -423,16 +416,6 @@ impl MorselAggregateExec {
         let Some(key_pos) = proj_pos(key_idx) else {
             return Ok(None);
         };
-        let mut agg_pos: Vec<Option<usize>> = Vec::new();
-        for (_, idx) in &kinds {
-            match idx {
-                Some(i) => match proj_pos(*i) {
-                    Some(p) => agg_pos.push(Some(p)),
-                    None => return Ok(None),
-                },
-                None => agg_pos.push(None),
-            }
-        }
 
         let num_threads = rayon::current_num_threads();
         let results: Vec<Result<()>> = (0..num_threads)
@@ -476,11 +459,14 @@ impl MorselAggregateExec {
                                 ))
                             }
                         };
-                        for (ai, ((kind, _), pos)) in kinds.iter().zip(agg_pos.iter()).enumerate() {
+                        for (ai, (kind, input)) in kinds.iter().enumerate() {
+                            let arr = match input {
+                                Some(e) => Some(evaluate_expr(&batch, e)?),
+                                None => None,
+                            };
                             match kind {
                                 DenseAgg::Count => {
-                                    if let Some(p) = pos {
-                                        let arr = batch.column(*p);
+                                    if let Some(arr) = &arr {
                                         for (r, &k) in keys_i64.iter().enumerate() {
                                             if !arr.is_null(r) {
                                                 acc_i64[ai][(k - kmin) as usize]
@@ -495,35 +481,41 @@ impl MorselAggregateExec {
                                     }
                                 }
                                 DenseAgg::SumI64 => {
-                                    let arr = batch
-                                        .column(pos.unwrap())
+                                    let arr = arr.as_ref().unwrap();
+                                    let arr = arr
                                         .as_any()
                                         .downcast_ref::<Int64Array>()
-                                        .unwrap();
-                                    if arr.null_count() > 0 {
-                                        return Err(QueryError::Execution(
-                                            "dense agg: null sum input".into(),
-                                        ));
-                                    }
+                                        .ok_or_else(|| {
+                                            QueryError::Execution(
+                                                "dense agg: expected Int64".into(),
+                                            )
+                                        })?;
                                     let vals = arr.values();
+                                    let has_nulls = arr.null_count() > 0;
                                     for (r, &k) in keys_i64.iter().enumerate() {
+                                        if has_nulls && arr.is_null(r) {
+                                            continue;
+                                        }
                                         acc_i64[ai][(k - kmin) as usize]
                                             .fetch_add(vals[r], Ordering::Relaxed);
                                     }
                                 }
                                 DenseAgg::SumF64 | DenseAgg::Avg => {
-                                    let arr = batch
-                                        .column(pos.unwrap())
+                                    let arr = arr.as_ref().unwrap();
+                                    let arr = arr
                                         .as_any()
                                         .downcast_ref::<Float64Array>()
-                                        .unwrap();
-                                    if arr.null_count() > 0 {
-                                        return Err(QueryError::Execution(
-                                            "dense agg: null sum input".into(),
-                                        ));
-                                    }
+                                        .ok_or_else(|| {
+                                            QueryError::Execution(
+                                                "dense agg: expected Float64".into(),
+                                            )
+                                        })?;
                                     let vals = arr.values();
+                                    let has_nulls = arr.null_count() > 0;
                                     for (r, &k) in keys_i64.iter().enumerate() {
+                                        if has_nulls && arr.is_null(r) {
+                                            continue;
+                                        }
                                         let cell = &acc_f64[ai][(k - kmin) as usize];
                                         let mut cur = cell.load(Ordering::Relaxed);
                                         loop {
