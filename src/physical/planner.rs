@@ -1064,8 +1064,14 @@ impl PhysicalPlanner {
                 // output and Anti would drop exactly the rows it must keep).
                 let rt_eligible = matches!(node.join_type, JoinType::Inner)
                     || (is_semi_anti && !build_right_for_left);
-                let probe_rt_filter = if rt_eligible && on.len() == 1 {
-                    if let Expr::Column(c) = &on[0].1 {
+                // Multi-key joins publish a partial filter on the first
+                // column pair (a correct superset of matching rows).
+                let rt_pair = on
+                    .iter()
+                    .position(|(_, r)| matches!(r, Expr::Column(_)))
+                    .unwrap_or(0);
+                let probe_rt_filter = if rt_eligible && !on.is_empty() {
+                    if let Some(Expr::Column(c)) = on.get(rt_pair).map(|(_, r)| r) {
                         // The probe-side streaming scan may sit under column
                         // pass-through Projects (decorrelated subquery
                         // shapes); the filter column is resolved by NAME in
@@ -1123,6 +1129,7 @@ impl PhysicalPlanner {
                     )
                     .with_build_right(build_right_for_left);
                     join.probe_runtime_filter = probe_rt_filter.clone();
+                    join.probe_runtime_filter_pair = rt_pair;
 
                     // For Semi/Anti, pass filter into the join operator;
                     // for other join types, apply as a post-filter

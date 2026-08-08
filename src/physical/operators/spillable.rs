@@ -96,6 +96,8 @@ pub(crate) async fn collect_input_partitions_concurrently(
 pub struct SpillableHashJoinExec {
     /// Runtime probe-scan key filter (Inner joins), passed to the delegate.
     pub probe_runtime_filter: Option<crate::physical::operators::SharedRuntimeFilter>,
+    /// Which equi pair the runtime filter applies to.
+    pub probe_runtime_filter_pair: usize,
     left: Arc<dyn PhysicalOperator>,
     right: Arc<dyn PhysicalOperator>,
     on: Vec<(Expr, Expr)>,
@@ -182,6 +184,7 @@ impl SpillableHashJoinExec {
             filter: None,
             build_decision: OnceCell::new(),
             probe_runtime_filter: None,
+            probe_runtime_filter_pair: 0,
         }
     }
 
@@ -299,6 +302,7 @@ impl PhysicalOperator for SpillableHashJoinExec {
                         )
                         .with_build_right(self.build_right);
                         hj.probe_runtime_filter = self.probe_runtime_filter.clone();
+                        hj.probe_runtime_filter_pair = self.probe_runtime_filter_pair;
                         Arc::new(hj)
                     } else {
                         let mut hj = crate::physical::operators::HashJoinExec::new(
@@ -309,6 +313,7 @@ impl PhysicalOperator for SpillableHashJoinExec {
                         )
                         .with_build_right(self.build_right);
                         hj.probe_runtime_filter = self.probe_runtime_filter.clone();
+                        hj.probe_runtime_filter_pair = self.probe_runtime_filter_pair;
                         Arc::new(hj)
                     };
                     Ok::<_, QueryError>(BuildDecision::InMemory(hash_join))

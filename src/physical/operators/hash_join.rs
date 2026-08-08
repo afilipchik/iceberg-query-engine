@@ -280,6 +280,9 @@ pub struct HashJoinExec {
     /// hashed, publish the key set so the scan decodes only matching rows.
     /// Inner joins only (planner-gated).
     pub probe_runtime_filter: Option<crate::physical::operators::SharedRuntimeFilter>,
+    /// Which equi pair the runtime filter applies to (multi-key joins
+    /// publish a partial filter on one pair — a correct superset).
+    pub probe_runtime_filter_pair: usize,
     /// Optional filter to evaluate during the join (required for Semi/Anti joins with filters)
     filter: Option<Expr>,
     /// Schema combining left and right for filter evaluation
@@ -373,6 +376,7 @@ impl HashJoinExec {
             build_cache: OnceCell::new(),
             build_right: false,
             probe_runtime_filter: None,
+            probe_runtime_filter_pair: 0,
         }
     }
 
@@ -518,12 +522,16 @@ impl PhysicalOperator for HashJoinExec {
                 if let Some(slot) = &self.probe_runtime_filter {
                     // Bitmap filters stay cheap far beyond the HashSet cap:
                     // 16M keys over a <=64M domain is an 8MB bitmap.
-                    if build_keys.len() == 1 && total_build_rows <= 16_000_000 {
+                    if build_keys.len() > self.probe_runtime_filter_pair
+                        && total_build_rows <= 16_000_000
+                    {
                         let mut keys: Vec<i64> = Vec::with_capacity(total_build_rows);
                         let mut ok = true;
                         'outer_rt: for batch in &build_batches {
-                            match crate::physical::operators::evaluate_expr(batch, &build_keys[0])
-                            {
+                            match crate::physical::operators::evaluate_expr(
+                                batch,
+                                &build_keys[self.probe_runtime_filter_pair],
+                            ) {
                                 Ok(arr) => match arr.as_any().downcast_ref::<Int64Array>() {
                                     Some(a) => {
                                         for i in 0..a.len() {
