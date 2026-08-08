@@ -63,6 +63,8 @@ impl Optimizer {
                 Arc::new(rules::GroupKeyReduction::new()),
                 // Pre-aggregate duplicated join inputs (needs footer stats)
                 Arc::new(rules::EagerAggregation::new()),
+                // Pack dual int group keys onto the raw aggregation path
+                Arc::new(rules::PackedGroupKeys::new()),
                 Arc::new(rules::ProjectionPushdown),
             ],
             max_iterations: 10,
@@ -103,6 +105,10 @@ impl Optimizer {
                         )) as Arc<dyn OptimizerRule>
                     } else if rule.name() == "GroupKeyReduction" {
                         Arc::new(rules::GroupKeyReduction::with_table_statistics(
+                            self.table_stats.clone(),
+                        )) as Arc<dyn OptimizerRule>
+                    } else if rule.name() == "PackedGroupKeys" {
+                        Arc::new(rules::PackedGroupKeys::with_table_statistics(
                             self.table_stats.clone(),
                         )) as Arc<dyn OptimizerRule>
                     } else {
