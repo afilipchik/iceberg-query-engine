@@ -95,14 +95,118 @@ pub fn row_group_might_match(
     }
 }
 
-/// Check if a row group definitely matches all rows for a predicate
-/// Used for NOT optimization
-fn row_group_definitely_matches(
-    _predicate: &Expr,
-    _row_group: &RowGroupMetaData,
-    _schema: &SchemaRef,
+/// Check if a row group PROVABLY matches ALL of its rows for a predicate:
+/// min/max bounds prove the comparison for every value AND the column has
+/// zero nulls (a null row fails any comparison). Used to drop the decoder
+/// RowFilter entirely for fully-passing row groups (Q01's shipdate bound
+/// passes ~96% of lineitem row groups whole).
+pub fn row_group_definitely_matches(
+    predicate: &Expr,
+    row_group: &RowGroupMetaData,
+    schema: &SchemaRef,
 ) -> bool {
-    false // Conservative: never claim definite match
+    match predicate {
+        Expr::BinaryExpr { left, op, right } => match op {
+            BinaryOp::And => {
+                row_group_definitely_matches(left, row_group, schema)
+                    && row_group_definitely_matches(right, row_group, schema)
+            }
+            BinaryOp::Or => {
+                row_group_definitely_matches(left, row_group, schema)
+                    || row_group_definitely_matches(right, row_group, schema)
+            }
+            _ => definite_comparison(left, op, right, row_group, schema),
+        },
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated: false,
+        } => {
+            row_group_definitely_matches(
+                &Expr::BinaryExpr {
+                    left: expr.clone(),
+                    op: BinaryOp::GtEq,
+                    right: low.clone(),
+                },
+                row_group,
+                schema,
+            ) && row_group_definitely_matches(
+                &Expr::BinaryExpr {
+                    left: expr.clone(),
+                    op: BinaryOp::LtEq,
+                    right: high.clone(),
+                },
+                row_group,
+                schema,
+            )
+        }
+        _ => false,
+    }
+}
+
+/// Prove a comparison holds for EVERY row of the group.
+fn definite_comparison(
+    left: &Expr,
+    op: &BinaryOp,
+    right: &Expr,
+    row_group: &RowGroupMetaData,
+    schema: &SchemaRef,
+) -> bool {
+    let (col_name, literal, flipped) = match (left, right) {
+        (Expr::Column(col), Expr::Literal(lit)) => (col.name.as_str(), lit, false),
+        (Expr::Literal(lit), Expr::Column(col)) => (col.name.as_str(), lit, true),
+        _ => return false,
+    };
+    let col_idx = match schema.fields().iter().position(|f| f.name() == col_name) {
+        Some(idx) => idx,
+        None => return false,
+    };
+    if col_idx >= row_group.num_columns() {
+        return false;
+    }
+    let col_meta = row_group.column(col_idx);
+    let stats = match col_meta.statistics() {
+        Some(s) => s,
+        None => return false,
+    };
+    // A null row fails every comparison
+    if stats.null_count_opt() != Some(0) {
+        return false;
+    }
+    let effective_op = if flipped { flip_op(op) } else { *op };
+    let (min, max): (f64, f64) = match stats {
+        ParquetStatistics::Int64(s) => match (s.min_opt(), s.max_opt()) {
+            (Some(a), Some(b)) => (*a as f64, *b as f64),
+            _ => return false,
+        },
+        ParquetStatistics::Int32(s) => match (s.min_opt(), s.max_opt()) {
+            (Some(a), Some(b)) => (*a as f64, *b as f64),
+            _ => return false,
+        },
+        ParquetStatistics::Double(s) => match (s.min_opt(), s.max_opt()) {
+            (Some(a), Some(b)) => (*a, *b),
+            _ => return false,
+        },
+        _ => return false,
+    };
+    let val: f64 = match literal {
+        ScalarValue::Int64(v) => *v as f64,
+        ScalarValue::Int32(v) => *v as f64,
+        ScalarValue::Date32(v) => *v as f64,
+        ScalarValue::Float64(v) => v.into_inner(),
+        ScalarValue::Timestamp(v) => *v as f64,
+        _ => return false,
+    };
+    match effective_op {
+        BinaryOp::Lt => max < val,
+        BinaryOp::LtEq => max <= val,
+        BinaryOp::Gt => min > val,
+        BinaryOp::GtEq => min >= val,
+        BinaryOp::Eq => min == val && max == val,
+        BinaryOp::NotEq => val < min || val > max,
+        _ => false,
+    }
 }
 
 /// Check a comparison predicate (col op literal) against row group statistics

@@ -52,6 +52,8 @@ pub struct RowGroupWork {
     pub file_path: PathBuf,
     pub row_group_idx: usize,
     pub file_idx: usize,
+    /// Zone maps prove the scan filter true for every row in this group.
+    pub filter_all_true: bool,
 }
 
 /// Parallel morsel source that reads Parquet files concurrently
@@ -115,18 +117,30 @@ impl ParallelParquetSource {
         let mut work_queue = VecDeque::new();
 
         for (file_idx, file_path) in files.iter().enumerate() {
-            let file = File::open(file_path)?;
-            let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-            let metadata = builder.metadata().clone();
+            let md = crate::storage::metadata_cache::cached_metadata(file_path)?;
+            let metadata = md.metadata().clone();
 
             let matching_rgs =
                 crate::storage::row_group_pruning::prune_row_groups(&metadata, &schema, filter);
 
             for row_group_idx in matching_rgs {
+                // Zone-map proof: if min/max show every row passes, the
+                // decoder RowFilter is dropped for this row group (single-
+                // phase decode, no per-row predicate evaluation).
+                let all_true = filter
+                    .map(|f| {
+                        crate::storage::row_group_pruning::row_group_definitely_matches(
+                            f,
+                            metadata.row_group(row_group_idx),
+                            &schema,
+                        )
+                    })
+                    .unwrap_or(false);
                 work_queue.push_back(RowGroupWork {
                     file_path: file_path.clone(),
                     row_group_idx,
                     file_idx,
+                    filter_all_true: all_true,
                 });
             }
         }
@@ -300,7 +314,9 @@ impl ParallelParquetSource {
 
         // Push the filter into the decoder: the predicate columns are decoded
         // first and only matching rows are materialized for the rest.
-        let builder = if let Some((expr, indices)) = &self.row_filter {
+        let builder = if work.filter_all_true {
+            builder
+        } else if let Some((expr, indices)) = &self.row_filter {
             use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter};
             let mask = ProjectionMask::roots(builder.parquet_schema(), indices.iter().copied());
             let expr = expr.clone();
