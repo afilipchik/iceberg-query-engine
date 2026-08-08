@@ -9,7 +9,7 @@ use arrow::compute::{self, SortColumn, SortOptions};
 use arrow::datatypes::{DataType, Field, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use futures::stream::{self, TryStreamExt};
+use futures::stream;
 use std::fmt;
 use std::sync::Arc;
 
@@ -67,14 +67,14 @@ impl PhysicalOperator for SortExec {
             return Ok(Box::pin(stream::empty()));
         }
 
-        // Collect from ALL input partitions (input may split data across partitions)
-        let input_partitions = self.input.output_partitions().max(1);
-        let mut all_batches = Vec::new();
-        for p in 0..input_partitions {
-            let input_stream = self.input.execute(p).await?;
-            let batches: Vec<RecordBatch> = input_stream.try_collect().await?;
-            all_batches.extend(batches);
-        }
+        // Collect from ALL input partitions (input may split data across partitions).
+        // Drain them concurrently — a sequential await loop would serialize a parallel
+        // scan/join beneath this sort onto a single core.
+        let (all_batches, _) =
+            crate::physical::operators::spillable::collect_input_partitions_concurrently(
+                &self.input,
+            )
+            .await?;
 
         // Concatenate into single batch
         if all_batches.is_empty() {

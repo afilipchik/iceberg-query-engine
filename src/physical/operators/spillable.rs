@@ -36,6 +36,54 @@ static SPILL_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Number of hash partitions for spilling
 const NUM_PARTITIONS: usize = 64;
 
+/// Drain every input partition concurrently and return the collected batches
+/// together with their estimated in-memory size.
+///
+/// Pipeline-breaking operators (aggregate, sort) must consume all input partitions
+/// before they can produce output. Draining them one-at-a-time in an `await` loop
+/// serializes the whole subtree beneath the operator — a parallel scan/join feeding
+/// an aggregate would execute on a single core. Spawning one task per partition lets
+/// the producers run concurrently across the tokio worker pool.
+///
+/// The total size is returned so the caller can decide whether the data fits within
+/// its memory budget or the spill path is required.
+pub(crate) async fn collect_input_partitions_concurrently(
+    input: &Arc<dyn PhysicalOperator>,
+) -> Result<(Vec<RecordBatch>, usize)> {
+    let input_partitions = input.output_partitions().max(1);
+
+    if input_partitions == 1 {
+        // Nothing to overlap — avoid the task-spawn round trip.
+        let stream = input.execute(0).await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        let size = batches.iter().map(estimate_batch_size).sum();
+        return Ok((batches, size));
+    }
+
+    let mut handles = Vec::with_capacity(input_partitions);
+    for part in 0..input_partitions {
+        let input = input.clone();
+        handles.push(tokio::spawn(async move {
+            let stream = input.execute(part).await?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await?;
+            let size: usize = batches.iter().map(estimate_batch_size).sum();
+            Ok::<_, QueryError>((batches, size))
+        }));
+    }
+
+    let mut all_batches = Vec::new();
+    let mut total_size = 0usize;
+    for handle in handles {
+        let (batches, size) = handle
+            .await
+            .map_err(|e| QueryError::Execution(format!("Partition task join error: {}", e)))??;
+        total_size += size;
+        all_batches.extend(batches);
+    }
+
+    Ok((all_batches, total_size))
+}
+
 // ============================================================================
 // Spillable Hash Join
 // ============================================================================
@@ -659,48 +707,12 @@ impl PhysicalOperator for SpillableHashAggregateExec {
             return Ok(Box::pin(stream::empty()));
         }
 
-        // Streaming collection: check memory incrementally and enter spill path early
-        let input_partitions = self.input.output_partitions().max(1);
-        let mut all_batches = Vec::new();
-        let mut total_size: usize = 0;
+        // Drain all input partitions concurrently so a parallel scan/join beneath this
+        // aggregate is not serialized onto a single core.
         let memory_threshold =
             (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
-        let mut exceeded = false;
-
-        for p in 0..input_partitions {
-            let input_stream = self.input.execute(p).await?;
-            let mut batch_stream = input_stream;
-            while let Some(batch) = batch_stream.try_next().await? {
-                let batch_mem = estimate_batch_size(&batch);
-                total_size += batch_mem;
-                all_batches.push(batch);
-
-                if total_size > memory_threshold {
-                    // Collect remaining from this stream
-                    let remaining: Vec<RecordBatch> = batch_stream.try_collect().await?;
-                    total_size += remaining
-                        .iter()
-                        .map(|b| estimate_batch_size(b))
-                        .sum::<usize>();
-                    all_batches.extend(remaining);
-                    exceeded = true;
-                    break;
-                }
-            }
-            if exceeded {
-                // Collect remaining partitions
-                for p2 in (p + 1)..input_partitions {
-                    let s = self.input.execute(p2).await?;
-                    let batches: Vec<RecordBatch> = s.try_collect().await?;
-                    total_size += batches
-                        .iter()
-                        .map(|b| estimate_batch_size(b))
-                        .sum::<usize>();
-                    all_batches.extend(batches);
-                }
-                break;
-            }
-        }
+        let (all_batches, total_size) = collect_input_partitions_concurrently(&self.input).await?;
+        let exceeded = total_size > memory_threshold;
 
         if !exceeded {
             // Data fits in memory — delegate to the proven HashAggregateExec
@@ -1023,47 +1035,12 @@ impl PhysicalOperator for ExternalSortExec {
             return Ok(Box::pin(stream::empty()));
         }
 
-        // Streaming collection: check memory incrementally and enter spill path early
-        let input_partitions = self.input.output_partitions().max(1);
-        let mut all_batches = Vec::new();
-        let mut total_size: usize = 0;
+        // Drain all input partitions concurrently so a parallel scan/join beneath this
+        // sort is not serialized onto a single core.
         let memory_threshold =
             (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
-        let mut exceeded = false;
-
-        for p in 0..input_partitions {
-            let input_stream = self.input.execute(p).await?;
-            let mut batch_stream = input_stream;
-            while let Some(batch) = batch_stream.try_next().await? {
-                let batch_mem = estimate_batch_size(&batch);
-                total_size += batch_mem;
-                all_batches.push(batch);
-
-                if total_size > memory_threshold {
-                    // Collect remaining from this stream
-                    let remaining: Vec<RecordBatch> = batch_stream.try_collect().await?;
-                    total_size += remaining
-                        .iter()
-                        .map(|b| estimate_batch_size(b))
-                        .sum::<usize>();
-                    all_batches.extend(remaining);
-                    exceeded = true;
-                    break;
-                }
-            }
-            if exceeded {
-                for p2 in (p + 1)..input_partitions {
-                    let s = self.input.execute(p2).await?;
-                    let batches: Vec<RecordBatch> = s.try_collect().await?;
-                    total_size += batches
-                        .iter()
-                        .map(|b| estimate_batch_size(b))
-                        .sum::<usize>();
-                    all_batches.extend(batches);
-                }
-                break;
-            }
-        }
+        let (all_batches, total_size) = collect_input_partitions_concurrently(&self.input).await?;
+        let exceeded = total_size > memory_threshold;
 
         if all_batches.is_empty() {
             return Ok(Box::pin(stream::empty()));
