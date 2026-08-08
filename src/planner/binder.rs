@@ -332,8 +332,17 @@ impl<'a> Binder<'a> {
 
         // 3. GROUP BY and aggregates
         let input_schema = plan.schema();
-        let (group_by, aggregates, aggregate_aliases, has_aggregates) =
+        let (group_by, mut aggregates, aggregate_aliases, mut has_aggregates) =
             self.extract_aggregates(&select.projection, &select.group_by, &input_schema)?;
+
+        // Also extract aggregates from HAVING clause (e.g., HAVING SUM(x) > 300)
+        if let Some(having) = &select.having {
+            let having_expr = self.bind_expr(having, &input_schema)?;
+            if having_expr.contains_aggregate() {
+                self.collect_aggregates(&having_expr, &mut aggregates);
+                has_aggregates = true;
+            }
+        }
 
         if has_aggregates || !group_by.is_empty() {
             let mut agg_fields = Vec::new();
@@ -496,8 +505,9 @@ impl<'a> Binder<'a> {
 
                     return Ok(LogicalPlan::SubqueryAlias(SubqueryAliasNode {
                         input: Arc::clone(cte_plan),
-                        alias: alias_name,
+                        alias: alias_name.clone(),
                         schema: aliased_schema,
+                        cte_name: Some(table_name.clone()),
                     }));
                 }
 
@@ -527,6 +537,7 @@ impl<'a> Binder<'a> {
                         input: Arc::new(scan),
                         alias: alias_name,
                         schema: aliased_schema,
+                        cte_name: None,
                     }))
                 } else {
                     Ok(scan)
@@ -554,6 +565,7 @@ impl<'a> Binder<'a> {
                     input: Arc::new(plan),
                     alias: alias_name,
                     schema: aliased_schema,
+                    cte_name: None,
                 }))
             }
             TableFactor::NestedJoin {

@@ -603,8 +603,23 @@ fn evaluate_case(
 
         result = Some(match result {
             Some(else_val) => {
-                // Use zip to select between then_value and else_val based on condition
-                zip(condition, &then_value, &else_val)?
+                // Coerce types if they differ (e.g., Int64 ELSE vs Float64 THEN)
+                let (then_arr, else_arr) = if then_value.data_type() != else_val.data_type() {
+                    let target = if then_value.data_type() == &arrow::datatypes::DataType::Float64
+                        || else_val.data_type() == &arrow::datatypes::DataType::Float64
+                    {
+                        arrow::datatypes::DataType::Float64
+                    } else {
+                        then_value.data_type().clone()
+                    };
+                    (
+                        arrow::compute::cast(&then_value, &target)?,
+                        arrow::compute::cast(&else_val, &target)?,
+                    )
+                } else {
+                    (then_value, else_val)
+                };
+                zip(condition, &then_arr, &else_arr)?
             }
             None => {
                 // No else, use null for false conditions

@@ -163,6 +163,7 @@ impl LogicalPlan {
                 input: children.into_iter().next().unwrap(),
                 alias: node.alias.clone(),
                 schema: node.schema.clone(),
+                cte_name: node.cte_name.clone(),
             }),
             LogicalPlan::DelimJoin(node) => {
                 let mut iter = children.into_iter();
@@ -437,6 +438,9 @@ pub struct SubqueryAliasNode {
     pub input: Arc<LogicalPlan>,
     pub alias: String,
     pub schema: PlanSchema,
+    /// If this alias is a CTE reference, the CTE name. Multiple SubqueryAlias nodes
+    /// with the same cte_name share the same underlying CTE and should be materialized once.
+    pub cte_name: Option<String>,
 }
 
 /// Empty relation node

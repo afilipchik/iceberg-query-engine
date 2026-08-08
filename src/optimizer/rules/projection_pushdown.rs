@@ -492,6 +492,7 @@ impl ProjectionPushdown {
                         input: Arc::new(input),
                         alias: node.alias.clone(),
                         schema: node.schema.clone(),
+                        cte_name: node.cte_name.clone(),
                     },
                 ))
             }

@@ -985,24 +985,46 @@ fn build_vectorized_agg_column(
             Ok(Arc::new(Int64Array::from(values)))
         }
         (AggregateFunction::Sum, DataType::Int64) => {
-            let values: Vec<i64> = gt.sums_i64[agg_idx][..num_groups].to_vec();
-            Ok(Arc::new(Int64Array::from(values)))
+            let mut builder = Int64Builder::with_capacity(num_groups);
+            for gid in 0..num_groups {
+                if gt.counts[agg_idx][gid] > 0 {
+                    builder.append_value(gt.sums_i64[agg_idx][gid]);
+                } else {
+                    builder.append_null();
+                }
+            }
+            Ok(Arc::new(builder.finish()))
         }
         (AggregateFunction::Sum, DataType::UInt64) => {
-            let values: Vec<u64> = gt.sums_i64[agg_idx][..num_groups]
-                .iter()
-                .map(|v| *v as u64)
-                .collect();
-            Ok(Arc::new(arrow::array::UInt64Array::from(values)))
+            let mut builder = UInt64Builder::with_capacity(num_groups);
+            for gid in 0..num_groups {
+                if gt.counts[agg_idx][gid] > 0 {
+                    builder.append_value(gt.sums_i64[agg_idx][gid] as u64);
+                } else {
+                    builder.append_null();
+                }
+            }
+            Ok(Arc::new(builder.finish()))
         }
         (AggregateFunction::Sum, DataType::Float64) => {
-            let values: Vec<f64> = gt.sums_f64[agg_idx][..num_groups].to_vec();
-            Ok(Arc::new(Float64Array::from(values)))
+            let mut builder = Float64Builder::with_capacity(num_groups);
+            for gid in 0..num_groups {
+                if gt.counts[agg_idx][gid] > 0 {
+                    builder.append_value(gt.sums_f64[agg_idx][gid]);
+                } else {
+                    builder.append_null();
+                }
+            }
+            Ok(Arc::new(builder.finish()))
         }
         (AggregateFunction::Sum, DataType::Decimal128(p, s)) => {
             let mut builder = Decimal128Builder::with_capacity(num_groups);
             for gid in 0..num_groups {
-                builder.append_value(gt.sums_i64[agg_idx][gid] as i128);
+                if gt.counts[agg_idx][gid] > 0 {
+                    builder.append_value(gt.sums_i64[agg_idx][gid] as i128);
+                } else {
+                    builder.append_null();
+                }
             }
             Ok(Arc::new(builder.finish().with_precision_and_scale(*p, *s)?))
         }
@@ -1245,6 +1267,7 @@ fn merge_accumulator_states(
             target.count += source.count;
         }
         AggregateFunction::Sum => {
+            target.count += source.count;
             target.sum += source.sum;
             target.sum_i64 = target.sum_i64.saturating_add(source.sum_i64);
         }
@@ -1374,21 +1397,30 @@ fn aggregate_scalar_simd(
             Arc::new(Int64Array::from(vec![count as i64]))
         }
         AggregateFunction::Sum => {
-            if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
-                // Use values() for iterator over non-null values
+            // SQL standard: SUM over empty set returns NULL, not 0
+            let non_null_count = input.len() - input.null_count();
+            if non_null_count == 0 {
+                // Return NULL for SUM of empty input
+                match input.data_type() {
+                    DataType::Int64 | DataType::Int32 => {
+                        Arc::new(Int64Array::from(vec![Option::<i64>::None]))
+                    }
+                    _ => Arc::new(Float64Array::from(vec![Option::<f64>::None])),
+                }
+            } else if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
                 let sum = a
-                    .values()
                     .iter()
-                    .fold(0i64, |acc, &x| acc.saturating_add(x));
+                    .flatten()
+                    .fold(0i64, |acc, x| acc.saturating_add(x));
                 Arc::new(Int64Array::from(vec![sum]))
             } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
-                let sum = a.values().iter().fold(0.0f64, |acc, &x| acc + x);
+                let sum = a.iter().flatten().fold(0.0f64, |acc, x| acc + x);
                 Arc::new(Float64Array::from(vec![sum]))
             } else if let Some(a) = input.as_any().downcast_ref::<arrow::array::Int32Array>() {
                 let sum = a
-                    .values()
                     .iter()
-                    .fold(0i64, |acc, &x| acc.saturating_add(x as i64));
+                    .flatten()
+                    .fold(0i64, |acc, x| acc.saturating_add(x as i64));
                 Arc::new(Int64Array::from(vec![sum]))
             } else {
                 return Err(QueryError::NotImplemented(format!(
@@ -1398,17 +1430,18 @@ fn aggregate_scalar_simd(
             }
         }
         AggregateFunction::Avg => {
-            if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
+            let non_null_count = input.len() - input.null_count();
+            if non_null_count == 0 {
+                Arc::new(Float64Array::from(vec![Option::<f64>::None]))
+            } else if let Some(a) = input.as_any().downcast_ref::<Int64Array>() {
                 let sum = a
-                    .values()
                     .iter()
-                    .fold(0i64, |acc, &x| acc.saturating_add(x));
-                let count = (a.len() - a.null_count()) as f64;
-                Arc::new(Float64Array::from(vec![sum as f64 / count.max(1.0)]))
+                    .flatten()
+                    .fold(0i64, |acc, x| acc.saturating_add(x));
+                Arc::new(Float64Array::from(vec![sum as f64 / non_null_count as f64]))
             } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
-                let sum = a.values().iter().fold(0.0f64, |acc, &x| acc + x);
-                let count = (a.len() - a.null_count()) as f64;
-                Arc::new(Float64Array::from(vec![sum / count.max(1.0)]))
+                let sum = a.iter().flatten().fold(0.0f64, |acc, x| acc + x);
+                Arc::new(Float64Array::from(vec![sum / non_null_count as f64]))
             } else {
                 return Err(QueryError::NotImplemented(format!(
                     "AVG not implemented for type {:?}",
@@ -2451,28 +2484,44 @@ fn build_agg_array(
         (AggregateFunction::Sum, DataType::Int64) => {
             let mut builder = Int64Builder::with_capacity(num_groups);
             for states in groups.values() {
-                builder.append_value(states[agg_idx].sum_i64);
+                if states[agg_idx].count > 0 {
+                    builder.append_value(states[agg_idx].sum_i64);
+                } else {
+                    builder.append_null();
+                }
             }
             Ok(Arc::new(builder.finish()))
         }
         (AggregateFunction::Sum, DataType::UInt64) => {
             let mut builder = UInt64Builder::with_capacity(num_groups);
             for states in groups.values() {
-                builder.append_value(states[agg_idx].sum_i64 as u64);
+                if states[agg_idx].count > 0 {
+                    builder.append_value(states[agg_idx].sum_i64 as u64);
+                } else {
+                    builder.append_null();
+                }
             }
             Ok(Arc::new(builder.finish()))
         }
         (AggregateFunction::Sum, DataType::Float64) => {
             let mut builder = Float64Builder::with_capacity(num_groups);
             for states in groups.values() {
-                builder.append_value(states[agg_idx].sum);
+                if states[agg_idx].count > 0 {
+                    builder.append_value(states[agg_idx].sum);
+                } else {
+                    builder.append_null();
+                }
             }
             Ok(Arc::new(builder.finish()))
         }
         (AggregateFunction::Sum, DataType::Decimal128(p, s)) => {
             let mut builder = Decimal128Builder::with_capacity(num_groups);
             for states in groups.values() {
-                builder.append_value(states[agg_idx].sum_i64 as i128);
+                if states[agg_idx].count > 0 {
+                    builder.append_value(states[agg_idx].sum_i64 as i128);
+                } else {
+                    builder.append_null();
+                }
             }
             Ok(Arc::new(builder.finish().with_precision_and_scale(*p, *s)?))
         }

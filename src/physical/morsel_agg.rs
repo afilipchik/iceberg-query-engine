@@ -1035,25 +1035,35 @@ impl AggregationState {
         }
     }
 
+    /// Check if a perfect hash slot has data.
+    /// For GROUP BY without aggregates (DISTINCT-like), check key_order instead.
+    fn slot_has_data(key: &GroupKey, accs: &[AccumulatorState]) -> bool {
+        // If there are no accumulators (GROUP BY without aggregates),
+        // check if the key slot was assigned (non-null key values)
+        if accs.is_empty() {
+            return !key.values.is_empty()
+                && !key.values.iter().all(|v| matches!(v, ScalarValue::Null));
+        }
+        accs.iter().any(|a| match a {
+            AccumulatorState::Count(c) => *c > 0,
+            AccumulatorState::Sum(s) => *s != 0.0,
+            AccumulatorState::SumInt(s) => *s != 0,
+            AccumulatorState::Avg { count, .. } => *count > 0,
+            AccumulatorState::Min(v) => v.is_some(),
+            AccumulatorState::Max(v) => v.is_some(),
+            AccumulatorState::BoolAnd(v) => v.is_some(),
+            AccumulatorState::BoolOr(v) => v.is_some(),
+            AccumulatorState::Variance { count, .. } => *count > 0,
+        })
+    }
+
     /// Drain perfect hash accumulators into the HashMap fallback
     fn drain_perfect_to_hashmap(&mut self) {
         for (idx, accs) in self.perfect_accs.drain(..).enumerate() {
             if idx < self.key_order.len() {
-                let key = self.key_order[idx].clone();
-                // Skip empty slots (all-null keys that were never assigned)
-                let has_data = accs.iter().any(|a| match a {
-                    AccumulatorState::Count(c) => *c > 0,
-                    AccumulatorState::Sum(s) => *s != 0.0,
-                    AccumulatorState::SumInt(s) => *s != 0,
-                    AccumulatorState::Avg { count, .. } => *count > 0,
-                    AccumulatorState::Min(v) => v.is_some(),
-                    AccumulatorState::Max(v) => v.is_some(),
-                    AccumulatorState::BoolAnd(v) => v.is_some(),
-                    AccumulatorState::BoolOr(v) => v.is_some(),
-                    AccumulatorState::Variance { count, .. } => *count > 0,
-                });
-                if has_data {
-                    self.groups.insert(key, accs);
+                let key = &self.key_order[idx];
+                if Self::slot_has_data(key, &accs) {
+                    self.groups.insert(key.clone(), accs);
                 }
             }
         }
@@ -1065,19 +1075,10 @@ impl AggregationState {
         // If other used perfect hash, merge into our perfect hash or groups
         if !other.overflowed && !other.perfect_accs.is_empty() {
             for (idx, other_accs) in other.perfect_accs.iter().enumerate() {
-                // Check if this slot has data
-                let has_data = other_accs.iter().any(|a| match a {
-                    AccumulatorState::Count(c) => *c > 0,
-                    AccumulatorState::Sum(s) => *s != 0.0,
-                    AccumulatorState::SumInt(s) => *s != 0,
-                    AccumulatorState::Avg { count, .. } => *count > 0,
-                    AccumulatorState::Min(v) => v.is_some(),
-                    AccumulatorState::Max(v) => v.is_some(),
-                    AccumulatorState::BoolAnd(v) => v.is_some(),
-                    AccumulatorState::BoolOr(v) => v.is_some(),
-                    AccumulatorState::Variance { count, .. } => *count > 0,
-                });
-                if !has_data {
+                if idx >= other.key_order.len() {
+                    continue;
+                }
+                if !Self::slot_has_data(&other.key_order[idx], other_accs) {
                     continue;
                 }
 
@@ -1111,6 +1112,11 @@ impl AggregationState {
                             acc.merge(other_acc);
                         }
                     } else {
+                        // Overflow just happened - drain perfect hash entries to HashMap
+                        // so they are not lost when build_output skips perfect_accs
+                        if !self.perfect_accs.is_empty() {
+                            self.drain_perfect_to_hashmap();
+                        }
                         // Cannot fit in perfect hash, use HashMap
                         let accs = self.groups.entry(key.clone()).or_insert_with(|| {
                             self.agg_funcs
@@ -1152,12 +1158,25 @@ impl AggregationState {
                                 .collect(),
                         );
                     }
+                    while self.key_order.len() <= our_idx {
+                        self.key_order.push(GroupKey {
+                            values: vec![
+                                ScalarValue::Null;
+                                self.num_group_cols.max(key.values.len())
+                            ],
+                        });
+                    }
+                    self.key_order[our_idx] = key.clone();
                     for (acc, other_acc) in
                         self.perfect_accs[our_idx].iter_mut().zip(other_accs.iter())
                     {
                         acc.merge(other_acc);
                     }
                     continue;
+                }
+                // Overflow just happened - drain perfect hash entries to HashMap
+                if !self.perfect_accs.is_empty() {
+                    self.drain_perfect_to_hashmap();
                 }
             }
 
@@ -1320,18 +1339,7 @@ impl AggregationState {
                 if idx >= self.key_order.len() {
                     continue;
                 }
-                let has_data = accs.iter().any(|a| match a {
-                    AccumulatorState::Count(c) => *c > 0,
-                    AccumulatorState::Sum(s) => *s != 0.0,
-                    AccumulatorState::SumInt(s) => *s != 0,
-                    AccumulatorState::Avg { count, .. } => *count > 0,
-                    AccumulatorState::Min(v) => v.is_some(),
-                    AccumulatorState::Max(v) => v.is_some(),
-                    AccumulatorState::BoolAnd(v) => v.is_some(),
-                    AccumulatorState::BoolOr(v) => v.is_some(),
-                    AccumulatorState::Variance { count, .. } => *count > 0,
-                });
-                if has_data {
+                if Self::slot_has_data(&self.key_order[idx], accs) {
                     all_groups.push((&self.key_order[idx], accs));
                 }
             }

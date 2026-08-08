@@ -436,9 +436,13 @@ impl TpchGenerator {
         let base_date = 8035;
         let date_range = 2557; // About 7 years
 
+        // Per TPC-H spec, o_custkey is drawn from a range 1.5x the customer count.
+        // This means ~1/3 of customer keys in orders don't correspond to actual customers,
+        // and some real customers will have no orders (needed for Q22's NOT EXISTS).
+        let custkey_range = (cust_count as f64 * 1.5) as i64;
         for i in 0..count {
             o_orderkey.push((i + 1) as i64);
-            o_custkey.push(((i % cust_count) + 1) as i64);
+            o_custkey.push(self.rng.gen_range(1..=custkey_range));
             o_orderstatus.append_value(status[i % 3].to_string());
             o_totalprice.push(self.rng.gen_range(1000.0..500000.0));
             o_orderdate.push(base_date + self.rng.gen_range(0..date_range));

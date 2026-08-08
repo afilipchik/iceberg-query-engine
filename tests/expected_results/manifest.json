@@ -8,9 +8,9 @@
   },
   {
     "id": "tpch/q02",
-    "sql": "SELECT\n    s_acctbal,\n    s_name,\n    n_name,\n    p_partkey,\n    p_mfgr,\n    s_address,\n    s_phone,\n    s_comment\nFROM\n    part,\n    supplier,\n    partsupp,\n    nation,\n    region\nWHERE\n    p_partkey = ps_partkey\n    AND s_suppkey = ps_suppkey\n    AND p_size = 15\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'EUROPE'\nORDER BY\n    s_acctbal DESC,\n    n_name,\n    s_name,\n    p_partkey\nLIMIT 100",
+    "sql": "SELECT\n    s_acctbal,\n    s_name,\n    n_name,\n    p_partkey,\n    p_mfgr,\n    s_address,\n    s_phone,\n    s_comment\nFROM\n    part,\n    supplier,\n    partsupp,\n    nation,\n    region\nWHERE\n    p_partkey = ps_partkey\n    AND s_suppkey = ps_suppkey\n    AND p_size = 15\n    AND p_type LIKE '%BRASS'\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'EUROPE'\n    AND ps_supplycost = (\n        SELECT MIN(ps_supplycost)\n        FROM partsupp, supplier, nation, region\n        WHERE\n            p_partkey = ps_partkey\n            AND s_suppkey = ps_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_regionkey = r_regionkey\n            AND r_name = 'EUROPE'\n    )\nORDER BY\n    s_acctbal DESC,\n    n_name,\n    s_name,\n    p_partkey\nLIMIT 100",
     "ordered": true,
-    "row_count": 4,
+    "row_count": 1,
     "file": "tpch/q02.csv"
   },
   {
@@ -22,7 +22,7 @@
   },
   {
     "id": "tpch/q04",
-    "sql": "SELECT\n    o_orderpriority,\n    COUNT(*) AS order_count\nFROM\n    orders\nWHERE\n    o_orderdate >= DATE '1993-07-01'\n    AND o_orderdate < DATE '1993-10-01'\nGROUP BY\n    o_orderpriority\nORDER BY\n    o_orderpriority",
+    "sql": "SELECT\n    o_orderpriority,\n    COUNT(*) AS order_count\nFROM\n    orders\nWHERE\n    o_orderdate >= DATE '1993-07-01'\n    AND o_orderdate < DATE '1993-10-01'\n    AND EXISTS (\n        SELECT *\n        FROM lineitem\n        WHERE l_orderkey = o_orderkey\n        AND l_commitdate < l_receiptdate\n    )\nGROUP BY\n    o_orderpriority\nORDER BY\n    o_orderpriority",
     "ordered": true,
     "row_count": 5,
     "file": "tpch/q04.csv"
@@ -87,12 +87,12 @@
     "id": "tpch/q13",
     "sql": "SELECT\n    c_count,\n    COUNT(*) AS custdist\nFROM (\n    SELECT\n        c_custkey,\n        COUNT(o_orderkey) AS c_count\n    FROM\n        customer\n        LEFT OUTER JOIN orders ON c_custkey = o_custkey\n    GROUP BY\n        c_custkey\n) AS c_orders\nGROUP BY\n    c_count\nORDER BY\n    custdist DESC,\n    c_count DESC\nLIMIT 100",
     "ordered": true,
-    "row_count": 1,
+    "row_count": 12,
     "file": "tpch/q13.csv"
   },
   {
     "id": "tpch/q14",
-    "sql": "SELECT\n    SUM(l_extendedprice * (1 - l_discount)) AS promo_revenue\nFROM\n    lineitem,\n    part\nWHERE\n    l_partkey = p_partkey\n    AND l_shipdate >= DATE '1995-09-01'\n    AND l_shipdate < DATE '1995-10-01'",
+    "sql": "SELECT\n    100.00 * SUM(CASE WHEN p_type LIKE 'PROMO%' THEN l_extendedprice * (1 - l_discount) ELSE 0 END) / SUM(l_extendedprice * (1 - l_discount)) AS promo_revenue\nFROM\n    lineitem,\n    part\nWHERE\n    l_partkey = p_partkey\n    AND l_shipdate >= DATE '1995-09-01'\n    AND l_shipdate < DATE '1995-10-01'",
     "ordered": false,
     "row_count": 1,
     "file": "tpch/q14.csv"
@@ -106,9 +106,9 @@
   },
   {
     "id": "tpch/q16",
-    "sql": "SELECT\n    p_brand,\n    p_type,\n    p_size,\n    COUNT(ps_suppkey) AS supplier_cnt\nFROM\n    partsupp,\n    part\nWHERE\n    p_partkey = ps_partkey\n    AND p_brand <> 'Brand#45'\n    AND p_size >= 1\nGROUP BY\n    p_brand,\n    p_type,\n    p_size\nORDER BY\n    supplier_cnt DESC,\n    p_brand,\n    p_type,\n    p_size\nLIMIT 100",
+    "sql": "SELECT\n    p_brand,\n    p_type,\n    p_size,\n    COUNT(DISTINCT ps_suppkey) AS supplier_cnt\nFROM\n    partsupp,\n    part\nWHERE\n    p_partkey = ps_partkey\n    AND p_brand <> 'Brand#45'\n    AND p_type NOT LIKE 'MEDIUM POLISHED%'\n    AND p_size IN (49, 14, 23, 45, 19, 3, 36, 9)\n    AND ps_suppkey NOT IN (\n        SELECT s_suppkey\n        FROM supplier\n        WHERE s_comment LIKE '%Customer%Complaints%'\n    )\nGROUP BY\n    p_brand,\n    p_type,\n    p_size\nORDER BY\n    supplier_cnt DESC,\n    p_brand,\n    p_type,\n    p_size",
     "ordered": true,
-    "row_count": 100,
+    "row_count": 25,
     "file": "tpch/q16.csv"
   },
   {
@@ -120,14 +120,14 @@
   },
   {
     "id": "tpch/q18",
-    "sql": "SELECT\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice,\n    SUM(l_quantity) AS total_quantity\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    c_custkey = o_custkey\n    AND o_orderkey = l_orderkey\nGROUP BY\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice\nORDER BY\n    o_totalprice DESC,\n    o_orderdate\nLIMIT 100",
+    "sql": "SELECT\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice,\n    SUM(l_quantity) AS total_quantity\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    o_orderkey IN (\n        SELECT l_orderkey\n        FROM lineitem\n        GROUP BY l_orderkey\n        HAVING SUM(l_quantity) > 300\n    )\n    AND c_custkey = o_custkey\n    AND o_orderkey = l_orderkey\nGROUP BY\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice\nORDER BY\n    o_totalprice DESC,\n    o_orderdate\nLIMIT 100",
     "ordered": true,
-    "row_count": 100,
+    "row_count": 41,
     "file": "tpch/q18.csv"
   },
   {
     "id": "tpch/q19",
-    "sql": "SELECT\n    SUM(l_extendedprice * (1 - l_discount)) AS revenue\nFROM\n    lineitem,\n    part\nWHERE\n    p_partkey = l_partkey\n    AND (\n        (p_brand = 'Brand#12'\n        AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')\n        AND l_quantity >= 1 AND l_quantity <= 11)\n        OR (p_brand = 'Brand#23'\n        AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')\n        AND l_quantity >= 10 AND l_quantity <= 20)\n        OR (p_brand = 'Brand#34'\n        AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')\n        AND l_quantity >= 20 AND l_quantity <= 30)\n    )\n    AND (\n        (p_brand = 'Brand#12' AND l_shipmode IN ('AIR', 'AIR REG'))\n        OR (p_brand = 'Brand#23' AND l_shipmode IN ('AIR', 'AIR REG'))\n        OR (p_brand = 'Brand#34' AND l_shipmode IN ('AIR', 'AIR REG'))\n    )",
+    "sql": "SELECT\n    SUM(l_extendedprice * (1 - l_discount)) AS revenue\nFROM\n    lineitem,\n    part\nWHERE\n    (\n        p_partkey = l_partkey\n        AND p_brand = 'Brand#12'\n        AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')\n        AND l_quantity >= 1 AND l_quantity <= 11\n        AND p_size BETWEEN 1 AND 5\n        AND l_shipmode IN ('AIR', 'AIR REG')\n        AND l_shipinstruct = 'DELIVER IN PERSON'\n    ) OR (\n        p_partkey = l_partkey\n        AND p_brand = 'Brand#23'\n        AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')\n        AND l_quantity >= 10 AND l_quantity <= 20\n        AND p_size BETWEEN 1 AND 10\n        AND l_shipmode IN ('AIR', 'AIR REG')\n        AND l_shipinstruct = 'DELIVER IN PERSON'\n    ) OR (\n        p_partkey = l_partkey\n        AND p_brand = 'Brand#34'\n        AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')\n        AND l_quantity >= 20 AND l_quantity <= 30\n        AND p_size BETWEEN 1 AND 15\n        AND l_shipmode IN ('AIR', 'AIR REG')\n        AND l_shipinstruct = 'DELIVER IN PERSON'\n    )",
     "ordered": false,
     "row_count": 1,
     "file": "tpch/q19.csv"

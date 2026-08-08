@@ -98,6 +98,7 @@ fn decorrelate_plan(plan: &LogicalPlan) -> Result<LogicalPlan> {
                 input: Arc::new(new_input),
                 alias: node.alias.clone(),
                 schema: node.schema.clone(),
+                cte_name: node.cte_name.clone(),
             })
         }
         _ => plan.clone(),

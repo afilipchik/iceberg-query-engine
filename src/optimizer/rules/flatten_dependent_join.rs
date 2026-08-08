@@ -109,6 +109,7 @@ fn flatten_plan(plan: &LogicalPlan) -> Result<LogicalPlan> {
                 input: Arc::new(new_input),
                 alias: node.alias.clone(),
                 schema: node.schema.clone(),
+                cte_name: node.cte_name.clone(),
             })
         }
         LogicalPlan::Union(node) => {

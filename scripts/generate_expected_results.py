@@ -72,9 +72,20 @@ WHERE
     p_partkey = ps_partkey
     AND s_suppkey = ps_suppkey
     AND p_size = 15
+    AND p_type LIKE '%BRASS'
     AND s_nationkey = n_nationkey
     AND n_regionkey = r_regionkey
     AND r_name = 'EUROPE'
+    AND ps_supplycost = (
+        SELECT MIN(ps_supplycost)
+        FROM partsupp, supplier, nation, region
+        WHERE
+            p_partkey = ps_partkey
+            AND s_suppkey = ps_suppkey
+            AND s_nationkey = n_nationkey
+            AND n_regionkey = r_regionkey
+            AND r_name = 'EUROPE'
+    )
 ORDER BY
     s_acctbal DESC,
     n_name,
@@ -118,6 +129,12 @@ FROM
 WHERE
     o_orderdate >= DATE '1993-07-01'
     AND o_orderdate < DATE '1993-10-01'
+    AND EXISTS (
+        SELECT *
+        FROM lineitem
+        WHERE l_orderkey = o_orderkey
+        AND l_commitdate < l_receiptdate
+    )
 GROUP BY
     o_orderpriority
 ORDER BY
@@ -371,7 +388,7 @@ LIMIT 100
 
     queries.append(("tpch/q14", """
 SELECT
-    SUM(l_extendedprice * (1 - l_discount)) AS promo_revenue
+    100.00 * SUM(CASE WHEN p_type LIKE 'PROMO%' THEN l_extendedprice * (1 - l_discount) ELSE 0.0 END) / SUM(l_extendedprice * (1 - l_discount)) AS promo_revenue
 FROM
     lineitem,
     part
@@ -418,14 +435,20 @@ SELECT
     p_brand,
     p_type,
     p_size,
-    COUNT(ps_suppkey) AS supplier_cnt
+    COUNT(DISTINCT ps_suppkey) AS supplier_cnt
 FROM
     partsupp,
     part
 WHERE
     p_partkey = ps_partkey
     AND p_brand <> 'Brand#45'
-    AND p_size >= 1
+    AND p_type NOT LIKE 'MEDIUM POLISHED%'
+    AND p_size IN (49, 14, 23, 45, 19, 3, 36, 9)
+    AND ps_suppkey NOT IN (
+        SELECT s_suppkey
+        FROM supplier
+        WHERE s_comment LIKE '%Customer%Complaints%'
+    )
 GROUP BY
     p_brand,
     p_type,
@@ -435,7 +458,6 @@ ORDER BY
     p_brand,
     p_type,
     p_size
-LIMIT 100
 """, True))
 
     queries.append(("tpch/q17", """
@@ -468,7 +490,13 @@ FROM
     orders,
     lineitem
 WHERE
-    c_custkey = o_custkey
+    o_orderkey IN (
+        SELECT l_orderkey
+        FROM lineitem
+        GROUP BY l_orderkey
+        HAVING SUM(l_quantity) > 300
+    )
+    AND c_custkey = o_custkey
     AND o_orderkey = l_orderkey
 GROUP BY
     c_name,
@@ -489,22 +517,30 @@ FROM
     lineitem,
     part
 WHERE
-    p_partkey = l_partkey
-    AND (
-        (p_brand = 'Brand#12'
+    (
+        p_partkey = l_partkey
+        AND p_brand = 'Brand#12'
         AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')
-        AND l_quantity >= 1 AND l_quantity <= 11)
-        OR (p_brand = 'Brand#23'
+        AND l_quantity >= 1 AND l_quantity <= 11
+        AND p_size BETWEEN 1 AND 5
+        AND l_shipmode IN ('AIR', 'AIR REG')
+        AND l_shipinstruct = 'DELIVER IN PERSON'
+    ) OR (
+        p_partkey = l_partkey
+        AND p_brand = 'Brand#23'
         AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')
-        AND l_quantity >= 10 AND l_quantity <= 20)
-        OR (p_brand = 'Brand#34'
+        AND l_quantity >= 10 AND l_quantity <= 20
+        AND p_size BETWEEN 1 AND 10
+        AND l_shipmode IN ('AIR', 'AIR REG')
+        AND l_shipinstruct = 'DELIVER IN PERSON'
+    ) OR (
+        p_partkey = l_partkey
+        AND p_brand = 'Brand#34'
         AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')
-        AND l_quantity >= 20 AND l_quantity <= 30)
-    )
-    AND (
-        (p_brand = 'Brand#12' AND l_shipmode IN ('AIR', 'AIR REG'))
-        OR (p_brand = 'Brand#23' AND l_shipmode IN ('AIR', 'AIR REG'))
-        OR (p_brand = 'Brand#34' AND l_shipmode IN ('AIR', 'AIR REG'))
+        AND l_quantity >= 20 AND l_quantity <= 30
+        AND p_size BETWEEN 1 AND 15
+        AND l_shipmode IN ('AIR', 'AIR REG')
+        AND l_shipinstruct = 'DELIVER IN PERSON'
     )
 """, False))
 
