@@ -60,36 +60,43 @@ pub(crate) fn merge_states_to_batches(
     const PARALLEL_MERGE_MIN_GROUPS: usize = 65_536;
     let total_groups: usize = states.iter().map(|s| s.group_count()).sum();
 
-    if states.len() > 1 && total_groups > PARALLEL_MERGE_MIN_GROUPS {
-        let p = rayon::current_num_threads().clamp(2, 64);
-        let per_state_shards: Vec<_> = states
-            .into_par_iter()
-            .map(|s| s.into_shards(p))
-            .collect::<Vec<_>>();
-
-        let mut shard_major: Vec<Vec<_>> = (0..p).map(|_| Vec::new()).collect();
-        for state_shards in per_state_shards {
-            for (pi, shard) in state_shards.into_iter().enumerate() {
-                shard_major[pi].push(shard);
+    // Full-raw pipeline for a single integer group column: shard, merge, and
+    // build output on raw u64 keys. The GroupKey pipeline converts every group
+    // to Vec<ScalarValue> and re-hashes it during the shard merge — profiling
+    // Q18's 15M-group aggregate showed merge_entries_into_map +
+    // build_scalar_array_ref dominating the whole query.
+    let num_group_cols = schema.fields().len() - agg_funcs.len();
+    let raw_dt = if num_group_cols == 1 {
+        match schema.field(0).data_type() {
+            DataType::Int64 | DataType::Int32 | DataType::Date32 => {
+                Some(schema.field(0).data_type().clone())
             }
+            _ => None,
         }
+    } else {
+        None
+    };
+    if let (Some(dt), true) = (raw_dt, total_groups > PARALLEL_MERGE_MIN_GROUPS) {
+        let mut prepared = Vec::with_capacity(states.len());
+        let mut all_raw = true;
+        for mut st in states {
+            st.raw_type = Some(dt.clone());
+            st.drain_perfect_to_hashmap();
+            st.normalize_raw();
+            if !st.groups.is_empty() {
+                all_raw = false;
+            }
+            prepared.push(st);
+        }
+        if all_raw {
+            return merge_raw_states_to_batches(prepared, agg_funcs, input_types, &dt, schema);
+        }
+        // Fall through: into_shards handles mixed raw/GroupKey states.
+        return merge_states_groupkey(prepared, agg_funcs, input_types, schema);
+    }
 
-        let batches: Vec<RecordBatch> = shard_major
-            .into_par_iter()
-            .map(|lists| {
-                let map = merge_entries_into_map(lists);
-                if map.is_empty() {
-                    return Ok(None);
-                }
-                let state =
-                    AggregationState::from_groups(agg_funcs.to_vec(), input_types.to_vec(), map);
-                state.build_output(schema).map(Some)
-            })
-            .collect::<Result<Vec<Option<RecordBatch>>>>()?
-            .into_iter()
-            .flatten()
-            .collect();
-        return Ok(batches);
+    if states.len() > 1 && total_groups > PARALLEL_MERGE_MIN_GROUPS {
+        return merge_states_groupkey(states, agg_funcs, input_types, schema);
     }
 
     let mut final_state = AggregationState::new(agg_funcs.to_vec(), input_types.to_vec());
@@ -97,6 +104,128 @@ pub(crate) fn merge_states_to_batches(
         final_state.merge(&state);
     }
     Ok(vec![final_state.build_output(schema)?])
+}
+
+/// GroupKey-based parallel shard merge (multi-column or non-integer keys).
+fn merge_states_groupkey(
+    states: Vec<AggregationState>,
+    agg_funcs: &[AggregateFunction],
+    input_types: &[DataType],
+    schema: &SchemaRef,
+) -> Result<Vec<RecordBatch>> {
+    let p = rayon::current_num_threads().clamp(2, 64);
+    let per_state_shards: Vec<_> = states
+        .into_par_iter()
+        .map(|s| s.into_shards(p))
+        .collect::<Vec<_>>();
+
+    let mut shard_major: Vec<Vec<_>> = (0..p).map(|_| Vec::new()).collect();
+    for state_shards in per_state_shards {
+        for (pi, shard) in state_shards.into_iter().enumerate() {
+            shard_major[pi].push(shard);
+        }
+    }
+
+    let batches: Vec<RecordBatch> = shard_major
+        .into_par_iter()
+        .map(|lists| {
+            let map = merge_entries_into_map(lists);
+            if map.is_empty() {
+                return Ok(None);
+            }
+            let state =
+                AggregationState::from_groups(agg_funcs.to_vec(), input_types.to_vec(), map);
+            state.build_output(schema).map(Some)
+        })
+        .collect::<Result<Vec<Option<RecordBatch>>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    Ok(batches)
+}
+
+/// Raw-u64 parallel shard merge: no GroupKey materialization anywhere.
+fn merge_raw_states_to_batches(
+    states: Vec<AggregationState>,
+    agg_funcs: &[AggregateFunction],
+    input_types: &[DataType],
+    raw_type: &DataType,
+    schema: &SchemaRef,
+) -> Result<Vec<RecordBatch>> {
+    let p = rayon::current_num_threads().clamp(2, 64);
+
+    // Null-group accumulators merged across states up front
+    let mut raw_null: Option<Vec<AccumulatorState>> = None;
+    let mut sharded_states: Vec<Vec<Vec<(u64, Vec<AccumulatorState>)>>> =
+        Vec::with_capacity(states.len());
+    for mut st in states {
+        if let Some(n) = st.raw_null.take() {
+            match &mut raw_null {
+                Some(existing) => {
+                    for (a, b) in existing.iter_mut().zip(n.iter()) {
+                        a.merge(b);
+                    }
+                }
+                None => raw_null = Some(n),
+            }
+        }
+        sharded_states.push(st.into_raw_shards(p));
+    }
+
+    let mut shard_major: Vec<Vec<_>> = (0..p).map(|_| Vec::new()).collect();
+    for state_shards in sharded_states {
+        for (pi, shard) in state_shards.into_iter().enumerate() {
+            shard_major[pi].push(shard);
+        }
+    }
+
+    let mut batches: Vec<RecordBatch> = shard_major
+        .into_par_iter()
+        .map(|lists| {
+            let cap: usize = lists.iter().map(|l| l.len()).sum();
+            if cap == 0 {
+                return Ok(None);
+            }
+            let mut map: HashMap<u64, Vec<AccumulatorState>> = HashMap::with_capacity(cap);
+            for list in lists {
+                for (key, accs) in list {
+                    match map.entry(key) {
+                        hashbrown::hash_map::Entry::Occupied(mut e) => {
+                            for (a, b) in e.get_mut().iter_mut().zip(accs.iter()) {
+                                a.merge(b);
+                            }
+                        }
+                        hashbrown::hash_map::Entry::Vacant(v) => {
+                            v.insert(accs);
+                        }
+                    }
+                }
+            }
+            let state = AggregationState::from_raw_groups(
+                agg_funcs.to_vec(),
+                input_types.to_vec(),
+                raw_type.clone(),
+                map,
+                None,
+            );
+            state.build_output(schema).map(Some)
+        })
+        .collect::<Result<Vec<Option<RecordBatch>>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    if let Some(null_accs) = raw_null {
+        let state = AggregationState::from_raw_groups(
+            agg_funcs.to_vec(),
+            input_types.to_vec(),
+            raw_type.clone(),
+            HashMap::new(),
+            Some(null_accs),
+        );
+        batches.push(state.build_output(schema)?);
+    }
+    Ok(batches)
 }
 
 /// Raw-key classification for normalize_raw / scalar_to_raw.
@@ -1383,6 +1512,34 @@ impl AggregationState {
         shards
     }
 
+    /// Shard raw-keyed groups by multiplicative hash of the u64 key.
+    /// Caller must have drained perfect entries and normalized to raw first.
+    pub(crate) fn into_raw_shards(mut self, p: usize) -> Vec<Vec<(u64, Vec<AccumulatorState>)>> {
+        let mut shards: Vec<Vec<(u64, Vec<AccumulatorState>)>> =
+            (0..p).map(|_| Vec::new()).collect();
+        for (raw, accs) in self.raw_groups.drain() {
+            let h = raw.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            shards[(h >> 33) as usize % p].push((raw, accs));
+        }
+        shards
+    }
+
+    /// Build a state holding pre-merged RAW groups (raw merge output path).
+    pub(crate) fn from_raw_groups(
+        agg_funcs: Vec<AggregateFunction>,
+        input_types: Vec<DataType>,
+        raw_type: DataType,
+        raw_groups: HashMap<u64, Vec<AccumulatorState>>,
+        raw_null: Option<Vec<AccumulatorState>>,
+    ) -> Self {
+        let mut state = Self::new(agg_funcs, input_types);
+        state.overflowed = true;
+        state.raw_type = Some(raw_type);
+        state.raw_groups = raw_groups;
+        state.raw_null = raw_null;
+        state
+    }
+
     /// Build a state that holds pre-merged groups (parallel merge output path).
     pub(crate) fn from_groups(
         agg_funcs: Vec<AggregateFunction>,
@@ -1696,6 +1853,17 @@ impl AggregationState {
     pub fn build_output(&self, schema: &SchemaRef) -> Result<RecordBatch> {
         let num_group_cols = schema.fields().len() - self.agg_funcs.len();
 
+        // Raw-direct fast path: single integer group column with all groups in
+        // the raw map — build the key array straight from the u64 keys and the
+        // aggregate arrays from the accumulators, no ScalarValue per group.
+        if num_group_cols == 1
+            && !self.raw_groups.is_empty()
+            && self.groups.is_empty()
+            && (self.overflowed || self.perfect_accs.is_empty())
+        {
+            return self.build_output_raw(schema);
+        }
+
         // Collect all groups from perfect hash, HashMap, and raw maps.
         // Raw keys are materialized as GroupKeys once, here at output time.
         let raw_keys: Vec<GroupKey> = self
@@ -1761,6 +1929,68 @@ impl AggregationState {
             let field = schema.field(num_group_cols + agg_idx);
             let array = build_scalar_array(&values, field.data_type())?;
             arrays.push(array);
+        }
+
+        RecordBatch::try_new(schema.clone(), arrays)
+            .map_err(|e| QueryError::Execution(format!("Failed to build output batch: {}", e)))
+    }
+
+    /// build_output specialization for raw-keyed single-int-column states.
+    fn build_output_raw(&self, schema: &SchemaRef) -> Result<RecordBatch> {
+        let entries: Vec<(u64, &Vec<AccumulatorState>)> =
+            self.raw_groups.iter().map(|(k, v)| (*k, v)).collect();
+        let has_null = self.raw_null.is_some();
+        let num_groups = entries.len() + usize::from(has_null);
+
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+
+        // Key column directly from raw bit patterns
+        let key_array: ArrayRef = match schema.field(0).data_type() {
+            DataType::Int32 => {
+                let mut b = Int32Builder::with_capacity(num_groups);
+                for (raw, _) in &entries {
+                    b.append_value(*raw as i64 as i32);
+                }
+                if has_null {
+                    b.append_null();
+                }
+                Arc::new(b.finish())
+            }
+            DataType::Date32 => {
+                let mut b = arrow::array::Date32Builder::with_capacity(num_groups);
+                for (raw, _) in &entries {
+                    b.append_value(*raw as i64 as i32);
+                }
+                if has_null {
+                    b.append_null();
+                }
+                Arc::new(b.finish())
+            }
+            _ => {
+                let mut b = Int64Builder::with_capacity(num_groups);
+                for (raw, _) in &entries {
+                    b.append_value(*raw as i64);
+                }
+                if has_null {
+                    b.append_null();
+                }
+                Arc::new(b.finish())
+            }
+        };
+        arrays.push(key_array);
+
+        // Aggregate columns
+        for agg_idx in 0..self.agg_funcs.len() {
+            let func = &self.agg_funcs[agg_idx];
+            let mut values: Vec<ScalarValue> = Vec::with_capacity(num_groups);
+            for (_, accs) in &entries {
+                values.push(accs[agg_idx].finalize(func));
+            }
+            if let Some(null_accs) = &self.raw_null {
+                values.push(null_accs[agg_idx].finalize(func));
+            }
+            let field = schema.field(1 + agg_idx);
+            arrays.push(build_scalar_array(&values, field.data_type())?);
         }
 
         RecordBatch::try_new(schema.clone(), arrays)

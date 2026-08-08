@@ -124,6 +124,14 @@ enum Commands {
 
 #[tokio::main]
 async fn main() {
+    // Allow any same-user process to attach a debugger/sampler when requested
+    // (yama ptrace_scope=1 otherwise restricts attach to ancestors).
+    if std::env::var("QUERY_PTRACE_ANY").is_ok() {
+        unsafe {
+            libc::prctl(libc::PR_SET_PTRACER, -1i64, 0, 0, 0);
+        }
+    }
+
     // Set up logging
     tracing_subscriber::fmt()
         .with_env_filter(

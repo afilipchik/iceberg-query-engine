@@ -2349,6 +2349,7 @@ dependencies = [
  "hex",
  "hmac",
  "itertools 0.13.0",
+ "libc",
  "md-5",
  "num-traits",
  "num_cpus",
