@@ -738,11 +738,15 @@ Based on the codebase structure, these appear to be planned but not fully implem
 
 ## TPC-H Benchmark Status (SF=10, 2026-08-08, 48G cgroup)
 
-Log: `logs/safe_benchmark_20260808_050120.log`. Spec queries, spec-generator data.
-**22/22 pass the benchmark runner; 21.6s vs native-table DuckDB 2.94s (7.3x); 15/22 within 10x.**
-**Like-for-like (DuckDB reading the SAME parquet via views, 4.47s total): 4.83x
+Log: `logs/safe_benchmark_20260808_052416.log`. Spec queries, spec-generator data.
+**22/22 pass the benchmark runner; 17.9s vs native-table DuckDB 2.94s (6.1x); 16/22 within 10x.**
+**Like-for-like (DuckDB reading the SAME parquet via views, ~4.47s total): ~4.0x
 aggregate and ALL 22 queries within 10x.** All 22 queries validate CELL-EXACT
-against DuckDB at SF=10 (see scripts + memory).
+against DuckDB at SF=10 after every change (scripts/generate_expected_results.py
+queries + --save-csv + DuckDB views; see memory).
+Key recent execution changes: unfiltered single-use parquet scans stream lazily
+per row group (StreamingParquetScanExec — decode overlaps consumers); identity
+probe indices skip the probe-side take; raw u64 group keys end-to-end.
 Like-for-like (DuckDB reading the SAME parquet files via views: 4.49s total):
 **5.2x aggregate, every query within 10x except Q11.**
 
