@@ -322,6 +322,25 @@ impl ParquetTable {
         let path = path.to_path_buf();
         let projection = projection.map(|p| p.to_vec());
 
+        // Row-filter pushdown: decode predicate columns first, materialize the
+        // remaining columns only for matching rows. The FilterExec above the
+        // scan re-checks survivors, so partial pushdown stays correct.
+        let row_filter_spec: Option<(crate::planner::Expr, Vec<usize>)> = filter.and_then(|expr| {
+            let mut cols: Vec<String> = Vec::new();
+            crate::physical::morsel::collect_expr_columns(expr, &mut cols);
+            if cols.is_empty() {
+                return None;
+            }
+            let mut indices = Vec::with_capacity(cols.len());
+            for c in &cols {
+                let idx = schema.fields().iter().position(|f| f.name() == c)?;
+                if !indices.contains(&idx) {
+                    indices.push(idx);
+                }
+            }
+            Some((expr.clone(), indices))
+        });
+
         let read_row_group =
             |rg_idx: usize| -> std::result::Result<Vec<RecordBatch>, arrow::error::ArrowError> {
                 let file = File::open(&path)
@@ -330,6 +349,30 @@ impl ParquetTable {
                     .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))?;
 
                 let builder = builder.with_batch_size(8_192).with_row_groups(vec![rg_idx]);
+
+                let builder = if let Some((expr, indices)) = &row_filter_spec {
+                    use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter};
+                    let mask = parquet::arrow::ProjectionMask::roots(
+                        builder.parquet_schema(),
+                        indices.iter().copied(),
+                    );
+                    let expr = expr.clone();
+                    let pred = ArrowPredicateFn::new(mask, move |batch: RecordBatch| {
+                        let arr = crate::physical::operators::evaluate_expr(&batch, &expr)
+                            .map_err(|e| arrow::error::ArrowError::ComputeError(e.to_string()))?;
+                        arr.as_any()
+                            .downcast_ref::<arrow::array::BooleanArray>()
+                            .cloned()
+                            .ok_or_else(|| {
+                                arrow::error::ArrowError::ComputeError(
+                                    "row filter did not evaluate to boolean".into(),
+                                )
+                            })
+                    });
+                    builder.with_row_filter(RowFilter::new(vec![Box::new(pred)]))
+                } else {
+                    builder
+                };
 
                 let reader = if let Some(ref indices) = projection {
                     let mask = parquet::arrow::ProjectionMask::roots(

@@ -119,7 +119,13 @@ impl PhysicalOperator for MorselAggregateExec {
         let group_by_exprs = self.group_by.clone();
         let agg_input_exprs: Vec<Expr> = self.aggregates.iter().map(|a| a.input.clone()).collect();
         let agg_funcs: Vec<AggregateFunction> = self.aggregates.iter().map(|a| a.func).collect();
-        let filter_expr = self.filter.clone();
+        // When the filter was pushed into the parquet decoder (RowFilter),
+        // re-applying it here would be wasted work.
+        let filter_expr = if source.filter_pushed_down() {
+            None
+        } else {
+            self.filter.clone()
+        };
         let output_schema = self.schema.clone();
 
         // Execute in parallel - each thread processes morsels and maintains its own hash table

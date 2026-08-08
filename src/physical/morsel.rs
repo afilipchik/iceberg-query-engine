@@ -73,6 +73,9 @@ pub struct ParallelParquetSource {
     completed: AtomicUsize,
     /// Total number of row groups
     total_row_groups: usize,
+    /// Filter to push into the parquet decoder as an arrow RowFilter.
+    /// Some((expr, column indices in the FULL file schema)) when eligible.
+    row_filter: Option<(crate::planner::Expr, Vec<usize>)>,
 }
 
 impl std::fmt::Debug for ParallelParquetSource {
@@ -125,6 +128,25 @@ impl ParallelParquetSource {
 
         let total_row_groups = work_queue.len();
 
+        // Decide row-filter pushdown: decode-time filtering skips materializing
+        // non-matching rows in every other column. Eligible when every column
+        // referenced by the filter exists in the file schema.
+        let row_filter = filter.and_then(|expr| {
+            let mut cols: Vec<String> = Vec::new();
+            collect_expr_columns(expr, &mut cols);
+            if cols.is_empty() {
+                return None;
+            }
+            let mut indices = Vec::with_capacity(cols.len());
+            for c in &cols {
+                let idx = schema.fields().iter().position(|f| f.name() == c)?;
+                if !indices.contains(&idx) {
+                    indices.push(idx);
+                }
+            }
+            Some((expr.clone(), indices))
+        });
+
         Ok(Self {
             schema,
             projection,
@@ -132,7 +154,14 @@ impl ParallelParquetSource {
             work_queue: Mutex::new(work_queue),
             completed: AtomicUsize::new(0),
             total_row_groups,
+            row_filter,
         })
+    }
+
+    /// True when the filter is applied inside the parquet decoder — callers
+    /// must not re-apply it.
+    pub fn filter_pushed_down(&self) -> bool {
+        self.row_filter.is_some()
     }
 
     /// Create from a directory of Parquet files
@@ -218,6 +247,29 @@ impl ParallelParquetSource {
         let builder = builder
             .with_row_groups(vec![work.row_group_idx])
             .with_batch_size(self.batch_size);
+
+        // Push the filter into the decoder: the predicate columns are decoded
+        // first and only matching rows are materialized for the rest.
+        let builder = if let Some((expr, indices)) = &self.row_filter {
+            use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter};
+            let mask = ProjectionMask::roots(builder.parquet_schema(), indices.iter().copied());
+            let expr = expr.clone();
+            let pred = ArrowPredicateFn::new(mask, move |batch: RecordBatch| {
+                let arr = crate::physical::operators::evaluate_expr(&batch, &expr)
+                    .map_err(|e| arrow::error::ArrowError::ComputeError(e.to_string()))?;
+                arr.as_any()
+                    .downcast_ref::<arrow::array::BooleanArray>()
+                    .cloned()
+                    .ok_or_else(|| {
+                        arrow::error::ArrowError::ComputeError(
+                            "row filter did not evaluate to boolean".into(),
+                        )
+                    })
+            });
+            builder.with_row_filter(RowFilter::new(vec![Box::new(pred)]))
+        } else {
+            builder
+        };
 
         let reader = builder.build()?;
         let batches: Vec<RecordBatch> = reader.collect::<std::result::Result<Vec<_>, _>>()?;
@@ -322,5 +374,60 @@ mod tests {
         assert_eq!(morsel.num_rows(), 3);
         assert_eq!(morsel.source_id, 0);
         assert_eq!(morsel.sequence, 0);
+    }
+}
+
+/// Collect the (unqualified) column names referenced by an expression.
+pub(crate) fn collect_expr_columns(expr: &crate::planner::Expr, out: &mut Vec<String>) {
+    use crate::planner::Expr;
+    match expr {
+        Expr::Column(c) => out.push(c.name.clone()),
+        Expr::BinaryExpr { left, right, .. } => {
+            collect_expr_columns(left, out);
+            collect_expr_columns(right, out);
+        }
+        Expr::UnaryExpr { expr, .. } => collect_expr_columns(expr, out),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_expr_columns(expr, out);
+            collect_expr_columns(low, out);
+            collect_expr_columns(high, out);
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_expr_columns(expr, out);
+            for e in list {
+                collect_expr_columns(e, out);
+            }
+        }
+        Expr::Cast { expr, .. } => collect_expr_columns(expr, out),
+        Expr::ScalarFunc { args, .. } => {
+            for a in args {
+                collect_expr_columns(a, out);
+            }
+        }
+        Expr::Alias { expr, .. } => collect_expr_columns(expr, out),
+        Expr::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(o) = operand {
+                collect_expr_columns(o, out);
+            }
+            for (w, t) in when_then {
+                collect_expr_columns(w, out);
+                collect_expr_columns(t, out);
+            }
+            if let Some(e) = else_expr {
+                collect_expr_columns(e, out);
+            }
+        }
+        // Subqueries and other constructs: bail by reporting a column that
+        // never resolves, disabling pushdown.
+        Expr::ScalarSubquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
+            out.push("__unpushable__".to_string())
+        }
+        _ => {}
     }
 }
