@@ -104,13 +104,50 @@ the per-page decompress+decode is the floor.
    (PLAIN/DICT f64 and i64 with Snappy) writing straight into aligned
    buffers, behind the existing `ParquetFileInfo` metadata layer.
 
+## Rewrite 4 — Owned storage layer: Arrow IPC sidecar cache (est. −2 to −3s; the direct path to NATIVE parity)
+
+**Reframing (2026-08-09)**: the exit criterion below treats native-table
+parity as out of scope because DuckDB's 2.94s prices in its owned storage
+format. But an owned format v0 is concrete: maintain an **Arrow IPC
+sidecar** per parquet file (`.qecache/<table>.arrow`, built once on first
+registration), and load it with **mmap zero-copy** (`arrow::ipc::reader`
+over a memory-mapped buffer — batches reference the mapping directly, no
+decode). Parquet decode — the single largest residual cost bucket — drops
+to ~0 for warm files, exactly as DuckDB's native reads do.
+
+**Integration points** (the catch is that hot paths bypass the provider):
+1. `ParquetTable::scan` (eager/prescan paths) — trivial swap-in.
+2. `ParallelParquetSource` — add an IPC mode: the IPC file footer gives
+   per-batch offsets; work units become batch ranges instead of row
+   groups; morsel/dense-aggregation loops consume the mmap'd batches
+   unchanged (they already take `RecordBatch`).
+3. `StreamingParquetScanExec` — same, with the caveat that runtime-filter
+   RowFilter pushdown doesn't apply to IPC (filtering happens post-load;
+   cheap because load is free). Static filters evaluate vectorized on
+   mmap'd batches.
+4. Row-group pruning maps to batch-range pruning: store per-batch min/max
+   for filter columns in a tiny sidecar footer (or reuse parquet footers,
+   since batch boundaries can mirror row groups 1:1 — simplest v0).
+
+**Memory safety**: mmap pages are file-backed (evictable, never OOM);
+the spillable operators are unaffected.
+
+**Honesty note**: this changes the benchmark's storage premise — document
+clearly that engine times are then measured against the engine's own
+cache format, the same premise as DuckDB-native times. The like-for-like
+parquet comparison remains reported alongside.
+
 ## Sequencing and exit
 
-1. Rewrite 1 scans (Q01/Q16) → full gauntlet → commit.
-2. Rewrite 2a JoinAggregateExec (Q21, Q09, Q20, Q18) → gauntlet → commit.
-3. Rewrite 1 join-side dictionaries (Q10/Q02/Q22 gathers).
-4. Rewrite 3.2 page pruning (Q06/Q12/Q14/Q19/Q20 bands).
-5. Re-measure; if >1.3x like-for-like remains, evaluate 2b and 3.3.
+1. ~~Rewrite 1 scans (Q01/Q16)~~ DONE (commits 96f7d43 + 01e03ed).
+2. **Rewrite 4 IPC sidecar cache** — biggest single lever remaining and
+   the only one that closes NATIVE-storage distance; start with
+   ParallelParquetSource IPC mode (lineitem dominates).
+3. Selection-vector execution (2b generalized) — the main engine-side
+   mechanism left; large.
+4. Rewrite 2a right-sized (−0.2/−0.4s) and join-side dictionaries —
+   only if 2+3 leave a gap. Page pruning (3.2) is DOA on this data
+   (shipdates are unclustered within row groups; verified).
 
 **Exit criterion**: like-for-like total (DuckDB on the same parquet, warm,
 same machine: `.scratch/duck_parquet_bench.py`) within 1.0x. The native-table
