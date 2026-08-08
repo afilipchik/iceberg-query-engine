@@ -342,6 +342,7 @@ impl PhysicalPlanner {
     /// Collect all scan projections for each table name in the plan.
     /// Used to compute union projections for scan caching.
     fn collect_scan_projections(
+        &self,
         plan: &LogicalPlan,
         table_scans: &mut HashMap<String, Vec<Option<Vec<usize>>>>,
     ) {
@@ -352,9 +353,18 @@ impl PhysicalPlanner {
                     .or_default()
                     .push(node.projection.clone());
             }
+            // Subtrees under a materialized CTE alias never execute (they are
+            // replaced by the cached batches) — prescanning their tables reads
+            // whole parquet files for nothing (Q15 pre-read all of lineitem).
+            LogicalPlan::SubqueryAlias(node)
+                if node
+                    .cte_name
+                    .as_ref()
+                    .map(|n| self.cte_cache.lock().contains_key(&Self::cte_name_key(n)))
+                    .unwrap_or(false) => {}
             _ => {
                 for child in plan.children() {
-                    Self::collect_scan_projections(child, table_scans);
+                    self.collect_scan_projections(child, table_scans);
                 }
             }
         }
@@ -382,7 +392,7 @@ impl PhysicalPlanner {
         use rayon::prelude::*;
 
         let mut table_scans: HashMap<String, Vec<Option<Vec<usize>>>> = HashMap::new();
-        Self::collect_scan_projections(logical, &mut table_scans);
+        self.collect_scan_projections(logical, &mut table_scans);
 
         // Build scan tasks: only prescan tables that are accessed 2+ times.
         // Single-use tables will be read on-demand, reducing peak memory.
@@ -429,6 +439,9 @@ impl PhysicalPlanner {
         // Count how many times each CTE name appears as a SubqueryAlias input
         let mut cte_counts: HashMap<String, usize> = HashMap::new();
         Self::count_cte_refs(logical, &mut cte_counts);
+        if std::env::var("CTE_DEBUG").is_ok() {
+            eprintln!("[cte] ref counts: {:?}", cte_counts);
+        }
 
         // Materialize CTEs referenced 2+ times
         if cte_counts.values().all(|&c| c < 2) {
@@ -720,11 +733,13 @@ impl PhysicalPlanner {
 
     /// Convert a logical plan to a physical plan
     pub fn create_physical_plan(&self, logical: &LogicalPlan) -> Result<Arc<dyn PhysicalOperator>> {
+        // Pre-materialize CTEs that are referenced multiple times to ensure
+        // identical results (avoids floating-point non-determinism from parallel aggregation).
+        // Must run BEFORE the shared-table prescan so tables that only appear
+        // inside a now-materialized CTE aren't pointlessly pre-read.
+        self.materialize_shared_ctes(logical)?;
         // Pre-scan tables that are accessed multiple times to avoid redundant parquet reads
         self.prescan_shared_tables(logical);
-        // Pre-materialize CTEs that are referenced multiple times to ensure
-        // identical results (avoids floating-point non-determinism from parallel aggregation)
-        self.materialize_shared_ctes(logical)?;
         // Share the CTE cache with the SubqueryExecutor so its planners can access
         // materialized CTEs (ensures scalar subqueries referencing CTEs get identical data)
         if !self.cte_cache.lock().is_empty() {
