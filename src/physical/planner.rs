@@ -1007,11 +1007,16 @@ impl PhysicalPlanner {
                 // because the output doesn't include right-side columns
                 let is_semi_anti = matches!(node.join_type, JoinType::Semi | JoinType::Anti);
 
-                // Runtime join-key filter: Inner joins with a single plain
+                // Runtime join-key filter: joins with a single plain
                 // probe-key column over a streaming parquet scan decode only
-                // rows whose key exists in the (small) build side.
-                let probe_rt_filter = if matches!(node.join_type, JoinType::Inner) && on.len() == 1
-                {
+                // rows whose key exists in the (small) build side. Safe for
+                // Inner; also for Semi and Anti when the build is the LEFT
+                // side (probe rows outside the build key set can never mark
+                // a build row — for swapped Semi/Anti the probe rows ARE the
+                // output and Anti would drop exactly the rows it must keep).
+                let rt_eligible = matches!(node.join_type, JoinType::Inner)
+                    || (is_semi_anti && !build_right_for_left);
+                let probe_rt_filter = if rt_eligible && on.len() == 1 {
                     if let Expr::Column(c) = &on[0].1 {
                         let key = Arc::as_ptr(&right) as *const () as usize;
                         let scans = self.streaming_scans.borrow();
