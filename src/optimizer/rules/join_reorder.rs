@@ -67,6 +67,18 @@ struct JoinEdge {
     conditions: Vec<(Expr, Expr)>,
 }
 
+/// DPsize memo entry: best plan found for a subset of relations (bitmask).
+#[derive(Clone, Copy)]
+struct DpEntry {
+    /// Cumulative C_out cost (sum of intermediate cardinalities)
+    cost: f64,
+    /// Estimated output cardinality of this subset's join
+    rows: f64,
+    /// Child subset masks (0 for base relations)
+    left: u32,
+    right: u32,
+}
+
 impl JoinReorder {
     /// Recursively reorder subquery plans inside an expression.
     /// This ensures cross joins within scalar subqueries, EXISTS, and IN subqueries
@@ -487,6 +499,15 @@ impl JoinReorder {
             }
         }
 
+        // Cost-based enumeration first: DPsize over the join graph, driven by
+        // footer statistics. Falls back to the greedy heuristic below for wide
+        // joins (>12 relations) or disconnected graphs (cross joins).
+        if relations.len() >= 2 && relations.len() <= 12 {
+            if let Some(plan) = self.build_join_tree_dpsize(relations, &edges) {
+                return Ok((plan, used_condition_indices));
+            }
+        }
+
         // Greedy join ordering
         let mut joined: HashSet<usize> = HashSet::new();
         let mut result_plan: Option<LogicalPlan> = None;
@@ -650,6 +671,268 @@ impl JoinReorder {
         }
 
         Ok((result_plan.unwrap(), used_condition_indices))
+    }
+
+    /// DPsize join enumeration: find the cheapest join tree under a C_out cost
+    /// model (sum of intermediate result cardinalities), using footer
+    /// statistics for base cardinalities and join-key NDVs.
+    ///
+    /// Returns None when the graph is disconnected (a cross join would be
+    /// required) or when there are too many relations — callers fall back to
+    /// the greedy heuristic.
+    fn build_join_tree_dpsize(
+        &self,
+        relations: &[JoinRelation],
+        edges: &[JoinEdge],
+    ) -> Option<LogicalPlan> {
+        let n = relations.len();
+        debug_assert!(n <= 12);
+        let full: u32 = (1u32 << n) - 1;
+
+        // Base cardinality estimates
+        let base_rows: Vec<f64> = relations
+            .iter()
+            .map(|rel| self.estimate_base_rows(rel))
+            .collect();
+
+        // Per-condition equi-join selectivity: 1 / max(ndv_left, ndv_right).
+        // NDV comes from footer stats of the owning base relation, capped by
+        // that relation's (filtered) row estimate.
+        let cond_selectivity = |rel_a: usize, rel_b: usize, l: &Expr, r: &Expr| -> f64 {
+            let ndv_l = self
+                .column_ndv(&relations[rel_a], l)
+                .unwrap_or(base_rows[rel_a].max(10.0))
+                .min(base_rows[rel_a].max(1.0));
+            let ndv_r = self
+                .column_ndv(&relations[rel_b], r)
+                .unwrap_or(base_rows[rel_b].max(10.0))
+                .min(base_rows[rel_b].max(1.0));
+            1.0 / ndv_l.max(ndv_r).max(1.0)
+        };
+
+        // Precompute each edge's endpoint masks and combined selectivity
+        struct EdgeInfo {
+            mask_a: u32,
+            mask_b: u32,
+            selectivity: f64,
+        }
+        let edge_infos: Vec<EdgeInfo> = edges
+            .iter()
+            .map(|e| {
+                let sel: f64 = e
+                    .conditions
+                    .iter()
+                    .map(|(l, r)| cond_selectivity(e.left_idx, e.right_idx, l, r))
+                    .product();
+                EdgeInfo {
+                    mask_a: 1 << e.left_idx,
+                    mask_b: 1 << e.right_idx,
+                    selectivity: sel.clamp(1e-12, 1.0),
+                }
+            })
+            .collect();
+
+        let mut dp: Vec<Option<DpEntry>> = vec![None; (full as usize) + 1];
+        for (i, &rows) in base_rows.iter().enumerate() {
+            dp[1usize << i] = Some(DpEntry {
+                cost: 0.0,
+                rows,
+                left: 0,
+                right: 0,
+            });
+        }
+
+        // Joined cardinality of two disjoint subsets: product of the sides'
+        // rows times the selectivity of every edge crossing the split.
+        // Returns None if no edge crosses (would be a cross join).
+        let join_rows = |s1: u32, s2: u32, r1: f64, r2: f64| -> Option<f64> {
+            let mut sel = 1.0f64;
+            let mut connected = false;
+            for info in &edge_infos {
+                let a_in_1 = info.mask_a & s1 != 0;
+                let a_in_2 = info.mask_a & s2 != 0;
+                let b_in_1 = info.mask_b & s1 != 0;
+                let b_in_2 = info.mask_b & s2 != 0;
+                if (a_in_1 && b_in_2) || (a_in_2 && b_in_1) {
+                    connected = true;
+                    sel *= info.selectivity;
+                }
+            }
+            if connected {
+                Some((r1 * r2 * sel).max(1.0))
+            } else {
+                None
+            }
+        };
+
+        for s in 2..=(full as usize) {
+            let s = s as u32;
+            if s.count_ones() < 2 || (s & full) != s {
+                continue;
+            }
+            // Enumerate proper subset splits; s1 < s2 avoids double-counting.
+            let mut s1 = (s - 1) & s;
+            while s1 > 0 {
+                let s2 = s ^ s1;
+                if s1 < s2 {
+                    if let (Some(e1), Some(e2)) = (dp[s1 as usize], dp[s2 as usize]) {
+                        if let Some(rows) = join_rows(s1, s2, e1.rows, e2.rows) {
+                            let cost = e1.cost + e2.cost + rows;
+                            let better = match dp[s as usize] {
+                                None => true,
+                                Some(cur) => cost < cur.cost,
+                            };
+                            if better {
+                                dp[s as usize] = Some(DpEntry {
+                                    cost,
+                                    rows,
+                                    left: s1,
+                                    right: s2,
+                                });
+                            }
+                        }
+                    }
+                }
+                s1 = (s1 - 1) & s;
+            }
+        }
+
+        dp[full as usize]?;
+        self.dp_build_plan(full, &dp, relations, edges)
+    }
+
+    /// Materialize the DP solution into a LogicalPlan join tree.
+    /// The smaller estimated side goes LEFT (the engine's default build side).
+    fn dp_build_plan(
+        &self,
+        mask: u32,
+        dp: &[Option<DpEntry>],
+        relations: &[JoinRelation],
+        edges: &[JoinEdge],
+    ) -> Option<LogicalPlan> {
+        let entry = dp[mask as usize]?;
+        if mask.count_ones() == 1 {
+            let idx = mask.trailing_zeros() as usize;
+            return Some(relations[idx].plan.clone());
+        }
+
+        let (l_mask, r_mask) = (entry.left, entry.right);
+        let l_entry = dp[l_mask as usize]?;
+        let r_entry = dp[r_mask as usize]?;
+
+        // Smaller side becomes the LEFT child (hash join build side).
+        let (build_mask, probe_mask) = if l_entry.rows <= r_entry.rows {
+            (l_mask, r_mask)
+        } else {
+            (r_mask, l_mask)
+        };
+
+        let build = self.dp_build_plan(build_mask, dp, relations, edges)?;
+        let probe = self.dp_build_plan(probe_mask, dp, relations, edges)?;
+
+        // Collect every edge condition crossing this split, oriented as
+        // (build_expr, probe_expr).
+        let mut on: Vec<(Expr, Expr)> = Vec::new();
+        for edge in edges {
+            let a = 1u32 << edge.left_idx;
+            let b = 1u32 << edge.right_idx;
+            if a & build_mask != 0 && b & probe_mask != 0 {
+                on.extend(edge.conditions.iter().cloned());
+            } else if b & build_mask != 0 && a & probe_mask != 0 {
+                on.extend(edge.conditions.iter().map(|(l, r)| (r.clone(), l.clone())));
+            }
+        }
+        if on.is_empty() {
+            return None; // should not happen: DP only joins connected splits
+        }
+
+        let mut schema_fields = build.schema().fields().to_vec();
+        schema_fields.extend(probe.schema().fields().iter().cloned());
+        let schema = crate::planner::PlanSchema::new(schema_fields);
+
+        Some(LogicalPlan::Join(JoinNode {
+            left: Arc::new(build),
+            right: Arc::new(probe),
+            join_type: JoinType::Inner,
+            on,
+            filter: None,
+            schema,
+        }))
+    }
+
+    /// Estimated cardinality of a base relation: footer row count scaled by a
+    /// heuristic selectivity for any attached filter predicates.
+    fn estimate_base_rows(&self, rel: &JoinRelation) -> f64 {
+        let base = self.get_relation_row_count(rel).unwrap_or(10_000).max(1) as f64;
+        (base * Self::plan_filter_selectivity(&rel.plan)).max(1.0)
+    }
+
+    /// Multiply the selectivities of all filters attached beneath a relation
+    /// (both Filter nodes and predicates pushed into ScanNode.filter).
+    fn plan_filter_selectivity(plan: &LogicalPlan) -> f64 {
+        match plan {
+            LogicalPlan::Filter(node) => {
+                Self::predicate_selectivity(&node.predicate)
+                    * Self::plan_filter_selectivity(&node.input)
+            }
+            LogicalPlan::Scan(node) => node
+                .filter
+                .as_ref()
+                .map(Self::predicate_selectivity)
+                .unwrap_or(1.0),
+            LogicalPlan::SubqueryAlias(node) => Self::plan_filter_selectivity(&node.input),
+            LogicalPlan::Project(node) => Self::plan_filter_selectivity(&node.input),
+            _ => 1.0,
+        }
+    }
+
+    /// Textbook per-predicate selectivity guesses (System-R style).
+    fn predicate_selectivity(expr: &Expr) -> f64 {
+        let sel = match expr {
+            Expr::BinaryExpr { left, op, right } => match op {
+                BinaryOp::And => {
+                    Self::predicate_selectivity(left) * Self::predicate_selectivity(right)
+                }
+                BinaryOp::Or => (Self::predicate_selectivity(left)
+                    + Self::predicate_selectivity(right))
+                .min(1.0),
+                BinaryOp::Eq => 0.1,
+                BinaryOp::NotEq => 0.9,
+                BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => 0.3,
+                BinaryOp::Like => 0.25,
+                BinaryOp::NotLike => 0.75,
+                _ => 0.25,
+            },
+            Expr::Between { negated, .. } => {
+                if *negated {
+                    0.75
+                } else {
+                    0.25
+                }
+            }
+            Expr::InList { list, .. } => (0.1 * list.len() as f64).min(0.5),
+            Expr::UnaryExpr {
+                op: crate::planner::UnaryOp::IsNull,
+                ..
+            } => 0.1,
+            Expr::UnaryExpr { .. } => 0.9,
+            // Subquery predicates and anything opaque: assume moderate
+            _ => 0.5,
+        };
+        sel.clamp(1e-4, 1.0)
+    }
+
+    /// NDV estimate for a join-key expression on a relation, from footer
+    /// column statistics of the underlying base table.
+    fn column_ndv(&self, rel: &JoinRelation, expr: &Expr) -> Option<f64> {
+        let col = match expr {
+            Expr::Column(c) => c.name.to_lowercase(),
+            _ => return None,
+        };
+        let table = self.get_underlying_table_name(&rel.plan)?;
+        let stats = self.table_stats.get(&table)?;
+        let col_stats = stats.column_stats.get(&col)?;
+        col_stats.ndv_est.map(|v| v as f64)
     }
 
     /// Rebuild filter predicate without the conditions used as join conditions
