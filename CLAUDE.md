@@ -738,8 +738,9 @@ Based on the codebase structure, these appear to be planned but not fully implem
 
 ## TPC-H Benchmark Status (SF=10, 2026-08-08, 48G cgroup)
 
-Log: `logs/safe_benchmark_20260808_053952.log`. Spec queries, spec-generator data.
-**22/22 pass the benchmark runner; 17.4s vs native-table DuckDB 2.94s (5.9x); 16/22 within 10x.**
+Log: `logs/safe_benchmark_20260808_055135.log`. Spec queries, spec-generator data.
+**22/22 pass the benchmark runner; 17.4s vs native-table DuckDB 2.94s (5.8x); 16/22 within 10x.**
+**Like-for-like (same parquet): 3.86x aggregate, ALL 22 within 10x, ALL CELL-EXACT.**
 **Like-for-like (DuckDB reading the SAME parquet via views, ~4.47s total): ~4.0x
 aggregate and ALL 22 queries within 10x.** All 22 queries validate CELL-EXACT
 against DuckDB at SF=10 after every change (scripts/generate_expected_results.py
