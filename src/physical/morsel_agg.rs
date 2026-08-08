@@ -57,6 +57,21 @@ pub(crate) fn merge_states_to_batches(
     input_types: &[DataType],
     schema: &SchemaRef,
 ) -> Result<Vec<RecordBatch>> {
+    merge_states_to_batches_filtered(states, agg_funcs, input_types, schema, None)
+}
+
+/// Like `merge_states_to_batches`, but applies a HAVING-style predicate to
+/// each shard's output batch INSIDE the parallel merge. Filtering per shard
+/// keeps only the surviving rows and drops the full-size shard arrays on the
+/// worker thread — materializing (and later freeing) the complete group set
+/// on one thread measured 550ms of munmap stalls alone on Q18's 15M groups.
+pub(crate) fn merge_states_to_batches_filtered(
+    states: Vec<AggregationState>,
+    agg_funcs: &[AggregateFunction],
+    input_types: &[DataType],
+    schema: &SchemaRef,
+    post_filter: Option<&Expr>,
+) -> Result<Vec<RecordBatch>> {
     const PARALLEL_MERGE_MIN_GROUPS: usize = 65_536;
     let total_groups: usize = states.iter().map(|s| s.group_count()).sum();
 
@@ -89,21 +104,49 @@ pub(crate) fn merge_states_to_batches(
             prepared.push(st);
         }
         if all_raw {
-            return merge_raw_states_to_batches(prepared, agg_funcs, input_types, &dt, schema);
+            return merge_raw_states_to_batches(
+                prepared,
+                agg_funcs,
+                input_types,
+                &dt,
+                schema,
+                post_filter,
+            );
         }
         // Fall through: into_shards handles mixed raw/GroupKey states.
-        return merge_states_groupkey(prepared, agg_funcs, input_types, schema);
+        return merge_states_groupkey(prepared, agg_funcs, input_types, schema, post_filter);
     }
 
     if states.len() > 1 && total_groups > PARALLEL_MERGE_MIN_GROUPS {
-        return merge_states_groupkey(states, agg_funcs, input_types, schema);
+        return merge_states_groupkey(states, agg_funcs, input_types, schema, post_filter);
     }
 
     let mut final_state = AggregationState::new(agg_funcs.to_vec(), input_types.to_vec());
     for state in states {
         final_state.merge(&state);
     }
-    Ok(vec![final_state.build_output(schema)?])
+    let batches = vec![final_state.build_output(schema)?];
+    match post_filter {
+        Some(pred) => crate::physical::operators::filter_batches(batches, pred),
+        None => Ok(batches),
+    }
+}
+
+/// Build a shard's output batch and apply the optional HAVING predicate while
+/// still on the merging worker thread.
+fn build_filtered_output(
+    state: &AggregationState,
+    schema: &SchemaRef,
+    post_filter: Option<&Expr>,
+) -> Result<Option<RecordBatch>> {
+    let batch = state.build_output(schema)?;
+    match post_filter {
+        Some(pred) => {
+            let mut filtered = crate::physical::operators::filter_batches(vec![batch], pred)?;
+            Ok(filtered.pop())
+        }
+        None => Ok(Some(batch)),
+    }
 }
 
 /// GroupKey-based parallel shard merge (multi-column or non-integer keys).
@@ -112,6 +155,7 @@ fn merge_states_groupkey(
     agg_funcs: &[AggregateFunction],
     input_types: &[DataType],
     schema: &SchemaRef,
+    post_filter: Option<&Expr>,
 ) -> Result<Vec<RecordBatch>> {
     let p = rayon::current_num_threads().clamp(2, 64);
     let per_state_shards: Vec<_> = states
@@ -135,7 +179,7 @@ fn merge_states_groupkey(
             }
             let state =
                 AggregationState::from_groups(agg_funcs.to_vec(), input_types.to_vec(), map);
-            state.build_output(schema).map(Some)
+            build_filtered_output(&state, schema, post_filter)
         })
         .collect::<Result<Vec<Option<RecordBatch>>>>()?
         .into_iter()
@@ -151,6 +195,7 @@ fn merge_raw_states_to_batches(
     input_types: &[DataType],
     raw_type: &DataType,
     schema: &SchemaRef,
+    post_filter: Option<&Expr>,
 ) -> Result<Vec<RecordBatch>> {
     let p = rayon::current_num_threads().clamp(2, 64);
 
@@ -208,7 +253,7 @@ fn merge_raw_states_to_batches(
                 map,
                 None,
             );
-            state.build_output(schema).map(Some)
+            build_filtered_output(&state, schema, post_filter)
         })
         .collect::<Result<Vec<Option<RecordBatch>>>>()?
         .into_iter()
@@ -223,7 +268,9 @@ fn merge_raw_states_to_batches(
             HashMap::new(),
             Some(null_accs),
         );
-        batches.push(state.build_output(schema)?);
+        if let Some(b) = build_filtered_output(&state, schema, post_filter)? {
+            batches.push(b);
+        }
     }
     Ok(batches)
 }

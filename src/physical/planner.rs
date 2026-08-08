@@ -895,6 +895,28 @@ impl PhysicalPlanner {
             }
 
             LogicalPlan::Filter(node) => {
+                // HAVING pushdown: a subquery-free predicate directly above an
+                // Aggregate is applied to the aggregate's output batches with
+                // vectorized kernels instead of a row-wise FilterExec.
+                if matches!(&*node.input, LogicalPlan::Aggregate(_))
+                    && !node.predicate.contains_subquery()
+                {
+                    let prev = self
+                        .pending_agg_filter
+                        .borrow_mut()
+                        .replace(node.predicate.clone());
+                    let agg = self.create_physical_plan_inner(&node.input)?;
+                    let leftover = {
+                        let mut slot = self.pending_agg_filter.borrow_mut();
+                        std::mem::replace(&mut *slot, prev)
+                    };
+                    if leftover.is_none() {
+                        // consumed by the aggregate operator
+                        return Ok(agg);
+                    }
+                    let filter = self.create_filter(agg, node.predicate.clone());
+                    return Ok(Arc::new(filter));
+                }
                 let input = self.create_physical_plan_inner(&node.input)?;
                 let filter = self.create_filter(input, node.predicate.clone());
                 Ok(Arc::new(filter))
@@ -1043,6 +1065,9 @@ impl PhysicalPlanner {
             }
 
             LogicalPlan::Aggregate(node) => {
+                // Take any pending HAVING predicate up front so aggregates
+                // nested inside this one's input can never consume it.
+                let post_filter = self.pending_agg_filter.borrow_mut().take();
                 // Convert logical aggregate expressions to physical
                 let aggregates = extract_aggregates(&node.aggregates);
 
@@ -1065,7 +1090,7 @@ impl PhysicalPlanner {
                             aggregates,
                             schema,
                         )
-                        .with_post_filter(self.pending_agg_filter.borrow_mut().take());
+                        .with_post_filter(post_filter);
                         return Ok(Arc::new(morsel_agg));
                     }
                 }
@@ -1094,12 +1119,18 @@ impl PhysicalPlanner {
                         self.memory_pool.clone().unwrap(),
                         self.config.clone().unwrap(),
                     )
-                    .with_post_filter(self.pending_agg_filter.borrow_mut().take());
+                    .with_post_filter(post_filter);
                     Ok(Arc::new(agg))
                 } else {
                     let agg =
                         HashAggregateExec::new(input, node.group_by.clone(), aggregates, schema);
-                    Ok(Arc::new(agg))
+                    match post_filter {
+                        Some(pred) => {
+                            let filter = self.create_filter(Arc::new(agg), pred);
+                            Ok(Arc::new(filter))
+                        }
+                        None => Ok(Arc::new(agg)),
+                    }
                 }
             }
 

@@ -3,6 +3,13 @@
 //! A custom SQL query engine built from scratch for Apache Iceberg,
 //! targeting top performance on TPC-H benchmarks.
 
+/// Global allocator: mimalloc. The engine frees tens of millions of small
+/// allocations at pipeline boundaries (per-group accumulators, batch arrays);
+/// glibc malloc serializes those frees behind arena locks and munmap
+/// consolidation stalls (measured 550ms on a single Q18 aggregate teardown).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod arrow_ffi;
 pub mod error;
 pub mod execution;

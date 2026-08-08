@@ -137,6 +137,8 @@ impl PhysicalOperator for MorselAggregateExec {
         };
         let output_schema = self.schema.clone();
 
+        let timing = std::env::var("AGG_TIMING").is_ok();
+        let t0 = std::time::Instant::now();
         // Execute in parallel - each thread processes morsels and maintains its own hash table
         let thread_states: Vec<Result<AggregationState>> = (0..num_threads)
             .into_par_iter()
@@ -195,17 +197,30 @@ impl PhysicalOperator for MorselAggregateExec {
 
         let states: Vec<AggregationState> =
             thread_states.into_iter().collect::<Result<Vec<_>>>()?;
+        if timing {
+            let groups: usize = states.iter().map(|s| s.group_count()).sum();
+            eprintln!(
+                "[AGG_TIMING] morsel scan+process: {:?} ({} thread-groups)",
+                t0.elapsed(),
+                groups
+            );
+        }
+        let t1 = std::time::Instant::now();
 
         // Shared merge: parallel shard merge above 64K groups (raw-u64 pipeline
         // for single integer group columns), sequential fold below.
-        let mut batches = crate::physical::morsel_agg::merge_states_to_batches(
+        let batches = crate::physical::morsel_agg::merge_states_to_batches_filtered(
             states,
             &agg_funcs,
             &input_types,
             &output_schema,
+            self.post_filter.as_ref(),
         )?;
-        if let Some(pred) = &self.post_filter {
-            batches = crate::physical::operators::filter_batches(batches, pred)?;
+        if timing {
+            eprintln!(
+                "[AGG_TIMING] morsel merge+output+having: {:?}",
+                t1.elapsed()
+            );
         }
         Ok(Box::pin(stream::iter(batches.into_iter().map(Ok))))
     }
