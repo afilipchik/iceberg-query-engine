@@ -1018,7 +1018,19 @@ impl PhysicalPlanner {
                     || (is_semi_anti && !build_right_for_left);
                 let probe_rt_filter = if rt_eligible && on.len() == 1 {
                     if let Expr::Column(c) = &on[0].1 {
-                        let key = Arc::as_ptr(&right) as *const () as usize;
+                        // The probe-side streaming scan may sit under column
+                        // pass-through Projects (decorrelated subquery
+                        // shapes); the filter column is resolved by NAME in
+                        // the provider schema, so digging through is safe.
+                        let mut probe_leaf = Arc::clone(&right);
+                        while probe_leaf.name() == "Project" {
+                            let ch = probe_leaf.children();
+                            if ch.len() != 1 {
+                                break;
+                            }
+                            probe_leaf = ch.into_iter().next().unwrap();
+                        }
+                        let key = Arc::as_ptr(&probe_leaf) as *const () as usize;
                         let scans = self.streaming_scans.borrow();
                         scans.get(&key).and_then(|(cfg, pschema)| {
                             pschema

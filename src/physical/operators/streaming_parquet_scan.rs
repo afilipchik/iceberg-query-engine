@@ -156,13 +156,11 @@ impl PhysicalOperator for StreamingParquetScanExec {
         let projection = self.projection.clone();
         let batch_size = self.batch_size;
         let schema = self.schema.clone();
-        // Resolve the runtime join-key filter once: the driving join populates
-        // the slot while building its hash table, before probing this scan.
-        let runtime: Option<(usize, std::sync::Arc<hashbrown::HashSet<i64>>)> = self
-            .runtime_filter
-            .lock()
-            .as_ref()
-            .and_then(|(idx, slot)| slot.lock().clone().map(|set| (*idx, set)));
+        // Runtime join-key filter handle: re-resolved at every row-group
+        // open, because the driving join publishes the key set only after
+        // its build side drains — a scan that started earlier (semi/anti
+        // probes drained concurrently) would otherwise never see it.
+        let runtime_cfg = std::sync::Arc::clone(&self.runtime_filter);
 
         // Create a stream that lazily reads row groups
         let stream = futures::stream::unfold(
@@ -172,9 +170,9 @@ impl PhysicalOperator for StreamingParquetScanExec {
                 batch_size,
                 schema,
                 None::<parquet::arrow::arrow_reader::ParquetRecordBatchReader>,
-                runtime,
+                runtime_cfg,
             ),
-            |(mut work_iter, projection, batch_size, schema, current_reader, runtime)| async move {
+            |(mut work_iter, projection, batch_size, schema, current_reader, runtime_cfg)| async move {
                 // Try to get next batch from current reader
                 if let Some(mut reader) = current_reader {
                     match reader.next() {
@@ -198,14 +196,14 @@ impl PhysicalOperator for StreamingParquetScanExec {
                                     batch_size,
                                     schema,
                                     Some(reader),
-                                    runtime,
+                                    runtime_cfg,
                                 ),
                             ));
                         }
                         Some(Err(e)) => {
                             return Some((
                                 Err(QueryError::Arrow(e)),
-                                (work_iter, projection, batch_size, schema, None, runtime),
+                                (work_iter, projection, batch_size, schema, None, runtime_cfg),
                             ));
                         }
                         None => {
@@ -221,7 +219,7 @@ impl PhysicalOperator for StreamingParquetScanExec {
                     Err(e) => {
                         return Some((
                             Err(QueryError::Io(e)),
-                            (work_iter, projection, batch_size, schema, None, runtime),
+                            (work_iter, projection, batch_size, schema, None, runtime_cfg),
                         ))
                     }
                 };
@@ -230,7 +228,7 @@ impl PhysicalOperator for StreamingParquetScanExec {
                     Err(e) => {
                         return Some((
                             Err(QueryError::Parquet(e)),
-                            (work_iter, projection, batch_size, schema, None, runtime),
+                            (work_iter, projection, batch_size, schema, None, runtime_cfg),
                         ))
                     }
                 };
@@ -239,6 +237,11 @@ impl PhysicalOperator for StreamingParquetScanExec {
                     .with_batch_size(batch_size)
                     .with_row_groups(vec![work.row_group_idx]);
 
+                // Re-resolve the runtime filter for this row group
+                let runtime: Option<(usize, std::sync::Arc<hashbrown::HashSet<i64>>)> = runtime_cfg
+                    .lock()
+                    .as_ref()
+                    .and_then(|(idx, slot)| slot.lock().clone().map(|set| (*idx, set)));
                 let builder = if let Some((col_idx, set)) = &runtime {
                     let mask =
                         parquet::arrow::ProjectionMask::roots(builder.parquet_schema(), [*col_idx]);
@@ -285,7 +288,7 @@ impl PhysicalOperator for StreamingParquetScanExec {
                     Err(e) => {
                         return Some((
                             Err(QueryError::Parquet(e)),
-                            (work_iter, projection, batch_size, schema, None, runtime),
+                            (work_iter, projection, batch_size, schema, None, runtime_cfg),
                         ))
                     }
                 };
@@ -310,13 +313,13 @@ impl PhysicalOperator for StreamingParquetScanExec {
                                 batch_size,
                                 schema,
                                 Some(reader),
-                                runtime,
+                                runtime_cfg,
                             ),
                         ))
                     }
                     Some(Err(e)) => Some((
                         Err(QueryError::Arrow(e)),
-                        (work_iter, projection, batch_size, schema, None, runtime),
+                        (work_iter, projection, batch_size, schema, None, runtime_cfg),
                     )),
                     None => {
                         // Empty row group, try next (recursive via unfold)
