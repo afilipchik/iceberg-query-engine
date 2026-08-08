@@ -17,6 +17,26 @@ pub struct TableStatistics {
     pub row_count: usize,
     /// Total size in bytes (approximate)
     pub total_byte_size: u64,
+    /// Per-column statistics keyed by (unqualified, lowercase) column name
+    pub column_stats: std::collections::HashMap<String, ColumnStatistics>,
+}
+
+/// Per-column statistics derived from file metadata (e.g. Parquet footers).
+///
+/// `ndv_est` is an estimated number of distinct values. For integer columns it
+/// is derived as `min(row_count - null_count, max - min + 1)`: TPC-H-style
+/// surrogate keys are dense ranges, so the value range is a tight NDV bound,
+/// and for genuinely sparse columns it still upper-bounds NDV by row count.
+#[derive(Debug, Clone, Default)]
+pub struct ColumnStatistics {
+    /// Minimum value (integer-typed columns only for now)
+    pub min_i64: Option<i64>,
+    /// Maximum value (integer-typed columns only for now)
+    pub max_i64: Option<i64>,
+    /// Total null count across all files/row groups, if known everywhere
+    pub null_count: Option<u64>,
+    /// Estimated number of distinct values
+    pub ndv_est: Option<u64>,
 }
 
 /// Table provider trait for accessing table data
@@ -95,6 +115,20 @@ impl TableProvider for MemoryTable {
                 .collect(),
             None => Ok(self.batches.clone()),
         }
+    }
+
+    fn statistics(&self) -> Option<TableStatistics> {
+        let row_count: usize = self.batches.iter().map(|b| b.num_rows()).sum();
+        let total_byte_size: u64 = self
+            .batches
+            .iter()
+            .map(|b| b.get_array_memory_size() as u64)
+            .sum();
+        Some(TableStatistics {
+            row_count,
+            total_byte_size,
+            column_stats: std::collections::HashMap::new(),
+        })
     }
 }
 

@@ -28,6 +28,9 @@ pub struct ParquetTable {
     schema: SchemaRef,
     /// List of Parquet files to read
     files: Vec<PathBuf>,
+    /// Footer-derived statistics, computed once per provider. Without this
+    /// cache every query re-opened every file's footer during optimization.
+    stats_cache: std::sync::OnceLock<Option<TableStatistics>>,
 }
 
 impl fmt::Debug for ParquetTable {
@@ -68,7 +71,118 @@ impl ParquetTable {
         // Infer schema from the first file
         let schema = Self::read_schema(&files[0])?;
 
-        Ok(Self { schema, files })
+        Ok(Self {
+            schema,
+            files,
+            stats_cache: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// Read table + per-column statistics from the Parquet footers.
+    ///
+    /// Column min/max/null_count are merged across all row groups of all
+    /// files. Integer columns get an NDV estimate of
+    /// `min(non_null_rows, max - min + 1)` — tight for dense surrogate keys
+    /// (TPC-H `*_key` columns), a safe upper bound otherwise.
+    fn compute_statistics(&self) -> Option<TableStatistics> {
+        use parquet::file::statistics::Statistics as ParquetStatistics;
+        use std::collections::HashMap;
+
+        struct ColAcc {
+            min_i64: Option<i64>,
+            max_i64: Option<i64>,
+            null_count: Option<u64>,
+            has_int_stats: bool,
+        }
+
+        let mut total_rows: usize = 0;
+        let mut total_bytes: u64 = 0;
+        let mut cols: HashMap<String, ColAcc> = HashMap::new();
+
+        for file_path in &self.files {
+            let file = File::open(file_path).ok()?;
+            let file_size = file.metadata().ok()?.len();
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
+            let metadata = builder.metadata();
+            total_bytes += file_size;
+
+            for rg in metadata.row_groups() {
+                total_rows += rg.num_rows() as usize;
+                for col_chunk in rg.columns() {
+                    let name = col_chunk.column_path().parts().join(".").to_lowercase();
+                    let acc = cols.entry(name).or_insert(ColAcc {
+                        min_i64: None,
+                        max_i64: None,
+                        null_count: Some(0),
+                        has_int_stats: false,
+                    });
+
+                    let Some(stats) = col_chunk.statistics() else {
+                        // A chunk without stats poisons null_count accuracy.
+                        acc.null_count = None;
+                        continue;
+                    };
+
+                    match stats.null_count_opt() {
+                        Some(n) => {
+                            if let Some(total) = &mut acc.null_count {
+                                *total += n;
+                            }
+                        }
+                        None => acc.null_count = None,
+                    }
+
+                    let (min, max) = match stats {
+                        ParquetStatistics::Int64(s) => (s.min_opt().copied(), s.max_opt().copied()),
+                        ParquetStatistics::Int32(s) => (
+                            s.min_opt().map(|v| *v as i64),
+                            s.max_opt().map(|v| *v as i64),
+                        ),
+                        _ => (None, None),
+                    };
+                    if let (Some(min), Some(max)) = (min, max) {
+                        acc.has_int_stats = true;
+                        acc.min_i64 = Some(acc.min_i64.map_or(min, |m| m.min(min)));
+                        acc.max_i64 = Some(acc.max_i64.map_or(max, |m| m.max(max)));
+                    }
+                }
+            }
+        }
+
+        let column_stats = cols
+            .into_iter()
+            .map(|(name, acc)| {
+                let non_null = acc
+                    .null_count
+                    .map(|n| (total_rows as u64).saturating_sub(n))
+                    .unwrap_or(total_rows as u64);
+                let ndv_est = if acc.has_int_stats {
+                    match (acc.min_i64, acc.max_i64) {
+                        (Some(min), Some(max)) if max >= min => {
+                            Some(non_null.min((max - min) as u64 + 1))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                (
+                    name,
+                    crate::physical::operators::ColumnStatistics {
+                        min_i64: acc.min_i64,
+                        max_i64: acc.max_i64,
+                        null_count: acc.null_count,
+                        ndv_est,
+                    },
+                )
+            })
+            .collect();
+
+        Some(TableStatistics {
+            row_count: total_rows,
+            total_byte_size: total_bytes,
+            column_stats,
+        })
     }
 
     /// Find all Parquet files in a directory (non-recursive)
@@ -297,23 +411,9 @@ impl TableProvider for ParquetTable {
     }
 
     fn statistics(&self) -> Option<TableStatistics> {
-        let mut total_rows: usize = 0;
-        let mut total_bytes: u64 = 0;
-
-        for file_path in &self.files {
-            let file = File::open(file_path).ok()?;
-            let file_size = file.metadata().ok()?.len();
-            let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
-            let metadata = builder.metadata();
-            let rows: i64 = metadata.row_groups().iter().map(|rg| rg.num_rows()).sum();
-            total_rows += rows as usize;
-            total_bytes += file_size;
-        }
-
-        Some(TableStatistics {
-            row_count: total_rows,
-            total_byte_size: total_bytes,
-        })
+        self.stats_cache
+            .get_or_init(|| self.compute_statistics())
+            .clone()
     }
 
     fn parquet_files(&self) -> Option<Vec<PathBuf>> {
@@ -844,5 +944,34 @@ mod tests {
     fn test_parquet_table_not_found() {
         let result = ParquetTable::try_new("/nonexistent/path.parquet");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_footer_column_statistics() {
+        // Requires generated test data (CI generates it before cargo test).
+        let path = format!(
+            "{}/data/tpch-1mb/orders.parquet",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        if !std::path::Path::new(&path).exists() {
+            eprintln!("skipping: {path} not generated");
+            return;
+        }
+        let table = ParquetTable::try_new(&path).unwrap();
+        let stats = table.statistics().expect("statistics available");
+        assert_eq!(stats.row_count, 1500); // SF=0.001 orders
+
+        let key = stats
+            .column_stats
+            .get("o_orderkey")
+            .expect("o_orderkey column stats");
+        assert_eq!(key.min_i64, Some(1));
+        assert_eq!(key.max_i64, Some(1500));
+        // Dense surrogate key: range-based NDV estimate is exact.
+        assert_eq!(key.ndv_est, Some(1500));
+
+        // Cache: second call must return the same (cached) result.
+        let again = table.statistics().unwrap();
+        assert_eq!(again.row_count, stats.row_count);
     }
 }

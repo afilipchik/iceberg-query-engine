@@ -26,7 +26,7 @@ pub use limit::LimitExec;
 pub use morsel_agg::MorselAggregateExec;
 pub use parquet::{ParquetScanExec, ParquetTable, ParquetWriter};
 pub use project::ProjectExec;
-pub use scan::{MemoryTable, MemoryTableExec, TableProvider, TableStatistics};
+pub use scan::{ColumnStatistics, MemoryTable, MemoryTableExec, TableProvider, TableStatistics};
 pub use sort::SortExec;
 pub use spillable::{ExternalSortExec, SpillableHashAggregateExec, SpillableHashJoinExec};
 pub use streaming_parquet_scan::StreamingParquetScanExec;
