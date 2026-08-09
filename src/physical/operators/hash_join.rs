@@ -1225,11 +1225,23 @@ impl PhysicalOperator for HashJoinExec {
     fn output_partitions(&self) -> usize {
         // Semi/Anti joins must see ALL probe rows to correctly determine
         // matched/unmatched build rows, so they must use a single partition.
-        // Other join types can be parallelized by probe side partitions.
+        // Other join types are parallelized over the PROBE side's partitions:
+        // execute(partition) forwards its argument to probe_side.execute(), so
+        // this count must be the probe side's or partitions get skipped (rows
+        // silently lost) or executed past the end. Which child is the probe
+        // side is the same test execute() makes, and it is not always
+        // self.right — a Left join with build_right probes self.left. This
+        // mirrors SpillableHashJoinExec::output_partitions.
         match self.join_type {
             JoinType::Semi | JoinType::Anti => 1,
-            JoinType::Right => self.left.output_partitions().max(1),
-            _ => self.right.output_partitions().max(1),
+            _ => {
+                let probe_side = if self.build_right || matches!(self.join_type, JoinType::Right) {
+                    &self.left
+                } else {
+                    &self.right
+                };
+                probe_side.output_partitions().max(1)
+            }
         }
     }
 
@@ -3681,5 +3693,65 @@ mod tests {
 
         let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2); // ids 3 and 4 don't exist in right
+    }
+
+    /// output_partitions() must report the PROBE side's partition count,
+    /// because execute(partition) forwards its argument to
+    /// probe_side.execute(partition). A Left join with build_right probes
+    /// self.LEFT, so reporting self.right's count under-counts whenever the
+    /// left child is more partitioned than the right — and the caller then
+    /// never asks for the missing partitions, silently dropping rows from the
+    /// side a LEFT JOIN exists to preserve.
+    #[tokio::test]
+    async fn test_left_join_build_right_output_partitions_follow_probe_side() {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        // 4 batches x 500 rows: MemoryTableExec partitions a >=1000-row table
+        // across its batches, so the left child reports several partitions.
+        let left_batches: Vec<RecordBatch> = (0..4)
+            .map(|b: i64| {
+                let vals: Vec<i64> = (0..500).map(|i| b * 500 + i).collect();
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vals))])
+                    .unwrap()
+            })
+            .collect();
+        let right_schema = Arc::new(Schema::new(vec![Field::new("rk", DataType::Int64, false)]));
+        let right_batch = RecordBatch::try_new(
+            right_schema.clone(),
+            vec![Arc::new(Int64Array::from((0..10).collect::<Vec<i64>>()))],
+        )
+        .unwrap();
+
+        let left_scan = Arc::new(MemoryTableExec::new(
+            "l",
+            schema.clone(),
+            left_batches,
+            None,
+        ));
+        let right_scan = Arc::new(MemoryTableExec::new(
+            "r",
+            right_schema,
+            vec![right_batch],
+            None,
+        ));
+        let expected_partitions = left_scan.output_partitions();
+
+        let join = HashJoinExec::new(
+            left_scan,
+            right_scan,
+            vec![(Expr::column("k"), Expr::column("rk"))],
+            JoinType::Left,
+        )
+        .with_build_right(true);
+
+        assert_eq!(join.output_partitions(), expected_partitions);
+
+        let mut total_rows = 0usize;
+        for p in 0..join.output_partitions() {
+            let stream = join.execute(p).await.unwrap();
+            let results: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+            total_rows += results.iter().map(|b| b.num_rows()).sum::<usize>();
+        }
+        // Every left row survives: 10 match a right row, 1990 NULL-extend.
+        assert_eq!(total_rows, 2000);
     }
 }
