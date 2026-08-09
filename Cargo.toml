@@ -95,14 +95,22 @@ memmap2 = "0.9.11"
 # Building this feature also needs `protoc` on PATH or in $PROTOC
 # (lance-table's build script compiles .proto files).
 lance = { version = "0.23", default-features = false, optional = true }
+# Already in the tree as transitive dependencies of lance 0.23.2 — naming them
+# here adds no compilation, only the direct import paths the WRITE path needs:
+# `DatasetIndexExt`/`IndexType` for create_index, and `MetricType` for the
+# index's distance function. lance re-exports neither. Same pin, same reason.
+lance-index = { version = "0.23", optional = true }
+lance-linalg = { version = "0.23", optional = true }
 
 [features]
 default = []
-# Enables the Lance table provider (src/storage/lance.rs), the `load-lance` /
-# `benchmark-lance` CLI commands, and the REPL `.lance` / `.tpch-lance` dot
-# commands. Off by default so the ~490-crate Lance tree (incl. DataFusion) is
-# never compiled — and never able to perturb — the default benchmark build.
-lance = ["dep:lance"]
+# Enables the Lance table provider (src/storage/lance.rs), the Lance writer
+# (src/storage/lance_write.rs), the `load-lance` / `benchmark-lance` /
+# `write-lance` / `lance-versions` / `create-lance-index` CLI commands, and the
+# REPL `.lance` / `.lance-versions` / `.tpch-lance` dot commands. Off by default
+# so the ~490-crate Lance tree (incl. DataFusion) is never compiled — and never
+# able to perturb — the default benchmark build.
+lance = ["dep:lance", "dep:lance-index", "dep:lance-linalg"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

@@ -824,6 +824,191 @@ fn test_unknown_version_is_an_error_not_a_fallback() {
     assert!(msg.contains("999"), "error must name the version: {}", msg);
 }
 
+// ---------------------------------------------------------------------------
+// Writing Lance datasets from Rust.
+//
+// These build their own fixtures, so unlike the read tests above they need no
+// generated data and no Python at all — which is the point of the write path
+// existing. A format you can only read is half-supported.
+// ---------------------------------------------------------------------------
+
+fn ints(name: &str, vals: &[i64]) -> (RecordBatch, arrow::datatypes::SchemaRef) {
+    use arrow::datatypes::{DataType, Field, Schema};
+    let schema = std::sync::Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![std::sync::Arc::new(arrow::array::Int64Array::from(
+            vals.to_vec(),
+        ))],
+    )
+    .expect("batch");
+    (batch, schema)
+}
+
+#[tokio::test]
+async fn test_write_batches_creates_a_readable_dataset() {
+    use query_engine::storage::{lance_write, LanceWriteMode};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("t.lance");
+
+    let (batch, schema) = ints("id", &[1, 2, 3, 4]);
+    let r = lance_write::write_batches(vec![batch], schema, &path, LanceWriteMode::Create)
+        .expect("write failed");
+    assert_eq!(r.rows, 4);
+    assert_eq!(r.version, 1, "a fresh dataset starts at version 1");
+
+    let mut ctx = ExecutionContext::new();
+    ctx.register_lance("t", &path).expect("register");
+    let out = ctx
+        .sql("SELECT id FROM t ORDER BY id")
+        .await
+        .expect("query failed");
+    assert_eq!(
+        to_cells(&out.batches),
+        vec![
+            "1".to_string(),
+            "2".to_string(),
+            "3".to_string(),
+            "4".to_string()
+        ]
+    );
+}
+
+/// The Phase-3 promise, now provable without Python: append creates a new
+/// version and the OLD one still reads its own, smaller contents.
+#[tokio::test]
+async fn test_append_increments_version_and_history_survives() {
+    use query_engine::storage::{lance_write, LanceTable, LanceWriteMode};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("t.lance");
+
+    let (b1, schema) = ints("id", &[1, 2, 3]);
+    let v1 = lance_write::write_batches(vec![b1], schema.clone(), &path, LanceWriteMode::Create)
+        .expect("create");
+    assert_eq!((v1.rows, v1.version), (3, 1));
+
+    let (b2, _) = ints("id", &[4, 5]);
+    let v2 = lance_write::write_batches(vec![b2], schema.clone(), &path, LanceWriteMode::Append)
+        .expect("append");
+    assert_eq!(
+        (v2.rows, v2.version),
+        (5, 2),
+        "append must add rows AND advance the version"
+    );
+
+    // An overwrite is a new version, not a delete: v1 and v2 stay readable.
+    let (b3, _) = ints("id", &[9]);
+    let v3 = lance_write::write_batches(vec![b3], schema, &path, LanceWriteMode::Overwrite)
+        .expect("overwrite");
+    assert_eq!((v3.rows, v3.version), (1, 3));
+
+    for (version, expected) in [(1u64, 3usize), (2, 5), (3, 1)] {
+        let t = LanceTable::try_new_at_version(&path, version).expect("checkout");
+        assert_eq!(t.num_rows(), expected, "version {}", version);
+        assert_eq!(t.version(), version);
+    }
+    assert_eq!(
+        LanceTable::list_versions(&path).unwrap().len(),
+        3,
+        "three writes, three versions"
+    );
+}
+
+#[test]
+fn test_write_modes_refuse_the_wrong_situation() {
+    use query_engine::storage::{lance_write, LanceWriteMode};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("t.lance");
+    let (b, schema) = ints("id", &[1]);
+
+    // Append with nothing there: a typo'd path must not silently create.
+    let err = lance_write::write_batches(
+        vec![b.clone()],
+        schema.clone(),
+        &path,
+        LanceWriteMode::Append,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("cannot append"), "{}", err);
+
+    lance_write::write_batches(
+        vec![b.clone()],
+        schema.clone(),
+        &path,
+        LanceWriteMode::Create,
+    )
+    .expect("create");
+
+    // Create over an existing dataset must not clobber it.
+    let err = lance_write::write_batches(vec![b], schema.clone(), &path, LanceWriteMode::Create)
+        .unwrap_err();
+    assert!(err.to_string().contains("already exists"), "{}", err);
+
+    // Zero batches almost always means "the source query returned nothing and
+    // nobody noticed", so it is refused rather than silently written.
+    let err =
+        lance_write::write_batches(vec![], schema, &path, LanceWriteMode::Overwrite).unwrap_err();
+    assert!(err.to_string().contains("zero batches"), "{}", err);
+}
+
+/// A Rust Parquet -> Lance conversion must produce the same rows the engine's
+/// own Parquet reader sees. This replaces `scripts/lance_convert.py` for the
+/// purposes of the test suite.
+#[tokio::test]
+async fn test_parquet_to_lance_conversion_matches_the_parquet_source() {
+    if !data_available() {
+        return;
+    }
+    use query_engine::storage::{lance_write, LanceWriteMode};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("orders.lance");
+
+    let src = parquet_dir().join("orders.parquet");
+    let r = lance_write::write_from_parquet(&src, &path, LanceWriteMode::Create).expect("convert");
+    assert_eq!(r.rows, 1500);
+    assert_eq!(r.version, 1);
+
+    let sql = "SELECT o_orderkey, o_custkey, o_orderstatus, o_totalprice, o_orderdate \
+               FROM orders ORDER BY o_orderkey LIMIT 50";
+
+    let mut lance_ctx = ExecutionContext::new();
+    lance_ctx.register_lance("orders", &path).expect("register");
+    let a = lance_ctx.sql(sql).await.expect("lance query");
+
+    let mut pq_ctx = ExecutionContext::new();
+    pq_ctx.register_parquet("orders", &src).expect("register");
+    let b = pq_ctx.sql(sql).await.expect("parquet query");
+
+    assert_eq!(a.row_count, b.row_count);
+    assert_eq!(
+        to_cells(&a.batches),
+        to_cells(&b.batches),
+        "the Rust converter must be lossless"
+    );
+}
+
+#[test]
+fn test_vector_index_refuses_a_non_vector_column() {
+    use query_engine::planner::vector_types::VectorMetric;
+    use query_engine::storage::{lance_write, LanceWriteMode};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("t.lance");
+    let (b, schema) = ints("id", &[1, 2, 3]);
+    lance_write::write_batches(vec![b], schema, &path, LanceWriteMode::Create).expect("create");
+
+    // An IVF_PQ index over an Int64 column is meaningless; say so by name.
+    let err = lance_write::create_vector_index(&path, "id", VectorMetric::L2, None, None, false)
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("id"), "must name the column: {}", msg);
+    assert!(msg.contains("fixed-size list"), "{}", msg);
+
+    // A column that is not there at all gets the column list, not a panic.
+    let err = lance_write::create_vector_index(&path, "nope", VectorMetric::L2, None, None, false)
+        .unwrap_err();
+    assert!(err.to_string().contains("nope"), "{}", err);
+}
+
 #[test]
 fn test_missing_dataset_is_a_clean_error() {
     let mut ctx = ExecutionContext::new();

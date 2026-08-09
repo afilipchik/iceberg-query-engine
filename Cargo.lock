@@ -4382,6 +4382,8 @@ dependencies = [
  "hmac",
  "itertools 0.13.0",
  "lance",
+ "lance-index",
+ "lance-linalg",
  "libc",
  "md-5",
  "memmap2",

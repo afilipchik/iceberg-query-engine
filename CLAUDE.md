@@ -718,14 +718,29 @@ query_engine benchmark-lance --path ./data/tpch-10gb-lance --iterations 1 \
 
 # REPL with TPC-H Lance tables preloaded
 query_engine repl --tpch-lance ./data/tpch-1mb-lance
+
+# --- TIME TRAVEL ---
+query_engine lance-versions --path ./data/orders.lance
+query_engine load-lance --path ./data/orders.lance --name o --version 1 \
+    --query "SELECT COUNT(*) FROM o"
+
+# --- WRITING (all in Rust; no Python needed) ---
+# Parquet -> Lance, streamed (never materializes either side)
+query_engine write-lance --from-parquet ./data/tpch-10gb --out ./data/x.lance
+# Append; the version increments and the old version stays readable
+query_engine write-lance --from-parquet ./data/more.parquet --out ./data/x.lance \
+    --mode append
+# CREATE TABLE AS SELECT, in effect: run SQL and write the result
+query_engine write-lance --sql "SELECT * FROM orders WHERE o_totalprice > 100000" \
+    --tables ./data/tpch-1mb --out ./data/big_orders.lance
+# Build the IVF_PQ index the (opt-in) k-NN pushdown uses
+query_engine create-lance-index --path ./data/vectors.lance --column embedding \
+    --metric cosine --partitions 447 --sub-vectors 48 --replace
 ```
 
-Converting Parquet to Lance (needs `.venv` with pylance 0.23.2):
-
-```bash
-.venv/bin/python scripts/lance_convert.py \
-    --parquet ./data/tpch-10gb --out ./data/tpch-10gb-lance
-```
+`scripts/lance_convert.py` (pylance) still exists and produced the committed
+`data/*-lance` fixtures, but `write-lance --from-parquet` is the Rust
+equivalent and is what the test suite uses.
 
 ### Interactive REPL Commands
 
@@ -739,7 +754,8 @@ Once in the REPL, the following dot-commands are available:
 | `.schema <table>` | Show schema for a table |
 | `.load <path> <name>` | Load Parquet file/directory as table |
 | `.tpch <path>` | Load all TPC-H tables from directory |
-| `.lance <path> <name>` | Load a Lance dataset as table (`--features lance`) |
+| `.lance <path> <name> [version]` | Load a Lance dataset as table, optionally at a historical version (`--features lance`) |
+| `.lance-versions <path>` | List a Lance dataset's versions (`--features lance`) |
 | `.tpch-lance <path>` | Load all TPC-H tables from a Lance directory (`--features lance`) |
 | `.mode <format>` | Set output format (table, csv, json, vertical) |
 | `.format` | Show current output format |
@@ -882,9 +898,73 @@ datasets. Enabled with `--features lance`; see Dependencies for protoc/MSRV.
   shared `num_cpus`-wide runtime is driven from a dedicated thread
   (`block_on_lance`), mirroring `subquery::subquery_runtime`. Never create a
   runtime per call, and never `block_on` on a thread a runtime already owns.
-- **Unsupported types fail loudly** at registration, naming the column.
-  `FixedSizeList` (Lance vector/embedding columns) gets a specific message,
-  since that is what a real LanceDB table most likely contains.
+- **Unsupported types fail loudly** at registration, naming the column — and
+  the check is RECURSIVE, judging a nested type by its leaves, so the rejection
+  names the offending leaf (`struct field \`d\`: column type Duration(Second)`).
+
+### Type surface: scalars are EVALUATED, nested values are CARRIED (2026-08-09)
+
+`FixedSizeList` (vectors), `List`/`LargeList`, **`Struct` and `Map`** all read,
+project, filter-around, sort-around, UNION ALL and print. None of them can be
+ordered, grouped, aggregated or compared — those fail with a message naming the
+column, via `crate::planner::vector_types`. Three guards close the holes that
+per-expression checks cannot see:
+
+- `is_opaque_nested` covers Struct/Map, arming GROUP BY / ORDER BY / aggregate
+  args / binary operators.
+- `require_scalar_row` covers **DISTINCT and UNION/INTERSECT/EXCEPT**, which are
+  planned as "group by / join on EVERY output column" and so have no `Expr` to
+  check. Without it `SELECT DISTINCT *` over a struct column collapsed every row
+  into one group (the group-key extractor returns NULL for unknown types) before
+  erroring downstream with a type but no column.
+- `extend_projection_for_sort` covers `ORDER BY <nested col not in SELECT>`,
+  the one shape where the sort key does not resolve against the projected schema
+  so `require_scalar` silently passes. The check is on the sort key EXPRESSION,
+  not its columns — `ORDER BY cosine_distance(embedding, [...])` names a vector
+  but produces a float.
+
+**Field access (`meta.source`) is NOT implemented**, but says so: it parses
+identically to `table.column`, so the binder disambiguates against the schema
+and reports "field access is not implemented" rather than "column not found".
+
+Fixture: `.venv/bin/python scripts/lance_nested_gen.py` -> `data/nested.lance`.
+
+### Filter pushdown: implemented, and gated because it usually LOSES (2026-08-09)
+
+`scan_with_filter` renders a narrow whitelist of `Expr` into `Scanner::filter`.
+Pushing unconditionally made SF=10 TPC-H **18% slower (7.96s -> 9.40s)**, so
+`LanceTable::plan_pushdown` requires all three of: a **nested (wide) column in
+the projection**, **no pushed conjunct touching it**, and **estimated
+selectivity known and <= 10%**. TPC-H has no wide columns, so it never fires
+there (asserted). On `data/vectors.lance` it does: `SELECT id, category,
+embedding FROM vectors WHERE id < 100` goes **44.5ms -> 7.0ms (6.4x)**.
+`QE_LANCE_FILTER_PUSHDOWN=0` reproduces the A/B on the shipped binary.
+
+Correctness rests on the planner ALWAYS re-applying the full predicate in a
+`FilterExec` above the scan, so a push can only be wrong by dropping a row the
+engine would have kept. Hence: unrenderable AND conjuncts are simply omitted;
+unrenderable OR arms refuse the whole predicate; literals are refused unless
+their family matches the column's; LIKE is off the whitelist entirely.
+
+### Versioning and time travel (2026-08-09)
+
+`LanceTable::try_new_at_version` / `version()` / `list_versions()`,
+`ExecutionContext::register_lance_version`, `load-lance --version`,
+`lance-versions`, REPL `.lance <p> <n> [version]` and `.lance-versions`.
+An unknown version is an ERROR, never a silent fall back to the latest.
+Registering one path twice at two versions diffs snapshots in one query.
+**SQL `FOR VERSION AS OF` is NOT implemented** (binder table-factor work).
+
+### Write path, in Rust (2026-08-09)
+
+`src/storage/lance_write.rs`: `write_batches` (CTAS), `write_from_parquet`
+(streamed, never materialized), `create_vector_index` (IVF_PQ). Each returns
+the version it committed. Verified end to end: converted
+`data/tpch-1mb/orders.parquet` cell-exact against the Parquet reader; built a
+447-partition/48-sub-vector cosine IVF_PQ index over 200k x 384 embeddings in
+**44s**, and `verify_vector_search.py --data .scratch/vecidx.lance` searched it
+at distance-exact@10 = 0.800 indexed / 1.000 exact — the whole loop (write,
+index, search) with no Python.
 
 **Statistics: Lance must SCAN for what Parquet gets from a footer.**
 `compute_column_stats` reads the *integer* columns (through Lance's projection,
@@ -1063,7 +1143,26 @@ verbatim whenever the mode is `Exact`, the provider has no index, or the
 provider declines. Exact is therefore not a re-implementation of the query — it
 *is* the query.
 
-### Three measured Lance 0.23.2 defects (all reproduce in raw pylance)
+### Six measured Lance 0.23.2 defects (all reproduce in raw pylance)
+
+Defects 4-6 were found on 2026-08-09 while completing the format support:
+
+4. **A top-level NULL struct does not round-trip.** pyarrow writes `meta = NULL`
+   for a row; Lance reads back `{source: '', score: 0.0, active: false}` with
+   `null_count == 0`. NULL *lists* and NULL struct *fields* both survive, so it
+   is specifically the struct-level validity bitmap that is dropped. The engine
+   renders exactly what Lance returns. Reproduce with
+   `scripts/lance_nested_gen.py` (row 3 is written NULL).
+5. **`Scanner::filter` costs more than decoding the columns**, and scales with
+   rows SCANNED not rows RETURNED. SF=10 `lineitem`, 2 columns: 147 ms
+   unfiltered vs 1,240 ms for a 1.3%-selective filter (375 ms at the best batch
+   size found). 6 columns with `l_shipdate <= '1998-09-02'`: 247 ms vs 1,867 ms.
+   This is why pushdown is gated rather than default.
+6. **A BTREE scalar index makes filtering SLOWER.** Same query, same data:
+   3,323 ms with the index, 1,531 ms with `use_scalar_index=False`, 120 ms with
+   no filter at all. Backwards for an index.
+
+The original three:
 
 1. **`prefilter(true)` does not prefilter when the vector index is used.**
    `nearest(...) + filter("category = 'books'")` returns **0 rows** on a dataset
@@ -1360,8 +1459,12 @@ category precision@10 = 1.000.
 | Main entry point | `src/execution/context.rs` |
 | Parquet table provider | `src/storage/parquet.rs` |
 | Lance table provider | `src/storage/lance.rs` (feature `lance`) |
+| Lance writer (CTAS, parquet→lance, index) | `src/storage/lance_write.rs` (feature `lance`) |
 | Lance tests | `tests/lance_tests.rs` (feature `lance`) |
-| Parquet→Lance conversion | `scripts/lance_convert.py` |
+| Parquet→Lance conversion (Rust) | `write-lance --from-parquet` |
+| Parquet→Lance conversion (Python) | `scripts/lance_convert.py` |
+| Nested-column Lance fixture | `scripts/lance_nested_gen.py` |
+| Versioned Lance fixture | `scripts/lance_versions_gen.py` |
 | DuckDB-over-Lance oracle/baseline | `scripts/duckdb_lance_bench.py` |
 | Streaming Parquet reader | `src/storage/parquet.rs` (StreamingParquetReader) |
 | Async Parquet reader | `src/storage/parquet.rs` (AsyncParquetReader) |

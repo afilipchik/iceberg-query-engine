@@ -144,6 +144,60 @@ enum Commands {
         path: PathBuf,
     },
 
+    /// Write a Lance dataset from Parquet or from a SQL query (--features lance)
+    #[cfg(feature = "lance")]
+    WriteLance {
+        /// Source Parquet file or directory. Mutually exclusive with --sql.
+        #[arg(long)]
+        from_parquet: Option<PathBuf>,
+
+        /// Source SQL query. Requires --tables to say what to run it against.
+        #[arg(long)]
+        sql: Option<String>,
+
+        /// Directory of Parquet files to register before running --sql.
+        #[arg(long)]
+        tables: Option<PathBuf>,
+
+        /// Destination Lance dataset directory
+        #[arg(short, long)]
+        out: PathBuf,
+
+        /// create (default, fails if it exists) | append | overwrite
+        #[arg(long, default_value = "create")]
+        mode: String,
+    },
+
+    /// Build an IVF_PQ vector index over an embedding column (--features lance)
+    #[cfg(feature = "lance")]
+    CreateLanceIndex {
+        /// Path to a Lance dataset directory
+        #[arg(short, long)]
+        path: PathBuf,
+
+        /// Vector column to index (FixedSizeList<Float32, N>)
+        #[arg(short, long)]
+        column: String,
+
+        /// Distance metric the index is built for: l2 | cosine | dot.
+        /// MUST match how queries will be asked — an L2 index answers cosine
+        /// queries wrongly.
+        #[arg(short, long, default_value = "l2")]
+        metric: String,
+
+        /// IVF partitions (default: sqrt(rows))
+        #[arg(long)]
+        partitions: Option<usize>,
+
+        /// PQ sub-vectors; must divide the vector dimension exactly
+        #[arg(long)]
+        sub_vectors: Option<usize>,
+
+        /// Replace an existing index on this column
+        #[arg(long)]
+        replace: bool,
+    },
+
     /// Run TPC-H benchmark from Lance datasets (requires --features lance)
     #[cfg(feature = "lance")]
     BenchmarkLance {
@@ -548,6 +602,156 @@ async fn main() {
 
             let successful = results.iter().filter(|(_, rows, _)| *rows > 0).count();
             println!("Successful queries: {}/{}", successful, results.len());
+        }
+
+        #[cfg(feature = "lance")]
+        Commands::WriteLance {
+            from_parquet,
+            sql,
+            tables,
+            out,
+            mode,
+        } => {
+            use query_engine::storage::{lance_write, LanceWriteMode};
+            let mode: LanceWriteMode = match mode.parse() {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let start = Instant::now();
+
+            let result = match (from_parquet, sql) {
+                (Some(_), Some(_)) => {
+                    eprintln!("Error: pass --from-parquet or --sql, not both");
+                    std::process::exit(1);
+                }
+                (None, None) => {
+                    eprintln!("Error: pass one of --from-parquet or --sql");
+                    std::process::exit(1);
+                }
+                (Some(src), None) => {
+                    println!(
+                        "Converting {} -> {} ({:?})",
+                        src.display(),
+                        out.display(),
+                        mode
+                    );
+                    lance_write::write_from_parquet(&src, &out, mode)
+                }
+                (None, Some(query)) => {
+                    let Some(dir) = tables else {
+                        eprintln!("Error: --sql needs --tables <parquet directory>");
+                        std::process::exit(1);
+                    };
+                    let mut ctx = ExecutionContext::new();
+                    // Register every parquet file in the directory under its
+                    // stem, so the query can name tables normally.
+                    match std::fs::read_dir(&dir) {
+                        Ok(entries) => {
+                            for entry in entries.flatten() {
+                                let p = entry.path();
+                                if p.extension().is_some_and(|e| e == "parquet") {
+                                    if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                                        if let Err(e) = ctx.register_parquet(stem, &p) {
+                                            eprintln!("Warning: {} not registered: {}", stem, e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error reading {}: {}", dir.display(), e);
+                            std::process::exit(1);
+                        }
+                    }
+                    println!("Running: {}", query);
+                    match ctx.sql(&query).await {
+                        Ok(r) => {
+                            println!("Query produced {} rows", r.row_count);
+                            lance_write::write_batches(r.batches, r.schema, &out, mode)
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            };
+
+            match result {
+                Ok(r) => {
+                    println!(
+                        "Wrote {} ({} rows, now at version {}) in {:?}",
+                        out.display(),
+                        r.rows,
+                        r.version,
+                        start.elapsed()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        #[cfg(feature = "lance")]
+        Commands::CreateLanceIndex {
+            path,
+            column,
+            metric,
+            partitions,
+            sub_vectors,
+            replace,
+        } => {
+            use query_engine::planner::vector_types::VectorMetric;
+            use query_engine::storage::lance_write;
+            let metric = match metric.to_ascii_lowercase().as_str() {
+                "l2" | "euclidean" => VectorMetric::L2,
+                "cosine" => VectorMetric::Cosine,
+                "dot" | "inner_product" => VectorMetric::Dot,
+                other => {
+                    eprintln!(
+                        "Error: unknown metric `{}` (expected l2, cosine or dot)",
+                        other
+                    );
+                    std::process::exit(1);
+                }
+            };
+            let start = Instant::now();
+            println!(
+                "Building IVF_PQ index on {}.{} (metric {})",
+                path.display(),
+                column,
+                metric
+            );
+            match lance_write::create_vector_index(
+                &path,
+                &column,
+                metric,
+                partitions,
+                sub_vectors,
+                replace,
+            ) {
+                Ok(r) => {
+                    println!(
+                        "Indexed {} rows in {:?}; dataset is now at version {}",
+                        r.rows,
+                        start.elapsed(),
+                        r.version
+                    );
+                    println!(
+                        "\nThe index is APPROXIMATE and stays OPT-IN. Enable it with \
+                         QE_VECTOR_SEARCH=indexed (see CLAUDE.md for measured recall)."
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
 
         #[cfg(feature = "lance")]

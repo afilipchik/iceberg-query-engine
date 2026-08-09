@@ -57,7 +57,7 @@ const LANCE_BATCH_SIZE: usize = 8192;
 /// decode that fragment parallelism exists to overlap. This mirrors the
 /// reasoning in `physical::operators::subquery::subquery_runtime`, which was
 /// widened from 2 workers to `num_cpus` for exactly this class of problem.
-fn lance_runtime() -> &'static tokio::runtime::Runtime {
+pub(super) fn lance_runtime() -> &'static tokio::runtime::Runtime {
     use std::sync::OnceLock;
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {

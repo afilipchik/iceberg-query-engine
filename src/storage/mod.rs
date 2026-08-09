@@ -17,5 +17,11 @@ mod lance;
 #[cfg(feature = "lance")]
 pub use lance::LanceTable;
 
+/// Writing Lance datasets. Requires `--features lance`.
+#[cfg(feature = "lance")]
+pub mod lance_write;
+#[cfg(feature = "lance")]
+pub use lance_write::{LanceWriteMode, LanceWriteResult};
+
 pub mod ipc_cache;
 pub mod metadata_cache;
