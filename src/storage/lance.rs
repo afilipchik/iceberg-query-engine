@@ -91,13 +91,55 @@ fn lance_err(context: &str, e: impl fmt::Display) -> QueryError {
     QueryError::Storage(format!("Lance {}: {}", context, e))
 }
 
+/// Is this a type the engine's *scalar* operators (compare, arithmetic, hash,
+/// sort) can evaluate directly?
+///
+/// Used to decide whether a nested type's element type is carryable.
+fn is_scalar_type(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::FixedSizeBinary(_)
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _)
+            | DataType::Decimal128(_, _)
+            | DataType::Null
+    )
+}
+
 /// Reject Lance column types the engine's execution operators cannot evaluate.
 ///
 /// Failing at registration with a named column beats coercing silently and
 /// producing wrong answers, or panicking deep inside an operator at run time.
-/// The nested cases are the realistic ones: `FixedSizeList` is how Lance stores
-/// vector embeddings, which is precisely what a LanceDB user is most likely to
-/// have in a table.
+///
+/// # Why `FixedSizeList` is now accepted
+///
+/// `FixedSizeList<Float32, N>` is how Lance stores vector embeddings, and it is
+/// the single most important column type a LanceDB user has. It is accepted as
+/// an *opaque carried value*: it can be scanned, projected, aliased, LIMITed and
+/// fed to the vector-distance functions (`l2_distance`, `cosine_distance`,
+/// `dot_product`). It deliberately cannot be summed, grouped by, compared with
+/// `=`/`<`, or sorted — those still fail loudly, naming the column, via
+/// `crate::planner::vector_types`. Carrying a value the engine cannot order is
+/// safe; pretending it has an order is not.
 fn unsupported_reason(dt: &DataType) -> Option<String> {
     match dt {
         DataType::Boolean
@@ -133,15 +175,27 @@ fn unsupported_reason(dt: &DataType) -> Option<String> {
                 _ => Some(format!("dictionary type {:?}", dt)),
             }
         }
-        DataType::FixedSizeList(field, width) => Some(format!(
-            "fixed-size list of {} x {:?} (a Lance vector/embedding column); \
-             the engine has no array type, so select the scalar columns \
-             explicitly instead of `SELECT *`",
-            width,
-            field.data_type()
-        )),
-        DataType::List(_) | DataType::LargeList(_) => {
-            Some("list/array columns (the engine has no array type)".to_string())
+        // Vector / embedding columns. Carried opaquely; see the doc comment.
+        DataType::FixedSizeList(field, width) => {
+            if is_scalar_type(field.data_type()) {
+                None
+            } else {
+                Some(format!(
+                    "fixed-size list[{}] of nested element type {:?}",
+                    width,
+                    field.data_type()
+                ))
+            }
+        }
+        DataType::List(field) | DataType::LargeList(field) => {
+            if is_scalar_type(field.data_type()) {
+                None
+            } else {
+                Some(format!(
+                    "list of nested element type {:?}",
+                    field.data_type()
+                ))
+            }
         }
         DataType::Struct(_) => Some("struct columns (no nested type support)".to_string()),
         DataType::Map(_, _) => Some("map columns (no nested type support)".to_string()),
@@ -578,13 +632,27 @@ mod tests {
     }
 
     #[test]
-    fn test_vector_column_is_rejected_by_name() {
+    fn test_vector_column_is_accepted() {
         use arrow::datatypes::Field;
         let dt =
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 128);
-        let reason = unsupported_reason(&dt).expect("vector columns must be rejected");
-        assert!(reason.contains("vector"), "unhelpful message: {}", reason);
+        assert!(
+            unsupported_reason(&dt).is_none(),
+            "embedding columns must be readable"
+        );
         assert!(unsupported_reason(&DataType::Int64).is_none());
         assert!(unsupported_reason(&DataType::Utf8).is_none());
+        // Lists of scalars pass through too.
+        let list = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        assert!(unsupported_reason(&list).is_none());
+    }
+
+    #[test]
+    fn test_nested_of_nested_still_rejected() {
+        use arrow::datatypes::Field;
+        let inner = DataType::Struct(vec![Field::new("a", DataType::Int32, true)].into());
+        let dt = DataType::FixedSizeList(Arc::new(Field::new("item", inner, true)), 4);
+        assert!(unsupported_reason(&dt).is_some());
+        assert!(unsupported_reason(&DataType::Struct(Default::default())).is_some());
     }
 }

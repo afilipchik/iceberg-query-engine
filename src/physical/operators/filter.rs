@@ -798,6 +798,71 @@ fn evaluate_in_list(value: &ArrayRef, list: &[ArrayRef], negated: bool) -> Resul
     }
 }
 
+/// Evaluate `l2_distance` / `cosine_distance` / `cosine_similarity` /
+/// `dot_product` over a batch.
+///
+/// Two supported shapes:
+///   * `f(vector_column, <array literal>)` — the k-NN case, and the one the
+///     pushdown rule recognizes. Symmetric, so the literal may be either side.
+///   * `f(vector_column, vector_column)` — row-wise distance between two
+///     vector columns of equal dimension.
+///
+/// This is the EXACT path: it computes the true distance for every row. It is
+/// what the engine falls back to for any provider without a vector index, and
+/// it is the reference the approximate index path is measured against.
+fn evaluate_vector_distance(
+    batch: &RecordBatch,
+    func: &crate::planner::ScalarFunction,
+    args: &[Expr],
+    subquery_executor: Option<&SubqueryExecutor>,
+) -> Result<ArrayRef> {
+    use crate::physical::vector::{
+        distance_column, distance_columns, query_vector_from_scalar, DistanceKind,
+    };
+    use crate::planner::ScalarFunction;
+
+    let kind = match func {
+        ScalarFunction::L2Distance => DistanceKind::L2,
+        ScalarFunction::CosineDistance => DistanceKind::Cosine,
+        ScalarFunction::CosineSimilarity => DistanceKind::CosineSimilarity,
+        ScalarFunction::DotProduct => DistanceKind::Dot,
+        other => {
+            return Err(QueryError::Internal(format!(
+                "{} is not a vector distance",
+                other
+            )))
+        }
+    };
+
+    if args.len() != 2 {
+        return Err(QueryError::InvalidArgument(format!(
+            "{} requires exactly 2 arguments, got {}",
+            func,
+            args.len()
+        )));
+    }
+
+    // Locate the constant side, if any. Distances are symmetric in their two
+    // arguments for every metric implemented here, so either order is fine.
+    let literal = |e: &Expr| match e {
+        Expr::Literal(v) => query_vector_from_scalar(v),
+        _ => None,
+    };
+
+    if let Some(q) = literal(&args[1]) {
+        let col = evaluate_expr_internal(batch, &args[0], subquery_executor)?;
+        return distance_column(&col, &q, kind, &args[0].output_name());
+    }
+    if let Some(q) = literal(&args[0]) {
+        let col = evaluate_expr_internal(batch, &args[1], subquery_executor)?;
+        return distance_column(&col, &q, kind, &args[1].output_name());
+    }
+
+    let left = evaluate_expr_internal(batch, &args[0], subquery_executor)?;
+    let right = evaluate_expr_internal(batch, &args[1], subquery_executor)?;
+    distance_columns(&left, &right, kind)
+}
+
 fn evaluate_scalar_func(
     batch: &RecordBatch,
     func: &crate::planner::ScalarFunction,
@@ -806,6 +871,20 @@ fn evaluate_scalar_func(
 ) -> Result<ArrayRef> {
     use crate::planner::ScalarFunction;
     use arrow::array::{BinaryArray, Float64Array};
+
+    // Vector distances are handled before the generic argument evaluation.
+    // A 384-float query vector must NOT go through `scalar_to_array`, which
+    // renders a `ScalarValue::List` as a JSON string once per row — that would
+    // be an O(rows x dim) string build before a single distance was computed.
+    if matches!(
+        func,
+        ScalarFunction::L2Distance
+            | ScalarFunction::CosineDistance
+            | ScalarFunction::CosineSimilarity
+            | ScalarFunction::DotProduct
+    ) {
+        return evaluate_vector_distance(batch, func, args, subquery_executor);
+    }
 
     let evaluated_args: Result<Vec<ArrayRef>> = args
         .iter()
@@ -3476,10 +3555,14 @@ fn evaluate_scalar_func(
             Ok(Arc::new(result))
         }
 
-        // ========== NEW MATH FUNCTIONS - VECTOR OPERATIONS ==========
-        ScalarFunction::CosineSimilarity | ScalarFunction::CosineDistance => Err(
-            QueryError::NotImplemented("Vector operations require array type support".into()),
-        ),
+        // Vector distances are intercepted at the top of this function; they
+        // never reach the generic per-function dispatch.
+        ScalarFunction::CosineSimilarity
+        | ScalarFunction::CosineDistance
+        | ScalarFunction::L2Distance
+        | ScalarFunction::DotProduct => Err(QueryError::Internal(
+            "vector distance reached the generic scalar dispatch".into(),
+        )),
 
         // ========== NEW STRING FUNCTIONS ==========
         ScalarFunction::Split => {

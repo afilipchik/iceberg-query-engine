@@ -6,6 +6,7 @@ mod binder;
 mod logical_expr;
 mod logical_plan;
 mod schema;
+pub mod vector_types;
 
 pub use binder::*;
 pub use logical_expr::*;

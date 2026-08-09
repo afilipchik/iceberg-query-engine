@@ -130,18 +130,33 @@ impl<'a> Binder<'a> {
         // Start with the body (SELECT, UNION, etc.)
         let mut plan = self.bind_set_expr(&query.body)?;
 
-        // Apply ORDER BY
+        // Apply ORDER BY.
+        //
+        // `ORDER BY` may reference columns the SELECT list does not output —
+        // `SELECT id FROM t ORDER BY price` is legal SQL, and it is exactly the
+        // shape of a vector search (`SELECT id, text ... ORDER BY
+        // cosine_distance(embedding, [...])`, where the 384-float embedding is
+        // emphatically not something you want in the result set). Those extra
+        // columns are added to the projection, sorted on, then trimmed back off
+        // above the LIMIT. See `extend_projection_for_sort`.
+        let mut trim_to: Option<PlanSchema> = None;
         if let Some(ref order_by_clause) = query.order_by {
             if !order_by_clause.exprs.is_empty() {
                 let order_by = self.bind_order_by(&order_by_clause.exprs, &plan.schema())?;
+                let (extended, trim) = extend_projection_for_sort(plan, &order_by)?;
+                trim_to = trim;
                 plan = LogicalPlan::Sort(SortNode {
-                    input: Arc::new(plan),
+                    input: Arc::new(extended),
                     order_by,
                 });
             }
         }
 
-        // Apply LIMIT/OFFSET
+        // Apply LIMIT/OFFSET.
+        //
+        // The trimming projection is deliberately applied *after* LIMIT: a
+        // projection between Sort and Limit would break the physical planner's
+        // Sort+Limit fusion and turn a top-k into a full sort.
         if query.limit.is_some() || query.offset.is_some() {
             let skip = query
                 .offset
@@ -157,6 +172,24 @@ impl<'a> Binder<'a> {
                 input: Arc::new(plan),
                 skip,
                 fetch,
+            });
+        }
+
+        if let Some(schema) = trim_to {
+            let exprs: Vec<Expr> = schema
+                .fields()
+                .iter()
+                .map(|f| {
+                    Expr::Column(Column {
+                        relation: f.relation.clone(),
+                        name: f.name.clone(),
+                    })
+                })
+                .collect();
+            plan = LogicalPlan::Project(ProjectNode {
+                input: Arc::new(plan),
+                exprs,
+                schema,
             });
         }
 
@@ -347,9 +380,21 @@ impl<'a> Binder<'a> {
         if has_aggregates || !group_by.is_empty() {
             let mut agg_fields = Vec::new();
             for expr in &group_by {
+                // Hashing a 384-float embedding as a group key is never what
+                // the user meant; reject it with the column name.
+                crate::planner::vector_types::require_scalar(expr, &input_schema, "GROUP BY")?;
                 agg_fields.push(expr.to_field(&input_schema)?);
             }
             for (i, expr) in aggregates.iter().enumerate() {
+                if let Expr::Aggregate { func, args, .. } = expr {
+                    for arg in args {
+                        crate::planner::vector_types::require_scalar(
+                            arg,
+                            &input_schema,
+                            &func.to_string(),
+                        )?;
+                    }
+                }
                 // Use the alias if available, otherwise use the expression's output name
                 let field_name = aggregate_aliases
                     .get(i)
@@ -1145,6 +1190,10 @@ impl<'a> Binder<'a> {
                     }
                     _ => self.bind_expr(&o.expr, schema)?,
                 };
+                // A vector has no total order; sorting by one would silently
+                // order by whatever byte-wise comparison the kernel happens to
+                // do. Reject it, naming the column.
+                crate::planner::vector_types::require_scalar(&expr, schema, "ORDER BY")?;
                 let direction = if o.asc.unwrap_or(true) {
                     SortDirection::Asc
                 } else {
@@ -1190,10 +1239,24 @@ impl<'a> Binder<'a> {
                 }
             }
             SqlExpr::Value(value) => self.bind_value(value),
+            // `[1.0, 2.0, ...]` / `ARRAY[...]`. The realistic use is a 384- or
+            // 1536-element query vector, so this must stay linear and cheap:
+            // elements are folded straight into one `ScalarValue::List`
+            // literal, never into a 384-node expression tree that every
+            // optimizer rule would then walk.
+            SqlExpr::Array(arr) => self.bind_array_literal(&arr.elem, schema),
             SqlExpr::BinaryOp { left, op, right } => {
                 let left_expr = self.bind_expr(left, schema)?;
                 let right_expr = self.bind_expr(right, schema)?;
                 let binary_op = self.convert_binary_op(op)?;
+                // `embedding = embedding` / `embedding > 3` have no meaning; the
+                // comparison kernels would either error opaquely or coerce.
+                crate::planner::vector_types::require_scalar_operands(
+                    &left_expr,
+                    &right_expr,
+                    schema,
+                    &binary_op.to_string(),
+                )?;
                 Ok(Expr::BinaryExpr {
                     left: Box::new(left_expr),
                     op: binary_op,
@@ -1513,6 +1576,55 @@ impl<'a> Binder<'a> {
                 value
             ))),
         }
+    }
+
+    /// Bind `[a, b, c]` / `ARRAY[a, b, c]` to a single `ScalarValue::List`.
+    ///
+    /// Elements must be constants. A 384-float query vector is the motivating
+    /// case, and folding it into one literal (rather than an N-child expression
+    /// node) keeps every later plan traversal O(1) in the vector's dimension
+    /// instead of O(N) per rule per pass.
+    ///
+    /// The element type is the widest of the element types present, so
+    /// `[1, 2.5]` is a Float64 list rather than a type error.
+    fn bind_array_literal(&mut self, elems: &[SqlExpr], schema: &PlanSchema) -> Result<Expr> {
+        let mut values: Vec<ScalarValue> = Vec::with_capacity(elems.len());
+        let mut any_float = false;
+        let mut any_string = false;
+
+        for (i, e) in elems.iter().enumerate() {
+            let bound = self.bind_expr(e, schema)?;
+            let scalar = const_scalar(&bound).ok_or_else(|| {
+                QueryError::NotImplemented(format!(
+                    "array literal element {} is not a constant ({}); \
+                     array literals must be built from literals",
+                    i, bound
+                ))
+            })?;
+            match &scalar {
+                ScalarValue::Float32(_) | ScalarValue::Float64(_) | ScalarValue::Decimal128(_) => {
+                    any_float = true
+                }
+                ScalarValue::Utf8(_) => any_string = true,
+                _ => {}
+            }
+            values.push(scalar);
+        }
+
+        let elem_type = if any_string {
+            ArrowDataType::Utf8
+        } else if any_float {
+            ArrowDataType::Float64
+        } else if values.is_empty() {
+            ArrowDataType::Null
+        } else {
+            ArrowDataType::Int64
+        };
+
+        Ok(Expr::Literal(ScalarValue::List(
+            values,
+            Box::new(elem_type),
+        )))
     }
 
     fn bind_function(&mut self, func: &ast::Function, schema: &PlanSchema) -> Result<Expr> {
@@ -2270,6 +2382,17 @@ impl<'a> Binder<'a> {
                 func: ScalarFunction::CosineDistance,
                 args,
             }),
+            // Vector distance / similarity. See ScalarFunction docs for the
+            // sign convention: *_DISTANCE is smaller-is-closer, DOT_PRODUCT is
+            // a similarity where larger is closer.
+            "L2_DISTANCE" | "EUCLIDEAN_DISTANCE" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::L2Distance,
+                args,
+            }),
+            "DOT_PRODUCT" | "INNER_PRODUCT" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::DotProduct,
+                args,
+            }),
             // New String functions
             "SPLIT" => Ok(Expr::ScalarFunc {
                 func: ScalarFunction::Split,
@@ -2871,6 +2994,162 @@ fn normalize_join_on(
     (normalized, filter)
 }
 
+/// Collect every column reference inside an expression.
+fn collect_expr_columns(e: &Expr, out: &mut Vec<Column>) {
+    match e {
+        Expr::Column(c) => out.push(c.clone()),
+        Expr::BinaryExpr { left, right, .. } => {
+            collect_expr_columns(left, out);
+            collect_expr_columns(right, out);
+        }
+        Expr::UnaryExpr { expr, .. } | Expr::Cast { expr, .. } | Expr::Alias { expr, .. } => {
+            collect_expr_columns(expr, out)
+        }
+        Expr::ScalarFunc { args, .. } | Expr::Aggregate { args, .. } => {
+            for a in args {
+                collect_expr_columns(a, out);
+            }
+        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(o) = operand {
+                collect_expr_columns(o, out);
+            }
+            for (w, t) in when_then {
+                collect_expr_columns(w, out);
+                collect_expr_columns(t, out);
+            }
+            if let Some(e) = else_expr {
+                collect_expr_columns(e, out);
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_expr_columns(expr, out);
+            for l in list {
+                collect_expr_columns(l, out);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_expr_columns(expr, out);
+            collect_expr_columns(low, out);
+            collect_expr_columns(high, out);
+        }
+        _ => {}
+    }
+}
+
+/// Make every column an ORDER BY needs visible to the Sort operator.
+///
+/// `SELECT id FROM t ORDER BY price` is valid SQL, but the plan is
+/// `Sort(Project([id], Scan))` — the Sort's input has no `price` column and
+/// execution failed with `Column not found: price`. (This bit every query of
+/// that shape, not just vector searches.)
+///
+/// The fix is the textbook one: widen the projection under the Sort with the
+/// missing columns, and hand the caller the ORIGINAL output schema so it can
+/// trim them back off once sorting (and LIMIT) are done.
+///
+/// Returns `(possibly-widened plan, Some(original schema) if widened)`.
+///
+/// Deliberately conservative. Widening happens only when:
+///   * the node under the Sort is a plain `Project`, and
+///   * every missing column resolves unambiguously in that Project's input, and
+///   * the Project's input is not an `Aggregate` — after grouping, a column
+///     that was projected away genuinely no longer exists, and inventing it
+///     would answer a different question.
+/// Anything else is left exactly as it was.
+fn extend_projection_for_sort(
+    plan: LogicalPlan,
+    order_by: &[SortExpr],
+) -> Result<(LogicalPlan, Option<PlanSchema>)> {
+    let out_schema = plan.schema();
+
+    // Which columns does the sort need that the current output lacks?
+    let mut missing: Vec<Column> = Vec::new();
+    for sort in order_by {
+        // A correlated subquery in ORDER BY resolves columns by rules this
+        // widening does not model; leave those plans untouched.
+        if sort.expr.contains_subquery() {
+            return Ok((plan, None));
+        }
+        let mut cols = Vec::new();
+        collect_expr_columns(&sort.expr, &mut cols);
+        for col in cols {
+            if out_schema.resolve_column(&col).is_none() && !missing.contains(&col) {
+                missing.push(col);
+            }
+        }
+    }
+    if missing.is_empty() {
+        return Ok((plan, None));
+    }
+
+    let LogicalPlan::Project(project) = plan else {
+        return Ok((plan, None));
+    };
+    if matches!(project.input.as_ref(), LogicalPlan::Aggregate(_)) {
+        return Ok((LogicalPlan::Project(project), None));
+    }
+
+    let input_schema = project.input.schema();
+    let mut extra_exprs = Vec::new();
+    let mut extra_fields = Vec::new();
+    for col in &missing {
+        let Some((_, field)) = input_schema.resolve_column(col) else {
+            // Not resolvable below either: leave the plan alone so the existing
+            // error path reports it rather than silently dropping the sort key.
+            return Ok((LogicalPlan::Project(project), None));
+        };
+        extra_exprs.push(Expr::Column(col.clone()));
+        extra_fields.push(field.clone());
+    }
+
+    let original_schema = project.schema.clone();
+    let mut exprs = project.exprs;
+    exprs.extend(extra_exprs);
+    let mut fields = project.schema.fields().to_vec();
+    fields.extend(extra_fields);
+
+    Ok((
+        LogicalPlan::Project(ProjectNode {
+            input: project.input,
+            exprs,
+            schema: PlanSchema::new(fields),
+        }),
+        Some(original_schema),
+    ))
+}
+
+/// Reduce a bound expression to a constant, if it is one.
+///
+/// `bind_expr` turns `-0.5` into `Negate(Literal(0.5))` rather than a negative
+/// literal, so array literals — which are overwhelmingly written with negative
+/// components — must undo that here.
+fn const_scalar(expr: &Expr) -> Option<ScalarValue> {
+    match expr {
+        Expr::Literal(v) => Some(v.clone()),
+        Expr::UnaryExpr {
+            op: UnaryOp::Negate,
+            expr,
+        } => match const_scalar(expr)? {
+            ScalarValue::Int8(v) => Some(ScalarValue::Int8(-v)),
+            ScalarValue::Int16(v) => Some(ScalarValue::Int16(-v)),
+            ScalarValue::Int32(v) => Some(ScalarValue::Int32(-v)),
+            ScalarValue::Int64(v) => Some(ScalarValue::Int64(-v)),
+            ScalarValue::Float32(v) => Some(ScalarValue::Float32(-v)),
+            ScalarValue::Float64(v) => Some(ScalarValue::Float64(-v)),
+            ScalarValue::Decimal128(v) => Some(ScalarValue::Decimal128(-v)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3018,16 +3297,60 @@ mod tests {
             .bind_sql("SELECT o_orderkey FROM orders ORDER BY o_totalprice DESC")
             .unwrap();
 
-        // Should have sort at top
+        // `o_totalprice` is not in the SELECT list, so the projection under the
+        // Sort is widened to carry it and a trimming Project is added on top.
         fn has_sort(plan: &LogicalPlan) -> bool {
             match plan {
                 LogicalPlan::Sort(_) => true,
                 LogicalPlan::Limit(l) => has_sort(&l.input),
+                LogicalPlan::Project(p) => has_sort(&p.input),
                 _ => false,
             }
         }
 
         assert!(has_sort(&plan));
+        // The user asked for one column and must get exactly one column back.
+        assert_eq!(plan.schema().fields().len(), 1);
+        assert_eq!(plan.schema().fields()[0].name, "o_orderkey");
+    }
+
+    #[test]
+    fn test_order_by_non_projected_column_is_visible_to_sort() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let plan = binder
+            .bind_sql("SELECT o_orderkey FROM orders ORDER BY o_totalprice")
+            .unwrap();
+
+        // Find the Sort and check its input actually exposes the sort key.
+        fn find_sort(plan: &LogicalPlan) -> Option<&SortNode> {
+            match plan {
+                LogicalPlan::Sort(s) => Some(s),
+                LogicalPlan::Limit(l) => find_sort(&l.input),
+                LogicalPlan::Project(p) => find_sort(&p.input),
+                _ => None,
+            }
+        }
+        let sort = find_sort(&plan).expect("sort node");
+        let input_schema = sort.input.schema();
+        assert!(
+            input_schema
+                .resolve_column(&Column::new("o_totalprice"))
+                .is_some(),
+            "sort input must expose the sort key, got {:?}",
+            input_schema
+        );
+    }
+
+    #[test]
+    fn test_order_by_projected_column_is_not_widened() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let plan = binder
+            .bind_sql("SELECT o_orderkey FROM orders ORDER BY o_orderkey")
+            .unwrap();
+        // No widening needed, so no trimming projection on top of the Sort.
+        assert!(matches!(plan, LogicalPlan::Sort(_)), "got {:?}", plan);
     }
 
     #[test]

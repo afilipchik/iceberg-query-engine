@@ -326,6 +326,12 @@ pub enum ScalarFunction {
     // Math - Vector operations
     CosineSimilarity,
     CosineDistance,
+    /// Euclidean (L2) distance. SMALLER = closer.
+    L2Distance,
+    /// Raw inner product. This is a **similarity**, not a distance:
+    /// LARGER = closer. Deliberately not negated or offset, so that
+    /// `dot_product(a, b)` means exactly what linear algebra says it means.
+    DotProduct,
     // String - Basic
     Upper,
     Lower,
@@ -595,6 +601,8 @@ impl fmt::Display for ScalarFunction {
             // Math - Vector operations
             ScalarFunction::CosineSimilarity => write!(f, "COSINE_SIMILARITY"),
             ScalarFunction::CosineDistance => write!(f, "COSINE_DISTANCE"),
+            ScalarFunction::L2Distance => write!(f, "L2_DISTANCE"),
+            ScalarFunction::DotProduct => write!(f, "DOT_PRODUCT"),
             // String - Basic
             ScalarFunction::Upper => write!(f, "UPPER"),
             ScalarFunction::Lower => write!(f, "LOWER"),
@@ -1340,7 +1348,9 @@ impl Expr {
                     | ScalarFunction::WilsonIntervalLower
                     | ScalarFunction::WilsonIntervalUpper
                     | ScalarFunction::CosineSimilarity
-                    | ScalarFunction::CosineDistance => Ok(ArrowDataType::Float64),
+                    | ScalarFunction::CosineDistance
+                    | ScalarFunction::L2Distance
+                    | ScalarFunction::DotProduct => Ok(ArrowDataType::Float64),
                     // Math functions returning Boolean
                     ScalarFunction::IsFinite
                     | ScalarFunction::IsNan

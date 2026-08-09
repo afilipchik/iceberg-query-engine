@@ -461,8 +461,75 @@ pub fn print_results(result: &QueryResult) {
     println!();
 
     if !result.batches.is_empty() {
-        let _ = print_batches(&result.batches);
+        let display: Vec<_> = result
+            .batches
+            .iter()
+            .map(summarize_vector_columns)
+            .collect();
+        let _ = print_batches(&display);
     }
+}
+
+/// Replace vector/list columns with a short text summary for display.
+///
+/// Arrow's `print_batches` renders a `FixedSizeList<Float32, 384>` cell as all
+/// 384 numbers, which produces a 5,000-character-wide table for a single
+/// embedding and hides every other column. Only the *printed* copy is
+/// rewritten; `QueryResult::batches` still holds the real vectors.
+fn summarize_vector_columns(batch: &RecordBatch) -> RecordBatch {
+    use arrow::array::{Array, ArrayRef, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let needs_summary = batch
+        .schema()
+        .fields()
+        .iter()
+        .any(|f| crate::planner::vector_types::is_opaque_nested(f.data_type()));
+    if !needs_summary {
+        return batch.clone();
+    }
+
+    let mut fields: Vec<Field> = Vec::with_capacity(batch.num_columns());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for (i, field) in batch.schema().fields().iter().enumerate() {
+        let col = batch.column(i);
+        if !crate::planner::vector_types::is_opaque_nested(field.data_type()) {
+            fields.push(field.as_ref().clone());
+            columns.push(col.clone());
+            continue;
+        }
+        let summary: StringArray = (0..col.len())
+            .map(|r| {
+                if col.is_null(r) {
+                    None
+                } else {
+                    Some(summarize_nested_cell(col, r))
+                }
+            })
+            .collect();
+        fields.push(Field::new(field.name(), DataType::Utf8, true));
+        columns.push(Arc::new(summary));
+    }
+
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap_or_else(|_| batch.clone())
+}
+
+fn summarize_nested_cell(col: &arrow::array::ArrayRef, row: usize) -> String {
+    use arrow::array::{Array, FixedSizeListArray, Float32Array};
+    use arrow::datatypes::DataType;
+
+    if let DataType::FixedSizeList(_, dim) = col.data_type() {
+        if let Some(list) = col.as_any().downcast_ref::<FixedSizeListArray>() {
+            let child = list.value(row);
+            if let Some(f) = child.as_any().downcast_ref::<Float32Array>() {
+                let head: Vec<String> = (0..f.len().min(3))
+                    .map(|i| format!("{:.4}", f.value(i)))
+                    .collect();
+                return format!("[{}, ...] ({}d)", head.join(", "), dim);
+            }
+        }
+    }
+    format!("<{}>", col.data_type())
 }
 
 /// Format bytes into human-readable string

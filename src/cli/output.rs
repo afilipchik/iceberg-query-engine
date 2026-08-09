@@ -440,11 +440,64 @@ impl OutputFormatter {
                     value.to_string()
                 }
             }
+            // Vector / array columns. A 384-float embedding printed in full
+            // makes a result table unreadable and a CSV unusable, so show the
+            // head and the dimension: `[0.011, -0.043, ... ] (384)`.
+            DataType::FixedSizeList(_, _) | DataType::List(_) | DataType::LargeList(_) => {
+                format_nested_value(array, row)
+            }
             _ => {
                 // Fallback: use Arrow's display
                 format!("{:?}", array.as_ref())
             }
         }
+    }
+}
+
+/// Render one row of a list/vector column compactly.
+///
+/// Full contents are never printed: an embedding is 384-1536 numbers and would
+/// swamp every other column. The dimension is included so the value is still
+/// self-describing.
+fn format_nested_value(array: &ArrayRef, row: usize) -> String {
+    use arrow::array::{FixedSizeListArray, LargeListArray, ListArray};
+
+    const HEAD: usize = 4;
+
+    let child: ArrayRef = match array.data_type() {
+        DataType::FixedSizeList(_, _) => {
+            let a = array
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .expect("checked by data_type");
+            a.value(row)
+        }
+        DataType::List(_) => {
+            let a = array
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("checked by data_type");
+            a.value(row)
+        }
+        DataType::LargeList(_) => {
+            let a = array
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .expect("checked by data_type");
+            a.value(row)
+        }
+        _ => return format!("{:?}", array.as_ref()),
+    };
+
+    let n = child.len();
+    let formatter = OutputFormatter::new(OutputFormat::Table);
+    let head: Vec<String> = (0..n.min(HEAD))
+        .map(|i| formatter.format_display_value(&child, i))
+        .collect();
+    if n > HEAD {
+        format!("[{}, ...] ({})", head.join(", "), n)
+    } else {
+        format!("[{}]", head.join(", "))
     }
 }
 
