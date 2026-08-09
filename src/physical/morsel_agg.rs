@@ -104,6 +104,27 @@ pub(crate) fn merge_states_to_batches_filtered(
             prepared.push(st);
         }
         if all_raw {
+            // Pair-based merge when the shape is exactly [Sum(Float64)]:
+            // (u64, f64) entries end to end, no boxed accumulators anywhere.
+            let sum_shape = agg_funcs.len() == 1
+                && matches!(agg_funcs[0], AggregateFunction::Sum)
+                && matches!(input_types.first(), Some(DataType::Float64))
+                && schema.fields().len() == 2
+                && schema.field(1).data_type() == &DataType::Float64;
+            if sum_shape
+                && prepared
+                    .iter_mut()
+                    .all(|st| st.absorb_raw_groups_into_sums())
+            {
+                return merge_raw_sum_states_to_batches(
+                    prepared,
+                    agg_funcs,
+                    input_types,
+                    &dt,
+                    schema,
+                    post_filter,
+                );
+            }
             return merge_raw_states_to_batches(
                 prepared,
                 agg_funcs,
@@ -198,6 +219,8 @@ fn merge_raw_states_to_batches(
     post_filter: Option<&Expr>,
 ) -> Result<Vec<RecordBatch>> {
     let p = rayon::current_num_threads().clamp(2, 64);
+    let timing = std::env::var("AGG_TIMING").is_ok();
+    let t0 = std::time::Instant::now();
 
     // Null-group accumulators merged across states up front; also gather the
     // global key range and group count to pick the merge strategy.
@@ -207,6 +230,7 @@ fn merge_raw_states_to_batches(
     let mut total = 0usize;
     let mut prepared: Vec<AggregationState> = Vec::with_capacity(states.len());
     for mut st in states {
+        st.demote_raw_sums();
         if let Some(n) = st.raw_null.take() {
             match &mut raw_null {
                 Some(existing) => {
@@ -253,6 +277,7 @@ fn merge_raw_states_to_batches(
             shard_major[pi].push(shard);
         }
     }
+    let t_sharded = t0.elapsed();
 
     let w = range.div_ceil(p as u64).max(1);
     let mut batches: Vec<RecordBatch> = shard_major
@@ -331,6 +356,186 @@ fn merge_raw_states_to_batches(
         .into_iter()
         .flatten()
         .collect();
+
+    if timing {
+        eprintln!(
+            "[raw-merge] {} groups dense={} shard: {:?}; merge+build: {:?}; total: {:?}",
+            total,
+            dense,
+            t_sharded,
+            t0.elapsed() - t_sharded,
+            t0.elapsed()
+        );
+    }
+    if let Some(null_accs) = raw_null {
+        let state = AggregationState::from_raw_groups(
+            agg_funcs.to_vec(),
+            input_types.to_vec(),
+            raw_type.clone(),
+            HashMap::new(),
+            Some(null_accs),
+        );
+        if let Some(b) = build_filtered_output(&state, schema, post_filter)? {
+            batches.push(b);
+        }
+    }
+    Ok(batches)
+}
+
+/// Pair-based parallel merge for the bare-f64 sum representation: (u64, f64)
+/// entries end to end — shard, merge, and build output without ever
+/// materializing a boxed accumulator (Q20: 4.4M groups, exactly [Sum(F64)]).
+fn merge_raw_sum_states_to_batches(
+    states: Vec<AggregationState>,
+    agg_funcs: &[AggregateFunction],
+    input_types: &[DataType],
+    raw_type: &DataType,
+    schema: &SchemaRef,
+    post_filter: Option<&Expr>,
+) -> Result<Vec<RecordBatch>> {
+    let p = rayon::current_num_threads().clamp(2, 64);
+    let timing = std::env::var("AGG_TIMING").is_ok();
+    let t0 = std::time::Instant::now();
+
+    // Null-group accumulators merged across states up front; also gather the
+    // global key range and group count to pick the merge strategy.
+    let mut raw_null: Option<Vec<AccumulatorState>> = None;
+    let mut gmin = i64::MAX;
+    let mut gmax = i64::MIN;
+    let mut total = 0usize;
+    let mut prepared: Vec<AggregationState> = Vec::with_capacity(states.len());
+    for mut st in states {
+        if let Some(n) = st.raw_null.take() {
+            match &mut raw_null {
+                Some(existing) => {
+                    for (a, b) in existing.iter_mut().zip(n.iter()) {
+                        a.merge(b);
+                    }
+                }
+                None => raw_null = Some(n),
+            }
+        }
+        total += st.raw_sums.len();
+        for k in st.raw_sums.keys() {
+            let v = *k as i64;
+            gmin = gmin.min(v);
+            gmax = gmax.max(v);
+        }
+        prepared.push(st);
+    }
+
+    let range = (gmax as i128 - gmin as i128 + 1).max(1) as u64;
+    let dense =
+        total > 0 && range <= 512_000_000 && (range as u128) <= 6 * total as u128 && gmax > gmin;
+    let w = range.div_ceil(p as u64).max(1);
+
+    let sharded: Vec<Vec<Vec<(u64, f64)>>> = if dense {
+        prepared
+            .into_iter()
+            .map(|st| st.into_range_sum_shards(p, gmin, w))
+            .collect()
+    } else {
+        prepared
+            .into_iter()
+            .map(|st| st.into_raw_sum_shards(p))
+            .collect()
+    };
+
+    let mut shard_major: Vec<Vec<Vec<(u64, f64)>>> = (0..p).map(|_| Vec::new()).collect();
+    for state_shards in sharded {
+        for (pi, shard) in state_shards.into_iter().enumerate() {
+            shard_major[pi].push(shard);
+        }
+    }
+    let t_sharded = t0.elapsed();
+
+    let mut batches: Vec<RecordBatch> = shard_major
+        .into_par_iter()
+        .enumerate()
+        .map(|(pi, lists)| {
+            let cap: usize = lists.iter().map(|l| l.len()).sum();
+            if cap == 0 {
+                return Ok(None);
+            }
+            let mut keys: Vec<u64> = Vec::with_capacity(cap);
+            let mut sums: Vec<f64> = Vec::with_capacity(cap);
+            if dense {
+                // Direct-address merge: slot index -> dense entry position
+                let lo = gmin + (pi as u64 * w) as i64;
+                let width = if pi == p - 1 {
+                    (gmax - lo + 1).max(1) as usize
+                } else {
+                    w as usize
+                };
+                let mut slots: Vec<u32> = vec![u32::MAX; width];
+                for list in lists {
+                    for (key, v) in list {
+                        let idx = ((key as i64).wrapping_sub(lo)) as usize;
+                        let slot = slots[idx];
+                        if slot == u32::MAX {
+                            slots[idx] = keys.len() as u32;
+                            keys.push(key);
+                            sums.push(v);
+                        } else {
+                            sums[slot as usize] += v;
+                        }
+                    }
+                }
+            } else {
+                let mut map: HashMap<u64, u32> = HashMap::with_capacity(cap);
+                for list in lists {
+                    for (key, v) in list {
+                        match map.entry(key) {
+                            hashbrown::hash_map::Entry::Occupied(e) => {
+                                sums[*e.get() as usize] += v;
+                            }
+                            hashbrown::hash_map::Entry::Vacant(slot) => {
+                                slot.insert(keys.len() as u32);
+                                keys.push(key);
+                                sums.push(v);
+                            }
+                        }
+                    }
+                }
+            }
+            let key_array: ArrayRef = match schema.field(0).data_type() {
+                DataType::Int32 => Arc::new(arrow::array::Int32Array::from(
+                    keys.iter().map(|&k| k as i64 as i32).collect::<Vec<_>>(),
+                )),
+                DataType::Date32 => Arc::new(arrow::array::Date32Array::from(
+                    keys.iter().map(|&k| k as i64 as i32).collect::<Vec<_>>(),
+                )),
+                _ => Arc::new(arrow::array::Int64Array::from(
+                    keys.iter().map(|&k| k as i64).collect::<Vec<_>>(),
+                )),
+            };
+            let sum_array: ArrayRef = Arc::new(arrow::array::Float64Array::from(sums));
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![key_array, sum_array]).map_err(|e| {
+                    QueryError::Execution(format!("Failed to build output batch: {}", e))
+                })?;
+            match post_filter {
+                Some(pred) => {
+                    Ok(crate::physical::operators::filter_batches(vec![batch], pred)?.pop())
+                }
+                None => Ok(Some(batch)),
+            }
+        })
+        .collect::<Result<Vec<Option<RecordBatch>>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    if timing {
+        eprintln!(
+            "[raw-sum-merge] {} groups dense={} shard: {:?}; merge+build: {:?}; total: {:?}",
+            total,
+            dense,
+            t_sharded,
+            t0.elapsed() - t_sharded,
+            t0.elapsed()
+        );
+    }
 
     if let Some(null_accs) = raw_null {
         let state = AggregationState::from_raw_groups(
@@ -1151,6 +1356,13 @@ pub struct AggregationState {
     /// per-row GroupKey/ScalarValue allocation of `groups` (u64 is the
     /// bit-pattern of the value; nulls tracked separately).
     raw_groups: HashMap<u64, Vec<AccumulatorState>>,
+    /// Specialized raw path for EXACTLY [Sum] over a Float64 input with a
+    /// single raw-encodable group column: 16-byte (u64, f64) entries instead
+    /// of a heap-boxed Vec<AccumulatorState> per group. Sum(f64) starts at
+    /// 0.0 and ignores nulls, so a bare f64 is an exact drop-in. Q20's
+    /// 4.4M-group packed-key aggregate spent most of its merge moving and
+    /// freeing the boxes.
+    raw_sums: HashMap<u64, f64>,
     raw_null: Option<Vec<AccumulatorState>>,
     raw_type: Option<DataType>,
     /// Aggregate functions
@@ -1174,6 +1386,7 @@ impl Default for AggregationState {
             overflowed: false,
             groups: HashMap::new(),
             raw_groups: HashMap::new(),
+            raw_sums: HashMap::new(),
             raw_null: None,
             raw_type: None,
             agg_funcs: Vec::new(),
@@ -1609,6 +1822,13 @@ impl AggregationState {
                     })
                     .collect();
 
+                // Bare-f64 fast path: exactly [Sum] over a Float64 input keeps
+                // groups as (u64, f64) map entries — no per-group heap box.
+                let use_raw_sums = self.agg_funcs.len() == 1
+                    && matches!(self.agg_funcs[0], AggregateFunction::Sum)
+                    && matches!(self.input_types.first(), Some(DataType::Float64))
+                    && matches!(agg_accessors[0], TypedArrayAccessor::Float64(_));
+
                 let mut row = start_row;
                 while row < end_row {
                     let (is_null, raw) = key_at(row);
@@ -1620,6 +1840,24 @@ impl AggregationState {
                             break;
                         }
                         run_end += 1;
+                    }
+                    if use_raw_sums && !is_null {
+                        let mut s = 0.0;
+                        if let Some(slices) = &f64_slices {
+                            let sl = slices[0];
+                            for r in row..run_end {
+                                s += sl[r];
+                            }
+                        } else if let TypedArrayAccessor::Float64(a) = &agg_accessors[0] {
+                            for r in row..run_end {
+                                if !a.is_null(r) {
+                                    s += a.value(r);
+                                }
+                            }
+                        }
+                        *self.raw_sums.entry(raw).or_insert(0.0) += s;
+                        row = run_end;
+                        continue;
                     }
                     let accumulators = if is_null {
                         self.raw_null.get_or_insert_with(|| {
@@ -1791,13 +2029,78 @@ impl AggregationState {
         } else {
             0
         };
-        perfect + self.groups.len() + self.raw_groups.len() + usize::from(self.raw_null.is_some())
+        perfect
+            + self.groups.len()
+            + self.raw_groups.len()
+            + self.raw_sums.len()
+            + usize::from(self.raw_null.is_some())
+    }
+
+    /// Fold the bare-f64 sum groups back into boxed raw_groups entries. Used
+    /// by every consumer that doesn't understand raw_sums, so the fast
+    /// representation can never silently drop groups.
+    pub(crate) fn demote_raw_sums(&mut self) {
+        if self.raw_sums.is_empty() {
+            return;
+        }
+        for (k, v) in self.raw_sums.drain() {
+            match self.raw_groups.entry(k) {
+                hashbrown::hash_map::Entry::Occupied(mut e) => {
+                    if let AccumulatorState::Sum(s) = &mut e.get_mut()[0] {
+                        *s += v;
+                    }
+                }
+                hashbrown::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(vec![AccumulatorState::Sum(v)]);
+                }
+            }
+        }
+    }
+
+    /// Inverse of demote_raw_sums: absorb boxed raw_groups (the pre-overflow
+    /// perfect-hash residue) into the bare-f64 map. Returns false (leaving
+    /// state unchanged) if any accumulator isn't a plain Sum.
+    fn absorb_raw_groups_into_sums(&mut self) -> bool {
+        if self
+            .raw_groups
+            .values()
+            .any(|accs| accs.len() != 1 || !matches!(accs[0], AccumulatorState::Sum(_)))
+        {
+            return false;
+        }
+        for (k, accs) in self.raw_groups.drain() {
+            if let AccumulatorState::Sum(s) = accs[0] {
+                *self.raw_sums.entry(k).or_insert(0.0) += s;
+            }
+        }
+        true
+    }
+
+    /// Shard the bare-f64 sum groups by multiplicative hash of the u64 key.
+    fn into_raw_sum_shards(mut self, p: usize) -> Vec<Vec<(u64, f64)>> {
+        let mut shards: Vec<Vec<(u64, f64)>> = (0..p).map(|_| Vec::new()).collect();
+        for (raw, v) in self.raw_sums.drain() {
+            let h = raw.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            shards[(h >> 33) as usize % p].push((raw, v));
+        }
+        shards
+    }
+
+    /// Shard the bare-f64 sum groups by key RANGE (dense direct-address merge).
+    fn into_range_sum_shards(mut self, p: usize, min: i64, w: u64) -> Vec<Vec<(u64, f64)>> {
+        let mut shards: Vec<Vec<(u64, f64)>> = (0..p).map(|_| Vec::new()).collect();
+        for (raw, v) in self.raw_sums.drain() {
+            let off = (raw as i64).wrapping_sub(min) as u64;
+            shards[((off / w) as usize).min(p - 1)].push((raw, v));
+        }
+        shards
     }
 
     /// Consume this state, sharding its groups by key hash into `p` buckets.
     /// Used by the parallel partitioned merge: entries for the same key always
     /// land in the same bucket regardless of which thread produced them.
     pub(crate) fn into_shards(mut self, p: usize) -> Vec<Vec<(GroupKey, Vec<AccumulatorState>)>> {
+        self.demote_raw_sums();
         self.drain_perfect_to_hashmap();
         let mut shards: Vec<Vec<(GroupKey, Vec<AccumulatorState>)>> =
             (0..p).map(|_| Vec::new()).collect();
@@ -1840,6 +2143,7 @@ impl AggregationState {
         min: i64,
         w: u64,
     ) -> Vec<Vec<(u64, Vec<AccumulatorState>)>> {
+        self.demote_raw_sums();
         let mut shards: Vec<Vec<(u64, Vec<AccumulatorState>)>> =
             (0..p).map(|_| Vec::new()).collect();
         for (raw, accs) in self.raw_groups.drain() {
@@ -1850,6 +2154,7 @@ impl AggregationState {
     }
 
     pub(crate) fn into_raw_shards(mut self, p: usize) -> Vec<Vec<(u64, Vec<AccumulatorState>)>> {
+        self.demote_raw_sums();
         let mut shards: Vec<Vec<(u64, Vec<AccumulatorState>)>> =
             (0..p).map(|_| Vec::new()).collect();
         for (raw, accs) in self.raw_groups.drain() {
@@ -2035,6 +2340,21 @@ impl AggregationState {
                 }
             }
         }
+        // Merge bare-f64 sum entries (folded into boxed raw_groups here; the
+        // fast pair-based merge path never goes through this function).
+        for (raw, v) in &other.raw_sums {
+            match self.raw_groups.entry(*raw) {
+                hashbrown::hash_map::Entry::Occupied(mut e) => {
+                    if let AccumulatorState::Sum(s) = &mut e.get_mut()[0] {
+                        *s += v;
+                    }
+                }
+                hashbrown::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(vec![AccumulatorState::Sum(*v)]);
+                }
+            }
+        }
+        self.demote_raw_sums();
         if let Some(other_null) = &other.raw_null {
             match &mut self.raw_null {
                 Some(existing) => {

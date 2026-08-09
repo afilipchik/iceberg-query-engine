@@ -708,6 +708,10 @@ impl SpillableHashAggregateExec {
         let agg_funcs: Vec<AggregateFunction> = self.aggregates.iter().map(|a| a.func).collect();
         let agg_inputs: Vec<Expr> = self.aggregates.iter().map(|a| a.input.clone()).collect();
 
+        let timing = std::env::var("AGG_TIMING").is_ok();
+        let t_start = std::time::Instant::now();
+        let busy_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
         // Group-state budget: a worker aborts the fused attempt if its state
         // estimate exceeds an equal share of the memory budget.
         let n_workers = rayon::current_num_threads().clamp(2, 32);
@@ -728,6 +732,7 @@ impl SpillableHashAggregateExec {
             let input_types = input_types.clone();
             let agg_inputs = agg_inputs.clone();
             let group_by = self.group_by.clone();
+            let busy_ns = Arc::clone(&busy_ns);
             workers.push(std::thread::spawn(move || {
                 let mut state = AggregationState::new(agg_funcs, input_types);
                 let mut batches_seen = 0usize;
@@ -735,10 +740,12 @@ impl SpillableHashAggregateExec {
                     if abort.load(AtomicOrdering::Relaxed) {
                         continue; // keep draining so senders never block forever
                     }
+                    let t = std::time::Instant::now();
                     if state.process_batch(&batch, &group_by, &agg_inputs).is_err() {
                         abort.store(true, AtomicOrdering::Relaxed);
                         continue;
                     }
+                    busy_ns.fetch_add(t.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
                     batches_seen += 1;
                     if batches_seen % 16 == 0 && state.group_count() > group_limit {
                         abort.store(true, AtomicOrdering::Relaxed);
@@ -787,6 +794,7 @@ impl SpillableHashAggregateExec {
                 _ => drain_failed = true,
             }
         }
+        let t_drained = t_start.elapsed();
 
         let mut states = Vec::with_capacity(workers.len());
         for w in workers {
@@ -800,9 +808,23 @@ impl SpillableHashAggregateExec {
             return Ok(None);
         }
 
+        let t_workers = t_start.elapsed();
+        let total_groups: usize = states.iter().map(|s| s.group_count()).sum();
         let mut batches = merge_states_to_batches(states, &agg_funcs, &input_types, &self.schema)?;
+        let t_merged = t_start.elapsed();
         if let Some(pred) = &self.post_filter {
             batches = crate::physical::operators::filter_batches(batches, pred)?;
+        }
+        if timing {
+            eprintln!(
+                "[fused-agg] drain(join+scan+send): {:?}; workers done: {:?}; merge {} state-groups -> out: {:?}; worker busy sum: {:.1}ms; total: {:?}",
+                t_drained,
+                t_workers,
+                total_groups,
+                t_merged - t_workers,
+                busy_ns.load(AtomicOrdering::Relaxed) as f64 / 1e6,
+                t_start.elapsed()
+            );
         }
         Ok(Some(Box::pin(stream::iter(batches.into_iter().map(Ok)))))
     }

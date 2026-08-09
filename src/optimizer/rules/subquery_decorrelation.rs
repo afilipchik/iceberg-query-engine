@@ -747,9 +747,18 @@ fn add_semi_join_reduction(
         _ => return agg_plan,
     };
 
-    // Collect semi-join conditions and find a common source from the outer plan
-    let mut semi_on = Vec::new();
-    let mut source: Option<LogicalPlan> = None;
+    // Collect per-predicate reduction-source candidates from the outer plan.
+    struct ReductionCand {
+        source: LogicalPlan,
+        inner_name: String,
+        outer_name: String,
+        /// A bare (possibly filtered/projected) dimension scan — no joins
+        /// inside. Preferred: joining it is far cheaper than re-running a
+        /// semi-joined fact subtree, and its correlation key is the
+        /// dimension key the semi itself relies on for uniqueness.
+        strong: bool,
+    }
+    let mut cands: Vec<ReductionCand> = Vec::new();
 
     for pred in correlation_predicates {
         // Get the outer column name (unqualified)
@@ -761,8 +770,9 @@ fn add_semi_join_reduction(
         };
 
         // Find the filtered scan/sub-plan in outer that provides this column
-        let found_source = match extract_correlation_source(outer, &outer_col_name) {
-            Some(s) if has_selectivity(&s) => s,
+        // (possibly remapped through a semi join to its dimension side).
+        let (found_source, source_col) = match extract_correlation_source(outer, &outer_col_name) {
+            Some((s, c)) if has_selectivity(&s) => (s, c),
             _ => continue,
         };
 
@@ -785,17 +795,84 @@ fn add_semi_join_reduction(
         // Find outer column in source schema
         let source_schema = found_source.schema();
         let outer_field = source_schema.fields().iter().find(|f| {
-            f.name == outer_col_name
-                || outer_col_name.ends_with(&format!(".{}", f.name))
-                || f.name.ends_with(&format!(".{}", outer_col_name))
+            f.name == source_col
+                || source_col.ends_with(&format!(".{}", f.name))
+                || f.name.ends_with(&format!(".{}", source_col))
         });
 
         if let (Some(inf), Some(outf)) = (inner_field, outer_field) {
-            semi_on.push((Expr::column(&inf.name), Expr::column(&outf.name)));
-            if source.is_none() {
-                source = Some(found_source);
+            let strong = is_simple_dimension(&found_source);
+            cands.push(ReductionCand {
+                inner_name: inf.name.clone(),
+                outer_name: outf.name.clone(),
+                strong,
+                source: found_source,
+            });
+        }
+    }
+
+    // Choose the reduction source: prefer a bare filtered dimension scan
+    // (Q20: `part` with the LIKE filter reached through the partsupp semi —
+    // single unique key, direct-address-eligible build, no fact re-scan)
+    // over a semi-wrapped fact subtree (previous behavior, kept as
+    // fallback). Only predicates whose candidate matches the chosen source
+    // contribute join pairs; a partial reduction is still just a superset
+    // filter — the LEFT join above selects exactly the groups it needs.
+    let chosen =
+        cands
+            .iter()
+            .position(|c| c.strong)
+            .or(if cands.is_empty() { None } else { Some(0) });
+    let mut semi_on = Vec::new();
+    let mut source: Option<LogicalPlan> = None;
+    if let Some(ci) = chosen {
+        let chosen_fields: Vec<String> = cands[ci]
+            .source
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        for c in &cands {
+            let same_source = c
+                .source
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name.as_str())
+                .eq(chosen_fields.iter().map(|s| s.as_str()));
+            if same_source {
+                semi_on.push((Expr::column(&c.inner_name), Expr::column(&c.outer_name)));
             }
         }
+        let mut src = cands.swap_remove(ci).source;
+        // Strong sources are projected down to the join keys so the join
+        // never gathers rider columns (p_name was riding along otherwise).
+        if is_simple_dimension(&src) {
+            let key_names: Vec<&str> = semi_on
+                .iter()
+                .filter_map(|(_, o)| match o {
+                    Expr::Column(c) => Some(c.name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let src_schema = src.schema();
+            let keep: Vec<_> = src_schema
+                .fields()
+                .iter()
+                .filter(|f| key_names.contains(&f.name.as_str()))
+                .cloned()
+                .collect();
+            if !keep.is_empty() && keep.len() < src_schema.fields().len() {
+                let exprs: Vec<Expr> = keep.iter().map(|f| Expr::column(&f.name)).collect();
+                src = LogicalPlan::Project(ProjectNode {
+                    input: Arc::new(src),
+                    exprs,
+                    schema: PlanSchema::new(keep),
+                });
+            }
+        }
+        source = Some(src);
     }
 
     if let (Some(source_plan), true) = (source, !semi_on.is_empty()) {
@@ -834,55 +911,98 @@ fn add_semi_join_reduction(
     agg_plan
 }
 
-/// Extract a sub-plan from the outer plan that produces the given correlation column.
-/// Walks the plan tree to find the scan containing the column, preserving any
-/// filters and semi-joins along the path (these reduce cardinality).
-fn extract_correlation_source(plan: &LogicalPlan, col_name: &str) -> Option<LogicalPlan> {
+/// A bare (possibly filtered/projected/aliased) scan — no joins or other
+/// shape-changing nodes inside. Its correlation key is a dimension key, so
+/// an Inner reduction join against it cannot duplicate aggregate-input rows.
+fn is_simple_dimension(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Scan(_) => true,
+        LogicalPlan::Filter(f) => is_simple_dimension(&f.input),
+        LogicalPlan::Project(p) => is_simple_dimension(&p.input),
+        LogicalPlan::SubqueryAlias(s) => is_simple_dimension(&s.input),
+        _ => false,
+    }
+}
+
+/// Extract a sub-plan from the outer plan that produces the given correlation
+/// column, returning the sub-plan and the name of the correlation column
+/// WITHIN it. Walks the plan tree to find the scan containing the column,
+/// preserving any filters and semi-joins along the path (these reduce
+/// cardinality). When the column is the LEFT key of a semi join, the search
+/// prefers remapping through the join equivalence to the semi's dimension
+/// side: filtering the aggregate input by the dimension key directly is far
+/// cheaper than re-running the semi-joined fact subtree (Q20: partsupp SEMI
+/// part on ps_partkey=p_partkey — reduce by `part` on p_partkey instead of
+/// by a 4.4M-row partsupp semi on two keys).
+fn extract_correlation_source(plan: &LogicalPlan, col_name: &str) -> Option<(LogicalPlan, String)> {
     match plan {
         LogicalPlan::Scan(scan) => {
-            let has_col = scan.schema.fields().iter().any(|f| {
+            let field = scan.schema.fields().iter().find(|f| {
                 f.name == col_name
                     || f.name.ends_with(&format!(".{}", col_name))
                     || col_name.ends_with(&format!(".{}", f.name))
             });
-            if has_col {
-                Some(plan.clone())
-            } else {
-                None
-            }
+            field.map(|f| (plan.clone(), f.name.clone()))
         }
         LogicalPlan::Filter(f) => {
-            let inner = extract_correlation_source(&f.input, col_name)?;
+            let (inner, name) = extract_correlation_source(&f.input, col_name)?;
             // Keep filter only if all its column references exist in the inner schema
             let inner_schema = inner.schema();
             if expr_columns_in_schema(&f.predicate, &inner_schema) {
-                Some(LogicalPlan::Filter(FilterNode {
-                    input: Arc::new(inner),
-                    predicate: f.predicate.clone(),
-                }))
+                Some((
+                    LogicalPlan::Filter(FilterNode {
+                        input: Arc::new(inner),
+                        predicate: f.predicate.clone(),
+                    }),
+                    name,
+                ))
             } else {
-                Some(inner)
+                Some((inner, name))
             }
         }
         LogicalPlan::Join(j) => {
+            // Semi join whose LEFT key is the requested column: try the
+            // dimension side via the join equivalence first.
+            if matches!(j.join_type, JoinType::Semi) {
+                for (l, r) in &j.on {
+                    if let (Expr::Column(lc), Expr::Column(rc)) = (l, r) {
+                        let matches_col = lc.name == col_name
+                            || lc.name.ends_with(&format!(".{}", col_name))
+                            || col_name.ends_with(&format!(".{}", lc.name));
+                        if matches_col {
+                            if let Some((dim, dim_col)) =
+                                extract_correlation_source(&j.right, &rc.name)
+                            {
+                                if is_simple_dimension(&dim) && has_selectivity(&dim) {
+                                    return Some((dim, dim_col));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             let in_left = extract_correlation_source(&j.left, col_name);
             let in_right = extract_correlation_source(&j.right, col_name);
 
             match (in_left, in_right) {
-                (Some(source), None) => {
+                (Some((source, name)), None) => {
                     // Column is on left side. If Semi/Anti join, preserve it as filter.
                     if matches!(j.join_type, JoinType::Semi | JoinType::Anti) {
                         let source_schema = source.schema();
-                        Some(LogicalPlan::Join(JoinNode {
-                            left: Arc::new(source),
-                            right: j.right.clone(),
-                            join_type: j.join_type,
-                            on: j.on.clone(),
-                            filter: j.filter.clone(),
-                            schema: source_schema,
-                        }))
+                        Some((
+                            LogicalPlan::Join(JoinNode {
+                                left: Arc::new(source),
+                                right: j.right.clone(),
+                                join_type: j.join_type,
+                                on: j.on.clone(),
+                                filter: j.filter.clone(),
+                                schema: source_schema,
+                            }),
+                            name,
+                        ))
                     } else {
-                        Some(source)
+                        Some((source, name))
                     }
                 }
                 (None, Some(source)) => Some(source),
