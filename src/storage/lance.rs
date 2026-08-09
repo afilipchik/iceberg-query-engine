@@ -216,6 +216,20 @@ pub struct LanceTable {
     path: PathBuf,
     /// Lazily computed column statistics; see `compute_column_stats`.
     stats_cache: std::sync::OnceLock<std::collections::HashMap<String, ColumnStatistics>>,
+    /// Whether `scan_with_filter` pushes the predicate into Lance.
+    ///
+    /// Diagnostic switch, not a safety switch: BOTH settings must produce
+    /// identical rows, and `pushdown_matches_no_pushdown_row_for_row` asserts
+    /// exactly that. It exists so the equivalence can be tested and the speedup
+    /// measured with one binary. Defaults to on.
+    filter_pushdown: bool,
+    /// How many scans actually pushed a predicate into Lance.
+    ///
+    /// Exists so a test can prove the pushdown FIRED. Without it, an A/B that
+    /// compares "pushdown on" against "pushdown off" passes trivially if the
+    /// renderer silently refuses everything — the most likely way for this
+    /// feature to be quietly dead.
+    pushed_filters: std::sync::atomic::AtomicUsize,
 }
 
 impl fmt::Debug for LanceTable {
@@ -291,7 +305,36 @@ impl LanceTable {
             num_fragments,
             path,
             stats_cache: std::sync::OnceLock::new(),
+            filter_pushdown: Self::env_pushdown_enabled(),
+            pushed_filters: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// Number of scans that pushed a predicate into Lance so far.
+    pub fn pushed_filter_count(&self) -> usize {
+        self.pushed_filters
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Turn predicate pushdown into Lance off (diagnostic only).
+    ///
+    /// Both settings are correct — the engine re-applies the full predicate
+    /// above the scan either way — so this changes speed, never answers. That
+    /// is precisely what makes it a usable A/B oracle in tests.
+    ///
+    /// Also reachable as `QE_LANCE_FILTER_PUSHDOWN=0` on any registration path,
+    /// so the same A/B can be run against the shipped binary.
+    pub fn with_filter_pushdown(mut self, enabled: bool) -> Self {
+        self.filter_pushdown = enabled;
+        self
+    }
+
+    /// `QE_LANCE_FILTER_PUSHDOWN=0` disables pushdown; anything else leaves it on.
+    fn env_pushdown_enabled() -> bool {
+        !matches!(
+            std::env::var("QE_LANCE_FILTER_PUSHDOWN").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        )
     }
 
     /// Number of rows, from metadata (no scan).
@@ -367,7 +410,8 @@ impl LanceTable {
 
         let ds = Arc::clone(&self.dataset);
         let names = int_names.clone();
-        let Ok(batches) = block_on_lance(async move { scan_fragments(ds, names).await }) else {
+        let Ok(batches) = block_on_lance(async move { scan_fragments(ds, names, None).await })
+        else {
             // Statistics are an optimization, not a correctness input: if the
             // probe scan fails, plan without them rather than failing the query.
             return out;
@@ -418,6 +462,108 @@ impl LanceTable {
         out
     }
 
+    /// Should this predicate be pushed into Lance, or is the engine faster?
+    ///
+    /// # This gate exists because `Scanner::filter` is usually a PESSIMIZATION
+    ///
+    /// Measured on lance 0.23.2, best of 2-3, warm page cache. A filtered Lance
+    /// scan costs far more than decoding the columns outright, because the cost
+    /// tracks rows *scanned*, not rows *returned*:
+    ///
+    /// | scan | rows out | time |
+    /// |---|---|---|
+    /// | SF=10 `lineitem`, 2 cols, no filter | 60,000,000 | **147 ms** |
+    /// | same, Q06's 4-predicate filter (1.3% selective) | 803,514 | 1,240 ms |
+    /// | same, tuned to the best batch size found | 803,514 | 375 ms |
+    /// | SF=10 `lineitem`, 6 cols, no filter | 60,000,000 | **247 ms** |
+    /// | same, `l_shipdate <= DATE '1998-09-02'` (95%) | 57,183,143 | 1,867 ms |
+    ///
+    /// Adding a BTREE scalar index on the filter column makes it *worse*, not
+    /// better: 3,323 ms with the index vs 1,531 ms without, both against 120 ms
+    /// for the unfiltered scan. Pushing unconditionally cost the SF=10 TPC-H
+    /// suite 18% (7.96s -> 9.40s), so unconditional pushdown was rejected.
+    ///
+    /// # When it DOES pay: a wide payload the filter lets Lance skip
+    ///
+    /// Late materialization only saves work if there is expensive work to skip.
+    /// TPC-H is all narrow scalars, so there is none. A real LanceDB table is
+    /// not: `data/vectors.lance` carries a 384-float embedding, and there the
+    /// same mechanism is transformative (200k rows, `SELECT *`, baseline
+    /// 42.2 ms unfiltered):
+    ///
+    /// | predicate | selectivity | time | vs baseline |
+    /// |---|---|---|---|
+    /// | `id < 100` | 0.05% | 2.1 ms | **20x faster** |
+    /// | `id < 2000` | 1% | 3.4 ms | 12x faster |
+    /// | `id < 10000` | 5% | 7.2 ms | 5.9x faster |
+    /// | `id < 20000` | 10% | 9.4 ms | 4.5x faster |
+    /// | `id < 40000` | 20% | 31.5 ms | 1.3x faster |
+    /// | `id < 100000` | 50% | 49.1 ms | 0.9x — SLOWER |
+    /// | `category = 'books'` (string col) | 20% | 99.1 ms | 0.4x — SLOWER |
+    ///
+    /// # The three conditions, each from a row of those tables
+    ///
+    /// 1. **The projection must contain a nested (wide) column.** That is the
+    ///    only thing whose decode is worth skipping; without it the filter is
+    ///    pure overhead, which is the entire TPC-H result above.
+    /// 2. **The filter must not reference that wide column**, or Lance has to
+    ///    decode it to evaluate the predicate and saves nothing.
+    /// 3. **Estimated selectivity must be known and <= 10%.** Unknown means no
+    ///    push: statistics exist only for integer/date columns, which
+    ///    conveniently excludes the string-column case — the slowest row in the
+    ///    table above, at 0.4x.
+    fn plan_pushdown(
+        &self,
+        predicate: &crate::planner::Expr,
+        projection: Option<&[usize]>,
+    ) -> Option<String> {
+        let fields = self.schema.fields();
+        let projected: Vec<&arrow::datatypes::FieldRef> = match projection {
+            Some(idx) => idx.iter().filter_map(|&i| fields.get(i)).collect(),
+            None => fields.iter().collect(),
+        };
+
+        // (1) Is there a wide payload column whose decode could be skipped?
+        let wide: Vec<String> = projected
+            .iter()
+            .filter(|f| crate::planner::vector_types::is_opaque_nested(f.data_type()))
+            .map(|f| f.name().to_lowercase())
+            .collect();
+        if wide.is_empty() {
+            return None;
+        }
+
+        let (_, conjuncts) = lance_pushable_conjuncts(predicate, &self.schema)?;
+        let stats = self.stats_cache.get_or_init(|| self.compute_column_stats());
+
+        let mut sql = Vec::new();
+        let mut combined = 1.0f64;
+        for c in conjuncts {
+            // (2) Skip a conjunct that touches the wide column: Lance would
+            // have to decode it to evaluate the predicate, which is the whole
+            // cost being avoided. Dropping a conjunct is always sound — the
+            // engine re-applies the full predicate — so this narrows the push
+            // rather than abandoning it.
+            let mut cols = Vec::new();
+            collect_columns(c, &mut cols);
+            if cols.iter().any(|col| wide.contains(col)) {
+                continue;
+            }
+            // (3) Estimatable, or leave it to the engine.
+            let (Some(s), Some(rendered)) = (
+                estimate_selectivity(c, &self.schema, stats, self.num_rows),
+                expr_to_lance_sql(c, &self.schema),
+            ) else {
+                continue;
+            };
+            combined *= s;
+            sql.push(rendered);
+        }
+
+        // Selective enough, in aggregate, to beat a straight decode.
+        (!sql.is_empty() && combined <= PUSHDOWN_SELECTIVITY_LIMIT).then(|| sql.join(" AND "))
+    }
+
     /// Resolve projection indices into Lance column names.
     fn projected_names(&self, projection: Option<&[usize]>) -> Result<Vec<String>> {
         match projection {
@@ -452,21 +598,26 @@ impl LanceTable {
 ///
 /// One task per fragment: Lance decode is CPU-bound per fragment, so this is
 /// the format's natural parallel unit (58 fragments for SF=10 `lineitem`).
-async fn scan_fragments(ds: Arc<Dataset>, names: Vec<String>) -> Result<Vec<RecordBatch>> {
+async fn scan_fragments(
+    ds: Arc<Dataset>,
+    names: Vec<String>,
+    filter: Option<String>,
+) -> Result<Vec<RecordBatch>> {
     let fragments = ds.get_fragments();
 
     // Single fragment: no point paying for task spawn + join.
     if fragments.len() <= 1 {
-        return scan_one(ds, names, None).await;
+        return scan_one(ds, names, None, filter).await;
     }
 
     let mut tasks = Vec::with_capacity(fragments.len());
     for fragment in fragments {
         let ds = Arc::clone(&ds);
         let names = names.clone();
+        let filter = filter.clone();
         let meta = fragment.metadata().clone();
         tasks.push(tokio::spawn(async move {
-            scan_one(ds, names, Some(meta)).await
+            scan_one(ds, names, Some(meta), filter).await
         }));
     }
 
@@ -485,6 +636,7 @@ async fn scan_one(
     ds: Arc<Dataset>,
     names: Vec<String>,
     fragment: Option<lance::table::format::Fragment>,
+    filter: Option<String>,
 ) -> Result<Vec<RecordBatch>> {
     let mut scanner = ds.scan();
     if let Some(meta) = fragment {
@@ -495,6 +647,15 @@ async fn scan_one(
     scanner
         .project(&refs)
         .map_err(|e| lance_err(&format!("project {:?}", names), e))?;
+    // Late materialization: Lance evaluates the predicate over the filter's own
+    // columns and only decodes the projected columns for surviving rows. The
+    // filter may reference columns outside the projection — verified — so no
+    // widening of `names` is needed.
+    if let Some(sql) = &filter {
+        scanner
+            .filter(sql)
+            .map_err(|e| lance_err(&format!("filter {}", sql), e))?;
+    }
     scanner.batch_size(LANCE_BATCH_SIZE);
 
     let stream = scanner
@@ -507,104 +668,225 @@ async fn scan_one(
         .map_err(|e| lance_err("read batches", e))
 }
 
+/// Resolve an engine column reference to the dataset field it names, if the
+/// name can be written as a BARE identifier.
+///
+/// # The single most dangerous fact about Lance 0.23.2's filter dialect
+///
+/// **A double-quoted identifier parses as a STRING LITERAL.** `"category" =
+/// 'footwear'` is not a column comparison, it is `'category' = 'footwear'` — a
+/// constant FALSE. The filter then matches NOTHING, and Lance reports no error:
+/// a scan that should return 40,000 rows returns 0. That is a wrong-answers
+/// failure mode, not a slow one.
+///
+/// So identifiers are never quoted, and any name that would *need* quoting
+/// (spaces, punctuation, a leading digit, a reserved word's shape) refuses the
+/// pushdown instead. A refused pushdown is slow; a quoted one is silently wrong.
+fn lance_bare_ident<'a>(
+    col: &crate::planner::Column,
+    schema: &'a ArrowSchema,
+) -> Option<&'a arrow::datatypes::Field> {
+    let field = schema
+        .fields()
+        .iter()
+        .find(|f| f.name().eq_ignore_ascii_case(&col.name))?;
+    let name = field.name();
+    let simple = !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    simple.then(|| field.as_ref())
+}
+
+/// Render a literal, and REFUSE it unless it means the same thing against
+/// `column_type` in Lance's dialect as it does in the engine's evaluator.
+///
+/// The type gate is the second line of defence after bare identifiers. The
+/// engine and DataFusion both do implicit coercion around comparisons, and they
+/// do not have to agree: a decimal literal against a float column, an integer
+/// against a date, a timestamp with an ambiguous zone. Any disagreement that
+/// makes Lance's filter MORE selective than the engine's silently loses rows.
+/// Requiring the literal's family to match the column's removes that whole
+/// class of hazard rather than reasoning about each case.
+fn lance_literal(v: &crate::planner::ScalarValue, column_type: &DataType) -> Option<String> {
+    use crate::planner::ScalarValue as SV;
+
+    let is_int_col = matches!(
+        column_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+    );
+    let is_float_col = matches!(column_type, DataType::Float32 | DataType::Float64);
+    let is_str_col = matches!(column_type, DataType::Utf8 | DataType::LargeUtf8);
+
+    match v {
+        SV::Boolean(b) if matches!(column_type, DataType::Boolean) => Some(b.to_string()),
+
+        SV::Int8(_)
+        | SV::Int16(_)
+        | SV::Int32(_)
+        | SV::Int64(_)
+        | SV::UInt8(_)
+        | SV::UInt16(_)
+        | SV::UInt32(_)
+        | SV::UInt64(_)
+            if is_int_col || is_float_col =>
+        {
+            let n: i128 = match v {
+                SV::Int8(i) => *i as i128,
+                SV::Int16(i) => *i as i128,
+                SV::Int32(i) => *i as i128,
+                SV::Int64(i) => *i as i128,
+                SV::UInt8(i) => *i as i128,
+                SV::UInt16(i) => *i as i128,
+                SV::UInt32(i) => *i as i128,
+                SV::UInt64(i) => *i as i128,
+                _ => return None,
+            };
+            // Against a float column the integer is widened. Beyond 2^53 that
+            // widening is lossy and the two engines could round differently.
+            if is_float_col && n.unsigned_abs() > (1u128 << 53) {
+                return None;
+            }
+            Some(n.to_string())
+        }
+
+        SV::Float32(f) if is_float_col => f.0.is_finite().then(|| format!("{:?}", f.0)),
+        SV::Float64(f) if is_float_col => f.0.is_finite().then(|| format!("{:?}", f.0)),
+
+        // Rendered with `{:?}` (shortest round-trip) so DataFusion's parser
+        // recovers bit-identical f64s. Verified: the folded TPC-H Q06 bounds
+        // 0.049999999999999996 / 0.06999999999999999 round-trip exactly and
+        // select the same 1183 rows as the Arrow kernel.
+        SV::Utf8(s) if is_str_col => Some(format!("'{}'", s.replace('\'', "''"))),
+
+        SV::Date32(d) if matches!(column_type, DataType::Date32) => {
+            // A DATE literal, never the raw day number: `l_shipdate <= 10471`
+            // would compare a date against an integer and depends entirely on
+            // whose coercion rules win. Lance rejects a bare string here
+            // ("could not convert to literal of type 'Date32'"), which is the
+            // good kind of failure, but `DATE '1998-09-02'` is unambiguous.
+            let date = chrono::NaiveDate::from_num_days_from_ce_opt(*d + 719_163)?;
+            Some(format!("DATE '{}'", date.format("%Y-%m-%d")))
+        }
+
+        // Decimals, timestamps, intervals, lists, NULL and every mismatched
+        // pairing above fall through here. Each has a formatting or coercion
+        // subtlety that could change which rows survive, and none is worth a
+        // wrong answer.
+        _ => None,
+    }
+}
+
 /// Render an engine predicate as a Lance (DataFusion) SQL filter string.
 ///
-/// Returns `None` for anything not on the whitelist. That conservatism is the
-/// point: `scan_knn` treats `None` as "do not push this search down at all",
-/// so an unsupported predicate costs performance, never correctness. Adding a
-/// case here is only safe if the rendered SQL means *exactly* what the engine's
-/// own evaluator would compute.
+/// # The contract
+///
+/// Returns `None` for anything not on the whitelist below, and the whitelist is
+/// deliberately narrow. Two callers depend on the result meaning **exactly**
+/// what the engine's own evaluator computes:
+///
+/// - `scan_with_filter`, where the engine re-applies the full predicate above
+///   the scan. A pushed filter can therefore only be wrong by dropping a row
+///   the engine would have KEPT. It can never be wrong by keeping too many.
+/// - `scan_knn`, where `None` means "do not push the search down at all",
+///   because a k-NN search that applies its filter after the fact returns fewer
+///   than k rows rather than the right k.
+///
+/// # The whitelist
+///
+/// `column OP literal` and `column OP column` for `= != < <= > >=`; `IS NULL`
+/// / `IS NOT NULL` on a column; `AND` / `OR` / `NOT` over the above; `IN` /
+/// `NOT IN` with literals; `BETWEEN` (desugared to two comparisons, so no
+/// dialect question about BETWEEN itself can arise).
+///
+/// # What is deliberately absent
+///
+/// - **LIKE / NOT LIKE.** The engine's pattern semantics against DataFusion's
+///   are unverified, and TPC-H leans on `NOT LIKE` in exactly the places where
+///   an over-selective filter would silently delete rows.
+/// - **Arithmetic.** Integer division and decimal scaling differ.
+/// - **Column-to-column comparison across different types**, for the coercion
+///   reason in `lance_literal`. Same-type is allowed, and is what makes
+///   `l_commitdate < l_receiptdate` pushable.
 fn expr_to_lance_sql(expr: &crate::planner::Expr, schema: &ArrowSchema) -> Option<String> {
-    use crate::planner::{BinaryOp, Expr, ScalarValue, UnaryOp};
+    use crate::planner::{BinaryOp, Expr, UnaryOp};
 
-    fn lit(v: &ScalarValue) -> Option<String> {
-        Some(match v {
-            ScalarValue::Boolean(b) => b.to_string(),
-            ScalarValue::Int8(i) => i.to_string(),
-            ScalarValue::Int16(i) => i.to_string(),
-            ScalarValue::Int32(i) => i.to_string(),
-            ScalarValue::Int64(i) => i.to_string(),
-            ScalarValue::UInt8(i) => i.to_string(),
-            ScalarValue::UInt16(i) => i.to_string(),
-            ScalarValue::UInt32(i) => i.to_string(),
-            ScalarValue::UInt64(i) => i.to_string(),
-            ScalarValue::Float32(f) => {
-                if !f.0.is_finite() {
-                    return None;
-                }
-                format!("{:?}", f.0)
-            }
-            ScalarValue::Float64(f) => {
-                if !f.0.is_finite() {
-                    return None;
-                }
-                format!("{:?}", f.0)
-            }
-            ScalarValue::Utf8(s) => format!("'{}'", s.replace('\'', "''")),
-            ScalarValue::Date32(d) => {
-                // Render as a date literal rather than an integer, so the
-                // comparison is against a DATE column and not its raw days.
-                let date = chrono::NaiveDate::from_num_days_from_ce_opt(*d + 719_163)?;
-                format!("DATE '{}'", date.format("%Y-%m-%d"))
-            }
-            // Decimals, timestamps, intervals, lists and NULL are deliberately
-            // absent: each has a formatting or type-coercion subtlety that
-            // could change the predicate's meaning.
-            _ => return None,
-        })
+    /// Strip aliases/no-op casts that would otherwise hide a plain column.
+    fn peel(e: &Expr) -> &Expr {
+        match e {
+            Expr::Alias { expr, .. } => peel(expr),
+            other => other,
+        }
     }
 
-    fn go(e: &crate::planner::Expr, schema: &ArrowSchema) -> Option<String> {
-        match e {
-            Expr::Column(c) => {
-                // Lance knows bare column names only; a qualifier from the
-                // engine's plan must resolve to a real dataset column.
-                let name = schema
-                    .fields()
-                    .iter()
-                    .find(|f| f.name().eq_ignore_ascii_case(&c.name))?
-                    .name();
-                // NOT double-quoted. Lance 0.23.2 parses `"category"` as the
-                // string literal 'category', so `"category" = 'footwear'` is a
-                // constant FALSE and the filter silently matches nothing.
-                // Emitting a bare identifier means only simple names can be
-                // pushed, so anything needing quoting refuses the pushdown.
-                let simple = !name.is_empty()
-                    && name
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-                simple.then(|| name.clone())
-            }
-            Expr::Literal(v) => lit(v),
-            Expr::BinaryExpr { left, op, right } => {
-                let sym = match op {
-                    BinaryOp::Eq => "=",
-                    BinaryOp::NotEq => "!=",
-                    BinaryOp::Lt => "<",
-                    BinaryOp::LtEq => "<=",
-                    BinaryOp::Gt => ">",
-                    BinaryOp::GtEq => ">=",
-                    BinaryOp::And => "AND",
-                    BinaryOp::Or => "OR",
-                    BinaryOp::Like => "LIKE",
-                    BinaryOp::NotLike => "NOT LIKE",
-                    // Arithmetic is omitted: integer division and decimal
-                    // scaling differ between the engine and DataFusion.
-                    _ => return None,
-                };
+    /// Render one comparison, type-checking both sides.
+    fn comparison(left: &Expr, sym: &str, right: &Expr, schema: &ArrowSchema) -> Option<String> {
+        let (l, r) = (peel(left), peel(right));
+        match (l, r) {
+            (Expr::Column(c), Expr::Literal(v)) => {
+                let f = lance_bare_ident(c, schema)?;
                 Some(format!(
                     "({} {} {})",
-                    go(left, schema)?,
+                    f.name(),
                     sym,
-                    go(right, schema)?
+                    lance_literal(v, f.data_type())?
                 ))
             }
-            Expr::UnaryExpr { op, expr } => match op {
-                UnaryOp::Not => Some(format!("(NOT {})", go(expr, schema)?)),
-                UnaryOp::IsNull => Some(format!("({} IS NULL)", go(expr, schema)?)),
-                UnaryOp::IsNotNull => Some(format!("({} IS NOT NULL)", go(expr, schema)?)),
+            (Expr::Literal(v), Expr::Column(c)) => {
+                let f = lance_bare_ident(c, schema)?;
+                Some(format!(
+                    "({} {} {})",
+                    lance_literal(v, f.data_type())?,
+                    sym,
+                    f.name()
+                ))
+            }
+            (Expr::Column(a), Expr::Column(b)) => {
+                let (fa, fb) = (lance_bare_ident(a, schema)?, lance_bare_ident(b, schema)?);
+                // Identical types only: no coercion, therefore nothing to
+                // disagree about.
+                (fa.data_type() == fb.data_type())
+                    .then(|| format!("({} {} {})", fa.name(), sym, fb.name()))
+            }
+            _ => None,
+        }
+    }
+
+    fn go(e: &Expr, schema: &ArrowSchema) -> Option<String> {
+        match peel(e) {
+            Expr::BinaryExpr { left, op, right } => match op {
+                BinaryOp::And => Some(format!(
+                    "({} AND {})",
+                    go(left, schema)?,
+                    go(right, schema)?
+                )),
+                BinaryOp::Or => Some(format!("({} OR {})", go(left, schema)?, go(right, schema)?)),
+                BinaryOp::Eq => comparison(left, "=", right, schema),
+                BinaryOp::NotEq => comparison(left, "!=", right, schema),
+                BinaryOp::Lt => comparison(left, "<", right, schema),
+                BinaryOp::LtEq => comparison(left, "<=", right, schema),
+                BinaryOp::Gt => comparison(left, ">", right, schema),
+                BinaryOp::GtEq => comparison(left, ">=", right, schema),
+                _ => None,
+            },
+            Expr::UnaryExpr { op, expr } => match (op, peel(expr)) {
+                (UnaryOp::Not, _) => Some(format!("(NOT {})", go(expr, schema)?)),
+                (UnaryOp::IsNull, Expr::Column(c)) => {
+                    Some(format!("({} IS NULL)", lance_bare_ident(c, schema)?.name()))
+                }
+                (UnaryOp::IsNotNull, Expr::Column(c)) => Some(format!(
+                    "({} IS NOT NULL)",
+                    lance_bare_ident(c, schema)?.name()
+                )),
                 _ => None,
             },
             Expr::InList {
@@ -612,32 +894,285 @@ fn expr_to_lance_sql(expr: &crate::planner::Expr, schema: &ArrowSchema) -> Optio
                 list,
                 negated,
             } => {
-                let items: Option<Vec<String>> = list.iter().map(|l| go(l, schema)).collect();
+                let Expr::Column(c) = peel(expr) else {
+                    return None;
+                };
+                let f = lance_bare_ident(c, schema)?;
+                let items: Option<Vec<String>> = list
+                    .iter()
+                    .map(|l| match peel(l) {
+                        Expr::Literal(v) => lance_literal(v, f.data_type()),
+                        _ => None,
+                    })
+                    .collect();
+                let items = items?;
+                if items.is_empty() {
+                    return None;
+                }
                 Some(format!(
                     "({} {}IN ({}))",
-                    go(expr, schema)?,
+                    f.name(),
                     if *negated { "NOT " } else { "" },
-                    items?.join(", ")
+                    items.join(", ")
                 ))
             }
+            // Desugared rather than emitted as BETWEEN: two comparisons the
+            // renderer already type-checks, and no reliance on Lance's BETWEEN.
             Expr::Between {
                 expr,
                 low,
                 high,
                 negated,
-            } => Some(format!(
-                "({} {}BETWEEN {} AND {})",
-                go(expr, schema)?,
-                if *negated { "NOT " } else { "" },
-                go(low, schema)?,
-                go(high, schema)?
-            )),
+            } => {
+                let lo = comparison(expr, ">=", low, schema)?;
+                let hi = comparison(expr, "<=", high, schema)?;
+                Some(if *negated {
+                    format!("(NOT ({} AND {}))", lo, hi)
+                } else {
+                    format!("({} AND {})", lo, hi)
+                })
+            }
             _ => None,
         }
     }
 
     go(expr, schema)
 }
+
+/// Split a predicate into its top-level AND conjuncts.
+fn split_conjuncts<'a>(e: &'a crate::planner::Expr, out: &mut Vec<&'a crate::planner::Expr>) {
+    use crate::planner::{BinaryOp, Expr};
+    if let Expr::BinaryExpr {
+        left,
+        op: BinaryOp::And,
+        right,
+    } = e
+    {
+        split_conjuncts(left, out);
+        split_conjuncts(right, out);
+    } else {
+        out.push(e);
+    }
+}
+
+/// Render as much of a WHERE predicate as Lance can evaluate faithfully.
+///
+/// # Why partial pushdown is sound here, and only here
+///
+/// The physical planner ALWAYS wraps a filtered scan in a `FilterExec` carrying
+/// the full predicate (`planner.rs`, the `node.filter` arm), so whatever Lance
+/// returns is filtered again by the engine. Pushdown can therefore only be
+/// wrong by returning too FEW rows, never too many.
+///
+/// That makes it sound to push a subset of the top-level AND conjuncts and drop
+/// the rest: under SQL's three-valued WHERE semantics only TRUE passes, so if a
+/// conjunct `C` is not TRUE for a row then `C AND rest` is not TRUE either, and
+/// the row was never going to survive. Every dropped conjunct is a row Lance
+/// removes that the engine would have removed anyway.
+///
+/// The same reasoning does NOT hold inside an `OR`, which is why disjunctions
+/// are pushed whole or not at all.
+fn lance_filter_sql(expr: &crate::planner::Expr, schema: &ArrowSchema) -> Option<String> {
+    lance_pushable_conjuncts(expr, schema).map(|(sql, _)| sql)
+}
+
+/// The renderable conjuncts of `expr`, as one SQL string plus the expressions
+/// that produced it (which the cost gate then estimates selectivity over).
+fn lance_pushable_conjuncts<'a>(
+    expr: &'a crate::planner::Expr,
+    schema: &ArrowSchema,
+) -> Option<(String, Vec<&'a crate::planner::Expr>)> {
+    let mut conjuncts = Vec::new();
+    split_conjuncts(expr, &mut conjuncts);
+
+    let mut sql = Vec::new();
+    let mut kept = Vec::new();
+    for c in conjuncts {
+        if let Some(s) = expr_to_lance_sql(c, schema) {
+            sql.push(s);
+            kept.push(c);
+        }
+    }
+    (!sql.is_empty()).then(|| (sql.join(" AND "), kept))
+}
+
+/// Collect the column names an expression references.
+///
+/// Only the variants `expr_to_lance_sql` can render need covering, since the
+/// only caller feeds it already-rendered conjuncts. Anything else contributes
+/// no columns, which is safe here: the caller uses this to prove a wide column
+/// is ABSENT, and it never sees an expression this does not understand.
+fn collect_columns(e: &crate::planner::Expr, out: &mut Vec<String>) {
+    use crate::planner::Expr;
+    match e {
+        Expr::Column(c) => out.push(c.name.to_lowercase()),
+        Expr::Alias { expr, .. } => collect_columns(expr, out),
+        Expr::BinaryExpr { left, right, .. } => {
+            collect_columns(left, out);
+            collect_columns(right, out);
+        }
+        Expr::UnaryExpr { expr, .. } => collect_columns(expr, out),
+        Expr::InList { expr, list, .. } => {
+            collect_columns(expr, out);
+            for l in list {
+                collect_columns(l, out);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_columns(expr, out);
+            collect_columns(low, out);
+            collect_columns(high, out);
+        }
+        _ => {}
+    }
+}
+
+/// Estimated fraction of rows a predicate keeps, or `None` when unknown.
+///
+/// Deliberately partial. Only integer- and date-typed columns have statistics
+/// (see `compute_column_stats`), so only predicates over those get an estimate;
+/// everything else returns `None` and the caller declines to push. That is the
+/// right bias: an unknown-selectivity filter is exactly the case the
+/// measurements below say can lose, so "I do not know" must mean "do not".
+fn estimate_selectivity(
+    e: &crate::planner::Expr,
+    schema: &ArrowSchema,
+    stats: &std::collections::HashMap<String, ColumnStatistics>,
+    rows: usize,
+) -> Option<f64> {
+    use crate::planner::{BinaryOp, Expr, ScalarValue as SV, UnaryOp};
+
+    /// A literal's value on the same i64 scale the statistics use.
+    fn as_i64(v: &SV) -> Option<i64> {
+        Some(match v {
+            SV::Int8(i) => *i as i64,
+            SV::Int16(i) => *i as i64,
+            SV::Int32(i) => *i as i64,
+            SV::Int64(i) => *i,
+            SV::UInt8(i) => *i as i64,
+            SV::UInt16(i) => *i as i64,
+            SV::UInt32(i) => *i as i64,
+            SV::UInt64(i) => i64::try_from(*i).ok()?,
+            SV::Date32(d) => *d as i64,
+            _ => return None,
+        })
+    }
+
+    fn col_stats<'a>(
+        e: &crate::planner::Expr,
+        stats: &'a std::collections::HashMap<String, ColumnStatistics>,
+    ) -> Option<&'a ColumnStatistics> {
+        match e {
+            Expr::Column(c) => stats.get(&c.name.to_lowercase()),
+            _ => None,
+        }
+    }
+
+    /// Fraction of a column's [min, max] range below `v`.
+    fn range_fraction(cs: &ColumnStatistics, v: i64, inclusive: bool) -> Option<f64> {
+        let (lo, hi) = (cs.min_i64?, cs.max_i64?);
+        let span = (hi as i128 - lo as i128 + 1).max(1) as f64;
+        let below = (v as i128 - lo as i128 + if inclusive { 1 } else { 0 }).max(0) as f64;
+        Some((below / span).clamp(0.0, 1.0))
+    }
+
+    match e {
+        Expr::BinaryExpr { left, op, right } => {
+            match op {
+                // Independence assumption, the same one the join reorderer makes.
+                BinaryOp::And => {
+                    let a = estimate_selectivity(left, schema, stats, rows)?;
+                    let b = estimate_selectivity(right, schema, stats, rows)?;
+                    return Some(a * b);
+                }
+                // Over-estimate a disjunction (no inclusion-exclusion term), so
+                // an OR is never *more* attractive than it deserves to be.
+                BinaryOp::Or => {
+                    let a = estimate_selectivity(left, schema, stats, rows)?;
+                    let b = estimate_selectivity(right, schema, stats, rows)?;
+                    return Some((a + b).min(1.0));
+                }
+                _ => {}
+            }
+            // Normalize to `column OP literal`, flipping the operator if the
+            // literal is on the left.
+            let (cs, lit, op) = match (col_stats(left, stats), right.as_ref()) {
+                (Some(cs), Expr::Literal(v)) => (cs, v, *op),
+                _ => match (left.as_ref(), col_stats(right, stats)) {
+                    (Expr::Literal(v), Some(cs)) => (
+                        cs,
+                        v,
+                        match op {
+                            BinaryOp::Lt => BinaryOp::Gt,
+                            BinaryOp::LtEq => BinaryOp::GtEq,
+                            BinaryOp::Gt => BinaryOp::Lt,
+                            BinaryOp::GtEq => BinaryOp::LtEq,
+                            other => *other,
+                        },
+                    ),
+                    // Column-to-column and everything else: unknown.
+                    _ => return None,
+                },
+            };
+            let v = as_i64(lit)?;
+            match op {
+                BinaryOp::Eq => Some(1.0 / cs.ndv_est? as f64),
+                BinaryOp::NotEq => Some(1.0 - 1.0 / cs.ndv_est? as f64),
+                BinaryOp::Lt => range_fraction(cs, v, false),
+                BinaryOp::LtEq => range_fraction(cs, v, true),
+                BinaryOp::Gt => range_fraction(cs, v, true).map(|f| 1.0 - f),
+                BinaryOp::GtEq => range_fraction(cs, v, false).map(|f| 1.0 - f),
+                _ => None,
+            }
+        }
+        Expr::UnaryExpr { op, expr } => match op {
+            UnaryOp::Not => estimate_selectivity(expr, schema, stats, rows).map(|s| 1.0 - s),
+            UnaryOp::IsNull => {
+                let cs = col_stats(expr, stats)?;
+                Some((cs.null_count? as f64 / rows.max(1) as f64).clamp(0.0, 1.0))
+            }
+            UnaryOp::IsNotNull => {
+                let cs = col_stats(expr, stats)?;
+                Some(1.0 - (cs.null_count? as f64 / rows.max(1) as f64).clamp(0.0, 1.0))
+            }
+            _ => None,
+        },
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let cs = col_stats(expr, stats)?;
+            let s = (list.len() as f64 / cs.ndv_est? as f64).clamp(0.0, 1.0);
+            Some(if *negated { 1.0 - s } else { s })
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let cs = col_stats(expr, stats)?;
+            let (Expr::Literal(l), Expr::Literal(h)) = (low.as_ref(), high.as_ref()) else {
+                return None;
+            };
+            let lo = range_fraction(cs, as_i64(l)?, false)?;
+            let hi = range_fraction(cs, as_i64(h)?, true)?;
+            let s = (hi - lo).clamp(0.0, 1.0);
+            Some(if *negated { 1.0 - s } else { s })
+        }
+        _ => None,
+    }
+}
+
+/// Estimated selectivity at or below which pushing a filter into Lance pays.
+///
+/// See `LanceTable::pushdown_pays` for the measurements. 10% sits well inside
+/// the winning region (4.5x at the measured 10% point, 20x at 0.05%) with
+/// margin before the ~40% crossover.
+const PUSHDOWN_SELECTIVITY_LIMIT: f64 = 0.10;
 
 fn dir_size(path: &Path) -> u64 {
     fn walk(p: &Path, acc: &mut u64) {
@@ -680,7 +1215,51 @@ impl TableProvider for LanceTable {
         }
 
         let ds = Arc::clone(&self.dataset);
-        block_on_lance(async move { scan_fragments(ds, names).await })
+        block_on_lance(async move { scan_fragments(ds, names, None).await })
+    }
+
+    /// Scan with as much of the predicate as Lance can evaluate faithfully.
+    ///
+    /// This is the Lance path's largest performance lever: without it, a
+    /// `WHERE l_shipdate <= DATE '1998-09-02'` scan decodes every row of every
+    /// column and throws most of them away in the engine.
+    ///
+    /// # Safety of a partial push
+    ///
+    /// The physical planner always wraps a filtered scan in a `FilterExec`
+    /// carrying the FULL predicate, so this is a row-reduction hint, not a
+    /// semantic commitment: rows Lance keeps are re-checked, rows Lance drops
+    /// are gone. That makes over-approximation free and under-approximation
+    /// fatal, which is exactly the bias `lance_filter_sql` is built with — see
+    /// its doc comment for why an unrenderable conjunct can simply be omitted
+    /// and why the same is not true inside an `OR`.
+    ///
+    /// Falls back to an unfiltered scan whenever nothing can be rendered.
+    fn scan_with_filter(
+        &self,
+        projection: Option<&[usize]>,
+        filter: Option<&crate::planner::Expr>,
+    ) -> Result<Vec<RecordBatch>> {
+        let Some(predicate) = filter.filter(|_| self.filter_pushdown) else {
+            return self.scan(projection);
+        };
+        let Some(sql) = self.plan_pushdown(predicate, projection) else {
+            return self.scan(projection);
+        };
+
+        let names = self.projected_names(projection)?;
+        // A zero-column projection is answered from metadata by `scan`, and a
+        // row count under a predicate is not what the caller asked for anyway
+        // (the engine's FilterExec cannot filter a column-less batch). Let the
+        // metadata path handle it.
+        if names.is_empty() {
+            return self.scan(projection);
+        }
+
+        self.pushed_filters
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let ds = Arc::clone(&self.dataset);
+        block_on_lance(async move { scan_fragments(ds, names, Some(sql)).await })
     }
 
     /// Run a k-NN search through Lance's vector index.
@@ -982,6 +1561,222 @@ mod tests {
         assert!(
             unsupported_reason(&dt).is_some_and(|r| r.contains("nesting deeper")),
             "pathological nesting must be refused, not recursed into"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Filter -> Lance SQL rendering.
+    //
+    // These assert on the STRING, because the failure mode being defended
+    // against is a filter Lance accepts and evaluates to something other than
+    // what the engine meant. A rendering test catches that at the seam; an
+    // end-to-end row-count test catches it only if the data happens to expose
+    // it. Both exist (see `tests/lance_tests.rs`).
+    // -----------------------------------------------------------------------
+
+    fn filter_schema() -> ArrowSchema {
+        use arrow::datatypes::Field;
+        ArrowSchema::new(vec![
+            Field::new("l_orderkey", DataType::Int64, false),
+            Field::new("l_quantity", DataType::Float64, false),
+            Field::new("l_returnflag", DataType::Utf8, false),
+            Field::new("l_shipdate", DataType::Date32, false),
+            Field::new("l_commitdate", DataType::Date32, false),
+            Field::new("l_price", DataType::Decimal128(15, 2), true),
+            Field::new("weird name", DataType::Int64, true),
+        ])
+    }
+
+    fn col(name: &str) -> crate::planner::Expr {
+        crate::planner::Expr::column(name)
+    }
+    fn lit_i(v: i64) -> crate::planner::Expr {
+        crate::planner::Expr::literal(crate::planner::ScalarValue::Int64(v))
+    }
+    fn lit_s(v: &str) -> crate::planner::Expr {
+        crate::planner::Expr::literal(crate::planner::ScalarValue::Utf8(v.to_string()))
+    }
+
+    /// THE headline hazard. Lance 0.23.2 parses a double-quoted identifier as a
+    /// STRING LITERAL, so `"l_returnflag" = 'R'` is the constant FALSE and
+    /// matches nothing — silently. Nothing this renderer emits may be quoted.
+    #[test]
+    fn test_identifiers_are_never_double_quoted() {
+        let s = filter_schema();
+        let sql = expr_to_lance_sql(&col("l_returnflag").eq(lit_s("R")), &s).expect("renderable");
+        assert!(
+            !sql.contains('"'),
+            "a double-quoted identifier is a silent constant-FALSE in Lance 0.23.2: {}",
+            sql
+        );
+        assert_eq!(sql, "(l_returnflag = 'R')");
+    }
+
+    /// A name that would need quoting must refuse the pushdown outright rather
+    /// than be quoted (see above) or emitted bare (which would not parse).
+    #[test]
+    fn test_unquotable_name_refuses_pushdown() {
+        let s = filter_schema();
+        assert!(expr_to_lance_sql(&col("weird name").eq(lit_i(1)), &s).is_none());
+    }
+
+    #[test]
+    fn test_string_literals_escape_embedded_quotes() {
+        let s = filter_schema();
+        let sql = expr_to_lance_sql(&col("l_returnflag").eq(lit_s("O'Brien")), &s).unwrap();
+        assert_eq!(sql, "(l_returnflag = 'O''Brien')");
+        // A quote-and-terminate injection must not escape the literal.
+        let sql = expr_to_lance_sql(&col("l_returnflag").eq(lit_s("x' OR '1'='1")), &s).unwrap();
+        assert_eq!(sql, "(l_returnflag = 'x'' OR ''1''=''1')");
+    }
+
+    /// Dates render as DATE literals, not day numbers. Lance refuses a bare
+    /// string ("could not convert to literal of type 'Date32'"), and an integer
+    /// would silently depend on whose coercion rules win.
+    #[test]
+    fn test_dates_render_as_date_literals() {
+        let s = filter_schema();
+        // 1998-09-02 is 10471 days after the epoch.
+        let d = crate::planner::Expr::literal(crate::planner::ScalarValue::Date32(10471));
+        let sql = expr_to_lance_sql(&col("l_shipdate").lt_eq(d), &s).unwrap();
+        assert_eq!(sql, "(l_shipdate <= DATE '1998-09-02')");
+    }
+
+    /// The type gate: a literal whose family does not match the column's is
+    /// refused, because the two engines' coercion rules do not have to agree
+    /// and a disagreement that narrows the filter loses rows.
+    #[test]
+    fn test_mismatched_literal_types_refuse_pushdown() {
+        let s = filter_schema();
+        // string literal against an integer column
+        assert!(expr_to_lance_sql(&col("l_orderkey").eq(lit_s("5")), &s).is_none());
+        // integer against a date column
+        assert!(expr_to_lance_sql(&col("l_shipdate").eq(lit_i(10471)), &s).is_none());
+        // anything against a decimal column: scale handling is not verified
+        assert!(expr_to_lance_sql(&col("l_price").gt(lit_i(10)), &s).is_none());
+        // an integer against a float column IS allowed, and is how TPC-H Q19
+        // writes `l_quantity >= 1`
+        assert_eq!(
+            expr_to_lance_sql(&col("l_quantity").gt_eq(lit_i(1)), &s).unwrap(),
+            "(l_quantity >= 1)"
+        );
+    }
+
+    /// Column-to-column is allowed only when the types are identical, so no
+    /// coercion happens on either side. This is what makes the TPC-H Q04/Q12/Q21
+    /// predicate `l_commitdate < l_receiptdate` pushable.
+    #[test]
+    fn test_column_to_column_requires_identical_types() {
+        let s = filter_schema();
+        assert_eq!(
+            expr_to_lance_sql(&col("l_commitdate").lt(col("l_shipdate")), &s).unwrap(),
+            "(l_commitdate < l_shipdate)"
+        );
+        assert!(expr_to_lance_sql(&col("l_orderkey").lt(col("l_quantity")), &s).is_none());
+    }
+
+    /// LIKE is deliberately NOT pushed: the engine's pattern semantics against
+    /// DataFusion's are unverified, and TPC-H uses NOT LIKE where an
+    /// over-selective filter would silently delete rows.
+    #[test]
+    fn test_like_is_not_pushed() {
+        use crate::planner::{BinaryOp, Expr};
+        let s = filter_schema();
+        let like = Expr::BinaryExpr {
+            left: Box::new(col("l_returnflag")),
+            op: BinaryOp::Like,
+            right: Box::new(lit_s("R%")),
+        };
+        assert!(expr_to_lance_sql(&like, &s).is_none());
+        // ...and an AND containing it still pushes the OTHER conjunct.
+        let both = like.and(col("l_orderkey").gt(lit_i(3)));
+        assert!(expr_to_lance_sql(&both, &s).is_none(), "whole-expr render");
+        assert_eq!(
+            lance_filter_sql(&both, &s).unwrap(),
+            "(l_orderkey > 3)",
+            "conjunct-wise render must keep the pushable half"
+        );
+    }
+
+    /// An unrenderable conjunct may be dropped (the engine re-checks), but an
+    /// unrenderable DISJUNCT may not: `a = 1 OR weird(b)` is not implied by
+    /// `a = 1`, and pushing it would delete rows that satisfy the right half.
+    #[test]
+    fn test_unrenderable_disjunct_refuses_the_whole_predicate() {
+        use crate::planner::{BinaryOp, Expr};
+        let s = filter_schema();
+        let like = Expr::BinaryExpr {
+            left: Box::new(col("l_returnflag")),
+            op: BinaryOp::Like,
+            right: Box::new(lit_s("R%")),
+        };
+        let disj = col("l_orderkey").gt(lit_i(3)).or(like);
+        assert!(
+            lance_filter_sql(&disj, &s).is_none(),
+            "an OR with an unrenderable arm must not be narrowed to its renderable arm"
+        );
+    }
+
+    #[test]
+    fn test_in_list_and_null_checks() {
+        use crate::planner::Expr;
+        let s = filter_schema();
+        let in_list = Expr::InList {
+            expr: Box::new(col("l_returnflag")),
+            list: vec![lit_s("R"), lit_s("A")],
+            negated: false,
+        };
+        assert_eq!(
+            expr_to_lance_sql(&in_list, &s).unwrap(),
+            "(l_returnflag IN ('R', 'A'))"
+        );
+        // One bad element poisons the whole list: a partial IN list is a
+        // NARROWER predicate, which is the one direction that loses rows.
+        let mixed = Expr::InList {
+            expr: Box::new(col("l_returnflag")),
+            list: vec![lit_s("R"), lit_i(7)],
+            negated: false,
+        };
+        assert!(expr_to_lance_sql(&mixed, &s).is_none());
+
+        let is_null = Expr::UnaryExpr {
+            op: crate::planner::UnaryOp::IsNull,
+            expr: Box::new(col("l_price")),
+        };
+        assert_eq!(
+            expr_to_lance_sql(&is_null, &s).unwrap(),
+            "(l_price IS NULL)"
+        );
+    }
+
+    /// BETWEEN is desugared into two type-checked comparisons, so Lance's own
+    /// BETWEEN semantics never enter the picture.
+    #[test]
+    fn test_between_is_desugared() {
+        use crate::planner::Expr;
+        let s = filter_schema();
+        let b = Expr::Between {
+            expr: Box::new(col("l_orderkey")),
+            low: Box::new(lit_i(5)),
+            high: Box::new(lit_i(9)),
+            negated: false,
+        };
+        assert_eq!(
+            expr_to_lance_sql(&b, &s).unwrap(),
+            "((l_orderkey >= 5) AND (l_orderkey <= 9))"
+        );
+    }
+
+    #[test]
+    fn test_conjunct_splitting_keeps_every_renderable_part() {
+        let s = filter_schema();
+        let e = col("l_orderkey")
+            .gt(lit_i(3))
+            .and(col("l_returnflag").eq(lit_s("R")))
+            .and(col("l_quantity").lt(lit_i(24)));
+        assert_eq!(
+            lance_filter_sql(&e, &s).unwrap(),
+            "(l_orderkey > 3) AND (l_returnflag = 'R') AND (l_quantity < 24)"
         );
     }
 }

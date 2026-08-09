@@ -212,6 +212,354 @@ async fn test_tpch_q05_matches_parquet() {
 }
 
 // ---------------------------------------------------------------------------
+// Filter pushdown into Lance.
+//
+// THE FAILURE MODE THIS GUARDS: in lance 0.23.2 a double-quoted identifier
+// parses as a STRING LITERAL, so `"category" = 'x'` is a constant FALSE that
+// matches NOTHING and reports no error. A pushdown bug of that shape does not
+// crash and does not slow anything down — it silently returns zero rows. So the
+// gate is not "does the query still run", it is "are the rows IDENTICAL with
+// pushdown on and off", including a predicate that should match nothing (which
+// must match nothing for the RIGHT reason) and one that should match
+// everything (which a constant-FALSE bug would empty out).
+// ---------------------------------------------------------------------------
+
+/// Same tables, pushdown explicitly disabled: the no-pushdown arm of the A/B.
+fn lance_ctx_no_pushdown() -> ExecutionContext {
+    use query_engine::storage::LanceTable;
+    let mut ctx = ExecutionContext::new();
+    for t in &TABLES {
+        let table = LanceTable::try_new(lance_dir().join(format!("{}.lance", t)))
+            .unwrap_or_else(|e| panic!("LanceTable::try_new({}) failed: {}", t, e))
+            .with_filter_pushdown(false);
+        ctx.register_table_provider(*t, std::sync::Arc::new(table));
+    }
+    ctx
+}
+
+/// The predicates the A/B runs. Chosen to cover every renderer branch AND the
+/// two boundary cases a silent constant-FALSE would hide behind.
+const PUSHDOWN_CASES: [(&str, &str); 12] = [
+    (
+        "date <=, the TPC-H Q01 shape",
+        "SELECT COUNT(*) AS n, SUM(l_quantity) AS q FROM lineitem \
+         WHERE l_shipdate <= DATE '1998-09-02'",
+    ),
+    (
+        "string equality (the double-quote hazard)",
+        "SELECT l_returnflag, COUNT(*) AS n FROM lineitem WHERE l_returnflag = 'R' \
+         GROUP BY l_returnflag ORDER BY l_returnflag",
+    ),
+    (
+        "MATCHES ZERO ROWS - must be empty for the right reason",
+        "SELECT COUNT(*) AS n FROM lineitem WHERE l_returnflag = 'ZZZ_NO_SUCH_FLAG'",
+    ),
+    (
+        "MATCHES EVERY ROW - a constant-FALSE bug empties this",
+        "SELECT COUNT(*) AS n FROM lineitem WHERE l_orderkey > -1",
+    ),
+    (
+        "date range, both ends",
+        "SELECT COUNT(*) AS n FROM orders \
+         WHERE o_orderdate >= DATE '1994-01-01' AND o_orderdate < DATE '1995-01-01'",
+    ),
+    (
+        "float comparison with an integer literal",
+        "SELECT COUNT(*) AS n, SUM(l_extendedprice) AS p FROM lineitem WHERE l_quantity < 24",
+    ),
+    (
+        "float comparison with float literals",
+        "SELECT COUNT(*) AS n FROM lineitem WHERE l_discount >= 0.05 AND l_discount <= 0.07",
+    ),
+    (
+        "IN list of strings",
+        "SELECT l_shipmode, COUNT(*) AS n FROM lineitem \
+         WHERE l_shipmode IN ('MAIL', 'SHIP') GROUP BY l_shipmode ORDER BY l_shipmode",
+    ),
+    (
+        "column-to-column, same type",
+        "SELECT COUNT(*) AS n FROM lineitem WHERE l_commitdate < l_receiptdate",
+    ),
+    (
+        "OR of two pushable comparisons",
+        "SELECT COUNT(*) AS n FROM orders WHERE o_orderstatus = 'F' OR o_totalprice > 100000",
+    ),
+    (
+        "AND where only one side is renderable (LIKE is not)",
+        "SELECT COUNT(*) AS n FROM part WHERE p_size = 15 AND p_type LIKE '%BRASS'",
+    ),
+    (
+        "!= and BETWEEN together",
+        "SELECT COUNT(*) AS n FROM lineitem \
+         WHERE l_returnflag != 'N' AND l_linenumber BETWEEN 2 AND 4",
+    ),
+];
+
+/// The mandatory verification: pushdown and no-pushdown must agree row for row.
+///
+/// Correctness of the pushdown is defined as "changes nothing but the time".
+#[tokio::test]
+async fn test_pushdown_matches_no_pushdown_row_for_row() {
+    if !data_available() {
+        return;
+    }
+    let (on, off) = (lance_ctx(), lance_ctx_no_pushdown());
+    for (label, sql) in PUSHDOWN_CASES {
+        let a = on
+            .sql(sql)
+            .await
+            .unwrap_or_else(|e| panic!("[{}] pushdown query failed: {}", label, e));
+        let b = off
+            .sql(sql)
+            .await
+            .unwrap_or_else(|e| panic!("[{}] no-pushdown query failed: {}", label, e));
+        assert_eq!(
+            a.row_count, b.row_count,
+            "[{}] row count differs with pushdown on/off: {}",
+            label, sql
+        );
+        let (ca, cb) = (to_cells(&a.batches), to_cells(&b.batches));
+        assert_eq!(
+            ca, cb,
+            "[{}] cells differ with pushdown on/off: {}",
+            label, sql
+        );
+    }
+}
+
+/// The two boundary cases deserve their own assertions on the ABSOLUTE answer,
+/// not just on agreement. Two identical wrong answers agree perfectly.
+#[tokio::test]
+async fn test_pushdown_boundary_predicates_have_the_right_absolute_answer() {
+    if !data_available() {
+        return;
+    }
+    let ctx = lance_ctx();
+
+    let zero = ctx
+        .sql("SELECT COUNT(*) AS n FROM lineitem WHERE l_returnflag = 'ZZZ_NO_SUCH_FLAG'")
+        .await
+        .expect("query failed");
+    assert_eq!(count_of(&zero), 0, "a predicate matching nothing must be 0");
+
+    // The all-rows case is the one a constant-FALSE pushdown bug destroys, and
+    // it is compared against the row count Lance reports from metadata.
+    let all = ctx
+        .sql("SELECT COUNT(*) AS n FROM lineitem WHERE l_orderkey > -1")
+        .await
+        .expect("query failed");
+    let total = ctx
+        .sql("SELECT COUNT(*) AS n FROM lineitem")
+        .await
+        .expect("query failed");
+    assert_eq!(
+        count_of(&all),
+        count_of(&total),
+        "a predicate matching every row must not lose any"
+    );
+    assert!(count_of(&total) > 0, "fixture must not be empty");
+}
+
+fn count_of(r: &query_engine::execution::QueryResult) -> i64 {
+    r.batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .expect("COUNT(*) is Int64")
+        .value(0)
+}
+
+/// TPC-H is all narrow scalar columns, so `pushdown_pays` must DECLINE every
+/// one of these. Pushing them unconditionally cost the SF=10 suite 18%
+/// (7.96s -> 9.40s), which is the regression this asserts cannot come back.
+#[tokio::test]
+async fn test_pushdown_declines_on_narrow_tables() {
+    if !data_available() {
+        return;
+    }
+    use query_engine::storage::LanceTable;
+    let table = std::sync::Arc::new(
+        LanceTable::try_new(lance_dir().join("lineitem.lance")).expect("open lineitem"),
+    );
+    let mut ctx = ExecutionContext::new();
+    ctx.register_table_provider("lineitem", table.clone());
+
+    for sql in [
+        "SELECT COUNT(*) AS n FROM lineitem WHERE l_shipdate <= DATE '1998-09-02'",
+        "SELECT COUNT(*) AS n FROM lineitem WHERE l_orderkey = 1",
+        "SELECT COUNT(*) AS n FROM lineitem WHERE l_returnflag = 'R'",
+    ] {
+        ctx.sql(sql).await.expect("query failed");
+    }
+    assert_eq!(
+        table.pushed_filter_count(),
+        0,
+        "no TPC-H column is worth late-materializing; pushing here is a measured 18% regression"
+    );
+}
+
+/// The case pushdown exists for: a table with an embedding column, filtered by
+/// a selective scalar. An A/B that agrees because the pushdown never fires
+/// proves nothing, so this asserts the predicate really reached Lance.
+#[tokio::test]
+async fn test_pushdown_fires_on_a_wide_payload_with_a_selective_filter() {
+    let Some(path) = vectors_path() else { return };
+    use query_engine::storage::LanceTable;
+    let table = std::sync::Arc::new(LanceTable::try_new(&path).expect("open vectors"));
+    let mut ctx = ExecutionContext::new();
+    ctx.register_table_provider("vectors", table.clone());
+
+    assert_eq!(table.pushed_filter_count(), 0);
+    // Wide column projected, filter on a different (integer, statistic-bearing)
+    // column, ~0.05% selective: all three gate conditions hold.
+    ctx.sql("SELECT id, embedding FROM vectors WHERE id < 100")
+        .await
+        .expect("query failed");
+    assert!(
+        table.pushed_filter_count() > 0,
+        "the predicate never reached Lance: pushdown is dead code"
+    );
+
+    // Same shape, but the filter is on a STRING column with no statistics, so
+    // selectivity is unknown. Unknown must mean "do not push" — that is the
+    // slowest measured case (0.4x).
+    let before = table.pushed_filter_count();
+    ctx.sql("SELECT id, embedding FROM vectors WHERE category = 'books'")
+        .await
+        .expect("query failed");
+    assert_eq!(
+        table.pushed_filter_count(),
+        before,
+        "unknown selectivity must decline"
+    );
+
+    // Same shape, but not selective enough.
+    ctx.sql("SELECT id, embedding FROM vectors WHERE id < 190000")
+        .await
+        .expect("query failed");
+    assert_eq!(
+        table.pushed_filter_count(),
+        before,
+        "a filter that keeps 95% of rows must decline"
+    );
+
+    // A selective conjunct next to an unestimatable one still pushes the half
+    // Lance can use; the string half stays engine-side.
+    ctx.sql("SELECT id, embedding FROM vectors WHERE id < 100 AND category = 'books'")
+        .await
+        .expect("query failed");
+    assert_eq!(
+        table.pushed_filter_count(),
+        before + 1,
+        "a mixed AND must still push its estimatable, selective half"
+    );
+}
+
+/// Row-for-row A/B on the dataset where pushdown actually fires. This is the
+/// verification that matters: a silent constant-FALSE would show up here as an
+/// empty result on the pushdown arm and a full one on the other.
+#[tokio::test]
+async fn test_pushdown_matches_no_pushdown_on_a_wide_table() {
+    let Some(path) = vectors_path() else { return };
+    use query_engine::storage::LanceTable;
+
+    let mut on = ExecutionContext::new();
+    on.register_table_provider(
+        "vectors",
+        std::sync::Arc::new(LanceTable::try_new(&path).expect("open")),
+    );
+    let mut off = ExecutionContext::new();
+    off.register_table_provider(
+        "vectors",
+        std::sync::Arc::new(
+            LanceTable::try_new(&path)
+                .expect("open")
+                .with_filter_pushdown(false),
+        ),
+    );
+
+    let cases: [(&str, &str); 6] = [
+        (
+            "selective int filter (pushes)",
+            "SELECT id, category, price FROM vectors WHERE id < 100 ORDER BY id",
+        ),
+        (
+            "MATCHES ZERO ROWS",
+            "SELECT COUNT(*) AS n FROM vectors WHERE id < -5",
+        ),
+        (
+            "MATCHES EVERY ROW",
+            "SELECT COUNT(*) AS n FROM vectors WHERE id >= 0",
+        ),
+        (
+            "IN list",
+            "SELECT id, category FROM vectors WHERE id IN (1, 7, 99) ORDER BY id",
+        ),
+        (
+            "BETWEEN",
+            "SELECT id, price FROM vectors WHERE id BETWEEN 10 AND 40 ORDER BY id",
+        ),
+        (
+            "AND with a string conjunct the whitelist keeps engine-side",
+            "SELECT id, category FROM vectors WHERE id < 500 AND category = 'books' ORDER BY id",
+        ),
+    ];
+
+    for (label, sql) in cases {
+        let a = on
+            .sql(sql)
+            .await
+            .unwrap_or_else(|e| panic!("[{}] pushdown failed: {}", label, e));
+        let b = off
+            .sql(sql)
+            .await
+            .unwrap_or_else(|e| panic!("[{}] no-pushdown failed: {}", label, e));
+        assert_eq!(a.row_count, b.row_count, "[{}] row count differs", label);
+        assert_eq!(
+            to_cells(&a.batches),
+            to_cells(&b.batches),
+            "[{}] cells differ",
+            label
+        );
+    }
+
+    // Absolute answers for the boundary cases: two identical wrong answers
+    // agree perfectly, so agreement alone is not enough.
+    let zero = on
+        .sql("SELECT COUNT(*) AS n FROM vectors WHERE id < -5")
+        .await
+        .unwrap();
+    assert_eq!(count_of(&zero), 0);
+    let all = on
+        .sql("SELECT COUNT(*) AS n FROM vectors WHERE id >= 0")
+        .await
+        .unwrap();
+    let total = on.sql("SELECT COUNT(*) AS n FROM vectors").await.unwrap();
+    assert_eq!(count_of(&all), count_of(&total));
+    assert!(count_of(&total) > 0);
+}
+
+fn vectors_path() -> Option<PathBuf> {
+    let p = PathBuf::from("data/vectors.lance");
+    if !p.exists() {
+        eprintln!("SKIP: data/vectors.lance missing");
+        return None;
+    }
+    Some(p)
+}
+
+/// Pushdown must not change what the Parquet oracle says either.
+#[tokio::test]
+async fn test_pushdown_still_matches_parquet() {
+    if !data_available() {
+        return;
+    }
+    for (_, sql) in PUSHDOWN_CASES {
+        assert_same(sql).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Nested column types (struct / list), the shape real LanceDB tables have.
 //
 // Fixture: `.venv/bin/python scripts/lance_nested_gen.py --out data/nested.lance`
