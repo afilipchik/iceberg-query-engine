@@ -322,6 +322,27 @@
     "file": "agg/empty_result.csv"
   },
   {
+    "id": "agg/empty_scalar_agg",
+    "sql": "SELECT SUM(o_totalprice) AS sum_price,\n       COUNT(*) AS n_rows,\n       COUNT(o_orderkey) AS n_keys,\n       MIN(o_orderdate) AS min_date,\n       MAX(o_totalprice) AS max_price,\n       AVG(o_totalprice) AS avg_price\nFROM orders\nWHERE o_orderkey < 0",
+    "ordered": false,
+    "row_count": 1,
+    "file": "agg/empty_scalar_agg.csv"
+  },
+  {
+    "id": "agg/empty_group_agg",
+    "sql": "SELECT o_orderstatus,\n       SUM(o_totalprice) AS sum_price,\n       COUNT(*) AS n_rows\nFROM orders\nWHERE o_orderkey < 0\nGROUP BY o_orderstatus\nORDER BY o_orderstatus",
+    "ordered": true,
+    "row_count": 0,
+    "file": "agg/empty_group_agg.csv"
+  },
+  {
+    "id": "agg/global_sum_all_null",
+    "sql": "SELECT SUM(o_totalprice) AS sum_price,\n       COUNT(o_orderkey) AS n_matched,\n       COUNT(*) AS n_rows\nFROM customer LEFT JOIN orders\n    ON c_custkey = o_custkey AND o_totalprice > 99999999",
+    "ordered": false,
+    "row_count": 1,
+    "file": "agg/global_sum_all_null.csv"
+  },
+  {
     "id": "agg/null_group_sum_float",
     "sql": "SELECT c_custkey,\n       SUM(o_totalprice) AS sum_price,\n       AVG(o_totalprice) AS avg_price,\n       MIN(o_totalprice) AS min_price,\n       MAX(o_totalprice) AS max_price,\n       COUNT(o_orderkey) AS n_matched\nFROM customer LEFT JOIN orders\n    ON c_custkey = o_custkey AND o_totalprice > 400000\nWHERE c_custkey <= 24\nGROUP BY c_custkey\nORDER BY c_custkey",
     "ordered": true,

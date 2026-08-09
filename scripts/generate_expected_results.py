@@ -782,6 +782,45 @@ GROUP BY n_regionkey
 ORDER BY n_regionkey
 """, True))
 
+    # A GLOBAL (ungrouped) aggregate produces exactly ONE row even when the
+    # input is empty: the set functions are evaluated over the empty multiset,
+    # giving 0 for COUNT and NULL for SUM/MIN/MAX/AVG. Returning zero rows here
+    # is wrong, and it is a different answer from the GROUP BY case below.
+    queries.append(("agg/empty_scalar_agg", """
+SELECT SUM(o_totalprice) AS sum_price,
+       COUNT(*) AS n_rows,
+       COUNT(o_orderkey) AS n_keys,
+       MIN(o_orderdate) AS min_date,
+       MAX(o_totalprice) AS max_price,
+       AVG(o_totalprice) AS avg_price
+FROM orders
+WHERE o_orderkey < 0
+""", False))
+
+    # The GROUP BY twin of the query above: with a grouping clause an empty
+    # input has no grouping sets, so the correct answer is ZERO rows. A "fix"
+    # that always synthesizes a row fails here.
+    queries.append(("agg/empty_group_agg", """
+SELECT o_orderstatus,
+       SUM(o_totalprice) AS sum_price,
+       COUNT(*) AS n_rows
+FROM orders
+WHERE o_orderkey < 0
+GROUP BY o_orderstatus
+ORDER BY o_orderstatus
+""", True))
+
+    # Non-empty input, but no non-NULL value reaches the global SUM: every
+    # customer's orders are rejected by the ON predicate, so the single output
+    # row must carry SUM = NULL with COUNT(*) = 150.
+    queries.append(("agg/global_sum_all_null", """
+SELECT SUM(o_totalprice) AS sum_price,
+       COUNT(o_orderkey) AS n_matched,
+       COUNT(*) AS n_rows
+FROM customer LEFT JOIN orders
+    ON c_custkey = o_custkey AND o_totalprice > 99999999
+""", False))
+
     # SUM over a group whose every row carries NULL in the summed column is
     # NULL, not 0 (SQL:2016 10.9 <set function specification>: SUM ignores
     # NULLs, and over an empty multiset returns the null value). AVG/MIN/MAX

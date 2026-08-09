@@ -2043,6 +2043,14 @@ impl AggregationState {
         if !key.values.is_empty() && !key.values.iter().all(|v| matches!(v, ScalarValue::Null)) {
             return true;
         }
+        // An empty key vector is the GLOBAL (ungrouped) aggregate's single
+        // slot, not a free slot — a grouped key always carries one value per
+        // group column. SQL gives a global aggregate exactly one output row
+        // whatever the input, so this slot is never droppable (the accumulator
+        // probe would drop `SELECT SUM(x) FROM t` when every x is NULL).
+        if key.values.is_empty() && !accs.is_empty() {
+            return true;
+        }
         // Unrecorded key: either a free slot, or a group whose key really is
         // NULL in every column. Fall back to the accumulator probe, which
         // keeps NULL-keyed groups that did see data.
@@ -2623,6 +2631,33 @@ impl AggregationState {
         }
         if let Some(accs) = &self.raw_null {
             all_groups.push((&null_key, accs));
+        }
+
+        // A GLOBAL (ungrouped) aggregate always produces exactly one row, even
+        // over an empty input: SQL evaluates the set functions over the empty
+        // multiset, giving 0 for COUNT and NULL for SUM/MIN/MAX/AVG. (With a
+        // GROUP BY, an empty input correctly produces zero rows — the grouping
+        // set is empty. That asymmetry is why this is keyed on
+        // num_group_cols == 0.) The state never allocated an accumulator
+        // because process_batch was never reached with a non-empty batch, so
+        // synthesize the initial accumulators here.
+        let empty_key = GroupKey { values: vec![] };
+        let empty_accs: Vec<AccumulatorState>;
+        if num_group_cols == 0 && all_groups.is_empty() {
+            empty_accs = self
+                .agg_funcs
+                .iter()
+                .enumerate()
+                .map(|(i, func)| {
+                    let dt = self
+                        .input_types
+                        .get(i)
+                        .cloned()
+                        .unwrap_or(DataType::Float64);
+                    AccumulatorState::new(func, &dt)
+                })
+                .collect();
+            all_groups.push((&empty_key, &empty_accs));
         }
 
         let num_groups = all_groups.len();
