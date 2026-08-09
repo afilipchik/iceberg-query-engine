@@ -12,12 +12,18 @@ use std::sync::Arc;
 
 /// Shared runtime for subquery execution. Created once, reused across all subquery
 /// evaluations. This eliminates the overhead of creating a new runtime per subquery.
+///
+/// This runtime exists to avoid nested-runtime panics (`block_on` inside an async
+/// context). It must be as wide as the main runtime: CTE materialization and
+/// uncorrelated subquery pipelines run *entire* scan/join/aggregate plans here, and
+/// those operators fan out with `tokio::spawn` per partition. A narrow pool
+/// serializes them.
 fn subquery_runtime() -> &'static tokio::runtime::Runtime {
     use std::sync::OnceLock;
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(num_cpus::get().max(2))
             .enable_all()
             .build()
             .expect("Failed to create subquery runtime")
