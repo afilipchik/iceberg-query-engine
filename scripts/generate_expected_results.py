@@ -1044,6 +1044,42 @@ WHERE o_orderstatus = 'F'
 ORDER BY variant
 """, True))
 
+    # An equality is symmetric, so the ON clause may name either input first.
+    # The engine's build/probe key lists are unzipped positionally from the ON
+    # pairs, so a pair written "right = left" used to evaluate one input's key
+    # against the other input's batches. These four pin the reversed spelling
+    # for every join type; each returns exactly what the conventional spelling
+    # returns.
+    queries.append(("join/inner_on_reversed", """
+SELECT COUNT(*) AS n_rows, COUNT(DISTINCT c_custkey) AS n_customers
+FROM orders JOIN customer
+    ON c_custkey = o_custkey
+""", False))
+
+    queries.append(("join/left_on_reversed", """
+SELECT c_custkey, COUNT(o_orderkey) AS c_count, SUM(o_totalprice) AS total
+FROM customer LEFT JOIN orders
+    ON o_custkey = c_custkey AND o_totalprice > 400000
+GROUP BY c_custkey
+ORDER BY c_count, c_custkey
+LIMIT 25
+""", True))
+
+    # The original repro: a RIGHT JOIN whose ON names the RIGHT input first,
+    # with a predicate no row satisfies, so every preserved row is
+    # NULL-extended.
+    queries.append(("join/right_on_reversed", """
+SELECT COUNT(*) AS n_rows, COUNT(o_orderkey) AS n_matched, COUNT(c_custkey) AS n_customers
+FROM orders RIGHT JOIN customer
+    ON c_custkey = o_custkey AND o_orderstatus = 'ZZZ'
+""", False))
+
+    queries.append(("join/full_on_reversed", """
+SELECT COUNT(*) AS n_rows, COUNT(c_custkey) AS n_left, COUNT(o_orderkey) AS n_right
+FROM customer FULL OUTER JOIN orders
+    ON o_custkey = c_custkey AND o_orderstatus = 'F'
+""", False))
+
     # =========================================================================
     # Subqueries (8 queries)
     # =========================================================================

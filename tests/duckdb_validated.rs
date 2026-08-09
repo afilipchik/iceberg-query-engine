@@ -505,6 +505,10 @@ duckdb_validated_test!(validated_join_left_on_both_sides, "join/left_on_both_sid
 duckdb_validated_test!(validated_join_right_on_filter, "join/right_on_filter");
 duckdb_validated_test!(validated_join_full_on_filter, "join/full_on_filter");
 duckdb_validated_test!(validated_join_on_vs_where, "join/on_vs_where");
+duckdb_validated_test!(validated_join_inner_on_reversed, "join/inner_on_reversed");
+duckdb_validated_test!(validated_join_left_on_reversed, "join/left_on_reversed");
+duckdb_validated_test!(validated_join_right_on_reversed, "join/right_on_reversed");
+duckdb_validated_test!(validated_join_full_on_reversed, "join/full_on_reversed");
 
 // Subqueries (8)
 duckdb_validated_test!(validated_subquery_scalar, "subquery/scalar");

@@ -483,6 +483,34 @@
     "file": "join/on_vs_where.csv"
   },
   {
+    "id": "join/inner_on_reversed",
+    "sql": "SELECT COUNT(*) AS n_rows, COUNT(DISTINCT c_custkey) AS n_customers\nFROM orders JOIN customer\n    ON c_custkey = o_custkey",
+    "ordered": false,
+    "row_count": 1,
+    "file": "join/inner_on_reversed.csv"
+  },
+  {
+    "id": "join/left_on_reversed",
+    "sql": "SELECT c_custkey, COUNT(o_orderkey) AS c_count, SUM(o_totalprice) AS total\nFROM customer LEFT JOIN orders\n    ON o_custkey = c_custkey AND o_totalprice > 400000\nGROUP BY c_custkey\nORDER BY c_count, c_custkey\nLIMIT 25",
+    "ordered": true,
+    "row_count": 25,
+    "file": "join/left_on_reversed.csv"
+  },
+  {
+    "id": "join/right_on_reversed",
+    "sql": "SELECT COUNT(*) AS n_rows, COUNT(o_orderkey) AS n_matched, COUNT(c_custkey) AS n_customers\nFROM orders RIGHT JOIN customer\n    ON c_custkey = o_custkey AND o_orderstatus = 'ZZZ'",
+    "ordered": false,
+    "row_count": 1,
+    "file": "join/right_on_reversed.csv"
+  },
+  {
+    "id": "join/full_on_reversed",
+    "sql": "SELECT COUNT(*) AS n_rows, COUNT(c_custkey) AS n_left, COUNT(o_orderkey) AS n_right\nFROM customer FULL OUTER JOIN orders\n    ON o_custkey = c_custkey AND o_orderstatus = 'F'",
+    "ordered": false,
+    "row_count": 1,
+    "file": "join/full_on_reversed.csv"
+  },
+  {
     "id": "subquery/scalar",
     "sql": "SELECT n_name\nFROM nation\nWHERE n_nationkey = (SELECT MIN(n_nationkey) FROM nation WHERE n_regionkey = 0)",
     "ordered": false,

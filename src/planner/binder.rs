@@ -617,6 +617,8 @@ impl<'a> Binder<'a> {
             _ => (vec![], None),
         };
 
+        let (on, filter) = normalize_join_on(on, filter, &left_schema, &right_schema);
+
         let schema = match join_type {
             JoinType::Semi | JoinType::Anti => left_schema,
             _ => combined_schema,
@@ -2798,6 +2800,75 @@ impl<'a> Binder<'a> {
             ))),
         }
     }
+}
+
+/// Which of a join's two inputs an ON-clause expression belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JoinSide {
+    Left,
+    Right,
+}
+
+/// Resolve which input a join key expression belongs to. Returns `None` when
+/// the answer is not unambiguous — the expression is not a bare column, or the
+/// name resolves in both inputs (a self join) or in neither.
+fn join_key_side(expr: &Expr, left: &PlanSchema, right: &PlanSchema) -> Option<JoinSide> {
+    let col = match expr {
+        Expr::Column(c) => c,
+        _ => return None,
+    };
+    match (
+        left.resolve_column(col).is_some(),
+        right.resolve_column(col).is_some(),
+    ) {
+        (true, false) => Some(JoinSide::Left),
+        (false, true) => Some(JoinSide::Right),
+        _ => None,
+    }
+}
+
+/// Orient every ON equi-pair so that `.0` resolves against the join's LEFT
+/// input and `.1` against its RIGHT input.
+///
+/// SQL imposes no order on an equality, so `ON c_custkey = o_custkey` and
+/// `ON o_custkey = c_custkey` are the same query. Everything downstream
+/// assumes the left-then-right order, though: the physical planner unzips the
+/// pairs into build/probe key lists positionally, so a reversed pair made the
+/// join evaluate one input's key expression against the other input's batches
+/// and fail at runtime with "Column not found". Inner joins were re-oriented
+/// as a side effect of JoinReorder, but only when the query actually triggered
+/// reordering, and outer joins were never re-oriented at all.
+///
+/// A pair whose two sides resolve to the SAME input is not an equi-key: it
+/// constrains one input on its own and belongs in the join filter. Pairs whose
+/// sides cannot be classified (ambiguous names in a self join, non-column
+/// expressions) are left exactly as written.
+fn normalize_join_on(
+    on: Vec<(Expr, Expr)>,
+    filter: Option<Expr>,
+    left: &PlanSchema,
+    right: &PlanSchema,
+) -> (Vec<(Expr, Expr)>, Option<Expr>) {
+    let mut normalized = Vec::with_capacity(on.len());
+    let mut demoted: Vec<Expr> = Vec::new();
+
+    for (l, r) in on {
+        match (
+            join_key_side(&l, left, right),
+            join_key_side(&r, left, right),
+        ) {
+            (Some(JoinSide::Left), Some(JoinSide::Right)) => normalized.push((l, r)),
+            (Some(JoinSide::Right), Some(JoinSide::Left)) => normalized.push((r, l)),
+            (Some(a), Some(b)) if a == b => demoted.push(l.eq(r)),
+            _ => normalized.push((l, r)),
+        }
+    }
+
+    let filter = demoted.into_iter().fold(filter, |acc, e| match acc {
+        Some(f) => Some(f.and(e)),
+        None => Some(e),
+    });
+    (normalized, filter)
 }
 
 #[cfg(test)]
