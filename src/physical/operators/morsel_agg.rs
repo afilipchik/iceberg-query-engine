@@ -152,7 +152,7 @@ impl PhysicalOperator for MorselAggregateExec {
         }
 
         // Create the parallel Parquet source with row group pruning
-        let source = ParallelParquetSource::try_new_with_filter(
+        let mut source = ParallelParquetSource::try_new_with_filter(
             self.files.clone(),
             self.input_schema.clone(),
             self.projection.clone(),
@@ -160,6 +160,9 @@ impl PhysicalOperator for MorselAggregateExec {
             self.filter.as_ref(),
         )?
         .with_dict_strings(dict_cols);
+        // Drop filter-only columns from the output projection once the
+        // decoder has taken the filter (see narrowed_projection).
+        self.apply_narrowed_projection(&mut source);
 
         // Determine input types for aggregates
         let plan_schema = crate::planner::PlanSchema::from(source.schema().as_ref());
@@ -308,6 +311,73 @@ enum DenseAgg {
 }
 
 impl MorselAggregateExec {
+    /// Columns the aggregation actually consumes: group keys plus aggregate
+    /// inputs. The scan projection handed down by the planner also contains
+    /// the filter's columns, because the logical scan needs them; but when
+    /// the filter is served by the parquet decoder's RowFilter, those
+    /// columns have already been decoded in the predicate phase and
+    /// re-listing them in the output projection decodes them a SECOND time
+    /// (Q01: l_shipdate over 60M rows, a filter that passes 98% of them).
+    ///
+    /// Returns None when nothing can be dropped, when a referenced column
+    /// cannot be resolved, or when the IPC sidecar cache is on (that path
+    /// applies the filter post-load and therefore needs its columns).
+    fn narrowed_projection(&self) -> Option<Vec<usize>> {
+        if crate::storage::ipc_cache::enabled() {
+            return None;
+        }
+        let mut names: Vec<String> = Vec::new();
+        for g in &self.group_by {
+            crate::physical::morsel::collect_expr_columns(g, &mut names);
+        }
+        for a in &self.aggregates {
+            crate::physical::morsel::collect_expr_columns(&a.input, &mut names);
+        }
+        let mut idxs: Vec<usize> = Vec::new();
+        for n in &names {
+            let i = self
+                .input_schema
+                .fields()
+                .iter()
+                .position(|f| f.name().eq_ignore_ascii_case(n))?;
+            if !idxs.contains(&i) {
+                idxs.push(i);
+            }
+        }
+        if idxs.is_empty() {
+            // COUNT(*) with no grouping: an empty projection would decode no
+            // columns at all — leave the projection alone.
+            return None;
+        }
+        idxs.sort_unstable();
+        match &self.projection {
+            Some(p) => {
+                if idxs.len() >= p.len() || !idxs.iter().all(|i| p.contains(i)) {
+                    None
+                } else {
+                    Some(idxs)
+                }
+            }
+            None => Some(idxs),
+        }
+    }
+
+    /// Narrow `source`'s projection to the columns the aggregation consumes,
+    /// but only once the decoder has taken the filter (or there is none).
+    /// Returns the projection actually in force.
+    fn apply_narrowed_projection(&self, source: &mut ParallelParquetSource) -> Option<Vec<usize>> {
+        if self.filter.is_some() && !source.filter_pushed_down() {
+            return self.projection.clone();
+        }
+        match self.narrowed_projection() {
+            Some(p) => {
+                source.set_projection(Some(p.clone()));
+                Some(p)
+            }
+            None => self.projection.clone(),
+        }
+    }
+
     /// Dense direct-address aggregation. Applies when the group key is one
     /// plain Int64/Int32/Date32 column whose footer min/max span at most
     /// 64M values, and every aggregate is COUNT / SUM / AVG over a plain
@@ -435,7 +505,7 @@ impl MorselAggregateExec {
             })
             .collect();
 
-        let source = ParallelParquetSource::try_new_with_filter(
+        let mut source = ParallelParquetSource::try_new_with_filter(
             self.files.clone(),
             self.input_schema.clone(),
             self.projection.clone(),
@@ -447,9 +517,12 @@ impl MorselAggregateExec {
         if self.filter.is_some() && !source.filter_pushed_down() {
             return Ok(None);
         }
+        // Filter-only columns were already decoded by the RowFilter; do not
+        // decode them again for the output.
+        let eff_projection = self.apply_narrowed_projection(&mut source);
         // Column positions AFTER projection
         let proj_pos = |file_idx: usize| -> Option<usize> {
-            match &self.projection {
+            match &eff_projection {
                 Some(p) => p.iter().position(|&i| i == file_idx),
                 None => Some(file_idx),
             }
@@ -603,7 +676,7 @@ impl MorselAggregateExec {
                 kinds.len(),
                 self.files.len(),
                 num_threads,
-                self.projection,
+                eff_projection,
                 source.filter_pushed_down()
             );
         }

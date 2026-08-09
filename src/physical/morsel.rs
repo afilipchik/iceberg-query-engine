@@ -189,6 +189,15 @@ impl ParallelParquetSource {
         })
     }
 
+    /// Replace the output projection. The work queue, the row-group pruning
+    /// and the RowFilter mask are all derived from the FILE schema and the
+    /// filter, never from the output projection, so this is safe to call
+    /// after construction — callers use it to drop filter-only columns once
+    /// they know the filter is served by the decoder.
+    pub fn set_projection(&mut self, projection: Option<Vec<usize>>) {
+        self.projection = projection;
+    }
+
     /// True when the filter is applied inside the parquet decoder — callers
     /// must not re-apply it.
     /// Request dictionary reads for the given file-schema column indices.
