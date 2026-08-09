@@ -822,6 +822,16 @@ impl JoinReorder {
         }
 
         dp[full as usize]?;
+        if std::env::var("DP_DEBUG").is_ok() {
+            for (s, entry) in dp.iter().enumerate() {
+                if let Some(e) = entry {
+                    eprintln!(
+                        "[dp] memo {:b}: rows={:.0} cost={:.0} split={:b}|{:b}",
+                        s, e.rows, e.cost, e.left, e.right
+                    );
+                }
+            }
+        }
         self.dp_build_plan(full, &dp, relations, edges)
     }
 
@@ -932,6 +942,16 @@ impl JoinReorder {
             _ => return None,
         };
         let cs = stats.column_stats.get(&name)?;
+        // Equality against any literal: NDV-based selectivity needs no
+        // numeric min/max, so it must not sit behind that gate — string
+        // dimension filters (o_orderstatus, n_name, c_mktsegment, p_brand)
+        // otherwise fell to the generic 10% guess. String NDVs come from the
+        // dictionary-page probe in the parquet stats collector.
+        if *op == BinaryOp::Eq && matches!(lit, Expr::Literal(_)) {
+            if let Some(ndv) = cs.ndv_est {
+                return Some((1.0 / ndv.max(1) as f64).clamp(0.0005, 1.0));
+            }
+        }
         let (min, max) = (cs.min_i64? as f64, cs.max_i64? as f64);
         if max <= min {
             return None;

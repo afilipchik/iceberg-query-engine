@@ -98,6 +98,16 @@ impl ParquetTable {
         let mut total_rows: usize = 0;
         let mut total_bytes: u64 = 0;
         let mut cols: HashMap<String, ColAcc> = HashMap::new();
+        // NDV estimates for columns WITHOUT integer min/max stats (strings):
+        // harvested from the dictionary-page value count of the first file's
+        // first row group (a chunk's dictionary holds exactly its distinct
+        // values). Without this, equality filters on string dimension columns
+        // fall to a generic 10% guess — o_orderstatus = 'F' (NDV 3) priced
+        // orders at 1.5M rows instead of 5M and n_name = '...' (NDV 25)
+        // priced nation at 2.5 rows instead of 1, which tied Q21's DP into
+        // orders-first.
+        let mut dict_ndv: HashMap<String, u64> = HashMap::new();
+        let mut first_file_meta: Option<(PathBuf, Arc<ParquetMetaData>)> = None;
 
         for file_path in &self.files {
             let file = File::open(file_path).ok()?;
@@ -147,6 +157,67 @@ impl ParquetTable {
                     }
                 }
             }
+
+            if first_file_meta.is_none() {
+                first_file_meta = Some((file_path.clone(), Arc::clone(builder.metadata())));
+            }
+        }
+
+        // Dictionary-page NDV probe: for string columns (no integer stats),
+        // read just the FIRST page of the column chunk in row group 0 of the
+        // first file — when it is a dictionary page, its value count is the
+        // chunk's exact distinct count (a lower bound for the whole table).
+        // Reuses the already-parsed footer metadata; per column this reads
+        // one dictionary page (capped at the writer's dictionary size limit).
+        if let Some((path, meta)) = &first_file_meta {
+            if meta.num_row_groups() > 0 {
+                use parquet::basic::Type as PhysType;
+                use parquet::column::page::{Page, PageReader};
+                let rg = meta.row_group(0);
+                let want: Vec<(usize, String)> = rg
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| {
+                        // The dictionary page spans [dictionary_page_offset,
+                        // data_page_offset); only read SMALL dictionaries —
+                        // low-cardinality enum-ish columns, the only ones
+                        // where equality selectivity matters. High-cardinality
+                        // dictionaries (comments, clerk ids) cost real
+                        // decompression time for an NDV the 10% default
+                        // already treats conservatively.
+                        c.column_type() == PhysType::BYTE_ARRAY
+                            && c.dictionary_page_offset().map_or(false, |dp| {
+                                let sz = c.data_page_offset().saturating_sub(dp);
+                                sz > 0 && sz <= 65_536
+                            })
+                    })
+                    .map(|(i, c)| (i, c.column_path().parts().join(".").to_lowercase()))
+                    .filter(|(_, n)| cols.get(n).map(|a| !a.has_int_stats).unwrap_or(false))
+                    .collect();
+                if !want.is_empty() {
+                    if let Ok(f) = File::open(path) {
+                        let f = Arc::new(f);
+                        for (i, name) in want {
+                            let ccm = rg.column(i);
+                            if let Ok(mut pages) =
+                                parquet::file::serialized_reader::SerializedPageReader::new(
+                                    Arc::clone(&f),
+                                    ccm,
+                                    rg.num_rows() as usize,
+                                    None,
+                                )
+                            {
+                                if let Ok(Some(Page::DictionaryPage { num_values, .. })) =
+                                    pages.get_next_page()
+                                {
+                                    dict_ndv.insert(name, num_values as u64);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         let column_stats = cols
@@ -164,7 +235,7 @@ impl ParquetTable {
                         _ => None,
                     }
                 } else {
-                    None
+                    dict_ndv.get(&name).copied().filter(|&n| n > 0)
                 };
                 (
                     name,
