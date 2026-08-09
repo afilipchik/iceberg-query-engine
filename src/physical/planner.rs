@@ -427,15 +427,24 @@ impl PhysicalPlanner {
             .filter(|(_, projections)| projections.len() > 1) // Only shared tables
             .filter_map(|(table_name, projections)| {
                 let provider = self.tables.get(table_name)?;
-                if let Some(files) = provider.parquet_files() {
-                    let total: u64 = files
-                        .iter()
-                        .filter_map(|f| std::fs::metadata(f).ok())
-                        .map(|m| m.len())
-                        .sum();
-                    if total > PRESCAN_MAX_BYTES {
-                        return None;
-                    }
+                // Size the table from its files when it is Parquet, else from
+                // provider statistics. Keying this off `parquet_files()` alone
+                // left every non-Parquet provider (e.g. Lance) exempt from the
+                // cap, so a multi-GB shared table would be decoded into the
+                // cache unconditionally. Providers that report neither (e.g.
+                // MemoryTable, already in memory) stay ungated as before.
+                let total_bytes: Option<u64> = match provider.parquet_files() {
+                    Some(files) => Some(
+                        files
+                            .iter()
+                            .filter_map(|f| std::fs::metadata(f).ok())
+                            .map(|m| m.len())
+                            .sum(),
+                    ),
+                    None => provider.statistics().map(|s| s.total_byte_size),
+                };
+                if total_bytes.is_some_and(|total| total > PRESCAN_MAX_BYTES) {
+                    return None;
                 }
                 let proj = Self::union_projection(projections);
                 Some((table_name.clone(), provider.clone(), proj))
@@ -1449,8 +1458,24 @@ impl PhysicalPlanner {
             LogicalPlan::EmptyRelation(node) => {
                 let schema = plan_schema_to_arrow(&node.schema);
                 let batches = if node.produce_one_row {
-                    // Create a single empty row
-                    vec![arrow::record_batch::RecordBatch::new_empty(schema.clone())]
+                    // A table-less SELECT (`SELECT 1`) is one row of no
+                    // columns: the projection above evaluates its expressions
+                    // once against it. RecordBatch::new_empty produced a
+                    // ZERO-row batch, so those queries returned nothing.
+                    // A batch with no columns cannot infer its length, so the
+                    // row count has to be stated explicitly.
+                    let columns: Vec<arrow::array::ArrayRef> = schema
+                        .fields()
+                        .iter()
+                        .map(|f| arrow::array::new_null_array(f.data_type(), 1))
+                        .collect();
+                    let options =
+                        arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(1usize));
+                    vec![arrow::record_batch::RecordBatch::try_new_with_options(
+                        schema.clone(),
+                        columns,
+                        &options,
+                    )?]
                 } else {
                     vec![]
                 };

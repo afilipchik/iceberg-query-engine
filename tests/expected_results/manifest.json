@@ -588,6 +588,20 @@
     "file": "expr/coalesce_nullif.csv"
   },
   {
+    "id": "expr/select_no_from",
+    "sql": "SELECT 1 AS one, 2 + 3 AS five, 'x' AS s, ABS(-7) AS abs7",
+    "ordered": false,
+    "row_count": 1,
+    "file": "expr/select_no_from.csv"
+  },
+  {
+    "id": "expr/null_scalar_subquery",
+    "sql": "SELECT n_name,\n       (SELECT SUM(o_totalprice) FROM orders WHERE o_orderkey < 0) AS null_sum,\n       (SELECT COUNT(*) FROM orders WHERE o_orderkey < 0) AS zero_count\nFROM nation\nORDER BY n_name\nLIMIT 5",
+    "ordered": true,
+    "row_count": 5,
+    "file": "expr/null_scalar_subquery.csv"
+  },
+  {
     "id": "expr/cast",
     "sql": "SELECT\n    CAST(SUM(l_quantity) AS BIGINT) AS total_qty_int,\n    CAST(42 AS DOUBLE) AS int_to_double,\n    CAST(100 AS VARCHAR) AS int_to_str\nFROM lineitem\nWHERE l_orderkey = 1",
     "ordered": false,

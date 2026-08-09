@@ -131,7 +131,31 @@ fn project_batch(
         })
         .collect();
 
-    RecordBatch::try_new(schema.clone(), columns?).map_err(Into::into)
+    // An expression whose VALUE is NULL but whose declared TYPE is not (a
+    // literal NULL, or an uncorrelated scalar subquery precomputed to NULL)
+    // evaluates to an untyped NullArray. RecordBatch::try_new rejects that
+    // against the column's declared type, turning valid SQL into an execution
+    // error; retype it as a typed all-NULL column instead.
+    let columns: Vec<_> = columns?
+        .into_iter()
+        .zip(schema.fields())
+        .map(|(col, field)| {
+            if col.data_type() == &arrow::datatypes::DataType::Null
+                && field.data_type() != &arrow::datatypes::DataType::Null
+            {
+                arrow::array::new_null_array(field.data_type(), col.len())
+            } else {
+                col
+            }
+        })
+        .collect();
+
+    // Row count must be stated explicitly: a projection may legitimately have
+    // no columns (`SELECT COUNT(*)` shapes reduced to nothing), and a batch
+    // with no columns cannot infer its length.
+    let options =
+        arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    RecordBatch::try_new_with_options(schema.clone(), columns, &options).map_err(Into::into)
 }
 
 #[cfg(test)]

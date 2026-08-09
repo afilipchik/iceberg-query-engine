@@ -528,6 +528,11 @@ duckdb_validated_test!(validated_expr_arithmetic, "expr/arithmetic");
 duckdb_validated_test!(validated_expr_case_when, "expr/case_when");
 duckdb_validated_test!(validated_expr_coalesce_nullif, "expr/coalesce_nullif");
 duckdb_validated_test!(validated_expr_cast, "expr/cast");
+duckdb_validated_test!(validated_expr_select_no_from, "expr/select_no_from");
+duckdb_validated_test!(
+    validated_expr_null_scalar_subquery,
+    "expr/null_scalar_subquery"
+);
 duckdb_validated_test!(validated_expr_string_functions, "expr/string_functions");
 duckdb_validated_test!(validated_expr_math_functions, "expr/math_functions");
 duckdb_validated_test!(validated_expr_date_extract, "expr/date_extract");

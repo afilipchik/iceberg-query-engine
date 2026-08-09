@@ -1188,6 +1188,27 @@ FROM nation
 LIMIT 1
 """, False))
 
+    # A SELECT with no FROM evaluates its expressions once and returns exactly
+    # one row. The engine used to plan that as a ZERO-row batch and return
+    # nothing, which is why the rest of this suite works around it with
+    # "FROM nation LIMIT 1".
+    queries.append(("expr/select_no_from", """
+SELECT 1 AS one, 2 + 3 AS five, 'x' AS s, ABS(-7) AS abs7
+""", False))
+
+    # A scalar subquery that evaluates to NULL must produce a typed NULL
+    # column, not an untyped one — the latter fails the output batch's type
+    # check and turns valid SQL into an execution error. The COUNT arm pins
+    # the neighbouring case: an empty aggregate's COUNT is 0, not NULL.
+    queries.append(("expr/null_scalar_subquery", """
+SELECT n_name,
+       (SELECT SUM(o_totalprice) FROM orders WHERE o_orderkey < 0) AS null_sum,
+       (SELECT COUNT(*) FROM orders WHERE o_orderkey < 0) AS zero_count
+FROM nation
+ORDER BY n_name
+LIMIT 5
+""", True))
+
     queries.append(("expr/cast", """
 SELECT
     CAST(SUM(l_quantity) AS BIGINT) AS total_qty_int,
