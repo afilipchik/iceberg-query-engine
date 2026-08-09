@@ -738,8 +738,8 @@ Based on the codebase structure, these appear to be planned but not fully implem
 
 ## TPC-H Benchmark Status (SF=10, 2026-08-08 night, 48G cgroup)
 
-Log: `logs/safe_benchmark_20260808_182449.log`. Spec queries, spec-generator data.
-**22/22 pass; 7.64s total vs native-table DuckDB 2.94s = 2.5x; 22/22 within 10x.**
+Log: `logs/safe_benchmark_20260808_200119.log`. Spec queries, spec-generator data.
+**22/22 pass; 7.51s total vs native-table DuckDB 2.94s = 2.5x; 22/22 within 10x.**
 **Like-for-like (DuckDB reading the SAME parquet via views ~4.1-4.2s) ≈ 1.85x.**
 Recent additions: dimension-mapped semi-join reduction sources, bare-f64 sum
 states, filter-only column pruning in ProjectionPushdown, RT-filter-aware
@@ -751,17 +751,17 @@ comparison; see `.scratch/validate22.py` pattern in memory).
 
 | Query | Engine | vs native | | Query | Engine | vs native |
 |-------|--------|-------|-|-------|--------|-------|
-| Q01 | 375ms | 3.5x | | Q12 | 171ms | 1.9x |
-| Q02 | 136ms | 6.1x | | Q13 | 115ms | **1.1x** |
-| Q03 | 441ms | 5.3x | | Q14 | 180ms | 4.6x |
-| Q04 | 228ms | 4.0x | | Q15 | 279ms | 9.0x |
-| Q05 | 303ms | 6.3x | | Q16 | 222ms | 5.6x |
-| Q06 | 135ms | 5.6x | | Q17 | 289ms | 3.3x |
-| Q07 | 327ms | 4.5x | | Q18 | 520ms | 2.2x |
-| Q08 | 376ms | 5.2x | | Q19 | 157ms | 1.7x |
-| Q09 | 1.37s | **1.0x** | | Q20 | 482ms | 3.0x |
-| Q10 | 430ms | 4.7x | | Q21 | 671ms | 3.1x |
-| Q11 | 132ms | 9.4x | | Q22 | 294ms | 8.6x |
+| Q01 | 352ms | 3.3x | | Q12 | 172ms | 1.9x |
+| Q02 | 128ms | 5.8x | | Q13 | 126ms | **1.2x** |
+| Q03 | 428ms | 5.2x | | Q14 | 211ms | 5.4x |
+| Q04 | 219ms | 3.8x | | Q15 | 275ms | 8.8x |
+| Q05 | 289ms | 6.0x | | Q16 | 237ms | 6.0x |
+| Q06 | 126ms | 5.2x | | Q17 | 289ms | 3.3x |
+| Q07 | 311ms | 4.3x | | Q18 | 523ms | 2.2x |
+| Q08 | 348ms | 4.8x | | Q19 | 144ms | 1.6x |
+| Q09 | 1.38s | **1.1x** | | Q20 | 498ms | 3.1x |
+| Q10 | 433ms | 4.7x | | Q21 | 580ms | 2.7x |
+| Q11 | 138ms | 9.8x | | Q22 | 301ms | 8.8x |
 
 **What got the engine here (2026-08-08)**: mimalloc global allocator (glibc
 free/consolidate stalls cost 550ms on a single aggregate teardown); DPsize CBO
