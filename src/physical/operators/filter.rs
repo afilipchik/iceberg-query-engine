@@ -204,6 +204,26 @@ fn evaluate_expr_internal(
                     return Ok(mask);
                 }
             }
+            // `col LIKE 'const'`: classify the pattern once per batch instead
+            // of re-parsing it per row.
+            if matches!(op, BinaryOp::Like | BinaryOp::NotLike) {
+                if let Expr::Literal(ScalarValue::Utf8(pat)) = &**right {
+                    if let Some(arr) = left_arr.as_any().downcast_ref::<StringArray>() {
+                        let kind = classify_like(pat);
+                        let negate = *op == BinaryOp::NotLike;
+                        let result: BooleanArray = (0..arr.len())
+                            .map(|i| {
+                                if arr.is_null(i) {
+                                    None
+                                } else {
+                                    Some(kind.matches(arr.value(i)) != negate)
+                                }
+                            })
+                            .collect();
+                        return Ok(Arc::new(result));
+                    }
+                }
+            }
             let right_arr = evaluate_expr_internal(batch, right, subquery_executor)?;
             evaluate_binary_op(&left_arr, *op, &right_arr)
         }
@@ -476,20 +496,11 @@ fn dict_literal_mask(
             .map(|i| (!values.is_null(i)).then(|| values.value(i) != lit))
             .collect(),
         BinaryOp::Like | BinaryOp::NotLike => {
-            let lit_arr = StringArray::from(vec![lit; 1]);
-            let mut out = Vec::with_capacity(values.len());
-            for i in 0..values.len() {
-                if values.is_null(i) {
-                    out.push(None);
-                    continue;
-                }
-                let v_arr = StringArray::from(vec![values.value(i); 1]);
-                let m = arrow::compute::kernels::comparison::like(&v_arr, &lit_arr)
-                    .map_err(|e| QueryError::Execution(e.to_string()))?;
-                let hit = m.value(0);
-                out.push(Some(if op == BinaryOp::NotLike { !hit } else { hit }));
-            }
-            out
+            let kind = classify_like(lit);
+            let negate = op == BinaryOp::NotLike;
+            (0..values.len())
+                .map(|i| (!values.is_null(i)).then(|| kind.matches(values.value(i)) != negate))
+                .collect()
         }
         _ => return Ok(None),
     };
@@ -5628,51 +5639,124 @@ fn parse_timezone_offset(tz: &str) -> Option<i64> {
     None
 }
 
+/// Shape of a constant LIKE pattern. Classifying once per batch turns the
+/// overwhelmingly common patterns (`'x%'`, `'%x'`, `'%x%'`, no wildcard) into
+/// a single `str` primitive per row instead of a backtracking scan.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LikeKind<'a> {
+    /// `'%'` / `'%%'` — matches every non-null string.
+    All,
+    /// No wildcards — plain equality.
+    Exact(&'a str),
+    /// `'p%'`
+    Prefix(&'a str),
+    /// `'%s'`
+    Suffix(&'a str),
+    /// `'%m%'`
+    Contains(&'a str),
+    /// Anything else — general backtracking matcher.
+    General(&'a str),
+}
+
+/// Classify a constant LIKE pattern. `%` and `_` are ASCII, and ASCII bytes
+/// never occur inside a multi-byte UTF-8 sequence, so byte scanning is safe.
+pub(crate) fn classify_like(pattern: &str) -> LikeKind<'_> {
+    let bytes = pattern.as_bytes();
+    if bytes.contains(&b'_') {
+        return LikeKind::General(pattern);
+    }
+    let n = bytes.len();
+    let pcts = bytes.iter().filter(|&&b| b == b'%').count();
+    match pcts {
+        0 => LikeKind::Exact(pattern),
+        1 => {
+            if bytes[0] == b'%' {
+                LikeKind::Suffix(&pattern[1..])
+            } else if bytes[n - 1] == b'%' {
+                LikeKind::Prefix(&pattern[..n - 1])
+            } else {
+                LikeKind::General(pattern)
+            }
+        }
+        2 if bytes[0] == b'%' && bytes[n - 1] == b'%' => {
+            if n == 2 {
+                LikeKind::All
+            } else {
+                LikeKind::Contains(&pattern[1..n - 1])
+            }
+        }
+        _ => LikeKind::General(pattern),
+    }
+}
+
+impl LikeKind<'_> {
+    #[inline]
+    pub(crate) fn matches(&self, text: &str) -> bool {
+        match self {
+            LikeKind::All => true,
+            LikeKind::Exact(s) => text == *s,
+            LikeKind::Prefix(s) => text.starts_with(*s),
+            LikeKind::Suffix(s) => text.ends_with(*s),
+            LikeKind::Contains(s) => text.contains(*s),
+            LikeKind::General(p) => like_match(text, p),
+        }
+    }
+}
+
 /// SQL LIKE pattern matching
 /// `%` matches any sequence of characters (including empty)
 /// `_` matches exactly one character
+///
+/// Allocation-free greedy matcher with single-star backtracking (the classic
+/// wildcard algorithm). The previous implementation collected both operands
+/// into `Vec<char>` on every call, so a 2M-row scan did 4M heap allocations;
+/// stack samples showed most LIKE time inside `RawVec::finish_grow`.
 fn like_match(text: &str, pattern: &str) -> bool {
-    let t_chars: Vec<char> = text.chars().collect();
-    let p_chars: Vec<char> = pattern.chars().collect();
+    let mut ti = 0usize; // byte offset into text
+    let mut pi = 0usize; // byte offset into pattern
+    let mut star_pi: Option<usize> = None; // pattern offset of the last '%'
+    let mut star_ti = 0usize; // text offset where that '%' started matching
 
-    like_match_recursive(&t_chars, &p_chars)
-}
-
-fn like_match_recursive(text: &[char], pattern: &[char]) -> bool {
-    if pattern.is_empty() {
-        return text.is_empty();
+    while ti < text.len() {
+        let tc = match text[ti..].chars().next() {
+            Some(c) => c,
+            None => break,
+        };
+        let pc = if pi < pattern.len() {
+            pattern[pi..].chars().next()
+        } else {
+            None
+        };
+        match pc {
+            Some('%') => {
+                star_pi = Some(pi);
+                star_ti = ti;
+                pi += 1;
+            }
+            Some('_') => {
+                ti += tc.len_utf8();
+                pi += 1;
+            }
+            Some(c) if c == tc => {
+                ti += tc.len_utf8();
+                pi += c.len_utf8();
+            }
+            // Mismatch (or pattern exhausted): let the last '%' swallow one
+            // more character and retry from there.
+            _ => match (star_pi, text[star_ti..].chars().next()) {
+                (Some(sp), Some(sc)) => {
+                    star_ti += sc.len_utf8();
+                    ti = star_ti;
+                    pi = sp + 1;
+                }
+                _ => return false,
+            },
+        }
     }
 
-    match pattern[0] {
-        '%' => {
-            // Try matching zero or more characters
-            // First try matching zero characters
-            if like_match_recursive(text, &pattern[1..]) {
-                return true;
-            }
-            // Then try matching one or more characters
-            if !text.is_empty() && like_match_recursive(&text[1..], pattern) {
-                return true;
-            }
-            false
-        }
-        '_' => {
-            // Match exactly one character
-            if text.is_empty() {
-                false
-            } else {
-                like_match_recursive(&text[1..], &pattern[1..])
-            }
-        }
-        c => {
-            // Match exact character
-            if text.is_empty() || text[0] != c {
-                false
-            } else {
-                like_match_recursive(&text[1..], &pattern[1..])
-            }
-        }
-    }
+    // Text consumed: whatever is left of the pattern must match the empty
+    // string, i.e. be all '%'.
+    pattern[pi..].bytes().all(|b| b == b'%')
 }
 
 use chrono::Datelike;
