@@ -736,9 +736,19 @@ Based on the codebase structure, these appear to be planned but not fully implem
   returns `0` instead of `NULL` (`AccumulatorState::Sum` / `raw_sums` carry no
   "seen" bit). Reachable via `LEFT JOIN ... GROUP BY`. Not yet fixed because the
   bare-`(u64, f64)` sum state is a load-bearing optimization.
-- **TPC-H queries are spec-compliant** since commit `d84f3a2` (Q02/Q04/Q14/Q16/Q18/Q19
-  were previously simplified). Remaining data adaptations: Q09/Q20 `'Part 1%'`,
-  Q22 2-digit phone codes.
+- **TPC-H queries are spec-compliant** since commit `d84f3a2` for
+  Q02/Q04/Q14/Q16/Q18/Q19, and since `6c53559` for Q13 — whose ON-clause
+  `o_comment NOT LIKE '%special%requests%'` had been dropped by an earlier
+  "simplified version" note that survived the d84f3a2 sweep. Restoring it
+  exposed four real engine bugs (see `be575fb`), including a wrong TPC-H
+  answer at SF=10 (23 rows instead of 24). **Lesson: a query simplified for
+  convenience is a disabled test.** Any future adaptation must be justified
+  by the DATA (see below), never by engine capability, and the DuckDB oracle
+  in `scripts/generate_expected_results.py` must carry the identical SQL.
+  Remaining data adaptations: Q09/Q20 `'Part 1%'`, Q22 2-digit phone codes.
+  Q13's spec predicate is a no-op on this data (the generator writes a
+  constant `o_comment`), so LEFT-JOIN-ON filter semantics are covered by
+  dedicated tests in `tests/expected_results/join/` instead.
 - **IMPORTANT — data↔CSV coupling**: `tests/expected_results/*.csv` are only valid
   against parquet produced by the current `src/tpch/generator.rs`. If the generator
   changes, regenerate the data AND the CSVs (`scripts/generate_expected_results.py`)
@@ -752,8 +762,10 @@ Based on the codebase structure, these appear to be planned but not fully implem
 
 ## TPC-H Benchmark Status (SF=10, 2026-08-08 night, 48G cgroup)
 
-Log: `logs/safe_benchmark_20260808_200119.log`. Spec queries, spec-generator data.
-**22/22 pass; 7.51s total vs native-table DuckDB 2.94s = 2.5x; 22/22 within 10x.**
+Log: `logs/safe_benchmark_20260808_222629.log`. Spec queries, spec-generator data.
+**22/22 pass; 7.49s total vs native-table DuckDB 2.99s = 2.5x; 22/22 within 10x.**
+(Q13 became spec-compliant 2026-08-08 — it now scans/evaluates `o_comment`,
+so its 126ms→480ms jump is real added work, not a regression.)
 **Like-for-like (DuckDB reading the SAME parquet via views ~4.1-4.2s) ≈ 1.85x.**
 Recent additions: dimension-mapped semi-join reduction sources, bare-f64 sum
 states, filter-only column pruning in ProjectionPushdown, RT-filter-aware
@@ -765,17 +777,17 @@ comparison; see `.scratch/validate22.py` pattern in memory).
 
 | Query | Engine | vs native | | Query | Engine | vs native |
 |-------|--------|-------|-|-------|--------|-------|
-| Q01 | 352ms | 3.3x | | Q12 | 172ms | 1.9x |
-| Q02 | 128ms | 5.8x | | Q13 | 126ms | **1.2x** |
-| Q03 | 428ms | 5.2x | | Q14 | 211ms | 5.4x |
-| Q04 | 219ms | 3.8x | | Q15 | 275ms | 8.8x |
-| Q05 | 289ms | 6.0x | | Q16 | 237ms | 6.0x |
-| Q06 | 126ms | 5.2x | | Q17 | 289ms | 3.3x |
-| Q07 | 311ms | 4.3x | | Q18 | 523ms | 2.2x |
-| Q08 | 348ms | 4.8x | | Q19 | 144ms | 1.6x |
-| Q09 | 1.38s | **1.1x** | | Q20 | 498ms | 3.1x |
-| Q10 | 433ms | 4.7x | | Q21 | 580ms | 2.7x |
-| Q11 | 138ms | 9.8x | | Q22 | 301ms | 8.8x |
+| Q01 | 342ms | 3.2x | | Q12 | 166ms | 1.8x |
+| Q02 | 97ms | 4.6x | | Q13 | 480ms | 4.1x |
+| Q03 | 425ms | 5.3x | | Q14 | 194ms | 5.2x |
+| Q04 | 222ms | 3.8x | | Q15 | 103ms | 3.0x |
+| Q05 | 309ms | 6.4x | | Q16 | 225ms | 5.4x |
+| Q06 | 102ms | 4.2x | | Q17 | 303ms | 3.4x |
+| Q07 | 352ms | 4.8x | | Q18 | 536ms | 2.2x |
+| Q08 | 376ms | 5.4x | | Q19 | 136ms | 1.4x |
+| Q09 | 1.37s | **1.0x** | | Q20 | 482ms | 2.8x |
+| Q10 | 420ms | 4.7x | | Q21 | 575ms | 2.7x |
+| Q11 | 65ms | 4.9x | | Q22 | 213ms | 6.0x |
 
 **What got the engine here (2026-08-08)**: mimalloc global allocator (glibc
 free/consolidate stalls cost 550ms on a single aggregate teardown); DPsize CBO
