@@ -923,8 +923,25 @@ all Lance decode (paid once, reported as `load=`). The engine's Lance times
 DuckDB-over-Arrow is also well off DuckDB's native-table pace (2.99s), so this
 is not DuckDB at its best — it is the honest cost of its Lance interop path.
 
-All 22 queries are **CELL-EXACT** engine/Lance vs DuckDB/Lance
-(`.scratch/validate22_lance.py`), and row counts match the Parquet leg exactly.
+All 22 queries are **CELL-EXACT** engine/Lance vs DuckDB/Lance, and row counts
+match the Parquet leg exactly. Reproduce with the committed scripts:
+
+```bash
+PROTOC=.scratch/tools/protoc/bin/protoc cargo build --release --features lance
+./target/release/query_engine benchmark-lance --path ./data/tpch-10gb-lance \
+    --iterations 1 --save-csv .scratch/lance_csv
+.venv/bin/python scripts/validate_lance.py --lance ./data/tpch-10gb-lance \
+    --csv .scratch/lance_csv --sf 10      # -> ALL 22 CELL-EXACT
+```
+
+Independently re-measured 2026-08-09 on an idle machine (second run, different
+process): engine/Parquet 7.59s, engine/Lance 7.97s (1.05x), DuckDB/Lance 10.80s
+query + 1.09s load. Consistent with the table above; run-to-run spread is ~±3%.
+
+`scripts/duckdb_lance_bench.py` and `scripts/validate_lance.py` both divide
+Q11's HAVING threshold by the scale factor. Without that DuckDB returns 0 rows
+for Q11 while the engine returns 100 — a timing row that looks like a huge
+engine loss but is comparing two different queries.
 
 Per-query, the Lance path **wins on join-heavy queries** (Q02 44 vs 64ms, Q05
 248 vs 345, Q08 268 vs 346, Q10 285 vs 414, Q03 303 vs 386) and **loses on

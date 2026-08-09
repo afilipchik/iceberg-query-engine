@@ -99,6 +99,14 @@ def main() -> int:
     ap.add_argument("--iterations", type=int, default=3)
     ap.add_argument("--threads", type=int, default=16)
     ap.add_argument("--queries", default="", help="comma list, default all 22")
+    ap.add_argument(
+        "--sf",
+        type=float,
+        default=10.0,
+        help="scale factor; Q11's HAVING threshold is spec'd for SF=1 and must "
+        "be divided by SF or DuckDB returns 0 rows while the engine returns 100 "
+        "-- an apples-to-oranges timing row if left unadjusted",
+    )
     ap.add_argument("--save-csv", default="", help="write per-query CSV results here")
     ap.add_argument(
         "--mode",
@@ -110,6 +118,8 @@ def main() -> int:
     args = ap.parse_args()
 
     queries = load_queries()
+    if args.sf != 1.0 and 11 in queries:
+        queries[11] = queries[11].replace("0.0001", str(0.0001 / args.sf))
     want = (
         [int(x) for x in args.queries.split(",") if x.strip()]
         if args.queries
