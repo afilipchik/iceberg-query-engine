@@ -229,6 +229,34 @@ impl ExecutionContext {
         Ok(())
     }
 
+    /// Register a HISTORICAL version of a Lance dataset — time travel.
+    ///
+    /// Lance commits a new manifest on every append, overwrite, delete and
+    /// index build, keeping the old ones, so `version` selects a past snapshot
+    /// of the same path. The table is immutable at that version.
+    ///
+    /// Registering one path twice under two names and two versions is a
+    /// supported way to diff snapshots in a single query:
+    ///
+    /// ```ignore
+    /// ctx.register_lance_version("t_old", "./data/t.lance", 1)?;
+    /// ctx.register_lance("t_new", "./data/t.lance")?;
+    /// ctx.sql("SELECT COUNT(*) FROM t_new WHERE id NOT IN (SELECT id FROM t_old)").await?;
+    /// ```
+    ///
+    /// An unknown version is an error, never a silent fall back to the latest.
+    #[cfg(feature = "lance")]
+    pub fn register_lance_version(
+        &mut self,
+        name: impl Into<String>,
+        path: impl AsRef<Path>,
+        version: u64,
+    ) -> Result<()> {
+        let table = crate::storage::LanceTable::try_new_at_version(path, version)?;
+        self.register_table_provider(name, Arc::new(table));
+        Ok(())
+    }
+
     /// Register a Lance dataset and immediately compute its column statistics.
     ///
     /// Same as [`register_lance`](Self::register_lance) except the statistics

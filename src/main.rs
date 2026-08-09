@@ -128,6 +128,20 @@ enum Commands {
         /// SQL query to execute (if omitted, just loads and shows schema)
         #[arg(short, long)]
         query: Option<String>,
+
+        /// Read a HISTORICAL version instead of the latest (Lance time travel).
+        /// Use `lance-versions` to list them. An unknown version is an error,
+        /// never a silent fall back to the latest.
+        #[arg(long)]
+        version: Option<u64>,
+    },
+
+    /// List the versions of a Lance dataset (requires --features lance)
+    #[cfg(feature = "lance")]
+    LanceVersions {
+        /// Path to a Lance dataset directory (e.g. ./data/orders.lance)
+        #[arg(short, long)]
+        path: PathBuf,
     },
 
     /// Run TPC-H benchmark from Lance datasets (requires --features lance)
@@ -537,13 +551,52 @@ async fn main() {
         }
 
         #[cfg(feature = "lance")]
-        Commands::LoadLance { path, name, query } => {
+        Commands::LanceVersions { path } => {
+            match query_engine::storage::LanceTable::list_versions(&path) {
+                Ok(versions) => {
+                    println!("Lance dataset: {}", path.display());
+                    println!("{} version(s):", versions.len());
+                    let latest = versions.last().map(|(v, _)| *v).unwrap_or(0);
+                    for (v, ts) in &versions {
+                        let marker = if *v == latest { "  <- latest" } else { "" };
+                        println!("  v{:<6} {}{}", v, ts, marker);
+                    }
+                    println!(
+                        "\nRead one with: load-lance --path {} --version <N>",
+                        path.display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        #[cfg(feature = "lance")]
+        Commands::LoadLance {
+            path,
+            name,
+            query,
+            version,
+        } => {
             let start = Instant::now();
             let mut ctx = ExecutionContext::new();
 
-            println!("Loading Lance dataset from: {}", path.display());
+            match version {
+                Some(v) => println!(
+                    "Loading Lance dataset from: {} (version {})",
+                    path.display(),
+                    v
+                ),
+                None => println!("Loading Lance dataset from: {}", path.display()),
+            }
 
-            match ctx.register_lance(&name, &path) {
+            let registered = match version {
+                Some(v) => ctx.register_lance_version(&name, &path, v),
+                None => ctx.register_lance(&name, &path),
+            };
+            match registered {
                 Ok(()) => {
                     println!("Registered table '{}' in {:?}", name, start.elapsed());
 
@@ -901,7 +954,8 @@ async fn handle_dot_command(
             println!("  .tpch <path>           Load all TPC-H tables from directory");
             #[cfg(feature = "lance")]
             {
-                println!("  .lance <path> <name>   Load a Lance dataset as table");
+                println!("  .lance <path> <name> [version]  Load a Lance dataset as table");
+                println!("  .lance-versions <path> List a Lance dataset's versions");
                 println!("  .tpch-lance <path>     Load all TPC-H tables from Lance directory");
             }
             println!("  .mode <format>         Set output format (table, csv, json, vertical)");
@@ -995,14 +1049,48 @@ async fn handle_dot_command(
             }
         }
         #[cfg(feature = "lance")]
+        #[cfg(feature = "lance")]
+        ".lance-versions" => {
+            if parts.len() < 2 {
+                eprintln!("Usage: .lance-versions <path.lance>\n");
+            } else {
+                let path = PathBuf::from(parts[1]);
+                match query_engine::storage::LanceTable::list_versions(&path) {
+                    Ok(versions) => {
+                        let latest = versions.last().map(|(v, _)| *v).unwrap_or(0);
+                        println!("{} version(s) of {}:", versions.len(), path.display());
+                        for (v, ts) in &versions {
+                            let marker = if *v == latest { "  <- latest" } else { "" };
+                            println!("  v{:<6} {}{}", v, ts, marker);
+                        }
+                        println!(
+                            "\nRead one with: .lance {} <name> <version>\n",
+                            path.display()
+                        );
+                    }
+                    Err(e) => eprintln!("Error: {}\n", e),
+                }
+            }
+        }
+        #[cfg(feature = "lance")]
         ".lance" => {
             if parts.len() < 3 {
-                eprintln!("Usage: .lance <path.lance> <table_name>\n");
+                eprintln!("Usage: .lance <path.lance> <table_name> [version]\n");
             } else {
                 let path = PathBuf::from(parts[1]);
                 let name = parts[2];
+                // Optional 4th token is a historical version to time-travel to.
+                let version: Option<u64> = parts.get(3).and_then(|v| v.parse().ok());
+                if parts.len() > 3 && version.is_none() {
+                    eprintln!("Version must be a number, got '{}'\n", parts[3]);
+                    return true;
+                }
                 let start = Instant::now();
-                match ctx.register_lance(name, &path) {
+                let registered = match version {
+                    Some(v) => ctx.register_lance_version(name, &path, v),
+                    None => ctx.register_lance(name, &path),
+                };
+                match registered {
                     Ok(()) => {
                         if let Some(schema) = ctx.table_schema(name) {
                             let columns: Vec<String> =

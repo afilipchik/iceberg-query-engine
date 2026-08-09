@@ -249,7 +249,62 @@ impl LanceTable {
     /// Returns an error naming the offending column if the dataset contains a
     /// type the engine cannot execute over.
     pub fn try_new(path: impl AsRef<Path>) -> Result<Self> {
+        Self::try_new_impl(path.as_ref(), None)
+    }
+
+    /// Open a HISTORICAL version of a Lance dataset — time travel.
+    ///
+    /// Lance is a versioned format: every append, overwrite, delete and index
+    /// build commits a new manifest and leaves the previous ones intact, so an
+    /// older version is a first-class thing to read rather than a backup to
+    /// restore. This is the property that distinguishes it from a directory of
+    /// Parquet files, and reading it costs nothing extra — the old manifest
+    /// points at data files that were never rewritten.
+    ///
+    /// The returned table is immutable at that version: its schema, row count
+    /// and statistics are all the version's own. Registering the same path
+    /// twice under different names and versions is therefore a legitimate way
+    /// to diff two snapshots in one SQL query.
+    pub fn try_new_at_version(path: impl AsRef<Path>, version: u64) -> Result<Self> {
+        Self::try_new_impl(path.as_ref(), Some(version))
+    }
+
+    /// The dataset version this table reads.
+    pub fn version(&self) -> u64 {
+        self.dataset.version().version
+    }
+
+    /// Every version of the dataset at `path`, oldest first.
+    ///
+    /// Returns `(version, RFC-3339 timestamp)`. Reads manifests only; no data
+    /// file is touched.
+    pub fn list_versions(path: impl AsRef<Path>) -> Result<Vec<(u64, String)>> {
         let path = path.as_ref().to_path_buf();
+        if !path.exists() {
+            return Err(QueryError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Lance dataset does not exist: {}", path.display()),
+            )));
+        }
+        let uri = path.to_string_lossy().to_string();
+        block_on_lance(async move {
+            let ds = Dataset::open(&uri)
+                .await
+                .map_err(|e| lance_err(&format!("open {}", uri), e))?;
+            let mut versions = ds
+                .versions()
+                .await
+                .map_err(|e| lance_err("versions", e))?
+                .into_iter()
+                .map(|v| (v.version, v.timestamp.to_rfc3339()))
+                .collect::<Vec<_>>();
+            versions.sort_by_key(|(v, _)| *v);
+            Ok(versions)
+        })
+    }
+
+    fn try_new_impl(path: &Path, version: Option<u64>) -> Result<Self> {
+        let path = path.to_path_buf();
         if !path.exists() {
             return Err(QueryError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -263,6 +318,17 @@ impl LanceTable {
             let ds = Dataset::open(&uri)
                 .await
                 .map_err(|e| lance_err(&format!("open {}", uri), e))?;
+            // Checking out an unknown version must fail loudly. Silently
+            // serving the latest instead would answer a question about history
+            // with today's data, which is the worst possible outcome for a
+            // feature whose entire purpose is to read the past.
+            let ds = match version {
+                None => ds,
+                Some(v) => ds
+                    .checkout_version(v)
+                    .await
+                    .map_err(|e| lance_err(&format!("checkout version {}", v), e))?,
+            };
             let rows = ds
                 .count_rows(None)
                 .await

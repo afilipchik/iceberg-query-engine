@@ -720,6 +720,110 @@ async fn test_union_all_is_allowed_over_nested_columns() {
     assert_eq!(r.row_count, 24);
 }
 
+// ---------------------------------------------------------------------------
+// Versioning and time travel — the property that distinguishes Lance from a
+// directory of Parquet files.
+//
+// Fixture: `.venv/bin/python scripts/lance_versions_gen.py`
+//   v1 create    ids 1..3   3 rows
+//   v2 append    ids 4..5   5 rows
+//   v3 overwrite id 9       1 row
+// The counts 3/5/1 are mutually distinct and v3 is SMALLER than v1, so neither
+// a "reads the latest" nor a "reads the biggest" bug can pass by coincidence.
+// ---------------------------------------------------------------------------
+
+fn versioned_path() -> Option<PathBuf> {
+    let p = PathBuf::from("data/versioned.lance");
+    if !p.exists() {
+        eprintln!("SKIP: data/versioned.lance missing (run scripts/lance_versions_gen.py)");
+        return None;
+    }
+    Some(p)
+}
+
+#[test]
+fn test_list_versions() {
+    let Some(p) = versioned_path() else { return };
+    use query_engine::storage::LanceTable;
+    let versions = LanceTable::list_versions(&p).expect("list_versions");
+    assert_eq!(
+        versions.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "versions must come back ascending and complete"
+    );
+    for (_, ts) in &versions {
+        assert!(ts.contains('T'), "timestamp should be RFC-3339, got {}", ts);
+    }
+}
+
+#[tokio::test]
+async fn test_time_travel_reads_each_version() {
+    let Some(p) = versioned_path() else { return };
+    // 3 rows created, 5 after the append, 1 after the overwrite.
+    for (version, expected) in [(1u64, 3i64), (2, 5), (3, 1)] {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_lance_version("t", &p, version)
+            .unwrap_or_else(|e| panic!("register v{} failed: {}", version, e));
+        let r = ctx
+            .sql("SELECT COUNT(*) AS n FROM t")
+            .await
+            .expect("query failed");
+        assert_eq!(
+            count_of(&r),
+            expected,
+            "version {} should have {} rows",
+            version,
+            expected
+        );
+    }
+
+    // No version means latest, which here is the SMALLEST version — so a reader
+    // that confuses "latest" with "most rows" fails.
+    let mut ctx = ExecutionContext::new();
+    ctx.register_lance("t", &p).expect("register latest");
+    let r = ctx
+        .sql("SELECT COUNT(*) AS n FROM t")
+        .await
+        .expect("query failed");
+    assert_eq!(count_of(&r), 1, "latest is v3, which has 1 row");
+}
+
+#[tokio::test]
+async fn test_two_versions_of_one_path_join_in_one_query() {
+    let Some(p) = versioned_path() else { return };
+    // The point of time travel: diff two snapshots. v2 has ids 1..5, v1 has
+    // 1..3, so the rows added between them are exactly {4, 5}.
+    let mut ctx = ExecutionContext::new();
+    ctx.register_lance_version("t_v1", &p, 1).expect("v1");
+    ctx.register_lance_version("t_v2", &p, 2).expect("v2");
+    let r = ctx
+        .sql("SELECT id FROM t_v2 WHERE id NOT IN (SELECT id FROM t_v1) ORDER BY id")
+        .await
+        .expect("cross-version query failed");
+    assert_eq!(to_cells(&r.batches), vec!["4".to_string(), "5".to_string()]);
+}
+
+#[test]
+fn test_version_accessor_reports_the_checked_out_version() {
+    let Some(p) = versioned_path() else { return };
+    use query_engine::storage::LanceTable;
+    assert_eq!(LanceTable::try_new_at_version(&p, 1).unwrap().version(), 1);
+    assert_eq!(LanceTable::try_new_at_version(&p, 2).unwrap().version(), 2);
+    assert_eq!(LanceTable::try_new(&p).unwrap().version(), 3);
+}
+
+/// An unknown version must FAIL. Silently serving the latest instead would
+/// answer a question about the past with today's data — the worst possible
+/// outcome for a feature whose whole purpose is reading history.
+#[test]
+fn test_unknown_version_is_an_error_not_a_fallback() {
+    let Some(p) = versioned_path() else { return };
+    use query_engine::storage::LanceTable;
+    let err = LanceTable::try_new_at_version(&p, 999).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("999"), "error must name the version: {}", msg);
+}
+
 #[test]
 fn test_missing_dataset_is_a_clean_error() {
     let mut ctx = ExecutionContext::new();
