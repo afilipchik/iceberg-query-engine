@@ -85,7 +85,7 @@
   },
   {
     "id": "tpch/q13",
-    "sql": "SELECT\n    c_count,\n    COUNT(*) AS custdist\nFROM (\n    SELECT\n        c_custkey,\n        COUNT(o_orderkey) AS c_count\n    FROM\n        customer\n        LEFT OUTER JOIN orders ON c_custkey = o_custkey\n    GROUP BY\n        c_custkey\n) AS c_orders\nGROUP BY\n    c_count\nORDER BY\n    custdist DESC,\n    c_count DESC\nLIMIT 100",
+    "sql": "SELECT\n    c_count,\n    COUNT(*) AS custdist\nFROM (\n    SELECT\n        c_custkey,\n        COUNT(o_orderkey) AS c_count\n    FROM\n        customer\n        LEFT OUTER JOIN orders ON c_custkey = o_custkey\n            AND o_comment NOT LIKE '%special%requests%'\n    GROUP BY\n        c_custkey\n) AS c_orders\nGROUP BY\n    c_count\nORDER BY\n    custdist DESC,\n    c_count DESC\nLIMIT 100",
     "ordered": true,
     "row_count": 12,
     "file": "tpch/q13.csv"

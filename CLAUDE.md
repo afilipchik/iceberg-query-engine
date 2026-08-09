@@ -57,36 +57,39 @@ When running benchmarks:
 1. Use timeout = 10 × DuckDB time for that query
 2. If the query cannot complete within 10x DuckDB time, it **FAILS**
 3. Reference DuckDB times from the benchmark table below
-4. These times were measured 2026-08-07 on the **spec-compliant queries**
+4. These times were measured 2026-08-08 on the **spec-compliant queries**
    and **spec-generator data** via `scripts/duckdb_rebaseline.py`
    (native DuckDB tables, 16 threads, best of 3). Re-run that script and
    update this table AND `scripts/safe_benchmark.sh` whenever the queries
    or the data generator change.
+   Q13 rose 99 -> 115ms when its spec ON-clause `NOT LIKE` was restored
+   (2026-08-08); numbers measured against the old simplified Q13 are not
+   comparable to current ones.
 
 | Query | DuckDB Time (SF=10) | Timeout |
 |-------|---------------------|---------|
-| Q01 | 105ms | 1.1s |
-| Q02 | 22ms | 220ms |
-| Q03 | 82ms | 820ms |
-| Q04 | 57ms | 570ms |
+| Q01 | 106ms | 1.1s |
+| Q02 | 21ms | 210ms |
+| Q03 | 80ms | 800ms |
+| Q04 | 58ms | 580ms |
 | Q05 | 48ms | 480ms |
 | Q06 | 24ms | 240ms |
 | Q07 | 72ms | 720ms |
-| Q08 | 71ms | 710ms |
-| Q09 | 1249ms | 12.5s |
-| Q10 | 91ms | 910ms |
-| Q11 | 14ms | 140ms |
-| Q12 | 87ms | 870ms |
-| Q13 | 99ms | 990ms |
-| Q14 | 39ms | 390ms |
-| Q15 | 31ms | 310ms |
-| Q16 | 39ms | 390ms |
-| Q17 | 87ms | 870ms |
-| Q18 | 232ms | 2.3s |
-| Q19 | 88ms | 880ms |
-| Q20 | 160ms | 1.6s |
-| Q21 | 213ms | 2.1s |
-| Q22 | 34ms | 340ms |
+| Q08 | 69ms | 690ms |
+| Q09 | 1277ms | 12.8s |
+| Q10 | 88ms | 880ms |
+| Q11 | 13ms | 130ms |
+| Q12 | 89ms | 890ms |
+| Q13 | 115ms | 1.1s |
+| Q14 | 37ms | 370ms |
+| Q15 | 34ms | 340ms |
+| Q16 | 41ms | 410ms |
+| Q17 | 88ms | 880ms |
+| Q18 | 235ms | 2.4s |
+| Q19 | 91ms | 910ms |
+| Q20 | 167ms | 1.7s |
+| Q21 | 207ms | 2.1s |
+| Q22 | 35ms | 350ms |
 
 ---
 
