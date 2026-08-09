@@ -484,25 +484,53 @@ impl PhysicalPlanner {
             return Ok(());
         }
 
-        // Collect the first SubqueryAlias node for each CTE that needs materialization
-        let mut cte_plans: HashMap<String, &LogicalPlan> = HashMap::new();
-        Self::collect_cte_plans(logical, &cte_counts, &mut cte_plans);
+        // Collect every SubqueryAlias node for each CTE that needs materialization.
+        let mut cte_candidates: HashMap<String, Vec<&LogicalPlan>> = HashMap::new();
+        Self::collect_cte_plans(logical, &cte_counts, &mut cte_candidates);
+
+        // All copies of one CTE compute the same ROWS (PredicatePushdown treats
+        // a named CTE as a materialization boundary and never pushes a
+        // consumer's predicate inside), but they are not equally optimized: a
+        // copy that lives inside a subquery EXPRESSION is never reached by
+        // ProjectionPushdown, so its scan still reads every column of the
+        // table. Materialize the widest output schema — so every consumer
+        // finds its columns in the shared result — and break ties with
+        // traversal order, which visits the main plan tree before expressions.
+        let cte_plans: HashMap<String, &LogicalPlan> = cte_candidates
+            .iter()
+            .filter_map(|(name, cands)| {
+                let max_fields = cands.iter().map(|p| p.schema().fields().len()).max()?;
+                let best = cands
+                    .iter()
+                    .find(|p| p.schema().fields().len() == max_fields)?;
+                Some((name.clone(), *best))
+            })
+            .collect();
 
         for (name, plan) in &cte_plans {
             if std::env::var("CTE_DEBUG").is_ok() {
                 eprintln!(
-                    "[cte] materializing {} from node: {}",
+                    "[cte] materializing {} ({} candidates) from node: {}",
                     name,
+                    cte_candidates.get(name).map(|c| c.len()).unwrap_or(0),
                     &format!("{}", plan).lines().next().unwrap_or("?")
                 );
             }
+            let t0 = std::time::Instant::now();
             let physical = self.create_physical_plan_inner(plan)?;
             let schema = physical.schema();
             let batches: Vec<arrow::record_batch::RecordBatch> = run_subquery_plan(physical)?;
             // Use a hash of the CTE name as the key
             let key = Self::cte_name_key(name);
             if std::env::var("CTE_DEBUG").is_ok() {
-                eprintln!("[cte] materialized {} (key {})", name, key);
+                let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                eprintln!(
+                    "[cte] materialized {} (key {}) in {:?} -> {} rows",
+                    name,
+                    key,
+                    t0.elapsed(),
+                    rows
+                );
             }
             self.cte_cache.lock().insert(key, (schema, batches));
         }
@@ -588,28 +616,29 @@ impl PhysicalPlanner {
     fn collect_cte_plans<'a>(
         plan: &'a LogicalPlan,
         needed: &HashMap<String, usize>,
-        plans: &mut HashMap<String, &'a LogicalPlan>,
+        plans: &mut HashMap<String, Vec<&'a LogicalPlan>>,
     ) {
         match plan {
             LogicalPlan::SubqueryAlias(node) => {
                 if let Some(ref cte_name) = node.cte_name {
-                    if needed.get(cte_name).copied().unwrap_or(0) >= 2
-                        && !plans.contains_key(cte_name)
-                    {
-                        plans.insert(cte_name.clone(), &node.input);
+                    if needed.get(cte_name).copied().unwrap_or(0) >= 2 {
+                        plans.entry(cte_name.clone()).or_default().push(&node.input);
                     }
                 }
                 Self::collect_cte_plans(&node.input, needed, plans);
             }
+            // Plan inputs are visited BEFORE subquery expressions: copies of a
+            // CTE that sit in the main tree have been through the full
+            // optimizer, copies nested in an expression have not.
             LogicalPlan::Filter(node) => {
-                Self::collect_cte_plans_in_expr(&node.predicate, needed, plans);
                 Self::collect_cte_plans(&node.input, needed, plans);
+                Self::collect_cte_plans_in_expr(&node.predicate, needed, plans);
             }
             LogicalPlan::Project(node) => {
+                Self::collect_cte_plans(&node.input, needed, plans);
                 for expr in &node.exprs {
                     Self::collect_cte_plans_in_expr(expr, needed, plans);
                 }
-                Self::collect_cte_plans(&node.input, needed, plans);
             }
             _ => {
                 for child in plan.children() {
@@ -622,7 +651,7 @@ impl PhysicalPlanner {
     fn collect_cte_plans_in_expr<'a>(
         expr: &'a Expr,
         needed: &HashMap<String, usize>,
-        plans: &mut HashMap<String, &'a LogicalPlan>,
+        plans: &mut HashMap<String, Vec<&'a LogicalPlan>>,
     ) {
         match expr {
             Expr::ScalarSubquery(plan) => Self::collect_cte_plans(plan, needed, plans),

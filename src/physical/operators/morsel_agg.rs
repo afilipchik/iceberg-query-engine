@@ -458,6 +458,8 @@ impl MorselAggregateExec {
             return Ok(None);
         };
 
+        let timing = std::env::var("AGG_TIMING").is_ok();
+        let t0 = std::time::Instant::now();
         let num_threads = rayon::current_num_threads();
         let results: Vec<Result<()>> = (0..num_threads)
             .into_par_iter()
@@ -592,6 +594,20 @@ impl MorselAggregateExec {
         for r in results {
             r?;
         }
+        if timing {
+            eprintln!(
+                "[AGG_TIMING] dense-direct scan+accumulate: {:?} (key={}, width={}, aggs={}, files={}, threads={}, projection={:?}, filter_pushed={})",
+                t0.elapsed(),
+                key_name,
+                width,
+                kinds.len(),
+                self.files.len(),
+                num_threads,
+                self.projection,
+                source.filter_pushed_down()
+            );
+        }
+        let t1 = std::time::Instant::now();
 
         // Parallel bitmap walk -> output batches per chunk of the key space
         let key_dt = self.schema.field(0).data_type().clone();
@@ -675,6 +691,14 @@ impl MorselAggregateExec {
 
         if let Some(pred) = &self.post_filter {
             batches = crate::physical::operators::filter_batches(batches, pred)?;
+        }
+        if timing {
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            eprintln!(
+                "[AGG_TIMING] dense-direct output: {:?} ({} rows)",
+                t1.elapsed(),
+                rows
+            );
         }
         Ok(Some(Box::pin(stream::iter(batches.into_iter().map(Ok)))))
     }
