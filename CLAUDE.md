@@ -1027,6 +1027,26 @@ serialized on an idle machine:
 | pylance IVF_PQ refine=10 (reference) | 3.1 ms | — | — |
 | pylance flat / exact (reference) | 38.6 ms | 1.000 | — |
 
+**Independently re-verified** (`scripts/verify_vector_search.py`, which drives
+the engine BINARY rather than a library call):
+
+| path | distance-exact@10 | id-recall@10 | category precision@10 |
+|---|---|---|---|
+| engine exact | **1.000** | 0.990 | **1.000** |
+| indexed, refine=10 | 0.700 | 0.920 | 1.000 |
+
+**SCORE VECTOR RESULTS BY DISTANCE, NOT BY ROW ID.** This corpus is
+template-generated, so many rows share identical text and therefore identical
+embeddings. For query 0, **eleven rows fall within the 10th-place distance** and
+the exact top-10 contains only **nine distinct distances**. The top-k *set* is
+genuinely ambiguous and rank order among equal distances is arbitrary, so
+comparing returned ids against ground-truth ids reports failures that are not
+failures: it scored the (provably correct) exact path at 0.990 recall and 0.200
+"rank-exact". The correct gate is DISTANCE-MULTISET equality — "are the returned
+rows as close as the best possible k", which is what the SQL actually asks. By
+that gate the exact path is 1.000, and the indexed path's 0.700 is a real,
+tie-independent difference.
+
 **Recall never reaches 1.0 at any refine factor.** 21x faster is a real prize,
 but silently answering `ORDER BY distance LIMIT 10` from an index that drops
 about one true neighbour in ten is a correctness regression dressed as an
