@@ -125,46 +125,56 @@ fn is_scalar_type(dt: &DataType) -> bool {
     )
 }
 
+/// How deep a nested type may nest before the reader refuses it.
+///
+/// A bound exists so a pathological (or hand-crafted) schema cannot drive the
+/// recursion below into a stack overflow. Eight levels is far past anything a
+/// real LanceDB table carries.
+const MAX_NEST_DEPTH: usize = 8;
+
 /// Reject Lance column types the engine's execution operators cannot evaluate.
 ///
 /// Failing at registration with a named column beats coercing silently and
 /// producing wrong answers, or panicking deep inside an operator at run time.
 ///
-/// # Why `FixedSizeList` is now accepted
+/// # The rule: scalars are *evaluated*, nested values are *carried*
 ///
-/// `FixedSizeList<Float32, N>` is how Lance stores vector embeddings, and it is
-/// the single most important column type a LanceDB user has. It is accepted as
-/// an *opaque carried value*: it can be scanned, projected, aliased, LIMITed and
-/// fed to the vector-distance functions (`l2_distance`, `cosine_distance`,
-/// `dot_product`). It deliberately cannot be summed, grouped by, compared with
-/// `=`/`<`, or sorted — those still fail loudly, naming the column, via
-/// `crate::planner::vector_types`. Carrying a value the engine cannot order is
-/// safe; pretending it has an order is not.
+/// A scalar column can be compared, summed, hashed and sorted. A nested column
+/// — a vector, a list, a struct, a map — is accepted as an **opaque carried
+/// value**: it can be scanned, projected, aliased, UNION'd and LIMITed, and a
+/// vector can additionally be fed to the distance functions. It deliberately
+/// cannot be summed, grouped by, compared with `=`/`<`, or sorted; those fail
+/// loudly, naming the column, via `crate::planner::vector_types`. Carrying a
+/// value the engine cannot order is safe; pretending it has an order is not.
+///
+/// `FixedSizeList<Float32, N>` is how Lance stores embeddings and is the single
+/// most important column type a LanceDB user has. `Struct` is the second: real
+/// tables routinely carry a metadata blob next to their vector. Both are read
+/// here as long as every *leaf* underneath them is a type the engine knows.
 fn unsupported_reason(dt: &DataType) -> Option<String> {
+    // Half-precision floats are carryable *inside* a vector — Lance stores fp16
+    // embeddings and the distance kernels widen them — but the engine has no
+    // fp16 scalar kernels, so a bare fp16 column is rejected rather than
+    // silently mis-evaluated by a path that assumes f32/f64.
+    if matches!(dt, DataType::Float16) {
+        return Some("half-precision float column (no fp16 scalar kernels)".to_string());
+    }
+    carried_reason(dt, 0)
+}
+
+/// Reason `dt` cannot be carried through the engine, or `None` if it can.
+///
+/// Recursive, so a struct of lists of structs is judged by its leaves: the
+/// engine never interprets the nesting, only the scalar types at the bottom
+/// (which have to round-trip through Arrow kernels during concat/take/filter).
+fn carried_reason(dt: &DataType, depth: usize) -> Option<String> {
+    if depth > MAX_NEST_DEPTH {
+        return Some(format!("nesting deeper than {} levels", MAX_NEST_DEPTH));
+    }
+    if is_scalar_type(dt) {
+        return None;
+    }
     match dt {
-        DataType::Boolean
-        | DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::UInt8
-        | DataType::UInt16
-        | DataType::UInt32
-        | DataType::UInt64
-        | DataType::Float32
-        | DataType::Float64
-        | DataType::Utf8
-        | DataType::LargeUtf8
-        | DataType::Binary
-        | DataType::LargeBinary
-        | DataType::FixedSizeBinary(_)
-        | DataType::Date32
-        | DataType::Date64
-        | DataType::Time32(_)
-        | DataType::Time64(_)
-        | DataType::Timestamp(_, _)
-        | DataType::Decimal128(_, _)
-        | DataType::Null => None,
         DataType::Dictionary(key, value) => {
             // Dictionary-encoded strings flow through the engine's string paths.
             match (key.as_ref(), value.as_ref()) {
@@ -175,30 +185,20 @@ fn unsupported_reason(dt: &DataType) -> Option<String> {
                 _ => Some(format!("dictionary type {:?}", dt)),
             }
         }
-        // Vector / embedding columns. Carried opaquely; see the doc comment.
-        DataType::FixedSizeList(field, width) => {
-            if is_scalar_type(field.data_type()) {
-                None
-            } else {
-                Some(format!(
-                    "fixed-size list[{}] of nested element type {:?}",
-                    width,
-                    field.data_type()
-                ))
-            }
-        }
+        DataType::FixedSizeList(field, width) => carried_reason(field.data_type(), depth + 1)
+            .map(|r| format!("fixed-size list[{}] element: {}", width, r)),
         DataType::List(field) | DataType::LargeList(field) => {
-            if is_scalar_type(field.data_type()) {
-                None
-            } else {
-                Some(format!(
-                    "list of nested element type {:?}",
-                    field.data_type()
-                ))
-            }
+            carried_reason(field.data_type(), depth + 1).map(|r| format!("list element: {}", r))
         }
-        DataType::Struct(_) => Some("struct columns (no nested type support)".to_string()),
-        DataType::Map(_, _) => Some("map columns (no nested type support)".to_string()),
+        DataType::Struct(fields) => fields.iter().find_map(|f| {
+            carried_reason(f.data_type(), depth + 1)
+                .map(|r| format!("struct field `{}`: {}", f.name(), r))
+        }),
+        // A Map is physically a list of key/value structs; judging the entry
+        // struct covers both halves in one recursion.
+        DataType::Map(entry, _) => {
+            carried_reason(entry.data_type(), depth + 1).map(|r| format!("map entry: {}", r))
+        }
         other => Some(format!("column type {:?}", other)),
     }
 }
@@ -902,11 +902,86 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_of_nested_still_rejected() {
+    fn test_struct_and_list_are_accepted() {
         use arrow::datatypes::Field;
-        let inner = DataType::Struct(vec![Field::new("a", DataType::Int32, true)].into());
-        let dt = DataType::FixedSizeList(Arc::new(Field::new("item", inner, true)), 4);
-        assert!(unsupported_reason(&dt).is_some());
-        assert!(unsupported_reason(&DataType::Struct(Default::default())).is_some());
+        // A metadata blob: the second most common column on a real LanceDB
+        // table after the embedding itself.
+        let meta = DataType::Struct(
+            vec![
+                Field::new("source", DataType::Utf8, true),
+                Field::new("score", DataType::Float64, true),
+            ]
+            .into(),
+        );
+        assert!(unsupported_reason(&meta).is_none(), "{:?}", meta);
+
+        // Struct of list of struct: nesting is judged by its leaves.
+        let deep = DataType::Struct(
+            vec![Field::new(
+                "items",
+                DataType::List(Arc::new(Field::new("item", meta.clone(), true))),
+                true,
+            )]
+            .into(),
+        );
+        assert!(unsupported_reason(&deep).is_none(), "{:?}", deep);
+
+        // A struct holding a vector, which is exactly how some LanceDB tables
+        // group an embedding with its model name.
+        let with_vec = DataType::Struct(
+            vec![Field::new(
+                "emb",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 384),
+                true,
+            )]
+            .into(),
+        );
+        assert!(unsupported_reason(&with_vec).is_none());
+    }
+
+    #[test]
+    fn test_unreadable_leaf_is_reported_with_its_path() {
+        use arrow::datatypes::Field;
+        // Duration has no engine kernels; the message must locate it.
+        let bad = DataType::Struct(
+            vec![Field::new(
+                "d",
+                DataType::Duration(arrow::datatypes::TimeUnit::Second),
+                true,
+            )]
+            .into(),
+        );
+        let reason = unsupported_reason(&bad).expect("must be rejected");
+        assert!(reason.contains('d'), "{}", reason);
+        assert!(reason.contains("Duration"), "{}", reason);
+
+        // Same leaf, one list deeper: the path prefix accumulates.
+        let nested = DataType::List(Arc::new(Field::new("item", bad, true)));
+        let reason = unsupported_reason(&nested).expect("must be rejected");
+        assert!(reason.contains("list element"), "{}", reason);
+        assert!(reason.contains("struct field"), "{}", reason);
+    }
+
+    #[test]
+    fn test_bare_fp16_column_rejected_but_fp16_vector_accepted() {
+        use arrow::datatypes::Field;
+        // The engine has no fp16 scalar kernels...
+        assert!(unsupported_reason(&DataType::Float16).is_some());
+        // ...but fp16 embeddings are a real Lance layout and are carried.
+        let v = DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float16, true)), 768);
+        assert!(unsupported_reason(&v).is_none());
+    }
+
+    #[test]
+    fn test_recursion_is_bounded() {
+        use arrow::datatypes::Field;
+        let mut dt = DataType::Int32;
+        for _ in 0..(MAX_NEST_DEPTH + 3) {
+            dt = DataType::List(Arc::new(Field::new("item", dt, true)));
+        }
+        assert!(
+            unsupported_reason(&dt).is_some_and(|r| r.contains("nesting deeper")),
+            "pathological nesting must be refused, not recursed into"
+        );
     }
 }

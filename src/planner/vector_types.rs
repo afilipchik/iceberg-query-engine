@@ -52,11 +52,21 @@ impl std::fmt::Display for VectorMetric {
     }
 }
 
-/// True for the nested types the engine carries opaquely (vectors and lists).
+/// True for the nested types the engine carries opaquely.
+///
+/// Vectors, lists, structs and maps all share one property that matters to the
+/// planner: they have no scalar value, therefore no ordering, no sum and no
+/// hashable equality the user would recognize. Every one of them must be
+/// refused wherever the SQL demands a scalar, and every one of them is fine to
+/// select, project, alias and LIMIT.
 pub fn is_opaque_nested(dt: &DataType) -> bool {
     matches!(
         dt,
-        DataType::FixedSizeList(_, _) | DataType::List(_) | DataType::LargeList(_)
+        DataType::FixedSizeList(_, _)
+            | DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::Struct(_)
+            | DataType::Map(_, _)
     )
 }
 
@@ -101,29 +111,93 @@ fn first_column_name(expr: &Expr) -> Option<String> {
     }
 }
 
+/// Short, user-facing rendering of a nested type.
+///
+/// Arrow's `Debug` for a struct is ~80 characters of `Field { name: .., dict_id:
+/// 0, .. }` per field, which buries the answer in an error message. This prints
+/// what the user wrote in their schema.
+pub fn describe_type(dt: &DataType) -> String {
+    describe(dt)
+}
+
 fn describe(dt: &DataType) -> String {
     match dt {
         DataType::FixedSizeList(f, w) => format!("vector({} x {})", w, f.data_type()),
         DataType::List(f) | DataType::LargeList(f) => format!("array of {}", f.data_type()),
+        DataType::Struct(fields) => format!(
+            "struct<{}>",
+            fields
+                .iter()
+                .map(|f| format!("{}: {}", f.name(), f.data_type()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        DataType::Map(_, _) => "map".to_string(),
         other => format!("{:?}", other),
     }
 }
 
-/// Reject an expression whose value is a vector/array where a scalar is required.
+/// What the user can actually do with a value of this type, appended to the
+/// rejection so the error is a next step rather than a dead end.
+fn remedy(dt: &DataType) -> &'static str {
+    match dt {
+        DataType::FixedSizeList(_, _) => {
+            "Vector columns can be selected and passed to l2_distance / \
+             cosine_distance / dot_product, but they have no ordering and no \
+             sum. Use a distance function to reduce it to a number first."
+        }
+        DataType::Struct(_) | DataType::Map(_, _) => {
+            "Struct and map columns are carried as opaque values: they can be \
+             selected, projected and aliased, but the engine cannot order, \
+             group or aggregate them, and field access (`col.field`) is not \
+             implemented. Project the scalar columns you need instead."
+        }
+        _ => {
+            "Array columns are carried as opaque values: they can be selected, \
+             projected and aliased, but they have no ordering and no sum."
+        }
+    }
+}
+
+/// Reject an expression whose value is nested where a scalar is required.
 ///
 /// `context` names the SQL construct ("GROUP BY", "ORDER BY", "SUM", "=") and
 /// goes into the message verbatim.
 pub fn require_scalar(expr: &Expr, schema: &PlanSchema, context: &str) -> Result<()> {
     if let Some((name, dt)) = nested_operand_name(expr, schema) {
         return Err(QueryError::Type(format!(
-            "{} is not supported on column `{}` of type {}. \
-             Vector columns can be selected and passed to l2_distance / \
-             cosine_distance / dot_product, but they have no ordering and no \
-             sum. Use a distance function to reduce it to a number first.",
+            "{} is not supported on column `{}` of type {}. {}",
             context,
             name,
-            describe(&dt)
+            describe(&dt),
+            remedy(&dt)
         )));
+    }
+    Ok(())
+}
+
+/// Reject a plan whose *entire output row* is used as a grouping key when one
+/// of its columns is nested.
+///
+/// `DISTINCT` and set-operation `UNION`/`INTERSECT`/`EXCEPT` are planned as
+/// "group by every output column", which never passes through the expression
+/// guards above — the columns are implicit, so there is no `Expr` to check.
+/// Without this, a struct column reaches the hash aggregate's group-key
+/// extractor, which returns a null key for a type it does not know: *every row
+/// collapses into one group* before the output builder eventually errors with a
+/// message that names a type but not a column. Refuse up front instead, naming
+/// the column and the construct.
+pub fn require_scalar_row(schema: &PlanSchema, context: &str) -> Result<()> {
+    for field in schema.fields() {
+        if is_opaque_nested(&field.data_type) {
+            return Err(QueryError::Type(format!(
+                "{} is not supported on column `{}` of type {}. {}",
+                context,
+                field.name,
+                describe(&field.data_type),
+                remedy(&field.data_type)
+            )));
+        }
     }
     Ok(())
 }

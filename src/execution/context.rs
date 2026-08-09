@@ -514,22 +514,82 @@ fn summarize_vector_columns(batch: &RecordBatch) -> RecordBatch {
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap_or_else(|_| batch.clone())
 }
 
+/// Render one nested cell as a short, human-readable string for the printed
+/// result table.
+///
+/// Uses Arrow's own value formatter for the leaves rather than a hand-rolled
+/// per-type match: this runs on display output only, so correctness of the
+/// rendering matters more than speed, and Arrow already knows how to print
+/// every leaf type the reader accepts. Vectors are truncated to a head plus a
+/// dimension; structs print all their fields, since a struct is a handful of
+/// named values rather than a thousand anonymous ones.
 fn summarize_nested_cell(col: &arrow::array::ArrayRef, row: usize) -> String {
-    use arrow::array::{Array, FixedSizeListArray, Float32Array};
+    use arrow::array::{Array, FixedSizeListArray, LargeListArray, ListArray, StructArray};
     use arrow::datatypes::DataType;
+    use arrow::util::display::{ArrayFormatter, FormatOptions};
 
-    if let DataType::FixedSizeList(_, dim) = col.data_type() {
-        if let Some(list) = col.as_any().downcast_ref::<FixedSizeListArray>() {
-            let child = list.value(row);
-            if let Some(f) = child.as_any().downcast_ref::<Float32Array>() {
-                let head: Vec<String> = (0..f.len().min(3))
-                    .map(|i| format!("{:.4}", f.value(i)))
-                    .collect();
-                return format!("[{}, ...] ({}d)", head.join(", "), dim);
-            }
+    const HEAD: usize = 3;
+
+    fn leaf(arr: &arrow::array::ArrayRef, i: usize) -> String {
+        let opts = FormatOptions::default().with_null("NULL");
+        match ArrayFormatter::try_new(arr.as_ref(), &opts) {
+            Ok(f) => f.value(i).to_string(),
+            Err(_) => format!("<{}>", arr.data_type()),
         }
     }
-    format!("<{}>", col.data_type())
+
+    // Recurse one level so a struct containing a vector still gets truncated.
+    fn cell(arr: &arrow::array::ArrayRef, i: usize, depth: usize) -> String {
+        if arr.is_null(i) {
+            return "NULL".to_string();
+        }
+        if depth > 2 {
+            return leaf(arr, i);
+        }
+        match arr.data_type() {
+            DataType::Struct(fields) => {
+                let Some(s) = arr.as_any().downcast_ref::<StructArray>() else {
+                    return leaf(arr, i);
+                };
+                let body: Vec<String> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(c, f)| format!("{}: {}", f.name(), cell(s.column(c), i, depth + 1)))
+                    .collect();
+                format!("{{{}}}", body.join(", "))
+            }
+            DataType::FixedSizeList(_, _) | DataType::List(_) | DataType::LargeList(_) => {
+                let child = match arr.data_type() {
+                    DataType::FixedSizeList(_, _) => arr
+                        .as_any()
+                        .downcast_ref::<FixedSizeListArray>()
+                        .map(|a| a.value(i)),
+                    DataType::List(_) => {
+                        arr.as_any().downcast_ref::<ListArray>().map(|a| a.value(i))
+                    }
+                    _ => arr
+                        .as_any()
+                        .downcast_ref::<LargeListArray>()
+                        .map(|a| a.value(i)),
+                };
+                let Some(child) = child else {
+                    return leaf(arr, i);
+                };
+                let n = child.len();
+                let head: Vec<String> = (0..n.min(HEAD))
+                    .map(|k| cell(&child, k, depth + 1))
+                    .collect();
+                if n > HEAD {
+                    format!("[{}, ...] ({})", head.join(", "), n)
+                } else {
+                    format!("[{}]", head.join(", "))
+                }
+            }
+            _ => leaf(arr, i),
+        }
+    }
+
+    cell(col, row, 0)
 }
 
 /// Format bytes into human-readable string

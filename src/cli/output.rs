@@ -440,12 +440,16 @@ impl OutputFormatter {
                     value.to_string()
                 }
             }
-            // Vector / array columns. A 384-float embedding printed in full
-            // makes a result table unreadable and a CSV unusable, so show the
-            // head and the dimension: `[0.011, -0.043, ... ] (384)`.
-            DataType::FixedSizeList(_, _) | DataType::List(_) | DataType::LargeList(_) => {
-                format_nested_value(array, row)
-            }
+            // Vector / array / struct / map columns. A 384-float embedding
+            // printed in full makes a result table unreadable and a CSV
+            // unusable, so show the head and the dimension:
+            // `[0.011, -0.043, ...] (384)`. Structs render as
+            // `{field: value, ...}`.
+            DataType::FixedSizeList(_, _)
+            | DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::Struct(_)
+            | DataType::Map(_, _) => format_nested_value(array, row),
             _ => {
                 // Fallback: use Arrow's display
                 format!("{:?}", array.as_ref())
@@ -454,15 +458,65 @@ impl OutputFormatter {
     }
 }
 
-/// Render one row of a list/vector column compactly.
+/// Render one row of a nested (list / vector / struct / map) column compactly.
 ///
 /// Full contents are never printed: an embedding is 384-1536 numbers and would
-/// swamp every other column. The dimension is included so the value is still
-/// self-describing.
+/// swamp every other column. The element count is included so a truncated value
+/// is still self-describing. Structs print every field — a struct is a handful
+/// of named fields, not a thousand anonymous numbers — but each field value
+/// recurses through here, so a struct holding a vector is still summarized.
 fn format_nested_value(array: &ArrayRef, row: usize) -> String {
-    use arrow::array::{FixedSizeListArray, LargeListArray, ListArray};
+    use arrow::array::{FixedSizeListArray, LargeListArray, ListArray, MapArray, StructArray};
 
     const HEAD: usize = 4;
+
+    let formatter = OutputFormatter::new(OutputFormat::Table);
+
+    // Structs are keyed, so render `{name: value}` rather than a bare list.
+    if let DataType::Struct(fields) = array.data_type() {
+        let a = array
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("checked by data_type");
+        let body: Vec<String> = fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                format!(
+                    "{}: {}",
+                    f.name(),
+                    formatter.format_display_value(a.column(i), row)
+                )
+            })
+            .collect();
+        return format!("{{{}}}", body.join(", "));
+    }
+
+    // A Map row is a list of key/value structs; render it as `{k: v, ...}`.
+    if let DataType::Map(_, _) = array.data_type() {
+        let a = array
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("checked by data_type");
+        let entries = a.value(row);
+        let n = entries.len();
+        let keys = entries.column(0).clone();
+        let vals = entries.column(1).clone();
+        let body: Vec<String> = (0..n.min(HEAD))
+            .map(|i| {
+                format!(
+                    "{}: {}",
+                    formatter.format_display_value(&keys, i),
+                    formatter.format_display_value(&vals, i)
+                )
+            })
+            .collect();
+        return if n > HEAD {
+            format!("{{{}, ...}} ({})", body.join(", "), n)
+        } else {
+            format!("{{{}}}", body.join(", "))
+        };
+    }
 
     let child: ArrayRef = match array.data_type() {
         DataType::FixedSizeList(_, _) => {
@@ -490,7 +544,6 @@ fn format_nested_value(array: &ArrayRef, row: usize) -> String {
     };
 
     let n = child.len();
-    let formatter = OutputFormatter::new(OutputFormat::Table);
     let head: Vec<String> = (0..n.min(HEAD))
         .map(|i| formatter.format_display_value(&child, i))
         .collect();

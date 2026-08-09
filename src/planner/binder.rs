@@ -227,6 +227,12 @@ impl<'a> Binder<'a> {
                         let schema = left_plan.schema();
                         // UNION ALL keeps duplicates, plain UNION removes them
                         let all = matches!(set_quantifier, ast::SetQuantifier::All);
+                        // Plain UNION de-duplicates on every column, which a
+                        // nested column cannot do; UNION ALL just concatenates
+                        // and is fine.
+                        if !all {
+                            crate::planner::vector_types::require_scalar_row(&schema, "UNION")?;
+                        }
                         Ok(LogicalPlan::Union(crate::planner::UnionNode {
                             inputs: vec![Arc::new(left_plan), Arc::new(right_plan)],
                             schema,
@@ -237,6 +243,12 @@ impl<'a> Binder<'a> {
                         // INTERSECT is implemented as a semi-join on all columns
                         let left_schema = left_plan.schema();
                         let right_schema = right_plan.schema();
+                        // Every column becomes a join key, and a nested value
+                        // has no hashable equality.
+                        crate::planner::vector_types::require_scalar_row(
+                            &left_schema,
+                            "INTERSECT",
+                        )?;
 
                         // Create join conditions on all columns
                         let on: Vec<(Expr, Expr)> = left_schema
@@ -274,6 +286,7 @@ impl<'a> Binder<'a> {
                         // EXCEPT is implemented as an anti-join on all columns
                         let left_schema = left_plan.schema();
                         let right_schema = right_plan.schema();
+                        crate::planner::vector_types::require_scalar_row(&left_schema, "EXCEPT")?;
 
                         // Create join conditions on all columns
                         let on: Vec<(Expr, Expr)> = left_schema
@@ -464,6 +477,12 @@ impl<'a> Binder<'a> {
         if let Some(distinct) = &select.distinct {
             match distinct {
                 ast::Distinct::Distinct => {
+                    // DISTINCT is planned as "group by every output column", so
+                    // the columns are implicit and never reach the per-expression
+                    // guards. `SELECT DISTINCT *` over a table with a struct
+                    // column would otherwise hash a group key the aggregate does
+                    // not understand.
+                    crate::planner::vector_types::require_scalar_row(&plan.schema(), "DISTINCT")?;
                     plan = LogicalPlan::Distinct(DistinctNode {
                         input: Arc::new(plan),
                     });
@@ -1224,6 +1243,33 @@ impl<'a> Binder<'a> {
                 Ok(Expr::Column(Column::new(name.clone())))
             }
             SqlExpr::CompoundIdentifier(idents) => {
+                // `a.b` is overwhelmingly `table.column`, but over a Lance (or
+                // any nested) table it may be struct field access. Those look
+                // identical to the parser, so disambiguate against the schema:
+                // if `a` is itself a nested column here, the user asked for a
+                // field and deserves to be told that field access is missing
+                // rather than "column a.b not found", which points at the wrong
+                // thing entirely.
+                if let Some(head) = idents.first() {
+                    if let Some((_, f)) = schema.resolve_column(&Column::new(head.value.clone())) {
+                        if crate::planner::vector_types::is_opaque_nested(&f.data_type) {
+                            return Err(QueryError::NotImplemented(format!(
+                                "field access `{}` is not implemented: column `{}` has nested \
+                                 type {}, and the engine carries nested values opaquely \
+                                 (selectable and projectable, but not decomposable). Select the \
+                                 whole column instead, or flatten the field when writing the \
+                                 dataset.",
+                                idents
+                                    .iter()
+                                    .map(|i| i.value.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("."),
+                                head.value,
+                                crate::planner::vector_types::describe_type(&f.data_type)
+                            )));
+                        }
+                    }
+                }
                 if idents.len() == 2 {
                     let table = &idents[0].value;
                     let column = &idents[1].value;
@@ -3105,8 +3151,25 @@ fn extend_projection_for_sort(
             // error path reports it rather than silently dropping the sort key.
             return Ok((LogicalPlan::Project(project), None));
         };
+        // `ORDER BY <nested column not in the SELECT list>` is the one shape
         extra_exprs.push(Expr::Column(col.clone()));
         extra_fields.push(field.clone());
+    }
+
+    // `ORDER BY <nested column not in the SELECT list>` is the one shape that
+    // escapes the guard in `bind_order_by`: there the sort key does not resolve
+    // against the *projected* schema, so `require_scalar` cannot see its type
+    // and silently passes. The input schema resolves it, so this is the first
+    // place the type is visible. Without this, `SELECT id FROM t ORDER BY
+    // struct_col` sorts by a value with no ordering and returns an arbitrary
+    // row order that looks like a real answer.
+    //
+    // The check is on the sort key EXPRESSION, not on the columns it mentions:
+    // `ORDER BY cosine_distance(embedding, [...])` names a vector column but
+    // produces a float, and is the single most important query this engine
+    // serves. Only the expression's result type decides.
+    for sort in order_by {
+        crate::planner::vector_types::require_scalar(&sort.expr, &input_schema, "ORDER BY")?;
     }
 
     let original_schema = project.schema.clone();
