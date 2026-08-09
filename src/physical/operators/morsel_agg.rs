@@ -165,7 +165,8 @@ impl PhysicalOperator for MorselAggregateExec {
         self.apply_narrowed_projection(&mut source);
 
         // Determine input types for aggregates
-        let plan_schema = crate::planner::PlanSchema::from(source.schema().as_ref());
+        let plan_schema =
+            crate::planner::PlanSchema::from_qualified_arrow(source.schema().as_ref());
         let input_types: Vec<DataType> = self
             .aggregates
             .iter()
@@ -417,7 +418,8 @@ impl MorselAggregateExec {
         // Aggregate kinds: inputs are arbitrary expressions evaluated per
         // batch (Q15 sums l_extendedprice * (1 - l_discount)); the value
         // type comes from the plan schema.
-        let plan_schema = crate::planner::PlanSchema::from(self.input_schema.as_ref());
+        let plan_schema =
+            crate::planner::PlanSchema::from_qualified_arrow(self.input_schema.as_ref());
         let mut kinds: Vec<(DenseAgg, Option<Expr>)> = Vec::new();
         for a in &self.aggregates {
             if a.distinct || a.second_arg.is_some() {

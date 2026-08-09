@@ -707,7 +707,8 @@ impl SpillableHashAggregateExec {
         use crate::planner::AggregateFunction;
         use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
-        let plan_schema = crate::planner::PlanSchema::from(self.input.schema().as_ref());
+        let plan_schema =
+            crate::planner::PlanSchema::from_qualified_arrow(self.input.schema().as_ref());
         let input_types: Vec<arrow::datatypes::DataType> = self
             .aggregates
             .iter()
@@ -719,7 +720,6 @@ impl SpillableHashAggregateExec {
             .collect();
         let agg_funcs: Vec<AggregateFunction> = self.aggregates.iter().map(|a| a.func).collect();
         let agg_inputs: Vec<Expr> = self.aggregates.iter().map(|a| a.input.clone()).collect();
-
         let timing = std::env::var("AGG_TIMING").is_ok();
         let t_start = std::time::Instant::now();
         let busy_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));

@@ -622,8 +622,13 @@ fn hash_scalar_value<H: Hasher>(value: &ScalarValue, state: &mut H) {
 #[derive(Clone, Debug)]
 pub(crate) enum AccumulatorState {
     Count(i64),
-    Sum(f64),
-    SumInt(i64),
+    /// SUM over a floating input. The bool is the "saw a non-NULL input"
+    /// flag: SQL says SUM over a set with no non-NULL values is NULL, not 0,
+    /// so the running total alone cannot be finalized (a real sum of 0.0 and
+    /// an empty sum are indistinguishable otherwise).
+    Sum(f64, bool),
+    /// SUM over an integer input; same NULL semantics as `Sum`.
+    SumInt(i64, bool),
     Avg {
         sum: f64,
         count: i64,
@@ -651,9 +656,9 @@ impl AccumulatorState {
             }
             AggregateFunction::Sum => match input_type {
                 DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                    AccumulatorState::SumInt(0)
+                    AccumulatorState::SumInt(0, false)
                 }
-                _ => AccumulatorState::Sum(0.0),
+                _ => AccumulatorState::Sum(0.0, false),
             },
             AggregateFunction::Avg => AccumulatorState::Avg { sum: 0.0, count: 0 },
             AggregateFunction::Min => AccumulatorState::Min(None),
@@ -685,14 +690,16 @@ impl AccumulatorState {
                     *c += 1;
                 }
             }
-            AccumulatorState::Sum(s) => {
+            AccumulatorState::Sum(s, seen) => {
                 if let Some(v) = scalar_to_f64(value) {
                     *s += v;
+                    *seen = true;
                 }
             }
-            AccumulatorState::SumInt(s) => {
+            AccumulatorState::SumInt(s, seen) => {
                 if let Some(v) = scalar_to_i64(value) {
                     *s += v;
+                    *seen = true;
                 }
             }
             AccumulatorState::Avg { sum, count } => {
@@ -758,8 +765,14 @@ impl AccumulatorState {
     fn update_f64(&mut self, value: f64) {
         match self {
             AccumulatorState::Count(c) => *c += 1,
-            AccumulatorState::Sum(s) => *s += value,
-            AccumulatorState::SumInt(s) => *s += value as i64,
+            AccumulatorState::Sum(s, seen) => {
+                *s += value;
+                *seen = true;
+            }
+            AccumulatorState::SumInt(s, seen) => {
+                *s += value as i64;
+                *seen = true;
+            }
             AccumulatorState::Avg { sum, count } => {
                 *sum += value;
                 *count += 1;
@@ -814,8 +827,14 @@ impl AccumulatorState {
     fn update_i64(&mut self, value: i64) {
         match self {
             AccumulatorState::Count(c) => *c += 1,
-            AccumulatorState::Sum(s) => *s += value as f64,
-            AccumulatorState::SumInt(s) => *s += value,
+            AccumulatorState::Sum(s, seen) => {
+                *s += value as f64;
+                *seen = true;
+            }
+            AccumulatorState::SumInt(s, seen) => {
+                *s += value;
+                *seen = true;
+            }
             AccumulatorState::Avg { sum, count } => {
                 *sum += value as f64;
                 *count += 1;
@@ -877,8 +896,14 @@ impl AccumulatorState {
     fn merge(&mut self, other: &AccumulatorState) {
         match (self, other) {
             (AccumulatorState::Count(a), AccumulatorState::Count(b)) => *a += b,
-            (AccumulatorState::Sum(a), AccumulatorState::Sum(b)) => *a += b,
-            (AccumulatorState::SumInt(a), AccumulatorState::SumInt(b)) => *a += b,
+            (AccumulatorState::Sum(a, sa), AccumulatorState::Sum(b, sb)) => {
+                *a += b;
+                *sa |= *sb;
+            }
+            (AccumulatorState::SumInt(a, sa), AccumulatorState::SumInt(b, sb)) => {
+                *a += b;
+                *sa |= *sb;
+            }
             (
                 AccumulatorState::Avg { sum: s1, count: c1 },
                 AccumulatorState::Avg { sum: s2, count: c2 },
@@ -958,8 +983,21 @@ impl AccumulatorState {
     fn finalize(&self, func: &AggregateFunction) -> ScalarValue {
         match self {
             AccumulatorState::Count(c) => ScalarValue::Int64(*c),
-            AccumulatorState::Sum(s) => ScalarValue::Float64(ordered_float::OrderedFloat(*s)),
-            AccumulatorState::SumInt(s) => ScalarValue::Int64(*s),
+            // SUM over zero non-NULL inputs is NULL (SQL:2016 10.9 / DuckDB).
+            AccumulatorState::Sum(s, seen) => {
+                if *seen {
+                    ScalarValue::Float64(ordered_float::OrderedFloat(*s))
+                } else {
+                    ScalarValue::Null
+                }
+            }
+            AccumulatorState::SumInt(s, seen) => {
+                if *seen {
+                    ScalarValue::Int64(*s)
+                } else {
+                    ScalarValue::Null
+                }
+            }
             AccumulatorState::Avg { sum, count } => {
                 if *count == 0 {
                     ScalarValue::Null
@@ -1647,9 +1685,9 @@ impl AggregationState {
                     let mut table: Vec<u16> = vec![u16::MAX; table_size];
                     let keys0 = dicts[0].keys().values();
                     let keys1 = dicts.get(1).map(|d| d.keys().values());
-                    let all_f64_inputs = agg_accessors
-                        .iter()
-                        .all(|a| matches!(a, TypedArrayAccessor::Float64(_)));
+                    let all_f64_inputs = agg_accessors.iter().all(
+                        |a| matches!(a, TypedArrayAccessor::Float64(arr) if arr.null_count() == 0),
+                    );
                     let f64_slices: Option<Vec<&[f64]>> = if all_f64_inputs {
                         Some(
                             agg_accessors
@@ -1702,10 +1740,15 @@ impl AggregationState {
                 }
             }
             // Perfect hash fast path
-            // Check if all aggregate inputs are f64 for the fastest possible path
+            // Check if all aggregate inputs are f64 for the fastest possible path.
+            // The slice load below reads arr.values() directly, which holds
+            // arbitrary bytes under a NULL slot — so this path is only valid
+            // for NULL-free inputs. A NULL-extended outer-join column reaches
+            // here with real nulls, and counting those rows both corrupts the
+            // total and marks the group as having seen data.
             let all_f64_inputs = agg_accessors
                 .iter()
-                .all(|a| matches!(a, TypedArrayAccessor::Float64(_)));
+                .all(|a| matches!(a, TypedArrayAccessor::Float64(arr) if arr.null_count() == 0));
 
             if all_f64_inputs && !agg_accessors.is_empty() {
                 // Ultra-fast path: pre-extract f64 slices and group key raw arrays
@@ -1824,10 +1867,16 @@ impl AggregationState {
 
                 // Bare-f64 fast path: exactly [Sum] over a Float64 input keeps
                 // groups as (u64, f64) map entries — no per-group heap box.
+                // Requires a NULL-free input column: a bare f64 cannot encode
+                // "this group saw no non-NULL value", which SQL finalizes as
+                // NULL rather than 0. With nulls present the batch falls back
+                // to the boxed Sum(f64, seen) accumulator, so every raw_sums
+                // entry is a group that provably saw data.
                 let use_raw_sums = self.agg_funcs.len() == 1
                     && matches!(self.agg_funcs[0], AggregateFunction::Sum)
                     && matches!(self.input_types.first(), Some(DataType::Float64))
-                    && matches!(agg_accessors[0], TypedArrayAccessor::Float64(_));
+                    && matches!(&agg_accessors[0],
+                        TypedArrayAccessor::Float64(a) if a.null_count() == 0);
 
                 let mut row = start_row;
                 while row < end_row {
@@ -2002,8 +2051,8 @@ impl AggregationState {
         }
         accs.iter().any(|a| match a {
             AccumulatorState::Count(c) => *c > 0,
-            AccumulatorState::Sum(s) => *s != 0.0,
-            AccumulatorState::SumInt(s) => *s != 0,
+            AccumulatorState::Sum(_, seen) => *seen,
+            AccumulatorState::SumInt(_, seen) => *seen,
             AccumulatorState::Avg { count, .. } => *count > 0,
             AccumulatorState::Min(v) => v.is_some(),
             AccumulatorState::Max(v) => v.is_some(),
@@ -2050,6 +2099,9 @@ impl AggregationState {
     /// Fold the bare-f64 sum groups back into boxed raw_groups entries. Used
     /// by every consumer that doesn't understand raw_sums, so the fast
     /// representation can never silently drop groups.
+    ///
+    /// Every raw_sums entry is by construction a group that saw at least one
+    /// non-NULL input (see `use_raw_sums`), so the demoted state is `seen`.
     pub(crate) fn demote_raw_sums(&mut self) {
         if self.raw_sums.is_empty() {
             return;
@@ -2057,12 +2109,13 @@ impl AggregationState {
         for (k, v) in self.raw_sums.drain() {
             match self.raw_groups.entry(k) {
                 hashbrown::hash_map::Entry::Occupied(mut e) => {
-                    if let AccumulatorState::Sum(s) = &mut e.get_mut()[0] {
+                    if let AccumulatorState::Sum(s, seen) = &mut e.get_mut()[0] {
                         *s += v;
+                        *seen = true;
                     }
                 }
                 hashbrown::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(vec![AccumulatorState::Sum(v)]);
+                    slot.insert(vec![AccumulatorState::Sum(v, true)]);
                 }
             }
         }
@@ -2070,17 +2123,19 @@ impl AggregationState {
 
     /// Inverse of demote_raw_sums: absorb boxed raw_groups (the pre-overflow
     /// perfect-hash residue) into the bare-f64 map. Returns false (leaving
-    /// state unchanged) if any accumulator isn't a plain Sum.
+    /// state unchanged) if any accumulator isn't a plain Sum that already saw
+    /// a non-NULL value — a bare f64 cannot represent "SUM is NULL", so a
+    /// group that has only seen NULLs must stay boxed.
     fn absorb_raw_groups_into_sums(&mut self) -> bool {
         if self
             .raw_groups
             .values()
-            .any(|accs| accs.len() != 1 || !matches!(accs[0], AccumulatorState::Sum(_)))
+            .any(|accs| accs.len() != 1 || !matches!(accs[0], AccumulatorState::Sum(_, true)))
         {
             return false;
         }
         for (k, accs) in self.raw_groups.drain() {
-            if let AccumulatorState::Sum(s) = accs[0] {
+            if let AccumulatorState::Sum(s, _) = accs[0] {
                 *self.raw_sums.entry(k).or_insert(0.0) += s;
             }
         }
@@ -2356,12 +2411,13 @@ impl AggregationState {
         for (raw, v) in &other.raw_sums {
             match self.raw_groups.entry(*raw) {
                 hashbrown::hash_map::Entry::Occupied(mut e) => {
-                    if let AccumulatorState::Sum(s) = &mut e.get_mut()[0] {
+                    if let AccumulatorState::Sum(s, seen) = &mut e.get_mut()[0] {
                         *s += v;
+                        *seen = true;
                     }
                 }
                 hashbrown::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(vec![AccumulatorState::Sum(*v)]);
+                    slot.insert(vec![AccumulatorState::Sum(*v, true)]);
                 }
             }
         }
@@ -2945,7 +3001,7 @@ pub fn execute_morsel_aggregation(
     let input_schema = source.schema();
 
     // Determine input types for aggregates
-    let plan_schema = crate::planner::PlanSchema::from(input_schema.as_ref());
+    let plan_schema = crate::planner::PlanSchema::from_qualified_arrow(input_schema.as_ref());
     let input_types: Vec<DataType> = agg_input_exprs
         .iter()
         .map(|e| e.data_type(&plan_schema).unwrap_or(DataType::Float64))

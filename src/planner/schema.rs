@@ -185,6 +185,37 @@ impl PlanSchema {
         Self::new(fields)
     }
 
+    /// Build a PlanSchema from an EXECUTION-time Arrow schema whose field
+    /// names may already be qualified ("orders.o_orderkey").
+    ///
+    /// `From<&ArrowSchema>` keeps the whole string as the field name, so an
+    /// UNQUALIFIED column reference (`o_orderkey`) does not resolve against
+    /// it. Type-inference call sites swallow that failure with a default
+    /// type, which silently changes results: an integer SUM inferred as
+    /// Float64 finalizes to a Float64 scalar that the Int64 output builder
+    /// then writes as NULL. Splitting the qualifier off makes both
+    /// `o_orderkey` and `orders.o_orderkey` resolve, and is strictly more
+    /// permissive than the unsplit form (duplicate bare names stay ambiguous
+    /// and resolve exactly as before).
+    pub fn from_qualified_arrow(schema: &ArrowSchema) -> Self {
+        let fields: Vec<SchemaField> = schema
+            .fields()
+            .iter()
+            .map(|f| {
+                let name = f.name();
+                let field = match name.split_once('.') {
+                    Some((rel, col)) if !rel.is_empty() && !col.is_empty() => {
+                        SchemaField::new(col.to_string(), f.data_type().clone())
+                            .with_relation(rel.to_string())
+                    }
+                    _ => SchemaField::new(name.clone(), f.data_type().clone()),
+                };
+                field.with_nullable(f.is_nullable())
+            })
+            .collect();
+        Self::new(fields)
+    }
+
     /// Project specific columns
     pub fn project(&self, indices: &[usize]) -> Self {
         let fields: Vec<SchemaField> = indices

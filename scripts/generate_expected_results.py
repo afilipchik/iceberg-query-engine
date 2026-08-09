@@ -782,6 +782,54 @@ GROUP BY n_regionkey
 ORDER BY n_regionkey
 """, True))
 
+    # SUM over a group whose every row carries NULL in the summed column is
+    # NULL, not 0 (SQL:2016 10.9 <set function specification>: SUM ignores
+    # NULLs, and over an empty multiset returns the null value). AVG/MIN/MAX
+    # are NULL for the same reason; COUNT is 0. A LEFT JOIN whose ON predicate
+    # rejects every match for a key is the natural producer of such a group.
+    queries.append(("agg/null_group_sum_float", """
+SELECT c_custkey,
+       SUM(o_totalprice) AS sum_price,
+       AVG(o_totalprice) AS avg_price,
+       MIN(o_totalprice) AS min_price,
+       MAX(o_totalprice) AS max_price,
+       COUNT(o_orderkey) AS n_matched
+FROM customer LEFT JOIN orders
+    ON c_custkey = o_custkey AND o_totalprice > 400000
+WHERE c_custkey <= 24
+GROUP BY c_custkey
+ORDER BY c_custkey
+""", True))
+
+    # Same, over an INTEGER input: SUM's integer accumulator needs its own
+    # "saw a non-NULL value" flag, distinct from the float one.
+    queries.append(("agg/null_group_sum_int", """
+SELECT c_custkey,
+       SUM(o_orderkey) AS sum_orderkey,
+       COUNT(o_orderkey) AS n_matched
+FROM customer LEFT JOIN orders
+    ON c_custkey = o_custkey AND o_totalprice > 400000
+WHERE c_custkey <= 24
+GROUP BY c_custkey
+ORDER BY c_custkey
+""", True))
+
+    # Distinguishes "SUM is NULL" from "SUM is 0": matched groups sum to
+    # exactly 0.0/0 here, unmatched groups are NULL. Any implementation that
+    # infers emptiness from the running total (sum == 0 => no data) collapses
+    # these two and fails.
+    queries.append(("agg/null_group_sum_vs_zero", """
+SELECT c_custkey,
+       SUM(o_totalprice * 0) AS zero_sum_float,
+       SUM(o_orderkey - o_orderkey) AS zero_sum_int,
+       COUNT(o_orderkey) AS n_matched
+FROM customer LEFT JOIN orders
+    ON c_custkey = o_custkey AND o_totalprice > 400000
+WHERE c_custkey <= 24
+GROUP BY c_custkey
+ORDER BY c_custkey
+""", True))
+
     # =========================================================================
     # Joins (10 queries)
     # =========================================================================
@@ -917,10 +965,8 @@ LIMIT 30
 
     # RIGHT JOIN with a filtering ON predicate: the preserved side is the BUILD
     # side here, so this exercises the unmatched-build emission path.
-    # NOTE: aggregates here are COUNT/MIN/MAX on purpose. SUM over a group with
-    # no non-NULL rows currently returns 0 instead of NULL in this engine (a
-    # separate, pre-existing aggregate-NULL bug), which would mask what this
-    # test is for.
+    # (Aggregates here are COUNT/MIN/MAX; SUM's NULL semantics over an all-NULL
+    # group are pinned separately by agg/null_group_sum_*.)
     queries.append(("join/right_on_filter", """
 SELECT c_custkey, COUNT(o_orderkey) AS c_count,
        MIN(o_orderkey) AS min_ok, MAX(o_orderkey) AS max_ok

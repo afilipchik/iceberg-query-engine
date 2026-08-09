@@ -1134,7 +1134,8 @@ fn aggregate_batches_morsel_parallel(
         return Ok(RecordBatch::new_empty(schema.clone()));
     }
 
-    let plan_schema = crate::planner::PlanSchema::from(batches[0].schema().as_ref());
+    let plan_schema =
+        crate::planner::PlanSchema::from_qualified_arrow(batches[0].schema().as_ref());
     let input_types: Vec<DataType> = aggregates
         .iter()
         .map(|a| a.input.data_type(&plan_schema).unwrap_or(DataType::Float64))

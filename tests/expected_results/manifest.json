@@ -322,6 +322,27 @@
     "file": "agg/empty_result.csv"
   },
   {
+    "id": "agg/null_group_sum_float",
+    "sql": "SELECT c_custkey,\n       SUM(o_totalprice) AS sum_price,\n       AVG(o_totalprice) AS avg_price,\n       MIN(o_totalprice) AS min_price,\n       MAX(o_totalprice) AS max_price,\n       COUNT(o_orderkey) AS n_matched\nFROM customer LEFT JOIN orders\n    ON c_custkey = o_custkey AND o_totalprice > 400000\nWHERE c_custkey <= 24\nGROUP BY c_custkey\nORDER BY c_custkey",
+    "ordered": true,
+    "row_count": 24,
+    "file": "agg/null_group_sum_float.csv"
+  },
+  {
+    "id": "agg/null_group_sum_int",
+    "sql": "SELECT c_custkey,\n       SUM(o_orderkey) AS sum_orderkey,\n       COUNT(o_orderkey) AS n_matched\nFROM customer LEFT JOIN orders\n    ON c_custkey = o_custkey AND o_totalprice > 400000\nWHERE c_custkey <= 24\nGROUP BY c_custkey\nORDER BY c_custkey",
+    "ordered": true,
+    "row_count": 24,
+    "file": "agg/null_group_sum_int.csv"
+  },
+  {
+    "id": "agg/null_group_sum_vs_zero",
+    "sql": "SELECT c_custkey,\n       SUM(o_totalprice * 0) AS zero_sum_float,\n       SUM(o_orderkey - o_orderkey) AS zero_sum_int,\n       COUNT(o_orderkey) AS n_matched\nFROM customer LEFT JOIN orders\n    ON c_custkey = o_custkey AND o_totalprice > 400000\nWHERE c_custkey <= 24\nGROUP BY c_custkey\nORDER BY c_custkey",
+    "ordered": true,
+    "row_count": 24,
+    "file": "agg/null_group_sum_vs_zero.csv"
+  },
+  {
     "id": "join/inner",
     "sql": "SELECT n.n_name, r.r_name\nFROM nation n, region r\nWHERE n.n_regionkey = r.r_regionkey\nORDER BY n.n_name",
     "ordered": true,

@@ -471,6 +471,15 @@ duckdb_validated_test!(validated_agg_having, "agg/having");
 duckdb_validated_test!(validated_agg_with_where, "agg/with_where");
 duckdb_validated_test!(validated_agg_expression_group, "agg/expression_group");
 duckdb_validated_test!(validated_agg_empty_result, "agg/empty_result");
+duckdb_validated_test!(
+    validated_agg_null_group_sum_float,
+    "agg/null_group_sum_float"
+);
+duckdb_validated_test!(validated_agg_null_group_sum_int, "agg/null_group_sum_int");
+duckdb_validated_test!(
+    validated_agg_null_group_sum_vs_zero,
+    "agg/null_group_sum_vs_zero"
+);
 
 // Joins (10)
 duckdb_validated_test!(validated_join_inner, "join/inner");
