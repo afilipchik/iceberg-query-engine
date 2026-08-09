@@ -27,4 +27,6 @@ pub use error::{QueryError, Result};
 pub use execution::{ExecutionConfig, ExecutionContext, QueryResult};
 pub use metastore::{BranchingMetastoreClient, MetastoreCatalog};
 pub use planner::{Binder, InMemoryCatalog, LogicalPlan};
+#[cfg(feature = "lance")]
+pub use storage::LanceTable;
 pub use storage::ParquetTable;

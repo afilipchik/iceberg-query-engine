@@ -8,7 +8,7 @@ use query_engine::execution::{print_results, ExecutionContext};
 use query_engine::tpch::{self, TpchGenerator};
 use rustyline::error::ReadlineError;
 use rustyline::{Config, Editor};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -114,12 +114,84 @@ enum Commands {
         save_csv: Option<PathBuf>,
     },
 
+    /// Load Lance dataset(s) and run a query (requires --features lance)
+    #[cfg(feature = "lance")]
+    LoadLance {
+        /// Path to a Lance dataset directory (e.g. ./data/orders.lance)
+        #[arg(short, long)]
+        path: PathBuf,
+
+        /// Table name to register
+        #[arg(short, long)]
+        name: String,
+
+        /// SQL query to execute (if omitted, just loads and shows schema)
+        #[arg(short, long)]
+        query: Option<String>,
+    },
+
+    /// Run TPC-H benchmark from Lance datasets (requires --features lance)
+    #[cfg(feature = "lance")]
+    BenchmarkLance {
+        /// Path to directory containing <table>.lance datasets
+        #[arg(short, long)]
+        path: PathBuf,
+
+        /// Number of iterations
+        #[arg(short, long, default_value = "1")]
+        iterations: usize,
+
+        /// Run only a specific query number (1-22)
+        #[arg(short, long)]
+        query: Option<usize>,
+
+        /// Scale factor (for Q11 threshold adjustment). Auto-detected from path if not specified.
+        #[arg(short, long)]
+        sf: Option<f64>,
+
+        /// Save query results as CSV files to this directory
+        #[arg(long)]
+        save_csv: Option<PathBuf>,
+    },
+
     /// Start interactive SQL shell (REPL)
     Repl {
         /// Optional: Preload TPC-H tables from Parquet directory
         #[arg(short, long)]
         tpch: Option<PathBuf>,
+
+        /// Optional: Preload TPC-H tables from a Lance directory (requires --features lance)
+        #[cfg(feature = "lance")]
+        #[arg(long)]
+        tpch_lance: Option<PathBuf>,
     },
+}
+
+/// The eight TPC-H tables, in dependency order.
+const TPCH_TABLES: [&str; 8] = [
+    "nation", "region", "part", "supplier", "partsupp", "customer", "orders", "lineitem",
+];
+
+/// Auto-detect TPC-H scale factor from a data directory name.
+fn detect_sf(path: &Path) -> f64 {
+    let path_str = path.to_string_lossy().to_lowercase();
+    if path_str.contains("1000gb") || path_str.contains("sf1000") {
+        1000.0
+    } else if path_str.contains("100gb") || path_str.contains("sf100") {
+        100.0
+    } else if path_str.contains("10gb") || path_str.contains("sf10") {
+        10.0
+    } else if path_str.contains("1gb") || path_str.contains("sf1") {
+        1.0
+    } else if path_str.contains("100mb") || path_str.contains("sf0.1") {
+        0.1
+    } else if path_str.contains("10mb") || path_str.contains("sf0.01") {
+        0.01
+    } else if path_str.contains("1mb") || path_str.contains("sf0.001") {
+        0.001
+    } else {
+        1.0 // default to SF=1
+    }
 }
 
 #[tokio::main]
@@ -348,26 +420,7 @@ async fn main() {
             save_csv,
         } => {
             // Auto-detect scale factor from path name if not specified
-            let sf = sf.unwrap_or_else(|| {
-                let path_str = path.to_string_lossy().to_lowercase();
-                if path_str.contains("1000gb") || path_str.contains("sf1000") {
-                    1000.0
-                } else if path_str.contains("100gb") || path_str.contains("sf100") {
-                    100.0
-                } else if path_str.contains("10gb") || path_str.contains("sf10") {
-                    10.0
-                } else if path_str.contains("1gb") || path_str.contains("sf1") {
-                    1.0
-                } else if path_str.contains("100mb") || path_str.contains("sf0.1") {
-                    0.1
-                } else if path_str.contains("10mb") || path_str.contains("sf0.01") {
-                    0.01
-                } else if path_str.contains("1mb") || path_str.contains("sf0.001") {
-                    0.001
-                } else {
-                    1.0 // default to SF=1
-                }
-            });
+            let sf = sf.unwrap_or_else(|| detect_sf(&path));
             println!("Running TPC-H benchmark from Parquet files (SF={})", sf);
             println!("Path: {}", path.display());
             println!("Iterations: {}", iterations);
@@ -483,7 +536,172 @@ async fn main() {
             println!("Successful queries: {}/{}", successful, results.len());
         }
 
-        Commands::Repl { tpch } => {
+        #[cfg(feature = "lance")]
+        Commands::LoadLance { path, name, query } => {
+            let start = Instant::now();
+            let mut ctx = ExecutionContext::new();
+
+            println!("Loading Lance dataset from: {}", path.display());
+
+            match ctx.register_lance(&name, &path) {
+                Ok(()) => {
+                    println!("Registered table '{}' in {:?}", name, start.elapsed());
+
+                    if let Some(schema) = ctx.table_schema(&name) {
+                        println!("Schema: {} columns", schema.fields().len());
+                        for field in schema.fields() {
+                            println!("  - {}: {:?}", field.name(), field.data_type());
+                        }
+                    }
+                    println!();
+
+                    if let Some(sql) = query {
+                        println!("Running query: {}", sql);
+                        println!();
+
+                        match ctx.sql(&sql).await {
+                            Ok(result) => {
+                                print_results(&result);
+                            }
+                            Err(e) => {
+                                eprintln!("Error: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error loading Lance dataset: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        #[cfg(feature = "lance")]
+        Commands::BenchmarkLance {
+            path,
+            iterations,
+            query,
+            sf,
+            save_csv,
+        } => {
+            let sf = sf.unwrap_or_else(|| detect_sf(&path));
+            println!("Running TPC-H benchmark from Lance datasets (SF={})", sf);
+            println!("Path: {}", path.display());
+            println!("Iterations: {}", iterations);
+            println!();
+
+            let start = Instant::now();
+            // Same 64GB cap as the Parquet benchmark so the two are comparable.
+            const MAX_MEMORY: usize = 64 * 1024 * 1024 * 1024;
+            let memory_limit =
+                (((sf * 4.0).max(1.0) as usize) * 1024 * 1024 * 1024).min(MAX_MEMORY);
+            println!("Memory limit: {} GB", memory_limit / (1024 * 1024 * 1024));
+            let mut ctx = ExecutionContext::with_memory_limit(memory_limit);
+
+            for table in &TPCH_TABLES {
+                let dataset_path = path.join(format!("{}.lance", table));
+                // Warm statistics here so the (Lance-specific) stats scan is
+                // reported as load time instead of inflating Q01.
+                match ctx.register_lance_warm(*table, &dataset_path) {
+                    Ok(()) => {
+                        if let Some(schema) = ctx.table_schema(table) {
+                            println!("  Loaded {}: {} columns", table, schema.fields().len());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error loading {}: {}", table, e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            println!(
+                "\nData loaded in {:?}. Running queries...\n",
+                start.elapsed()
+            );
+
+            let queries: Vec<usize> = if let Some(q) = query {
+                if !(1..=22).contains(&q) {
+                    eprintln!("Invalid query number {}. Valid range: 1-22", q);
+                    std::process::exit(1);
+                }
+                vec![q]
+            } else {
+                tpch::ALL_QUERIES.to_vec()
+            };
+
+            let mut total_time = std::time::Duration::ZERO;
+            let mut results = Vec::new();
+
+            for iter in 0..iterations {
+                if iterations > 1 {
+                    println!("=== Iteration {} ===", iter + 1);
+                }
+                let iter_start = Instant::now();
+
+                for &q in &queries {
+                    if let Some(sql) = tpch::get_query_for_sf(q, sf) {
+                        let query_start = Instant::now();
+                        match ctx.sql(&sql).await {
+                            Ok(result) => {
+                                let elapsed = query_start.elapsed();
+                                println!(
+                                    "Q{:02}: {:>8} rows in {:>8.3}ms",
+                                    q,
+                                    result.row_count,
+                                    elapsed.as_secs_f64() * 1000.0
+                                );
+                                if iter == 0 {
+                                    results.push((q, result.row_count, elapsed));
+                                    if let Some(ref csv_dir) = save_csv {
+                                        std::fs::create_dir_all(csv_dir).ok();
+                                        let csv_path = csv_dir.join(format!("q{:02}.csv", q));
+                                        if let Ok(file) = std::fs::File::create(&csv_path) {
+                                            let mut writer = arrow::csv::WriterBuilder::new()
+                                                .with_header(true)
+                                                .build(file);
+                                            for batch in &result.batches {
+                                                writer.write(batch).ok();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                println!("Q{:02}: ERROR - {}", q, e);
+                                if iter == 0 {
+                                    results.push((q, 0, std::time::Duration::ZERO));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let iter_time = iter_start.elapsed();
+                total_time += iter_time;
+                println!("Iteration time: {:?}\n", iter_time);
+            }
+
+            println!("=== Summary ===");
+            println!("Total time: {:?}", total_time);
+            println!("Average iteration: {:?}", total_time / iterations as u32);
+
+            let query_total: std::time::Duration = results.iter().map(|(_, _, t)| *t).sum();
+            println!("Query execution time: {:?}", query_total);
+
+            let successful = results.iter().filter(|(_, rows, _)| *rows > 0).count();
+            println!("Successful queries: {}/{}", successful, results.len());
+        }
+
+        Commands::Repl {
+            tpch,
+            #[cfg(feature = "lance")]
+            tpch_lance,
+        } => {
+            #[cfg(feature = "lance")]
+            run_repl(tpch, tpch_lance).await;
+            #[cfg(not(feature = "lance"))]
             run_repl(tpch).await;
         }
     }
@@ -502,8 +720,47 @@ impl ReplState {
     }
 }
 
+/// Load all eight TPC-H tables from `dir`, registering each with the REPL's
+/// completion helper. `lance` selects the Lance loader over the Parquet one.
+fn load_tpch_dir(
+    ctx: &mut ExecutionContext,
+    helper: &Arc<ReplHelper>,
+    dir: &Path,
+    #[cfg(feature = "lance")] lance: bool,
+) {
+    println!("Loading TPC-H tables from: {}", dir.display());
+    for table in &TPCH_TABLES {
+        #[cfg(feature = "lance")]
+        let loaded = if lance {
+            ctx.register_lance(*table, dir.join(format!("{}.lance", table)))
+        } else {
+            ctx.register_parquet(*table, dir.join(format!("{}.parquet", table)))
+        };
+        #[cfg(not(feature = "lance"))]
+        let loaded = ctx.register_parquet(*table, dir.join(format!("{}.parquet", table)));
+
+        match loaded {
+            Ok(()) => {
+                if let Some(schema) = ctx.table_schema(table) {
+                    let columns: Vec<String> =
+                        schema.fields().iter().map(|f| f.name().clone()).collect();
+                    println!("  Loaded {}: {} columns", table, columns.len());
+                    helper.register_table(table, columns);
+                }
+            }
+            Err(e) => {
+                eprintln!("  Warning: Could not load {}: {}", table, e);
+            }
+        }
+    }
+    println!();
+}
+
 /// Run the interactive SQL REPL
-async fn run_repl(tpch_path: Option<PathBuf>) {
+async fn run_repl(
+    tpch_path: Option<PathBuf>,
+    #[cfg(feature = "lance")] tpch_lance_path: Option<PathBuf>,
+) {
     println!("Query Engine Interactive SQL Shell");
     println!("Type .help for available commands, or enter SQL queries.");
     println!("Tab completion and syntax highlighting enabled.");
@@ -515,28 +772,17 @@ async fn run_repl(tpch_path: Option<PathBuf>) {
 
     // Preload TPC-H tables if path provided
     if let Some(path) = tpch_path {
-        println!("Loading TPC-H tables from: {}", path.display());
-        let tables = [
-            "nation", "region", "part", "supplier", "partsupp", "customer", "orders", "lineitem",
-        ];
-
-        for table in &tables {
-            let file_path = path.join(format!("{}.parquet", table));
-            match ctx.register_parquet(*table, &file_path) {
-                Ok(()) => {
-                    if let Some(schema) = ctx.table_schema(table) {
-                        let columns: Vec<String> =
-                            schema.fields().iter().map(|f| f.name().clone()).collect();
-                        println!("  Loaded {}: {} columns", table, columns.len());
-                        helper.register_table(table, columns);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("  Warning: Could not load {}: {}", table, e);
-                }
-            }
-        }
-        println!();
+        load_tpch_dir(
+            &mut ctx,
+            &helper,
+            &path,
+            #[cfg(feature = "lance")]
+            false,
+        );
+    }
+    #[cfg(feature = "lance")]
+    if let Some(path) = tpch_lance_path {
+        load_tpch_dir(&mut ctx, &helper, &path, true);
     }
 
     // Configure rustyline with history and completion settings
@@ -653,6 +899,11 @@ async fn handle_dot_command(
             println!("  .schema <table>        Show schema for a table");
             println!("  .load <path> <name>    Load Parquet file/directory as table");
             println!("  .tpch <path>           Load all TPC-H tables from directory");
+            #[cfg(feature = "lance")]
+            {
+                println!("  .lance <path> <name>   Load a Lance dataset as table");
+                println!("  .tpch-lance <path>     Load all TPC-H tables from Lance directory");
+            }
             println!("  .mode <format>         Set output format (table, csv, json, vertical)");
             println!("  .format                Show current output format");
             println!();
@@ -734,29 +985,49 @@ async fn handle_dot_command(
             if parts.len() < 2 {
                 eprintln!("Usage: .tpch <parquet_directory>\n");
             } else {
+                load_tpch_dir(
+                    ctx,
+                    helper,
+                    &PathBuf::from(parts[1]),
+                    #[cfg(feature = "lance")]
+                    false,
+                );
+            }
+        }
+        #[cfg(feature = "lance")]
+        ".lance" => {
+            if parts.len() < 3 {
+                eprintln!("Usage: .lance <path.lance> <table_name>\n");
+            } else {
                 let path = PathBuf::from(parts[1]);
-                let tables = [
-                    "nation", "region", "part", "supplier", "partsupp", "customer", "orders",
-                    "lineitem",
-                ];
-                println!("Loading TPC-H tables from: {}", path.display());
-                for table in &tables {
-                    let file_path = path.join(format!("{}.parquet", table));
-                    match ctx.register_parquet(*table, &file_path) {
-                        Ok(()) => {
-                            if let Some(schema) = ctx.table_schema(table) {
-                                let columns: Vec<String> =
-                                    schema.fields().iter().map(|f| f.name().clone()).collect();
-                                println!("  Loaded {}: {} columns", table, columns.len());
-                                helper.register_table(table, columns);
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("  Warning: Could not load {}: {}", table, e);
+                let name = parts[2];
+                let start = Instant::now();
+                match ctx.register_lance(name, &path) {
+                    Ok(()) => {
+                        if let Some(schema) = ctx.table_schema(name) {
+                            let columns: Vec<String> =
+                                schema.fields().iter().map(|f| f.name().clone()).collect();
+                            println!(
+                                "Loaded '{}' ({} columns) in {:.3}ms\n",
+                                name,
+                                columns.len(),
+                                start.elapsed().as_secs_f64() * 1000.0
+                            );
+                            helper.register_table(name, columns);
                         }
                     }
+                    Err(e) => {
+                        eprintln!("Error loading '{}': {}\n", path.display(), e);
+                    }
                 }
-                println!();
+            }
+        }
+        #[cfg(feature = "lance")]
+        ".tpch-lance" => {
+            if parts.len() < 2 {
+                eprintln!("Usage: .tpch-lance <lance_directory>\n");
+            } else {
+                load_tpch_dir(ctx, helper, &PathBuf::from(parts[1]), true);
             }
         }
         ".mode" => {

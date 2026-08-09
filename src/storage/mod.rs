@@ -11,5 +11,11 @@ pub use parquet::{
     ParquetFileInfo, ParquetTable, StreamingParquetReader, StreamingParquetScanBuilder,
 };
 
+/// Lance datasets. Requires `--features lance`; see `src/storage/lance.rs`.
+#[cfg(feature = "lance")]
+mod lance;
+#[cfg(feature = "lance")]
+pub use lance::LanceTable;
+
 pub mod ipc_cache;
 pub mod metadata_cache;

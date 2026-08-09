@@ -213,6 +213,40 @@ impl ExecutionContext {
         Ok(())
     }
 
+    /// Register a table from a Lance dataset directory (e.g. `orders.lance`).
+    ///
+    /// Requires the `lance` cargo feature. Column projection is pushed into
+    /// Lance; see `storage::LanceTable` for what the Lance path does and does
+    /// not get relative to the Parquet path.
+    #[cfg(feature = "lance")]
+    pub fn register_lance(
+        &mut self,
+        name: impl Into<String>,
+        path: impl AsRef<Path>,
+    ) -> Result<()> {
+        let table = crate::storage::LanceTable::try_new(path)?;
+        self.register_table_provider(name, Arc::new(table));
+        Ok(())
+    }
+
+    /// Register a Lance dataset and immediately compute its column statistics.
+    ///
+    /// Same as [`register_lance`](Self::register_lance) except the statistics
+    /// scan (which Lance, unlike Parquet, cannot answer from metadata) is paid
+    /// here rather than inside whichever query first invokes the optimizer.
+    /// Benchmarks use this so load cost is reported as load cost.
+    #[cfg(feature = "lance")]
+    pub fn register_lance_warm(
+        &mut self,
+        name: impl Into<String>,
+        path: impl AsRef<Path>,
+    ) -> Result<()> {
+        let table = crate::storage::LanceTable::try_new(path)?;
+        table.warm_statistics();
+        self.register_table_provider(name, Arc::new(table));
+        Ok(())
+    }
+
     /// Execute a SQL query and return results
     pub async fn sql(&self, query: &str) -> Result<QueryResult> {
         let start = Instant::now();

@@ -168,8 +168,21 @@ pub const SQL_KEYWORDS: &[&str] = &[
 
 /// Dot commands for the REPL
 pub const DOT_COMMANDS: &[&str] = &[
-    ".help", ".h", ".quit", ".exit", ".q", ".tables", ".schema", ".load", ".tpch", ".mode",
+    ".help",
+    ".h",
+    ".quit",
+    ".exit",
+    ".q",
+    ".tables",
+    ".schema",
+    ".load",
+    ".tpch",
+    ".mode",
     ".format",
+    #[cfg(feature = "lance")]
+    ".lance",
+    #[cfg(feature = "lance")]
+    ".tpch-lance",
 ];
 
 /// REPL helper that provides completion, highlighting, and hints

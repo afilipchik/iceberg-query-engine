@@ -200,8 +200,9 @@ src/
 │       └── iceberg.rs        # IcebergScanExec, PartitionFilter
 │
 ├── storage/                  # External storage providers
-│   ├── mod.rs                # Module exports (ParquetTable)
-│   └── parquet.rs            # ParquetTable - reads Parquet files/directories
+│   ├── mod.rs                # Module exports (ParquetTable, LanceTable)
+│   ├── parquet.rs            # ParquetTable - reads Parquet files/directories
+│   └── lance.rs              # LanceTable - reads Lance datasets (feature "lance")
 │
 ├── execution/
 │   ├── mod.rs                # Module exports
@@ -315,6 +316,7 @@ pub trait TableProvider: Send + Sync + std::fmt::Debug {
 Implementations:
 - `MemoryTable` - In-memory Arrow batches
 - `ParquetTable` - Parquet files (single file or directory)
+- `LanceTable` - Lance datasets (requires `--features lance`)
 - `IcebergTable` - Planned for Phase 2
 
 ### Join Types
@@ -637,6 +639,31 @@ assert_eq!(result.schema.fields().len(), expected_cols);
 | `num_cpus` | CPU core detection |
 | `rayon` | Data parallelism |
 | `statrs` | Statistical functions |
+| `lance` | Lance dataset reader — **OPTIONAL**, `--features lance` only |
+
+### Optional `lance` feature — build requirements
+
+The Lance reader is **off by default**. `cargo build` compiles none of it.
+
+1. **Version is pinned to `0.23.x` deliberately.** It is the last line built
+   against **arrow 53**, the arrow major this engine uses, so Lance returns
+   *our* `RecordBatch` with no IPC/FFI bridge. lance 0.25+/10.x need arrow
+   54/55/58 and would fork arrow in-tree. Do not bump it.
+2. **`protoc` is required** (lance-table's build script compiles `.proto`):
+   `PROTOC=<abs path>/.scratch/tools/protoc/bin/protoc cargo build --release --features lance`
+3. **MSRV resolver.** `Cargo.toml` sets `resolver = "3"` + `rust-version = "1.93.0"`.
+   lance-io depends on aws-config unconditionally and the newest aws-* crates
+   declare rust-version 1.94.1 while this toolchain is 1.93.0; the MSRV-aware
+   resolver picks aws-config 1.8.18 instead of failing. `default-features = false`
+   alone does NOT drop the aws crates.
+4. **The default dependency set is provably unchanged.** Adding the optional dep
+   left every pre-existing crate at its exact prior version (verified by diffing
+   `Cargo.lock`). 23 crates gained an *additional* semver-incompatible major
+   (reqwest 0.12, thiserror 2, hyper 1, sqlparser 0.53, …) reachable only through
+   the lance tree — `cargo tree -e normal,build` on the default features contains
+   zero of them. `dashmap` is pinned to 6.1.0 and `once_cell` to 1.21.3 for this
+   reason: dashmap 6.2.1 requires `once_cell ^1.21.4`, which would have been the
+   one and only bump to a crate the default build actually compiles.
 
 ## CLI Commands
 
@@ -673,6 +700,31 @@ query_engine repl
 query_engine repl --tpch ./data/tpch-10mb
 ```
 
+### Lance commands (require `--features lance`)
+
+```bash
+# Build with the Lance reader (needs protoc; see Dependencies)
+PROTOC=.scratch/tools/protoc/bin/protoc cargo build --release --features lance
+
+# Load a Lance dataset and run a query
+query_engine load-lance --path ./data/tpch-1mb-lance/orders.lance --name orders \
+    --query "SELECT COUNT(*) FROM orders"
+
+# Run TPC-H benchmark over Lance datasets
+query_engine benchmark-lance --path ./data/tpch-10gb-lance --iterations 1 \
+    --save-csv .scratch/lance_csv
+
+# REPL with TPC-H Lance tables preloaded
+query_engine repl --tpch-lance ./data/tpch-1mb-lance
+```
+
+Converting Parquet to Lance (needs `.venv` with pylance 0.23.2):
+
+```bash
+.venv/bin/python scripts/lance_convert.py \
+    --parquet ./data/tpch-10gb --out ./data/tpch-10gb-lance
+```
+
 ### Interactive REPL Commands
 
 Once in the REPL, the following dot-commands are available:
@@ -685,6 +737,8 @@ Once in the REPL, the following dot-commands are available:
 | `.schema <table>` | Show schema for a table |
 | `.load <path> <name>` | Load Parquet file/directory as table |
 | `.tpch <path>` | Load all TPC-H tables from directory |
+| `.lance <path> <name>` | Load a Lance dataset as table (`--features lance`) |
+| `.tpch-lance <path>` | Load all TPC-H tables from a Lance directory (`--features lance`) |
 | `.mode <format>` | Set output format (table, csv, json, vertical) |
 | `.format` | Show current output format |
 
@@ -810,6 +864,85 @@ round-by-round evidence log lives in the project memory file.
 in memory: FD-based group-by reduction (Q10's 7-column group key has a unique
 c_custkey), radix-partitioned aggregation (hash-probe latency floor), parquet
 decode. See the memory file for the full round-by-round log.
+
+## Lance Reader (feature-gated, 2026-08-09)
+
+`src/storage/lance.rs` implements `LanceTable`, a `TableProvider` over Lance
+datasets. Enabled with `--features lance`; see Dependencies for protoc/MSRV.
+
+**Design**
+- **Projection pushdown** is the point: `Scanner::project(&names)` makes Lance
+  read only the requested columns off disk. Column order follows the projection
+  list, not the table schema.
+- **Fragment-parallel scan**: one `tokio::spawn` per fragment (58 for SF=10
+  `lineitem`), collected in fragment order so results are deterministic.
+- **Async/sync bridge**: `TableProvider::scan` is sync, Lance is async. A single
+  shared `num_cpus`-wide runtime is driven from a dedicated thread
+  (`block_on_lance`), mirroring `subquery::subquery_runtime`. Never create a
+  runtime per call, and never `block_on` on a thread a runtime already owns.
+- **Unsupported types fail loudly** at registration, naming the column.
+  `FixedSizeList` (Lance vector/embedding columns) gets a specific message,
+  since that is what a real LanceDB table most likely contains.
+
+**Statistics: Lance must SCAN for what Parquet gets from a footer.**
+`compute_column_stats` reads the *integer* columns (through Lance's projection,
+so wide string columns are never touched) to derive min/max and
+`ndv_est = min(non_null_rows, max-min+1)` — the same estimate `ParquetTable`
+uses. This is **not** optional: with cardinality but no NDV, the DPsize join
+reorderer put TPC-H **Q05 into `supplier ⋈ customer` on `nationkey`, a
+~1.2-billion-row intermediate that never finished** (>10 min, killed). With int
+stats the Lance plan matches the Parquet plan exactly and Q05 runs in 248ms.
+The cost is ~0.9s at SF=10 for all 8 tables; `register_lance_warm` (used by
+`benchmark-lance`) pays it at load time instead of inside the first query.
+String NDV is still missing — Parquet gets it free from dictionary pages, and
+there is no cheap Lance equivalent — so string equality filters fall back to
+default selectivity.
+
+**Related fix in shared code**: `PhysicalPlanner::prescan_shared_tables` gated
+its 400MB prescan cap on `provider.parquet_files()`, so *any* non-Parquet
+provider was exempt and a multi-GB shared table would be decoded into the cache
+unconditionally. The gate now falls back to `statistics().total_byte_size`.
+Parquet behaviour is bit-identical (same computation); MemoryTable stays ungated.
+
+### Lance vs Parquet vs DuckDB (SF=10, 2026-08-09, serialized, same binary)
+
+All three legs on the same idle machine. Engine legs use ONE binary built with
+`--features lance`, so Lance and Parquet differ only in the storage path.
+
+| Configuration | Load | Query total | vs engine/Parquet |
+|---|---|---|---|
+| Engine over **Parquet** | 0.002s | **7.38s** | 1.00x |
+| Engine over **Lance** | 0.89s | **8.04s** | 1.09x slower |
+| DuckDB over **Lance** (Arrow interop) | 1.16s | **10.60s** | 1.44x slower |
+| DuckDB **native tables** (reference) | — | 2.99s | 0.41x |
+
+**Read the DuckDB/Lance number carefully**: in `materialized` mode DuckDB reads
+each dataset into an Arrow table *before* timing, so its per-query times exclude
+all Lance decode (paid once, reported as `load=`). The engine's Lance times
+*include* decode. Including load on both sides: engine 8.94s vs DuckDB 11.76s.
+DuckDB-over-Arrow is also well off DuckDB's native-table pace (2.99s), so this
+is not DuckDB at its best — it is the honest cost of its Lance interop path.
+
+All 22 queries are **CELL-EXACT** engine/Lance vs DuckDB/Lance
+(`.scratch/validate22_lance.py`), and row counts match the Parquet leg exactly.
+
+Per-query, the Lance path **wins on join-heavy queries** (Q02 44 vs 64ms, Q05
+248 vs 345, Q08 268 vs 346, Q10 285 vs 414, Q03 303 vs 386) and **loses on
+filter-heavy single-table scans** (Q19 412 vs 117ms, Q12 372 vs 199, Q09 2088 vs
+1431, Q06 131 vs 109). That split is the expected shape: the Parquet path's fast
+lanes are exactly the scan-side ones, and none of them are reachable from a
+generic `TableProvider`.
+
+**What the Lance path does NOT get** (all keyed off `parquet_files()` /
+`ParquetTable`, measured cost above):
+- morsel-driven parallel aggregation (`MorselAggregateExec`)
+- arrow `RowFilter` predicate pushdown into the decoder
+- row-group statistics pruning and dictionary filters
+- runtime join-filter bitmaps pushed into the scan
+- `scan_with_filter` — `LanceTable` uses the default no-op. Lance's
+  `Scanner::filter(&str)` takes a DataFusion SQL string; wiring the engine's
+  `Expr` to it risks silent dialect divergence, so it was left out deliberately.
+  This is the largest remaining lever for the Lance path.
 
 ## Recently Implemented Features
 
@@ -1046,6 +1179,10 @@ decode. See the memory file for the full round-by-round log.
 | Flatten dependent join rule | `src/optimizer/rules/flatten_dependent_join.rs` |
 | Main entry point | `src/execution/context.rs` |
 | Parquet table provider | `src/storage/parquet.rs` |
+| Lance table provider | `src/storage/lance.rs` (feature `lance`) |
+| Lance tests | `tests/lance_tests.rs` (feature `lance`) |
+| Parquet→Lance conversion | `scripts/lance_convert.py` |
+| DuckDB-over-Lance oracle/baseline | `scripts/duckdb_lance_bench.py` |
 | Streaming Parquet reader | `src/storage/parquet.rs` (StreamingParquetReader) |
 | Async Parquet reader | `src/storage/parquet.rs` (AsyncParquetReader) |
 | TableProvider trait | `src/physical/operators/scan.rs` |

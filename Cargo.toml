@@ -5,6 +5,14 @@ edition = "2021"
 authors = ["Query Engine Team"]
 description = "High-performance SQL query engine for Apache Iceberg"
 license = "Apache-2.0"
+# The MSRV-aware dependency resolver. Required by the optional `lance` feature:
+# lance-io depends on aws-config unconditionally, and the newest aws-* releases
+# declare rust-version 1.94.1 while this toolchain is 1.93.0. Resolver 3 reads
+# `rust-version` below and picks the newest aws-* that this compiler accepts
+# (aws-config 1.8.18 etc.) instead of failing the build. It is a no-op for the
+# default feature set — see the Cargo.lock note in CLAUDE.md.
+rust-version = "1.93.0"
+resolver = "3"
 
 [dependencies]
 # SQL Parsing
@@ -78,6 +86,23 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 mimalloc = "0.1.52"
 memmap2 = "0.9.11"
+
+# Lance columnar format (OPTIONAL — see [features] below).
+# Pinned to 0.23.x on purpose: 0.23 is the last line that builds against
+# arrow 53, the same arrow major this engine uses, so Lance's RecordBatch IS
+# our RecordBatch and no IPC/FFI bridge is needed. lance 0.25+/10.x require
+# arrow 54/55/58 and would fork the arrow version in-tree. Do not bump.
+# Building this feature also needs `protoc` on PATH or in $PROTOC
+# (lance-table's build script compiles .proto files).
+lance = { version = "0.23", default-features = false, optional = true }
+
+[features]
+default = []
+# Enables the Lance table provider (src/storage/lance.rs), the `load-lance` /
+# `benchmark-lance` CLI commands, and the REPL `.lance` / `.tpch-lance` dot
+# commands. Off by default so the ~490-crate Lance tree (incl. DataFusion) is
+# never compiled — and never able to perturb — the default benchmark build.
+lance = ["dep:lance"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
