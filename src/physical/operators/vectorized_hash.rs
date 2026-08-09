@@ -96,6 +96,13 @@ fn combine_hash(seed: u64, value: u64) -> u64 {
     seed.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(value)
 }
 
+/// Hash of a single non-null i64 key — exactly what `hash_arrays` computes
+/// for a one-column Int64 key, for point lookups into tables built with it.
+#[inline(always)]
+pub fn hash_i64(value: i64) -> u64 {
+    combine_hash(0x517cc1b727220a95u64, value as u64)
+}
+
 /// Hash a byte slice (for string values).
 #[inline(always)]
 fn hash_bytes(data: &[u8]) -> u64 {

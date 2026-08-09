@@ -503,6 +503,55 @@ impl VectorizedHashTable {
         matches
     }
 
+    /// Whether `for_each_i64_candidate` point lookups work on this table:
+    /// a single Int64 key in direct-address mode, or hash mode with the
+    /// zero-copy i64 key views available for verification.
+    fn supports_i64_lookup(&self) -> bool {
+        self.direct.is_some()
+            || self
+                .i64_key_bufs
+                .as_ref()
+                .map(|b| b.len() == 1)
+                .unwrap_or(false)
+    }
+
+    /// Visit the (batch_idx, row_idx) candidates whose key equals `key`.
+    /// The callback returns true to STOP the walk. Caller must have checked
+    /// `supports_i64_lookup`. Filtered Semi/Anti probes use this instead of a
+    /// separately built HashMap<i64, Vec<HashEntry>> — the chained VHT
+    /// already holds the same candidates without per-key heap boxes (Q21
+    /// spent ~70ms building i64 maps its probes barely touched).
+    #[inline]
+    fn for_each_i64_candidate(&self, key: i64, mut f: impl FnMut(u32, u32) -> bool) {
+        if let Some((kmin, kmax)) = self.direct {
+            if key < kmin || key > kmax {
+                return;
+            }
+            let mut entry = self.heads[(key - kmin) as usize];
+            while entry != u32::MAX {
+                let (bb, br) = self.entries[entry as usize];
+                if f(bb, br) {
+                    return;
+                }
+                entry = self.next[entry as usize];
+            }
+            return;
+        }
+        let bufs = match &self.i64_key_bufs {
+            Some(b) => b,
+            None => return,
+        };
+        let bucket = vectorized_hash::hash_i64(key) as usize & self.mask;
+        let mut entry = self.heads[bucket];
+        while entry != u32::MAX {
+            let (bb, br) = self.entries[entry as usize];
+            if bufs[0][bb as usize][br as usize] == key && f(bb, br) {
+                return;
+            }
+            entry = self.next[entry as usize];
+        }
+    }
+
     /// Probe for Semi/Anti joins: returns a boolean mask per probe row indicating match.
     #[inline]
     fn probe_batch_semi(&self, probe_key_arrays: &[ArrayRef], num_rows: usize) -> Vec<bool> {
@@ -711,8 +760,18 @@ impl PhysicalOperator for HashJoinExec {
         };
         let probe_keys = if swapped { &on_left } else { &on_right };
 
-        // For Semi/Anti joins, start probe collection early so it overlaps with build side
-        let probe_prefetch_handle = if matches!(self.join_type, JoinType::Semi | JoinType::Anti) {
+        // For Semi/Anti joins, start probe collection early so it overlaps
+        // with the build side — UNLESS this join publishes a runtime filter
+        // into the probe-side scan. Prefetch would start decoding before the
+        // build exists, so the filter (published only after the build drains)
+        // could never prune anything: Q21's l2/l3 lineitem probes decoded
+        // ~35M rows each where the bitmap admits ~2.5M. With a linked filter
+        // the probe is collected AFTER the build instead (see below); the
+        // bitmap-pruned decode is far cheaper than what overlap saved.
+        let defer_probe_for_filter = self.probe_runtime_filter.is_some();
+        let probe_prefetch_handle = if matches!(self.join_type, JoinType::Semi | JoinType::Anti)
+            && !defer_probe_for_filter
+        {
             let probe = probe_side.clone();
             Some(tokio::spawn(async move {
                 let probe_partitions = probe.output_partitions().max(1);
@@ -977,12 +1036,31 @@ impl PhysicalOperator for HashJoinExec {
                 // table doesn't serve (VHT probe requires filter.is_none()). It is a
                 // HashMap with one heap-allocated Vec per distinct key — on a 15M-row
                 // build side that's tens of seconds of pure waste if never probed.
-                let i64_needed = vectorized_ht.is_none() || self.filter.is_some();
+                // Filtered Semi/Anti probes can take candidates straight from
+                // the VHT when it supports single-i64 point lookups — the i64
+                // map would be built (per-key Vec allocs over the whole build)
+                // and barely probed. probe_semi_anti_parallel rebuilds a local
+                // map if its VHT path turns out unusable at probe time.
+                let vht_serves_semi_anti = matches!(self.join_type, JoinType::Semi | JoinType::Anti)
+                    && vectorized_ht
+                        .as_ref()
+                        .map(|v| v.supports_i64_lookup())
+                        .unwrap_or(false);
+                let i64_needed = vectorized_ht.is_none()
+                    || (self.filter.is_some() && !vht_serves_semi_anti);
+                let t_i64 = std::time::Instant::now();
                 let i64_hash_table = if i64_needed && build_keys.len() == 1 {
                     build_i64_hash_table(&build_batches, &build_keys[0])
                 } else {
                     None
                 };
+                if timing && i64_needed && build_keys.len() == 1 {
+                    eprintln!(
+                        "[hj] i64 ht build: {:?} ({} rows)",
+                        t_i64.elapsed(),
+                        total_build_rows
+                    );
+                }
 
                 // Skip expensive generic hash table build when vectorized or i64 fast path is available
                 let hash_table = if vectorized_ht.is_some()
@@ -1029,11 +1107,36 @@ impl PhysicalOperator for HashJoinExec {
             .await?;
 
         // Collect probe batches. For Semi/Anti, await the prefetched probe data
-        // that was running concurrently with the build side.
+        // that was running concurrently with the build side — or, when the
+        // prefetch was deferred so the published runtime filter can prune the
+        // probe-side decode, collect ALL probe partitions now.
         let probe_batches: Vec<RecordBatch> = if let Some(handle) = probe_prefetch_handle {
             handle.await.map_err(|e| {
                 crate::error::QueryError::Execution(format!("Probe prefetch task failed: {}", e))
             })??
+        } else if matches!(self.join_type, JoinType::Semi | JoinType::Anti) {
+            let probe_partitions = probe_side.output_partitions().max(1);
+            let handles: Vec<_> = (0..probe_partitions)
+                .map(|p| {
+                    let probe = probe_side.clone();
+                    tokio::spawn(async move {
+                        let stream = probe.execute(p).await?;
+                        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                        Ok::<_, crate::error::QueryError>(batches)
+                    })
+                })
+                .collect();
+            let mut all_batches = Vec::new();
+            for handle in handles {
+                let batches = handle.await.map_err(|e| {
+                    crate::error::QueryError::Execution(format!(
+                        "Probe partition task failed: {}",
+                        e
+                    ))
+                })??;
+                all_batches.extend(batches);
+            }
+            all_batches
         } else {
             let probe_stream = probe_side.execute(partition).await?;
             probe_stream.try_collect().await?
@@ -1795,6 +1898,7 @@ fn probe_semi_anti_parallel(
     probe_batches: &[RecordBatch],
     hash_table: &HashMap<JoinKey, Vec<HashEntry>>,
     cached_i64_ht: Option<&HashMap<i64, Vec<HashEntry>>>,
+    vht: Option<&VectorizedHashTable>,
     probe_key_exprs: &[Expr],
     join_type: JoinType,
     swapped: bool,
@@ -1824,14 +1928,26 @@ fn probe_semi_anti_parallel(
     let compiled_filter =
         filter.and_then(|f| CompiledFilter::try_compile(f, &build_schema, &probe_schema, swapped));
 
-    // Use cached i64 hash table if available, otherwise build one
-    let local_i64_ht: Option<HashMap<i64, Vec<HashEntry>>> = if cached_i64_ht.is_some() {
-        None // Using cached, no need to build local
-    } else if probe_key_exprs.len() == 1 {
-        build_i64_hash_table(build_batches, &probe_key_exprs[0])
-    } else {
-        None
-    };
+    // Serve candidate lookups straight from the vectorized hash table when
+    // it supports single-i64 point lookups and the filter (if any) compiled:
+    // the separately built HashMap<i64, Vec<HashEntry>> adds nothing then.
+    let use_vht: Option<&VectorizedHashTable> = vht.filter(|v| {
+        probe_key_exprs.len() == 1
+            && v.supports_i64_lookup()
+            && (filter.is_none() || compiled_filter.is_some())
+    });
+
+    // Use cached i64 hash table if available, otherwise build one (skipped
+    // when the VHT serves lookups; the local build remains the safety net
+    // for probe shapes the VHT path can't take, e.g. non-Int64 probe keys).
+    let local_i64_ht: Option<HashMap<i64, Vec<HashEntry>>> =
+        if cached_i64_ht.is_some() || use_vht.is_some() {
+            None
+        } else if probe_key_exprs.len() == 1 {
+            build_i64_hash_table(build_batches, &probe_key_exprs[0])
+        } else {
+            None
+        };
     let i64_ht_ref: Option<&HashMap<i64, Vec<HashEntry>>> = cached_i64_ht.or(local_i64_ht.as_ref());
 
     // Process probe BATCHES in parallel: 8K-row parquet batches are smaller
@@ -1861,7 +1977,7 @@ fn probe_semi_anti_parallel(
 
             // Fall back to full key extraction if no i64 fast path
             let probe_key_arrays: Option<Vec<ArrayRef>> =
-                if i64_values.is_none() || i64_ht_ref.is_none() {
+                if i64_values.is_none() || (i64_ht_ref.is_none() && use_vht.is_none()) {
                     let arrays: Result<Vec<ArrayRef>> = probe_key_exprs
                         .iter()
                         .map(|e| evaluate_expr(probe_batch, e))
@@ -1880,6 +1996,37 @@ fn probe_semi_anti_parallel(
 
             {
                 for probe_row in 0..n_rows {
+                    // VHT point-lookup path: candidates straight from the
+                    // chained table, filter evaluated per candidate, stop at
+                    // the first pass (same semantics as the map path below).
+                    if let (Some(vals), Some(v)) = (i64_values, use_vht) {
+                        if let Some(ref nb) = null_bitmap {
+                            if !nb.is_valid(probe_row) {
+                                continue;
+                            }
+                        }
+                        v.for_each_i64_candidate(vals[probe_row], |bb, br| {
+                            let pass = match &compiled_filter {
+                                Some(cf) => cf.evaluate(
+                                    &build_batches[bb as usize],
+                                    br as usize,
+                                    probe_batch,
+                                    probe_row,
+                                ),
+                                None => true,
+                            };
+                            if pass {
+                                if swapped {
+                                    probe_matched_batch[probe_row].store(true, Ordering::Relaxed);
+                                } else {
+                                    build_matched[bb as usize][br as usize]
+                                        .store(true, Ordering::Relaxed);
+                                }
+                            }
+                            pass
+                        });
+                        continue;
+                    }
                     // Fast i64 path: direct array access, no JoinKey allocation
                     let entries_opt = if let (Some(vals), Some(ht)) = (i64_values, i64_ht_ref) {
                         if let Some(ref nb) = null_bitmap {
@@ -2570,6 +2717,7 @@ fn probe_hash_table(
             probe_batches,
             hash_table,
             i64_hash_table,
+            vectorized_ht,
             probe_key_exprs,
             join_type,
             swapped,

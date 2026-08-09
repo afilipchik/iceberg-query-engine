@@ -2,7 +2,7 @@
 
 use crate::error::Result;
 use crate::optimizer::OptimizerRule;
-use crate::planner::{Column, Expr, LogicalPlan, ScanNode};
+use crate::planner::{Column, Expr, LogicalPlan, PlanSchema, ProjectNode, ScanNode};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -15,9 +15,16 @@ impl OptimizerRule for ProjectionPushdown {
     }
 
     fn optimize(&self, plan: &LogicalPlan) -> Result<LogicalPlan> {
-        // Collect all required columns from top and push down
+        // Collect all required columns from top and push down. Columns a
+        // scan's own pushed-down filter reads are NOT in this set: the scan
+        // reads them but a Project drops them from its output, so filter-only
+        // columns never ride through joins (Q21 gathered a Utf8
+        // o_orderstatus per matched row and carried two filter-only date
+        // columns through two joins; the shared column-name matching below
+        // also over-projected them onto every other lineitem alias).
         let required = self.collect_required_columns(plan);
-        self.pushdown(plan, &required)
+        let keep_all = required.is_empty() && !Self::any_scan_filter(plan);
+        self.pushdown(plan, &required, keep_all)
     }
 }
 
@@ -28,13 +35,22 @@ impl ProjectionPushdown {
         required
     }
 
+    /// Whether any scan in the plan carries a pushed-down filter.
+    fn any_scan_filter(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Scan(node) => node.filter.is_some(),
+            _ => plan.children().iter().any(|c| Self::any_scan_filter(c)),
+        }
+    }
+
     fn collect_recursive(&self, plan: &LogicalPlan, required: &mut HashSet<Column>) {
         match plan {
-            LogicalPlan::Scan(node) => {
-                // If scan has a filter (from predicate pushdown), extract its columns
-                if let Some(filter) = &node.filter {
-                    self.extract_columns_from_expr(filter, required);
-                }
+            LogicalPlan::Scan(_) => {
+                // A scan's own pushed-down filter columns are handled at the
+                // scan itself (read but projected away); registering them
+                // here forced them into the scan OUTPUT and, through the
+                // name-based alias matching, into every other scan of the
+                // same table.
             }
             LogicalPlan::Filter(node) => {
                 self.extract_columns_from_expr(&node.predicate, required);
@@ -351,10 +367,17 @@ impl ProjectionPushdown {
         }
     }
 
-    fn pushdown(&self, plan: &LogicalPlan, required: &HashSet<Column>) -> Result<LogicalPlan> {
+    fn pushdown(
+        &self,
+        plan: &LogicalPlan,
+        required: &HashSet<Column>,
+        keep_all: bool,
+    ) -> Result<LogicalPlan> {
         match plan {
             LogicalPlan::Scan(node) => {
-                // Compute projection indices for scan
+                // Compute projection indices for scan: the columns consumers
+                // ABOVE the scan read (`required` excludes this scan's own
+                // filter columns).
                 let schema = &node.schema;
                 let mut projection = Vec::new();
 
@@ -370,9 +393,8 @@ impl ProjectionPushdown {
                     };
 
                     // Check for exact match or unqualified match
-                    let mut is_required = required.contains(&col)
-                        || required.contains(&unqualified)
-                        || required.is_empty();
+                    let mut is_required =
+                        required.contains(&col) || required.contains(&unqualified) || keep_all;
 
                     // Also check if any required column has the same name (handles table aliases)
                     // e.g., required has "l1.l_orderkey" but schema has "lineitem.l_orderkey"
@@ -390,26 +412,77 @@ impl ProjectionPushdown {
                     }
                 }
 
-                // If all columns are needed, don't set projection
-                let projection = if projection.len() == schema.len() {
-                    None
-                } else if projection.is_empty() {
-                    // Need at least one column
-                    Some(vec![0])
-                } else {
-                    Some(projection)
+                // Columns the pushed-down scan filter reads (loose name
+                // matching, same as above).
+                let mut read = projection.clone();
+                if let Some(filter) = &node.filter {
+                    let mut filter_cols: HashSet<Column> = HashSet::new();
+                    self.extract_columns_from_expr(filter, &mut filter_cols);
+                    for (i, field) in schema.fields().iter().enumerate() {
+                        if read.contains(&i) {
+                            continue;
+                        }
+                        let needed = filter_cols.iter().any(|c| {
+                            c.name == field.name
+                                || c.name.ends_with(&format!(".{}", field.name))
+                                || field.name.ends_with(&format!(".{}", c.name))
+                        });
+                        if needed {
+                            read.push(i);
+                        }
+                    }
+                    read.sort_unstable();
+                }
+
+                let make_scan = |proj: Vec<usize>| {
+                    let projection = if proj.len() == schema.len() {
+                        None
+                    } else if proj.is_empty() {
+                        // Need at least one column
+                        Some(vec![0])
+                    } else {
+                        Some(proj)
+                    };
+                    LogicalPlan::Scan(ScanNode {
+                        table_name: node.table_name.clone(),
+                        schema: node.schema.clone(),
+                        projection,
+                        filter: node.filter.clone(),
+                    })
                 };
 
-                Ok(LogicalPlan::Scan(ScanNode {
-                    table_name: node.table_name.clone(),
-                    schema: node.schema.clone(),
-                    projection,
-                    filter: node.filter.clone(),
+                // No filter-only columns, or nothing above needs this scan's
+                // columns at all: keep the legacy single-projection shape
+                // (reading exactly what the filter needs in the latter case).
+                if projection.is_empty() || read.len() == projection.len() {
+                    return Ok(make_scan(read));
+                }
+
+                // Filter-only columns present: the scan reads them (the
+                // filter runs inside the scan) and a Project drops them from
+                // the output, so they are never carried through joins.
+                let kept: Vec<crate::planner::SchemaField> = projection
+                    .iter()
+                    .map(|&i| schema.fields()[i].clone())
+                    .collect();
+                let exprs: Vec<Expr> = kept
+                    .iter()
+                    .map(|f| {
+                        Expr::Column(Column {
+                            relation: f.relation.clone(),
+                            name: f.name.clone(),
+                        })
+                    })
+                    .collect();
+                Ok(LogicalPlan::Project(ProjectNode {
+                    input: Arc::new(make_scan(read)),
+                    exprs,
+                    schema: PlanSchema::new(kept),
                 }))
             }
 
             LogicalPlan::Filter(node) => {
-                let input = self.pushdown(&node.input, required)?;
+                let input = self.pushdown(&node.input, required, keep_all)?;
                 Ok(LogicalPlan::Filter(crate::planner::FilterNode {
                     input: Arc::new(input),
                     predicate: node.predicate.clone(),
@@ -417,7 +490,15 @@ impl ProjectionPushdown {
             }
 
             LogicalPlan::Project(node) => {
-                let input = self.pushdown(&node.input, required)?;
+                let input = self.pushdown(&node.input, required, keep_all)?;
+                // Collapse the identical column-passthrough Project the
+                // scan-level filter-column pruning re-creates on repeated
+                // optimizer passes (it would otherwise stack once per pass).
+                if let LogicalPlan::Project(inner) = &input {
+                    if inner.exprs == node.exprs {
+                        return Ok(input);
+                    }
+                }
                 Ok(LogicalPlan::Project(crate::planner::ProjectNode {
                     input: Arc::new(input),
                     exprs: node.exprs.clone(),
@@ -426,8 +507,8 @@ impl ProjectionPushdown {
             }
 
             LogicalPlan::Join(node) => {
-                let left = self.pushdown(&node.left, required)?;
-                let right = self.pushdown(&node.right, required)?;
+                let left = self.pushdown(&node.left, required, keep_all)?;
+                let right = self.pushdown(&node.right, required, keep_all)?;
                 Ok(LogicalPlan::Join(crate::planner::JoinNode {
                     left: Arc::new(left),
                     right: Arc::new(right),
@@ -439,7 +520,7 @@ impl ProjectionPushdown {
             }
 
             LogicalPlan::Aggregate(node) => {
-                let input = self.pushdown(&node.input, required)?;
+                let input = self.pushdown(&node.input, required, keep_all)?;
                 Ok(LogicalPlan::Aggregate(crate::planner::AggregateNode {
                     input: Arc::new(input),
                     group_by: node.group_by.clone(),
@@ -449,7 +530,7 @@ impl ProjectionPushdown {
             }
 
             LogicalPlan::Sort(node) => {
-                let input = self.pushdown(&node.input, required)?;
+                let input = self.pushdown(&node.input, required, keep_all)?;
                 Ok(LogicalPlan::Sort(crate::planner::SortNode {
                     input: Arc::new(input),
                     order_by: node.order_by.clone(),
@@ -457,7 +538,7 @@ impl ProjectionPushdown {
             }
 
             LogicalPlan::Limit(node) => {
-                let input = self.pushdown(&node.input, required)?;
+                let input = self.pushdown(&node.input, required, keep_all)?;
                 Ok(LogicalPlan::Limit(crate::planner::LimitNode {
                     input: Arc::new(input),
                     skip: node.skip,
@@ -466,7 +547,7 @@ impl ProjectionPushdown {
             }
 
             LogicalPlan::Distinct(node) => {
-                let input = self.pushdown(&node.input, required)?;
+                let input = self.pushdown(&node.input, required, keep_all)?;
                 Ok(LogicalPlan::Distinct(crate::planner::DistinctNode {
                     input: Arc::new(input),
                 }))
@@ -476,7 +557,7 @@ impl ProjectionPushdown {
                 let inputs: Result<Vec<Arc<LogicalPlan>>> = node
                     .inputs
                     .iter()
-                    .map(|i| self.pushdown(i, required).map(Arc::new))
+                    .map(|i| self.pushdown(i, required, keep_all).map(Arc::new))
                     .collect();
                 Ok(LogicalPlan::Union(crate::planner::UnionNode {
                     inputs: inputs?,
@@ -486,7 +567,7 @@ impl ProjectionPushdown {
             }
 
             LogicalPlan::SubqueryAlias(node) => {
-                let input = self.pushdown(&node.input, required)?;
+                let input = self.pushdown(&node.input, required, keep_all)?;
                 Ok(LogicalPlan::SubqueryAlias(
                     crate::planner::SubqueryAliasNode {
                         input: Arc::new(input),
@@ -501,8 +582,8 @@ impl ProjectionPushdown {
 
             LogicalPlan::DelimJoin(node) => {
                 // Recursively push projections but don't modify DelimJoin structure
-                let left = self.pushdown(&node.left, required)?;
-                let right = self.pushdown(&node.right, required)?;
+                let left = self.pushdown(&node.left, required, keep_all)?;
+                let right = self.pushdown(&node.right, required, keep_all)?;
                 Ok(LogicalPlan::DelimJoin(crate::planner::DelimJoinNode {
                     left: Arc::new(left),
                     right: Arc::new(right),
