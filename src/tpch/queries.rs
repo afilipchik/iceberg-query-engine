@@ -415,7 +415,12 @@ ORDER BY
 "#;
 
 /// Q13: Customer Distribution
-/// Note: Simplified version without nested subquery - counts orders per customer
+/// Spec-compliant. NOTE on data: the generator writes a constant `o_comment`
+/// ("order comment"), so the spec's NOT LIKE predicate matches every row here
+/// and filters nothing — the engine still pays the full 15M-row evaluation,
+/// but the c_count distribution differs from real TPC-H. LEFT-JOIN-ON filter
+/// SEMANTICS are therefore covered by a dedicated test rather than by this
+/// query (see tests/expected_results/join/left_on_filter.csv).
 pub const Q13: &str = r#"
 SELECT
     c_count,
@@ -427,6 +432,7 @@ FROM (
     FROM
         customer
         LEFT OUTER JOIN orders ON c_custkey = o_custkey
+            AND o_comment NOT LIKE '%special%requests%'
     GROUP BY
         c_custkey
 ) AS c_orders

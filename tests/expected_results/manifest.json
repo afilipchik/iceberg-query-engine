@@ -92,7 +92,7 @@
   },
   {
     "id": "tpch/q14",
-    "sql": "SELECT\n    100.00 * SUM(CASE WHEN p_type LIKE 'PROMO%' THEN l_extendedprice * (1 - l_discount) ELSE 0 END) / SUM(l_extendedprice * (1 - l_discount)) AS promo_revenue\nFROM\n    lineitem,\n    part\nWHERE\n    l_partkey = p_partkey\n    AND l_shipdate >= DATE '1995-09-01'\n    AND l_shipdate < DATE '1995-10-01'",
+    "sql": "SELECT\n    100.00 * SUM(CASE WHEN p_type LIKE 'PROMO%' THEN l_extendedprice * (1 - l_discount) ELSE 0.0 END) / SUM(l_extendedprice * (1 - l_discount)) AS promo_revenue\nFROM\n    lineitem,\n    part\nWHERE\n    l_partkey = p_partkey\n    AND l_shipdate >= DATE '1995-09-01'\n    AND l_shipdate < DATE '1995-10-01'",
     "ordered": false,
     "row_count": 1,
     "file": "tpch/q14.csv"
@@ -390,6 +390,55 @@
     "ordered": true,
     "row_count": 50,
     "file": "join/inequality.csv"
+  },
+  {
+    "id": "join/left_on_filter",
+    "sql": "SELECT c_custkey, COUNT(o_orderkey) AS c_count\nFROM customer LEFT JOIN orders\n    ON c_custkey = o_custkey AND o_orderstatus <> 'F'\nGROUP BY c_custkey\nORDER BY c_count DESC, c_custkey\nLIMIT 25",
+    "ordered": true,
+    "row_count": 25,
+    "file": "join/left_on_filter.csv"
+  },
+  {
+    "id": "join/left_on_not_like",
+    "sql": "SELECT COUNT(*) AS n_customers, SUM(c_count) AS total_matched\nFROM (\n    SELECT c_custkey, COUNT(o_orderkey) AS c_count\n    FROM customer LEFT JOIN orders\n        ON c_custkey = o_custkey AND o_comment NOT LIKE '%order%'\n    GROUP BY c_custkey\n) t",
+    "ordered": true,
+    "row_count": 1,
+    "file": "join/left_on_not_like.csv"
+  },
+  {
+    "id": "join/left_on_filter_cols",
+    "sql": "SELECT c_custkey, COALESCE(o_orderkey, -1) AS ok, o_totalprice\nFROM customer LEFT JOIN orders\n    ON c_custkey = o_custkey AND o_totalprice > 400000\nWHERE c_custkey <= 40\nORDER BY c_custkey, ok\nLIMIT 25",
+    "ordered": true,
+    "row_count": 25,
+    "file": "join/left_on_filter_cols.csv"
+  },
+  {
+    "id": "join/left_on_both_sides",
+    "sql": "SELECT c_custkey, COUNT(o_orderkey) AS c_count, MIN(o_orderkey) AS min_ok\nFROM customer LEFT JOIN orders\n    ON c_custkey = o_custkey AND o_totalprice > c_acctbal * 50\nGROUP BY c_custkey\nORDER BY c_count, c_custkey\nLIMIT 30",
+    "ordered": true,
+    "row_count": 30,
+    "file": "join/left_on_both_sides.csv"
+  },
+  {
+    "id": "join/right_on_filter",
+    "sql": "SELECT c_custkey, COUNT(o_orderkey) AS c_count,\n       MIN(o_orderkey) AS min_ok, MAX(o_orderkey) AS max_ok\nFROM orders RIGHT JOIN customer\n    ON o_custkey = c_custkey AND o_orderstatus = 'F'\nGROUP BY c_custkey\nORDER BY c_count, c_custkey\nLIMIT 30",
+    "ordered": true,
+    "row_count": 30,
+    "file": "join/right_on_filter.csv"
+  },
+  {
+    "id": "join/full_on_filter",
+    "sql": "SELECT\n    COUNT(*) AS n_rows,\n    COUNT(c_custkey) AS n_left,\n    COUNT(o_orderkey) AS n_right,\n    SUM(CASE WHEN c_custkey IS NULL THEN 1 ELSE 0 END) AS right_only,\n    SUM(CASE WHEN o_orderkey IS NULL THEN 1 ELSE 0 END) AS left_only\nFROM customer FULL OUTER JOIN orders\n    ON c_custkey = o_custkey AND o_orderstatus = 'F'",
+    "ordered": false,
+    "row_count": 1,
+    "file": "join/full_on_filter.csv"
+  },
+  {
+    "id": "join/on_vs_where",
+    "sql": "SELECT 'a_on_clause' AS variant, COUNT(*) AS n_rows, COUNT(o_orderkey) AS n_matched\nFROM customer LEFT JOIN orders\n    ON c_custkey = o_custkey AND o_orderstatus = 'F'\nUNION ALL\nSELECT 'b_where_clause' AS variant, COUNT(*) AS n_rows, COUNT(o_orderkey) AS n_matched\nFROM customer LEFT JOIN orders\n    ON c_custkey = o_custkey\nWHERE o_orderstatus = 'F'\nORDER BY variant",
+    "ordered": true,
+    "row_count": 2,
+    "file": "join/on_vs_where.csv"
   },
   {
     "id": "subquery/scalar",

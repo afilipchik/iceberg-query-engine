@@ -1084,6 +1084,22 @@ impl PhysicalPlanner {
                 // because the output doesn't include right-side columns
                 let is_semi_anti = matches!(node.join_type, JoinType::Semi | JoinType::Anti);
 
+                // An ON-clause predicate is part of the JOIN CONDITION, not a
+                // post-join filter. The two are equivalent for Inner joins, but
+                // for Left/Right/Full a post-filter also sees the NULL-extended
+                // rows the outer join exists to produce; those rows fail every
+                // comparison (NULL is not TRUE) and get dropped, silently
+                // degrading the outer join to an inner join. Such predicates
+                // must be applied to candidate (build, probe) pairs INSIDE the
+                // join, before match tracking. Semi/Anti need this too, for the
+                // separate reason that their output drops the other side's
+                // columns entirely.
+                let filter_inside_join = is_semi_anti
+                    || matches!(
+                        node.join_type,
+                        JoinType::Left | JoinType::Right | JoinType::Full
+                    );
+
                 // Runtime join-key filter: joins with a single plain
                 // probe-key column over a streaming parquet scan decode only
                 // rows whose key exists in the (small) build side. Safe for
@@ -1160,9 +1176,10 @@ impl PhysicalPlanner {
                     join.probe_runtime_filter = probe_rt_filter.clone();
                     join.probe_runtime_filter_pair = rt_pair;
 
-                    // For Semi/Anti, pass filter into the join operator;
-                    // for other join types, apply as a post-filter
-                    if is_semi_anti && node.filter.is_some() {
+                    // Semi/Anti and the outer join types evaluate the ON
+                    // predicate inside the join; only Inner/Cross may post-filter
+                    // (for them ON and WHERE are equivalent).
+                    if filter_inside_join && node.filter.is_some() {
                         join = join.with_filter(node.filter.clone());
                         Ok(Arc::new(join))
                     } else {
@@ -1174,12 +1191,24 @@ impl PhysicalPlanner {
                             None => Ok(Arc::new(join)),
                         }
                     }
+                } else if filter_inside_join && node.filter.is_some() {
+                    // Use regular hash join (no memory management), evaluating
+                    // the ON predicate as part of the join condition.
+                    let join = HashJoinExec::with_filter(
+                        left,
+                        right,
+                        on,
+                        node.join_type,
+                        node.filter.clone(),
+                    )
+                    .with_build_right(build_right_for_left);
+                    Ok(Arc::new(join))
                 } else {
                     // Use regular hash join (no memory management)
                     let join = HashJoinExec::new(left, right, on, node.join_type)
                         .with_build_right(build_right_for_left);
 
-                    // Apply additional filter if present (for non-Semi/Anti joins)
+                    // Inner/Cross only: ON is equivalent to WHERE here.
                     match &node.filter {
                         Some(predicate) => {
                             let filter = self.create_filter(Arc::new(join), predicate.clone());

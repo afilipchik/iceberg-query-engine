@@ -862,6 +862,102 @@ WHERE n1.n_regionkey = n2.n_regionkey AND n1.n_nationkey < n2.n_nationkey
 ORDER BY nation1, nation2
 """, True))
 
+    # LEFT JOIN with a filtering predicate in the ON clause (TPC-H Q13's shape).
+    # A right-side ON predicate must NOT behave like a WHERE: left rows whose
+    # matches all fail the predicate stay in the result, NULL-extended. Pushing
+    # such a predicate below the join silently converts it to inner-join
+    # semantics, which this partial-filter case detects.
+    queries.append(("join/left_on_filter", """
+SELECT c_custkey, COUNT(o_orderkey) AS c_count
+FROM customer LEFT JOIN orders
+    ON c_custkey = o_custkey AND o_orderstatus <> 'F'
+GROUP BY c_custkey
+ORDER BY c_count DESC, c_custkey
+LIMIT 25
+""", True))
+
+    # Same shape with NOT LIKE, and a pattern that rejects EVERY right row:
+    # every customer must survive with count 0. Q13 itself cannot cover this
+    # because the generator writes a constant o_comment that the spec pattern
+    # never matches.
+    queries.append(("join/left_on_not_like", """
+SELECT COUNT(*) AS n_customers, SUM(c_count) AS total_matched
+FROM (
+    SELECT c_custkey, COUNT(o_orderkey) AS c_count
+    FROM customer LEFT JOIN orders
+        ON c_custkey = o_custkey AND o_comment NOT LIKE '%order%'
+    GROUP BY c_custkey
+) t
+""", True))
+
+    # Partial ON filter that returns the RIGHT side's payload columns, so the
+    # NULL-extension of o_orderkey/o_totalprice is checked and not just a count.
+    # 46 of the 150 customers have no order above the threshold; each of those
+    # contributes exactly one NULL-extended row (ordered first by COALESCE).
+    queries.append(("join/left_on_filter_cols", """
+SELECT c_custkey, COALESCE(o_orderkey, -1) AS ok, o_totalprice
+FROM customer LEFT JOIN orders
+    ON c_custkey = o_custkey AND o_totalprice > 400000
+WHERE c_custkey <= 40
+ORDER BY c_custkey, ok
+LIMIT 25
+""", True))
+
+    # ON predicate referencing BOTH sides — a genuine non-equi join condition
+    # that cannot be pushed into either scan. 21 customers keep no order.
+    queries.append(("join/left_on_both_sides", """
+SELECT c_custkey, COUNT(o_orderkey) AS c_count, MIN(o_orderkey) AS min_ok
+FROM customer LEFT JOIN orders
+    ON c_custkey = o_custkey AND o_totalprice > c_acctbal * 50
+GROUP BY c_custkey
+ORDER BY c_count, c_custkey
+LIMIT 30
+""", True))
+
+    # RIGHT JOIN with a filtering ON predicate: the preserved side is the BUILD
+    # side here, so this exercises the unmatched-build emission path.
+    # NOTE: aggregates here are COUNT/MIN/MAX on purpose. SUM over a group with
+    # no non-NULL rows currently returns 0 instead of NULL in this engine (a
+    # separate, pre-existing aggregate-NULL bug), which would mask what this
+    # test is for.
+    queries.append(("join/right_on_filter", """
+SELECT c_custkey, COUNT(o_orderkey) AS c_count,
+       MIN(o_orderkey) AS min_ok, MAX(o_orderkey) AS max_ok
+FROM orders RIGHT JOIN customer
+    ON o_custkey = c_custkey AND o_orderstatus = 'F'
+GROUP BY c_custkey
+ORDER BY c_count, c_custkey
+LIMIT 30
+""", True))
+
+    # FULL OUTER JOIN with a filtering ON predicate: BOTH the unmatched-build
+    # and the unmatched-probe rows must survive, each exactly once.
+    queries.append(("join/full_on_filter", """
+SELECT
+    COUNT(*) AS n_rows,
+    COUNT(c_custkey) AS n_left,
+    COUNT(o_orderkey) AS n_right,
+    SUM(CASE WHEN c_custkey IS NULL THEN 1 ELSE 0 END) AS right_only,
+    SUM(CASE WHEN o_orderkey IS NULL THEN 1 ELSE 0 END) AS left_only
+FROM customer FULL OUTER JOIN orders
+    ON c_custkey = o_custkey AND o_orderstatus = 'F'
+""", False))
+
+    # Pins ON-filter vs WHERE-filter semantics in BOTH directions on the same
+    # join: the ON variant keeps every customer, the WHERE variant is an inner
+    # join. A "fix" that collapses either one into the other fails here.
+    queries.append(("join/on_vs_where", """
+SELECT 'a_on_clause' AS variant, COUNT(*) AS n_rows, COUNT(o_orderkey) AS n_matched
+FROM customer LEFT JOIN orders
+    ON c_custkey = o_custkey AND o_orderstatus = 'F'
+UNION ALL
+SELECT 'b_where_clause' AS variant, COUNT(*) AS n_rows, COUNT(o_orderkey) AS n_matched
+FROM customer LEFT JOIN orders
+    ON c_custkey = o_custkey
+WHERE o_orderstatus = 'F'
+ORDER BY variant
+""", True))
+
     # =========================================================================
     # Subqueries (8 queries)
     # =========================================================================

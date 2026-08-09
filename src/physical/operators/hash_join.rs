@@ -1046,8 +1046,17 @@ impl PhysicalOperator for HashJoinExec {
                         .as_ref()
                         .map(|v| v.supports_i64_lookup())
                         .unwrap_or(false);
+                // Left/Right/Full apply the ON predicate to candidate pairs
+                // inside the vectorized probe, so a filtered outer join has no
+                // use for the i64 map either.
+                let vht_serves_filtered_join = vht_serves_semi_anti
+                    || (vectorized_ht.is_some()
+                        && matches!(
+                            self.join_type,
+                            JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full
+                        ));
                 let i64_needed = vectorized_ht.is_none()
-                    || (self.filter.is_some() && !vht_serves_semi_anti);
+                    || (self.filter.is_some() && !vht_serves_filtered_join);
                 let t_i64 = std::time::Instant::now();
                 let i64_hash_table = if i64_needed && build_keys.len() == 1 {
                     build_i64_hash_table(&build_batches, &build_keys[0])
@@ -1536,6 +1545,66 @@ fn create_combined_batch(
     };
 
     RecordBatch::try_new(combined_schema.clone(), all_columns).map_err(Into::into)
+}
+
+/// Apply the non-equi part of an ON clause to the candidate (build row, probe
+/// row) pairs produced by the hash lookup.
+///
+/// This has to happen INSIDE the join, not above it. A post-join filter also
+/// sees the NULL-extended rows an outer join emits for unmatched rows; those
+/// rows fail every comparison (NULL is not TRUE) and get dropped, which turns
+/// the outer join into an inner join. Rejecting candidate pairs here instead
+/// leaves an outer row that loses all of its matches genuinely unmatched, so
+/// the normal null-extension path still emits it exactly once.
+fn filter_candidate_pairs(
+    build_batches: &[RecordBatch],
+    probe_batch: &RecordBatch,
+    build_indices: Vec<(usize, usize)>,
+    probe_indices: Vec<usize>,
+    swapped: bool,
+    combined_schema: &SchemaRef,
+    filter: &Expr,
+) -> Result<(Vec<(usize, usize)>, Vec<usize>)> {
+    if build_indices.is_empty() {
+        return Ok((build_indices, probe_indices));
+    }
+
+    let combined_batch = create_combined_batch(
+        build_batches,
+        &build_indices,
+        probe_batch,
+        &probe_indices,
+        swapped,
+        combined_schema,
+    )?;
+
+    let filter_result = evaluate_expr(&combined_batch, filter)?;
+    let mask = match filter_result
+        .as_any()
+        .downcast_ref::<arrow::array::BooleanArray>()
+    {
+        Some(mask) => mask,
+        // Non-boolean filter result: keep every candidate (the fallback the
+        // Semi/Anti path has always used).
+        None => return Ok((build_indices, probe_indices)),
+    };
+
+    // Every candidate qualifies (TPC-H Q13's ON predicate matches every row):
+    // skip rebuilding the index vectors entirely.
+    if mask.null_count() == 0 && mask.true_count() == mask.len() {
+        return Ok((build_indices, probe_indices));
+    }
+
+    let mut kept_build = Vec::with_capacity(build_indices.len());
+    let mut kept_probe = Vec::with_capacity(probe_indices.len());
+    for i in 0..mask.len() {
+        // NULL is not TRUE: an unknown join condition rejects the pair.
+        if mask.is_valid(i) && mask.value(i) {
+            kept_build.push(build_indices[i]);
+            kept_probe.push(probe_indices[i]);
+        }
+    }
+    Ok((kept_build, kept_probe))
 }
 
 /// A pre-compiled filter for fast evaluation without per-row batch creation.
@@ -2232,6 +2301,8 @@ fn probe_vectorized(
     join_type: JoinType,
     swapped: bool,
     output_schema: &SchemaRef,
+    filter: Option<&Expr>,
+    combined_schema: &SchemaRef,
     shared_build_matched: Option<&[Vec<std::sync::atomic::AtomicBool>]>,
     row_store: Option<(&RowStore, &[usize])>,
 ) -> Result<Vec<RecordBatch>> {
@@ -2291,6 +2362,21 @@ fn probe_vectorized(
                         build_indices.push((bb as usize, br as usize));
                         probe_indices.push(pr as usize);
                     }
+                    let (build_indices, probe_indices) = match filter {
+                        Some(f) => filter_candidate_pairs(
+                            build_batches,
+                            probe_batch,
+                            build_indices,
+                            probe_indices,
+                            swapped,
+                            combined_schema,
+                            f,
+                        )?,
+                        None => (build_indices, probe_indices),
+                    };
+                    if build_indices.is_empty() {
+                        return Ok(None);
+                    }
                     let batch = create_joined_batch(
                         build_batches,
                         probe_batch,
@@ -2320,13 +2406,39 @@ fn probe_vectorized(
                     let probe_key_arrays = probe_key_arrays?;
                     let n_rows = probe_batch.num_rows();
                     let matches = vht.probe_batch(&probe_key_arrays, n_rows);
-                    let mut probe_matched = vec![false; n_rows];
-                    let mut build_indices: Vec<(usize, usize)> = Vec::new();
-                    let mut probe_indices: Vec<usize> = Vec::new();
+                    let mut build_indices: Vec<(usize, usize)> = Vec::with_capacity(matches.len());
+                    let mut probe_indices: Vec<usize> = Vec::with_capacity(matches.len());
                     for (bb, br, pr) in &matches {
                         build_indices.push((*bb as usize, *br as usize));
                         probe_indices.push(*pr as usize);
-                        probe_matched[*pr as usize] = true;
+                    }
+                    // ON-clause predicate: reject non-qualifying pairs BEFORE
+                    // match tracking, so a left row whose every match fails the
+                    // predicate stays unmatched and is null-extended.
+                    let (build_indices, probe_indices) = match filter {
+                        Some(f) => filter_candidate_pairs(
+                            build_batches,
+                            probe_batch,
+                            build_indices,
+                            probe_indices,
+                            swapped,
+                            combined_schema,
+                            f,
+                        )?,
+                        None => (build_indices, probe_indices),
+                    };
+                    let mut probe_matched = vec![false; n_rows];
+                    for &pr in &probe_indices {
+                        probe_matched[pr] = true;
+                    }
+                    // Build side is the preserved (left) side when !swapped:
+                    // publish match bits so execute() can emit the left rows
+                    // that never matched. Without this every build row looks
+                    // unmatched and the matched ones are emitted twice.
+                    if let Some(shared) = shared_build_matched {
+                        for &(bb, br) in &build_indices {
+                            shared[bb][br].store(true, Ordering::Relaxed);
+                        }
                     }
                     let (bi, pi) = if swapped {
                         add_unmatched_probe(&build_indices, &probe_indices, &probe_matched, n_rows)
@@ -2412,6 +2524,19 @@ fn probe_vectorized(
                     }
                 }
 
+                let (all_build_indices, all_probe_indices) = match filter {
+                    Some(f) => filter_candidate_pairs(
+                        build_batches,
+                        probe_batch,
+                        all_build_indices,
+                        all_probe_indices,
+                        swapped,
+                        combined_schema,
+                        f,
+                    )?,
+                    None => (all_build_indices, all_probe_indices),
+                };
+
                 if !all_build_indices.is_empty() {
                     let batch = create_joined_batch(
                         build_batches,
@@ -2430,16 +2555,35 @@ fn probe_vectorized(
                 // For Left join: collect matches, then add unmatched probe rows with nulls
                 let matches = vht.probe_batch(&probe_key_arrays, n_rows);
 
-                let mut probe_matched = vec![false; n_rows];
-                let mut build_indices: Vec<(usize, usize)> = Vec::new();
-                let mut probe_indices: Vec<usize> = Vec::new();
+                let mut build_indices: Vec<(usize, usize)> = Vec::with_capacity(matches.len());
+                let mut probe_indices: Vec<usize> = Vec::with_capacity(matches.len());
 
                 for (bb, br, pr) in &matches {
                     build_indices.push((*bb as usize, *br as usize));
                     probe_indices.push(*pr as usize);
-                    probe_matched[*pr as usize] = true;
+                }
+
+                // ON-clause predicate: applied to candidate pairs, before any
+                // match is recorded (see filter_candidate_pairs).
+                let (build_indices, probe_indices) = match filter {
+                    Some(f) => filter_candidate_pairs(
+                        build_batches,
+                        probe_batch,
+                        build_indices,
+                        probe_indices,
+                        swapped,
+                        combined_schema,
+                        f,
+                    )?,
+                    None => (build_indices, probe_indices),
+                };
+
+                let mut probe_matched = vec![false; n_rows];
+                for (i, &pr) in probe_indices.iter().enumerate() {
+                    probe_matched[pr] = true;
                     if let Some(shared) = shared_build_matched {
-                        shared[*bb as usize][*br as usize].store(true, Ordering::Relaxed);
+                        let (bb, br) = build_indices[i];
+                        shared[bb][br].store(true, Ordering::Relaxed);
                     }
                 }
 
@@ -2469,17 +2613,33 @@ fn probe_vectorized(
                 // Right join: collect matches and track build-side matches
                 let matches = vht.probe_batch(&probe_key_arrays, n_rows);
 
-                let mut build_indices: Vec<(usize, usize)> = Vec::new();
-                let mut probe_indices: Vec<usize> = Vec::new();
+                let mut build_indices: Vec<(usize, usize)> = Vec::with_capacity(matches.len());
+                let mut probe_indices: Vec<usize> = Vec::with_capacity(matches.len());
 
                 for (bb, br, pr) in &matches {
                     build_indices.push((*bb as usize, *br as usize));
                     probe_indices.push(*pr as usize);
+                }
+
+                let (build_indices, probe_indices) = match filter {
+                    Some(f) => filter_candidate_pairs(
+                        build_batches,
+                        probe_batch,
+                        build_indices,
+                        probe_indices,
+                        swapped,
+                        combined_schema,
+                        f,
+                    )?,
+                    None => (build_indices, probe_indices),
+                };
+
+                for &(bb, br) in &build_indices {
                     if needs_build_tracking {
-                        build_matched[*bb as usize][*br as usize] = true;
+                        build_matched[bb][br] = true;
                     }
                     if let Some(shared) = shared_build_matched {
-                        shared[*bb as usize][*br as usize].store(true, Ordering::Relaxed);
+                        shared[bb][br].store(true, Ordering::Relaxed);
                     }
                 }
 
@@ -2500,26 +2660,51 @@ fn probe_vectorized(
             JoinType::Full => {
                 let matches = vht.probe_batch(&probe_key_arrays, n_rows);
 
-                let mut build_indices: Vec<(usize, usize)> = Vec::new();
-                let mut probe_indices: Vec<usize> = Vec::new();
+                let mut build_indices: Vec<(usize, usize)> = Vec::with_capacity(matches.len());
+                let mut probe_indices: Vec<usize> = Vec::with_capacity(matches.len());
 
                 for (bb, br, pr) in &matches {
                     build_indices.push((*bb as usize, *br as usize));
                     probe_indices.push(*pr as usize);
+                }
+
+                let (build_indices, probe_indices) = match filter {
+                    Some(f) => filter_candidate_pairs(
+                        build_batches,
+                        probe_batch,
+                        build_indices,
+                        probe_indices,
+                        swapped,
+                        combined_schema,
+                        f,
+                    )?,
+                    None => (build_indices, probe_indices),
+                };
+
+                let mut probe_matched = vec![false; n_rows];
+                for (i, &pr) in probe_indices.iter().enumerate() {
+                    probe_matched[pr] = true;
+                    let (bb, br) = build_indices[i];
                     if needs_build_tracking {
-                        build_matched[*bb as usize][*br as usize] = true;
+                        build_matched[bb][br] = true;
                     }
                     if let Some(shared) = shared_build_matched {
-                        shared[*bb as usize][*br as usize].store(true, Ordering::Relaxed);
+                        shared[bb][br].store(true, Ordering::Relaxed);
                     }
                 }
 
-                if !build_indices.is_empty() {
+                // FULL OUTER: probe rows with no surviving match are emitted
+                // with NULLs on the build side. (Unmatched BUILD rows are
+                // emitted once by the last probe partition, in execute().)
+                let (bi, pi) =
+                    add_unmatched_probe(&build_indices, &probe_indices, &probe_matched, n_rows);
+
+                if !bi.is_empty() {
                     let batch = create_joined_batch(
                         build_batches,
                         probe_batch,
-                        &build_indices,
-                        &probe_indices,
+                        &bi,
+                        &pi,
                         swapped,
                         output_schema,
                         None,
@@ -2695,7 +2880,15 @@ fn probe_hash_table(
     // Try vectorized path first (handles all key types, all join types except Cross)
     // Cross joins have no join keys and must use the generic path.
     if let Some(vht) = vectorized_ht {
-        if filter.is_none() && total_probe_rows > 0 && join_type != JoinType::Cross {
+        // A join filter no longer forces the slow path for the join types whose
+        // probe applies it to candidate pairs (see filter_candidate_pairs).
+        // Semi/Anti keep their dedicated filtered path below.
+        let filter_served = filter.is_none()
+            || matches!(
+                join_type,
+                JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full
+            );
+        if filter_served && total_probe_rows > 0 && join_type != JoinType::Cross {
             return probe_vectorized(
                 build_batches,
                 probe_batches,
@@ -2704,6 +2897,8 @@ fn probe_hash_table(
                 join_type,
                 swapped,
                 output_schema,
+                filter,
+                combined_schema,
                 shared_build_matched,
                 row_store,
             );
@@ -2788,50 +2983,21 @@ fn probe_hash_table(
             }
         }
 
-        // For Semi/Anti joins with filter, evaluate filter on all candidates at once
-        let (build_indices, probe_indices) =
-            if matches!(join_type, JoinType::Semi | JoinType::Anti) && filter.is_some() {
-                if candidate_build_indices.is_empty() {
-                    (vec![], vec![])
-                } else {
-                    // Create combined batch with all candidate pairs
-                    let combined_batch = create_combined_batch(
-                        build_batches,
-                        &candidate_build_indices,
-                        probe_batch,
-                        &candidate_probe_indices,
-                        swapped,
-                        combined_schema,
-                    )?;
-
-                    // Evaluate filter on entire batch
-                    let filter_result = evaluate_expr(&combined_batch, filter.unwrap())?;
-                    let filter_mask = filter_result
-                        .as_any()
-                        .downcast_ref::<arrow::array::BooleanArray>();
-
-                    // Filter the indices based on filter result
-                    let mut filtered_build_indices = Vec::new();
-                    let mut filtered_probe_indices = Vec::new();
-
-                    if let Some(mask) = filter_mask {
-                        for i in 0..mask.len() {
-                            if mask.value(i) {
-                                filtered_build_indices.push(candidate_build_indices[i]);
-                                filtered_probe_indices.push(candidate_probe_indices[i]);
-                            }
-                        }
-                    } else {
-                        // If filter didn't return boolean array, keep all candidates
-                        filtered_build_indices = candidate_build_indices;
-                        filtered_probe_indices = candidate_probe_indices;
-                    }
-
-                    (filtered_build_indices, filtered_probe_indices)
-                }
-            } else {
-                (candidate_build_indices, candidate_probe_indices)
-            };
+        // The ON-clause predicate is part of the join condition: reject
+        // non-qualifying candidate pairs here, BEFORE match tracking, so outer
+        // rows that lose every match are still emitted null-extended.
+        let (build_indices, probe_indices) = match filter {
+            Some(f) => filter_candidate_pairs(
+                build_batches,
+                probe_batch,
+                candidate_build_indices,
+                candidate_probe_indices,
+                swapped,
+                combined_schema,
+                f,
+            )?,
+            None => (candidate_build_indices, candidate_probe_indices),
+        };
 
         // Update matched tracking
         let mut probe_matched = vec![false; probe_batch.num_rows()];
@@ -2933,13 +3099,21 @@ fn probe_hash_table(
                 // For now, treat like Semi join (keep matched rows)
             }
             JoinType::Full => {
-                // Implemented below after processing all probe batches
-                if !build_indices.is_empty() {
+                // Unmatched BUILD rows are emitted after all probe batches (or
+                // by execute() when a shared tracker exists). Unmatched PROBE
+                // rows are emitted here, null-extended on the build side.
+                let (bi, pi) = add_unmatched_probe(
+                    &build_indices,
+                    &probe_indices,
+                    &probe_matched,
+                    probe_batch.num_rows(),
+                );
+                if !bi.is_empty() {
                     let batch = create_joined_batch(
                         build_batches,
                         probe_batch,
-                        &build_indices,
-                        &probe_indices,
+                        &bi,
+                        &pi,
                         swapped,
                         output_schema,
                         None,
@@ -2950,22 +3124,48 @@ fn probe_hash_table(
         }
     }
 
-    // For outer joins, add unmatched build rows
-    if matches!(join_type, JoinType::Right | JoinType::Full) && !swapped {
-        let unmatched_build = collect_unmatched_build(&build_matched);
-        if !unmatched_build.is_empty() {
-            let batch =
-                create_build_only_batch(build_batches, &unmatched_build, output_schema, swapped)?;
-            results.push(batch);
+    // Publish local build-match bits into the SHARED tracker when one exists;
+    // execute()'s last probe partition then emits the unmatched build rows
+    // exactly once. Emitting them here as well would duplicate them.
+    if matches!(join_type, JoinType::Left | JoinType::Right | JoinType::Full) {
+        if let Some(shared) = shared_build_matched {
+            for (batch_idx, flags) in build_matched.iter().enumerate() {
+                for (row_idx, &m) in flags.iter().enumerate() {
+                    if m {
+                        shared[batch_idx][row_idx]
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
         }
     }
 
-    if matches!(join_type, JoinType::Full) && swapped {
-        let unmatched_build = collect_unmatched_build(&build_matched);
-        if !unmatched_build.is_empty() {
-            let batch =
-                create_build_only_batch(build_batches, &unmatched_build, output_schema, swapped)?;
-            results.push(batch);
+    // For outer joins, add unmatched build rows
+    if shared_build_matched.is_none() {
+        if matches!(join_type, JoinType::Right | JoinType::Full) && !swapped {
+            let unmatched_build = collect_unmatched_build(&build_matched);
+            if !unmatched_build.is_empty() {
+                let batch = create_build_only_batch(
+                    build_batches,
+                    &unmatched_build,
+                    output_schema,
+                    swapped,
+                )?;
+                results.push(batch);
+            }
+        }
+
+        if matches!(join_type, JoinType::Full) && swapped {
+            let unmatched_build = collect_unmatched_build(&build_matched);
+            if !unmatched_build.is_empty() {
+                let batch = create_build_only_batch(
+                    build_batches,
+                    &unmatched_build,
+                    output_schema,
+                    swapped,
+                )?;
+                results.push(batch);
+            }
         }
     }
 

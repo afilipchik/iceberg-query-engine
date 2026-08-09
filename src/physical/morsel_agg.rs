@@ -1983,11 +1983,22 @@ impl AggregationState {
     /// Check if a perfect hash slot has data.
     /// For GROUP BY without aggregates (DISTINCT-like), check key_order instead.
     fn slot_has_data(key: &GroupKey, accs: &[AccumulatorState]) -> bool {
-        // If there are no accumulators (GROUP BY without aggregates),
-        // check if the key slot was assigned (non-null key values)
+        // A slot whose key was recorded is a real group, even when every
+        // accumulator still looks "empty". That happens for legitimate
+        // results: COUNT(col) is 0 and MIN/MAX are NULL when the group's
+        // rows all carry NULL in the aggregated column (exactly what an
+        // outer join's NULL-extended rows produce), and SUM can genuinely be
+        // 0.0. Inferring occupancy from the accumulators deleted those whole
+        // rows from the output. This is the same occupancy test the
+        // perfect-hash rehash uses.
+        if !key.values.is_empty() && !key.values.iter().all(|v| matches!(v, ScalarValue::Null)) {
+            return true;
+        }
+        // Unrecorded key: either a free slot, or a group whose key really is
+        // NULL in every column. Fall back to the accumulator probe, which
+        // keeps NULL-keyed groups that did see data.
         if accs.is_empty() {
-            return !key.values.is_empty()
-                && !key.values.iter().all(|v| matches!(v, ScalarValue::Null));
+            return false;
         }
         accs.iter().any(|a| match a {
             AccumulatorState::Count(c) => *c > 0,

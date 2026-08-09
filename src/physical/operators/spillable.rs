@@ -368,6 +368,18 @@ impl SpillableHashJoinExec {
                 self.join_type
             )));
         }
+        // The spill path also ignores the join filter (the non-equi part of an
+        // ON clause). Inner joins are lowered with a post-filter above the join
+        // so they never carry one, but never emit unfiltered rows if that ever
+        // changes.
+        if self.filter.is_some() {
+            return Err(QueryError::Execution(
+                "join build side exceeds the memory budget, but the join spill \
+                 path cannot evaluate an ON-clause filter. Raise the memory \
+                 limit for this query."
+                    .to_string(),
+            ));
+        }
 
         self.config.ensure_spill_dir()?;
 
