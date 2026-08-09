@@ -210,6 +210,51 @@ pub struct ExecutionConfig {
     /// Enable morsel-driven parallel execution for aggregations over Parquet
     /// When true (default), uses optimized parallel aggregation for Parquet scans
     pub enable_morsel_execution: bool,
+
+    /// How `ORDER BY <distance> LIMIT k` is answered. See [`VectorSearchMode`].
+    pub vector_search_mode: VectorSearchMode,
+
+    /// Candidates to re-rank with exact distances, as a multiple of `k`.
+    ///
+    /// This is the recall lever: the index proposes `k * factor` rows, then
+    /// exact distances decide the final k. `None` means no refinement.
+    pub vector_refine_factor: Option<u32>,
+
+    /// IVF partitions to probe. `None` uses the index's own default.
+    pub vector_nprobes: Option<usize>,
+}
+
+/// Which semantics `ORDER BY <distance> LIMIT k` gets.
+///
+/// # Why this is a user-visible choice and not an optimizer decision
+///
+/// An IVF_PQ / HNSW index is **approximate**. Answering a SQL query from it can
+/// return different rows than the query literally specifies. Every other
+/// optimization in this engine preserves the answer exactly; this one does not,
+/// so it is not the optimizer's call to make silently. The mode is explicit,
+/// and the default is documented in CLAUDE.md with the measured recall that
+/// justifies it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorSearchMode {
+    /// Always compute exact distances for every row. Slowest, always right.
+    Exact,
+    /// Let the storage layer serve the search from its index when it has one,
+    /// falling back to `Exact` when it does not. Results may differ from
+    /// `Exact` — see `vector_refine_factor`.
+    Indexed,
+}
+
+impl VectorSearchMode {
+    /// Parse from a config string (`exact` / `indexed`); anything else is None.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "exact" | "brute" | "brute_force" | "off" | "false" | "0" => Some(Self::Exact),
+            "indexed" | "index" | "approx" | "approximate" | "on" | "true" | "1" => {
+                Some(Self::Indexed)
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Default for ExecutionConfig {
@@ -225,6 +270,42 @@ impl Default for ExecutionConfig {
             spill_threshold: 0.8,
             // Morsel execution enabled by default for better performance
             enable_morsel_execution: true,
+            // DEFAULT: Exact. Measured on data/vectors.lance (200k x 384,
+            // IVF_PQ 447 partitions / 48 sub-vectors, cosine), 10 natural
+            // language queries, k=10:
+            //
+            //   exact                109 ms   recall 1.000
+            //   indexed, no refine     5 ms   recall 0.590
+            //   indexed, refine=10     6 ms   recall 0.910
+            //   indexed, refine=50    15 ms   recall 0.940   <- plateau
+            //
+            // 21x faster is a real prize, but recall does not reach 1.0 at any
+            // refine factor, so the indexed path answers a measurably
+            // DIFFERENT question than the SQL asked. Making that the default
+            // would mean `ORDER BY distance LIMIT 10` quietly dropping about
+            // one true neighbour in ten because an index file happened to
+            // exist. Users who want that trade set `QE_VECTOR_SEARCH=indexed`
+            // (or `ExecutionConfig::vector_search_mode`) and get it.
+            vector_search_mode: std::env::var("QE_VECTOR_SEARCH")
+                .ok()
+                .and_then(|v| VectorSearchMode::parse(&v))
+                .unwrap_or(VectorSearchMode::Exact),
+            // refine=10 is the knee: 0.59 -> 0.91 recall for ~1 ms. Going to
+            // 50 buys 0.94 for 9 ms more, and nothing buys 1.0.
+            vector_refine_factor: match std::env::var("QE_VECTOR_REFINE") {
+                Ok(v) => v.parse::<u32>().ok().filter(|f| *f > 0),
+                Err(_) => Some(10),
+            },
+            // Left at Lance's own default on purpose. MEASURED IN LANCE
+            // 0.23.2: raising nprobes makes recall WORSE, monotonically —
+            // 0.91 at the default, 0.38 at nprobes=20, 0.16 at nprobes=447
+            // (all with refine=10). That is backwards for IVF and reproduces
+            // in raw pylance, so it is a defect in the pinned version, not in
+            // this engine. The knob is kept for the day it is fixed.
+            vector_nprobes: std::env::var("QE_VECTOR_NPROBES")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|n| *n > 0),
         }
     }
 }

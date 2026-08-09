@@ -6,6 +6,7 @@ use crate::physical::operators::{
     run_subquery_plan, AggregateExpr, ExternalSortExec, FilterExec, HashAggregateExec,
     HashJoinExec, LimitExec, MemoryTableExec, MorselAggregateExec, ProjectExec, SortExec,
     SpillableHashAggregateExec, SpillableHashJoinExec, SubqueryExecutor, TableProvider, UnionExec,
+    VectorSearchExec,
 };
 use crate::physical::PhysicalOperator;
 use crate::planner::{BinaryOp, Expr, JoinType, LogicalPlan, PlanSchema};
@@ -1344,6 +1345,57 @@ impl PhysicalPlanner {
                 let input = self.create_physical_plan_inner(&node.input)?;
                 let limit = LimitExec::new(input, node.skip, node.fetch);
                 Ok(Arc::new(limit))
+            }
+
+            LogicalPlan::VectorSearch(node) => {
+                // The fallback IS the plan the optimizer replaced: build it
+                // exactly as if the rule had never fired, so the exact path is
+                // the same code that would have run otherwise.
+                let sorted = LogicalPlan::Sort(crate::planner::SortNode {
+                    input: node.input.clone(),
+                    order_by: vec![node.sort_key.clone()],
+                });
+                let limited = LogicalPlan::Limit(crate::planner::LimitNode {
+                    input: Arc::new(sorted),
+                    skip: node.skip,
+                    fetch: Some(node.k),
+                });
+                let fallback = self.create_physical_plan_inner(&limited)?;
+
+                let provider = self.tables.get(&node.table_name).cloned();
+                // Map output columns to indices in the PROVIDER's schema.
+                // If any column cannot be resolved there, hand the operator no
+                // provider at all — it will use the exact path.
+                let projection: Option<Vec<usize>> = provider.as_ref().and_then(|p| {
+                    let s = p.schema();
+                    node.outputs
+                        .iter()
+                        .map(|(src, _)| {
+                            s.fields()
+                                .iter()
+                                .position(|f| f.name().eq_ignore_ascii_case(src))
+                        })
+                        .collect()
+                });
+                let (provider, projection) = match projection {
+                    Some(p) => (provider, p),
+                    None => (None, Vec::new()),
+                };
+
+                Ok(Arc::new(VectorSearchExec::new(
+                    fallback,
+                    provider,
+                    projection,
+                    node.outputs.iter().map(|(_, f)| f.clone()).collect(),
+                    node.column.clone(),
+                    node.query.clone(),
+                    node.k,
+                    node.skip,
+                    node.metric,
+                    node.filter.clone(),
+                    plan_schema_to_arrow(&node.schema),
+                    self.config.clone().unwrap_or_default(),
+                )))
             }
 
             LogicalPlan::Distinct(node) => {

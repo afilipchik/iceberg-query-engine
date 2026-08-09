@@ -377,6 +377,11 @@ impl JoinReorder {
                 }))
             }
 
+            // Opaque: its `input` is a frozen exact-fallback plan whose shape
+            // the node's own metadata (outputs, filter) describes. Rewriting
+            // that subtree independently would desynchronize the two.
+            LogicalPlan::VectorSearch(node) => Ok(LogicalPlan::VectorSearch(node.clone())),
+
             LogicalPlan::DelimGet(node) => Ok(LogicalPlan::DelimGet(node.clone())),
         }
     }

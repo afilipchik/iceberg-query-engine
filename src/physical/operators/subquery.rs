@@ -1032,6 +1032,9 @@ fn substitute_columns_in_plan(
             }))
         }
 
+        // A vector search never contains an outer reference: the rule only
+        // fires on a literal query vector over a single scan.
+        LogicalPlan::VectorSearch(node) => Ok(LogicalPlan::VectorSearch(node.clone())),
         LogicalPlan::DelimGet(node) => Ok(LogicalPlan::DelimGet(node.clone())),
     }
 }

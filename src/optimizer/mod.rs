@@ -68,6 +68,9 @@ impl Optimizer {
                 // Pack dual int group keys onto the raw aggregation path
                 Arc::new(rules::PackedGroupKeys::new()),
                 Arc::new(rules::ProjectionPushdown),
+                // Last: needs the final projection/filter shape to recognize a
+                // k-NN, and produces an opaque node the other rules skip.
+                Arc::new(rules::VectorSearchPushdown),
             ],
             max_iterations: 10,
             table_stats: HashMap::new(),

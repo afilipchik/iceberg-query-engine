@@ -253,6 +253,13 @@ impl CostEstimator {
                 }
             }
 
+            // A top-k search emits exactly k rows, whatever its input costs.
+            LogicalPlan::VectorSearch(node) => Statistics {
+                row_count: Some(node.k),
+                total_byte_size: Some(node.k * node.schema.len() * 8),
+                column_stats: vec![],
+            },
+
             LogicalPlan::DelimGet(node) => {
                 // DelimGet receives distinct correlation values - estimate based on delim columns
                 Statistics {
@@ -380,6 +387,8 @@ impl CostEstimator {
                         left_rows * distinct_factor * 16.0, // Hash table memory for distinct values
                     )
             }
+
+            LogicalPlan::VectorSearch(node) => self.estimate(&node.input),
 
             LogicalPlan::DelimGet(_) => {
                 // DelimGet is a source that receives data from parent - minimal cost

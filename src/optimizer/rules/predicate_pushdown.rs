@@ -569,6 +569,21 @@ impl PredicatePushdown {
                 }
             }
 
+            // A predicate must NOT sink below a top-k: filtering after the
+            // fact changes which k rows the query returns. Keep it above.
+            LogicalPlan::VectorSearch(node) => {
+                let node = LogicalPlan::VectorSearch(node.clone());
+                if predicates.is_empty() {
+                    Ok(node)
+                } else {
+                    let combined = self.combine_predicates(predicates);
+                    Ok(LogicalPlan::Filter(FilterNode {
+                        input: Arc::new(node),
+                        predicate: combined,
+                    }))
+                }
+            }
+
             LogicalPlan::DelimGet(node) => {
                 // DelimGet is a leaf node - can't push predicates into it
                 if predicates.is_empty() {

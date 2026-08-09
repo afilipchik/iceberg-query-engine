@@ -68,6 +68,28 @@ pub trait TableProvider: Send + Sync + fmt::Debug {
     fn parquet_files(&self) -> Option<Vec<PathBuf>> {
         None
     }
+
+    /// Serve a k-nearest-neighbour search from a vector index, if this provider
+    /// has one.
+    ///
+    /// `Ok(None)` means "not supported" and is the default: the caller MUST
+    /// then fall back to the exact brute-force path, which is always correct.
+    /// A provider therefore cannot change any existing query's answer by
+    /// existing, and this method can gain fields without touching implementors.
+    ///
+    /// # Approximate results
+    ///
+    /// An implementation backed by an approximate index (IVF_PQ, HNSW) may
+    /// return rows that differ from the exact top-k. That is why
+    /// [`VectorQuery::use_index`] exists and why the engine only calls this
+    /// when the user has opted in — see `VectorSearchExec`.
+    fn scan_knn(
+        &self,
+        _projection: Option<&[usize]>,
+        _query: &crate::physical::vector::VectorQuery,
+    ) -> Result<Option<Vec<RecordBatch>>> {
+        Ok(None)
+    }
 }
 
 /// In-memory table provider

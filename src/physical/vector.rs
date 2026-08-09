@@ -33,6 +33,37 @@ use crate::error::{QueryError, Result};
 use arrow::array::{Array, ArrayRef, FixedSizeListArray, Float32Array, Float64Array};
 use arrow::datatypes::DataType;
 
+pub use crate::planner::vector_types::VectorMetric;
+
+/// A k-nearest-neighbour request handed to a [`crate::physical::operators::TableProvider`].
+///
+/// Providers that cannot serve it return `Ok(None)` and the engine falls back
+/// to the exact brute-force path, so adding a field here can never change an
+/// existing provider's answers.
+#[derive(Debug, Clone)]
+pub struct VectorQuery {
+    /// Name of the vector column in the provider's schema.
+    pub column: String,
+    /// The query vector. Its length must equal the column's dimension.
+    pub query: Vec<f32>,
+    /// Number of neighbours requested.
+    pub k: usize,
+    /// Metric implied by the SQL distance function used.
+    pub metric: VectorMetric,
+    /// Optional scalar predicate to apply *before* the search (a prefilter).
+    /// `None` means no filter.
+    pub filter: Option<crate::planner::Expr>,
+    /// When false, force an exact (brute-force) search inside the provider.
+    /// This is what makes approximate-vs-exact an explicit choice rather than
+    /// an accident of whether an index happens to exist.
+    pub use_index: bool,
+    /// IVF probes. `None` leaves the provider's default.
+    pub nprobes: Option<usize>,
+    /// Refine factor: fetch `k * refine_factor` candidates from the index, then
+    /// re-rank them with exact distances. The single biggest recall lever.
+    pub refine_factor: Option<u32>,
+}
+
 /// Borrow a fixed-size-list column as `(flat values, dimension)`.
 ///
 /// Returns `None` when the array is not a float vector column. The returned

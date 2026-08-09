@@ -107,6 +107,9 @@ impl ProjectionPushdown {
                 self.collect_recursive(&node.left, required);
                 self.collect_recursive(&node.right, required);
             }
+            // Opaque; its projection list is already fixed by the rule that
+            // built it, and its input must not be re-pruned underneath it.
+            LogicalPlan::VectorSearch(_) => {}
             LogicalPlan::DelimGet(_) => {}
         }
     }
@@ -594,6 +597,7 @@ impl ProjectionPushdown {
                 }))
             }
 
+            LogicalPlan::VectorSearch(node) => Ok(LogicalPlan::VectorSearch(node.clone())),
             LogicalPlan::DelimGet(node) => Ok(LogicalPlan::DelimGet(node.clone())),
         }
     }

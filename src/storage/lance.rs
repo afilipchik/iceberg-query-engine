@@ -507,6 +507,138 @@ async fn scan_one(
         .map_err(|e| lance_err("read batches", e))
 }
 
+/// Render an engine predicate as a Lance (DataFusion) SQL filter string.
+///
+/// Returns `None` for anything not on the whitelist. That conservatism is the
+/// point: `scan_knn` treats `None` as "do not push this search down at all",
+/// so an unsupported predicate costs performance, never correctness. Adding a
+/// case here is only safe if the rendered SQL means *exactly* what the engine's
+/// own evaluator would compute.
+fn expr_to_lance_sql(expr: &crate::planner::Expr, schema: &ArrowSchema) -> Option<String> {
+    use crate::planner::{BinaryOp, Expr, ScalarValue, UnaryOp};
+
+    fn lit(v: &ScalarValue) -> Option<String> {
+        Some(match v {
+            ScalarValue::Boolean(b) => b.to_string(),
+            ScalarValue::Int8(i) => i.to_string(),
+            ScalarValue::Int16(i) => i.to_string(),
+            ScalarValue::Int32(i) => i.to_string(),
+            ScalarValue::Int64(i) => i.to_string(),
+            ScalarValue::UInt8(i) => i.to_string(),
+            ScalarValue::UInt16(i) => i.to_string(),
+            ScalarValue::UInt32(i) => i.to_string(),
+            ScalarValue::UInt64(i) => i.to_string(),
+            ScalarValue::Float32(f) => {
+                if !f.0.is_finite() {
+                    return None;
+                }
+                format!("{:?}", f.0)
+            }
+            ScalarValue::Float64(f) => {
+                if !f.0.is_finite() {
+                    return None;
+                }
+                format!("{:?}", f.0)
+            }
+            ScalarValue::Utf8(s) => format!("'{}'", s.replace('\'', "''")),
+            ScalarValue::Date32(d) => {
+                // Render as a date literal rather than an integer, so the
+                // comparison is against a DATE column and not its raw days.
+                let date = chrono::NaiveDate::from_num_days_from_ce_opt(*d + 719_163)?;
+                format!("DATE '{}'", date.format("%Y-%m-%d"))
+            }
+            // Decimals, timestamps, intervals, lists and NULL are deliberately
+            // absent: each has a formatting or type-coercion subtlety that
+            // could change the predicate's meaning.
+            _ => return None,
+        })
+    }
+
+    fn go(e: &crate::planner::Expr, schema: &ArrowSchema) -> Option<String> {
+        match e {
+            Expr::Column(c) => {
+                // Lance knows bare column names only; a qualifier from the
+                // engine's plan must resolve to a real dataset column.
+                let name = schema
+                    .fields()
+                    .iter()
+                    .find(|f| f.name().eq_ignore_ascii_case(&c.name))?
+                    .name();
+                // NOT double-quoted. Lance 0.23.2 parses `"category"` as the
+                // string literal 'category', so `"category" = 'footwear'` is a
+                // constant FALSE and the filter silently matches nothing.
+                // Emitting a bare identifier means only simple names can be
+                // pushed, so anything needing quoting refuses the pushdown.
+                let simple = !name.is_empty()
+                    && name
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                simple.then(|| name.clone())
+            }
+            Expr::Literal(v) => lit(v),
+            Expr::BinaryExpr { left, op, right } => {
+                let sym = match op {
+                    BinaryOp::Eq => "=",
+                    BinaryOp::NotEq => "!=",
+                    BinaryOp::Lt => "<",
+                    BinaryOp::LtEq => "<=",
+                    BinaryOp::Gt => ">",
+                    BinaryOp::GtEq => ">=",
+                    BinaryOp::And => "AND",
+                    BinaryOp::Or => "OR",
+                    BinaryOp::Like => "LIKE",
+                    BinaryOp::NotLike => "NOT LIKE",
+                    // Arithmetic is omitted: integer division and decimal
+                    // scaling differ between the engine and DataFusion.
+                    _ => return None,
+                };
+                Some(format!(
+                    "({} {} {})",
+                    go(left, schema)?,
+                    sym,
+                    go(right, schema)?
+                ))
+            }
+            Expr::UnaryExpr { op, expr } => match op {
+                UnaryOp::Not => Some(format!("(NOT {})", go(expr, schema)?)),
+                UnaryOp::IsNull => Some(format!("({} IS NULL)", go(expr, schema)?)),
+                UnaryOp::IsNotNull => Some(format!("({} IS NOT NULL)", go(expr, schema)?)),
+                _ => None,
+            },
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                let items: Option<Vec<String>> = list.iter().map(|l| go(l, schema)).collect();
+                Some(format!(
+                    "({} {}IN ({}))",
+                    go(expr, schema)?,
+                    if *negated { "NOT " } else { "" },
+                    items?.join(", ")
+                ))
+            }
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => Some(format!(
+                "({} {}BETWEEN {} AND {})",
+                go(expr, schema)?,
+                if *negated { "NOT " } else { "" },
+                go(low, schema)?,
+                go(high, schema)?
+            )),
+            _ => None,
+        }
+    }
+
+    go(expr, schema)
+}
+
 fn dir_size(path: &Path) -> u64 {
     fn walk(p: &Path, acc: &mut u64) {
         let Ok(entries) = std::fs::read_dir(p) else {
@@ -549,6 +681,128 @@ impl TableProvider for LanceTable {
 
         let ds = Arc::clone(&self.dataset);
         block_on_lance(async move { scan_fragments(ds, names).await })
+    }
+
+    /// Run a k-NN search through Lance's vector index.
+    ///
+    /// # Semantics — read this before trusting the output
+    ///
+    /// Lance's vector indices (IVF_PQ, IVF_HNSW_*) are **approximate**. The
+    /// rows this returns are not guaranteed to be the exact top-k, and with
+    /// product quantization the returned `_distance` values are quantized
+    /// approximations too. `refine_factor` re-ranks `k * factor` candidates
+    /// with exact distances, which fixes the *distances* and greatly improves
+    /// *which rows* come back, but does not make the search exhaustive.
+    ///
+    /// `use_index = false` asks Lance for a flat (exact) search. That is still
+    /// useful — Lance's scan is faster than pulling every embedding through the
+    /// engine — and it is what makes "exact via Lance" a distinct, cheaper
+    /// option from "exact via the engine's brute-force path".
+    ///
+    /// Returns `Ok(None)` when the request cannot be served faithfully:
+    /// unknown column, dimension mismatch, or no index when one was required.
+    /// The caller then falls back to the exact path.
+    fn scan_knn(
+        &self,
+        projection: Option<&[usize]>,
+        q: &crate::physical::vector::VectorQuery,
+    ) -> Result<Option<Vec<RecordBatch>>> {
+        use arrow::array::Float32Array;
+
+        // Validate the column against the dataset schema before touching Lance,
+        // so a typo produces a clean fallback rather than an opaque Lance error.
+        let Some(field) = self
+            .schema
+            .fields()
+            .iter()
+            .find(|f| f.name().eq_ignore_ascii_case(&q.column))
+        else {
+            return Ok(None);
+        };
+        match field.data_type() {
+            DataType::FixedSizeList(_, width) if *width as usize == q.query.len() => {}
+            _ => return Ok(None),
+        }
+
+        let mut names = self.projected_names(projection)?;
+        // Lance rejects an empty projection, and the search needs at least one
+        // column to hang the result on.
+        if names.is_empty() {
+            names.push(field.name().clone());
+        }
+
+        // A predicate that cannot be rendered faithfully as Lance SQL must
+        // abort the pushdown entirely. Running the search WITHOUT the filter
+        // and letting a later operator apply it would return the k nearest
+        // rows overall and then throw most of them away — fewer than k rows,
+        // silently. Falling back is slow; this would be wrong.
+        let filter_sql = match &q.filter {
+            None => None,
+            Some(e) => match expr_to_lance_sql(e, &self.schema) {
+                Some(sql) => Some(sql),
+                None => return Ok(None),
+            },
+        };
+
+        let ds = Arc::clone(&self.dataset);
+        let column = field.name().clone();
+        let query = q.clone();
+        let batches = block_on_lance(async move {
+            let mut scanner = ds.scan();
+            let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+            scanner
+                .project(&refs)
+                .map_err(|e| lance_err(&format!("project {:?}", names), e))?;
+
+            let key = Arc::new(Float32Array::from(query.query.clone()));
+            scanner
+                .nearest(&column, key.as_ref(), query.k)
+                .map_err(|e| lance_err(&format!("nearest({})", column), e))?;
+
+            // MEASURED BUG IN LANCE 0.23.2: `prefilter(true)` does not
+            // prefilter when the vector index is used. A search for
+            // `category = 'books'` over a dataset with 40,000 matching rows
+            // returns ZERO rows, because the predicate is applied to the
+            // index's candidate list instead of before it — and for a query
+            // vector whose neighbours are all in another category, that list
+            // contains nothing that survives. `use_index(false)` + prefilter
+            // returns the correct 10 rows.
+            //
+            // So: a filtered search runs as a flat (exact) Lance scan. That is
+            // slower than the index (67ms vs 11ms on the 200k test set) but it
+            // is still ~2x faster than pulling every embedding through the
+            // engine, and — the part that matters — it is CORRECT. Returning
+            // silently truncated results here would be the exact failure mode
+            // this whole operator is built to prevent.
+            let use_index = query.use_index && filter_sql.is_none();
+            scanner.use_index(use_index);
+            if use_index {
+                if let Some(n) = query.nprobes {
+                    scanner.nprobs(n);
+                }
+                if let Some(r) = query.refine_factor {
+                    scanner.refine(r);
+                }
+            }
+            if let Some(sql) = &filter_sql {
+                scanner.prefilter(true);
+                scanner
+                    .filter(sql)
+                    .map_err(|e| lance_err(&format!("filter {}", sql), e))?;
+            }
+            scanner.batch_size(LANCE_BATCH_SIZE);
+
+            let stream = scanner
+                .try_into_stream()
+                .await
+                .map_err(|e| lance_err("open knn stream", e))?;
+            stream
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|e| lance_err("read knn batches", e))
+        })?;
+
+        Ok(Some(batches))
     }
 
     /// Row count and size come from Lance metadata; integer column min/max/NDV

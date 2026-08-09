@@ -197,7 +197,9 @@ src/
 │       ├── subquery.rs       # SubqueryExecutor for correlated subqueries
 │       ├── union.rs          # UnionExec for UNION/UNION ALL
 │       ├── parquet.rs        # ParquetScanExec, ParquetTable, ParquetWriter
+│       ├── vector_search.rs  # VectorSearchExec (k-NN, exact + index paths)
 │       └── iceberg.rs        # IcebergScanExec, PartitionFilter
+│   ├── vector.rs             # Distance kernels, VectorQuery, VectorMetric
 │
 ├── storage/                  # External storage providers
 │   ├── mod.rs                # Module exports (ParquetTable, LanceTable)
@@ -959,7 +961,148 @@ generic `TableProvider`.
 - `scan_with_filter` — `LanceTable` uses the default no-op. Lance's
   `Scanner::filter(&str)` takes a DataFusion SQL string; wiring the engine's
   `Expr` to it risks silent dialect divergence, so it was left out deliberately.
-  This is the largest remaining lever for the Lance path.
+  This is the largest remaining lever for the Lance path. (A *narrow*,
+  whitelist-only `Expr -> Lance SQL` renderer now exists in `lance.rs` for the
+  k-NN prefilter — see Vector Search — and the dialect divergence fear turned
+  out to be justified: see the double-quote finding there.)
+
+## Vector Search (2026-08-09, `--features lance`)
+
+Vector columns (`FixedSizeList<Float32, N>` — how Lance stores embeddings) are
+readable, projectable and searchable end-to-end.
+
+```sql
+SELECT id, category, text FROM vectors
+ORDER BY cosine_distance(embedding, [0.013, -0.041, ...])   -- 384 floats
+LIMIT 10;
+```
+
+### The three layers
+
+1. **Reading** — `unsupported_reason` in `src/storage/lance.rs` accepts
+   `FixedSizeList`/`List`/`LargeList` of scalars. A vector is carried as an
+   **opaque value**: selectable, projectable, aliasable, LIMIT-able. It is NOT
+   summable, groupable, orderable or comparable — `src/planner/vector_types.rs`
+   rejects those in the binder with a message naming the column and its
+   dimension. Struct/Map are still rejected.
+2. **Distance functions** — `src/physical/vector.rs`. Kernels read the
+   `FixedSizeListArray` values buffer directly (one contiguous `&[f32]` per
+   batch, no per-row `Vec`). Array literals bind to one `ScalarValue::List`
+   (`Binder::bind_array_literal`), so a 384-element vector is a single plan node,
+   not a 384-child expression tree.
+3. **Index pushdown** — `TableProvider::scan_knn` (default `Ok(None)` = "not
+   supported"), `LanceTable::scan_knn` via `Scanner::nearest`, the
+   `VectorSearchPushdown` optimizer rule, and `VectorSearchExec`.
+
+### Sign conventions (fixed; the pushdown rule depends on them)
+
+| function | formula | closer = | ORDER BY |
+|---|---|---|---|
+| `l2_distance` / `euclidean_distance` | `sqrt(sum((a-b)^2))` | smaller | ASC |
+| `cosine_distance` | `1 - cos_sim` | smaller | ASC |
+| `cosine_similarity` | `cos_sim` | larger | DESC |
+| `dot_product` / `inner_product` | `sum(a*b)` | larger | DESC |
+
+`dot_product` is the raw inner product, deliberately not disguised as a distance
+(Lance stores "dot distance" as `1 - dot`, pgvector's `<#>` is `-dot`; both
+change the number the user sees). `l2_distance` takes the square root; Lance's
+internal L2 is *squared*. Ordering is unaffected either way, which is why
+pushdown stays valid.
+
+### THE SEMANTIC DECISION: default is EXACT
+
+**`ExecutionConfig::vector_search_mode` defaults to `VectorSearchMode::Exact`.**
+
+Measured on `data/vectors.lance` (200k x 384 real MiniLM embeddings, IVF_PQ /
+447 partitions / 48 sub-vectors / cosine), 10 natural-language queries, k=10,
+serialized on an idle machine:
+
+| path | median exec | recall@10 vs exact | category precision@10 |
+|---|---|---|---|
+| engine exact (brute force) | 109 ms | **1.000** | 1.000 |
+| indexed, no refine | 5.2 ms | 0.590 | 1.000 |
+| indexed, refine=10 (default when opted in) | 5.8 ms | **0.910** | 1.000 |
+| indexed, refine=50 | 15 ms | 0.940 | 1.000 |
+| indexed, refine=200 | 16 ms | 0.950 (plateau) | 1.000 |
+| pylance IVF_PQ refine=10 (reference) | 3.1 ms | — | — |
+| pylance flat / exact (reference) | 38.6 ms | 1.000 | — |
+
+**Recall never reaches 1.0 at any refine factor.** 21x faster is a real prize,
+but silently answering `ORDER BY distance LIMIT 10` from an index that drops
+about one true neighbour in ten is a correctness regression dressed as an
+optimization. So the fast path is opt-in and explicit:
+
+```bash
+QE_VECTOR_SEARCH=indexed      # or ExecutionConfig::vector_search_mode
+QE_VECTOR_REFINE=50           # candidates = k * factor, re-ranked exactly
+QE_VECTOR_NPROBES=...         # see the warning below
+```
+
+`VectorSearchExec` keeps the ORIGINAL plan as `fallback` and executes it
+verbatim whenever the mode is `Exact`, the provider has no index, or the
+provider declines. Exact is therefore not a re-implementation of the query — it
+*is* the query.
+
+### Three measured Lance 0.23.2 defects (all reproduce in raw pylance)
+
+1. **`prefilter(true)` does not prefilter when the vector index is used.**
+   `nearest(...) + filter("category = 'books'")` returns **0 rows** on a dataset
+   where 40,000 rows match, because the predicate is applied to the index's
+   candidate list rather than before it. `use_index(false)` + prefilter returns
+   the correct 10. **Workaround**: `LanceTable::scan_knn` forces a flat Lance
+   scan whenever a filter is present. Slower than the index (67 vs 11 ms) but
+   exact — and filtered searches are therefore exact in *both* modes.
+2. **Double-quoted identifiers are parsed as string literals.**
+   `"category" = 'footwear'` is a constant FALSE, so the filter matches nothing
+   — silently. `expr_to_lance_sql` emits bare identifiers and refuses to push
+   any column name that would need quoting.
+3. **Raising `nprobes` monotonically *lowers* recall**: 0.91 at Lance's default,
+   0.56 at 10, 0.38 at 20, 0.16 at 447 (all with refine=10). Backwards for IVF.
+   `vector_nprobes` defaults to `None` (Lance's own default) for that reason.
+
+### The optimizer rule refuses more than it accepts
+
+`VectorSearchPushdown` (`src/optimizer/rules/vector_search.rs`, registered LAST)
+matches `Limit(k)` over `Sort([one distance key])` over a chain of *pure column*
+projections over a `Scan`. It declines on: multiple sort keys, a direction that
+contradicts the metric's sign convention (`ORDER BY cosine_distance(...) DESC`
+asks for the k *furthest* rows), no LIMIT, `NULLS FIRST`, any computed
+projection, any Filter/Join/Aggregate between Sort and Scan, or a dimension
+mismatch. A missed pushdown is slow; a wrong one is wrong answers.
+
+The scan's pushed-down predicate becomes the prefilter. Lance's `_distance`
+column is dropped in `VectorSearchExec::shape_output` so it never appears as a
+surprise column.
+
+**Known limitation, by design**: putting the distance in the SELECT list —
+`SELECT id, cosine_distance(embedding, [...]) AS score FROM ... ORDER BY ...` —
+makes the projection a *computed* one, so the rule refuses and the query runs
+the exact path. Results are correct, just at exact-path speed. This bit the
+test suite first: an early `vector_search_tests.rs` measured "indexed" recall
+with that shape and got a meaningless 1.000 because the pushdown never fired.
+`pushdown_fires_only_on_the_canonical_shape` now asserts on the optimized plan
+so the measurement cannot lie again.
+
+### Related bug found and fixed in shared code
+
+**`ORDER BY <column not in the SELECT list>` failed with `Column not found`.**
+`SELECT o_orderkey FROM orders ORDER BY o_totalprice` — valid SQL, and the exact
+shape a vector search needs — planned as `Sort(Project([o_orderkey], Scan))`,
+whose Sort input has no `o_totalprice`. `extend_projection_for_sort` in
+`binder.rs` now widens the projection under the Sort and adds a trimming
+projection **above the LIMIT** (above, so Sort+Limit stay adjacent and the
+physical planner's top-k fusion still fires). Conservative: only over a plain
+`Project`, never over an `Aggregate`, never when the sort key holds a subquery.
+
+### Validation
+
+`tests/vector_search_tests.rs` (feature-gated, skips without
+`data/vectors.lance` + `.scratch/vector_gt.json`). Assertions are on the
+**distance sequence**, not id lists: the dataset has duplicate texts, hence rows
+with byte-identical embeddings and tied distances straddling the k boundary, so
+which id lands at rank 10 is arbitrary in any implementation. The exact path
+matches the GPU float64 ground truth on all 10 queries at every rank, with
+category precision@10 = 1.000.
 
 ## Recently Implemented Features
 
@@ -1205,6 +1348,12 @@ generic `TableProvider`.
 | TableProvider trait | `src/physical/operators/scan.rs` |
 | Memory pool/config | `src/execution/memory.rs` |
 | Spillable operators | `src/physical/operators/spillable.rs` |
+| Vector distance kernels | `src/physical/vector.rs` |
+| Vector type rules (fail-loudly) | `src/planner/vector_types.rs` |
+| k-NN pushdown rule | `src/optimizer/rules/vector_search.rs` |
+| k-NN operator | `src/physical/operators/vector_search.rs` |
+| Lance k-NN / prefilter SQL | `src/storage/lance.rs` (`scan_knn`, `expr_to_lance_sql`) |
+| Vector search tests | `tests/vector_search_tests.rs` |
 | Iceberg scan with stats | `src/physical/operators/iceberg.rs` |
 | TPC-H queries | `src/tpch/queries.rs` |
 | TPC-H schemas | `src/tpch/schema.rs` |

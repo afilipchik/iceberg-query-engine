@@ -12,6 +12,7 @@ mod predicate_pushdown;
 mod projection_pushdown;
 mod semi_join_pushdown;
 mod subquery_decorrelation;
+mod vector_search;
 
 pub use constant_folding::ConstantFolding;
 pub use derive_or_predicates::DeriveOrPredicates;
@@ -25,3 +26,4 @@ pub use predicate_pushdown::PredicatePushdown;
 pub use projection_pushdown::ProjectionPushdown;
 pub use semi_join_pushdown::SemiJoinPushdown;
 pub use subquery_decorrelation::SubqueryDecorrelation;
+pub use vector_search::VectorSearchPushdown;

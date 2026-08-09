@@ -15,6 +15,7 @@ pub mod spillable;
 pub mod streaming_parquet_scan;
 mod subquery;
 mod union;
+pub mod vector_search;
 pub mod vectorized_hash;
 
 pub use delim_join::{DelimGetExec, DelimJoinExec, DelimState};
@@ -34,3 +35,4 @@ pub use subquery::{
     evaluate_subquery_expr, is_correlated_subquery_plan, run_subquery_plan, SubqueryExecutor,
 };
 pub use union::UnionExec;
+pub use vector_search::VectorSearchExec;

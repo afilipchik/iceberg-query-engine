@@ -69,6 +69,13 @@ pub enum LogicalPlan {
     /// DelimGet - Scan of deduplicated outer values inside a decorrelated subquery
     /// Receives correlation values from parent DelimJoin
     DelimGet(DelimGetNode),
+    /// Top-k nearest-neighbour search over a vector column.
+    ///
+    /// Produced by the `VectorSearchPushdown` rule from the canonical
+    /// `LIMIT k` over `ORDER BY <distance>(col, <literal>)` shape. It keeps its
+    /// original subtree as `input`, so the physical operator can execute the
+    /// unmodified exact plan whenever the storage layer declines the pushdown.
+    VectorSearch(VectorSearchNode),
 }
 
 impl LogicalPlan {
@@ -89,6 +96,7 @@ impl LogicalPlan {
             LogicalPlan::Values(node) => node.schema.clone(),
             LogicalPlan::DelimJoin(node) => node.schema.clone(),
             LogicalPlan::DelimGet(node) => node.schema.clone(),
+            LogicalPlan::VectorSearch(node) => node.schema.clone(),
         }
     }
 
@@ -107,6 +115,7 @@ impl LogicalPlan {
             LogicalPlan::SubqueryAlias(node) => vec![&node.input],
             LogicalPlan::DelimJoin(node) => vec![&node.left, &node.right],
             LogicalPlan::DelimGet(_) => vec![], // DelimGet is a source, no children
+            LogicalPlan::VectorSearch(node) => vec![&node.input],
         }
     }
 
@@ -177,6 +186,10 @@ impl LogicalPlan {
                 })
             }
             LogicalPlan::DelimGet(node) => LogicalPlan::DelimGet(node.clone()),
+            LogicalPlan::VectorSearch(node) => LogicalPlan::VectorSearch(VectorSearchNode {
+                input: children.into_iter().next().unwrap(),
+                ..node.clone()
+            }),
         }
     }
 
@@ -352,6 +365,26 @@ impl LogicalPlan {
                 let cols: Vec<String> = node.columns.iter().map(|e| e.to_string()).collect();
                 writeln!(f, "{}DelimGet: columns=[{}]", prefix, cols.join(", "))?;
             }
+            LogicalPlan::VectorSearch(node) => {
+                // The query vector is summarized, not printed: a 384-float
+                // literal makes every EXPLAIN unreadable.
+                writeln!(
+                    f,
+                    "{}VectorSearch: {}.{} metric={} k={} skip={} dim={}{}",
+                    prefix,
+                    node.table_name,
+                    node.column,
+                    node.metric,
+                    node.k,
+                    node.skip,
+                    node.query.len(),
+                    match &node.filter {
+                        Some(e) => format!(" prefilter=({})", e),
+                        None => String::new(),
+                    }
+                )?;
+                node.input.fmt_indent(f, indent + 1)?;
+            }
         }
         Ok(())
     }
@@ -516,6 +549,48 @@ pub struct DelimGetNode {
     pub schema: PlanSchema,
     /// Unique identifier to link with parent DelimJoin (set during planning)
     pub delim_id: u64,
+}
+
+/// A top-k nearest-neighbour search.
+///
+/// # The semantic hazard this node encodes
+///
+/// `input` is the ORIGINAL, exact plan (`Sort` input + the sort key + k). It is
+/// kept, not discarded, because a vector index is *approximate*: pushing the
+/// search into it can return different rows than `ORDER BY distance LIMIT k`
+/// computes. `VectorSearchExec` therefore treats the pushdown as an option, not
+/// a decision — when the session asks for exact results, or the provider has no
+/// index, or the predicate cannot be pushed faithfully, it runs `input` and the
+/// answer is bit-for-bit what the query said.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorSearchNode {
+    /// The exact plan this node replaced: `Project*(Scan)` below the Sort.
+    /// Executing `Limit(k, Sort(sort_key, input))` reproduces the original
+    /// query exactly, and that is precisely the fallback.
+    pub input: Arc<LogicalPlan>,
+    /// Table name of the `Scan` at the bottom of `input`.
+    pub table_name: String,
+    /// Vector column, named as it appears in the TABLE's schema.
+    pub column: String,
+    /// Query vector, folded out of the array literal.
+    pub query: Vec<f32>,
+    /// Neighbours to return (the LIMIT).
+    pub k: usize,
+    /// Rows to skip before the k (the OFFSET). Non-zero offsets need `skip + k`
+    /// neighbours from the index.
+    pub skip: usize,
+    /// Metric implied by the distance function that was written.
+    pub metric: crate::planner::vector_types::VectorMetric,
+    /// Scan-level predicate, to be applied as an index prefilter.
+    pub filter: Option<Expr>,
+    /// `(column name in the table, output field)` for each output column.
+    /// Every entry is a plain column reference — the rule refuses to fire on a
+    /// projection that computes anything.
+    pub outputs: Vec<(String, SchemaField)>,
+    /// The original ORDER BY key, used verbatim by the fallback path.
+    pub sort_key: SortExpr,
+    /// Output schema, identical to `input`'s.
+    pub schema: PlanSchema,
 }
 
 /// Builder for creating logical plans
