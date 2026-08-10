@@ -621,19 +621,31 @@ machine whose THP mode is `always` or `madvise`. That is a net **loss** here:
 
 * A standalone random-probe microbenchmark (`.scratch/hugebench/`) confirms 2MB
   pages ARE worth **8-11%** over a 1GB table. The TLB win is real in isolation.
-* The engine nonetheless runs **faster on 4KB pages**: SF=10 suite total
-  **7.98s -> 7.48s (-6.3%)**, 16 of 22 queries faster (Q01 -22%, Q06 -18%,
-  Q13 -14%, Q18 -13%, Q14 -12%, Q11 -11%, Q04 -11%). Of the 6 that were not,
-  three are sub-1% ties and Q19/Q21 flipped to faster when re-measured at 7
-  pairs. No query reliably prefers 2MB.
+* The engine nonetheless runs **cheaper on 4KB pages**. CORRECTED 2026-08-10
+  after independent re-measurement — the original claim here was
+  "7.98s -> 7.48s (-6.3%) suite wall", and that **did not reproduce**. Its
+  THP-on baseline (7.98s) was inflated by unrelated VM benchmarks running
+  concurrently on the box; a clean interleaved suite A/B shows THP-on and
+  THP-off within this machine's noise band on WALL time. The defensible,
+  reproduced numbers are CPU time and memory, which barely move with noise:
+  - **Q01 CPU 29.8s -> 26.5s (-11.3%)**, RSS 2244 -> 2111 MB (-6.3%)
+  - **Q09 CPU 83.2s -> 76.3s (-8.3%)**, RSS 5958 -> 5513 MB (-8.1%)
+  - **Throughput under load** (4 concurrent engines x 8 pinned cores, the
+    shared-nothing shape): **-2.5% wall, 3/3 pairs** for 4KB pages.
+  Single-query wall time on an IDLE box is a wash: ~8-11% less CPU is absorbed
+  by spare cores, so it only becomes speed once cores are saturated. That is
+  precisely why the concurrency measurement, not the idle one, justifies this.
 * **Why the microbenchmark does not transfer**: the engine's hot memory is
   *streamed*, not randomly probed. Morsel scans allocate, fill, drain and free
   large Arrow buffers continuously, so sequential prefetch already hides the TLB
   cost. What 2MB pages add is fault-time cost — on Q01 they raised kernel time
   2.64s -> 3.94s and user time 6.27s -> 7.80s, because the kernel zeroes a full
   2MB per fault and the engine ends up touching ~16% more physical memory.
-* Peak RSS **drops** with 4KB pages (Q01 1962 -> 1691MB, Q09 5087 -> 4813MB),
-  which is the direction the memory-safety rule wants.
+* Peak RSS **drops** with 4KB pages, which is the direction the memory-safety
+  rule wants. Two independent measurements agree on the direction and differ
+  in magnitude with the run (single-query vs 3-iteration): 1962 -> 1691MB and
+  5087 -> 4813MB in the original pass; 2244 -> 2111MB (Q01) and 5958 -> 5513MB
+  (Q09) on re-measurement.
 
 Set `QUERY_ENGINE_ALLOW_THP=1` to re-enable huge pages when re-measuring.
 
