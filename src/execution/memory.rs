@@ -9,6 +9,64 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+/// Opt this process out of transparent huge pages (2MB), keeping 4KB pages.
+///
+/// # Why the engine does NOT want huge pages
+///
+/// The intuition says otherwise — a multi-GB hash table probed at random costs
+/// ~262,000 TLB entries at 4KB versus 512 at 2MB — so this was measured rather
+/// than assumed, at SF=10 on 22 TPC-H queries, 5-7 interleaved A/B pairs each:
+///
+/// * A standalone random-probe microbenchmark says 2MB pages ARE worth
+///   8-11% over a 1GB table, and ~7% over 64MB. The TLB win is real.
+/// * The engine still runs FASTER on 4KB pages: **suite total 7.98s -> 7.48s
+///   (-6.3%)**, 16 of 22 queries faster — Q01 -22%, Q06 -18%, Q13 -14%,
+///   Q18 -13%, Q14 -12%, Q11 -11%, Q04 -11%.
+/// * Of the 6 that were not faster, three (Q02/Q03/Q10) are sub-1% ties, and
+///   Q19 (+8.4%) and Q21 (+2.2%) both flipped to FASTER on 4KB when
+///   re-measured at 7 pairs (-2.7%, -4.8%) — they were noise. Only Q16 has no
+///   consistent direction (+2.5% one run, -2.2% another). No query reliably
+///   prefers 2MB pages.
+///
+/// The reason the microbenchmark does not transfer: the engine's hot memory is
+/// *streamed*, not randomly probed. Morsel-driven scans allocate, fill, drain
+/// and free large Arrow buffers continuously, so sequential prefetch already
+/// hides the TLB cost that huge pages would remove. What huge pages add instead
+/// is fault-time cost — on Q01, 2MB pages raised kernel time 2.64s -> 3.94s and
+/// user time 6.27s -> 7.80s, because the kernel must zero a full 2MB on every
+/// fault and the engine touches ~16% more physical memory as a result
+/// (RSS 1.75GB -> 1.94GB). We pay to zero memory we never read.
+///
+/// Dropping to 4KB therefore both speeds the engine up and shrinks its peak
+/// RSS, which is the direction the memory-safety rule wants anyway.
+///
+/// mimalloc explicitly asks for huge pages (`madvise(MADV_HUGEPAGE)`) on its
+/// large regions, so without this call the engine gets 2MB backing for ~97-99%
+/// of its RSS on any machine whose THP mode is `always` or `madvise`.
+/// `PR_SET_THP_DISABLE` is used rather than mimalloc's `allow_thp` option
+/// because it takes effect immediately for every subsequent fault, regardless
+/// of whether mimalloc's one-shot OS-layer init has already run.
+///
+/// Set `QUERY_ENGINE_ALLOW_THP=1` to keep huge pages (for re-measuring this).
+/// Call once, early in `main`. No-op off Linux.
+pub fn disable_transparent_hugepages() {
+    // Only an explicit affirmative keeps huge pages. An empty or unrecognised
+    // value means "unset", so a stray `FOO=` in a shell script cannot silently
+    // switch the engine back onto the slower path.
+    let allow = std::env::var("QUERY_ENGINE_ALLOW_THP")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if allow {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        // PR_SET_THP_DISABLE == 41. Unprivileged, inherited by children, and
+        // advisory: a kernel without it just returns EINVAL, which we ignore.
+        libc::prctl(41, 1, 0, 0, 0);
+    }
+}
+
 /// Memory pool for tracking memory usage
 #[derive(Debug)]
 pub struct MemoryPool {

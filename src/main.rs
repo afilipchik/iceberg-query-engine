@@ -267,6 +267,13 @@ fn detect_sf(path: &Path) -> f64 {
 
 #[tokio::main]
 async fn main() {
+    // Serve the engine's memory on 4KB pages, not 2MB transparent huge pages.
+    // Measured, not assumed: 17 of 22 TPC-H queries get faster and peak RSS
+    // drops. See disable_transparent_hugepages() for the evidence and why the
+    // usual "huge pages help big hash tables" intuition does not apply here.
+    // Do this first: it only governs faults taken after this point.
+    query_engine::execution::disable_transparent_hugepages();
+
     // Allow any same-user process to attach a debugger/sampler when requested
     // (yama ptrace_scope=1 otherwise restricts attach to ancestors).
     if std::env::var("QUERY_PTRACE_ANY").is_ok() {

@@ -607,6 +607,43 @@ assert_eq!(result.schema.fields().len(), expected_cols);
 3. **Arrow kernels**: Use Arrow's optimized compute kernels where possible
 4. **Hash-based algorithms**: Preferred for joins and aggregations
 5. **Streaming**: Avoid materializing full results when possible
+6. **4KB pages, NOT transparent huge pages**: `main()` calls
+   `disable_transparent_hugepages()` (`src/execution/memory.rs`) to opt the
+   process out of THP via `prctl(PR_SET_THP_DISABLE)`. This is deliberate and
+   counter-intuitive — see the "Transparent huge pages" note below before
+   reverting it.
+
+### Transparent huge pages: measured OFF (2026-08-09)
+
+mimalloc calls `madvise(MADV_HUGEPAGE)` on its large regions, so without an
+explicit opt-out the engine gets 2MB pages for **97-99% of its RSS** on any
+machine whose THP mode is `always` or `madvise`. That is a net **loss** here:
+
+* A standalone random-probe microbenchmark (`.scratch/hugebench/`) confirms 2MB
+  pages ARE worth **8-11%** over a 1GB table. The TLB win is real in isolation.
+* The engine nonetheless runs **faster on 4KB pages**: SF=10 suite total
+  **7.98s -> 7.48s (-6.3%)**, 16 of 22 queries faster (Q01 -22%, Q06 -18%,
+  Q13 -14%, Q18 -13%, Q14 -12%, Q11 -11%, Q04 -11%). Of the 6 that were not,
+  three are sub-1% ties and Q19/Q21 flipped to faster when re-measured at 7
+  pairs. No query reliably prefers 2MB.
+* **Why the microbenchmark does not transfer**: the engine's hot memory is
+  *streamed*, not randomly probed. Morsel scans allocate, fill, drain and free
+  large Arrow buffers continuously, so sequential prefetch already hides the TLB
+  cost. What 2MB pages add is fault-time cost — on Q01 they raised kernel time
+  2.64s -> 3.94s and user time 6.27s -> 7.80s, because the kernel zeroes a full
+  2MB per fault and the engine ends up touching ~16% more physical memory.
+* Peak RSS **drops** with 4KB pages (Q01 1962 -> 1691MB, Q09 5087 -> 4813MB),
+  which is the direction the memory-safety rule wants.
+
+Set `QUERY_ENGINE_ALLOW_THP=1` to re-enable huge pages when re-measuring.
+
+**Gotcha for anyone re-measuring this**: the Claude Code CLI sets
+`PR_SET_THP_DISABLE`, and child processes inherit it — so any benchmark run
+from an agent shell has THP silently unavailable and will show huge pages doing
+nothing. Check `grep THP_enabled /proc/self/status` (1 = available) and clear
+the flag first; `.scratch/hugebench/src/bin/thprun.rs` is a wrapper that does.
+Always confirm `AnonHugePages` in `/proc/<pid>/smaps_rollup` actually rises
+before attributing any timing delta to huge pages.
 
 ## Dependencies (Key Crates)
 
