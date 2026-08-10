@@ -299,6 +299,17 @@ impl ParallelParquetSource {
         (self.completed.load(Ordering::SeqCst), self.total_row_groups)
     }
 
+    /// Row groups this source will hand out, i.e. the number of indivisible
+    /// units of work available. Row-group pruning has already been applied, so
+    /// a selective `WHERE` can leave far fewer than the file contains.
+    ///
+    /// Fan-out sites use this to size their worker count: spawning 32 workers
+    /// for 3 row groups allocates 29 thread-local aggregation states that never
+    /// see a row, then shards the merge across all of them.
+    pub fn total_work(&self) -> usize {
+        self.total_row_groups
+    }
+
     /// Read a single row group and return batches
     pub fn read_row_group(&self, work: &RowGroupWork) -> Result<Vec<RecordBatch>> {
         // IPC sidecar: decode-free read of the row group; the scan filter
@@ -387,7 +398,10 @@ impl ParallelParquetSource {
     /// It spawns worker threads that each grab work from the queue
     /// and read row groups independently.
     pub fn read_all_parallel(&self) -> Result<Vec<Morsel>> {
-        let num_threads = rayon::current_num_threads();
+        let num_threads = crate::execution::topology::workers_for(
+            self.total_work(),
+            rayon::current_num_threads(),
+        );
 
         // Use rayon to parallelize across row groups
         let results: Vec<Result<Vec<Morsel>>> = (0..num_threads)
@@ -428,7 +442,10 @@ impl ParallelParquetSource {
         F: Fn(Morsel) -> Result<T> + Sync,
         T: Send,
     {
-        let num_threads = rayon::current_num_threads();
+        let num_threads = crate::execution::topology::workers_for(
+            self.total_work(),
+            rayon::current_num_threads(),
+        );
 
         let results: Vec<Result<Vec<T>>> = (0..num_threads)
             .into_par_iter()

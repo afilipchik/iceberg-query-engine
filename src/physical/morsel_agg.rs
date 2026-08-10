@@ -170,6 +170,22 @@ fn build_filtered_output(
     }
 }
 
+/// Group entries a merge shard should hold before another shard is worth
+/// creating.
+///
+/// The parallel merge splits every thread-local state into `p` shards, then
+/// merges shard `i` of all states on one worker. With `p` fixed at the thread
+/// count, a 4-group aggregate built 32 states x 32 shards = 1024 vectors and
+/// 32 output batches to combine 128 entries. Sizing `p` by the entry count
+/// keeps each shard worth a worker's while.
+const MERGE_ENTRIES_PER_SHARD: usize = 4096;
+
+/// Shard count for a parallel merge over `total_entries` group entries.
+fn merge_shard_count(total_entries: usize) -> usize {
+    let max = rayon::current_num_threads().clamp(2, 64);
+    (total_entries / MERGE_ENTRIES_PER_SHARD).clamp(2, max)
+}
+
 /// GroupKey-based parallel shard merge (multi-column or non-integer keys).
 fn merge_states_groupkey(
     states: Vec<AggregationState>,
@@ -178,7 +194,7 @@ fn merge_states_groupkey(
     schema: &SchemaRef,
     post_filter: Option<&Expr>,
 ) -> Result<Vec<RecordBatch>> {
-    let p = rayon::current_num_threads().clamp(2, 64);
+    let p = merge_shard_count(states.iter().map(|s| s.approx_group_count()).sum());
     let per_state_shards: Vec<_> = states
         .into_par_iter()
         .map(|s| s.into_shards(p))
@@ -218,7 +234,6 @@ fn merge_raw_states_to_batches(
     schema: &SchemaRef,
     post_filter: Option<&Expr>,
 ) -> Result<Vec<RecordBatch>> {
-    let p = rayon::current_num_threads().clamp(2, 64);
     let timing = std::env::var("AGG_TIMING").is_ok();
     let t0 = std::time::Instant::now();
 
@@ -249,6 +264,9 @@ fn merge_raw_states_to_batches(
         }
         prepared.push(st);
     }
+
+    // Shard count follows the entry count, now that it is known.
+    let p = merge_shard_count(total);
 
     // Dense key domain (e.g. l_orderkey, c_custkey): range-partition the
     // entries and merge each shard with a direct-address table — the
@@ -393,7 +411,6 @@ fn merge_raw_sum_states_to_batches(
     schema: &SchemaRef,
     post_filter: Option<&Expr>,
 ) -> Result<Vec<RecordBatch>> {
-    let p = rayon::current_num_threads().clamp(2, 64);
     let timing = std::env::var("AGG_TIMING").is_ok();
     let t0 = std::time::Instant::now();
 
@@ -424,6 +441,7 @@ fn merge_raw_sum_states_to_batches(
         prepared.push(st);
     }
 
+    let p = merge_shard_count(total);
     let range = (gmax as i128 - gmin as i128 + 1).max(1) as u64;
     let dense =
         total > 0 && range <= 512_000_000 && (range as u128) <= 6 * total as u128 && gmax > gmin;
@@ -2170,6 +2188,14 @@ impl AggregationState {
         shards
     }
 
+    /// Number of group entries this state holds, across every representation
+    /// it might be using. Cheap (four `len()` calls) and used only to size the
+    /// merge fan-out, so an over-count from a state that is mid-promotion is
+    /// harmless.
+    pub(crate) fn approx_group_count(&self) -> usize {
+        self.groups.len() + self.raw_groups.len() + self.raw_sums.len() + self.key_order.len()
+    }
+
     /// Consume this state, sharding its groups by key hash into `p` buckets.
     /// Used by the parallel partitioned merge: entries for the same key always
     /// land in the same bucket regardless of which thread produced them.
@@ -3042,7 +3068,8 @@ pub fn execute_morsel_aggregation(
         .map(|e| e.data_type(&plan_schema).unwrap_or(DataType::Float64))
         .collect();
 
-    let num_threads = rayon::current_num_threads();
+    let num_threads =
+        crate::execution::topology::workers_for(source.total_work(), rayon::current_num_threads());
 
     // Clone expressions for use in parallel closure
     let group_by_exprs = group_by_exprs.to_vec();

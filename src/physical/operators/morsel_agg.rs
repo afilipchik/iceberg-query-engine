@@ -173,7 +173,13 @@ impl PhysicalOperator for MorselAggregateExec {
             .map(|a| a.input.data_type(&plan_schema).unwrap_or(DataType::Float64))
             .collect();
 
-        let num_threads = rayon::current_num_threads();
+        // One worker per row group at most: after pruning, a selective scan can
+        // leave three row groups, and 29 extra workers only allocate 29
+        // aggregation states that never see a row.
+        let num_threads = crate::execution::topology::workers_for(
+            source.total_work(),
+            rayon::current_num_threads(),
+        );
 
         // Clone expressions for use in parallel closure
         let group_by_exprs = self.group_by.clone();
@@ -535,7 +541,10 @@ impl MorselAggregateExec {
 
         let timing = std::env::var("AGG_TIMING").is_ok();
         let t0 = std::time::Instant::now();
-        let num_threads = rayon::current_num_threads();
+        let num_threads = crate::execution::topology::workers_for(
+            source.total_work(),
+            rayon::current_num_threads(),
+        );
         let results: Vec<Result<()>> = (0..num_threads)
             .into_par_iter()
             .map(|_| {
