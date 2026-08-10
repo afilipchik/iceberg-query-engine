@@ -436,6 +436,137 @@ async fn union_streams_lazily_rather_than_materializing() {
 }
 
 // ---------------------------------------------------------------------------
+// Bug 2 — LIMIT/OFFSET are per query, not per batch and not per partition
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn limit_counts_rows_across_batches_and_partitions() {
+    // 4 partitions x 3 batches x 500 rows. Both dimensions matter:
+    //   * several BATCHES per partition catches the counters dying inside the
+    //     per-batch future (LIMIT 10 used to emit 10 rows PER BATCH), and
+    //   * several PARTITIONS catches execute() forwarding `partition` to a
+    //     multi-partition child while declaring one partition.
+    // A single-batch, single-partition fixture — i.e. data/tpch-1mb, or the
+    // 5-row in-memory table in tests/sql_comprehensive.rs — makes both
+    // assertions vacuous.
+    let child = scan(4, 3, 500);
+    assert!(child.output_partitions() > 1 && 6_000 > 500);
+
+    for fetch in [1usize, 10, 499, 500, 501, 1_500, 1_501, 6_000] {
+        let limit = LimitExec::new(child.clone(), 0, Some(fetch));
+        assert_eq!(
+            run_all_partitions(&limit).await,
+            fetch,
+            "LIMIT {fetch} must emit exactly {fetch} rows"
+        );
+    }
+
+    // A limit larger than the input is the whole input, not more.
+    let limit = LimitExec::new(child.clone(), 0, Some(999_999));
+    assert_eq!(run_all_partitions(&limit).await, 6_000);
+}
+
+#[tokio::test]
+async fn limit_emits_the_first_rows_in_input_order() {
+    // Not just the right COUNT: the right ROWS. A per-batch limit returns the
+    // first 10 of every batch, which has the correct shape and the wrong
+    // contents.
+    let child = scan(4, 3, 500);
+    let limit = LimitExec::new(child, 0, Some(1_200));
+    let ids = collect_ids(&limit).await;
+    assert_eq!(ids, (0..1_200).collect::<Vec<i64>>());
+}
+
+#[tokio::test]
+async fn offset_skips_across_batches_and_partitions() {
+    let child = scan(4, 3, 500);
+
+    // OFFSET past the first batch, past the first partition, and to the very end.
+    for (skip, fetch, expected_rows, first_id) in [
+        (0usize, Some(5usize), 5usize, 0i64),
+        (3, Some(5), 5, 3),
+        (700, Some(5), 5, 700),    // second batch of partition 0
+        (1_600, Some(5), 5, 1600), // second partition
+        (5_995, None, 5, 5995),    // last five rows
+        (6_000, None, 0, 0),       // exactly at the end
+        (7_000, None, 0, 0),       // past the end
+        (1_000, Some(999_999), 5_000, 1000),
+    ] {
+        let limit = LimitExec::new(child.clone(), skip, fetch);
+        let ids = collect_ids(&limit).await;
+        assert_eq!(
+            ids.len(),
+            expected_rows,
+            "OFFSET {skip} FETCH {fetch:?} row count"
+        );
+        if expected_rows > 0 {
+            assert_eq!(ids[0], first_id, "OFFSET {skip} first row");
+            assert_eq!(
+                ids,
+                (first_id..first_id + expected_rows as i64).collect::<Vec<i64>>(),
+                "OFFSET {skip} FETCH {fetch:?} contents"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn limit_declares_one_partition() {
+    // LIMIT is global: `fetch` rows for the query, not per partition. If this
+    // ever reports the input's count, `ExecutionContext` will drive each one
+    // and the query returns `fetch * partitions` rows.
+    let child = scan(4, 3, 500);
+    let limit = LimitExec::new(child, 0, Some(10));
+    assert_eq!(limit.output_partitions(), 1);
+}
+
+#[tokio::test]
+async fn limit_stops_reading_once_satisfied() {
+    // The lazy walk gives LIMIT an early exit it never had: a satisfied limit
+    // must not open the input's later partitions. `CountingScan` records every
+    // partition it is asked for.
+    #[derive(Debug)]
+    struct CountingScan {
+        inner: FixedPartitionScan,
+        opened: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    #[async_trait]
+    impl PhysicalOperator for CountingScan {
+        fn schema(&self) -> SchemaRef {
+            self.inner.schema()
+        }
+        fn children(&self) -> Vec<Arc<dyn PhysicalOperator>> {
+            vec![]
+        }
+        fn output_partitions(&self) -> usize {
+            self.inner.output_partitions()
+        }
+        async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
+            self.opened.lock().unwrap().push(partition);
+            self.inner.execute(partition).await
+        }
+        fn name(&self) -> &str {
+            "CountingScan"
+        }
+    }
+
+    let opened = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let scan = Arc::new(CountingScan {
+        inner: FixedPartitionScan::new(4, 3, 500),
+        opened: opened.clone(),
+    });
+
+    let limit = LimitExec::new(scan, 0, Some(10));
+    assert_eq!(run_all_partitions(&limit).await, 10);
+    assert_eq!(
+        *opened.lock().unwrap(),
+        vec![0],
+        "LIMIT 10 must not open partitions it cannot need"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // SQL-level regressions, DuckDB-validated against data/tpch-10mb
 // ---------------------------------------------------------------------------
 
@@ -589,5 +720,68 @@ async fn union_all_inside_a_twice_referenced_cte_keeps_every_row() {
         )
         .await,
         60_000, // DuckDB: every orderkey is present
+    );
+}
+
+/// LIMIT/OFFSET over a table scanned in several partitions, several batches
+/// each. Every expected value is DuckDB's, reading the same parquet file.
+///
+/// Note what makes these queries load-bearing: there is NO `ORDER BY`. TPC-H
+/// never caught this bug because `planner.rs` fuses Sort+Limit into
+/// `SortExec::with_fetch`, so 7 of its 8 LIMITs never build a `LimitExec` at
+/// all, and the eighth sits over a Sort that has already collapsed to one
+/// batch in one partition. Adding an ORDER BY to any test below deletes the
+/// test.
+#[tokio::test]
+async fn limit_over_a_multi_partition_scan_is_per_query() {
+    let ctx = tpch_10mb_ctx();
+
+    // Pre-fix: 80 rows (8 batches x 10). DuckDB: 10.
+    assert_eq!(
+        rows(&ctx, "SELECT l_orderkey FROM lineitem LIMIT 10").await,
+        10
+    );
+    assert_eq!(
+        rows(&ctx, "SELECT l_orderkey FROM lineitem LIMIT 1").await,
+        1
+    );
+    assert_eq!(
+        rows(&ctx, "SELECT l_orderkey FROM lineitem LIMIT 10 OFFSET 5").await,
+        10
+    );
+    assert_eq!(
+        rows(
+            &ctx,
+            "SELECT l_orderkey FROM lineitem LIMIT 20000 OFFSET 50000"
+        )
+        .await,
+        10_000 // DuckDB
+    );
+    assert_eq!(
+        rows(&ctx, "SELECT l_orderkey FROM lineitem OFFSET 59995").await,
+        5 // DuckDB
+    );
+    assert_eq!(
+        rows(&ctx, "SELECT l_orderkey FROM lineitem LIMIT 999999").await,
+        60_000 // DuckDB: a limit past the end is the whole table
+    );
+
+    // A filtered LIMIT whose matches do NOT all live in scan partition 0.
+    // Pre-fix this returned 0 rows, because only partition 0 was ever driven.
+    assert_eq!(
+        rows(
+            &ctx,
+            "SELECT l_orderkey FROM lineitem WHERE l_orderkey > 14000 LIMIT 100000"
+        )
+        .await,
+        3_336 // DuckDB, and equal to the unlimited COUNT(*) of the same filter
+    );
+    assert_eq!(
+        rows(
+            &ctx,
+            "SELECT l_orderkey FROM lineitem WHERE l_orderkey > 14000 LIMIT 10"
+        )
+        .await,
+        10
     );
 }
