@@ -101,9 +101,7 @@ impl PhysicalOperator for MorselAggregateExec {
 
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
         // Morsel aggregate produces a single partition
-        if partition != 0 {
-            return Ok(Box::pin(stream::empty()));
-        }
+        crate::physical::check_partition(self, partition)?;
 
         // Dense direct-address fast path: single bounded int group key with
         // simple aggregates skips hash tables AND the merge.

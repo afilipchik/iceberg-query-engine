@@ -283,7 +283,9 @@ impl PhysicalOperator for IcebergScanExec {
         vec![]
     }
 
-    async fn execute(&self, _partition: usize) -> Result<RecordBatchStream> {
+    async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
+        crate::physical::check_partition(self, partition)?;
+
         // Load table metadata
         let metadata = self.load_metadata()?;
 

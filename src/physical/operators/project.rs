@@ -82,6 +82,8 @@ impl PhysicalOperator for ProjectExec {
     }
 
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
+        crate::physical::check_partition(self, partition)?;
+
         let input_stream = self.input.execute(partition).await?;
         let exprs = self.exprs.clone();
         let schema = self.schema.clone();

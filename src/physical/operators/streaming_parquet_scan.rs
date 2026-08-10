@@ -279,6 +279,10 @@ impl PhysicalOperator for StreamingParquetScanExec {
     }
 
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
+        crate::physical::check_partition(self, partition)?;
+
+        // `output_partitions()` floors at 1, so a scan with NO work items still
+        // declares (and must answer) partition 0 — with nothing.
         if partition >= self.partitioned_work.len() {
             return Ok(Box::pin(futures::stream::empty()));
         }

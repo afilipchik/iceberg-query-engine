@@ -41,6 +41,8 @@ impl PhysicalOperator for LimitExec {
 
     #[allow(unused_assignments)] // Variables are read across multiple closure invocations
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
+        crate::physical::check_partition(self, partition)?;
+
         let input_stream = self.input.execute(partition).await?;
         let skip = self.skip;
         let fetch = self.fetch;

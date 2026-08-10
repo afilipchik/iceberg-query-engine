@@ -253,6 +253,8 @@ impl PhysicalOperator for SpillableHashJoinExec {
     }
 
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
+        crate::physical::check_partition(self, partition)?;
+
         // Determine build and probe sides
         let (build_side, probe_side, swapped) =
             if self.build_right || matches!(self.join_type, JoinType::Right) {
@@ -879,9 +881,7 @@ impl PhysicalOperator for SpillableHashAggregateExec {
 
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
         // Aggregation always produces a single partition by collecting from all input partitions
-        if partition != 0 {
-            return Ok(Box::pin(stream::empty()));
-        }
+        crate::physical::check_partition(self, partition)?;
 
         // Fused streaming aggregation: input batches flow through a bounded
         // channel into balanced aggregation workers — the input is never
@@ -1181,9 +1181,7 @@ impl PhysicalOperator for ExternalSortExec {
 
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
         // Sort always produces a single partition
-        if partition != 0 {
-            return Ok(Box::pin(stream::empty()));
-        }
+        crate::physical::check_partition(self, partition)?;
 
         // Drain all input partitions concurrently so a parallel scan/join beneath this
         // sort is not serialized onto a single core.

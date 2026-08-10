@@ -225,11 +225,7 @@ impl PhysicalOperator for VectorSearchExec {
     }
 
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
-        if partition != 0 {
-            return Ok(Box::pin(futures::stream::iter(
-                Vec::<Result<RecordBatch>>::new(),
-            )));
-        }
+        crate::physical::check_partition(self, partition)?;
 
         if let Some(batches) = self.try_index()? {
             let results: Vec<Result<RecordBatch>> = batches.into_iter().map(Ok).collect();

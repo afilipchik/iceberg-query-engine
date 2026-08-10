@@ -736,6 +736,8 @@ impl PhysicalOperator for HashJoinExec {
     }
 
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
+        crate::physical::check_partition(self, partition)?;
+
         debug_log(&format!(
             "execute() partition={} join_type={:?}",
             partition, self.join_type

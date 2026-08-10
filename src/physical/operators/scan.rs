@@ -253,6 +253,8 @@ impl PhysicalOperator for MemoryTableExec {
     }
 
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
+        crate::physical::check_partition(self, partition)?;
+
         // Determine the number of partitions to use
         let num_partitions = self.output_partitions().max(1);
 

@@ -42,7 +42,9 @@ impl PhysicalOperator for UnionExec {
         "UnionExec"
     }
 
-    async fn execute(&self, _partition: usize) -> Result<RecordBatchStream> {
+    async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
+        crate::physical::check_partition(self, partition)?;
+
         // Collect all input streams and chain them together
         let mut streams = Vec::new();
         for input in &self.inputs {

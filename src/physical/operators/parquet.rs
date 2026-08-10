@@ -87,7 +87,9 @@ impl PhysicalOperator for ParquetScanExec {
         vec![]
     }
 
-    async fn execute(&self, _partition: usize) -> Result<RecordBatchStream> {
+    async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
+        crate::physical::check_partition(self, partition)?;
+
         let file = File::open(&self.path).map_err(|e| {
             QueryError::Execution(format!(
                 "Failed to open Parquet file {:?}: {}",

@@ -162,9 +162,7 @@ impl PhysicalOperator for HashAggregateExec {
 
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
         // Aggregation always produces a single partition by collecting from all input partitions
-        if partition != 0 {
-            return Ok(Box::pin(stream::empty()));
-        }
+        crate::physical::check_partition(self, partition)?;
 
         // Collect from all input partitions in parallel using tokio
         let input_partitions = self.input.output_partitions().max(1);

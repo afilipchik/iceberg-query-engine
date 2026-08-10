@@ -146,7 +146,9 @@ impl PhysicalOperator for DelimJoinExec {
         1 // DelimJoin materializes everything, outputs single partition
     }
 
-    async fn execute(&self, _partition: usize) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+    async fn execute(&self, partition: usize) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+        crate::physical::check_partition(self, partition)?;
+
         // Step 1: Collect all rows from the outer side
         let mut outer_batches = Vec::new();
         let outer_stream = self.left.execute(0).await?;
@@ -245,7 +247,9 @@ impl PhysicalOperator for DelimGetExec {
         1
     }
 
-    async fn execute(&self, _partition: usize) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+    async fn execute(&self, partition: usize) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+        crate::physical::check_partition(self, partition)?;
+
         // Get distinct values from parent DelimJoin's state
         let batch = self
             .delim_state

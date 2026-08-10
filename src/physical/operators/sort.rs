@@ -63,9 +63,7 @@ impl PhysicalOperator for SortExec {
 
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
         // Sort always produces a single partition by collecting from all input partitions
-        if partition != 0 {
-            return Ok(Box::pin(stream::empty()));
-        }
+        crate::physical::check_partition(self, partition)?;
 
         // Collect from ALL input partitions (input may split data across partitions).
         // Drain them concurrently — a sequential await loop would serialize a parallel
