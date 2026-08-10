@@ -20,11 +20,17 @@
 //! # What this provider does and does not do
 //!
 //! It pushes **column projection** into Lance (`Scanner::project`), which is
-//! the format's core strength, and scans fragments in parallel. It does *not*
-//! get the parquet path's fast lanes — morsel-driven aggregation, runtime
-//! filter bitmaps pushed into the decoder, row-group pruning — because those
-//! are keyed off `TableProvider::parquet_files()`. See CLAUDE.md for the
-//! measured cost of that gap.
+//! the format's core strength, scans fragments in parallel, and derives the
+//! table/column statistics the shared optimizer needs (Lance exposes none).
+//!
+//! It does *not* get the parquet path's decoder-level fast lanes — morsel
+//! aggregation, `RowFilter`, row-group pruning, runtime join-filter bitmaps —
+//! because those are keyed off `TableProvider::parquet_files()`. As of
+//! 2026-08-09 the Lance leg is nevertheless **8% FASTER** than the Parquet leg
+//! on SF=10 TPC-H (6.79s vs 7.39s, winning 15 of 22), because statistics
+//! parity matters more than decoder tricks. CLAUDE.md, "Which Parquet
+//! optimizations the Lance path shares", records which of those lanes were
+//! ported, which cannot be, and which were built and then measured negative.
 
 use crate::error::{QueryError, Result};
 use crate::physical::operators::{ColumnStatistics, TableProvider, TableStatistics};
