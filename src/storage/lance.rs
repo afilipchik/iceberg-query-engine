@@ -557,54 +557,72 @@ impl LanceTable {
 
     /// Should this predicate be pushed into Lance, or is the engine faster?
     ///
-    /// # This gate exists because `Scanner::filter` is usually a PESSIMIZATION
+    /// # What a pushed filter costs, measured correctly
     ///
-    /// Measured on lance 0.23.2, best of 2-3, warm page cache. A filtered Lance
-    /// scan costs far more than decoding the columns outright, because the cost
-    /// tracks rows *scanned*, not rows *returned*:
+    /// An earlier round of these measurements concluded that `Scanner::filter`
+    /// is a flat pessimization — 8x slower than decoding the columns outright.
+    /// That conclusion was an artifact of two things the benchmark held wrong,
+    /// and it is worth spelling out because it nearly buried a real win:
     ///
-    /// | scan | rows out | time |
-    /// |---|---|---|
-    /// | SF=10 `lineitem`, 2 cols, no filter | 60,000,000 | **147 ms** |
-    /// | same, Q06's 4-predicate filter (1.3% selective) | 803,514 | 1,240 ms |
-    /// | same, tuned to the best batch size found | 803,514 | 375 ms |
-    /// | SF=10 `lineitem`, 6 cols, no filter | 60,000,000 | **247 ms** |
-    /// | same, `l_shipdate <= DATE '1998-09-02'` (95%) | 57,183,143 | 1,867 ms |
+    /// - it left `MaterializationStyle` at its default, `Heuristic`, which on
+    ///   local storage late-materializes only columns wider than 10 bytes and
+    ///   therefore late-materializes *nothing* in a table of narrow scalars;
+    /// - it ran one scanner over the whole dataset, while the engine's reader
+    ///   is fragment-parallel.
     ///
-    /// Adding a BTREE scalar index on the filter column makes it *worse*, not
-    /// better: 3,323 ms with the index vs 1,531 ms without, both against 120 ms
-    /// for the unfiltered scan. Pushing unconditionally cost the SF=10 TPC-H
-    /// suite 18% (7.96s -> 9.40s), so unconditional pushdown was rejected.
+    /// Fixed on both counts (SF=10 `lineitem`, 32 threads, best of 3), the sign
+    /// flips. `scan_one` now always asks for `AllLate`:
     ///
-    /// # When it DOES pay: a wide payload the filter lets Lance skip
-    ///
-    /// Late materialization only saves work if there is expensive work to skip.
-    /// TPC-H is all narrow scalars, so there is none. A real LanceDB table is
-    /// not: `data/vectors.lance` carries a 384-float embedding, and there the
-    /// same mechanism is transformative (200k rows, `SELECT *`, baseline
-    /// 42.2 ms unfiltered):
-    ///
-    /// | predicate | selectivity | time | vs baseline |
+    /// | shape | no filter | filter, Heuristic | filter, **AllLate** |
     /// |---|---|---|---|
-    /// | `id < 100` | 0.05% | 2.1 ms | **20x faster** |
-    /// | `id < 2000` | 1% | 3.4 ms | 12x faster |
-    /// | `id < 10000` | 5% | 7.2 ms | 5.9x faster |
-    /// | `id < 20000` | 10% | 9.4 ms | 4.5x faster |
-    /// | `id < 40000` | 20% | 31.5 ms | 1.3x faster |
-    /// | `id < 100000` | 50% | 49.1 ms | 0.9x — SLOWER |
-    /// | `category = 'books'` (string col) | 20% | 99.1 ms | 0.4x — SLOWER |
+    /// | Q06, 4 cols, 1.3% out | 192 ms | 1,112 ms | **121 ms (0.63x)** |
+    /// | Q12, 5 cols, 2.9% out | 165 ms | 1,707 ms | **134 ms (0.81x)** |
+    /// | Q19, 6 cols, 3.6% out | 266 ms | 1,120 ms | 251 ms (0.94x) |
     ///
-    /// # The three conditions, each from a row of those tables
+    /// # But the gate still stands, because the loss side is brutal
     ///
-    /// 1. **The projection must contain a nested (wide) column.** That is the
-    ///    only thing whose decode is worth skipping; without it the filter is
-    ///    pure overhead, which is the entire TPC-H result above.
+    /// A pushed filter is a win only where it is SELECTIVE. Forcing every
+    /// renderable conjunct down (`QE_LANCE_PUSH=all`, with `AllLate` on) took
+    /// the SF=10 suite from **6.76s to 10.83s**. The selective queries improved
+    /// exactly as the table predicts — Q19 405 -> 325 ms, Q06 151 -> 133,
+    /// Q12 241 -> 228 — and the non-selective ones collapsed: **Q01 351 ->
+    /// 1801 ms** (its predicate keeps 95% of rows), Q21 556 -> 1432, Q03
+    /// 294 -> 811. Unconditional pushdown stays rejected; only the threshold's
+    /// justification changed.
+    ///
+    /// A BTREE scalar index on the filter column also still makes it worse, not
+    /// better: 3,323 ms with the index vs 1,531 ms without.
+    ///
+    /// # Where it pays hugely: a wide payload the filter lets Lance skip
+    ///
+    /// `data/vectors.lance` carries a 384-float embedding. `SELECT id,
+    /// category, embedding FROM vectors WHERE id < 100`, through the engine
+    /// binary, with `AllLate`: **33-53 ms unpushed vs 2.1-5.3 ms pushed, 15-25x**
+    /// (it was 6.4x before `AllLate`). Selectivity sweep on the same dataset:
+    ///
+    /// | predicate | selectivity | vs unfiltered |
+    /// |---|---|---|
+    /// | `id < 100` | 0.05% | 20x faster |
+    /// | `id < 10000` | 5% | 5.9x faster |
+    /// | `id < 20000` | 10% | 4.5x faster |
+    /// | `id < 40000` | 20% | 1.3x faster |
+    /// | `id < 100000` | 50% | 0.9x — SLOWER |
+    /// | `category = 'books'` (string col) | 20% | 0.4x — SLOWER |
+    ///
+    /// # The three conditions
+    ///
+    /// 1. **The projection must contain a nested (wide) column.** This is the
+    ///    conservative one, and it is what keeps TPC-H out. Dropping it would
+    ///    unlock the Q06/Q12/Q19 wins above (~110 ms of a 6.7s suite) but only
+    ///    if the gate could tell those apart from Q01 — and it cannot: their
+    ///    selectivity lives in `l_shipmode`/`l_shipinstruct`/`l_discount`, and
+    ///    `estimate_selectivity` has statistics for neither strings nor floats.
+    ///    Guessing wrong costs 5x on one query to gain 20% on another.
     /// 2. **The filter must not reference that wide column**, or Lance has to
     ///    decode it to evaluate the predicate and saves nothing.
     /// 3. **Estimated selectivity must be known and <= 10%.** Unknown means no
-    ///    push: statistics exist only for integer/date columns, which
-    ///    conveniently excludes the string-column case — the slowest row in the
-    ///    table above, at 0.4x.
+    ///    push, which conveniently excludes the string-column case — the
+    ///    slowest row in the table above, at 0.4x.
     fn plan_pushdown(
         &self,
         predicate: &crate::planner::Expr,
@@ -778,6 +796,25 @@ async fn scan_one(
         scanner
             .filter(sql)
             .map_err(|e| lance_err(&format!("filter {}", sql), e))?;
+        // ASK for late materialization; do not accept the default.
+        //
+        // `MaterializationStyle::Heuristic` (the default) late-materializes a
+        // column only if it is wider than 10 bytes on local storage, so for a
+        // table of narrow scalars it late-materializes NOTHING: every projected
+        // column is decoded for every row and then thrown away. That single
+        // knob is most of why a pushed filter used to look like a catastrophe.
+        // Measured on SF=10 `lineitem`, fragment-parallel, best of 3, against
+        // the same scan with no filter at all:
+        //
+        // | shape | no filter | filter, Heuristic | filter, AllLate |
+        // |---|---|---|---|
+        // | Q06, 4 cols, 1.3% | 192 ms | 1,112 ms | **121 ms** |
+        // | Q12, 5 cols, 2.9% | 165 ms | 1,707 ms | **134 ms** |
+        // | Q19, 6 cols, 3.6% | 266 ms | 1,120 ms | 251 ms |
+        //
+        // The default turns a 0.63x win into a 5.8x loss. Every earlier
+        // conclusion about Lance filter pushdown was measured through it.
+        scanner.materialization_style(lance::dataset::scanner::MaterializationStyle::AllLate);
     }
     scanner.batch_size(LANCE_BATCH_SIZE);
 
@@ -1366,7 +1403,16 @@ impl TableProvider for LanceTable {
         let Some(predicate) = filter.filter(|_| self.filter_pushdown) else {
             return self.scan(projection);
         };
-        let Some(sql) = self.plan_pushdown(predicate, projection) else {
+        // `QE_LANCE_PUSH=all` pushes every renderable conjunct, ignoring the
+        // cost gate. Diagnostic only: it is how the gate below is calibrated,
+        // and it stays correct because the planner re-applies the predicate.
+        let forced = matches!(std::env::var("QE_LANCE_PUSH").as_deref(), Ok("all"));
+        let sql = if forced {
+            lance_filter_sql(predicate, &self.schema)
+        } else {
+            self.plan_pushdown(predicate, projection)
+        };
+        let Some(sql) = sql else {
             return self.scan(projection);
         };
 

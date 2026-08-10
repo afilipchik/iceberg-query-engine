@@ -369,9 +369,13 @@ fn count_of(r: &query_engine::execution::QueryResult) -> i64 {
         .value(0)
 }
 
-/// TPC-H is all narrow scalar columns, so `pushdown_pays` must DECLINE every
-/// one of these. Pushing them unconditionally cost the SF=10 suite 18%
-/// (7.96s -> 9.40s), which is the regression this asserts cannot come back.
+/// TPC-H is all narrow scalar columns, so the gate must DECLINE every one of
+/// these. Re-measured 2026-08-09 with `MaterializationStyle::AllLate`, which
+/// makes a pushed filter far cheaper than it used to be and turns the
+/// *selective* TPC-H predicates into small wins: forcing every renderable
+/// conjunct down still took the SF=10 suite from **6.76s to 10.83s**, because
+/// the non-selective ones collapse (Q01 351ms -> 1801ms). That is the
+/// regression this asserts cannot come back.
 #[tokio::test]
 async fn test_pushdown_declines_on_narrow_tables() {
     if !data_available() {
@@ -394,7 +398,7 @@ async fn test_pushdown_declines_on_narrow_tables() {
     assert_eq!(
         table.pushed_filter_count(),
         0,
-        "no TPC-H column is worth late-materializing; pushing here is a measured 18% regression"
+        "no TPC-H column is worth late-materializing; forcing it is a measured 6.76s -> 10.83s regression"
     );
 }
 

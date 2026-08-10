@@ -97,8 +97,17 @@ impl PhysicalPlanner {
     }
 
     /// Check if morsel execution should be used
+    ///
+    /// `QE_MORSEL=0` forces the generic aggregate path on, a diagnostic switch
+    /// in the mould of `RT_DISABLE`. It exists to answer "what is
+    /// `MorselAggregateExec` actually worth on this query", which is the only
+    /// honest way to price porting it to a non-Parquet source: the morsel path
+    /// is reachable only through `parquet_files()`, so on any other provider
+    /// the measured delta IS the ceiling.
     fn use_morsel_execution(&self) -> bool {
-        self.config.is_some() && self.config.as_ref().unwrap().enable_morsel_execution
+        self.config.is_some()
+            && self.config.as_ref().unwrap().enable_morsel_execution
+            && !matches!(std::env::var("QE_MORSEL").as_deref(), Ok("0"))
     }
 
     /// Try to extract Parquet files and filter from a logical plan for morsel execution
