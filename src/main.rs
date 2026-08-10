@@ -233,6 +233,9 @@ enum Commands {
         #[arg(long)]
         tpch_lance: Option<PathBuf>,
     },
+
+    /// Print the hardware topology the engine detected and how it placed workers
+    Topology,
 }
 
 /// The eight TPC-H tables, in dependency order.
@@ -271,6 +274,13 @@ async fn main() {
             libc::prctl(libc::PR_SET_PTRACER, -1i64, 0, 0, 0);
         }
     }
+
+    // Place the rayon worker pool on the machine's best CPUs before anything
+    // else touches rayon (the pool is global and first-writer-wins). Pins
+    // worker i to the i-th CPU of the topology preference order: physical
+    // cores before SMT siblings, fast classes before slow, round-robin across
+    // NUMA nodes. `QE_TOPOLOGY=0` restores rayon's default pool.
+    query_engine::execution::topology::init_global_pool();
 
     // Set up logging
     tracing_subscriber::fmt()
@@ -961,6 +971,52 @@ async fn main() {
             #[cfg(not(feature = "lance"))]
             run_repl(tpch).await;
         }
+
+        Commands::Topology => print_topology(),
+    }
+}
+
+/// Report what the topology probe found and where the workers landed.
+fn print_topology() {
+    use query_engine::execution::topology::{self, Topology};
+    let t = Topology::get();
+    println!("NUMA nodes:        {}", t.num_numa_nodes());
+    for node in &t.nodes {
+        println!(
+            "  node {:<3} cpus={:?}\n           distances={:?}",
+            node.id, node.cpus, node.distances
+        );
+    }
+    println!("Usable CPUs:       {}", t.cpus.len());
+    println!("Physical cores:    {}", t.num_physical_cores());
+    println!(
+        "Uniform cores:     {}   (heterogeneous placement matters: {})",
+        t.is_uniform(),
+        t.is_heterogeneous()
+    );
+    println!("Total weight:      {}", t.total_weight());
+    println!("Fast-class CPUs:   {:?}", t.fast_cpus());
+    println!("Worker threads:    {}", t.default_worker_threads());
+    println!("Placement active:  {}", topology::placement_active());
+    println!("Preference order:  {:?}", t.preferred_cpu_order());
+    println!();
+    println!(
+        "{:>4} {:>5} {:>5} {:>4} {:>4} {:>10} {:>7}",
+        "cpu", "node", "core", "pkg", "smt", "capacity", "weight"
+    );
+    for c in &t.cpus {
+        println!(
+            "{:>4} {:>5} {:>5} {:>4} {:>4} {:>10} {:>7}",
+            c.id,
+            c.node,
+            c.core_id,
+            c.package_id,
+            if c.is_smt_sibling { "yes" } else { "-" },
+            c.raw_capacity
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into()),
+            c.weight
+        );
     }
 }
 
