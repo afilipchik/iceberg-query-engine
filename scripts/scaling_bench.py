@@ -50,6 +50,49 @@ def total_cores() -> int:
     return os.cpu_count() or 1
 
 
+def physical_cores() -> list[int]:
+    """One CPU id per PHYSICAL core, cheapest-class-last, SMT siblings excluded.
+
+    THIS FUNCTION EXISTS BECAUSE THE OBVIOUS THING IS WRONG. Pinning contiguous
+    ids (`taskset -c 0-K`) on a hybrid SMT machine does not vary "core count" --
+    it walks a heterogeneous list. On this i9-13900KF, cpus 0..15 are 8 P-cores
+    with HyperThreading (siblings adjacent: 0-1, 2-3, ...) and 16..31 are E-cores.
+    So a contiguous sweep means: K=1 one SMT thread, K=2 BOTH THREADS OF ONE
+    PHYSICAL CORE, K=4 two cores, ... K=32 adds 16 slower E-cores. The measured
+    "speedup" then conflates three different variables.
+
+    That mistake produced a real, propagated error: a contiguous sweep gave
+    1->32 speedup 5.66x and an Amdahl fit of f=0.150, which was quoted as a hard
+    architectural limit ("single-query speedup capped at 6.7x") and used to order
+    the phases of the distributed design. Re-measured over homogeneous physical
+    P-cores the curve is 1.00 / 1.44 / 2.55 / 4.20 at 1/2/4/8 cores (52%
+    efficiency at 8), and a per-point Amdahl fit yields 0.389 / 0.189 / 0.129 --
+    a spread that REJECTS the single-serial-fraction model. Use a USL fit
+    (contention + coherency) instead of quoting one f.
+    """
+    by_core: dict[tuple, int] = {}
+    weight: dict[int, int] = {}
+    for c in range(total_cores()):
+        base = f"/sys/devices/system/cpu/cpu{c}/topology"
+        try:
+            core = open(f"{base}/core_id").read().strip()
+            pkg = open(f"{base}/physical_package_id").read().strip()
+        except OSError:
+            return list(range(total_cores()))  # no sysfs (container): degrade
+        by_core.setdefault((pkg, core), c)  # first sibling only
+        try:
+            weight[c] = int(
+                open(f"/sys/devices/system/cpu/cpu{c}/cpufreq/cpuinfo_max_freq").read()
+            )
+        except OSError:
+            weight[c] = 0
+    cpus = list(by_core.values())
+    # Fastest class first so a K-core sweep stays homogeneous for as long as
+    # possible instead of mixing P- and E-cores at the first opportunity.
+    cpus.sort(key=lambda c: (-weight.get(c, 0), c))
+    return cpus
+
+
 def run_one(cores: list[int], data: str, queries: str, iterations: int) -> tuple[float, int]:
     """Run the benchmark pinned to `cores`; return (wall_seconds, queries_run)."""
     cmd = []
@@ -69,17 +112,24 @@ def run_one(cores: list[int], data: str, queries: str, iterations: int) -> tuple
 
 def mode_cores(args) -> None:
     """Single process, varying core count -> the intra-node scaling curve."""
-    tc = total_cores()
-    counts = [int(x) for x in args.cores.split(",")] if args.cores else [1, 2, 4, 8, 16, tc]
+    pcores = physical_cores()
+    tc = len(pcores) if not args.contiguous else total_cores()
+    counts = [int(x) for x in args.cores.split(",")] if args.cores else [1, 2, 4, 8, tc]
     counts = [c for c in counts if c <= tc]
-    print(f"Intra-node scaling: 1 process, {tc} cores available\n")
+    if args.contiguous:
+        print("WARNING: --contiguous pins cpu ids 0..K-1, which on an SMT/hybrid")
+        print("machine varies core TYPE as well as count. Results are not a")
+        print("scaling curve. See physical_cores() for why this matters.\n")
+    print(f"Intra-node scaling: 1 process, {tc} "
+          f"{'cpus (contiguous)' if args.contiguous else 'PHYSICAL cores'}\n")
     print(f"{'cores':>6} {'wall(s)':>9} {'QPS':>8} {'speedup':>8} {'efficiency':>11}")
     base = None
     rows = []
     for c in counts:
         walls = []
         for _ in range(args.repeat):
-            w, n = run_one(list(range(c)), args.data, args.queries, args.iterations)
+            cpus = list(range(c)) if args.contiguous else pcores[:c]
+            w, n = run_one(cpus, args.data, args.queries, args.iterations)
             walls.append(w)
         w = statistics.median(walls)
         qps = (n * args.iterations) / w if w else 0
@@ -149,6 +199,9 @@ def main() -> int:
     ap.add_argument("--repeat", type=int, default=3, help="medians per point")
     ap.add_argument("--cores", default="", help="comma list for --mode cores")
     ap.add_argument("--procs", default="1,2,4,8", help="comma list for --mode concurrency")
+    ap.add_argument("--contiguous", action="store_true",
+                    help="pin cpu ids 0..K-1 (WRONG on SMT/hybrid; kept only to\n"
+                         "reproduce the flawed historical measurement)")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 

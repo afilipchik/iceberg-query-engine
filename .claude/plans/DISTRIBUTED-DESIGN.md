@@ -6,6 +6,36 @@
 
 ---
 
+## 0-CORRECTION (2026-08-10): the f=0.150 in this section is an ARTIFACT — do not act on it
+
+The architecture review re-derived Section 0's numbers and found the measurement
+method invalid. `scripts/scaling_bench.py` pinned CONTIGUOUS cpu ids on a hybrid
+SMT machine, so its "cores" axis was not a core-count axis at all: on this
+i9-13900KF, K=1 is one SMT thread, **K=2 is BOTH THREADS OF ONE PHYSICAL CORE**,
+K=16 is all 8 P-cores, and K=32 adds 16 slower E-cores. The 1.18x at "2 cores"
+that drove the high serial fraction was two hyperthreads sharing one core.
+
+Re-measured over homogeneous PHYSICAL P-cores (harness fixed in the same pass):
+
+| cores | wall | speedup | efficiency |
+|------:|-----:|--------:|-----------:|
+| 1 | 42.83s | 1.00 | 100% |
+| 2 | 29.90s | 1.43 | 72% |
+| 4 | 16.61s | 2.58 | 64% |
+| 8 | 10.12s | 4.23 | 53% |
+
+A per-point Amdahl fit gives f = 0.389 / 0.189 / 0.129 — a spread that REJECTS
+the single-serial-fraction model. There is no "6.7x cap"; what the data shows is
+a CONTENTION term, so fit a USL (contention + coherency) rather than quoting one f.
+
+CONSEQUENCES FOR THIS PLAN, which must be re-derived before implementation:
+* The claim "single-query speedup is capped at 6.7x forever" is withdrawn.
+* P2's accept gate (efficiency 0.177 -> >= 0.25 at 32 cores) is measured on the
+  invalid axis and must be restated over physical cores (baseline 53% at 8).
+* The promotion of replica routing to P1 was justified partly by that cap. The
+  +46% shared-nothing result is INDEPENDENT of this error and still stands, so
+  P1 survives — but on its own evidence, not on f.
+
 ## 0. Read this first: the measurement that drives the whole plan
 
 Two files in `.scratch/` were produced on this machine on 2026-08-09 by a sibling agent. I did not re-run them, but I read them and they are the empirical foundation of this design.
