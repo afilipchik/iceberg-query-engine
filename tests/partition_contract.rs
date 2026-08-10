@@ -364,7 +364,79 @@ async fn fixture_really_is_multi_partition_and_multi_batch() {
 }
 
 // ---------------------------------------------------------------------------
-// SQL-level smoke test: the guard must not fire on a real query
+// Bug 1 — UnionExec must drain every input partition
+// ---------------------------------------------------------------------------
+
+/// Collect every `id` value the operator emits across all of its partitions.
+async fn collect_ids(op: &dyn PhysicalOperator) -> Vec<i64> {
+    let mut ids = Vec::new();
+    for p in 0..op.output_partitions() {
+        let batches: Vec<RecordBatch> = op.execute(p).await.unwrap().try_collect().await.unwrap();
+        for b in batches {
+            let col = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id column");
+            ids.extend(col.values().iter().copied());
+        }
+    }
+    ids
+}
+
+#[tokio::test]
+async fn union_all_keeps_every_row_of_every_input_partition() {
+    // Each branch: 4 partitions x 3 batches x 500 rows = 6,000 rows, ids 0..5999.
+    // The branches are separate fixtures, so the union must contain every id in
+    // 0..5999 exactly TWICE.
+    //
+    // Before the fix `UnionExec::execute` ignored its argument and called
+    // `input.execute(0)` on each input while declaring 1 partition, so it
+    // returned 2 x 1,500 = 3,000 rows: a quarter of each branch. The count
+    // assertion below is what catches that; the per-id assertion catches the
+    // subtler failure where the right NUMBER of rows comes back from the wrong
+    // partitions.
+    let a = scan(4, 3, 500);
+    let b = scan(4, 3, 500);
+    let union = UnionExec::new(vec![a, b]);
+
+    assert_eq!(
+        run_all_partitions(&union).await,
+        12_000,
+        "UNION ALL must keep every row of every input partition"
+    );
+
+    let mut ids = collect_ids(&union).await;
+    ids.sort_unstable();
+    let expected: Vec<i64> = (0..6_000).flat_map(|i| [i, i]).collect();
+    assert_eq!(ids, expected, "UNION ALL must keep each id exactly twice");
+}
+
+#[tokio::test]
+async fn union_all_of_three_inputs_keeps_every_row() {
+    let union = UnionExec::new(vec![scan(4, 3, 500), scan(2, 1, 1000), scan(3, 2, 250)]);
+    let expected = 4 * 3 * 500 + 2 * 1000 + 3 * 2 * 250;
+    assert_eq!(run_all_partitions(&union).await, expected);
+    assert_eq!(expected, 9_500);
+}
+
+#[tokio::test]
+async fn union_streams_lazily_rather_than_materializing() {
+    // UNION ALL is not a pipeline breaker. Draining all input partitions must
+    // not turn it into one — `collect_input_partitions_concurrently`, the
+    // idiom SortExec uses, would materialize both branches before emitting a
+    // row, which for UNION ALL over two large tables is an OOM the engine's
+    // memory-safety rule does not permit. A lazily chained union emits its
+    // first batch after opening exactly one partition, so taking one batch
+    // must not require reading everything.
+    let union = UnionExec::new(vec![scan(4, 3, 500), scan(4, 3, 500)]);
+    let mut stream = union.execute(0).await.unwrap();
+    let first = stream.try_next().await.unwrap().expect("a first batch");
+    assert_eq!(first.num_rows(), 500, "expected one batch, not a concat");
+}
+
+// ---------------------------------------------------------------------------
+// SQL-level regressions, DuckDB-validated against data/tpch-10mb
 // ---------------------------------------------------------------------------
 
 const TPCH_10MB: &str = "data/tpch-10mb";
@@ -431,5 +503,91 @@ async fn multi_partition_queries_do_not_trip_the_guard() {
         )
         .await,
         5
+    );
+}
+
+/// UNION ALL over a table big enough to be scanned in several partitions.
+///
+/// Every expected value here was produced by DuckDB reading the SAME parquet
+/// file (`duckdb.read_parquet('data/tpch-10mb/lineitem.parquet')`).
+///
+/// The fixture matters: `data/tpch-1mb` is 6,000 rows in ONE batch, so it is
+/// one partition and this query is correct there even with the bug — which is
+/// exactly why `tests/expected_results/setop/union_all.csv` stayed green while
+/// UNION ALL was losing 96% of its rows at SF=0.1. Do not "simplify" these onto
+/// tpch-1mb.
+#[tokio::test]
+async fn union_all_over_a_multi_partition_scan_keeps_every_row() {
+    let ctx = tpch_10mb_ctx();
+
+    // Self-validating: whatever the generator produces, the union is 2x it.
+    let base = count(&ctx, "SELECT COUNT(*) FROM lineitem").await;
+    assert_eq!(base, 60_000, "fixture changed; DuckDB oracle says 60000");
+
+    assert_eq!(
+        count(
+            &ctx,
+            "SELECT COUNT(*) FROM (SELECT l_orderkey FROM lineitem \
+             UNION ALL SELECT l_orderkey FROM lineitem) x"
+        )
+        .await,
+        2 * base, // DuckDB: 120000; pre-fix engine: 16384
+    );
+
+    assert_eq!(
+        count(
+            &ctx,
+            "SELECT COUNT(*) FROM (SELECT l_orderkey FROM lineitem \
+             UNION ALL SELECT l_orderkey FROM lineitem \
+             UNION ALL SELECT l_orderkey FROM lineitem) x"
+        )
+        .await,
+        3 * base, // DuckDB: 180000
+    );
+
+    // UNION (distinct) is lowered as group-by-every-column ON TOP of UnionExec,
+    // so it inherited the same loss.
+    assert_eq!(
+        count(
+            &ctx,
+            "SELECT COUNT(*) FROM (SELECT DISTINCT l_orderkey FROM lineitem \
+             UNION SELECT DISTINCT l_orderkey FROM lineitem) x"
+        )
+        .await,
+        14_785, // DuckDB
+    );
+}
+
+/// A UNION ALL that is NOT at the plan root.
+///
+/// CTE materialization and uncorrelated subqueries run their plan through
+/// `run_subquery_blocking`, which drives partition 0 only. A union that
+/// declared one partition per input partition would return 1/8 of its rows
+/// here even though the top-level query above is correct — which is why
+/// `UnionExec::output_partitions()` is 1. DuckDB on the same parquet: 4.
+#[tokio::test]
+async fn union_all_inside_a_twice_referenced_cte_keeps_every_row() {
+    let ctx = tpch_10mb_ctx();
+    assert_eq!(
+        count(
+            &ctx,
+            "WITH t AS (SELECT l_orderkey FROM lineitem \
+                        UNION ALL SELECT l_orderkey FROM lineitem) \
+             SELECT COUNT(*) AS c FROM t a JOIN t b ON a.l_orderkey = b.l_orderkey \
+             WHERE a.l_orderkey = 1"
+        )
+        .await,
+        4,
+    );
+
+    // Same shape through an uncorrelated IN subquery.
+    assert_eq!(
+        count(
+            &ctx,
+            "SELECT COUNT(*) FROM lineitem WHERE l_orderkey IN \
+             (SELECT l_orderkey FROM lineitem UNION ALL SELECT l_orderkey FROM lineitem)"
+        )
+        .await,
+        60_000, // DuckDB: every orderkey is present
     );
 }
