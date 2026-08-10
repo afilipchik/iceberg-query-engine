@@ -470,6 +470,33 @@ impl LanceTable {
             .collect();
 
         let mut out: HashMap<String, ColumnStatistics> = HashMap::new();
+
+        // A NOT NULL column has zero nulls. That is a fact carried by the
+        // schema, not an estimate, and it costs nothing to read — which makes
+        // it the one piece of statistics Lance gives away as freely as a
+        // Parquet footer does.
+        //
+        // It is also load-bearing, and for a column type the scan below never
+        // touches. `EagerAggregation` refuses to pre-aggregate unless every
+        // column feeding a SUM factor is provably null-free, because summing a
+        // group with no non-NULL rows must yield NULL and a pre-aggregate would
+        // turn that into 0. Q09's factor is `ps_supplycost`, a **Float64**, so
+        // with integer statistics alone the lookup missed, the rule declined,
+        // and the Lance plan silently diverged from the Parquet one — 2.06s
+        // instead of 1.43s at SF=10. Nothing about that was visible as a
+        // "statistics" problem; it looked like the join order was just worse.
+        for field in self.schema.fields() {
+            if !field.is_nullable() {
+                out.insert(
+                    field.name().to_lowercase(),
+                    ColumnStatistics {
+                        null_count: Some(0),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
         if int_names.is_empty() {
             return out;
         }
@@ -664,7 +691,37 @@ impl LanceTable {
 ///
 /// One task per fragment: Lance decode is CPU-bound per fragment, so this is
 /// the format's natural parallel unit (58 fragments for SF=10 `lineitem`).
+/// `QE_LANCE_TIMING=1` reports every scan's wall time, width and row count.
+///
+/// Attribution before optimization: this is what showed that the Lance path's
+/// TPC-H losses are NOT in the scan (Q09 spends 165ms of 2.06s there) and that
+/// Q19's are (176ms of 416ms), which sent the work to the optimizer instead of
+/// to the reader.
 async fn scan_fragments(
+    ds: Arc<Dataset>,
+    names: Vec<String>,
+    filter: Option<String>,
+) -> Result<Vec<RecordBatch>> {
+    if std::env::var("QE_LANCE_TIMING").is_err() {
+        return scan_fragments_inner(ds, names, filter).await;
+    }
+    let t0 = std::time::Instant::now();
+    let out = scan_fragments_inner(ds, names.clone(), filter).await;
+    let rows: usize = out
+        .as_ref()
+        .map(|b: &Vec<RecordBatch>| b.iter().map(|x| x.num_rows()).sum())
+        .unwrap_or(0);
+    eprintln!(
+        "[lance-scan] {:>7.1}ms {:>11} rows {} cols {:?}",
+        t0.elapsed().as_secs_f64() * 1000.0,
+        rows,
+        names.len(),
+        names
+    );
+    out
+}
+
+async fn scan_fragments_inner(
     ds: Arc<Dataset>,
     names: Vec<String>,
     filter: Option<String>,
