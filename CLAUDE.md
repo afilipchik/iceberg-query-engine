@@ -1362,6 +1362,38 @@ category precision@10 = 1.000.
 
 ## Recently Implemented Features
 
+- **Hardware Topology Awareness** (2026-08-09) — `src/execution/topology.rs`
+  - Startup sysfs probe: NUMA nodes + cpulists + SLIT distances, SMT siblings,
+    per-CPU performance weight from `cpuinfo_max_freq` (ARM `cpu_capacity`
+    fallback). Classes are DERIVED — no CPU model numbers anywhere. Intersected
+    with the process affinity mask, so `taskset` shrinks the topology.
+  - `query_engine topology` prints the detected layout and placement.
+  - API: `Topology::get()`, `num_numa_nodes()`, `cpus_for_node()`, `distance()`,
+    `total_weight()`, `is_uniform()`, `preferred_cpu_order()`, `fast_cpus()`,
+    `core_siblings()`; free functions `init_global_pool()`, `node_pool()`,
+    `preferred_node_for()`, `first_touch()`, `workers_for()`,
+    `pin_current_thread_to()`, `set_thread_affinity()`, `current_cpu()`.
+  - Env: `QE_TOPOLOGY=0` disables the placed pool; `QE_PLACEMENT=cpu|core|node`
+    selects binding tightness (default `node`).
+  - **THIS DEV BOX HAS NO NUMA** (`numactl`: 1 node). It is a hybrid
+    i9-13900KF: CPUs 0-15 = 8 P-cores with SMT (5.5-5.8 GHz), CPUs 16-31 = 16
+    E-cores (4.3 GHz). Every NUMA branch is a no-op at one node, is unit-tested
+    against synthetic sysfs fixtures (fake 2-socket / hybrid / empty container),
+    and **has never run on real multi-socket silicon**.
+  - Measured and REJECTED as defaults: per-CPU pinning (Q02 -16.2% but Q11
+    +22.7%, Q06 +8.2%) and per-core pinning (Q06 +16.2%). Default `node`
+    placement A/Bs flat (-0.2% over 22 queries) — it is free here and is the
+    right rule on a real server.
+  - `workers_for(work_units, max)` sizes fan-outs to available work; used by
+    the morsel aggregate drivers and `ParallelParquetSource` (`total_work()`).
+    Merge shard count now scales with group count (`merge_shard_count`).
+    Suite effect at SF=10: -1.0% (Q02 -16%, Q12 -9%, Q19/Q11 -7%, Q14 -7%).
+  - **What does NOT work on a hybrid box**: any static core-class policy. The
+    E-cores help long CPU-bound queries (Q17/Q20/Q07/Q03/Q08 gain 16-29% from
+    them) and hurt short ones (Q02/Q11/Q14 lose 12-25%). Restricting to
+    P-cores wins some and loses more. Reducing the global thread count does
+    nothing (`RAYON_NUM_THREADS=16` on 32 CPUs: +-1%).
+
 - **Morsel-Driven Aggregation Integration + Vectorization** (2026-01-29)
   - Integrated morsel-driven parallel aggregation into the query engine
   - New `MorselAggregateExec` physical operator in `src/physical/operators/morsel_agg.rs`
@@ -1607,6 +1639,7 @@ category precision@10 = 1.000.
 | Async Parquet reader | `src/storage/parquet.rs` (AsyncParquetReader) |
 | TableProvider trait | `src/physical/operators/scan.rs` |
 | Memory pool/config | `src/execution/memory.rs` |
+| Hardware topology / NUMA / core classes | `src/execution/topology.rs` |
 | Spillable operators | `src/physical/operators/spillable.rs` |
 | Vector distance kernels | `src/physical/vector.rs` |
 | Vector type rules (fail-loudly) | `src/planner/vector_types.rs` |
