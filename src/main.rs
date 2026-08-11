@@ -236,6 +236,73 @@ enum Commands {
 
     /// Print the hardware topology the engine detected and how it placed workers
     Topology,
+
+    /// Run this process as a cluster node: HTTP server, peer discovery, health.
+    ///
+    /// MILESTONE 1: `/sql` executes LOCALLY against this node's own tables.
+    /// There is no fan-out and no distributed answer yet — see
+    /// `.claude/plans/DISTRIBUTED-IMPLEMENTATION.md`.
+    Serve {
+        /// Address to bind. Use `:0` for an ephemeral port (tests).
+        #[arg(long, default_value = "0.0.0.0:7777")]
+        bind: String,
+
+        /// Static peer list, `host:port,host:port`. May include this node.
+        #[arg(long, value_delimiter = ',')]
+        peers: Vec<String>,
+
+        /// DNS name whose A records are the cluster. In Kubernetes this is the
+        /// headless Service; it is re-resolved on a timer so pod churn is seen.
+        #[arg(long, conflicts_with = "peers")]
+        peers_dns: Option<String>,
+
+        /// Port to assume for `--peers-dns` A records (default: the bound port)
+        #[arg(long)]
+        peers_dns_port: Option<u16>,
+
+        /// Stable node id. Defaults to $QE_NODE_ID, then the StatefulSet pod
+        /// ordinal from the hostname, then a hash of the advertised address.
+        #[arg(long)]
+        node_id: Option<u64>,
+
+        /// Address peers should use to reach this node. Defaults to
+        /// $QE_ADVERTISE_ADDR, then $POD_IP:<port>, then a local interface.
+        #[arg(long)]
+        advertise: Option<String>,
+
+        /// Directory of TPC-H Parquet files. Registers all eight tables and
+        /// FAILS if any is missing — a node serving a partial schema is worse
+        /// than a node that refuses to start.
+        #[arg(long)]
+        data: Option<PathBuf>,
+
+        /// Directory of arbitrary `*.parquet` files, each registered under its
+        /// file stem. Can be combined with --data.
+        #[arg(long)]
+        tables: Option<PathBuf>,
+
+        /// Memory limit, e.g. `8G`. Default: the engine's normal default.
+        #[arg(long)]
+        memory_limit: Option<String>,
+
+        /// Discovery re-resolution and peer-probe interval, milliseconds.
+        #[arg(long, default_value = "2000")]
+        discovery_interval_ms: u64,
+
+        /// Per-probe timeout, milliseconds.
+        #[arg(long, default_value = "1000")]
+        probe_timeout_ms: u64,
+
+        /// On SIGTERM, keep serving (reporting /readyz false) this long before
+        /// closing the listener, so a Kubernetes Service can drop this pod
+        /// from its endpoints first.
+        #[arg(long, default_value = "0")]
+        drain_ms: u64,
+
+        /// Grace period for in-flight requests after the listener closes.
+        #[arg(long, default_value = "10000")]
+        shutdown_grace_ms: u64,
+    },
 }
 
 /// The eight TPC-H tables, in dependency order.
@@ -980,7 +1047,135 @@ async fn main() {
         }
 
         Commands::Topology => print_topology(),
+
+        Commands::Serve {
+            bind,
+            peers,
+            peers_dns,
+            peers_dns_port,
+            node_id,
+            advertise,
+            data,
+            tables,
+            memory_limit,
+            discovery_interval_ms,
+            probe_timeout_ms,
+            drain_ms,
+            shutdown_grace_ms,
+        } => {
+            use query_engine::distributed::{serve, ServeOptions};
+            use std::time::Duration;
+
+            if data.is_none() && tables.is_none() {
+                eprintln!(
+                    "serve: nothing to serve. Pass --data <tpch-dir> and/or --tables <parquet-dir>."
+                );
+                std::process::exit(2);
+            }
+
+            let opts = ServeOptions {
+                bind,
+                advertise,
+                node_id,
+                peers,
+                peers_dns,
+                peers_dns_port,
+                discovery_interval: Duration::from_millis(discovery_interval_ms),
+                probe_timeout: Duration::from_millis(probe_timeout_ms),
+                drain: Duration::from_millis(drain_ms),
+                shutdown_grace: Duration::from_millis(shutdown_grace_ms),
+            };
+
+            let loader = Box::new(move || build_serve_context(&data, &tables, &memory_limit));
+            if let Err(e) = serve(opts, loader).await {
+                eprintln!("serve: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
+}
+
+/// Build the `serve` node's tables. Runs off the HTTP path, after the listener
+/// is up, so `/healthz` answers while this is still working.
+///
+/// Every failure here is loud and terminal for readiness: a node whose tables
+/// did not load reports `/readyz` false forever with the reason attached,
+/// rather than starting up and answering queries against a partial schema.
+fn build_serve_context(
+    data: &Option<PathBuf>,
+    tables: &Option<PathBuf>,
+    memory_limit: &Option<String>,
+) -> query_engine::Result<ExecutionContext> {
+    use query_engine::error::QueryError;
+
+    let mut ctx = match memory_limit {
+        Some(limit) => {
+            let config = query_engine::ExecutionConfig::new().with_memory_limit_str(limit)?;
+            ExecutionContext::with_config(config)
+        }
+        None => ExecutionContext::new(),
+    };
+
+    if let Some(dir) = data {
+        for table in TPCH_TABLES {
+            let file = dir.join(format!("{}.parquet", table));
+            if !file.exists() {
+                return Err(QueryError::Storage(format!(
+                    "--data {} is missing {}.parquet; a TPC-H node must serve all eight tables",
+                    dir.display(),
+                    table
+                )));
+            }
+            ctx.register_parquet(table, &file)?;
+        }
+    }
+
+    if let Some(dir) = tables {
+        let entries = std::fs::read_dir(dir)
+            .map_err(|e| QueryError::Storage(format!("--tables {}: {}", dir.display(), e)))?;
+        let mut registered = 0usize;
+        let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        paths.sort();
+        for path in paths {
+            let is_parquet_file =
+                path.is_file() && path.extension().map(|e| e == "parquet").unwrap_or(false);
+            let is_parquet_dir = path.is_dir()
+                && std::fs::read_dir(&path)
+                    .map(|mut it| {
+                        it.any(|e| {
+                            e.ok()
+                                .map(|e| {
+                                    e.path()
+                                        .extension()
+                                        .map(|x| x == "parquet")
+                                        .unwrap_or(false)
+                                })
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false);
+            if !is_parquet_file && !is_parquet_dir {
+                continue;
+            }
+            let name = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            ctx.register_parquet(&name, &path)?;
+            registered += 1;
+        }
+        if registered == 0 {
+            return Err(QueryError::Storage(format!(
+                "--tables {} contains no Parquet files or Parquet directories",
+                dir.display()
+            )));
+        }
+    }
+
+    Ok(ctx)
 }
 
 /// Report what the topology probe found and where the workers landed.

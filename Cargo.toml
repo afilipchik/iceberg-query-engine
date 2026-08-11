@@ -76,6 +76,17 @@ rust-stemmers = "1.2"
 # HTTP Client (for metastore)
 reqwest = { version = "0.11", features = ["json"] }
 
+# HTTP server for `query_engine serve` (src/distributed/). Deliberately hyper +
+# arrow-ipc rather than tonic/arrow-flight: all three crates below are ALREADY
+# in Cargo.lock (pulled in under `--features lance` via object_store/aws-sdk),
+# so naming them here adds ZERO new lock entries and cannot move the arrow-53
+# pin that Lance requires. `http1`+`server` only — the `http2` feature would
+# pull h2 into the default build for no benefit. See
+# .claude/plans/DISTRIBUTED-DESIGN.md "Flight semantics, not the Flight crate".
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 rustyline = { version = "14", features = ["with-fuzzy"] }
