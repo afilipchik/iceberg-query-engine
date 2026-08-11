@@ -291,8 +291,13 @@ cmd_verify() {
     if kill -0 "$vpid" 2>/dev/null; then
         bad "node $victim ignored SIGTERM"; failures=$((failures + 1))
     else
-        wait "$vpid" 2>/dev/null && ok "node $victim exited cleanly on SIGTERM" \
-            || ok "node $victim exited on SIGTERM"
+        # `kill -0` is a sound liveness test here precisely because the node is
+        # NOT a child of this shell -- it was started by an earlier invocation,
+        # so init reaps it and there is no zombie to mistake for a live process.
+        # (The in-process Rust test spawns its own children and must therefore
+        # use try_wait instead; see tests/distributed_cluster.rs. That test also
+        # asserts the exit status is 0, which this shell cannot observe.)
+        ok "node $victim exited on SIGTERM"
     fi
 
     deadline=$((SECONDS + 30))
