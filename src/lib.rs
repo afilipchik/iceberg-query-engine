@@ -11,6 +11,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub mod arrow_ffi;
+pub mod distributed;
 pub mod error;
 pub mod execution;
 pub mod metastore;
