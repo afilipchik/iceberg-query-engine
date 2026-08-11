@@ -105,3 +105,49 @@ partitioned operator model. Not started until P-1 lands.
 
 M1 server+membership → M1 k8s artifacts → M2 sharding+two-phase → M2 gate.
 Then P-1 prerequisites, then M3.
+
+## 5. Load balance is a measured requirement, not a hope (added 2026-08-11)
+
+"Work divided among participants as equally as possible" is an acceptance
+criterion with a number, not an aspiration. Three rules follow.
+
+**Split at row-group / fragment granularity, never whole files.** TPC-H at SF=10
+is one ~7GB `lineitem` and a 2KB `nation`; any file-level assignment gives one
+node nearly all the work. Parquet exposes `num_row_groups()` and per-row-group
+byte sizes (`src/storage/parquet.rs:119,295`); Lance exposes fragments. Those are
+the atoms.
+
+**Assign by SIZE with greedy longest-processing-time-first, not `hash % N`.**
+Hash assignment balances *counts*, which is the wrong quantity — it is only
+balanced when every split is the same size, which is never true. Sort splits
+descending by bytes and repeatedly give the next split to the least-loaded node.
+
+**Report the imbalance and gate on it.** Define
+`imbalance = max_node_bytes / mean_node_bytes`. Expose it in the query response
+so it is observable in production, not just in a test. Gate: `imbalance <= 1.10`
+for TPC-H `lineitem` across 3 and 8 nodes.
+
+**Static balance is necessary but not sufficient.** Equal bytes is not equal
+time: nodes differ in speed (this box has P-cores at 5.8GHz and E-cores at
+4.3GHz — a 1.35x spread), filters have different selectivity per split, and a
+straggler sets the query's latency. So M4 adds **pull-based / work-stealing
+assignment**, where an idle node takes the next split rather than being handed a
+fixed set up front. That is what actually equalizes *time*, and it is the same
+mechanism Trino uses. Measure it as wall-time spread across nodes
+(`max_node_ms / mean_node_ms`), which is the number the user actually cares
+about.
+
+## 6. Full staged path to true distributed execution
+
+* **M2 — Balanced distributed scan + two-phase aggregation.** Row-group splits,
+  LPT assignment, partial aggregates merged by the initiator. No shuffle, so no
+  dependency on the readiness blockers. Unsupported shapes rejected loudly.
+* **P-1 — Prerequisites** (`DISTRIBUTED-READINESS.md`): the three partition-0
+  callers, memory accounting through the pool, planning-time sub-plan execution,
+  cancellation. Blocking for anything that shuffles.
+* **M3 — Exchange / shuffle.** `ExchangeExec` over the existing partitioned
+  operator model, hash repartitioning, distributed joins, `AggregateMode`
+  partial/final across the network.
+* **M4 — Dynamic balance.** Work-stealing split assignment, straggler
+  mitigation, and skew handling for hash-partitioned exchanges (the case where
+  one key dominates and static hashing cannot help).
