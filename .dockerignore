@@ -1,0 +1,30 @@
+# Keep the build context small. Without this, `docker build .` uploads
+# everything in the working tree to the daemon before the first instruction
+# runs — and this repository's `data/` holds TPC-H datasets up to 100 GB, plus
+# `target/` after a release build. The result is a build that appears to hang
+# for minutes on "sending build context" and can fill the daemon's disk.
+#
+# Data is MOUNTED at runtime (see k8s/statefulset.yaml), never baked in.
+
+data/
+target/
+.git/
+.github/
+logs/
+.scratch/
+.venv/
+__pycache__/
+*.pyc
+
+# Not needed to build the binary. `benches/` IS needed: Cargo.toml declares a
+# [[bench]] target and Cargo refuses to load a manifest whose target file is
+# missing, even for `cargo build --bin`.
+tests/
+docs/
+k8s/
+scripts/
+.claude/
+*.md
+Dockerfile
+.dockerignore
+kind-cluster.yaml

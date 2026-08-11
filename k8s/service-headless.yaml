@@ -1,0 +1,29 @@
+# The DNS name that `--peers-dns` resolves.
+#
+# UNVALIDATED-ON-CLUSTER — see the header of scripts/kind_test.sh.
+#
+# A headless Service (clusterIP: None) makes CoreDNS return one A record per
+# pod IP for `query-engine-headless.<namespace>.svc.cluster.local`. That set IS
+# the cluster membership, which is why the engine re-resolves it on a timer:
+# scale the StatefulSet and every node sees the change within one interval.
+apiVersion: v1
+kind: Service
+metadata:
+  name: query-engine-headless
+  labels:
+    app: query-engine
+spec:
+  clusterIP: None
+  # THE CRITICAL FIELD. Without it, CoreDNS only publishes records for *ready*
+  # pods — and a pod is only ready once it has resolved its peers. Every pod
+  # would wait for DNS that waits for a ready pod: a startup deadlock that
+  # looks like a discovery bug and is not one. Publishing not-ready addresses
+  # is how StatefulSet-based clusters (Cassandra, Kafka, etcd) bootstrap.
+  publishNotReadyAddresses: true
+  selector:
+    app: query-engine
+  ports:
+    - name: http
+      port: 7777
+      targetPort: http
+      protocol: TCP

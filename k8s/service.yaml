@@ -1,0 +1,29 @@
+# Client entry point. Any node can answer, so this load-balances across all
+# ready pods.
+#
+# UNVALIDATED-ON-CLUSTER — see the header of scripts/kind_test.sh.
+#
+# NodePort rather than ClusterIP so `scripts/kind_test.sh` can reach it from
+# the host through the port mapping in `kind-cluster.yaml`, with no
+# `kubectl port-forward` in the loop. For a real deployment, change `type` to
+# ClusterIP (or LoadBalancer) and delete `nodePort`.
+#
+# Endpoint membership is governed by the readiness probe, which is why /readyz
+# must mean "can correctly answer a query" and not merely "process is alive":
+# a node that has not resolved its peers must not be in this Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: query-engine
+  labels:
+    app: query-engine
+spec:
+  type: NodePort
+  selector:
+    app: query-engine
+  ports:
+    - name: http
+      port: 7777
+      targetPort: http
+      nodePort: 30777
+      protocol: TCP

@@ -214,6 +214,12 @@ src/
 ├── metastore/
 │   └── mod.rs                # BranchingMetastoreClient REST API client
 │
+├── distributed/              # `query_engine serve` — MILESTONE 1 ONLY
+│   ├── mod.rs                # Module exports
+│   ├── server.rs             # hyper HTTP server: /healthz /readyz /cluster /sql
+│   ├── membership.rs         # Peer discovery (static + DNS), self-id, probes
+│   └── http_client.rs        # ~100-line HTTP client used for peer probes
+│
 └── tpch/
     ├── mod.rs                # TPC-H module exports
     ├── generator.rs          # TpchGenerator for test data + Parquet export
@@ -222,6 +228,14 @@ src/
 
 tests/
 ├── sql_comprehensive.rs      # 131 SQL correctness tests
+└── distributed_cluster.rs    # M1 gate: 3 in-process nodes + 3 real processes
+
+k8s/                          # UNVALIDATED-ON-CLUSTER (no Docker on this box)
+├── statefulset.yaml          # 3 nodes, QE_NODE_ID from the pod ordinal
+├── service-headless.yaml     # the DNS name --peers-dns resolves
+└── service.yaml              # client entry point (NodePort 30777)
+Dockerfile                    # multi-stage; data is MOUNTED, not baked
+kind-cluster.yaml             # 1 control-plane + 3 workers, host mount for data
 
 data/                         # Generated test data (gitignored)
 ├── tpch-1mb/                 # SF=0.001 - 8 Parquet files
@@ -749,7 +763,50 @@ query_engine repl
 
 # Start REPL with TPC-H tables preloaded
 query_engine repl --tpch ./data/tpch-10mb
+
+# Run as a cluster node (MILESTONE 1: /sql executes LOCALLY, no fan-out yet)
+query_engine serve --bind 0.0.0.0:7777 --node-id 0 \
+    --peers 10.0.0.1:7777,10.0.0.2:7777 --data ./data/tpch-10mb
+# ...or with Kubernetes-style DNS discovery against a headless Service:
+query_engine serve --bind 0.0.0.0:7777 --peers-dns query-engine-headless \
+    --data /data
 ```
+
+### Distributed mode (M1)
+
+`serve` turns the process into a cluster node. See
+`.claude/plans/DISTRIBUTED-IMPLEMENTATION.md` for the milestone plan and
+`.claude/plans/DISTRIBUTED-READINESS.md` for the three blockers that must be
+fixed before M3 (shuffle).
+
+| Endpoint | Meaning |
+|----------|---------|
+| `GET /healthz` | Liveness. Touches no tables, peers or disk, so a slow query can never cause a Kubernetes restart. Returns this node's id. |
+| `GET /readyz` | Readiness = tables loaded AND discovery resolved AND not draining. 503 with a `reason` otherwise. |
+| `GET /cluster` | Membership as JSON. The `members` array is sorted by address so every node in a healthy cluster renders an identical list. |
+| `POST /sql` | Body is the statement. Returns Arrow IPC by default; `?format=json` and `?format=csv` for humans and diffing. **M1 executes locally** — no fan-out. |
+
+**What M1 is NOT**: no shuffle, no exchange, no distributed joins, no fragment
+execution. Each node answers from its own complete copy of the data, and its
+answer is byte-identical to the single-process binary's.
+
+**Testing without Docker.** kind cannot run on the development machine (no
+docker/podman, no passwordless sudo, and
+`kernel.apparmor_restrict_unprivileged_userns=1` blocks unprivileged user
+namespaces). The acceptance testbed is therefore N separate OS processes over
+real TCP:
+
+```bash
+./scripts/cluster_local.sh start 3     # 3 processes, static peer list
+./scripts/cluster_local.sh verify      # the full M1 gate
+./scripts/cluster_local.sh stop
+cargo test --release --test distributed_cluster
+```
+
+The Kubernetes artifacts (`Dockerfile`, `k8s/*.yaml`, `kind-cluster.yaml`) are
+**UNVALIDATED-ON-CLUSTER**. `.venv/bin/python scripts/validate_k8s_manifests.py`
+checks everything checkable without an API server; `scripts/kind_test.sh` is
+what must be run on a Docker-capable machine to change that status.
 
 ### Lance commands (require `--features lance`)
 
@@ -1686,6 +1743,13 @@ category precision@10 = 1.000.
 | DuckDB-over-Lance oracle/baseline | `scripts/duckdb_lance_bench.py` |
 | Streaming Parquet reader | `src/storage/parquet.rs` (StreamingParquetReader) |
 | Async Parquet reader | `src/storage/parquet.rs` (AsyncParquetReader) |
+| Server mode (`serve`) | `src/distributed/server.rs` |
+| Peer discovery / membership | `src/distributed/membership.rs` |
+| M1 cluster tests | `tests/distributed_cluster.rs` |
+| Local N-process cluster harness | `scripts/cluster_local.sh` |
+| Kubernetes manifests (unvalidated) | `k8s/`, `Dockerfile`, `kind-cluster.yaml` |
+| Manifest checks without a cluster | `scripts/validate_k8s_manifests.py` |
+| kind end-to-end test (needs Docker) | `scripts/kind_test.sh` |
 | TableProvider trait | `src/physical/operators/scan.rs` |
 | Memory pool/config | `src/execution/memory.rs` |
 | Hardware topology / NUMA / core classes | `src/execution/topology.rs` |

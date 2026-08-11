@@ -1,0 +1,45 @@
+# kind cluster for the distributed engine: 1 control-plane + 3 workers.
+#
+# UNVALIDATED-ON-CLUSTER: kind cannot run on the development machine (no
+# docker/podman, no passwordless sudo, and unprivileged user namespaces are
+# blocked by kernel.apparmor_restrict_unprivileged_userns=1). This file has
+# never been fed to `kind create cluster`.
+#
+# Three workers so the three StatefulSet pods land on three different nodes and
+# the transport is genuinely cross-node rather than three processes sharing a
+# loopback — which is the one thing the local harness cannot reproduce.
+#
+#   kind create cluster --config kind-cluster.yaml
+#
+# `hostPath: /data` in k8s/statefulset.yaml resolves inside each node's
+# container, so the dataset must be mounted into every node, including the
+# control-plane (NodePort traffic enters there).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: query-engine
+nodes:
+  - role: control-plane
+    extraMounts:
+      - hostPath: ./data/tpch-1mb
+        containerPath: /data
+        readOnly: true
+    extraPortMappings:
+      # NodePort 30777 (k8s/service.yaml) reachable at localhost:30777.
+      - containerPort: 30777
+        hostPort: 30777
+        protocol: TCP
+  - role: worker
+    extraMounts:
+      - hostPath: ./data/tpch-1mb
+        containerPath: /data
+        readOnly: true
+  - role: worker
+    extraMounts:
+      - hostPath: ./data/tpch-1mb
+        containerPath: /data
+        readOnly: true
+  - role: worker
+    extraMounts:
+      - hostPath: ./data/tpch-1mb
+        containerPath: /data
+        readOnly: true

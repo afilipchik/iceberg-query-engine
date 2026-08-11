@@ -1,0 +1,144 @@
+# Three engine nodes with stable identities.
+#
+# UNVALIDATED-ON-CLUSTER — see the header of scripts/kind_test.sh. Never applied to a cluster.
+#
+# StatefulSet, not Deployment, for one reason that matters here and will matter
+# more in M2: pod names are ordinal and stable, so `QE_NODE_ID` is stable, so
+# the file-to-node sharding function in M2 (`hash(path) % N == i`) maps the same
+# files to the same node across restarts. A Deployment's random pod names would
+# reshuffle every shard on every rollout.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: query-engine
+  labels:
+    app: query-engine
+spec:
+  serviceName: query-engine-headless
+  replicas: 3
+  podManagementPolicy: Parallel # all three must come up together to discover
+  selector:
+    matchLabels:
+      app: query-engine
+  template:
+    metadata:
+      labels:
+        app: query-engine
+    spec:
+      # SIGTERM, then this long, then SIGKILL. Must exceed drain + the longest
+      # query we are willing to let finish.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: query-engine
+          image: query-engine:dev
+          # `kind load docker-image` puts the image on each node; nothing must
+          # go looking for it in a registry that does not have it.
+          imagePullPolicy: IfNotPresent
+          # A shell only to turn the pod ordinal into QE_NODE_ID. `exec` is
+          # mandatory, not stylistic: without it the shell stays PID 1, absorbs
+          # SIGTERM, and the engine is SIGKILLed on every rollout — which looks
+          # exactly like a crash-looping node.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              export QE_NODE_ID="${HOSTNAME##*-}"
+              exec /usr/local/bin/query_engine serve \
+                --bind 0.0.0.0:7777 \
+                --peers-dns query-engine-headless \
+                --peers-dns-port 7777 \
+                --data /data \
+                --memory-limit "${QE_MEMORY_LIMIT}" \
+                --discovery-interval-ms 5000 \
+                --probe-timeout-ms 2000 \
+                --drain-ms 5000 \
+                --shutdown-grace-ms 15000
+          env:
+            # Read by derive_advertise(): the address peers must dial. The
+            # bound address (0.0.0.0:7777) is not routable, and the pod IP is
+            # exactly what the headless Service publishes, so this is the one
+            # value that makes self-identification exact rather than heuristic.
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: QE_ADVERTISE_ADDR
+              value: "$(POD_IP):7777"
+            - name: QE_MEMORY_LIMIT
+              value: "2G"
+            - name: RUST_LOG
+              value: "info"
+          ports:
+            - name: http
+              containerPort: 7777
+              protocol: TCP
+          # Three probes, three different questions.
+          #
+          # startup: "has it finished loading?" — table registration on a large
+          #   dataset can take minutes, and without this the liveness probe
+          #   would kill the pod mid-load, forever.
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60 # up to 5 minutes to load
+          # liveness: "is the process wedged?" — /healthz touches no tables, no
+          #   peers and no disk, so a slow query can never cause a restart.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # readiness: "should clients be sent here?" — false while loading,
+          #   false while peers are unresolved, false while draining.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              # Above QE_MEMORY_LIMIT: the engine's budget governs spilling, and
+              # the cgroup limit is the backstop. Setting them equal makes every
+              # spill decision a race with the OOM killer.
+              memory: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+              readOnly: true
+            # The root filesystem is read-only, so the spill directory
+            # (std::env::temp_dir()/query_engine_spill) needs writable space.
+            # Larger-than-memory queries write here; sizeLimit makes an
+            # unbounded spill evict the pod instead of filling the node's disk.
+            - name: spill
+              mountPath: /tmp
+      volumes:
+        - name: data
+          # Provided by kind-cluster.yaml's extraMounts on every node. For a
+          # real cluster replace this with a PersistentVolumeClaim or an
+          # object-store-backed volume; hostPath is a kind convenience only.
+          hostPath:
+            path: /data
+            type: Directory
+        - name: spill
+          emptyDir:
+            sizeLimit: 8Gi
