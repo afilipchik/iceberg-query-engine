@@ -15,6 +15,9 @@
 #   scripts/cluster_local.sh status           Print each node's /cluster view
 #   scripts/cluster_local.sh query "<SQL>"    Run SQL on every node, diff results
 #   scripts/cluster_local.sh verify           Run the full M1 acceptance gate
+#   scripts/cluster_local.sh verify-m2        Run the M2 gate (balance, two-phase
+#                                             aggregation, loud rejection)
+#   scripts/cluster_local.sh splits <table>   Show how a table divides at 2..16 nodes
 #   scripts/cluster_local.sh kill <i>         SIGTERM node i
 #   scripts/cluster_local.sh stop             Stop everything
 #
@@ -235,7 +238,14 @@ cmd_verify() {
     #    binary's. The reference is produced by `benchmark-parquet --save-csv`,
     #    which never touches the server code at all — the comparison is against
     #    the engine as it has always run, not against another server.
-    info "2/4  TPC-H results match the single-process binary, byte for byte"
+    #
+    #    Pinned to `distributed=0`: this check is about the LOCAL path, and
+    #    byte-for-byte is only a fair demand of it. A distributed SUM adds an
+    #    f64 column in shard-sized pieces, and floating-point addition is not
+    #    associative, so the last bits legitimately differ. The distributed
+    #    answers are gated separately by `verify-m2`, against DuckDB, with the
+    #    same numeric tolerance the DuckDB-validated suite uses.
+    info "2/4  TPC-H results match the single-process binary, byte for byte (local path)"
     mkdir -p "$STATE_DIR/verify" "$STATE_DIR/ref"
     for q in 1 3 6 10 12; do
         local qq; qq="$(printf 'q%02d' "$q")"
@@ -253,7 +263,7 @@ cmd_verify() {
         local agree=1
         for ((i = 0; i < n; i++)); do
             curl -s -X POST --data "$sql" \
-                 "http://$(addr_of "$i")/sql?format=csv" \
+                 "http://$(addr_of "$i")/sql?format=csv&distributed=0" \
                  -o "$STATE_DIR/verify/${qq}_node$i.csv"
             if ! diff -q "$STATE_DIR/ref/$qq.csv" "$STATE_DIR/verify/${qq}_node$i.csv" >/dev/null 2>&1; then
                 agree=0
@@ -322,7 +332,7 @@ cmd_verify() {
         local code
         code="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
                 --data "SELECT COUNT(*) AS n FROM orders" \
-                "http://$(addr_of "$i")/sql?format=csv")"
+                "http://$(addr_of "$i")/sql?format=csv&distributed=0")"
         [[ "$code" == "200" ]] || { still=0; bad "node $i stopped serving (HTTP $code)"; }
     done
     if [[ $still -eq 1 ]]; then
@@ -337,6 +347,44 @@ cmd_verify() {
     else
         echo -e "${RED}${BOLD}M1 GATE: $failures FAILURE(S)${NC}"; return 1
     fi
+}
+
+# ── splits: how a table divides ──────────────────────────────────────────────
+
+cmd_splits() {
+    local table="${1:-lineitem}"
+    local n; n="$(running_nodes)"
+    [[ -n "$n" ]] || die "no cluster running (run: $0 start)"
+    BASE_PORT="$(cat "$STATE_DIR/base_port")"
+    echo -e "${BOLD}how \`$table\` divides (imbalance = max_node_bytes / mean_node_bytes)${NC}"
+    for k in 1 2 3 4 8 16 32; do
+        curl -s "http://$(addr_of 0)/splits?table=$table&nodes=$k" \
+        | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+gate='PASS' if d['imbalance']<=1.10 else 'FAIL'
+print(f\"  {gate}  nodes={d['nodes']:>3}  imbalance={d['imbalance']:.5f}  \"
+      f\"splits={d['total_splits']:>5}  target={d['target_split_bytes']/(1<<20):.1f}MB  \"
+      f\"total={d['total_bytes']/(1<<30):.2f}GB  idle={len(d['idle_nodes'])}\")
+" || echo "  (query failed for nodes=$k)"
+    done
+}
+
+# ── verify-m2: the M2 acceptance gate ────────────────────────────────────────
+#
+# Delegates to scripts/distributed_validate.py, which is where the comparison
+# logic lives: it needs DuckDB, cell-wise numeric tolerance and JSON parsing,
+# none of which belong in shell.
+
+cmd_verify_m2() {
+    local n; n="$(running_nodes)"
+    [[ -n "$n" ]] || die "no cluster running (run: $0 start)"
+    BASE_PORT="$(cat "$STATE_DIR/base_port")"
+    local py=".venv/bin/python"
+    [[ -x "$py" ]] || py="python3"
+    command -v duckdb >/dev/null 2>&1 || die "duckdb is required for the M2 gate"
+    "$py" scripts/distributed_validate.py \
+        --data "$DATA_DIR" --nodes "$n" --base-port "$BASE_PORT" "$@"
 }
 
 # ── kill / stop ──────────────────────────────────────────────────────────────
@@ -371,6 +419,8 @@ case "$CMD" in
     status) cmd_status ;;
     query)  cmd_query "$@" ;;
     verify) cmd_verify ;;
+    verify-m2) cmd_verify_m2 "$@" ;;
+    splits) cmd_splits "$@" ;;
     kill)   cmd_kill "$@" ;;
     stop)   cmd_stop ;;
     *)

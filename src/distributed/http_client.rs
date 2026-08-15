@@ -24,10 +24,14 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-/// A parsed HTTP response: status code and the complete body.
+/// A parsed HTTP response: status code, headers, and the complete body.
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
     pub status: u16,
+    /// Header names lower-cased; values as sent. Kept because a fragment reply
+    /// carries its node's own row count and elapsed time out-of-band, and
+    /// re-deriving those from the Arrow payload would lose the timing entirely.
+    pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
 
@@ -39,6 +43,14 @@ impl HttpResponse {
 
     pub fn is_success(&self) -> bool {
         (200..300).contains(&self.status)
+    }
+
+    /// First value of `name` (case-insensitive).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
     }
 }
 
@@ -102,6 +114,24 @@ pub async fn get(addr: &str, path: &str, timeout: Duration) -> std::io::Result<H
     request(addr, "GET", path, None, None, timeout).await
 }
 
+/// `POST addr/path` with a JSON body.
+pub async fn post_json(
+    addr: &str,
+    path: &str,
+    body: &[u8],
+    timeout: Duration,
+) -> std::io::Result<HttpResponse> {
+    request(
+        addr,
+        "POST",
+        path,
+        Some("application/json"),
+        Some(body),
+        timeout,
+    )
+    .await
+}
+
 /// `POST addr/path` with a text/plain body.
 pub async fn post_text(
     addr: &str,
@@ -139,7 +169,21 @@ fn parse_response(raw: &[u8]) -> std::io::Result<HttpResponse> {
         .and_then(|s| s.parse::<u16>().ok())
         .ok_or_else(|| invalid(&format!("unparseable status line: {status_line:?}")))?;
 
-    Ok(HttpResponse { status, body })
+    let headers = head
+        .split(|b| *b == b'\n')
+        .skip(1)
+        .filter_map(|line| {
+            let line = String::from_utf8_lossy(line);
+            let (k, v) = line.split_once(':')?;
+            Some((k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        })
+        .collect();
+
+    Ok(HttpResponse {
+        status,
+        headers,
+        body,
+    })
 }
 
 fn invalid(msg: &str) -> std::io::Error {
@@ -152,11 +196,16 @@ mod tests {
 
     #[test]
     fn parses_a_normal_response() {
-        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-QE-Rows: 42\r\n\r\nok";
         let r = parse_response(raw).unwrap();
         assert_eq!(r.status, 200);
         assert_eq!(r.body, b"ok");
         assert!(r.is_success());
+        // Header lookup is case-insensitive: a fragment's row count and timing
+        // arrive this way and must not depend on a peer's capitalisation.
+        assert_eq!(r.header("x-qe-rows"), Some("42"));
+        assert_eq!(r.header("X-Qe-Rows"), Some("42"));
+        assert_eq!(r.header("x-qe-missing"), None);
     }
 
     #[test]

@@ -252,8 +252,17 @@ async fn three_nodes_converge_on_one_identical_membership_view() {
     shutdown_all(nodes).await;
 }
 
-/// GATE: each node answers `/sql` independently, and identically to the
+/// GATE (M1): each node answers `/sql` independently, and identically to the
 /// single-process engine.
+///
+/// Pinned to `distributed=0` deliberately. This test's subject is the LOCAL
+/// path — "a server process answers what the binary answers, byte for byte" —
+/// and byte-for-byte is only a fair demand of the local path. A distributed
+/// `SUM` over `f64` adds the column in shard-sized pieces, and floating-point
+/// addition is not associative, so the last bits legitimately differ. The
+/// distributed answers get their own gate
+/// (`distributed_answers_match_the_single_process_engine`), which compares with
+/// the same numeric tolerance the DuckDB-validated suite uses.
 #[tokio::test]
 async fn every_node_answers_exactly_what_the_single_process_engine_answers() {
     let nodes = start_cluster(3).await;
@@ -296,9 +305,10 @@ async fn every_node_answers_exactly_what_the_single_process_engine_answers() {
         }));
 
         for (i, addr) in addrs.iter().enumerate() {
-            let resp = http_client::post_text(addr, "/sql?format=csv", sql, HTTP_TIMEOUT)
-                .await
-                .unwrap_or_else(|e| panic!("node {i} POST /sql ({name}): {e}"));
+            let resp =
+                http_client::post_text(addr, "/sql?format=csv&distributed=0", sql, HTTP_TIMEOUT)
+                    .await
+                    .unwrap_or_else(|e| panic!("node {i} POST /sql ({name}): {e}"));
             assert!(
                 resp.is_success(),
                 "node {i} rejected {name}: HTTP {} {}",
@@ -658,6 +668,495 @@ async fn membership_follows_peer_list_changes() {
         })
         .await,
         "re-added peer never came back up"
+    );
+
+    shutdown_all(nodes).await;
+}
+
+// ---------------------------------------------------------------------------
+// M2: balanced distributed scan and two-phase aggregation
+// ---------------------------------------------------------------------------
+
+/// Cell-by-cell comparison with the numeric tolerance the DuckDB-validated
+/// suite uses, and rows compared as a SET.
+///
+/// Both relaxations are arithmetic facts, not looseness:
+///
+/// * `SUM` over `f64` is not associative, so adding a column in three
+///   shard-sized pieces differs from adding it in one — in the last bits.
+/// * `GROUP BY` without `ORDER BY` has unspecified row order in SQL, and the
+///   merge hashes a handful of partial rows where the single-node run hashes
+///   thousands of base rows. `ORDER BY` is REJECTED for distributed queries
+///   precisely so nobody mistakes the incidental order for a promise.
+fn assert_cells_match(got: &str, expected: &str, context: &str) {
+    let norm = |s: &str| {
+        let mut l: Vec<String> = s.trim().lines().map(|x| x.to_string()).collect();
+        if l.len() > 1 {
+            l[1..].sort();
+        }
+        l
+    };
+    let (g, e) = (norm(got), norm(expected));
+    assert_eq!(
+        g.len(),
+        e.len(),
+        "{context}: row count\n--got--\n{got}\n--want--\n{expected}"
+    );
+    for (row, (gl, el)) in g.iter().zip(e.iter()).enumerate() {
+        let gc: Vec<&str> = gl.split(',').collect();
+        let ec: Vec<&str> = el.split(',').collect();
+        assert_eq!(gc.len(), ec.len(), "{context}: column count on row {row}");
+        for (col, (a, b)) in gc.iter().zip(ec.iter()).enumerate() {
+            if a == b {
+                continue;
+            }
+            match (a.parse::<f64>(), b.parse::<f64>()) {
+                (Ok(x), Ok(y)) => {
+                    let tol = (1e-6 * x.abs().max(y.abs())).max(1e-9);
+                    assert!(
+                        (x - y).abs() <= tol,
+                        "{context}: row {row} col {col}: {a} vs {b}"
+                    );
+                }
+                _ => panic!("{context}: row {row} col {col}: `{a}` vs `{b}`"),
+            }
+        }
+    }
+}
+
+async fn dsql(addr: &str, sql: &str) -> query_engine::distributed::HttpResponse {
+    http_client::post_text(addr, "/sql?format=csv&distributed=1", sql, HTTP_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("POST /sql?distributed=1 to {addr}: {e}"))
+}
+
+/// The M2 headline: a query fanned out across three processes returns what the
+/// whole dataset returns — from whichever node received it.
+#[tokio::test]
+async fn distributed_answers_match_the_single_process_engine() {
+    let nodes = start_cluster(3).await;
+    let addrs: Vec<String> = nodes.iter().map(|h| h.local_addr().to_string()).collect();
+    for a in &addrs {
+        assert!(
+            wait_ready(a, Duration::from_secs(30)).await,
+            "{a} never ready"
+        );
+    }
+    let local = in_process_context();
+
+    let queries: &[(&str, &str)] = &[
+        ("count", "SELECT COUNT(*) AS n FROM lineitem"),
+        (
+            "count_filtered",
+            "SELECT COUNT(*) AS n FROM lineitem WHERE l_shipdate < '1995-01-01'",
+        ),
+        (
+            "sum_min_max",
+            "SELECT SUM(l_quantity) AS s, MIN(l_extendedprice) AS lo, \
+             MAX(l_extendedprice) AS hi FROM lineitem",
+        ),
+        (
+            "avg",
+            "SELECT AVG(l_quantity) AS a, AVG(l_discount) AS d FROM lineitem",
+        ),
+        (
+            "avg_of_nothing",
+            "SELECT AVG(l_quantity) AS a, COUNT(*) AS c FROM lineitem WHERE l_orderkey < 0",
+        ),
+        (
+            "group_by",
+            "SELECT l_returnflag, l_linestatus, SUM(l_quantity) AS q, \
+             AVG(l_discount) AS d, COUNT(*) AS c \
+             FROM lineitem GROUP BY l_returnflag, l_linestatus",
+        ),
+        (
+            "group_by_having",
+            "SELECT l_shipmode, COUNT(*) AS c FROM lineitem \
+             GROUP BY l_shipmode HAVING COUNT(*) > 100",
+        ),
+        (
+            "tiny_table",
+            "SELECT COUNT(*) AS c, MIN(n_name) AS lo, MAX(n_name) AS hi FROM nation",
+        ),
+        (
+            "pass_through",
+            "SELECT l_orderkey, l_linenumber FROM lineitem WHERE l_quantity > 49.9",
+        ),
+    ];
+
+    for (name, sql) in queries {
+        let expected = csv_of(&local.sql(sql).await.unwrap_or_else(|e| {
+            panic!("single-process engine failed on {name}: {e}");
+        }));
+        for (i, addr) in addrs.iter().enumerate() {
+            let resp = dsql(addr, sql).await;
+            assert!(
+                resp.is_success(),
+                "node {i} could not distribute {name}: HTTP {} {}",
+                resp.status,
+                resp.text()
+            );
+            // `distributed=1` must never fall back; if this header is false the
+            // comparison below would be comparing local to local and proving
+            // nothing.
+            assert_eq!(
+                resp.header("x-qe-distributed"),
+                Some("true"),
+                "node {i} answered {name} locally despite distributed=1"
+            );
+            assert_cells_match(&resp.text(), &expected, &format!("{name} @node{i}"));
+        }
+    }
+
+    shutdown_all(nodes).await;
+}
+
+/// Every response says how the work was divided, and the division adds up.
+#[tokio::test]
+async fn the_distribution_is_reported_with_every_answer() {
+    let nodes = start_cluster(3).await;
+    let addrs: Vec<String> = nodes.iter().map(|h| h.local_addr().to_string()).collect();
+    for a in &addrs {
+        assert!(wait_ready(a, Duration::from_secs(30)).await);
+    }
+    assert!(
+        converges(Duration::from_secs(20), || {
+            let a = addrs[0].clone();
+            async move { get_json(&a, "/cluster").await["member_count"].as_u64() == Some(3) }
+        })
+        .await,
+        "cluster never converged"
+    );
+
+    let resp = dsql(&addrs[0], "SELECT COUNT(*) AS n FROM lineitem").await;
+    assert!(resp.is_success(), "{}", resp.text());
+    let d: serde_json::Value = serde_json::from_str(
+        resp.header("x-qe-distribution")
+            .expect("distribution header"),
+    )
+    .expect("distribution header is JSON");
+
+    assert_eq!(d["shard_count"].as_u64(), Some(3));
+    assert_eq!(d["table"].as_str(), Some("lineitem"));
+    let per: Vec<u64> = d["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["assigned_bytes"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        per.iter().sum::<u64>(),
+        d["total_bytes"].as_u64().unwrap(),
+        "every byte must be attributed to exactly one node"
+    );
+    let imbalance = d["imbalance"].as_f64().unwrap();
+    assert!(
+        (1.0..=1.10).contains(&imbalance),
+        "imbalance {imbalance} outside the gate"
+    );
+    // Exactly one node reports itself as the in-process shard: the initiator
+    // works, it does not just coordinate.
+    assert_eq!(
+        d["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|n| n["local"].as_bool() == Some(true))
+            .count(),
+        1
+    );
+
+    shutdown_all(nodes).await;
+}
+
+/// `/splits` prices the division for ANY node count without running that many
+/// nodes, because it is metadata arithmetic. This is the balance gate.
+#[tokio::test]
+async fn the_balance_gate_holds_at_three_and_eight_nodes() {
+    let nodes = start_cluster(1).await;
+    let addr = nodes[0].local_addr().to_string();
+    assert!(wait_ready(&addr, Duration::from_secs(30)).await);
+
+    for n in [3u64, 8] {
+        let v = get_json(&addr, &format!("/splits?table=lineitem&nodes={n}")).await;
+        let imbalance = v["imbalance"].as_f64().expect("imbalance is a number");
+        assert!(
+            imbalance <= 1.10,
+            "lineitem at {n} nodes: imbalance {imbalance:.4} exceeds the 1.10 gate \
+             ({} splits)",
+            v["total_splits"]
+        );
+        assert_eq!(
+            v["idle_nodes"].as_array().map(|a| a.len()),
+            Some(0),
+            "no node should be left with nothing at {n} nodes: {v}"
+        );
+        let assigned: u64 = v["per_node"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["bytes"].as_u64().unwrap())
+            .sum();
+        assert_eq!(assigned, v["total_bytes"].as_u64().unwrap());
+    }
+
+    // An unknown table is a 400 naming it, not an empty assignment.
+    let r = http_client::get(&addr, "/splits?table=nope&nodes=3", HTTP_TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(r.status, 400);
+    assert!(r.text().contains("nope"), "{}", r.text());
+
+    shutdown_all(nodes).await;
+}
+
+/// The rejection gate: each unsupported shape must be refused, by name, with a
+/// 501 — never answered from one shard and presented as a cluster answer.
+#[tokio::test]
+async fn unsupported_shapes_are_refused_by_name() {
+    let nodes = start_cluster(3).await;
+    let addrs: Vec<String> = nodes.iter().map(|h| h.local_addr().to_string()).collect();
+    for a in &addrs {
+        assert!(wait_ready(a, Duration::from_secs(30)).await);
+    }
+
+    let cases: &[(&str, &str)] = &[
+        (
+            "SELECT COUNT(*) FROM lineitem JOIN orders ON l_orderkey = o_orderkey",
+            "cross-shard joins",
+        ),
+        (
+            "SELECT COUNT(*) FROM lineitem, orders WHERE l_orderkey = o_orderkey",
+            "cross-shard joins",
+        ),
+        (
+            "SELECT COUNT(DISTINCT l_orderkey) FROM lineitem",
+            "COUNT(DISTINCT",
+        ),
+        (
+            "SELECT COUNT(*) FROM lineitem WHERE l_orderkey IN (SELECT o_orderkey FROM orders)",
+            "subqueries",
+        ),
+        (
+            "SELECT COUNT(*) FROM lineitem l WHERE EXISTS \
+             (SELECT 1 FROM orders o WHERE o.o_orderkey = l.l_orderkey)",
+            "subqueries",
+        ),
+        (
+            "SELECT COUNT(*) FROM lineitem \
+             WHERE l_quantity > (SELECT AVG(l_quantity) FROM lineitem)",
+            "subqueries",
+        ),
+        (
+            "SELECT l_orderkey FROM lineitem ORDER BY l_orderkey LIMIT 10",
+            "global ORDER BY",
+        ),
+        ("SELECT l_orderkey FROM lineitem LIMIT 10", "global LIMIT"),
+        (
+            "SELECT SUM(l_quantity) OVER () FROM lineitem",
+            "Window function",
+        ),
+        ("SELECT STDDEV(l_quantity) FROM lineitem", "STDDEV"),
+        (
+            "SELECT DISTINCT l_returnflag FROM lineitem",
+            "SELECT DISTINCT",
+        ),
+        (
+            "SELECT COUNT(*) FROM lineitem UNION ALL SELECT COUNT(*) FROM orders",
+            "set operations",
+        ),
+        (
+            "WITH x AS (SELECT * FROM lineitem) SELECT COUNT(*) FROM x",
+            "common table expressions",
+        ),
+        (
+            "SELECT COUNT(*) FROM (SELECT * FROM lineitem) t",
+            "subqueries in FROM",
+        ),
+    ];
+
+    for (sql, needle) in cases {
+        let resp = dsql(&addrs[0], sql).await;
+        assert_eq!(
+            resp.status,
+            501,
+            "`{sql}` must be refused with 501, got {} {}",
+            resp.status,
+            resp.text()
+        );
+        let msg = resp.text();
+        assert!(
+            msg.to_lowercase().contains(&needle.to_lowercase()),
+            "the rejection of `{sql}` must name the reason ({needle}); said: {msg}"
+        );
+        assert!(
+            msg.contains("distributed execution supports"),
+            "the rejection of `{sql}` must say what IS supported; said: {msg}"
+        );
+    }
+
+    // ...and in `auto` mode the same query is answered LOCALLY over this node's
+    // full copy of the data, with the response saying so and why. That is a
+    // complete, correct answer — it is simply not a distributed one, and a
+    // caller can tell the difference from the headers alone.
+    let resp = http_client::post_text(
+        &addrs[0],
+        "/sql?format=csv&distributed=auto",
+        "SELECT COUNT(*) AS n FROM lineitem JOIN orders ON l_orderkey = o_orderkey",
+        HTTP_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    assert!(resp.is_success(), "{} {}", resp.status, resp.text());
+    assert_eq!(resp.header("x-qe-distributed"), Some("false"));
+    assert!(
+        resp.header("x-qe-distributed-skipped")
+            .is_some_and(|r| r.contains("cross-shard joins")),
+        "auto mode must record WHY it did not distribute: {:?}",
+        resp.header("x-qe-distributed-skipped")
+    );
+
+    shutdown_all(nodes).await;
+}
+
+/// A node that dies mid-query must fail the query, loudly, naming itself —
+/// never return the surviving shards' partial answer as if it were complete.
+///
+/// Made deterministic by giving the nodes an effectively infinite discovery
+/// interval and driving convergence by hand: the initiator therefore still
+/// believes the dead node is a member when the query is issued, which is
+/// exactly the mid-query case. (A slower test that waited for the prober would
+/// instead be testing the *recovery* path, which the second half checks.)
+#[tokio::test]
+async fn a_node_that_dies_fails_the_query_instead_of_answering_partially() {
+    isolate_env();
+    let mut handles = Vec::new();
+    for i in 0..3 {
+        let opts = ServeOptions {
+            bind: "127.0.0.1:0".into(),
+            node_id: Some(i),
+            discovery_interval: Duration::from_secs(3600),
+            probe_timeout: Duration::from_millis(2000),
+            ..Default::default()
+        };
+        handles.push(spawn(opts, tpch_loader()).await.expect("bind"));
+    }
+    let addrs: Vec<String> = handles.iter().map(|h| h.local_addr().to_string()).collect();
+    let peers: Vec<String> = handles.iter().map(|h| h.address().to_string()).collect();
+    // `set_peers` kicks the discovery loop, so this is the ONLY probe round
+    // that will happen for the next hour.
+    for h in &handles {
+        h.set_peers(peers.clone());
+    }
+    for a in &addrs {
+        assert!(
+            wait_ready(a, Duration::from_secs(30)).await,
+            "{a} never ready"
+        );
+    }
+    assert!(
+        converges(Duration::from_secs(20), || {
+            let a = addrs[0].clone();
+            async move {
+                let v = get_json(&a, "/cluster").await;
+                v["member_count"].as_u64() == Some(3)
+                    && member_identities(&v).iter().all(|(_, _, st)| st == "up")
+            }
+        })
+        .await,
+        "cluster never converged"
+    );
+
+    // Sanity: the three-node answer is right before anything dies.
+    let before = dsql(&addrs[0], "SELECT COUNT(*) AS n FROM lineitem").await;
+    assert!(before.is_success());
+    assert_eq!(before.header("x-qe-shards"), Some("3"));
+    let full = before.text();
+
+    // Kill the last node. Node 0 will not re-probe.
+    let victim = handles.pop().unwrap();
+    victim.shutdown().await;
+
+    let after = dsql(&addrs[0], "SELECT COUNT(*) AS n FROM lineitem").await;
+    assert!(
+        !after.is_success(),
+        "a dead shard owner must fail the query; instead it returned:\n{}",
+        after.text()
+    );
+    let msg = after.text();
+    assert!(
+        msg.contains(&addrs[2]),
+        "the failure must name the node that did not answer ({}): {msg}",
+        addrs[2]
+    );
+    assert!(
+        msg.contains("did not complete shard"),
+        "the failure must say what was lost: {msg}"
+    );
+
+    // And once the survivors are told the cluster is smaller, they re-divide
+    // the work and return the SAME complete answer over two shards.
+    for h in &handles {
+        h.set_peers(vec![peers[0].clone(), peers[1].clone()]);
+    }
+    assert!(
+        converges(Duration::from_secs(20), || {
+            let a = addrs[0].clone();
+            async move { get_json(&a, "/cluster").await["member_count"].as_u64() == Some(2) }
+        })
+        .await,
+        "survivors never shrank the membership"
+    );
+    let recovered = dsql(&addrs[0], "SELECT COUNT(*) AS n FROM lineitem").await;
+    assert!(recovered.is_success(), "{}", recovered.text());
+    assert_eq!(recovered.header("x-qe-shards"), Some("2"));
+    assert_eq!(
+        recovered.text(),
+        full,
+        "the two-shard answer must equal the three-shard one"
+    );
+
+    shutdown_all(handles).await;
+}
+
+/// Nodes that disagree about what data exists must refuse to answer together.
+///
+/// Driven through the real `/fragment` endpoint with a deliberately wrong
+/// digest, which is what a node holding a stale or partial copy of the table
+/// would produce. Without this interlock each node would compute a share of a
+/// *different* table and the merge would look perfectly healthy.
+#[tokio::test]
+async fn a_fragment_whose_digest_disagrees_is_refused() {
+    let nodes = start_cluster(1).await;
+    let addr = nodes[0].local_addr().to_string();
+    assert!(wait_ready(&addr, Duration::from_secs(30)).await);
+
+    let body = serde_json::json!({
+        "sql": "SELECT COUNT(*) AS qe_a0 FROM lineitem",
+        "table": "lineitem",
+        "shard_index": 0,
+        "shard_count": 2,
+        "splits_digest": 1234567890u64,
+    })
+    .to_string();
+
+    let resp = http_client::request(
+        &addr,
+        "POST",
+        "/fragment",
+        Some("application/json"),
+        Some(body.as_bytes()),
+        HTTP_TIMEOUT,
+    )
+    .await
+    .expect("POST /fragment");
+
+    assert_eq!(resp.status, 400, "{}", resp.text());
+    let msg = resp.text();
+    assert!(msg.contains("split digest mismatch"), "{msg}");
+    assert!(
+        msg.contains("Refusing"),
+        "the message must be explicit that no answer is being given: {msg}"
     );
 
     shutdown_all(nodes).await;

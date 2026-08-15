@@ -603,12 +603,15 @@ async fn route(req: Request<Incoming>, state: Arc<NodeState>) -> Response<Full<B
         (&Method::GET, "/healthz") => healthz(&state),
         (&Method::GET, "/readyz") => readyz(&state),
         (&Method::GET, "/cluster") => cluster(&state),
+        (&Method::GET, "/splits") => splits(&state, &query),
         (&Method::POST, "/sql") => sql(req, &state, &query).await,
+        (&Method::POST, "/fragment") => fragment(req, &state).await,
         (&Method::GET, "/") => index(&state),
-        (_, "/healthz") | (_, "/readyz") | (_, "/cluster") | (_, "/") => {
+        (_, "/healthz") | (_, "/readyz") | (_, "/cluster") | (_, "/splits") | (_, "/") => {
             error_response(StatusCode::METHOD_NOT_ALLOWED, "use GET")
         }
         (_, "/sql") => error_response(StatusCode::METHOD_NOT_ALLOWED, "use POST /sql"),
+        (_, "/fragment") => error_response(StatusCode::METHOD_NOT_ALLOWED, "use POST /fragment"),
         _ => error_response(
             StatusCode::NOT_FOUND,
             "no such endpoint; try /healthz /readyz /cluster or POST /sql",
@@ -630,12 +633,271 @@ fn index(state: &Arc<NodeState>) -> Response<Full<Bytes>> {
          GET  /healthz    liveness\n\
          GET  /readyz     readiness (tables loaded AND peers resolved)\n\
          GET  /cluster    membership view (JSON)\n\
+         GET  /splits     how a table divides across N nodes (JSON)\n\
+                          ?table=<name>&nodes=<N>\n\
          POST /sql        execute SQL; body is the statement.\n\
-                          ?format=arrow (default) | json | csv\n\n\
-         NOTE: M1 executes /sql LOCALLY. There is no fan-out yet.\n",
+                          ?format=arrow (default) | json | csv\n\
+                          ?distributed=auto (default) | 1 | 0\n\
+         POST /fragment   execute one shard of a distributed query (internal)\n\n\
+         Every /sql response carries x-qe-distributed: true|false, and when it\n\
+         is true, x-qe-imbalance and x-qe-distribution describing exactly how\n\
+         the work was divided. `distributed=1` NEVER falls back: an unsupported\n\
+         query shape is a 400 with the reason, not a quietly local answer.\n",
         state.node_id, state.address
     );
     text_response(StatusCode::OK, body)
+}
+
+// ---------------------------------------------------------------------------
+// Distributed execution
+// ---------------------------------------------------------------------------
+
+/// How a `/sql` request should be executed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DistMode {
+    /// Distribute when the cluster has peers and the shape is supported;
+    /// otherwise run locally over this node's full copy of the data. The
+    /// response always says which happened and, when it fell back, why.
+    Auto,
+    /// Distribute or fail. An unsupported shape is an error, never a local
+    /// answer — this is the mode a client uses when it needs to KNOW the
+    /// cluster did the work.
+    Force,
+    /// Never distribute. M1 behaviour, kept because a node holding the whole
+    /// dataset can always answer alone and that is a useful reference.
+    Off,
+}
+
+impl DistMode {
+    fn parse(query: &str) -> std::result::Result<Self, String> {
+        for pair in query.split('&') {
+            let Some((k, v)) = pair.split_once('=') else {
+                continue;
+            };
+            if k != "distributed" {
+                continue;
+            }
+            return match v {
+                "1" | "true" | "yes" | "force" => Ok(DistMode::Force),
+                "0" | "false" | "no" | "local" => Ok(DistMode::Off),
+                "auto" => Ok(DistMode::Auto),
+                other => Err(format!(
+                    "unknown distributed mode {other:?}; expected auto, 1 or 0"
+                )),
+            };
+        }
+        Ok(DistMode::Auto)
+    }
+}
+
+/// Peers this node may send fragments to, in a deterministic order.
+///
+/// Sorted by address (which is how `Membership::members` renders them), so
+/// shard *i* means the same node no matter which member is the initiator. Only
+/// members we have actually reached are included: sending a fragment to a peer
+/// last seen as `Down` would fail the whole query, and a peer never probed
+/// (`Unknown`) may not even exist.
+fn participants(state: &Arc<NodeState>) -> Vec<crate::distributed::Participant> {
+    state
+        .membership
+        .members()
+        .into_iter()
+        .filter(|m| m.is_self || m.status == crate::distributed::PeerStatus::Up)
+        .map(|m| crate::distributed::Participant {
+            node_id: m.node_id.unwrap_or(u64::MAX),
+            address: m.address,
+            is_self: m.is_self,
+        })
+        .collect()
+}
+
+/// Sends fragments to peers over HTTP. The initiator's own shard does not go
+/// through here — it is executed in-process by the coordinator, on the same
+/// code path, so there is only one fragment executor in the system.
+struct HttpTransport {
+    timeout: Duration,
+}
+
+#[async_trait::async_trait]
+impl crate::distributed::FragmentTransport for HttpTransport {
+    async fn send(
+        &self,
+        address: &str,
+        req: &crate::distributed::FragmentRequest,
+    ) -> Result<(Vec<u8>, usize, f64)> {
+        let body = serde_json::to_vec(req)
+            .map_err(|e| QueryError::Execution(format!("cannot encode fragment request: {e}")))?;
+        let resp = http_client::post_json(address, "/fragment", &body, self.timeout)
+            .await
+            .map_err(|e| QueryError::Execution(e.to_string()))?;
+        if !resp.is_success() {
+            // Carry the peer's own message through verbatim: a digest mismatch
+            // or an unsupported shape explains itself far better than
+            // "HTTP 400" ever could.
+            let detail = serde_json::from_slice::<serde_json::Value>(&resp.body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
+                .unwrap_or_else(|| resp.text());
+            return Err(QueryError::Execution(format!(
+                "HTTP {} — {detail}",
+                resp.status
+            )));
+        }
+        let rows = resp
+            .header("x-qe-rows")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        let ms = resp
+            .header("x-qe-elapsed-ms")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        Ok((resp.body, rows, ms))
+    }
+}
+
+/// `POST /fragment` — run one shard. Internal to the cluster.
+async fn fragment(req: Request<Incoming>, state: &Arc<NodeState>) -> Response<Full<Bytes>> {
+    let Some(ctx) = state.context() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &state
+                .load_error()
+                .map(|e| format!("tables failed to load: {e}"))
+                .unwrap_or_else(|| "tables are still loading".to_string()),
+        );
+    };
+
+    let body = match Limited::new(req.into_body(), MAX_SQL_BODY_BYTES)
+        .collect()
+        .await
+    {
+        Ok(b) => b.to_bytes(),
+        Err(_) => {
+            return error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                &format!("fragment body exceeds {MAX_SQL_BODY_BYTES} bytes"),
+            )
+        }
+    };
+    let request: crate::distributed::FragmentRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("malformed fragment request: {e}"),
+            )
+        }
+    };
+
+    state.queries_total.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+    let joined = query_runtime()
+        .spawn(async move {
+            let (result, stats) = crate::distributed::execute_fragment(&ctx, &request).await?;
+            let bytes =
+                crate::distributed::coordinator::encode_ipc(&result.schema, &result.batches)?;
+            Ok::<_, QueryError>((bytes, result.row_count, stats))
+        })
+        .await;
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+    match joined {
+        Ok(Ok((bytes, rows, stats))) => {
+            let mut resp =
+                raw_response(StatusCode::OK, "application/vnd.apache.arrow.stream", bytes);
+            let h = resp.headers_mut();
+            h.insert("x-qe-rows", rows.to_string().parse().expect("numeric"));
+            h.insert(
+                "x-qe-elapsed-ms",
+                format!("{elapsed_ms:.3}").parse().expect("numeric"),
+            );
+            h.insert(
+                "x-qe-shard-bytes",
+                stats.bytes.to_string().parse().expect("numeric"),
+            );
+            h.insert(
+                "x-qe-shard-rows",
+                stats.rows.to_string().parse().expect("numeric"),
+            );
+            h.insert(
+                "x-qe-shard-splits",
+                stats.splits.to_string().parse().expect("numeric"),
+            );
+            resp
+        }
+        Ok(Err(e)) => {
+            state.queries_failed.fetch_add(1, Ordering::Relaxed);
+            error_response(StatusCode::BAD_REQUEST, &e.to_string())
+        }
+        Err(e) => {
+            state.queries_failed.fetch_add(1, Ordering::Relaxed);
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("fragment task failed: {e}"),
+            )
+        }
+    }
+}
+
+/// `GET /splits?table=lineitem&nodes=8` — how the work would be divided.
+///
+/// Exists so balance is auditable without running an N-node cluster: it is pure
+/// metadata arithmetic. `nodes` defaults to the current member count.
+fn splits(state: &Arc<NodeState>, query: &str) -> Response<Full<Bytes>> {
+    let Some(ctx) = state.context() else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "tables are still loading");
+    };
+    let mut table: Option<String> = None;
+    let mut nodes: Option<usize> = None;
+    for pair in query.split('&') {
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        match k {
+            "table" => table = Some(v.to_string()),
+            "nodes" => match v.parse::<usize>() {
+                Ok(n) if n >= 1 => nodes = Some(n),
+                _ => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        &format!("nodes must be a positive integer, got {v:?}"),
+                    )
+                }
+            },
+            _ => {}
+        }
+    }
+    let Some(table) = table else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "missing ?table=<name>; try /cluster to see what is loaded",
+        );
+    };
+    let nodes = nodes.unwrap_or_else(|| state.membership.members().len().max(1));
+
+    let set = match crate::distributed::splits_of(&ctx, &table, nodes) {
+        Ok(s) => s,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    let assignment = crate::distributed::assign_lpt(&set, nodes);
+    let body = serde_json::json!({
+        "table": table,
+        "nodes": nodes,
+        "total_splits": set.len(),
+        "total_rows": set.total_rows,
+        "total_bytes": set.total_bytes,
+        "target_split_bytes": set.target_split_bytes,
+        "splits_digest": format!("{:#018x}", set.digest()),
+        "imbalance": assignment.imbalance(),
+        "idle_nodes": assignment.idle_nodes(),
+        "per_node": (0..nodes).map(|i| serde_json::json!({
+            "shard_index": i,
+            "splits": assignment.node_splits[i],
+            "bytes": assignment.node_bytes[i],
+            "rows": assignment.node_rows[i],
+        })).collect::<Vec<_>>(),
+    });
+    json_response(StatusCode::OK, &body)
 }
 
 /// Liveness. Must not touch tables, peers, locks held by queries, or disk:
@@ -803,6 +1065,10 @@ async fn sql(req: Request<Incoming>, state: &Arc<NodeState>, query: &str) -> Res
         Ok(f) => f,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
     };
+    let mode = match DistMode::parse(query) {
+        Ok(m) => m,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
+    };
 
     let Some(ctx) = state.context() else {
         let reason = state
@@ -835,19 +1101,49 @@ async fn sql(req: Request<Incoming>, state: &Arc<NodeState>, query: &str) -> Res
     state.queries_total.fetch_add(1, Ordering::Relaxed);
     let started = Instant::now();
 
+    // Decide local vs distributed BEFORE any fan-out, and only ever fall back
+    // for a capability reason. A fallback triggered by an execution failure
+    // would hide a broken cluster behind a correct-looking answer.
+    let members = participants(state);
+    let (distribute, fallback_reason) = match mode {
+        DistMode::Off => (false, Some("distributed=0 requested".to_string())),
+        DistMode::Force => (true, None),
+        DistMode::Auto => {
+            if members.len() < 2 {
+                (false, Some("only one cluster member is up".to_string()))
+            } else {
+                match crate::distributed::plan_distributed(&ctx, &statement) {
+                    Ok(_) => (true, None),
+                    Err(e) => (false, Some(e.to_string())),
+                }
+            }
+        }
+    };
+
     // Off the HTTP runtime — see the module docs.
     let joined = query_runtime()
         .spawn(async move {
-            let result = ctx.sql(&statement).await?;
-            let rows = result.row_count;
-            let encoded = encode(&result, format)?;
-            Ok::<(Vec<u8>, usize), QueryError>((encoded, rows))
+            if !distribute {
+                let result = ctx.sql(&statement).await?;
+                let rows = result.row_count;
+                let encoded = encode(&result, format)?;
+                return Ok::<_, QueryError>((encoded, rows, None));
+            }
+            let transport = HttpTransport {
+                timeout: crate::distributed::coordinator::DEFAULT_FRAGMENT_TIMEOUT,
+            };
+            let out =
+                crate::distributed::execute_distributed(&ctx, &statement, &members, &transport)
+                    .await?;
+            let rows = out.result.row_count;
+            let encoded = encode(&out.result, format)?;
+            Ok((encoded, rows, Some(out.distribution)))
         })
         .await;
 
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     match joined {
-        Ok(Ok((bytes, rows))) => {
+        Ok(Ok((bytes, rows, distribution))) => {
             let mut resp = raw_response(StatusCode::OK, format.content_type(), bytes);
             let h = resp.headers_mut();
             h.insert("x-qe-rows", rows.to_string().parse().expect("numeric"));
@@ -855,11 +1151,57 @@ async fn sql(req: Request<Incoming>, state: &Arc<NodeState>, query: &str) -> Res
                 "x-qe-elapsed-ms",
                 format!("{elapsed_ms:.3}").parse().expect("numeric"),
             );
+            match &distribution {
+                None => {
+                    h.insert("x-qe-distributed", "false".parse().expect("ascii"));
+                    if let Some(reason) = &fallback_reason {
+                        if let Ok(v) = header_value(reason) {
+                            h.insert("x-qe-distributed-skipped", v);
+                        }
+                    }
+                }
+                Some(d) => {
+                    h.insert("x-qe-distributed", "true".parse().expect("ascii"));
+                    h.insert(
+                        "x-qe-shards",
+                        d.nodes.len().to_string().parse().expect("numeric"),
+                    );
+                    h.insert(
+                        "x-qe-imbalance",
+                        format!("{:.4}", d.imbalance).parse().expect("numeric"),
+                    );
+                    h.insert(
+                        "x-qe-wall-time-spread",
+                        format!("{:.4}", d.wall_time_spread)
+                            .parse()
+                            .expect("numeric"),
+                    );
+                    // The full picture, so a production caller can see the
+                    // division without a second request. Dropped rather than
+                    // truncated if it would not fit a header cleanly — a
+                    // half-JSON header is worse than none.
+                    if let Ok(json) = serde_json::to_string(d) {
+                        if json.len() <= 6144 {
+                            if let Ok(v) = header_value(&json) {
+                                h.insert("x-qe-distribution", v);
+                            }
+                        }
+                    }
+                }
+            }
             resp
         }
         Ok(Err(e)) => {
             state.queries_failed.fetch_add(1, Ordering::Relaxed);
-            error_response(StatusCode::BAD_REQUEST, &e.to_string())
+            let status = if matches!(e, QueryError::NotImplemented(_)) {
+                StatusCode::NOT_IMPLEMENTED
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            let mut resp = error_response(status, &e.to_string());
+            resp.headers_mut()
+                .insert("x-qe-distributed", "false".parse().expect("ascii"));
+            resp
         }
         Err(e) => {
             state.queries_failed.fetch_add(1, Ordering::Relaxed);
@@ -869,6 +1211,23 @@ async fn sql(req: Request<Incoming>, state: &Arc<NodeState>, query: &str) -> Res
             )
         }
     }
+}
+
+/// A header value with control characters and non-ASCII stripped, since an
+/// error message or a table name may contain either and an invalid header
+/// aborts the whole response.
+fn header_value(s: &str) -> std::result::Result<hyper::header::HeaderValue, ()> {
+    let cleaned: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii() && !c.is_ascii_control() {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    hyper::header::HeaderValue::from_str(&cleaned).map_err(|_| ())
 }
 
 /// Encode a result. Arrow IPC is the default because it is lossless and it is
@@ -1057,6 +1416,36 @@ mod tests {
         // a client asking for `?format=jsonl` and getting IPC bytes debugs the
         // wrong layer for an hour.
         assert!(ResultFormat::parse("format=jsonl").is_err());
+    }
+
+    #[test]
+    fn distributed_mode_defaults_to_auto_and_rejects_nonsense() {
+        assert_eq!(DistMode::parse("").unwrap(), DistMode::Auto);
+        assert_eq!(DistMode::parse("format=csv").unwrap(), DistMode::Auto);
+        assert_eq!(DistMode::parse("distributed=1").unwrap(), DistMode::Force);
+        assert_eq!(
+            DistMode::parse("distributed=true").unwrap(),
+            DistMode::Force
+        );
+        assert_eq!(DistMode::parse("distributed=0").unwrap(), DistMode::Off);
+        assert_eq!(
+            DistMode::parse("format=csv&distributed=auto").unwrap(),
+            DistMode::Auto
+        );
+        // A typo must not silently mean "auto": a caller writing
+        // `?distributed=yes-please` and getting a local answer would believe
+        // the cluster had participated.
+        assert!(DistMode::parse("distributed=maybe").is_err());
+    }
+
+    #[test]
+    fn header_values_survive_messages_with_newlines_and_unicode() {
+        // Rejection reasons quote the user's SQL, which can contain anything.
+        // An invalid header value would abort the whole response, turning a
+        // clear 501 into a connection error.
+        let v = header_value("bad\nreason: SUM(dépôt)\r\n").unwrap();
+        assert!(!v.to_str().unwrap().contains('\n'));
+        assert!(v.to_str().unwrap().starts_with("bad reason"));
     }
 
     #[test]

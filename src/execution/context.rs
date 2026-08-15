@@ -425,6 +425,14 @@ impl ExecutionContext {
     pub fn table_schema(&self, name: &str) -> Option<SchemaRef> {
         self.tables.get(name).map(|t| t.schema())
     }
+
+    /// The provider backing `name`, if it is registered.
+    ///
+    /// Distributed execution needs this to ask a table what files it is made
+    /// of before replacing it with the shard of those files this node owns.
+    pub fn table_provider(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+        self.tables.get(name).cloned()
+    }
 }
 
 /// Convert Arrow schema to PlanSchema
