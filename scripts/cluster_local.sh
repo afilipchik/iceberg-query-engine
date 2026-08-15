@@ -31,6 +31,9 @@ DATA_DIR="${QE_DATA:-./data/tpch-1mb}"
 BASE_PORT="${QE_BASE_PORT:-17700}"
 BINARY="${QE_BINARY:-./target/release/query_engine}"
 STATE_DIR=".scratch/cluster-local"
+# When set, nodes register tables from a Gravitino metastore instead of --data.
+METASTORE="${QE_METASTORE:-}"
+METASTORE_SCHEMA="${QE_METASTORE_SCHEMA:-tpch}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
@@ -52,6 +55,8 @@ while [[ $# -gt 0 ]]; do
         --base-port) BASE_PORT="$2"; shift 2 ;;
         --binary)    BINARY="$2"; shift 2 ;;
         --nodes)     NODES="$2"; shift 2 ;;
+        --metastore) METASTORE="$2"; shift 2 ;;
+        --metastore-schema) METASTORE_SCHEMA="$2"; shift 2 ;;
         *)           break ;;
     esac
 done
@@ -107,10 +112,12 @@ wait_converged() {
 
 cmd_start() {
     [[ -x "$BINARY" ]] || die "binary not found at $BINARY (cargo build --release)"
-    [[ -d "$DATA_DIR" ]] || die "data directory not found: $DATA_DIR"
-    for t in nation region part supplier partsupp customer orders lineitem; do
-        [[ -f "$DATA_DIR/$t.parquet" ]] || die "$DATA_DIR is missing $t.parquet"
-    done
+    if [[ -z "$METASTORE" ]]; then
+        [[ -d "$DATA_DIR" ]] || die "data directory not found: $DATA_DIR"
+        for t in nation region part supplier partsupp customer orders lineitem; do
+            [[ -f "$DATA_DIR/$t.parquet" ]] || die "$DATA_DIR is missing $t.parquet"
+        done
+    fi
 
     if [[ -f "$STATE_DIR/nodes" ]]; then
         info "a cluster is already recorded; stopping it first"
@@ -124,12 +131,17 @@ cmd_start() {
     info "starting $NODES nodes on ports $(port_of 0)..$(port_of $((NODES - 1)))"
     info "peer list: $peers"
 
+    local source_args=(--data "$DATA_DIR")
+    if [[ -n "$METASTORE" ]]; then
+        source_args=(--metastore "$METASTORE" --metastore-schema "$METASTORE_SCHEMA")
+        info "tables from metastore $METASTORE schema $METASTORE_SCHEMA"
+    fi
     for ((i = 0; i < NODES; i++)); do
         "$BINARY" serve \
             --bind "127.0.0.1:$(port_of "$i")" \
             --node-id "$i" \
             --peers "$peers" \
-            --data "$DATA_DIR" \
+            "${source_args[@]}" \
             --discovery-interval-ms 500 \
             > "$STATE_DIR/node$i.log" 2>&1 &
         echo $! > "$STATE_DIR/node$i.pid"

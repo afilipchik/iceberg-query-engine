@@ -281,6 +281,27 @@ enum Commands {
         #[arg(long)]
         tables: Option<PathBuf>,
 
+        /// Apache Gravitino metastore URL, e.g. `http://127.0.0.1:8090`.
+        /// Every fileset in the schema below is registered as a table, its
+        /// reader chosen by the fileset's `format` property (parquet,
+        /// iceberg, lance). Every node pulling the SAME schema from the SAME
+        /// metastore is what makes the cluster's catalog agree by
+        /// construction. Can be combined with --data/--tables.
+        #[arg(long)]
+        metastore: Option<String>,
+
+        /// Gravitino metalake holding the tables.
+        #[arg(long, default_value = "local_lake")]
+        metastore_metalake: String,
+
+        /// Gravitino catalog (type FILESET) holding the tables.
+        #[arg(long, default_value = "lakehouse")]
+        metastore_catalog: String,
+
+        /// Gravitino schema whose filesets become this node's tables.
+        #[arg(long, default_value = "tpch")]
+        metastore_schema: String,
+
         /// Memory limit, e.g. `8G`. Default: the engine's normal default.
         #[arg(long)]
         memory_limit: Option<String>,
@@ -1057,6 +1078,10 @@ async fn main() {
             advertise,
             data,
             tables,
+            metastore,
+            metastore_metalake,
+            metastore_catalog,
+            metastore_schema,
             memory_limit,
             discovery_interval_ms,
             probe_timeout_ms,
@@ -1066,12 +1091,20 @@ async fn main() {
             use query_engine::distributed::{serve, ServeOptions};
             use std::time::Duration;
 
-            if data.is_none() && tables.is_none() {
+            if data.is_none() && tables.is_none() && metastore.is_none() {
                 eprintln!(
-                    "serve: nothing to serve. Pass --data <tpch-dir> and/or --tables <parquet-dir>."
+                    "serve: nothing to serve. Pass --data <tpch-dir>, --tables <dir>, \
+                     and/or --metastore <url>."
                 );
                 std::process::exit(2);
             }
+            let metastore_source =
+                metastore.map(|base_url| query_engine::metastore::GravitinoSource {
+                    base_url,
+                    metalake: metastore_metalake,
+                    catalog: metastore_catalog,
+                    schema: metastore_schema,
+                });
 
             let opts = ServeOptions {
                 bind,
@@ -1086,7 +1119,9 @@ async fn main() {
                 shutdown_grace: Duration::from_millis(shutdown_grace_ms),
             };
 
-            let loader = Box::new(move || build_serve_context(&data, &tables, &memory_limit));
+            let loader = Box::new(move || {
+                build_serve_context(&data, &tables, &metastore_source, &memory_limit)
+            });
             if let Err(e) = serve(opts, loader).await {
                 eprintln!("serve: {}", e);
                 std::process::exit(1);
@@ -1104,6 +1139,7 @@ async fn main() {
 fn build_serve_context(
     data: &Option<PathBuf>,
     tables: &Option<PathBuf>,
+    metastore: &Option<query_engine::metastore::GravitinoSource>,
     memory_limit: &Option<String>,
 ) -> query_engine::Result<ExecutionContext> {
     use query_engine::error::QueryError;
@@ -1192,6 +1228,23 @@ fn build_serve_context(
                 dir.display()
             )));
         }
+    }
+
+    if let Some(source) = metastore {
+        // Loud on any failure: a node that comes up serving HALF the catalog
+        // answers "table not found" on exactly the joins that matter. This
+        // runs inside the loader (spawn_blocking), so readiness stays false
+        // with this error attached until the metastore answers.
+        let names = source.register_all(&mut ctx)?;
+        eprintln!(
+            "metastore {}: registered {} table(s) from {}/{}/{}: {}",
+            source.base_url,
+            names.len(),
+            source.metalake,
+            source.catalog,
+            source.schema,
+            names.join(", ")
+        );
     }
 
     Ok(ctx)

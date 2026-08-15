@@ -1,7 +1,10 @@
-//! Branching metastore REST API client
+//! Metastore clients: external catalogs the engine can register tables from.
 //!
-//! This module provides a client for connecting to the branching metastore REST API,
-//! enabling the query engine to fetch table metadata from the centralized metastore.
+//! * [`gravitino`] — Apache Gravitino fileset catalogs (the supported path).
+//! * The remainder of this file is the older branching-metastore REST client.
+
+pub mod gravitino;
+pub use gravitino::{Fileset, GravitinoSource};
 
 use crate::error::{QueryError, Result};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
