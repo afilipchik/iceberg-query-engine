@@ -68,6 +68,11 @@ pub enum MergeShape {
     /// Two-phase: workers compute partial aggregates, the initiator merges them
     /// with [`DistributedPlan::final_sql`].
     TwoPhase,
+    /// General path: workers stream their shard of every referenced table to
+    /// the initiator, which runs the original statement over the gathered
+    /// columns. Chosen only when neither exact shape above applies. See
+    /// [`crate::distributed::gather`].
+    Gather,
 }
 
 /// A query, split into the part every worker runs over its own shard and the

@@ -913,7 +913,168 @@ async fn the_balance_gate_holds_at_three_and_eight_nodes() {
 /// The rejection gate: each unsupported shape must be refused, by name, with a
 /// 501 — never answered from one shard and presented as a cluster answer.
 #[tokio::test]
-async fn unsupported_shapes_are_refused_by_name() {
+async fn every_engine_supported_shape_is_answered_distributed() {
+    let nodes = start_cluster(3).await;
+    let addrs: Vec<String> = nodes.iter().map(|h| h.local_addr().to_string()).collect();
+    for a in &addrs {
+        assert!(wait_ready(a, Duration::from_secs(30)).await);
+    }
+    let local = in_process_context();
+
+    // Everything M2 used to refuse and M2.5 (gather) now answers. The second
+    // field says how to compare against the single-process answer: `true`
+    // means cell-for-cell; `false` means row COUNT only, for statements whose
+    // answer is legitimately nondeterministic (LIMIT without ORDER BY may
+    // return any 10 rows, and which 10 depends on shard arrival order).
+    let cases: &[(&str, &str, bool)] = &[
+        (
+            "inner_join",
+            "SELECT COUNT(*) AS n FROM lineitem JOIN orders ON l_orderkey = o_orderkey",
+            true,
+        ),
+        (
+            "comma_join",
+            "SELECT COUNT(*) AS n FROM lineitem, orders WHERE l_orderkey = o_orderkey",
+            true,
+        ),
+        (
+            "left_join",
+            "SELECT COUNT(*) AS n, COUNT(o_orderkey) AS matched FROM orders \
+             LEFT JOIN lineitem ON o_orderkey = l_orderkey AND l_quantity > 45",
+            true,
+        ),
+        (
+            "three_way_join",
+            "SELECT n_name, COUNT(*) AS c FROM customer \
+             JOIN orders ON c_custkey = o_custkey \
+             JOIN nation ON c_nationkey = n_nationkey \
+             GROUP BY n_name ORDER BY c DESC, n_name",
+            true,
+        ),
+        (
+            "count_distinct",
+            "SELECT COUNT(DISTINCT l_orderkey) AS n FROM lineitem",
+            true,
+        ),
+        (
+            "in_subquery",
+            "SELECT COUNT(*) AS n FROM lineitem WHERE l_orderkey IN (SELECT o_orderkey FROM orders)",
+            true,
+        ),
+        (
+            "exists_subquery",
+            "SELECT COUNT(*) AS n FROM lineitem l WHERE EXISTS \
+             (SELECT 1 FROM orders o WHERE o.o_orderkey = l.l_orderkey)",
+            true,
+        ),
+        (
+            "scalar_subquery",
+            "SELECT COUNT(*) AS n FROM lineitem \
+             WHERE l_quantity > (SELECT AVG(l_quantity) FROM lineitem)",
+            true,
+        ),
+        (
+            "order_by_limit",
+            "SELECT l_orderkey FROM lineitem ORDER BY l_orderkey LIMIT 10",
+            true,
+        ),
+        (
+            "bare_limit",
+            "SELECT l_orderkey FROM lineitem LIMIT 10",
+            false,
+        ),
+        (
+            "stddev",
+            "SELECT STDDEV(l_quantity) AS s FROM lineitem",
+            true,
+        ),
+        (
+            "distinct",
+            "SELECT DISTINCT l_returnflag FROM lineitem",
+            true,
+        ),
+        (
+            "union_all",
+            "SELECT COUNT(*) AS n FROM lineitem UNION ALL SELECT COUNT(*) FROM orders",
+            true,
+        ),
+        (
+            "cte",
+            "WITH x AS (SELECT * FROM lineitem) SELECT COUNT(*) AS n FROM x",
+            true,
+        ),
+        (
+            "derived_table",
+            "SELECT COUNT(*) AS n FROM (SELECT * FROM lineitem) t",
+            true,
+        ),
+        (
+            "scalar_functions",
+            "SELECT UPPER(l_shipmode) AS m, ROUND(SUM(l_extendedprice * (1 - l_discount)), 2) AS rev \
+             FROM lineitem WHERE SUBSTRING(l_shipinstruct, 1, 4) = 'TAKE' \
+             GROUP BY UPPER(l_shipmode) ORDER BY m",
+            true,
+        ),
+    ];
+
+    for (name, sql, exact) in cases {
+        let expected = csv_of(&local.sql(sql).await.unwrap_or_else(|e| {
+            panic!("single-process engine failed on {name}: {e}");
+        }));
+        let resp = dsql(&addrs[0], sql).await;
+        assert!(
+            resp.is_success(),
+            "{name}: distributed=1 must now answer `{sql}`: HTTP {} {}",
+            resp.status,
+            resp.text()
+        );
+        assert_eq!(
+            resp.header("x-qe-distributed"),
+            Some("true"),
+            "{name} answered locally despite distributed=1"
+        );
+        if *exact {
+            assert_cells_match(&resp.text(), &expected, name);
+        } else {
+            let got_rows = resp.text().trim().lines().count();
+            let want_rows = expected.trim().lines().count();
+            assert_eq!(got_rows, want_rows, "{name}: row count");
+        }
+    }
+
+    // A multi-table query must report a contribution from every node for
+    // every table it gathered — that is what makes it distributed rather than
+    // locally answered with extra steps.
+    let resp = dsql(
+        &addrs[1],
+        "SELECT COUNT(*) AS n FROM lineitem JOIN orders ON l_orderkey = o_orderkey",
+    )
+    .await;
+    let dist: serde_json::Value = serde_json::from_str(
+        resp.header("x-qe-distribution")
+            .expect("distribution header"),
+    )
+    .expect("distribution header is JSON");
+    assert_eq!(dist["shape"], "gather");
+    let tables_seen: std::collections::BTreeSet<&str> = dist["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["table"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        tables_seen.into_iter().collect::<Vec<_>>(),
+        vec!["lineitem", "orders"],
+        "both joined tables must have been gathered"
+    );
+
+    shutdown_all(nodes).await;
+}
+
+/// What still cannot be distributed is refused with the reason — never
+/// answered approximately, and never silently answered locally.
+#[tokio::test]
+async fn what_cannot_be_distributed_is_refused_by_name() {
     let nodes = start_cluster(3).await;
     let addrs: Vec<String> = nodes.iter().map(|h| h.local_addr().to_string()).collect();
     for a in &addrs {
@@ -921,58 +1082,12 @@ async fn unsupported_shapes_are_refused_by_name() {
     }
 
     let cases: &[(&str, &str)] = &[
-        (
-            "SELECT COUNT(*) FROM lineitem JOIN orders ON l_orderkey = o_orderkey",
-            "cross-shard joins",
-        ),
-        (
-            "SELECT COUNT(*) FROM lineitem, orders WHERE l_orderkey = o_orderkey",
-            "cross-shard joins",
-        ),
-        (
-            "SELECT COUNT(DISTINCT l_orderkey) FROM lineitem",
-            "COUNT(DISTINCT",
-        ),
-        (
-            "SELECT COUNT(*) FROM lineitem WHERE l_orderkey IN (SELECT o_orderkey FROM orders)",
-            "subqueries",
-        ),
-        (
-            "SELECT COUNT(*) FROM lineitem l WHERE EXISTS \
-             (SELECT 1 FROM orders o WHERE o.o_orderkey = l.l_orderkey)",
-            "subqueries",
-        ),
-        (
-            "SELECT COUNT(*) FROM lineitem \
-             WHERE l_quantity > (SELECT AVG(l_quantity) FROM lineitem)",
-            "subqueries",
-        ),
-        (
-            "SELECT l_orderkey FROM lineitem ORDER BY l_orderkey LIMIT 10",
-            "global ORDER BY",
-        ),
-        ("SELECT l_orderkey FROM lineitem LIMIT 10", "global LIMIT"),
-        (
-            "SELECT SUM(l_quantity) OVER () FROM lineitem",
-            "Window function",
-        ),
-        ("SELECT STDDEV(l_quantity) FROM lineitem", "STDDEV"),
-        (
-            "SELECT DISTINCT l_returnflag FROM lineitem",
-            "SELECT DISTINCT",
-        ),
-        (
-            "SELECT COUNT(*) FROM lineitem UNION ALL SELECT COUNT(*) FROM orders",
-            "set operations",
-        ),
-        (
-            "WITH x AS (SELECT * FROM lineitem) SELECT COUNT(*) FROM x",
-            "common table expressions",
-        ),
-        (
-            "SELECT COUNT(*) FROM (SELECT * FROM lineitem) t",
-            "subqueries in FROM",
-        ),
+        // The engine itself has no window functions yet; gather widens
+        // distributed support to exactly the local envelope, never past it.
+        ("SELECT SUM(l_quantity) OVER () FROM lineitem", "indow"),
+        // No base table: there is nothing to shard.
+        ("SELECT 1", "no base table"),
+        ("DROP TABLE lineitem", "only SELECT"),
     ];
 
     for (sql, needle) in cases {
@@ -989,16 +1104,12 @@ async fn unsupported_shapes_are_refused_by_name() {
             msg.to_lowercase().contains(&needle.to_lowercase()),
             "the rejection of `{sql}` must name the reason ({needle}); said: {msg}"
         );
-        assert!(
-            msg.contains("distributed execution supports"),
-            "the rejection of `{sql}` must say what IS supported; said: {msg}"
-        );
     }
 
-    // ...and in `auto` mode the same query is answered LOCALLY over this node's
-    // full copy of the data, with the response saying so and why. That is a
-    // complete, correct answer — it is simply not a distributed one, and a
-    // caller can tell the difference from the headers alone.
+    // ...and in `auto` mode a gather-shaped query is answered LOCALLY over
+    // this node's full copy of the data, with the response saying so and why:
+    // when every node already holds all the data, moving it first is never
+    // the faster correct answer. `distributed=1` remains the way to force it.
     let resp = http_client::post_text(
         &addrs[0],
         "/sql?format=csv&distributed=auto",
@@ -1015,6 +1126,43 @@ async fn unsupported_shapes_are_refused_by_name() {
         "auto mode must record WHY it did not distribute: {:?}",
         resp.header("x-qe-distributed-skipped")
     );
+
+    shutdown_all(nodes).await;
+}
+
+/// The full TPC-H suite, distributed. Every query the single-process engine
+/// answers must come back identical through `distributed=1` — joins,
+/// correlated subqueries, ORDER BY, LIMIT, HAVING, CASE, all of it.
+#[tokio::test]
+async fn all_22_tpch_queries_match_single_process_distributed() {
+    let nodes = start_cluster(3).await;
+    let addrs: Vec<String> = nodes.iter().map(|h| h.local_addr().to_string()).collect();
+    for a in &addrs {
+        assert!(wait_ready(a, Duration::from_secs(30)).await);
+    }
+    let local = in_process_context();
+
+    for q in 1..=22 {
+        let sql = query_engine::tpch::get_query(q).unwrap_or_else(|| panic!("no TPC-H Q{q}"));
+        let expected = csv_of(&local.sql(sql).await.unwrap_or_else(|e| {
+            panic!("single-process engine failed on Q{q}: {e}");
+        }));
+        // Rotate the initiator so all three nodes coordinate some queries.
+        let addr = &addrs[q % addrs.len()];
+        let resp = dsql(addr, sql).await;
+        assert!(
+            resp.is_success(),
+            "Q{q} via distributed=1: HTTP {} {}",
+            resp.status,
+            resp.text()
+        );
+        assert_eq!(
+            resp.header("x-qe-distributed"),
+            Some("true"),
+            "Q{q} answered locally despite distributed=1"
+        );
+        assert_cells_match(&resp.text(), &expected, &format!("TPC-H Q{q}"));
+    }
 
     shutdown_all(nodes).await;
 }

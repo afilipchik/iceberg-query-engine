@@ -131,6 +131,15 @@ impl PhysicalPlanner {
                 Some((files, input_schema, filter, projection))
             }
             LogicalPlan::Filter(node) => {
+                // A predicate containing a subquery must NOT be fused into the
+                // scan: the scan evaluates its predicate itself, without a
+                // subquery executor, and fails at execution ("no executor
+                // available"). Left unfused, the generic path plans a
+                // FilterExec, which precomputes uncorrelated scalars and
+                // carries the executor for whatever remains.
+                if node.predicate.contains_subquery() {
+                    return None;
+                }
                 // Check if input is a Scan over ParquetTable
                 if let LogicalPlan::Scan(scan_node) = node.input.as_ref() {
                     let provider = self.tables.get(&scan_node.table_name)?;

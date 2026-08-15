@@ -76,6 +76,12 @@ rust-stemmers = "1.2"
 # HTTP Client (for metastore)
 reqwest = { version = "0.11", features = ["json"] }
 
+# Avro, for Iceberg manifest lists and manifest files (src/storage/iceberg.rs).
+# Arrow-independent: this cannot move the arrow-53 pin the Lance feature needs.
+# Default features only — Iceberg manifests use the null and deflate codecs,
+# both supported without optional codec features.
+apache-avro = "0.17"
+
 # HTTP server for `query_engine serve` (src/distributed/). Deliberately hyper +
 # arrow-ipc rather than tonic/arrow-flight: all three crates below are ALREADY
 # in Cargo.lock (pulled in under `--features lance` via object_store/aws-sdk),

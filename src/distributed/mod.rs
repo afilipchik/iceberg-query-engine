@@ -32,6 +32,7 @@
 //! ```
 
 pub mod coordinator;
+pub mod gather;
 pub mod http_client;
 pub mod membership;
 pub mod plan;
@@ -40,9 +41,11 @@ pub mod shard;
 pub mod splits;
 
 pub use coordinator::{
-    execute_distributed, execute_fragment, splits_of, DistributedResult, Distribution,
-    FragmentRequest, FragmentTransport, NodeContribution, Participant,
+    execute_any_distributed, execute_distributed, execute_fragment, execute_gathered, splits_of,
+    DistributedResult, Distribution, FragmentRequest, FragmentTransport, NodeContribution,
+    Participant,
 };
+pub use gather::{plan_gather, GatherPlan, GatherTable};
 pub use http_client::{get as http_get, post_text as http_post, HttpResponse};
 pub use membership::{Discovery, Member, Membership, MembershipChange, NodeId, PeerStatus};
 pub use plan::{plan_distributed, DistributedPlan, MergeShape};

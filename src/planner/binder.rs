@@ -1062,6 +1062,92 @@ impl<'a> Binder<'a> {
                     data_type: data_type.clone(),
                 })
             }
+            // A scalar function OVER an aggregate — ROUND(SUM(x), 2) — must
+            // have its arguments rewritten to the aggregate's output columns,
+            // exactly like the operands of `SUM(x) * 2`. These four variants
+            // used to fall into the catch-all below, which left the raw
+            // SUM(x) to fail against the aggregate output schema
+            // ("Column not found: x").
+            Expr::ScalarFunc { func, args } => Ok(Expr::ScalarFunc {
+                func: func.clone(),
+                args: args
+                    .iter()
+                    .map(|a| {
+                        self.convert_expr_with_aggregates(
+                            a,
+                            agg_schema,
+                            group_by,
+                            aggregates,
+                            _input_schema,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            }),
+            Expr::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
+                let conv = |e: &Expr| {
+                    self.convert_expr_with_aggregates(
+                        e,
+                        agg_schema,
+                        group_by,
+                        aggregates,
+                        _input_schema,
+                    )
+                };
+                Ok(Expr::Case {
+                    operand: operand.as_deref().map(&conv).transpose()?.map(Box::new),
+                    when_then: when_then
+                        .iter()
+                        .map(|(w, t)| Ok((conv(w)?, conv(t)?)))
+                        .collect::<Result<Vec<_>>>()?,
+                    else_expr: else_expr.as_deref().map(&conv).transpose()?.map(Box::new),
+                })
+            }
+            Expr::InList {
+                expr: inner,
+                list,
+                negated,
+            } => {
+                let conv = |e: &Expr| {
+                    self.convert_expr_with_aggregates(
+                        e,
+                        agg_schema,
+                        group_by,
+                        aggregates,
+                        _input_schema,
+                    )
+                };
+                Ok(Expr::InList {
+                    expr: Box::new(conv(inner)?),
+                    list: list.iter().map(&conv).collect::<Result<Vec<_>>>()?,
+                    negated: *negated,
+                })
+            }
+            Expr::Between {
+                expr: inner,
+                low,
+                high,
+                negated,
+            } => {
+                let conv = |e: &Expr| {
+                    self.convert_expr_with_aggregates(
+                        e,
+                        agg_schema,
+                        group_by,
+                        aggregates,
+                        _input_schema,
+                    )
+                };
+                Ok(Expr::Between {
+                    expr: Box::new(conv(inner)?),
+                    low: Box::new(conv(low)?),
+                    high: Box::new(conv(high)?),
+                    negated: *negated,
+                })
+            }
             // For columns and literals, return as-is
             Expr::Column(_) | Expr::Literal(_) => Ok(expr.clone()),
             // For aggregates that weren't matched above, find by output name

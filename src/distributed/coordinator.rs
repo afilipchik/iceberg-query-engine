@@ -43,6 +43,7 @@
 //! cache. The wall-time numbers this produces measure *coordination*, not
 //! scaling. See `spread` in [`Distribution`] and the note on it.
 
+use crate::distributed::gather::{plan_gather, GatherPlan};
 use crate::distributed::plan::{plan_distributed, DistributedPlan, MergeShape, PARTIAL_TABLE};
 use crate::distributed::shard::ShardedParquetTable;
 use crate::distributed::splits::{assign_lpt, enumerate_parquet, Assignment, SplitSet};
@@ -71,6 +72,9 @@ pub struct FragmentRequest {
 pub struct NodeContribution {
     pub node_id: u64,
     pub address: String,
+    /// Table this contribution scanned. One query produces contributions for
+    /// several tables under [`MergeShape::Gather`]; exactly one otherwise.
+    pub table: String,
     pub shard_index: usize,
     /// Bytes the assignment gave this node. The balance metric is computed
     /// from these.
@@ -224,8 +228,182 @@ pub async fn execute_fragment(
     Ok((result, stats))
 }
 
-/// Run `sql` across `participants`, with `local` executing the initiator's own
-/// shard in-process and `transport` reaching the rest.
+/// Fan `sql` out over the shards of `table` and collect every shard's batches.
+///
+/// This is the one fan-out in the module: the scatter path runs it once with a
+/// partial query, the gather path once per referenced table with a column
+/// scan. The initiator's own shard executes in-process while the remote ones
+/// fly; any shard failing fails the whole call, with the node named.
+async fn scatter_sql_over_table(
+    base: &ExecutionContext,
+    sql: &str,
+    table: &str,
+    set: &SplitSet,
+    participants: &[Participant],
+    transport: &dyn FragmentTransport,
+) -> Result<(Vec<RecordBatch>, Vec<NodeContribution>)> {
+    let digest = set.digest();
+    let assignment = assign_lpt(set, participants.len());
+
+    // A node with no splits is skipped rather than sent an empty fragment. For
+    // a global aggregate an empty shard would contribute an identity row, which
+    // merges harmlessly — but sending work that is known to be empty wastes a
+    // round trip and muddies the wall-time spread.
+    let active: Vec<usize> = (0..participants.len())
+        .filter(|&i| assignment.node_splits[i] > 0)
+        .collect();
+
+    let mut contributions: Vec<NodeContribution> = Vec::with_capacity(active.len());
+    let mut batches: Vec<RecordBatch> = Vec::new();
+
+    if active.is_empty() {
+        // The table has no row groups at all. Answer it locally over an empty
+        // shard so an aggregate still emits its identity row (COUNT = 0), which
+        // is what a single-node run returns.
+        let (ctx, _) = shard_context(base, table, set, &assignment, 0)?;
+        let started = Instant::now();
+        let r = ctx.sql(sql).await?;
+        contributions.push(NodeContribution {
+            node_id: participants[0].node_id,
+            address: participants[0].address.clone(),
+            table: table.to_string(),
+            shard_index: 0,
+            assigned_bytes: 0,
+            assigned_rows: 0,
+            assigned_splits: 0,
+            result_rows: r.row_count,
+            elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+            local: true,
+        });
+        batches.extend(r.batches);
+        return Ok((batches, contributions));
+    }
+
+    let req_for = |shard_index: usize| FragmentRequest {
+        sql: sql.to_string(),
+        table: table.to_string(),
+        shard_index,
+        shard_count: participants.len(),
+        splits_digest: digest,
+    };
+
+    // Remote fragments concurrently; the local one on this thread while
+    // they fly.
+    let remote: Vec<_> = active
+        .iter()
+        .copied()
+        .filter(|&i| !participants[i].is_self)
+        .map(|i| {
+            let req = req_for(i);
+            let addr = participants[i].address.clone();
+            async move {
+                let started = Instant::now();
+                let out = transport.send(&addr, &req).await;
+                (i, out, started.elapsed())
+            }
+        })
+        .collect();
+    let remote = futures::future::join_all(remote);
+
+    let local_index = active.iter().copied().find(|&i| participants[i].is_self);
+    let local = async {
+        match local_index {
+            None => Ok::<_, QueryError>(None),
+            Some(i) => {
+                let started = Instant::now();
+                let (r, stats) = execute_fragment(base, &req_for(i)).await?;
+                Ok(Some((i, r, stats, started.elapsed())))
+            }
+        }
+    };
+
+    let (remote_out, local_out) = futures::future::join(remote, local).await;
+    let local_out: Option<_> = local_out?;
+
+    if let Some((i, r, stats, elapsed)) = local_out {
+        contributions.push(NodeContribution {
+            node_id: participants[i].node_id,
+            address: participants[i].address.clone(),
+            table: table.to_string(),
+            shard_index: i,
+            assigned_bytes: stats.bytes,
+            assigned_rows: stats.rows,
+            assigned_splits: stats.splits,
+            result_rows: r.row_count,
+            elapsed_ms: elapsed.as_secs_f64() * 1000.0,
+            local: true,
+        });
+        batches.extend(r.batches);
+    }
+
+    for (i, out, elapsed) in remote_out {
+        let (bytes, rows, node_ms) = out.map_err(|e| {
+            QueryError::Execution(format!(
+                "distributed query failed: node {} ({}) did not complete shard {} of {} \
+                 (table `{table}`): {e}",
+                participants[i].node_id,
+                participants[i].address,
+                i,
+                participants.len()
+            ))
+        })?;
+        let decoded = decode_ipc(&bytes).map_err(|e| {
+            QueryError::Execution(format!(
+                "node {} ({}) returned an undecodable fragment result: {e}",
+                participants[i].node_id, participants[i].address
+            ))
+        })?;
+        contributions.push(NodeContribution {
+            node_id: participants[i].node_id,
+            address: participants[i].address.clone(),
+            table: table.to_string(),
+            shard_index: i,
+            assigned_bytes: assignment.node_bytes[i],
+            assigned_rows: assignment.node_rows[i],
+            assigned_splits: assignment.node_splits[i],
+            result_rows: rows,
+            elapsed_ms: if node_ms > 0.0 {
+                node_ms
+            } else {
+                elapsed.as_secs_f64() * 1000.0
+            },
+            local: false,
+        });
+        batches.extend(decoded);
+    }
+
+    contributions.sort_by_key(|c| c.shard_index);
+    Ok((batches, contributions))
+}
+
+/// `max/mean` of a per-node reduction over contributions — the balance metrics
+/// for a query that may have scanned several tables on each node.
+fn per_node_spread(
+    contributions: &[NodeContribution],
+    value: impl Fn(&NodeContribution) -> f64,
+) -> f64 {
+    let mut per_node: std::collections::BTreeMap<&str, f64> = Default::default();
+    for c in contributions {
+        *per_node.entry(c.address.as_str()).or_default() += value(c);
+    }
+    let n = per_node.len();
+    if n == 0 {
+        return 1.0;
+    }
+    let sum: f64 = per_node.values().sum();
+    let max = per_node.values().fold(0.0f64, |a, &b| a.max(b));
+    let mean = sum / n as f64;
+    if mean > 0.0 {
+        max / mean
+    } else {
+        1.0
+    }
+}
+
+/// Run `sql` across `participants` on the exact scatter–gather path, with the
+/// initiator executing its own shard in-process and `transport` reaching the
+/// rest. Refuses (`NotImplemented`) any shape whose partial/final split is not
+/// exact — [`execute_any_distributed`] adds the general fallback.
 pub async fn execute_distributed(
     base: &ExecutionContext,
     sql: &str,
@@ -243,140 +421,17 @@ pub async fn execute_distributed(
     let digest = set.digest();
     let assignment = assign_lpt(&set, participants.len());
 
-    // A node with no splits is skipped rather than sent an empty fragment. For
-    // a global aggregate an empty shard would contribute an identity row, which
-    // merges harmlessly — but sending work that is known to be empty wastes a
-    // round trip and muddies the wall-time spread.
-    let active: Vec<usize> = (0..participants.len())
-        .filter(|&i| assignment.node_splits[i] > 0)
-        .collect();
+    let (batches, contributions) = scatter_sql_over_table(
+        base,
+        &plan.partial_sql,
+        &plan.table,
+        &set,
+        participants,
+        transport,
+    )
+    .await?;
 
-    let mut contributions: Vec<NodeContribution> = Vec::with_capacity(active.len());
-    let mut batches: Vec<RecordBatch> = Vec::new();
-
-    if active.is_empty() {
-        // The table has no row groups at all. Answer it locally over an empty
-        // shard so an aggregate still emits its identity row (COUNT = 0), which
-        // is what a single-node run returns.
-        let (ctx, _) = shard_context(base, &plan.table, &set, &assignment, 0)?;
-        let started = Instant::now();
-        let r = ctx.sql(&plan.partial_sql).await?;
-        contributions.push(NodeContribution {
-            node_id: participants[0].node_id,
-            address: participants[0].address.clone(),
-            shard_index: 0,
-            assigned_bytes: 0,
-            assigned_rows: 0,
-            assigned_splits: 0,
-            result_rows: r.row_count,
-            elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
-            local: true,
-        });
-        batches.extend(r.batches);
-    } else {
-        let req_for = |shard_index: usize| FragmentRequest {
-            sql: plan.partial_sql.clone(),
-            table: plan.table.clone(),
-            shard_index,
-            shard_count: participants.len(),
-            splits_digest: digest,
-        };
-
-        // Remote fragments concurrently; the local one on this thread while
-        // they fly.
-        let remote: Vec<_> = active
-            .iter()
-            .copied()
-            .filter(|&i| !participants[i].is_self)
-            .map(|i| {
-                let req = req_for(i);
-                let addr = participants[i].address.clone();
-                async move {
-                    let started = Instant::now();
-                    let out = transport.send(&addr, &req).await;
-                    (i, out, started.elapsed())
-                }
-            })
-            .collect();
-        let remote = futures::future::join_all(remote);
-
-        let local_index = active.iter().copied().find(|&i| participants[i].is_self);
-        let local = async {
-            match local_index {
-                None => Ok::<_, QueryError>(None),
-                Some(i) => {
-                    let started = Instant::now();
-                    let (r, stats) = execute_fragment(base, &req_for(i)).await?;
-                    Ok(Some((i, r, stats, started.elapsed())))
-                }
-            }
-        };
-
-        let (remote_out, local_out) = futures::future::join(remote, local).await;
-        let local_out: Option<_> = local_out?;
-
-        if let Some((i, r, stats, elapsed)) = local_out {
-            contributions.push(NodeContribution {
-                node_id: participants[i].node_id,
-                address: participants[i].address.clone(),
-                shard_index: i,
-                assigned_bytes: stats.bytes,
-                assigned_rows: stats.rows,
-                assigned_splits: stats.splits,
-                result_rows: r.row_count,
-                elapsed_ms: elapsed.as_secs_f64() * 1000.0,
-                local: true,
-            });
-            batches.extend(r.batches);
-        }
-
-        for (i, out, elapsed) in remote_out {
-            let (bytes, rows, node_ms) = out.map_err(|e| {
-                QueryError::Execution(format!(
-                    "distributed query failed: node {} ({}) did not complete shard {} of {}: {e}",
-                    participants[i].node_id,
-                    participants[i].address,
-                    i,
-                    participants.len()
-                ))
-            })?;
-            let decoded = decode_ipc(&bytes).map_err(|e| {
-                QueryError::Execution(format!(
-                    "node {} ({}) returned an undecodable fragment result: {e}",
-                    participants[i].node_id, participants[i].address
-                ))
-            })?;
-            contributions.push(NodeContribution {
-                node_id: participants[i].node_id,
-                address: participants[i].address.clone(),
-                shard_index: i,
-                assigned_bytes: assignment.node_bytes[i],
-                assigned_rows: assignment.node_rows[i],
-                assigned_splits: assignment.node_splits[i],
-                result_rows: rows,
-                elapsed_ms: if node_ms > 0.0 {
-                    node_ms
-                } else {
-                    elapsed.as_secs_f64() * 1000.0
-                },
-                local: false,
-            });
-            batches.extend(decoded);
-        }
-    }
-
-    contributions.sort_by_key(|c| c.shard_index);
     let result = merge(base, &plan, batches).await?;
-
-    let mean_ms = if contributions.is_empty() {
-        0.0
-    } else {
-        contributions.iter().map(|c| c.elapsed_ms).sum::<f64>() / contributions.len() as f64
-    };
-    let max_ms = contributions
-        .iter()
-        .map(|c| c.elapsed_ms)
-        .fold(0.0f64, f64::max);
 
     Ok(DistributedResult {
         result,
@@ -389,12 +444,153 @@ pub async fn execute_distributed(
             target_split_bytes: set.target_split_bytes,
             splits_digest: digest,
             imbalance: assignment.imbalance(),
-            wall_time_spread: if mean_ms > 0.0 { max_ms / mean_ms } else { 1.0 },
+            wall_time_spread: per_node_spread(&contributions, |c| c.elapsed_ms),
             nodes: contributions,
             partial_sql: plan.partial_sql.clone(),
             final_sql: plan.final_sql.clone(),
         },
     })
+}
+
+/// Run `sql` by gathering sharded scans of every referenced table, then
+/// executing the original statement on the initiator. See
+/// [`crate::distributed::gather`] for the design and its limits.
+pub async fn execute_gathered(
+    base: &ExecutionContext,
+    plan: &GatherPlan,
+    participants: &[Participant],
+    transport: &dyn FragmentTransport,
+) -> Result<DistributedResult> {
+    if participants.is_empty() {
+        return Err(QueryError::Execution(
+            "no cluster members are up; cannot execute a distributed query".into(),
+        ));
+    }
+
+    // Enumerate every table's splits BEFORE any fragment is sent, both for the
+    // memory bound and so a non-shardable table refuses the query up front.
+    let mut sets: Vec<SplitSet> = Vec::with_capacity(plan.tables.len());
+    for t in &plan.tables {
+        sets.push(splits_of(base, &t.name, participants.len())?);
+    }
+
+    // The gathered columns are materialized in initiator memory. Refuse
+    // anything that could not possibly fit rather than find out by dying:
+    // compressed on-disk bytes are the (conservative: pruning is not counted)
+    // stand-in for what will arrive. Half the budget, because the query
+    // itself — a join build side, a sort — still has to run over the result.
+    let moved: u64 = sets.iter().map(|s| s.total_bytes).sum();
+    let budget = (base.config().memory_limit / 2) as u64;
+    if moved > budget {
+        return Err(QueryError::NotImplemented(format!(
+            "gather would move up to {moved} compressed bytes of {} into initiator memory, \
+             over the {budget}-byte bound (half of --memory-limit). Cross-node partitioned \
+             execution of this shape is M3 (shuffle); until then, raise the memory limit or \
+             restrict the query to an exactly-mergeable aggregate",
+            plan.tables
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )));
+    }
+
+    // Gather every table concurrently; each table fans over all shards.
+    let gathers = futures::future::join_all(plan.tables.iter().zip(&sets).map(|(t, set)| {
+        scatter_sql_over_table(base, &t.gather_sql, &t.name, set, participants, transport)
+    }))
+    .await;
+
+    let mut gctx = ExecutionContext::with_config(base.config().clone());
+    let mut contributions: Vec<NodeContribution> = Vec::new();
+    for (t, out) in plan.tables.iter().zip(gathers) {
+        let (batches, contrib) = out?;
+        let batches = unify(batches)?;
+        let schema = match batches.first() {
+            Some(b) => b.schema(),
+            // Zero rows gathered: the registered table still needs the shape
+            // the statement will bind against — the provider schema, narrowed
+            // to the gathered columns.
+            None => {
+                let full = base
+                    .table_provider(&t.name)
+                    .ok_or_else(|| QueryError::TableNotFound(t.name.clone()))?
+                    .schema();
+                match &t.columns {
+                    None => full,
+                    Some(cols) => Arc::new(arrow::datatypes::Schema::new(
+                        full.fields()
+                            .iter()
+                            .filter(|f| cols.contains(f.name()))
+                            .map(|f| f.as_ref().clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                }
+            }
+        };
+        gctx.register_table(&t.name, schema, batches);
+        contributions.extend(contrib);
+    }
+
+    // The original statement, over the gathered tables, with the ordinary
+    // local engine. Nothing was rewritten, so nothing can disagree with what a
+    // single process would answer.
+    let result = gctx.sql(&plan.sql).await?;
+
+    let total_splits = sets.iter().map(|s| s.len()).sum();
+    let total_bytes = sets.iter().map(|s| s.total_bytes).sum();
+    let target_split_bytes = sets.iter().map(|s| s.target_split_bytes).max().unwrap_or(0);
+    let digest = sets
+        .iter()
+        .fold(0u64, |acc, s| acc.rotate_left(1) ^ s.digest());
+
+    Ok(DistributedResult {
+        result,
+        distribution: Distribution {
+            table: plan
+                .tables
+                .iter()
+                .map(|t| t.name.clone())
+                .collect::<Vec<_>>()
+                .join(","),
+            shape: MergeShape::Gather,
+            shard_count: participants.len(),
+            total_splits,
+            total_bytes,
+            target_split_bytes,
+            splits_digest: digest,
+            imbalance: per_node_spread(&contributions, |c| c.assigned_bytes as f64),
+            wall_time_spread: per_node_spread(&contributions, |c| c.elapsed_ms),
+            nodes: contributions,
+            partial_sql: plan
+                .tables
+                .iter()
+                .map(|t| t.gather_sql.clone())
+                .collect::<Vec<_>>()
+                .join("; "),
+            final_sql: Some(plan.sql.clone()),
+        },
+    })
+}
+
+/// The distributed entry point: the exact scatter–gather path when the shape
+/// allows it, the gather path for everything else. A non-`NotImplemented`
+/// planning error (unknown table, unknown column) propagates untouched — it
+/// is the statement that is wrong, not the distribution.
+pub async fn execute_any_distributed(
+    base: &ExecutionContext,
+    sql: &str,
+    participants: &[Participant],
+    transport: &dyn FragmentTransport,
+) -> Result<DistributedResult> {
+    match plan_distributed(base, sql) {
+        Ok(_) => execute_distributed(base, sql, participants, transport).await,
+        Err(QueryError::NotImplemented(_)) => {
+            let plan = plan_gather(base, sql)?;
+            execute_gathered(base, &plan, participants, transport).await
+        }
+        Err(other) => Err(other),
+    }
 }
 
 /// Combine the shards' answers.
@@ -417,6 +613,13 @@ async fn merge(
                 row_count,
                 metrics: Default::default(),
             })
+        }
+        MergeShape::Gather => {
+            // A DistributedPlan is never built with this shape; gather runs
+            // through execute_gathered, which does not merge.
+            return Err(QueryError::Execution(
+                "merge() called with MergeShape::Gather — a scatter plan cannot carry it".into(),
+            ));
         }
         MergeShape::TwoPhase => {
             let final_sql = plan

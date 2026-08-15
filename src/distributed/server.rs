@@ -641,8 +641,12 @@ fn index(state: &Arc<NodeState>) -> Response<Full<Bytes>> {
          POST /fragment   execute one shard of a distributed query (internal)\n\n\
          Every /sql response carries x-qe-distributed: true|false, and when it\n\
          is true, x-qe-imbalance and x-qe-distribution describing exactly how\n\
-         the work was divided. `distributed=1` NEVER falls back: an unsupported\n\
-         query shape is a 400 with the reason, not a quietly local answer.\n",
+         the work was divided. `distributed=1` NEVER falls back to local: exact\n\
+         two-phase shapes scatter-gather, every other SELECT runs as sharded\n\
+         scans gathered to the initiator, and what cannot be distributed at\n\
+         all (non-SELECT, no base table) is an error with the reason.\n\
+         `distributed=auto` scatter-gathers exact shapes and answers the rest\n\
+         locally, naming why in x-qe-distributed-skipped.\n",
         state.node_id, state.address
     );
     text_response(StatusCode::OK, body)
@@ -1132,8 +1136,11 @@ async fn sql(req: Request<Incoming>, state: &Arc<NodeState>, query: &str) -> Res
             let transport = HttpTransport {
                 timeout: crate::distributed::coordinator::DEFAULT_FRAGMENT_TIMEOUT,
             };
+            // Auto mode only reaches here when the exact scatter-gather plan
+            // succeeded, so this takes the scatter path; distributed=1 also
+            // covers every other SELECT via the gather path.
             let out =
-                crate::distributed::execute_distributed(&ctx, &statement, &members, &transport)
+                crate::distributed::execute_any_distributed(&ctx, &statement, &members, &transport)
                     .await?;
             let rows = out.result.row_count;
             let encoded = encode(&out.result, format)?;

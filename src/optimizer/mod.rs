@@ -147,7 +147,15 @@ impl Optimizer {
             let mut changed = false;
 
             for rule in rules {
-                let new_plan = rule.optimize(&current)?;
+                // A failing rule must say WHICH rule failed: "Column not
+                // found: x" alone points at the user's SQL, when the defect is
+                // in whatever transformation manufactured the reference.
+                let new_plan = rule.optimize(&current).map_err(|e| {
+                    crate::error::QueryError::Internal(format!(
+                        "optimizer rule `{}` failed: {e}",
+                        rule.name()
+                    ))
+                })?;
 
                 // Simple check if plan changed (by string representation)
                 // A proper implementation would use plan hashing

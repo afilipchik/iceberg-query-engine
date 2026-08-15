@@ -72,38 +72,47 @@ QUERIES = [
      "SELECT l_orderkey, l_linenumber FROM lineitem WHERE l_quantity > 49.9"),
 ]
 
-# Shapes that MUST be refused. The needle is the substring the message must
-# contain; the point is that the reason is specific, not that an error occurred.
-REJECTIONS = [
+# Shapes the exact scatter-gather planner refuses but the GATHER path (M2.5)
+# answers: workers stream their shard of every referenced table to the
+# initiator, which runs the original statement. All deterministic, so they are
+# validated cell-exact against DuckDB exactly like QUERIES above.
+GATHER_QUERIES = [
     ("cross-shard join (explicit)",
-     "SELECT COUNT(*) FROM lineitem JOIN orders ON l_orderkey = o_orderkey",
-     "cross-shard joins"),
+     "SELECT COUNT(*) AS n FROM lineitem JOIN orders ON l_orderkey = o_orderkey"),
     ("cross-shard join (comma)",
-     "SELECT COUNT(*) FROM lineitem, orders WHERE l_orderkey = o_orderkey",
-     "cross-shard joins"),
-    ("COUNT(DISTINCT)", "SELECT COUNT(DISTINCT l_orderkey) FROM lineitem", "COUNT(DISTINCT"),
+     "SELECT COUNT(*) AS n FROM lineitem, orders WHERE l_orderkey = o_orderkey"),
+    ("COUNT(DISTINCT)", "SELECT COUNT(DISTINCT l_orderkey) AS n FROM lineitem"),
     ("uncorrelated subquery",
-     "SELECT COUNT(*) FROM lineitem WHERE l_orderkey IN (SELECT o_orderkey FROM orders)",
-     "subqueries"),
+     "SELECT COUNT(*) AS n FROM lineitem WHERE l_orderkey IN (SELECT o_orderkey FROM orders)"),
     ("correlated subquery",
-     "SELECT COUNT(*) FROM lineitem l WHERE EXISTS "
-     "(SELECT 1 FROM orders o WHERE o.o_orderkey = l.l_orderkey)",
-     "subqueries"),
+     "SELECT COUNT(*) AS n FROM lineitem l WHERE EXISTS "
+     "(SELECT 1 FROM orders o WHERE o.o_orderkey = l.l_orderkey)"),
     ("scalar subquery",
-     "SELECT COUNT(*) FROM lineitem WHERE l_quantity > (SELECT AVG(l_quantity) FROM lineitem)",
-     "subqueries"),
+     "SELECT COUNT(*) AS n FROM lineitem "
+     "WHERE l_quantity > (SELECT AVG(l_quantity) FROM lineitem)"),
     ("global ORDER BY + LIMIT",
-     "SELECT l_orderkey FROM lineitem ORDER BY l_orderkey LIMIT 10", "global ORDER BY"),
-    ("global LIMIT", "SELECT l_orderkey FROM lineitem LIMIT 10", "global LIMIT"),
-    ("window function", "SELECT SUM(l_quantity) OVER () FROM lineitem", "Window function"),
-    ("STDDEV", "SELECT STDDEV(l_quantity) FROM lineitem", "STDDEV"),
-    ("APPROX_DISTINCT", "SELECT APPROX_DISTINCT(l_orderkey) FROM lineitem", "APPROX_DISTINCT"),
-    ("SELECT DISTINCT", "SELECT DISTINCT l_returnflag FROM lineitem", "SELECT DISTINCT"),
-    ("UNION", "SELECT COUNT(*) FROM lineitem UNION ALL SELECT COUNT(*) FROM orders",
-     "set operations"),
-    ("CTE", "WITH x AS (SELECT * FROM lineitem) SELECT COUNT(*) FROM x",
-     "common table expressions"),
-    ("derived table", "SELECT COUNT(*) FROM (SELECT * FROM lineitem) t", "subqueries in FROM"),
+     "SELECT l_orderkey FROM lineitem ORDER BY l_orderkey LIMIT 10"),
+    ("STDDEV", "SELECT STDDEV(l_quantity) AS s FROM lineitem"),
+    ("SELECT DISTINCT", "SELECT DISTINCT l_returnflag FROM lineitem"),
+    ("UNION", "SELECT COUNT(*) AS n FROM lineitem UNION ALL SELECT COUNT(*) FROM orders"),
+    ("CTE", "WITH x AS (SELECT * FROM lineitem) SELECT COUNT(*) AS n FROM x"),
+    ("derived table", "SELECT COUNT(*) AS n FROM (SELECT * FROM lineitem) t"),
+    ("three-way join + group",
+     "SELECT n_name, COUNT(*) AS c FROM customer "
+     "JOIN orders ON c_custkey = o_custkey "
+     "JOIN nation ON c_nationkey = n_nationkey "
+     "GROUP BY n_name ORDER BY c DESC, n_name"),
+]
+
+# Shapes that MUST still be refused. The needle is the substring the message
+# must contain; the point is that the reason is specific, not merely an error.
+# The list is short on purpose: gather widened distributed support to exactly
+# the local engine's envelope, so what remains is what the ENGINE cannot run
+# (windows), what has nothing to shard, and what is not a SELECT.
+REJECTIONS = [
+    ("window function", "SELECT SUM(l_quantity) OVER () FROM lineitem", "indow"),
+    ("no base table", "SELECT 1", "no base table"),
+    ("non-SELECT", "DROP TABLE lineitem", "only SELECT"),
 ]
 
 GREEN, RED, YELLOW, BOLD, NC = "\033[0;32m", "\033[0;31m", "\033[1;33m", "\033[1m", "\033[0m"
@@ -267,8 +276,36 @@ def main():
             else:
                 failures.append(name)
 
-    # ---- 3. rejections ----------------------------------------------------
-    print(f"\n{BOLD}=== 3/4  unsupported shapes are refused, by name ==={NC}")
+    # ---- 3. gather path + rejections --------------------------------------
+    print(f"\n{BOLD}=== 3/4  gather path (joins, subqueries, DISTINCT, ORDER BY) "
+          f"vs DuckDB ==={NC}")
+    for name, sql in GATHER_QUERIES:
+        try:
+            expected = duckdb_csv(args.data, sql, args.duckdb)
+        except Exception as e:  # noqa: BLE001
+            print(f"{RED}FAIL{NC} {name}: DuckDB: {e}")
+            failures.append(f"gather {name}")
+            continue
+        status, body, hdrs = post_sql(addrs[0], sql)
+        if status != 200:
+            print(f"{RED}FAIL{NC} {name}: HTTP {status} {body[:200]}")
+            failures.append(f"gather {name}")
+            continue
+        if hdrs.get("x-qe-distributed") != "true":
+            print(f"{RED}FAIL{NC} {name}: answered locally, not distributed")
+            failures.append(f"gather {name}")
+            continue
+        diff = compare(body, expected)
+        if diff:
+            print(f"{RED}FAIL{NC} {name}: {diff}")
+            failures.append(f"gather {name}")
+        else:
+            shape = "?"
+            if "x-qe-distribution" in hdrs:
+                shape = json.loads(hdrs["x-qe-distribution"]).get("shape", "?")
+            print(f"{GREEN}PASS{NC} {name:<28} identical to DuckDB (shape={shape})")
+
+    print(f"\n{BOLD}===      what remains refused, is refused by name ==={NC}")
     for name, sql, needle in REJECTIONS:
         status, body, _ = post_sql(addrs[0], sql)
         if status == 200:
