@@ -260,11 +260,43 @@ kubectl rollout status statefulset/query-engine --timeout=180s >/dev/null \
     && ok "the StatefulSet healed back to 3 ready pods" \
     || { bad "the StatefulSet did not recover"; FAILURES=$((FAILURES + 1)); }
 
+# ── 5. Distributed execution (M2 scatter + M2.5 gather) across pods ─────────
+
+echo -e "${BOLD}=== distributed gate on Kubernetes ===${NC}"
+
+# Each query runs twice through the same Service: distributed=1 (real fan-out
+# across the pods) and distributed=0 (one pod answering locally over its full
+# copy). The two must agree cell-for-cell; the distributed one must also SAY
+# it distributed. Both queries carry a full ORDER BY so the comparison can be
+# byte-exact.
+DIST_QUERIES=(
+  "SELECT l_returnflag, l_linestatus, SUM(l_quantity) AS q, COUNT(*) AS c FROM lineitem GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus"
+  "SELECT o_orderpriority, COUNT(*) AS c FROM orders o JOIN lineitem l ON o.o_orderkey = l.l_orderkey WHERE l.l_shipmode = 'AIR' GROUP BY o_orderpriority ORDER BY o_orderpriority"
+)
+di=0
+for sql in "${DIST_QUERIES[@]}"; do
+    di=$((di + 1))
+    hdrs="$(curl -sf -o .scratch/kind/results/dist$di.csv -D - -X POST --data "$sql"             "$ENTRY/sql?format=csv&distributed=1" | tr -d '\r' || true)"
+    if ! grep -qi '^x-qe-distributed: true' <<<"$hdrs"; then
+        bad "distributed query $di did not fan out (x-qe-distributed != true)"
+        FAILURES=$((FAILURES + 1)); continue
+    fi
+    curl -sf -o .scratch/kind/results/local$di.csv -X POST --data "$sql"          "$ENTRY/sql?format=csv&distributed=0" || true
+    if diff -q .scratch/kind/results/dist$di.csv .scratch/kind/results/local$di.csv >/dev/null; then
+        shards="$(grep -i '^x-qe-shards:' <<<"$hdrs" | awk '{print $2}')"
+        ok "distributed query $di identical to the local answer (${shards:-?} shard fragments)"
+    else
+        bad "distributed query $di DIFFERS from the local answer"
+        diff .scratch/kind/results/dist$di.csv .scratch/kind/results/local$di.csv | head -10
+        FAILURES=$((FAILURES + 1))
+    fi
+done
+
 echo
 if [[ $FAILURES -eq 0 ]]; then
-    echo -e "${GREEN}${BOLD}M1 KUBERNETES GATE: PASS${NC}"
+    echo -e "${GREEN}${BOLD}KUBERNETES GATE (M1 + distributed): PASS${NC}"
     echo "Record this run: the artifacts are no longer UNVALIDATED-ON-CLUSTER."
 else
-    echo -e "${RED}${BOLD}M1 KUBERNETES GATE: $FAILURES FAILURE(S)${NC}"
+    echo -e "${RED}${BOLD}KUBERNETES GATE: $FAILURES FAILURE(S)${NC}"
     exit 1
 fi

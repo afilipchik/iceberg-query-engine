@@ -685,7 +685,8 @@ before attributing any timing delta to huge pages.
 | `thiserror` | Error derive macros |
 | `clap` | CLI argument parsing |
 | `rustyline` | Interactive REPL line editing |
-| `reqwest` | HTTP client for metastore REST API |
+| `reqwest` | HTTP client for the older branching-metastore REST API |
+| `apache-avro` | Iceberg manifest lists/files (arrow-independent by construction) |
 | `regex` | Regular expression support |
 | `serde_json` | JSON parsing and serialization |
 | `sha2` | SHA-256/SHA-512 hash functions |
@@ -772,11 +773,11 @@ query_engine serve --bind 0.0.0.0:7777 --peers-dns query-engine-headless \
     --data /data
 ```
 
-### Distributed mode (M1)
+### Distributed mode (M1 + M2 + M2.5, 2026-08-15)
 
 `serve` turns the process into a cluster node. See
 `.claude/plans/DISTRIBUTED-IMPLEMENTATION.md` for the milestone plan and
-`.claude/plans/DISTRIBUTED-READINESS.md` for the three blockers that must be
+`.claude/plans/DISTRIBUTED-READINESS.md` for the blockers that must be
 fixed before M3 (shuffle).
 
 | Endpoint | Meaning |
@@ -784,11 +785,34 @@ fixed before M3 (shuffle).
 | `GET /healthz` | Liveness. Touches no tables, peers or disk, so a slow query can never cause a Kubernetes restart. Returns this node's id. |
 | `GET /readyz` | Readiness = tables loaded AND discovery resolved AND not draining. 503 with a `reason` otherwise. |
 | `GET /cluster` | Membership as JSON. The `members` array is sorted by address so every node in a healthy cluster renders an identical list. |
-| `POST /sql` | Body is the statement. Returns Arrow IPC by default; `?format=json` and `?format=csv` for humans and diffing. **M1 executes locally** — no fan-out. |
+| `GET /splits` | `?table=<t>&nodes=<n>` — how a table divides, with imbalance. |
+| `POST /sql` | Body is the statement. `?format=arrow (default)|json|csv`; `?distributed=auto (default)|1|0`. Headers report `x-qe-distributed`, `x-qe-distribution` (full JSON), `x-qe-imbalance`, `x-qe-shards`. |
+| `POST /fragment` | One shard of a distributed query (internal). Digest-checked. |
 
-**What M1 is NOT**: no shuffle, no exchange, no distributed joins, no fragment
-execution. Each node answers from its own complete copy of the data, and its
-answer is byte-identical to the single-process binary's.
+**Execution paths under `distributed=1`** (`src/distributed/`):
+
+* **Scatter (M2, `plan.rs`+`coordinator.rs`)** — single-table scans/filters/
+  projections and exactly-mergeable aggregates (COUNT/SUM/MIN/MAX/AVG, GROUP
+  BY/HAVING). Workers run a rewritten partial over their shard, initiator
+  merges with generated final SQL. Splits are row ranges inside Parquet row
+  groups (`splits.rs`), divided by BYTES with LPT; every node recomputes the
+  assignment and a `SplitSet::digest` mismatch FAILS the query.
+* **Gather (M2.5, `gather.rs`)** — everything else the local engine can run:
+  joins, subqueries, COUNT(DISTINCT), DISTINCT, CTEs, set ops, global ORDER
+  BY/LIMIT, STDDEV. Workers stream their shard of every referenced table
+  (columns pruned to what the optimized plan reads — NEVER `SELECT *`, whose
+  qualified output names cannot be re-bound), the initiator runs the ORIGINAL
+  statement over the gathered tables. Memory-bounded: refuses if assigned
+  compressed bytes exceed half of `--memory-limit`. All 22 TPC-H queries pass
+  distributed, byte-compared against the single-process engine.
+* `distributed=auto` scatters exact shapes when >=2 members are up, answers
+  everything else locally with the reason in `x-qe-distributed-skipped`.
+  `distributed=1` never falls back to local.
+
+Splits are provider-generic (`TableProvider::distributed_splits` /
+`shard_by_splits`): Parquet AND Iceberg tables enumerate row-group ranges,
+Lance datasets enumerate whole fragments (subset threaded through every
+scan path; k-NN pushdown declined on a shard). Still no shuffle — that is M3.
 
 **Testing without Docker.** kind cannot run on the development machine (no
 docker/podman, no passwordless sudo, and
@@ -848,6 +872,44 @@ query_engine create-lance-index --path ./data/vectors.lance --column embedding \
 `data/*-lance` fixtures, but `write-lance --from-parquet` is the Rust
 equivalent and is what the test suite uses.
 
+### Iceberg tables (default build, 2026-08-15)
+
+`src/storage/iceberg.rs` reads REAL Iceberg tables (format v1/v2): latest
+`*.metadata.json` (via `version-hint.text` or greatest `last-updated-ms`),
+Avro manifest lists + manifest files (apache-avro), entry status handling,
+absolute/`file:`-URI resolution, snapshot time travel. The resolved file list
+becomes an ordinary `ParquetTable`, so statistics, pruning and distributed
+splits apply unchanged. REFUSED by name: delete files, non-Parquet data
+files, empty tables, remote URIs. Registration:
+`ctx.register_iceberg(name, dir, snapshot_id: Option<i64>)`;
+`serve --tables <dir>` auto-detects Iceberg table dirs (checked BEFORE the
+parquet-dir test — order is a correctness matter) and `.lance` datasets.
+Fixtures: `scripts/iceberg_gen.py` (pyiceberg in `.venv`) regenerates
+`data/tpch-{1,10}mb-iceberg`; the 1mb `orders` has TWO snapshots
+(1500 rows, then +100 → 1600) for time-travel tests.
+
+### Metastore: Apache Gravitino (2026-08-15)
+
+`src/metastore/gravitino.rs` + `serve --metastore <url>
+[--metastore-metalake local_lake] [--metastore-catalog lakehouse]
+[--metastore-schema tpch]`: every fileset of one Gravitino schema is
+registered as a table; the fileset's `format` property (parquet|iceberg|
+lance) picks the reader, optional `file` property names a parquet inside a
+directory (Gravitino refuses file storageLocations). No sniffing; missing
+format is refused by name. A local Gravitino 1.3.0 (+JDK17) lives under
+`.scratch/metastore/` — no docker, no sudo:
+
+```bash
+scripts/metastore_local.sh start|stop|status|wipe   # the server
+scripts/metastore_demo.sh [--with-lance]           # the full gate:
+#   populates local_lake/lakehouse with schemas tpch (parquet),
+#   tpch_iceberg, tpch_lance; starts a 3-node cluster from NOTHING but
+#   --metastore; verifies distributed answers vs the single-process oracle
+#   and byte-identical cross-node agreement. PASS for all three formats.
+scripts/cluster_local.sh start 3 --metastore http://127.0.0.1:8090 \
+    --metastore-schema tpch_iceberg                # harness in metastore mode
+```
+
 ### Interactive REPL Commands
 
 Once in the REPL, the following dot-commands are available:
@@ -880,11 +942,12 @@ Any other input is executed as a SQL query.
 ## Future/Planned Features
 
 Based on the codebase structure, these appear to be planned but not fully implemented:
-- **Apache Iceberg integration** - Phase 2 of storage plan (see plan file at `.claude/plans/`)
-  - Iceberg metadata.json parsing (basic structure exists in `src/physical/operators/iceberg.rs`)
-  - Avro manifest file reading
-  - Time travel queries via snapshot IDs
-  - Partition pruning
+- **Iceberg partition pruning + row-level deletes** — the reader
+  (`src/storage/iceberg.rs`, DONE 2026-08-15: real metadata.json + Avro
+  manifests + snapshot time travel, resolved to a ParquetTable) refuses
+  delete files and does no partition pruning yet. The old JSON-manifest stub
+  in `src/physical/operators/iceberg.rs` is dead code kept only for its
+  stats-pruning scaffolding.
 - **Window functions** - ROW_NUMBER, RANK, DENSE_RANK, LEAD, LAG, etc.
   - Requires new WindowExpr, WindowNode, and WindowExec infrastructure
   - See plan at `.claude/plans/trino-function-implementation.md` Phase 6
@@ -895,10 +958,11 @@ Based on the codebase structure, these appear to be planned but not fully implem
 - Cost-based optimization (cost.rs exists but is minimal)
 - Parallel execution (partition parameter exists but single-threaded)
 
-## Current Test Status (2026-08-08)
+## Current Test Status (2026-08-15)
 
-- **All test suites green**: **837** on the default build, **900** with
-  `--features lance` (2026-08-09), including:
+- **All test suites green**: **955** on the default build (was 837 on
+  2026-08-08; the growth is distributed M2/M2.5, gather, Iceberg reader and
+  Gravitino client tests), lance-feature suite green, including:
   - **DuckDB-validated suite**: 163 passing (`tests/duckdb_validated.rs`) — requires
     `data/tpch-1mb` generated by the CURRENT generator (CI regenerates it; the
     generator is byte-for-byte deterministic)
