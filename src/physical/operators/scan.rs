@@ -90,6 +90,35 @@ pub trait TableProvider: Send + Sync + fmt::Debug {
     ) -> Result<Option<Vec<RecordBatch>>> {
         Ok(None)
     }
+
+    /// Enumerate this table's distributed splits — the atoms `assign_lpt`
+    /// divides across cluster nodes. `None` (the default) means the provider
+    /// cannot be sharded and a distributed query over it must be refused;
+    /// `Some(Err(..))` means it should be shardable but enumeration failed,
+    /// which must fail the query rather than downgrade it.
+    ///
+    /// The contract that makes leaderless assignment sound: every node's
+    /// enumeration of the same table over the same data must be IDENTICAL
+    /// (canonical order, same digest). See `distributed::splits`.
+    fn distributed_splits(
+        &self,
+        table: &str,
+        nodes: usize,
+    ) -> Option<Result<crate::distributed::SplitSet>> {
+        let _ = (table, nodes);
+        None
+    }
+
+    /// A provider restricted to exactly `splits` — one node's shard of this
+    /// table. Must be implemented by every provider whose
+    /// [`distributed_splits`](Self::distributed_splits) returns `Some`.
+    fn shard_by_splits(
+        &self,
+        splits: &[crate::distributed::Split],
+    ) -> Option<Result<Arc<dyn TableProvider>>> {
+        let _ = splits;
+        None
+    }
 }
 
 /// In-memory table provider

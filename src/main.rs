@@ -1137,6 +1137,31 @@ fn build_serve_context(
         let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
         paths.sort();
         for path in paths {
+            let name = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+
+            // Iceberg first: an Iceberg table directory CONTAINS parquet
+            // files, so the parquet-dir test would match it and register
+            // every historical file — including ones the current snapshot
+            // deleted. Detection order is a correctness matter here.
+            if path.is_dir() && query_engine::storage::iceberg::is_iceberg_dir(&path) {
+                ctx.register_iceberg(&name, &path, None)?;
+                registered += 1;
+                continue;
+            }
+
+            #[cfg(feature = "lance")]
+            if path.is_dir() && path.extension().map(|e| e == "lance").unwrap_or(false) {
+                ctx.register_lance(&name, &path)?;
+                registered += 1;
+                continue;
+            }
+
             let is_parquet_file =
                 path.is_file() && path.extension().map(|e| e == "parquet").unwrap_or(false);
             let is_parquet_dir = path.is_dir()
@@ -1157,19 +1182,13 @@ fn build_serve_context(
             if !is_parquet_file && !is_parquet_dir {
                 continue;
             }
-            let name = path
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            if name.is_empty() {
-                continue;
-            }
             ctx.register_parquet(&name, &path)?;
             registered += 1;
         }
         if registered == 0 {
             return Err(QueryError::Storage(format!(
-                "--tables {} contains no Parquet files or Parquet directories",
+                "--tables {} contains no Parquet files/directories, Iceberg tables, \
+                 or Lance datasets",
                 dir.display()
             )));
         }

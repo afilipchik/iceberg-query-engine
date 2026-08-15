@@ -213,6 +213,21 @@ impl ExecutionContext {
         Ok(())
     }
 
+    /// Register an Apache Iceberg table directory, optionally at a specific
+    /// snapshot (time travel). The provider is the ordinary ParquetTable over
+    /// the snapshot's manifest-listed data files, so every Parquet-path
+    /// capability — including distributed split enumeration — applies.
+    pub fn register_iceberg(
+        &mut self,
+        name: impl Into<String>,
+        path: impl AsRef<Path>,
+        snapshot_id: Option<i64>,
+    ) -> Result<()> {
+        let opened = crate::storage::open_iceberg_table(path, snapshot_id)?;
+        self.register_table_provider(name, Arc::new(opened.table));
+        Ok(())
+    }
+
     /// Register a table from a Lance dataset directory (e.g. `orders.lance`).
     ///
     /// Requires the `lance` cargo feature. Column projection is pushed into

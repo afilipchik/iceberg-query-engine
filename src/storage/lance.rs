@@ -210,6 +210,14 @@ fn carried_reason(dt: &DataType, depth: usize) -> Option<String> {
 }
 
 /// Table provider backed by a Lance dataset.
+/// One fragment's identity and weight, for distributed split enumeration.
+#[derive(Clone, Copy, Debug)]
+pub struct FragmentInfo {
+    pub id: u64,
+    pub rows: i64,
+    pub bytes: u64,
+}
+
 pub struct LanceTable {
     dataset: Arc<Dataset>,
     schema: SchemaRef,
@@ -236,6 +244,11 @@ pub struct LanceTable {
     /// renderer silently refuses everything — the most likely way for this
     /// feature to be quietly dead.
     pushed_filters: std::sync::atomic::AtomicUsize,
+    /// When set, every scan is restricted to exactly these fragment ids —
+    /// the distributed layer's shard of this dataset. `None` = the whole
+    /// dataset. Threaded through every scan path; a path that ignored it
+    /// would return another shard's rows as its own.
+    fragment_subset: Option<std::collections::BTreeSet<u64>>,
 }
 
 impl fmt::Debug for LanceTable {
@@ -379,6 +392,7 @@ impl LanceTable {
             stats_cache: std::sync::OnceLock::new(),
             filter_pushdown: Self::env_pushdown_enabled(),
             pushed_filters: std::sync::atomic::AtomicUsize::new(0),
+            fragment_subset: None,
         })
     }
 
@@ -417,6 +431,82 @@ impl LanceTable {
     /// Number of fragments in the dataset.
     pub fn num_fragments(&self) -> usize {
         self.num_fragments
+    }
+
+    /// Every fragment's identity, row count and on-disk bytes — the atoms the
+    /// distributed layer divides. Sorted by id so every node enumerates the
+    /// identical list. Refuses datasets with deletion vectors: a row count
+    /// that ignores them is a wrong answer waiting to be summed.
+    pub fn fragment_infos(&self) -> Result<Vec<FragmentInfo>> {
+        let mut out = Vec::new();
+        for f in self.dataset.get_fragments() {
+            let meta = f.metadata();
+            if meta.deletion_file.is_some() {
+                return Err(QueryError::NotImplemented(format!(
+                    "Lance dataset {} fragment {} has a deletion vector; distributed \
+                     execution over datasets with deletions is not supported — compact first",
+                    self.path.display(),
+                    meta.id
+                )));
+            }
+            let rows = meta.physical_rows.ok_or_else(|| {
+                QueryError::Storage(format!(
+                    "Lance dataset {} fragment {} does not record physical_rows",
+                    self.path.display(),
+                    meta.id
+                ))
+            })? as i64;
+            let mut bytes = 0u64;
+            for df in &meta.files {
+                let p = self.path.join("data").join(&df.path);
+                bytes += std::fs::metadata(&p)
+                    .map_err(|e| {
+                        QueryError::Storage(format!(
+                            "Lance data file {} is listed but unreadable: {e}",
+                            p.display()
+                        ))
+                    })?
+                    .len();
+            }
+            out.push(FragmentInfo {
+                id: meta.id,
+                rows,
+                bytes,
+            });
+        }
+        out.sort_by_key(|f| f.id);
+        Ok(out)
+    }
+
+    /// A view of this dataset restricted to exactly `ids` — one node's shard.
+    /// Row count and byte size are recomputed for the subset so the count(*)
+    /// metadata shortcut and the optimizer's estimates describe the SHARD,
+    /// not the whole dataset.
+    pub fn shard_with_fragments(&self, ids: impl IntoIterator<Item = u64>) -> Result<LanceTable> {
+        let subset: std::collections::BTreeSet<u64> = ids.into_iter().collect();
+        let infos = self.fragment_infos()?;
+        for id in &subset {
+            if !infos.iter().any(|f| f.id == *id) {
+                return Err(QueryError::Storage(format!(
+                    "Lance dataset {} has no fragment {id}; the shard assignment does not \
+                     match this node's copy of the data",
+                    self.path.display()
+                )));
+            }
+        }
+        let owned: Vec<_> = infos.iter().filter(|f| subset.contains(&f.id)).collect();
+        Ok(LanceTable {
+            dataset: Arc::clone(&self.dataset),
+            schema: self.schema.clone(),
+            num_rows: owned.iter().map(|f| f.rows).sum::<i64>() as usize,
+            total_bytes: owned.iter().map(|f| f.bytes).sum(),
+            num_fragments: owned.len(),
+            path: self.path.clone(),
+            stats_cache: std::sync::OnceLock::new(),
+            filter_pushdown: self.filter_pushdown,
+            pushed_filters: std::sync::atomic::AtomicUsize::new(0),
+            fragment_subset: Some(subset),
+        })
     }
 
     /// Compute and cache column statistics, doing the work at most once.
@@ -509,7 +599,9 @@ impl LanceTable {
 
         let ds = Arc::clone(&self.dataset);
         let names = int_names.clone();
-        let Ok(batches) = block_on_lance(async move { scan_fragments(ds, names, None).await })
+        let subset = self.fragment_subset.clone();
+        let Ok(batches) =
+            block_on_lance(async move { scan_fragments(ds, names, None, subset).await })
         else {
             // Statistics are an optimization, not a correctness input: if the
             // probe scan fails, plan without them rather than failing the query.
@@ -725,12 +817,13 @@ async fn scan_fragments(
     ds: Arc<Dataset>,
     names: Vec<String>,
     filter: Option<String>,
+    subset: Option<std::collections::BTreeSet<u64>>,
 ) -> Result<Vec<RecordBatch>> {
     if std::env::var("QE_LANCE_TIMING").is_err() {
-        return scan_fragments_inner(ds, names, filter).await;
+        return scan_fragments_inner(ds, names, filter, subset).await;
     }
     let t0 = std::time::Instant::now();
-    let out = scan_fragments_inner(ds, names.clone(), filter).await;
+    let out = scan_fragments_inner(ds, names.clone(), filter, subset).await;
     let rows: usize = out
         .as_ref()
         .map(|b: &Vec<RecordBatch>| b.iter().map(|x| x.num_rows()).sum())
@@ -749,12 +842,26 @@ async fn scan_fragments_inner(
     ds: Arc<Dataset>,
     names: Vec<String>,
     filter: Option<String>,
+    subset: Option<std::collections::BTreeSet<u64>>,
 ) -> Result<Vec<RecordBatch>> {
-    let fragments = ds.get_fragments();
+    let mut fragments = ds.get_fragments();
+    if let Some(keep) = &subset {
+        fragments.retain(|f| keep.contains(&f.metadata().id));
+        if fragments.is_empty() {
+            return Ok(Vec::new());
+        }
+    }
 
-    // Single fragment: no point paying for task spawn + join.
+    // Single fragment: no point paying for task spawn + join. When a subset
+    // is active the fragment must still be named explicitly — an unfragmented
+    // scan would read the whole dataset.
     if fragments.len() <= 1 {
-        return scan_one(ds, names, None, filter).await;
+        let meta = if subset.is_some() {
+            fragments.first().map(|f| f.metadata().clone())
+        } else {
+            None
+        };
+        return scan_one(ds, names, meta, filter).await;
     }
 
     let mut tasks = Vec::with_capacity(fragments.len());
@@ -1381,7 +1488,8 @@ impl TableProvider for LanceTable {
         }
 
         let ds = Arc::clone(&self.dataset);
-        block_on_lance(async move { scan_fragments(ds, names, None).await })
+        let subset = self.fragment_subset.clone();
+        block_on_lance(async move { scan_fragments(ds, names, None, subset).await })
     }
 
     /// Scan with as much of the predicate as Lance can evaluate faithfully.
@@ -1434,7 +1542,8 @@ impl TableProvider for LanceTable {
         self.pushed_filters
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let ds = Arc::clone(&self.dataset);
-        block_on_lance(async move { scan_fragments(ds, names, Some(sql)).await })
+        let subset = self.fragment_subset.clone();
+        block_on_lance(async move { scan_fragments(ds, names, Some(sql), subset).await })
     }
 
     /// Run a k-NN search through Lance's vector index.
@@ -1456,12 +1565,68 @@ impl TableProvider for LanceTable {
     /// Returns `Ok(None)` when the request cannot be served faithfully:
     /// unknown column, dimension mismatch, or no index when one was required.
     /// The caller then falls back to the exact path.
+    fn distributed_splits(
+        &self,
+        table: &str,
+        nodes: usize,
+    ) -> Option<Result<crate::distributed::SplitSet>> {
+        use crate::distributed::{Split, SplitSet};
+        let infos = match self.fragment_infos() {
+            Ok(i) => i,
+            Err(e) => return Some(Err(e)),
+        };
+        // The atom is a whole fragment — Lance's own unit of parallel decode.
+        // No sub-fragment cutting yet: balance is bounded by fragment sizes
+        // (58 fragments for SF=10 lineitem spread fine across <=8 nodes).
+        let splits: Vec<Split> = infos
+            .iter()
+            .map(|f| Split {
+                table: table.to_string(),
+                path: self.path.clone(),
+                file: format!("fragment-{:08}", f.id),
+                row_group: f.id as usize,
+                row_offset: 0,
+                num_rows: f.rows,
+                bytes: f.bytes,
+            })
+            .collect();
+        let total_bytes = splits.iter().map(|s| s.bytes).sum();
+        let total_rows = splits.iter().map(|s| s.num_rows).sum();
+        Some(Ok(SplitSet {
+            table: table.to_string(),
+            splits,
+            total_bytes,
+            total_rows,
+            target_split_bytes: crate::distributed::splits::target_split_bytes(total_bytes, nodes),
+        }))
+    }
+
+    fn shard_by_splits(
+        &self,
+        splits: &[crate::distributed::Split],
+    ) -> Option<Result<Arc<dyn TableProvider>>> {
+        Some(
+            self.shard_with_fragments(splits.iter().map(|s| s.row_group as u64))
+                .map(|t| Arc::new(t) as Arc<dyn TableProvider>),
+        )
+    }
+
     fn scan_knn(
         &self,
         projection: Option<&[usize]>,
         q: &crate::physical::vector::VectorQuery,
     ) -> Result<Option<Vec<RecordBatch>>> {
         use arrow::array::Float32Array;
+
+        // A sharded view declines the k-NN pushdown: Lance's nearest() has no
+        // fragment restriction here, so it would search the WHOLE dataset and
+        // attribute the result to this shard. Declining sends the caller to
+        // the exact path, whose scans are subset-filtered and therefore
+        // correct. (Worker SQL never contains a k-NN shape today; this guard
+        // is for whatever calls it tomorrow.)
+        if self.fragment_subset.is_some() {
+            return Ok(None);
+        }
 
         // Validate the column against the dataset schema before touching Lance,
         // so a typo produces a clean fallback rather than an opaque Lance error.

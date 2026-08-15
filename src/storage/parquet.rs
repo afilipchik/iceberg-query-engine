@@ -78,6 +78,33 @@ impl ParquetTable {
         })
     }
 
+    /// Create a ParquetTable from an explicit file list — the shape a
+    /// metadata layer (Iceberg manifests) produces. Directory scanning would
+    /// be WRONG there: a table directory can contain files its current
+    /// snapshot no longer includes.
+    pub fn try_from_files(files: Vec<PathBuf>) -> Result<Self> {
+        if files.is_empty() {
+            return Err(QueryError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "cannot build a ParquetTable from zero files".to_string(),
+            )));
+        }
+        for f in &files {
+            if !f.is_file() {
+                return Err(QueryError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("listed data file does not exist: {}", f.display()),
+                )));
+            }
+        }
+        let schema = Self::read_schema(&files[0])?;
+        Ok(Self {
+            schema,
+            files,
+            stats_cache: std::sync::OnceLock::new(),
+        })
+    }
+
     /// Read table + per-column statistics from the Parquet footers.
     ///
     /// Column min/max/null_count are merged across all row groups of all
@@ -528,6 +555,29 @@ impl TableProvider for ParquetTable {
 
     fn parquet_files(&self) -> Option<Vec<PathBuf>> {
         Some(self.files.clone())
+    }
+
+    fn distributed_splits(
+        &self,
+        table: &str,
+        nodes: usize,
+    ) -> Option<Result<crate::distributed::SplitSet>> {
+        Some(crate::distributed::enumerate_parquet(
+            table,
+            &self.files,
+            nodes,
+        ))
+    }
+
+    fn shard_by_splits(
+        &self,
+        splits: &[crate::distributed::Split],
+    ) -> Option<Result<Arc<dyn TableProvider>>> {
+        Some(Ok(Arc::new(crate::distributed::ShardedParquetTable::new(
+            self.schema.clone(),
+            splits.to_vec(),
+            self.statistics(),
+        ))))
     }
 }
 

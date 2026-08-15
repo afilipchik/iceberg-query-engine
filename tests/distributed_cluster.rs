@@ -1495,3 +1495,209 @@ async fn three_real_processes_serve_and_survive_a_sigterm() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Format-generic distribution: Iceberg and Lance
+// ---------------------------------------------------------------------------
+
+/// Like `start_cluster`, with a caller-chosen table loader.
+async fn start_cluster_with(n: u64, make_loader: fn() -> TableLoader) -> Vec<ServerHandle> {
+    isolate_env();
+    let mut handles = Vec::new();
+    for i in 0..n {
+        handles.push(
+            spawn(test_options(i), make_loader())
+                .await
+                .expect("server failed to bind"),
+        );
+    }
+    let addrs: Vec<String> = handles.iter().map(|h| h.address().to_string()).collect();
+    for h in &handles {
+        h.set_peers(addrs.clone());
+    }
+    handles
+}
+
+fn iceberg_dir(table: &str) -> String {
+    format!(
+        "{}/data/tpch-1mb-iceberg/{table}",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+fn iceberg_loader() -> TableLoader {
+    Box::new(|| {
+        let mut ctx = ExecutionContext::new();
+        for t in TABLES {
+            ctx.register_iceberg(t, iceberg_dir(t), None)?;
+        }
+        Ok(ctx)
+    })
+}
+
+fn iceberg_local_context() -> ExecutionContext {
+    let mut ctx = ExecutionContext::new();
+    for t in TABLES {
+        ctx.register_iceberg(t, iceberg_dir(t), None)
+            .unwrap_or_else(|e| panic!("cannot open Iceberg table {t}: {e}"));
+    }
+    ctx
+}
+
+/// The queries a format cluster must answer identically to its own local
+/// context: an exact scatter shape, a grouped scatter shape, a gather join,
+/// and a row-exactness sweep that would expose any shard overlap or gap.
+const FORMAT_QUERIES: &[(&str, &str)] = &[
+    ("count", "SELECT COUNT(*) AS n FROM lineitem"),
+    (
+        "grouped_agg",
+        "SELECT l_returnflag, l_linestatus, SUM(l_quantity) AS q, COUNT(*) AS c \
+         FROM lineitem GROUP BY l_returnflag, l_linestatus",
+    ),
+    (
+        "gather_join",
+        "SELECT o_orderpriority, COUNT(*) AS c FROM orders o \
+         JOIN lineitem l ON o.o_orderkey = l.l_orderkey \
+         WHERE l.l_shipmode = 'AIR' GROUP BY o_orderpriority ORDER BY o_orderpriority",
+    ),
+    (
+        "row_exactness",
+        "SELECT l_orderkey, l_linenumber FROM lineitem",
+    ),
+];
+
+/// GATE: a 3-node cluster serving ICEBERG tables answers scatter and gather
+/// shapes identically to a single process reading the same Iceberg metadata.
+#[tokio::test]
+async fn iceberg_tables_distribute_and_match_the_single_process_engine() {
+    let nodes = start_cluster_with(3, iceberg_loader).await;
+    let addrs: Vec<String> = nodes.iter().map(|h| h.local_addr().to_string()).collect();
+    for a in &addrs {
+        assert!(
+            wait_ready(a, Duration::from_secs(30)).await,
+            "{a} not ready"
+        );
+    }
+    let local = iceberg_local_context();
+
+    for (name, sql) in FORMAT_QUERIES {
+        let expected = csv_of(&local.sql(sql).await.unwrap_or_else(|e| {
+            panic!("local Iceberg context failed on {name}: {e}");
+        }));
+        let resp = dsql(&addrs[0], sql).await;
+        assert!(
+            resp.is_success(),
+            "{name} over Iceberg: HTTP {} {}",
+            resp.status,
+            resp.text()
+        );
+        assert_eq!(
+            resp.header("x-qe-distributed"),
+            Some("true"),
+            "{name} answered locally despite distributed=1"
+        );
+        assert_cells_match(&resp.text(), &expected, &format!("iceberg {name}"));
+    }
+
+    // The multi-snapshot table: the CURRENT snapshot must be served. The
+    // fixture's orders table is 1500 rows plus a 100-row second append.
+    let resp = dsql(&addrs[0], "SELECT COUNT(*) AS n FROM orders").await;
+    assert!(
+        resp.text().contains("1600"),
+        "orders must be served at its current snapshot (1600 rows): {}",
+        resp.text()
+    );
+
+    shutdown_all(nodes).await;
+}
+
+/// Iceberg time travel: registering the same table at its FIRST snapshot
+/// serves the pre-append row count — and the distributed digest interlock
+/// means a cluster whose nodes disagreed on the snapshot would refuse, not
+/// mis-answer.
+#[tokio::test]
+async fn iceberg_time_travel_serves_the_older_snapshot() {
+    let opened =
+        query_engine::storage::open_iceberg_table(iceberg_dir("orders"), None).expect("open");
+    assert_eq!(opened.snapshots.len(), 2, "fixture must have 2 snapshots");
+    let first = opened.snapshots[0].snapshot_id;
+
+    let mut ctx = ExecutionContext::new();
+    ctx.register_iceberg("orders", iceberg_dir("orders"), Some(first))
+        .expect("register at snapshot 1");
+    let r = ctx.sql("SELECT COUNT(*) AS n FROM orders").await.unwrap();
+    let csv = csv_of(&r);
+    assert!(
+        csv.contains("1500"),
+        "snapshot 1 must have 1500 rows: {csv}"
+    );
+}
+
+#[cfg(feature = "lance")]
+fn lance_loader() -> TableLoader {
+    Box::new(|| {
+        let mut ctx = ExecutionContext::new();
+        for t in TABLES {
+            ctx.register_lance(
+                t,
+                format!(
+                    "{}/data/tpch-1mb-lance/{t}.lance",
+                    env!("CARGO_MANIFEST_DIR")
+                ),
+            )?;
+        }
+        Ok(ctx)
+    })
+}
+
+/// GATE: a 3-node cluster serving LANCE datasets answers scatter and gather
+/// shapes identically to a single process over the same datasets. Fragment
+/// sharding: every fragment served exactly once (row_exactness would expose
+/// an overlap or a gap immediately).
+#[cfg(feature = "lance")]
+#[tokio::test]
+async fn lance_tables_distribute_and_match_the_single_process_engine() {
+    let nodes = start_cluster_with(3, lance_loader).await;
+    let addrs: Vec<String> = nodes.iter().map(|h| h.local_addr().to_string()).collect();
+    for a in &addrs {
+        assert!(
+            wait_ready(a, Duration::from_secs(30)).await,
+            "{a} not ready"
+        );
+    }
+    let local = {
+        let mut ctx = ExecutionContext::new();
+        for t in TABLES {
+            ctx.register_lance(
+                t,
+                format!(
+                    "{}/data/tpch-1mb-lance/{t}.lance",
+                    env!("CARGO_MANIFEST_DIR")
+                ),
+            )
+            .unwrap_or_else(|e| panic!("cannot open Lance dataset {t}: {e}"));
+        }
+        ctx
+    };
+
+    for (name, sql) in FORMAT_QUERIES {
+        let expected = csv_of(&local.sql(sql).await.unwrap_or_else(|e| {
+            panic!("local Lance context failed on {name}: {e}");
+        }));
+        let resp = dsql(&addrs[0], sql).await;
+        assert!(
+            resp.is_success(),
+            "{name} over Lance: HTTP {} {}",
+            resp.status,
+            resp.text()
+        );
+        assert_eq!(
+            resp.header("x-qe-distributed"),
+            Some("true"),
+            "{name} answered locally despite distributed=1"
+        );
+        assert_cells_match(&resp.text(), &expected, &format!("lance {name}"));
+    }
+
+    shutdown_all(nodes).await;
+}

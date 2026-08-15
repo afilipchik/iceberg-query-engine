@@ -45,8 +45,7 @@
 
 use crate::distributed::gather::{plan_gather, GatherPlan};
 use crate::distributed::plan::{plan_distributed, DistributedPlan, MergeShape, PARTIAL_TABLE};
-use crate::distributed::shard::ShardedParquetTable;
-use crate::distributed::splits::{assign_lpt, enumerate_parquet, Assignment, SplitSet};
+use crate::distributed::splits::{assign_lpt, Assignment, SplitSet};
 use crate::error::{QueryError, Result};
 use crate::execution::{ExecutionContext, QueryResult};
 use arrow::record_batch::RecordBatch;
@@ -140,17 +139,21 @@ pub struct DistributedResult {
 }
 
 /// Enumerate the splits of `table` as this node sees them.
+///
+/// The provider decides what a split IS: row ranges inside Parquet row groups
+/// (Parquet and Iceberg tables), whole fragments (Lance). What every provider
+/// must guarantee is the same canonical enumeration on every node — the
+/// digest interlock depends on it.
 pub fn splits_of(ctx: &ExecutionContext, table: &str, nodes: usize) -> Result<SplitSet> {
     let provider = ctx
         .table_provider(table)
         .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
-    let files = provider.parquet_files().ok_or_else(|| {
+    provider.distributed_splits(table, nodes).ok_or_else(|| {
         QueryError::NotImplemented(format!(
-            "table `{table}` is not Parquet-backed, so it has no row groups to divide; \
-             distributed execution currently enumerates splits from Parquet footers only"
+            "table `{table}`'s provider cannot be divided into distributed splits; \
+             Parquet, Iceberg and Lance tables can"
         ))
-    })?;
-    enumerate_parquet(table, &files, nodes)
+    })?
 }
 
 /// Build a context in which `table` is replaced by this node's shard of it.
@@ -187,9 +190,14 @@ pub fn shard_context(
         splits: owned.len(),
     };
 
-    let sharded = ShardedParquetTable::new(provider.schema(), owned, provider.statistics());
+    let sharded = provider.shard_by_splits(&owned).ok_or_else(|| {
+        QueryError::Execution(format!(
+            "table `{table}`'s provider enumerated splits but cannot shard by them; \
+                 distributed_splits and shard_by_splits must be implemented together"
+        ))
+    })??;
     let mut ctx = ExecutionContext::with_config(base.config().clone());
-    ctx.register_table_provider(table, Arc::new(sharded));
+    ctx.register_table_provider(table, sharded);
     Ok((ctx, stats))
 }
 
@@ -1048,7 +1056,10 @@ mod tests {
         );
         let e = splits_of(&c, "mem", 3).unwrap_err();
         assert!(matches!(e, QueryError::NotImplemented(_)), "{e:?}");
-        assert!(e.to_string().contains("not Parquet-backed"));
+        assert!(
+            e.to_string().contains("cannot be divided"),
+            "the refusal must say the provider is not shardable: {e}"
+        );
     }
 
     #[test]
@@ -1056,7 +1067,7 @@ mod tests {
         let base = ctx();
         let provider = base.table_provider("lineitem").unwrap();
         let files = provider.parquet_files().unwrap();
-        let bogus = ShardedParquetTable::new(
+        let bogus = crate::distributed::ShardedParquetTable::new(
             provider.schema(),
             vec![Split {
                 table: "lineitem".into(),

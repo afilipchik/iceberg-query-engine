@@ -2,11 +2,14 @@
 //!
 //! This module provides table providers for reading data from external storage:
 //! - Parquet files and directories (batch and streaming)
-//! - Apache Iceberg tables (see `physical::operators::iceberg`)
+//! - Apache Iceberg tables (`storage::iceberg`): spec metadata + Avro
+//!   manifests resolved to a `ParquetTable`
 
+pub mod iceberg;
 mod parquet;
 pub mod row_group_pruning;
 
+pub use iceberg::{open_table as open_iceberg_table, IcebergTable};
 pub use parquet::{
     ParquetFileInfo, ParquetTable, StreamingParquetReader, StreamingParquetScanBuilder,
 };
