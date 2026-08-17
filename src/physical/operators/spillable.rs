@@ -128,8 +128,14 @@ enum BuildDecision {
     InMemory(Arc<crate::physical::operators::HashJoinExec>),
     /// Build exceeds memory — spill path (only partition 0 processes)
     Spill {
-        /// Build batches stored for partition 0 to consume once.
-        build_batches: std::sync::Mutex<Option<Vec<RecordBatch>>>,
+        /// Build batches, kept for EVERY execution of partition 0 — an
+        /// operator above may legitimately execute its child more than once
+        /// (the fused streaming aggregate drains, aborts, and re-executes).
+        /// The previous `Mutex<Option<..>>::take()` shape handed the second
+        /// execution an EMPTY build side, which joined to zero rows and
+        /// returned them as the answer. Cloning is cheap: RecordBatch
+        /// columns are Arc'd buffers.
+        build_batches: Vec<RecordBatch>,
     },
 }
 
@@ -320,9 +326,7 @@ impl PhysicalOperator for SpillableHashJoinExec {
                     };
                     Ok::<_, QueryError>(BuildDecision::InMemory(hash_join))
                 } else {
-                    Ok(BuildDecision::Spill {
-                        build_batches: std::sync::Mutex::new(Some(build_batches)),
-                    })
+                    Ok(BuildDecision::Spill { build_batches })
                 }
             })
             .await?;
@@ -337,8 +341,8 @@ impl PhysicalOperator for SpillableHashJoinExec {
                 if partition > 0 {
                     return Ok(Box::pin(stream::empty()));
                 }
-                let batches = build_batches.lock().unwrap().take().unwrap_or_default();
-                self.execute_spill_path(batches, probe_side, swapped).await
+                self.execute_spill_path(build_batches.clone(), probe_side, swapped)
+                    .await
             }
         }
     }
@@ -951,6 +955,14 @@ impl PhysicalOperator for SpillableHashAggregateExec {
             QueryError::Execution(format!("Failed to create spill directory: {}", e))
         })?;
 
+        if std::env::var("QE_SPILL_DEBUG").is_ok() {
+            eprintln!(
+                "[spill-agg] collected {} batches, {} rows, {} bytes",
+                all_batches.len(),
+                all_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+                total_size
+            );
+        }
         let input_stream: RecordBatchStream =
             Box::pin(stream::iter(all_batches.into_iter().map(Ok)));
 
@@ -958,6 +970,18 @@ impl PhysicalOperator for SpillableHashAggregateExec {
         let (in_memory_partitions, spilled_files) = self
             .aggregate_with_spilling(input_stream, &spill_dir)
             .await?;
+        if std::env::var("QE_SPILL_DEBUG").is_ok() {
+            let mem_rows: usize = in_memory_partitions
+                .iter()
+                .flatten()
+                .map(|p| p.batches.iter().map(|b| b.num_rows()).sum::<usize>())
+                .sum();
+            eprintln!(
+                "[spill-agg] in-memory rows {}, spilled files {}",
+                mem_rows,
+                spilled_files.iter().flatten().count()
+            );
+        }
 
         // Each partition holds RAW input rows hash-partitioned by group key, so
         // a given group lives in exactly one partition — possibly split between
@@ -1043,56 +1067,83 @@ impl SpillableHashAggregateExec {
         let memory_threshold =
             (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
 
-        while let Some(batch) = input_stream.try_next().await? {
-            let batch_size = estimate_batch_size(&batch);
+        while let Some(big) = input_stream.try_next().await? {
+            // Re-chunk over-large batches (an mmap-backed IPC scan emits
+            // 65536-row slabs) into zero-copy slices. Spill accounting
+            // decides BEFORE each addition; fed one slab bigger than the
+            // whole budget it could decide nothing — the answer stayed
+            // correct but the budget became advisory.
+            let mut chunks: Vec<RecordBatch> = Vec::new();
+            const CHUNK_ROWS: usize = 8_192;
+            if big.num_rows() > CHUNK_ROWS {
+                let mut off = 0;
+                while off < big.num_rows() {
+                    let len = CHUNK_ROWS.min(big.num_rows() - off);
+                    chunks.push(big.slice(off, len));
+                    off += len;
+                }
+            } else {
+                chunks.push(big);
+            }
 
-            // Check if we need to spill before adding more data
-            if total_memory + batch_size > memory_threshold {
-                // Find the largest partition to spill
-                if let Some(idx) = find_largest_agg_partition(&partitions) {
-                    if let Some(ref mut part) = partitions[idx] {
-                        if !part.batches.is_empty() {
-                            // Spill this partition
-                            let spill_path = spill_dir
-                                .join(format!("part_{}_{}.parquet", idx, spill_file_counts[idx]));
-                            spill_file_counts[idx] += 1;
+            for batch in chunks {
+                let batch_size = estimate_batch_size(&batch);
 
-                            write_batches_to_parquet(&spill_path, &part.batches)?;
-                            self.memory_pool.record_spill(part.memory_bytes);
-                            total_memory -= part.memory_bytes;
+                // Check if we need to spill before adding more data
+                if total_memory + batch_size > memory_threshold {
+                    // Find the largest partition to spill
+                    if let Some(idx) = find_largest_agg_partition(&partitions) {
+                        if let Some(ref mut part) = partitions[idx] {
+                            if !part.batches.is_empty() {
+                                // Spill this partition
+                                let spill_path = spill_dir.join(format!(
+                                    "part_{}_{}.parquet",
+                                    idx, spill_file_counts[idx]
+                                ));
+                                spill_file_counts[idx] += 1;
 
-                            // If we already have a spill file for this partition, merge them
-                            if let Some(ref existing_path) = spilled_files[idx] {
-                                // Append new file path to a list file or merge
-                                // For simplicity, we'll just keep the latest and merge on read
-                                merge_parquet_files(existing_path, &spill_path, spill_dir, idx)?;
-                            } else {
-                                spilled_files[idx] = Some(spill_path);
+                                write_batches_to_parquet(&spill_path, &part.batches)?;
+                                self.memory_pool.record_spill(part.memory_bytes);
+                                total_memory -= part.memory_bytes;
+
+                                // If we already have a spill file for this partition, merge them
+                                if let Some(ref existing_path) = spilled_files[idx] {
+                                    // Append new file path to a list file or merge
+                                    // For simplicity, we'll just keep the latest and merge on read
+                                    merge_parquet_files(
+                                        existing_path,
+                                        &spill_path,
+                                        spill_dir,
+                                        idx,
+                                    )?;
+                                } else {
+                                    spilled_files[idx] = Some(spill_path);
+                                }
+
+                                part.clear();
                             }
-
-                            part.clear();
                         }
                     }
                 }
-            }
 
-            // Partition the batch by group key hash
-            let partitioned = partition_batch_by_hash(&batch, &self.group_by, NUM_PARTITIONS)?;
+                // Partition the batch by group key hash
+                let partitioned = partition_batch_by_hash(&batch, &self.group_by, NUM_PARTITIONS)?;
 
-            for (idx, part_batch) in partitioned.into_iter().enumerate() {
-                if let Some(pb) = part_batch {
-                    let pb_size = estimate_batch_size(&pb);
+                for (idx, part_batch) in partitioned.into_iter().enumerate() {
+                    if let Some(pb) = part_batch {
+                        let pb_size = estimate_batch_size(&pb);
 
-                    if let Some(ref mut part) = partitions[idx] {
-                        part.add_batch(pb);
-                        total_memory += pb_size;
-                    } else if let Some(ref spill_path) = spilled_files[idx] {
-                        // Partition was fully spilled, append to spill file
-                        let temp_path = spill_dir
-                            .join(format!("temp_{}_{}.parquet", idx, spill_file_counts[idx]));
-                        spill_file_counts[idx] += 1;
-                        write_batches_to_parquet(&temp_path, &[pb])?;
-                        merge_parquet_files(spill_path, &temp_path, spill_dir, idx)?;
+                        if let Some(ref mut part) = partitions[idx] {
+                            part.add_batch(pb);
+                            total_memory += pb_size;
+                        } else if let Some(ref spill_path) = spilled_files[idx] {
+                            // Partition was fully spilled, append to spill file
+                            let temp_path = spill_dir
+                                .join(format!("temp_{}_{}.parquet", idx, spill_file_counts[idx]));
+                            spill_file_counts[idx] += 1;
+                            write_batches_to_parquet(&temp_path, &[pb])?;
+                            merge_parquet_files(spill_path, &temp_path, spill_dir, idx)?;
+                        }
                     }
                 }
             }
@@ -1667,8 +1718,47 @@ impl fmt::Display for ExternalSortExec {
 // ============================================================================
 
 /// Estimate the memory size of a RecordBatch
+/// Bytes a batch LOGICALLY holds, computed slice-aware.
+///
+/// `get_array_memory_size()` reports the CAPACITY of the underlying buffers,
+/// which for an array sliced out of a larger allocation — every batch an
+/// mmap-backed IPC read produces — counts the whole mapping per batch. Spill
+/// decisions made on that number spill everything unconditionally (and the
+/// spilled join's build-side estimate was off by ~50x). Offsets-based sizing
+/// counts the rows the batch actually references; unknown types fall back to
+/// the capacity number, which over- rather than under-counts (the safe
+/// direction for a spill decision).
 fn estimate_batch_size(batch: &RecordBatch) -> usize {
-    batch.get_array_memory_size()
+    use arrow::array::Array;
+    batch
+        .columns()
+        .iter()
+        .map(|c| {
+            let rows = c.len();
+            let null_bytes = rows.div_ceil(8);
+            match c.data_type() {
+                t if t.primitive_width().is_some() => {
+                    rows * t.primitive_width().unwrap_or(8) + null_bytes
+                }
+                arrow::datatypes::DataType::Boolean => rows.div_ceil(8) + null_bytes,
+                arrow::datatypes::DataType::Utf8 | arrow::datatypes::DataType::Binary => {
+                    let data: usize = match c.as_any().downcast_ref::<arrow::array::StringArray>() {
+                        Some(a) if rows > 0 => {
+                            (a.value_offsets()[rows] - a.value_offsets()[0]) as usize
+                        }
+                        _ => match c.as_any().downcast_ref::<arrow::array::BinaryArray>() {
+                            Some(a) if rows > 0 => {
+                                (a.value_offsets()[rows] - a.value_offsets()[0]) as usize
+                            }
+                            _ => 0,
+                        },
+                    };
+                    data + rows * 4 + null_bytes
+                }
+                _ => c.get_array_memory_size(),
+            }
+        })
+        .sum()
 }
 
 /// Find the index of the largest partition

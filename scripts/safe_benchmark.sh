@@ -19,17 +19,16 @@ ITERATIONS=1
 BINARY="./target/release/query_engine"
 
 # DuckDB reference times (milliseconds) at SF=10.
-# Measured 2026-08-08 on the spec-compliant queries + spec-generator data
+# Measured 2026-08-16 on the spec-compliant queries + spec-generator data
 # via scripts/duckdb_rebaseline.py (native tables, 16 threads, best of 3).
 # Re-run that script and update this block whenever queries or data change.
 # Q13 rose 99 -> 115ms when its spec ON-clause NOT LIKE was restored; the
 # earlier value was measured against a simplified Q13 and is not comparable.
 declare -A DUCKDB_MS=(
-    [1]=106  [2]=21   [3]=80   [4]=58   [5]=48   [6]=24
-    [7]=72   [8]=69   [9]=1277 [10]=88  [11]=13  [12]=89
-    [13]=115 [14]=37  [15]=34  [16]=41  [17]=88  [18]=235
-    [19]=91  [20]=167 [21]=207 [22]=35
-)
+    [1]=107  [2]=24   [3]=80   [4]=60   [5]=50   [6]=26
+    [7]=74   [8]=72   [9]=1543 [10]=101 [11]=12  [12]=94
+    [13]=134 [14]=41  [15]=34  [16]=42  [17]=98  [18]=237
+    [19]=90  [20]=164 [21]=208 [22]=33)
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 

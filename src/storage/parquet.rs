@@ -317,6 +317,19 @@ impl ParquetTable {
     fn read_file(path: &Path, projection: Option<&[usize]>) -> Result<Vec<RecordBatch>> {
         use rayon::prelude::*;
 
+        // IPC sidecar: decode-free whole-file read (see storage::ipc_cache).
+        if crate::storage::ipc_cache::enabled() {
+            if let Some(dir) = crate::storage::ipc_cache::ensure_sidecar(path) {
+                let md = crate::storage::metadata_cache::cached_metadata(path)?;
+                let n = md.metadata().num_row_groups();
+                let per_rg: Result<Vec<Vec<RecordBatch>>> = (0..n)
+                    .into_par_iter()
+                    .map(|rg| crate::storage::ipc_cache::read_row_group(&dir, rg, projection))
+                    .collect();
+                return Ok(per_rg?.into_iter().flatten().collect());
+            }
+        }
+
         let file = File::open(path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
         let num_row_groups = builder.metadata().num_row_groups();
@@ -397,6 +410,88 @@ impl ParquetTable {
 
         if matching_rgs.is_empty() {
             return Ok(vec![]);
+        }
+
+        // IPC sidecar: read the pruned row groups decode-free, evaluate the
+        // exact predicate post-load, and project down. Returning exactly-
+        // filtered rows is safe under this method's contract (the FilterExec
+        // above re-checks survivors), and returning fewer-than-parquet rows
+        // is impossible because the SAME expression evaluates either way.
+        if crate::storage::ipc_cache::enabled() {
+            if let Some(dir) = crate::storage::ipc_cache::ensure_sidecar(path) {
+                let filter_idxs: Option<Vec<usize>> = filter.and_then(|expr| {
+                    let mut cols: Vec<String> = Vec::new();
+                    crate::physical::morsel::collect_expr_columns(expr, &mut cols);
+                    let mut idxs = Vec::new();
+                    for c in &cols {
+                        let i = schema.fields().iter().position(|f| f.name() == c)?;
+                        if !idxs.contains(&i) {
+                            idxs.push(i);
+                        }
+                    }
+                    Some(idxs)
+                });
+                // A filter over STRING columns keeps the parquet path: the
+                // decoder evaluates it over dictionary indices (once per
+                // distinct value), while post-load evaluation walks every
+                // materialized string. Q19's OR-of-IN-lists over l_shipmode
+                // measured 132ms(parquet) vs 332ms(IPC) before this guard.
+                let filter_reads_strings = filter_idxs.as_ref().is_some_and(|idxs| {
+                    idxs.iter().any(|&i| {
+                        schema.fields()[i].data_type() == &arrow::datatypes::DataType::Utf8
+                    })
+                });
+                if filter_reads_strings {
+                    // fall through to the parquet reader below
+                } else {
+                    let read_set: Option<Vec<usize>> = match (projection, &filter_idxs) {
+                        (None, _) => None,
+                        (Some(p), fi) => {
+                            let mut s: Vec<usize> = p.to_vec();
+                            if let Some(fi) = fi {
+                                s.extend(fi.iter().copied());
+                            }
+                            s.sort_unstable();
+                            s.dedup();
+                            Some(s)
+                        }
+                    };
+                    let can_filter = filter.is_some() && filter_idxs.is_some();
+                    let per_rg: Result<Vec<Vec<RecordBatch>>> = matching_rgs
+                        .par_iter()
+                        .map(|&rg| {
+                            let mut batches = crate::storage::ipc_cache::read_row_group(
+                                &dir,
+                                rg,
+                                read_set.as_deref(),
+                            )?;
+                            if can_filter {
+                                batches = crate::physical::operators::filter_batches(
+                                    batches,
+                                    filter.expect("checked"),
+                                )?;
+                            }
+                            match (projection, &read_set) {
+                                (Some(p), Some(rs)) if rs.len() != p.len() => batches
+                                    .into_iter()
+                                    .map(|b| {
+                                        let cols: Vec<usize> = p
+                                            .iter()
+                                            .map(|i| {
+                                                rs.binary_search(i).expect("read_set superset")
+                                            })
+                                            .collect();
+                                        b.project(&cols)
+                                            .map_err(|e| QueryError::Execution(e.to_string()))
+                                    })
+                                    .collect(),
+                                _ => Ok(batches),
+                            }
+                        })
+                        .collect();
+                    return Ok(per_rg?.into_iter().flatten().collect());
+                }
+            }
         }
 
         // If all row groups match and count is small, use simple sequential read

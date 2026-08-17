@@ -1003,7 +1003,22 @@ Based on the codebase structure, these appear to be planned but not fully implem
   `SpillableHashJoinExec` still materializes the build side before deciding to
   spill (known hole, fixed by the Phase-5 streaming spill rewrite, see ROADMAP).
 
-## TPC-H Benchmark Status (SF=10, 2026-08-08 night, 48G cgroup)
+## TPC-H Benchmark Status (SF=10, updated 2026-08-17)
+
+**7.45s parquet / 6.37s with the IPC sidecar cache (`QE_IPC_CACHE=1`) vs
+DuckDB native re-baselined 3.32s = 2.2x / 1.92x. 22/22 pass, 22/22
+cell-exact vs DuckDB, 959 tests green in BOTH modes.** The cache is an
+Arrow-IPC-per-row-group sidecar read back mmap zero-copy
+(`storage/ipc_cache.rs`, arrow `FileDecoder`); it stays opt-in because it
+costs ~2.6x parquet's footprint on disk. Guards that are load-bearing:
+dictionary-coercion scans and string-filtered eager scans keep the parquet
+path (decoder evaluates over dictionary values; post-load walks 60M
+strings — Q19 132→332ms when that guard was missing). The 2026-08-16 BMAD
+round in `.claude/plans/PARITY-PLAN.md` has the full story, including
+three latent engine bugs it exposed (single-shot spilled-join build,
+stream-ending empty row group, capacity-counting batch estimates).
+
+## Previous status (SF=10, 2026-08-08 night, 48G cgroup)
 
 Log: `logs/safe_benchmark_20260808_222629.log`. Spec queries, spec-generator data.
 **22/22 pass; 7.49s total vs native-table DuckDB 2.99s = 2.5x; 22/22 within 10x.**

@@ -155,3 +155,68 @@ comparison (2.94s) additionally includes DuckDB's storage-format advantage;
 parity there requires an owned storage format (out of scope — closest
 equivalent would be caching decoded/dictionary-compressed columns, i.e. a
 buffer pool, which is a fourth project).
+
+---
+
+## 2026-08-16 BMAD round — measured state, PRD, stories
+
+**Analyst (all re-measured today, same machine, warm page cache):**
+
+* Engine on parquet: **7.66s** (22/22 pass, per-query log
+  `logs/safe_benchmark_*_20260816*`). Worst ratios: Q02 6.9x, Q05 6.0x,
+  Q22 5.9x, Q03 5.7x. Worst absolute: Q09 1.47s (1.1x native — at parity),
+  Q21 582ms, Q18 525ms, Q13 521ms.
+* DuckDB native, re-baselined via `duckdb_rebaseline.py`: **3.32s**
+  (Q09 rose 1277→1543ms). True native ratio today: **2.31x**.
+* IPC sidecar v0 (`QE_IPC_CACHE=1`), warm: **9.42s — a net REGRESSION**
+  (Q06 97→558ms, Q15 106→546ms, Q18 525→989ms). Root cause: the read path
+  is `File`+`BufReader` — it copies and validates every batch of an
+  uncompressed sidecar (lineitem: 7.2GB vs 2.8GB parquet), so it pays MORE
+  memory traffic than parquet decode saved. The plan said mmap zero-copy;
+  v0 never implemented it. This is why the flag was left default-off.
+
+**PRD (targets are measured, warm, this machine):**
+
+* G1: warm IPC total ≤ **4.5s** this round, correctness unchanged
+  (22/22 cell-exact vs DuckDB, full suite green, memory-safety intact).
+* G2 (exit, unchanged from above): like-for-like parquet parity ≤1.0x;
+  native-premise comparison reported alongside with the storage caveat.
+* Non-goals this round: shuffle/M3, selection-vector execution (2b).
+
+**Stories:**
+
+1. **S1 — mmap zero-copy IPC reads**: `FileDecoder` over a `Buffer` built
+   with `Buffer::from_custom_allocation` on a `memmap2::Mmap` (arrow-ipc
+   53.4.1 has the full API; alignment preserved because FileWriter pads and
+   mmap is page-aligned, so `build_aligned` stays zero-copy). Gate:
+   Q06 warm-IPC within 1.3x of its parquet-path time; no test changes.
+2. **S2 — cover the remaining scan paths** (streaming/filtered, eager) if
+   S1's numbers justify it; static filters evaluate vectorized post-load.
+3. **S3 — re-measure everything**, update this file with the verdict:
+   default-on, keep opt-in, or delete the cache (a cache that loses is
+   worse than no cache; deletion is a legitimate outcome).
+
+**S3 verdict (2026-08-17, all gates run):**
+
+* S1 (mmap zero-copy via `FileDecoder` + `Buffer::from_custom_allocation`)
+  and S2 (streaming + eager scan paths wired; dict-coercion scans and
+  string-filter eager scans keep parquet) shipped. Warm totals, same
+  machine: **6.37s IPC vs 7.45s parquet-only vs 9.42s broken v0**; DuckDB
+  native re-measured 3.32s → **1.92x native** (was 2.31x), G1 (≤4.5s)
+  exceeded. Q09 1.1x, Q12/Q18 1.6x, Q19 1.8x, Q17/Q21 ~2x.
+* Verdict: **keep `QE_IPC_CACHE=1` opt-in** — it costs ~2.6x the parquet
+  footprint in sidecar disk and a one-time build; the benchmark reports
+  both premises. Not default until sidecar lifecycle (eviction, rebuild on
+  schema change) is designed.
+* The hunt also fixed three latent engine bugs the gauntlet exposed, all
+  reachable WITHOUT the cache: a spilled hash join's build batches were
+  consumed by the FIRST execution (re-execution silently joined an empty
+  build side — zero rows as an answer); an empty row group ENDED the
+  streaming scan's unfold instead of advancing (silently dropping the
+  partition's remaining row groups); and `estimate_batch_size` counted
+  buffer CAPACITY, over-counting sliced arrays. Plus: the spillable
+  aggregate re-chunks oversized batches so the memory budget stays
+  enforceable against any producer's batch size.
+* Remaining per-query residue at 1.9x: Q13 4.3x (o_comment LIKE decode),
+  Q22 5.4x, Q16 5.1x, Q14 4.7x — string/dictionary work (Rewrite 1's join
+  side) and selection-vector execution (2b) are the next levers.

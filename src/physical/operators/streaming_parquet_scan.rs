@@ -86,6 +86,10 @@ pub struct StreamingParquetScanExec {
     dict_filter_schema: Option<SchemaRef>,
     /// Post-projection column positions to cast back to Utf8 on emission
     coerce_back: Vec<usize>,
+    /// IPC sidecar dir per file (QE_IPC_CACHE=1 and the sidecar built).
+    /// A file that has one is read decode-free; filters that the parquet
+    /// path pushes into the decoder apply vectorized post-load instead.
+    ipc_dirs: std::collections::HashMap<PathBuf, PathBuf>,
 }
 
 impl fmt::Debug for StreamingParquetScanExec {
@@ -227,6 +231,18 @@ impl StreamingParquetScanExec {
             }
         }
 
+        let ipc_dirs: std::collections::HashMap<PathBuf, PathBuf> =
+            if crate::storage::ipc_cache::enabled() {
+                files
+                    .iter()
+                    .filter_map(|f| {
+                        crate::storage::ipc_cache::ensure_sidecar(f).map(|d| (f.clone(), d))
+                    })
+                    .collect()
+            } else {
+                Default::default()
+            };
+
         // Distribute row groups round-robin across partitions
         let num_threads = rayon::current_num_threads();
         let num_partitions = if all_work.is_empty() {
@@ -259,6 +275,7 @@ impl StreamingParquetScanExec {
             filter_spec,
             dict_filter_schema,
             coerce_back,
+            ipc_dirs,
         })
     }
 
@@ -300,208 +317,286 @@ impl PhysicalOperator for StreamingParquetScanExec {
         let dict_schema = self.dict_filter_schema.clone();
         let coerce_back = std::sync::Arc::new(self.coerce_back.clone());
 
-        // Create a stream that lazily reads row groups
+        let ipc_dirs = std::sync::Arc::new(self.ipc_dirs.clone());
+
+        // A stream that lazily reads row groups. The body is a LOOP over work
+        // items on purpose: a row group whose every row is filtered out (a
+        // selective runtime join-key filter can do that) must move on to the
+        // NEXT row group. The previous shape returned `None` from the unfold
+        // there, which does not mean "retry" — it ends the stream, silently
+        // dropping every remaining row group of the partition.
         let stream = futures::stream::unfold(
             (
-                work_items.into_iter().peekable(),
+                work_items.into_iter(),
                 projection,
                 batch_size,
                 schema,
                 None::<parquet::arrow::arrow_reader::ParquetRecordBatchReader>,
-                (runtime_cfg, filter_spec, dict_schema, coerce_back),
+                None::<std::vec::IntoIter<RecordBatch>>,
+                (runtime_cfg, filter_spec, dict_schema, coerce_back, ipc_dirs),
             ),
-            |(mut work_iter, projection, batch_size, schema, current_reader, rt_state)| async move {
-                let (runtime_cfg, filter_spec, dict_schema, coerce_back) = rt_state;
-                // Try to get next batch from current reader
-                if let Some(mut reader) = current_reader {
-                    match reader.next() {
-                        Some(Ok(batch)) => {
-                            // Re-wrap with logical schema if needed
-                            let result = wrap_batch(batch, &schema, &coerce_back);
+            |(
+                mut work_iter,
+                projection,
+                batch_size,
+                schema,
+                mut current_reader,
+                mut ipc_iter,
+                rt_state,
+            )| async move {
+                let (runtime_cfg, filter_spec, dict_schema, coerce_back, ipc_dirs) = rt_state;
+                loop {
+                    // Drain an open IPC row group first.
+                    if let Some(mut it) = ipc_iter.take() {
+                        if let Some(batch) = it.next() {
                             return Some((
-                                result,
+                                Ok(batch),
                                 (
                                     work_iter,
                                     projection,
                                     batch_size,
                                     schema,
-                                    Some(reader),
-                                    (runtime_cfg, filter_spec, dict_schema, coerce_back),
+                                    current_reader,
+                                    Some(it),
+                                    (runtime_cfg, filter_spec, dict_schema, coerce_back, ipc_dirs),
                                 ),
                             ));
                         }
-                        Some(Err(e)) => {
+                    }
+                    // Then an open parquet reader.
+                    if let Some(mut reader) = current_reader.take() {
+                        match reader.next() {
+                            Some(Ok(batch)) => {
+                                let result = wrap_batch(batch, &schema, &coerce_back);
+                                return Some((
+                                    result,
+                                    (
+                                        work_iter,
+                                        projection,
+                                        batch_size,
+                                        schema,
+                                        Some(reader),
+                                        None,
+                                        (
+                                            runtime_cfg,
+                                            filter_spec,
+                                            dict_schema,
+                                            coerce_back,
+                                            ipc_dirs,
+                                        ),
+                                    ),
+                                ));
+                            }
+                            Some(Err(e)) => {
+                                return Some((
+                                    Err(QueryError::Arrow(e)),
+                                    (
+                                        work_iter,
+                                        projection,
+                                        batch_size,
+                                        schema,
+                                        None,
+                                        None,
+                                        (
+                                            runtime_cfg,
+                                            filter_spec,
+                                            dict_schema,
+                                            coerce_back,
+                                            ipc_dirs,
+                                        ),
+                                    ),
+                                ));
+                            }
+                            None => {} // exhausted; open the next work item
+                        }
+                    }
+
+                    let work = work_iter.next()?;
+
+                    // Re-resolve the runtime filter for this row group: the
+                    // driving join publishes the key set only after its build
+                    // side drains.
+                    let runtime: Option<(usize, std::sync::Arc<RuntimeFilterPayload>)> =
+                        runtime_cfg
+                            .lock()
+                            .as_ref()
+                            .and_then(|(idx, slot)| slot.lock().clone().map(|set| (*idx, set)));
+
+                    // IPC sidecar: decode-free, filters applied post-load.
+                    // Dictionary-coercion scans keep the parquet path: their
+                    // predicate (LIKE over a low-cardinality string) evaluates
+                    // once per DICTIONARY VALUE there, and post-load evaluation
+                    // over materialized strings measurably loses (Q13
+                    // 425→538ms when this guard was missing).
+                    if let (Some(dir), None) = (ipc_dirs.get(&work.file_path), &dict_schema) {
+                        match ipc_read_work(
+                            dir,
+                            &work,
+                            projection.as_deref(),
+                            filter_spec.as_ref().as_ref(),
+                            runtime.as_ref(),
+                            &schema,
+                        ) {
+                            Ok(batches) => {
+                                ipc_iter = Some(batches.into_iter());
+                                continue;
+                            }
+                            Err(e) => {
+                                return Some((
+                                    Err(e),
+                                    (
+                                        work_iter,
+                                        projection,
+                                        batch_size,
+                                        schema,
+                                        None,
+                                        None,
+                                        (
+                                            runtime_cfg,
+                                            filter_spec,
+                                            dict_schema,
+                                            coerce_back,
+                                            ipc_dirs,
+                                        ),
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+
+                    let builder = match match &dict_schema {
+                        Some(ds) => {
+                            crate::storage::metadata_cache::cached_reader_builder_with_schema(
+                                &work.file_path,
+                                ds.clone(),
+                            )
+                        }
+                        None => {
+                            crate::storage::metadata_cache::cached_reader_builder(&work.file_path)
+                        }
+                    } {
+                        Ok(b) => b,
+                        Err(e) => {
                             return Some((
-                                Err(QueryError::Arrow(e)),
+                                Err(e),
                                 (
                                     work_iter,
                                     projection,
                                     batch_size,
                                     schema,
                                     None,
-                                    (runtime_cfg, filter_spec, dict_schema, coerce_back),
+                                    None,
+                                    (runtime_cfg, filter_spec, dict_schema, coerce_back, ipc_dirs),
                                 ),
-                            ));
+                            ))
                         }
-                        None => {
-                            // Reader exhausted, fall through to open next
+                    };
+
+                    let builder = builder
+                        .with_batch_size(batch_size)
+                        .with_row_groups(vec![work.row_group_idx]);
+
+                    let mut predicates: Vec<Box<dyn parquet::arrow::arrow_reader::ArrowPredicate>> =
+                        Vec::new();
+                    if let Some((expr, indices)) = filter_spec.as_ref() {
+                        let mask = parquet::arrow::ProjectionMask::roots(
+                            builder.parquet_schema(),
+                            indices.iter().copied(),
+                        );
+                        let expr = expr.clone();
+                        predicates.push(Box::new(
+                            parquet::arrow::arrow_reader::ArrowPredicateFn::new(
+                                mask,
+                                move |batch: RecordBatch| {
+                                    let arr =
+                                        crate::physical::operators::evaluate_expr(&batch, &expr)
+                                            .map_err(|e| {
+                                                arrow::error::ArrowError::ComputeError(
+                                                    e.to_string(),
+                                                )
+                                            })?;
+                                    arr.as_any()
+                                        .downcast_ref::<arrow::array::BooleanArray>()
+                                        .cloned()
+                                        .ok_or_else(|| {
+                                            arrow::error::ArrowError::ComputeError(
+                                                "scan filter did not evaluate to boolean".into(),
+                                            )
+                                        })
+                                },
+                            ),
+                        ));
+                    }
+                    if let Some((col_idx, set)) = &runtime {
+                        let mask = parquet::arrow::ProjectionMask::roots(
+                            builder.parquet_schema(),
+                            [*col_idx],
+                        );
+                        let set = std::sync::Arc::clone(set);
+                        predicates.push(Box::new(
+                            parquet::arrow::arrow_reader::ArrowPredicateFn::new(
+                                mask,
+                                move |batch: RecordBatch| {
+                                    let arr = batch
+                                        .column(0)
+                                        .as_any()
+                                        .downcast_ref::<arrow::array::Int64Array>()
+                                        .ok_or_else(|| {
+                                            arrow::error::ArrowError::ComputeError(
+                                                "runtime filter column is not Int64".into(),
+                                            )
+                                        })?;
+                                    use arrow::array::Array;
+                                    let mut b =
+                                        arrow::array::BooleanBuilder::with_capacity(arr.len());
+                                    for i in 0..arr.len() {
+                                        b.append_value(
+                                            !arr.is_null(i) && set.contains(arr.value(i)),
+                                        );
+                                    }
+                                    Ok(b.finish())
+                                },
+                            ),
+                        ));
+                    }
+                    let builder = if predicates.is_empty() {
+                        builder
+                    } else {
+                        builder.with_row_filter(parquet::arrow::arrow_reader::RowFilter::new(
+                            predicates,
+                        ))
+                    };
+
+                    let builder = if let Some(ref indices) = projection {
+                        let mask = parquet::arrow::ProjectionMask::roots(
+                            builder.parquet_schema(),
+                            indices.iter().copied(),
+                        );
+                        builder.with_projection(mask)
+                    } else {
+                        builder
+                    };
+
+                    match builder.build() {
+                        Ok(r) => {
+                            current_reader = Some(r);
+                            // Loop pulls the first batch (and moves on when the
+                            // row group filters down to nothing).
                         }
-                    }
-                }
-
-                // Open next row group
-                let work = work_iter.next()?;
-                let builder = match match &dict_schema {
-                    Some(ds) => crate::storage::metadata_cache::cached_reader_builder_with_schema(
-                        &work.file_path,
-                        ds.clone(),
-                    ),
-                    None => crate::storage::metadata_cache::cached_reader_builder(&work.file_path),
-                } {
-                    Ok(b) => b,
-                    Err(e) => {
-                        return Some((
-                            Err(e),
-                            (
-                                work_iter,
-                                projection,
-                                batch_size,
-                                schema,
-                                None,
-                                (runtime_cfg, filter_spec, dict_schema, coerce_back),
-                            ),
-                        ))
-                    }
-                };
-
-                let builder = builder
-                    .with_batch_size(batch_size)
-                    .with_row_groups(vec![work.row_group_idx]);
-
-                // Re-resolve the runtime filter for this row group
-                let runtime: Option<(usize, std::sync::Arc<RuntimeFilterPayload>)> = runtime_cfg
-                    .lock()
-                    .as_ref()
-                    .and_then(|(idx, slot)| slot.lock().clone().map(|set| (*idx, set)));
-                let mut predicates: Vec<Box<dyn parquet::arrow::arrow_reader::ArrowPredicate>> =
-                    Vec::new();
-                if let Some((expr, indices)) = filter_spec.as_ref() {
-                    let mask = parquet::arrow::ProjectionMask::roots(
-                        builder.parquet_schema(),
-                        indices.iter().copied(),
-                    );
-                    let expr = expr.clone();
-                    predicates.push(Box::new(
-                        parquet::arrow::arrow_reader::ArrowPredicateFn::new(
-                            mask,
-                            move |batch: RecordBatch| {
-                                let arr = crate::physical::operators::evaluate_expr(&batch, &expr)
-                                    .map_err(|e| {
-                                        arrow::error::ArrowError::ComputeError(e.to_string())
-                                    })?;
-                                arr.as_any()
-                                    .downcast_ref::<arrow::array::BooleanArray>()
-                                    .cloned()
-                                    .ok_or_else(|| {
-                                        arrow::error::ArrowError::ComputeError(
-                                            "scan filter did not evaluate to boolean".into(),
-                                        )
-                                    })
-                            },
-                        ),
-                    ));
-                }
-                if let Some((col_idx, set)) = &runtime {
-                    let mask =
-                        parquet::arrow::ProjectionMask::roots(builder.parquet_schema(), [*col_idx]);
-                    let set = std::sync::Arc::clone(set);
-                    predicates.push(Box::new(
-                        parquet::arrow::arrow_reader::ArrowPredicateFn::new(
-                            mask,
-                            move |batch: RecordBatch| {
-                                let arr = batch
-                                    .column(0)
-                                    .as_any()
-                                    .downcast_ref::<arrow::array::Int64Array>()
-                                    .ok_or_else(|| {
-                                        arrow::error::ArrowError::ComputeError(
-                                            "runtime filter column is not Int64".into(),
-                                        )
-                                    })?;
-                                use arrow::array::Array;
-                                let mut b = arrow::array::BooleanBuilder::with_capacity(arr.len());
-                                for i in 0..arr.len() {
-                                    b.append_value(!arr.is_null(i) && set.contains(arr.value(i)));
-                                }
-                                Ok(b.finish())
-                            },
-                        ),
-                    ));
-                }
-                let builder = if predicates.is_empty() {
-                    builder
-                } else {
-                    builder
-                        .with_row_filter(parquet::arrow::arrow_reader::RowFilter::new(predicates))
-                };
-
-                let builder = if let Some(ref indices) = projection {
-                    let mask = parquet::arrow::ProjectionMask::roots(
-                        builder.parquet_schema(),
-                        indices.iter().copied(),
-                    );
-                    builder.with_projection(mask)
-                } else {
-                    builder
-                };
-
-                let mut reader = match builder.build() {
-                    Ok(r) => r,
-                    Err(e) => {
-                        return Some((
-                            Err(QueryError::Parquet(e)),
-                            (
-                                work_iter,
-                                projection,
-                                batch_size,
-                                schema,
-                                None,
-                                (runtime_cfg, filter_spec, dict_schema, coerce_back),
-                            ),
-                        ))
-                    }
-                };
-
-                // Get first batch from this reader
-                match reader.next() {
-                    Some(Ok(batch)) => {
-                        let result = wrap_batch(batch, &schema, &coerce_back);
-                        Some((
-                            result,
-                            (
-                                work_iter,
-                                projection,
-                                batch_size,
-                                schema,
-                                Some(reader),
-                                (runtime_cfg, filter_spec, dict_schema, coerce_back),
-                            ),
-                        ))
-                    }
-                    Some(Err(e)) => Some((
-                        Err(QueryError::Arrow(e)),
-                        (
-                            work_iter,
-                            projection,
-                            batch_size,
-                            schema,
-                            None,
-                            (runtime_cfg, filter_spec, dict_schema, coerce_back),
-                        ),
-                    )),
-                    None => {
-                        // Empty row group, try next (recursive via unfold)
-                        None
+                        Err(e) => {
+                            return Some((
+                                Err(QueryError::Parquet(e)),
+                                (
+                                    work_iter,
+                                    projection,
+                                    batch_size,
+                                    schema,
+                                    None,
+                                    None,
+                                    (runtime_cfg, filter_spec, dict_schema, coerce_back, ipc_dirs),
+                                ),
+                            ))
+                        }
                     }
                 }
             },
@@ -593,6 +688,101 @@ fn mark_string_cols(expr: &Expr, out: &mut Vec<String>) {
 }
 
 /// Wrap a decoded batch with the logical schema, casting coerced
+/// Read one row group from the IPC sidecar and apply, post-load, everything
+/// the parquet path pushes into the decoder: the static predicate, the
+/// runtime join-key filter, and the output projection.
+///
+/// Post-load filtering is not a downgrade here: the load is zero-copy mmap
+/// references, so the "wasted" materialization the RowFilter exists to avoid
+/// costs nothing — the filter kernel then copies survivors only, which is
+/// the same work the decoder-side path does for its survivors.
+#[allow(clippy::type_complexity)]
+fn ipc_read_work(
+    dir: &std::path::Path,
+    work: &RowGroupWork,
+    projection: Option<&[usize]>,
+    filter_spec: Option<&(Expr, Vec<usize>)>,
+    runtime: Option<&(usize, std::sync::Arc<RuntimeFilterPayload>)>,
+    out_schema: &SchemaRef,
+) -> Result<Vec<RecordBatch>> {
+    // Read the union of output + filter + runtime-key columns; positions
+    // within the read set are recovered by binary search (the set is sorted).
+    let read_set: Option<Vec<usize>> = match projection {
+        None => None,
+        Some(p) => {
+            let mut s: Vec<usize> = p.to_vec();
+            if let Some((_, idxs)) = filter_spec {
+                s.extend(idxs.iter().copied());
+            }
+            if let Some((ridx, _)) = runtime {
+                s.push(*ridx);
+            }
+            s.sort_unstable();
+            s.dedup();
+            Some(s)
+        }
+    };
+    let pos_of = |file_idx: usize| -> Result<usize> {
+        match &read_set {
+            None => Ok(file_idx),
+            Some(s) => s.binary_search(&file_idx).map_err(|_| {
+                QueryError::Execution(format!(
+                    "IPC read set does not contain file column {file_idx}"
+                ))
+            }),
+        }
+    };
+
+    let mut batches =
+        crate::storage::ipc_cache::read_row_group(dir, work.row_group_idx, read_set.as_deref())?;
+
+    if let Some((expr, _)) = filter_spec {
+        batches = crate::physical::operators::filter_batches(batches, expr)?;
+    }
+    if let Some((ridx, set)) = runtime {
+        let col = pos_of(*ridx)?;
+        let mut kept = Vec::with_capacity(batches.len());
+        for batch in batches {
+            let arr = batch
+                .column(col)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .ok_or_else(|| {
+                    QueryError::Execution("runtime filter column is not Int64".into())
+                })?;
+            use arrow::array::Array;
+            let mut b = arrow::array::BooleanBuilder::with_capacity(arr.len());
+            for i in 0..arr.len() {
+                b.append_value(!arr.is_null(i) && set.contains(arr.value(i)));
+            }
+            let mask = b.finish();
+            let filtered = arrow::compute::filter_record_batch(&batch, &mask)
+                .map_err(|e| QueryError::Execution(e.to_string()))?;
+            if filtered.num_rows() > 0 {
+                kept.push(filtered);
+            }
+        }
+        batches = kept;
+    }
+
+    // Project down to the requested output columns, in output order, and
+    // re-wrap with the logical (qualified-name) schema.
+    let mut out = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let projected = match projection {
+            None => batch,
+            Some(p) => {
+                let cols: Vec<usize> = p.iter().map(|&i| pos_of(i)).collect::<Result<_>>()?;
+                batch
+                    .project(&cols)
+                    .map_err(|e| QueryError::Execution(e.to_string()))?
+            }
+        };
+        out.push(wrap_batch(projected, out_schema, &[])?);
+    }
+    Ok(out)
+}
+
 /// dictionary filter columns back to Utf8 (survivors only — the RowFilter
 /// already dropped non-matching rows).
 fn wrap_batch(
