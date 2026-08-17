@@ -67,6 +67,9 @@ impl Optimizer {
                 Arc::new(rules::EagerAggregation::new()),
                 // Pack dual int group keys onto the raw aggregation path
                 Arc::new(rules::PackedGroupKeys::new()),
+                // Pack dual int JOIN keys onto the single-int64 probe path
+                // (needs footer stats to prove the pack collision-free)
+                Arc::new(rules::PackedJoinKeys::new()),
                 Arc::new(rules::ProjectionPushdown),
                 // Last: needs the final projection/filter shape to recognize a
                 // k-NN, and produces an opaque node the other rules skip.
@@ -114,6 +117,10 @@ impl Optimizer {
                         )) as Arc<dyn OptimizerRule>
                     } else if rule.name() == "PackedGroupKeys" {
                         Arc::new(rules::PackedGroupKeys::with_table_statistics(
+                            self.table_stats.clone(),
+                        )) as Arc<dyn OptimizerRule>
+                    } else if rule.name() == "PackedJoinKeys" {
+                        Arc::new(rules::PackedJoinKeys::with_table_statistics(
                             self.table_stats.clone(),
                         )) as Arc<dyn OptimizerRule>
                     } else {
