@@ -1003,6 +1003,23 @@ Based on the codebase structure, these appear to be planned but not fully implem
   `SpillableHashJoinExec` still materializes the build side before deciding to
   spill (known hole, fixed by the Phase-5 streaming spill rewrite, see ROADMAP).
 
+## SF=100: the four-way matrix (2026-08-17, warm, same machine, duckdb 1.4.4)
+
+| storage | engine | DuckDB on the SAME files | ratio |
+|---|---|---|---|
+| parquet (identical files) | 87.1s | 39.4s (`read_parquet` views) | 2.21x |
+| lance (identical files) | 98.3s | 75.7s (community `lance` ext) | **1.30x** |
+| DuckDB native (in-mem) | — | 65.8s (Q9 alone 36.4s) | — |
+
+`scripts/duckdb_files_bench_sf100.py` reproduces the DuckDB side. Note the
+inversion: DuckDB-native is SLOWER than DuckDB-parquet at SF=100 because
+native Q9 is pathological (36.4s vs 9.2s over views) — so "vs native"
+ratios (the stored 67.1s baseline ≈ today's 65.8s) understate DuckDB's
+parquet reader. The honest like-for-like on identical parquet is 2.21x;
+on identical lance it is 1.30x, and the engine beats DuckDB's lance
+reader outright on Q1 (3.9 vs 7.9s), Q6 (1.5 vs 11.8s) and Q15
+(1.8 vs 3.4s).
+
 ## TPC-H Benchmark Status (SF=100 LANCE, 2026-08-17)
 
 **Warm 98.3s = 1.47x DuckDB native, 1.13x the engine's own parquet path
