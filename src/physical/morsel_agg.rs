@@ -153,6 +153,47 @@ pub(crate) fn merge_states_to_batches_filtered(
     }
 }
 
+/// Finalize states whose group-key sets are DISJOINT by construction (the
+/// fused streaming aggregate hash-partitions its input to per-worker
+/// channels). No cross-state merge exists to do: each state builds its own
+/// output in parallel and the batches concatenate. Running these through the
+/// shard merge instead re-hashed every group to prove a disjointness the
+/// producer already guaranteed — 4.3s of Q13's 7.5s at SF=100.
+pub(crate) fn finalize_disjoint_states(
+    states: Vec<AggregationState>,
+    agg_funcs: &[AggregateFunction],
+    input_types: &[DataType],
+    schema: &SchemaRef,
+    post_filter: Option<&Expr>,
+) -> Result<Vec<RecordBatch>> {
+    use rayon::prelude::*;
+    // Each state runs the SAME single-state pipeline the shared merge uses —
+    // raw-type prep, perfect-hash drain, normalization — because
+    // `build_output` alone is NOT sufficient for a state that abandoned its
+    // perfect-hash array mid-build: its raw fast path emits only the raw
+    // groups (Q11 at SF=100 lost ~70% of every sum this way, invisibly to a
+    // row-count check). Disjointness removes the CROSS-state combine, not
+    // the per-state finalize.
+    let out: Result<Vec<Vec<RecordBatch>>> = states
+        .into_par_iter()
+        .filter(|s| s.group_count() > 0)
+        .map(|state| {
+            merge_states_to_batches_filtered(
+                vec![state],
+                agg_funcs,
+                input_types,
+                schema,
+                post_filter,
+            )
+        })
+        .collect();
+    Ok(out?
+        .into_iter()
+        .flatten()
+        .filter(|b| b.num_rows() > 0)
+        .collect())
+}
+
 /// Build a shard's output batch and apply the optional HAVING predicate while
 /// still on the merging worker thread.
 fn build_filtered_output(

@@ -1003,6 +1003,16 @@ Based on the codebase structure, these appear to be planned but not fully implem
   `SpillableHashJoinExec` still materializes the build side before deciding to
   spill (known hole, fixed by the Phase-5 streaming spill rewrite, see ROADMAP).
 
+## TPC-H Benchmark Status (SF=100, 2026-08-17)
+
+**87.1s vs DuckDB native 67.1s = 1.30x; 22/22 cell-exact.** Q6/Q9/Q15/Q19
+run FASTER than DuckDB. Fused-aggregate disjoint mode (stats-gated on
+dense int key ranges 2M..64M) took Q13 from 5.9x to 2.3x. Remaining top
+gaps: Q10 3.5x, Q16 2.8x, Q11 2.6x, Q13 2.3x. Run via
+`scripts/sf100_full_benchmark.sh`; validate VALUES against
+`data/sf100_duckdb_results` — a Q11 wrong-answer bug returned exactly the
+right ROW COUNT (see PARITY-PLAN round 2: row counts are not answers).
+
 ## TPC-H Benchmark Status (SF=10, updated 2026-08-17)
 
 **7.45s parquet / 6.37s with the IPC sidecar cache (`QE_IPC_CACHE=1`) vs

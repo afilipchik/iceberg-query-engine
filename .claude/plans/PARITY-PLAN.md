@@ -220,3 +220,32 @@ buffer pool, which is a fourth project).
 * Remaining per-query residue at 1.9x: Q13 4.3x (o_comment LIKE decode),
   Q22 5.4x, Q16 5.1x, Q14 4.7x — string/dictionary work (Rewrite 1's join
   side) and selection-vector execution (2b) are the next levers.
+
+**BMAD round 2 (2026-08-17, SF=100):**
+
+* First SF=100 sweep: 92.2s vs DuckDB 67.1s (1.37x), 22/22 row-valid.
+  Attribution OVERRODE the plan's guess: Q13's +6.1s was not LIKE decode
+  but the fused aggregate's shared-channel merge — 32 workers holding
+  overlapping partials over a dense 15M-key space (126M slots for 15M
+  groups, 4.3s to merge). Q18's +4.6s is join-probe drain, not merge.
+* Fix: stats-gated DISJOINT mode — the planner hints the fused aggregate
+  to hash-partition batches to per-worker channels when the single int
+  group key's RANGE (from footer min/max; ndv_est is circular for this)
+  is 2M..64M, the dense direct-address regime. Scatter coalesces pieces
+  to >=8192 rows (256-row slivers tripled worker busy time). Q13
+  7.4s → 2.9s; Q18/Q3/Q10 unchanged.
+* The first disjoint finalize had a WRONG-ANSWER bug the row-count
+  validation could not see: `build_output` on a state that abandoned its
+  perfect-hash array emits only the raw-map groups — Q11 at SF=100 lost
+  ~70% of every SUM while returning exactly 100 rows. Caught only by
+  full-value comparison against DuckDB; fixed by running each disjoint
+  state through the same single-state prep pipeline the shared merge
+  uses, and pinned by `disjoint_aggregation_matches_plain_aggregation_
+  exactly` (300k groups, forces the perfect-hash transitions).
+  **Lesson recorded: row counts are not answers.**
+* Final SF=100: **87.1s vs 67.1s = 1.30x**, 22/22 cell-exact at the
+  reference's precision. SF=10 unchanged: 7.46s parquet / 6.50s IPC,
+  22/22 cell-exact. 960 tests green both modes. Sub-DuckDB queries at
+  SF=100: Q6 (.7x), Q9 (.8x), Q15 (.8x), Q19 (.4x).
+* Next: Q18/Q21-class join-probe drain (fused probe→aggregate, 2a) and
+  Q10's decoration gather — both scoped above.

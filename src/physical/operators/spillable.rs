@@ -632,6 +632,8 @@ impl fmt::Display for SpillableHashJoinExec {
 
 /// Hash aggregate execution operator with spilling support
 pub struct SpillableHashAggregateExec {
+    /// See [`Self::with_disjoint_groups`].
+    disjoint_hint: bool,
     input: Arc<dyn PhysicalOperator>,
     group_by: Vec<Expr>,
     aggregates: Vec<AggregateExpr>,
@@ -677,10 +679,23 @@ impl SpillableHashAggregateExec {
             memory_pool,
             config,
             post_filter: None,
+            disjoint_hint: false,
         }
     }
 
-    /// Attach a HAVING predicate applied to output batches before returning.
+    /// Planner hint: hash-partition the fused-agg input to per-worker
+    /// channels (disjoint states, trivial finalize). Set only when the group
+    /// key's statistics predict the shared-channel merge will pay a large
+    /// overlap penalty — a DENSE integer key space (range ≈ NDV) with
+    /// millions of groups, where every worker's partial state spans the
+    /// whole range. Q13's c_custkey (NDV=range=15M): shared merge 4.3s,
+    /// disjoint 0.1ms. Sparse keys (Q18's l_orderkey, range 4x NDV) LOSE
+    /// under scatter (+1.3s), so the default stays shared.
+    pub fn with_disjoint_groups(mut self, disjoint: bool) -> Self {
+        self.disjoint_hint = disjoint;
+        self
+    }
+
     pub fn with_post_filter(mut self, post_filter: Option<Expr>) -> Self {
         self.post_filter = post_filter;
         self
@@ -738,13 +753,38 @@ impl SpillableHashAggregateExec {
             (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
         let group_limit = ((memory_threshold / n_workers) / per_group_bytes).max(64);
 
-        let (tx, rx) = crossbeam::channel::bounded::<RecordBatch>(n_workers * 8);
+        // Grouped aggregates hash-partition batches to PER-WORKER channels so
+        // every worker owns a disjoint key subset: the finalize is then a
+        // parallel per-state build instead of a full shard merge. With one
+        // shared channel, 32 workers each accumulated partials over the WHOLE
+        // key space and the merge paid the overlap (Q13 at SF=100: 126M
+        // partial slots for 15M real groups, 4.3s of a 7.5s query). Global
+        // aggregates (no GROUP BY) keep the shared channel — every row is one
+        // group, and partitioning would serialize onto one worker.
+        let disjoint = self.disjoint_hint && !self.group_by.is_empty();
+        let mut txs: Vec<crossbeam::channel::Sender<RecordBatch>> = Vec::with_capacity(n_workers);
+        let mut rxs: Vec<crossbeam::channel::Receiver<RecordBatch>> = Vec::with_capacity(n_workers);
+        if disjoint {
+            for _ in 0..n_workers {
+                let (t, r) = crossbeam::channel::bounded::<RecordBatch>(8);
+                txs.push(t);
+                rxs.push(r);
+            }
+        } else {
+            let (t, r) = crossbeam::channel::bounded::<RecordBatch>(n_workers * 8);
+            txs.push(t);
+            rxs.push(r);
+        }
         let abort = Arc::new(AtomicBool::new(false));
 
         // Aggregation workers: dedicated OS threads pulling from the channel.
         let mut workers = Vec::with_capacity(n_workers);
-        for _ in 0..n_workers {
-            let rx = rx.clone();
+        for w in 0..n_workers {
+            let rx = if disjoint {
+                rxs[w].clone()
+            } else {
+                rxs[0].clone()
+            };
             let abort = Arc::clone(&abort);
             let agg_funcs = agg_funcs.clone();
             let input_types = input_types.clone();
@@ -772,38 +812,113 @@ impl SpillableHashAggregateExec {
                 if state.group_count() > group_limit {
                     abort.store(true, AtomicOrdering::Relaxed);
                 }
+                if std::env::var("QE_WORKER_DEBUG").is_ok() {
+                    eprintln!(
+                        "[fused-worker] batches={} groups={}",
+                        batches_seen,
+                        state.group_count()
+                    );
+                }
                 state
             }));
         }
-        drop(rx);
+        drop(rxs);
 
-        // Drain tasks: one per input partition, sending into the channel.
+        // Drain tasks: one per input partition. Disjoint mode partitions each
+        // batch by group-key hash and routes piece i to worker i's channel;
+        // the scatter runs on the drain task, so it parallelizes across input
+        // partitions.
         let input_partitions = self.input.output_partitions().max(1);
         let mut drains = Vec::with_capacity(input_partitions);
         for p in 0..input_partitions {
             let input = self.input.clone();
-            let tx = tx.clone();
+            let txs = txs.clone();
             let abort = Arc::clone(&abort);
+            let group_by = self.group_by.clone();
             drains.push(tokio::spawn(async move {
+                let mut coalesce: Vec<(usize, Vec<RecordBatch>)> =
+                    (0..txs.len()).map(|_| (0, Vec::new())).collect();
                 let mut stream = input.execute(p).await?;
                 while let Some(batch) = stream.try_next().await? {
                     if abort.load(AtomicOrdering::Relaxed) {
                         break;
                     }
-                    let tx = tx.clone();
-                    // Bounded send provides backpressure; run it off the async
-                    // reactor so a full channel doesn't stall other tasks.
-                    let send_res =
-                        tokio::task::spawn_blocking(move || tx.send(batch).is_err()).await;
+                    let pieces: Vec<(usize, RecordBatch)> = if disjoint {
+                        // Coalesce per-worker pieces before sending: an
+                        // 8192-row batch split 32 ways is 256-row slivers,
+                        // and per-batch costs in process_batch (expr eval
+                        // setup, hash-table probes' setup) tripled worker
+                        // busy time when slivers went out directly.
+                        let mut out: Vec<(usize, RecordBatch)> = Vec::new();
+                        for (i, b) in partition_batch_by_hash(&batch, &group_by, txs.len())?
+                            .into_iter()
+                            .enumerate()
+                        {
+                            let Some(b) = b else { continue };
+                            if b.num_rows() == 0 {
+                                continue;
+                            }
+                            let (rows, bufd) = &mut coalesce[i];
+                            *rows += b.num_rows();
+                            bufd.push(b);
+                            if *rows >= 8_192 {
+                                let merged =
+                                    arrow::compute::concat_batches(&bufd[0].schema(), bufd.iter())
+                                        .map_err(|e| QueryError::Execution(e.to_string()))?;
+                                bufd.clear();
+                                *rows = 0;
+                                out.push((i, merged));
+                            }
+                        }
+                        out
+                    } else {
+                        vec![(0, batch)]
+                    };
+                    if pieces.is_empty() {
+                        continue;
+                    }
+                    // Bounded sends provide backpressure; run them off the
+                    // async reactor so a full channel doesn't stall others.
+                    let txs2 = txs.clone();
+                    let send_res = tokio::task::spawn_blocking(move || {
+                        for (i, piece) in pieces {
+                            if txs2[i].send(piece).is_err() {
+                                return true;
+                            }
+                        }
+                        false
+                    })
+                    .await;
                     match send_res {
                         Ok(false) => {}
                         _ => break, // channel closed or join error
                     }
                 }
+                // Flush the per-worker coalescing buffers.
+                let mut tail: Vec<(usize, RecordBatch)> = Vec::new();
+                for (i, (rows, bufd)) in coalesce.iter_mut().enumerate() {
+                    if *rows > 0 {
+                        let merged = arrow::compute::concat_batches(&bufd[0].schema(), bufd.iter())
+                            .map_err(|e| QueryError::Execution(e.to_string()))?;
+                        bufd.clear();
+                        tail.push((i, merged));
+                    }
+                }
+                if !tail.is_empty() && !abort.load(AtomicOrdering::Relaxed) {
+                    let txs2 = txs.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        for (i, piece) in tail {
+                            if txs2[i].send(piece).is_err() {
+                                return;
+                            }
+                        }
+                    })
+                    .await;
+                }
                 Ok::<_, QueryError>(())
             }));
         }
-        drop(tx);
+        drop(txs);
 
         let mut drain_failed = false;
         for d in drains {
@@ -828,10 +943,22 @@ impl SpillableHashAggregateExec {
 
         let t_workers = t_start.elapsed();
         let total_groups: usize = states.iter().map(|s| s.group_count()).sum();
-        let mut batches = merge_states_to_batches(states, &agg_funcs, &input_types, &self.schema)?;
+        let mut batches = if disjoint {
+            crate::physical::morsel_agg::finalize_disjoint_states(
+                states,
+                &agg_funcs,
+                &input_types,
+                &self.schema,
+                self.post_filter.as_ref(),
+            )?
+        } else {
+            merge_states_to_batches(states, &agg_funcs, &input_types, &self.schema)?
+        };
         let t_merged = t_start.elapsed();
-        if let Some(pred) = &self.post_filter {
-            batches = crate::physical::operators::filter_batches(batches, pred)?;
+        if !disjoint {
+            if let Some(pred) = &self.post_filter {
+                batches = crate::physical::operators::filter_batches(batches, pred)?;
+            }
         }
         if timing {
             eprintln!(
@@ -2356,5 +2483,98 @@ mod tests {
 
         let size = estimate_batch_size(&batch);
         assert!(size > 0);
+    }
+
+    /// Disjoint fused aggregation must produce EXACTLY what the plain
+    /// aggregate produces, at a group count high enough that worker states
+    /// abandon their perfect-hash arrays mid-build. The first disjoint
+    /// finalize skipped the per-state raw prep and silently emitted only the
+    /// raw-map groups — Q11 at SF=100 lost ~70% of every SUM while still
+    /// returning the right ROW COUNT. Row counts are not answers.
+    #[tokio::test]
+    async fn disjoint_aggregation_matches_plain_aggregation_exactly() {
+        use arrow::array::{Float64Array, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        // 3M rows over 300k dense keys: big enough for raw/perfect-hash
+        // transitions inside worker states, keyed densely like c_custkey.
+        let n_rows = 3_000_000usize;
+        let n_keys = 300_000i64;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Float64, false),
+        ]));
+        let mut batches = Vec::new();
+        for chunk in 0..(n_rows / 8192) {
+            let start = chunk * 8192;
+            let keys: Vec<i64> = (start..start + 8192)
+                .map(|i| (i as i64 * 2654435761i64.wrapping_abs()) % n_keys)
+                .collect();
+            let vals: Vec<f64> = keys.iter().map(|k| (*k % 97) as f64 + 0.5).collect();
+            batches.push(
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(keys)),
+                        Arc::new(Float64Array::from(vals)),
+                    ],
+                )
+                .unwrap(),
+            );
+        }
+        let input: Arc<dyn PhysicalOperator> = Arc::new(
+            crate::physical::operators::MemoryTableExec::new("t", schema.clone(), batches, None),
+        );
+
+        let group_by = vec![Expr::column("k")];
+        let aggs = vec![AggregateExpr {
+            func: crate::planner::AggregateFunction::Sum,
+            input: Expr::column("v"),
+            distinct: false,
+            second_arg: None,
+        }];
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("sum_v", DataType::Float64, true),
+        ]));
+
+        let pool = crate::execution::create_memory_pool(8 * 1024 * 1024 * 1024);
+        let config = ExecutionConfig::default();
+
+        let mut results = Vec::new();
+        for disjoint in [false, true] {
+            let agg = SpillableHashAggregateExec::new(
+                input.clone(),
+                group_by.clone(),
+                aggs.clone(),
+                out_schema.clone(),
+                pool.clone(),
+                config.clone(),
+            )
+            .with_disjoint_groups(disjoint);
+            let mut stream = agg.execute(0).await.unwrap();
+            let mut rows: Vec<(i64, f64)> = Vec::new();
+            use futures::TryStreamExt;
+            while let Some(b) = stream.try_next().await.unwrap() {
+                let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                let v = b.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+                for i in 0..b.num_rows() {
+                    rows.push((k.value(i), v.value(i)));
+                }
+            }
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            results.push(rows);
+        }
+        assert_eq!(results[0].len(), results[1].len(), "group count differs");
+        for (a, b) in results[0].iter().zip(results[1].iter()) {
+            assert_eq!(a.0, b.0, "group keys diverge");
+            assert!(
+                (a.1 - b.1).abs() < 1e-6,
+                "sum for key {} differs: {} vs {}",
+                a.0,
+                a.1,
+                b.1
+            );
+        }
     }
 }

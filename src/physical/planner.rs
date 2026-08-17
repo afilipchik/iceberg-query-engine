@@ -340,6 +340,47 @@ impl PhysicalPlanner {
         }
     }
 
+    /// Should the fused streaming aggregate hash-partition its input to
+    /// per-worker channels (disjoint states)?
+    ///
+    /// True only for a single INTEGER group key whose footer statistics show
+    /// a DENSE key space: NDV >= 1M and range <= 2x NDV. That is the regime
+    /// where every worker's shared-channel partial state spans the whole key
+    /// range and the merge pays workers-fold overlap (Q13's c_custkey,
+    /// NDV=range=15M: merge 4.3s shared vs 0.1ms disjoint at SF=100).
+    /// Sparse keys (l_orderkey, range 4x NDV) measured a net LOSS under the
+    /// scatter, and low-NDV keys pay scatter for a merge that was already
+    /// trivial — both stay on the shared channel.
+    fn disjoint_group_hint(&self, group_by: &[Expr]) -> bool {
+        if group_by.len() != 1 {
+            return false;
+        }
+        let Expr::Column(c) = &group_by[0] else {
+            return false;
+        };
+        let name = c.name.to_lowercase();
+        for provider in self.tables.values() {
+            if let Some(stats) = provider.statistics() {
+                if let Some(cs) = stats.column_stats.get(&name) {
+                    if let (Some(min), Some(max)) = (cs.min_i64, cs.max_i64) {
+                        // Mirror the merge's dense-path trigger from HARD
+                        // stats only. ndv_est is min(rows, range), which made
+                        // a range-vs-ndv test circular: sparse l_orderkey
+                        // (range 600M) passed it and Q18 paid a 32-way
+                        // scatter for a merge that was already cheap. The
+                        // pathological shared-merge case is a dense DIRECT-
+                        // ADDRESS key domain, and that is a RANGE property:
+                        // c_custkey (range 15M) qualifies, l_orderkey does
+                        // not.
+                        let range = max.saturating_sub(min).saturating_add(1).max(1) as u64;
+                        return (2_000_000..=64_000_000).contains(&range);
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Register a table provider
     pub fn register_table(&mut self, name: impl Into<String>, provider: Arc<dyn TableProvider>) {
         let name = name.into();
@@ -1294,6 +1335,7 @@ impl PhysicalPlanner {
                             })
                             .collect();
 
+                    let disjoint = self.disjoint_group_hint(&node.group_by);
                     let agg = SpillableHashAggregateExec::new(
                         input,
                         node.group_by.clone(),
@@ -1302,7 +1344,8 @@ impl PhysicalPlanner {
                         self.memory_pool.clone().unwrap(),
                         self.config.clone().unwrap(),
                     )
-                    .with_post_filter(post_filter);
+                    .with_post_filter(post_filter)
+                    .with_disjoint_groups(disjoint);
                     Ok(Arc::new(agg))
                 } else {
                     let agg =
