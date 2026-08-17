@@ -1003,6 +1003,19 @@ Based on the codebase structure, these appear to be planned but not fully implem
   `SpillableHashJoinExec` still materializes the build side before deciding to
   spill (known hole, fixed by the Phase-5 streaming spill rewrite, see ROADMAP).
 
+## TPC-H Benchmark Status (SF=100 LANCE, 2026-08-17)
+
+**Warm 98.3s = 1.47x DuckDB native, 1.13x the engine's own parquet path
+(87.1s); 22/22 cell-exact vs `data/sf100_duckdb_results`.** Dataset:
+`data/tpch-100gb-lance` (56GB vs 32GB parquet), written by the engine's own
+`write-lance --from-parquet` in ~7 min (lineitem 600M rows in 5.4 min).
+Cold first pass 118.1s. Disjoint-agg mode fires through Lance too (Q13
+2.9s, same as parquet — LanceTable's column stats feed the same hint).
+Largest Lance-vs-parquet gaps: Q19 5.3s vs 1.2s (the OR-of-IN-lists
+predicate is refused by the Lance pushdown whitelist, so it full-decodes),
+Q10 5.5 vs 3.9, Q18 11.5 vs 9.1. Run:
+`benchmark-lance --path data/tpch-100gb-lance --sf 100`.
+
 ## TPC-H Benchmark Status (SF=100, 2026-08-17)
 
 **87.1s vs DuckDB native 67.1s = 1.30x; 22/22 cell-exact.** Q6/Q9/Q15/Q19
