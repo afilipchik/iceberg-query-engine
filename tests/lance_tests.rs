@@ -369,15 +369,15 @@ fn count_of(r: &query_engine::execution::QueryResult) -> i64 {
         .value(0)
 }
 
-/// TPC-H is all narrow scalar columns, so the gate must DECLINE every one of
-/// these. Re-measured 2026-08-09 with `MaterializationStyle::AllLate`, which
-/// makes a pushed filter far cheaper than it used to be and turns the
-/// *selective* TPC-H predicates into small wins: forcing every renderable
-/// conjunct down still took the SF=10 suite from **6.76s to 10.83s**, because
-/// the non-selective ones collapse (Q01 351ms -> 1801ms). That is the
-/// regression this asserts cannot come back.
+/// The gate's contract on narrow (flat-schema) tables since 2026-08-18:
+/// SELECTIVITY alone decides. Non-selective predicates must decline — Q01's
+/// date band keeps ~95% of rows and forcing it down was a measured 351ms ->
+/// 1801ms collapse — while genuinely selective ones now push (Q19's
+/// OR-of-IN-lists at SF=100 went 5.5s -> 3.3s once sampled string/float
+/// statistics made its ~0.1% estimable). The old "wide column required"
+/// condition existed only because those estimates did not exist.
 #[tokio::test]
-async fn test_pushdown_declines_on_narrow_tables() {
+async fn test_pushdown_gates_narrow_tables_by_selectivity() {
     if !data_available() {
         return;
     }
@@ -388,17 +388,35 @@ async fn test_pushdown_declines_on_narrow_tables() {
     let mut ctx = ExecutionContext::new();
     ctx.register_table_provider("lineitem", table.clone());
 
-    for sql in [
-        "SELECT COUNT(*) AS n FROM lineitem WHERE l_shipdate <= DATE '1998-09-02'",
-        "SELECT COUNT(*) AS n FROM lineitem WHERE l_orderkey = 1",
-        "SELECT COUNT(*) AS n FROM lineitem WHERE l_returnflag = 'R'",
-    ] {
-        ctx.sql(sql).await.expect("query failed");
-    }
+    // ~95% of rows survive the Q01 date band: must NOT push.
+    ctx.sql("SELECT COUNT(*) AS n FROM lineitem WHERE l_shipdate <= DATE '1998-09-02'")
+        .await
+        .expect("query failed");
     assert_eq!(
         table.pushed_filter_count(),
         0,
-        "no TPC-H column is worth late-materializing; forcing it is a measured 6.76s -> 10.83s regression"
+        "a ~95%-selectivity predicate must never push (Q01's measured 5x collapse)"
+    );
+
+    // 1-in-3 string equality (l_returnflag over sampled NDV 3): above the
+    // 10% limit, must NOT push.
+    ctx.sql("SELECT COUNT(*) AS n FROM lineitem WHERE l_returnflag = 'R'")
+        .await
+        .expect("query failed");
+    assert_eq!(
+        table.pushed_filter_count(),
+        0,
+        "1/3 string equality is above the pushdown selectivity limit"
+    );
+
+    // Point lookup on a dense int key: ~1e-8 selective, MUST push — this is
+    // what the sampled/derived statistics unlocked on flat schemas.
+    ctx.sql("SELECT COUNT(*) AS n FROM lineitem WHERE l_orderkey = 1")
+        .await
+        .expect("query failed");
+    assert!(
+        table.pushed_filter_count() > 0,
+        "a point-lookup predicate must push now that its selectivity is estimable"
     );
 }
 

@@ -37,6 +37,16 @@ pub struct ColumnStatistics {
     pub null_count: Option<u64>,
     /// Estimated number of distinct values
     pub ndv_est: Option<u64>,
+    /// SAMPLED minimum for float columns (Lance fills these from its first
+    /// fragment). An estimate for selectivity gating only — NOT a bound, and
+    /// never a correctness input.
+    pub min_f64: Option<f64>,
+    /// SAMPLED maximum for float columns; see `min_f64`.
+    pub max_f64: Option<f64>,
+    /// SAMPLED distinct-value count for string columns, capped (a capped
+    /// sample reading "N" means ">= N distinct in the sample"). Estimate
+    /// only; see `min_f64`.
+    pub ndv_str: Option<u64>,
 }
 
 /// Table provider trait for accessing table data

@@ -184,6 +184,7 @@ mod tests {
                     max_i64: Some(*hi),
                     null_count: Some(0),
                     ndv_est: None,
+                    ..Default::default()
                 },
             );
         }

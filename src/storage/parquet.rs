@@ -271,6 +271,7 @@ impl ParquetTable {
                         max_i64: acc.max_i64,
                         null_count: acc.null_count,
                         ndv_est,
+                        ..Default::default()
                     },
                 )
             })

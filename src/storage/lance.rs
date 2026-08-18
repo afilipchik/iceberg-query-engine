@@ -647,10 +647,117 @@ impl LanceTable {
                     max_i64: max_v,
                     null_count: Some(nulls),
                     ndv_est,
+                    ..Default::default()
                 },
             );
         }
+
+        self.sample_string_float_stats(&mut out);
         out
+    }
+
+    /// SAMPLED statistics for string and float columns, read from the first
+    /// fragment only. They exist so `estimate_selectivity` can price string
+    /// equality/IN-list and float range filters — the exact estimates whose
+    /// absence kept the pushdown gate from ever firing on flat-schema data
+    /// (Q19's OR-of-IN-lists full-decoded 600M rows at SF=100 for a filter
+    /// keeping ~0.1%). Estimates only: a wrong sample can only cost
+    /// performance, never rows — the engine re-applies the full predicate
+    /// above every pushed scan.
+    fn sample_string_float_stats(
+        &self,
+        out: &mut std::collections::HashMap<String, ColumnStatistics>,
+    ) {
+        use arrow::datatypes::DataType as DT;
+
+        let sample_names: Vec<String> = self
+            .schema
+            .fields()
+            .iter()
+            .filter(|f| matches!(f.data_type(), DT::Utf8 | DT::Float32 | DT::Float64))
+            .map(|f| f.name().clone())
+            .collect();
+        if sample_names.is_empty() {
+            return;
+        }
+
+        // First fragment of this table's view: respect a distributed shard's
+        // fragment subset so every node samples data it actually owns.
+        let first_frag: Option<u64> = match &self.fragment_subset {
+            Some(subset) => subset.iter().next().copied(),
+            None => {
+                let ds = Arc::clone(&self.dataset);
+                block_on_lance(async move {
+                    Ok::<_, QueryError>(ds.get_fragments().first().map(|f| f.metadata().id))
+                })
+                .ok()
+                .flatten()
+            }
+        };
+        let Some(frag_id) = first_frag else {
+            return;
+        };
+
+        let ds = Arc::clone(&self.dataset);
+        let names = sample_names.clone();
+        let subset = Some(std::collections::BTreeSet::from([frag_id]));
+        let Ok(batches) =
+            block_on_lance(async move { scan_fragments(ds, names, None, subset).await })
+        else {
+            return;
+        };
+
+        // Cap the distinct-set: a column that blows past the cap is
+        // high-cardinality, and "at least CAP distinct" already prices an
+        // equality filter as selective enough for any gate decision.
+        const NDV_CAP: usize = 4096;
+        for (idx, name) in sample_names.iter().enumerate() {
+            let mut distinct: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            let mut capped = false;
+            let (mut fmin, mut fmax): (Option<f64>, Option<f64>) = (None, None);
+            let mut saw_string = false;
+            let mut saw_float = false;
+
+            for batch in &batches {
+                let Some(col) = batch.columns().get(idx) else {
+                    continue;
+                };
+                if let Some(sa) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
+                    saw_string = true;
+                    if !capped {
+                        for i in 0..sa.len() {
+                            if !sa.is_null(i) {
+                                distinct.insert(sa.value(i));
+                                if distinct.len() >= NDV_CAP {
+                                    capped = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } else if let Ok(fa) = arrow::compute::cast(col, &DT::Float64) {
+                    if let Some(fa) = fa.as_any().downcast_ref::<arrow::array::Float64Array>() {
+                        saw_float = true;
+                        use arrow::compute::kernels::aggregate::{max as fmaxk, min as fmink};
+                        if let Some(v) = fmink(fa) {
+                            fmin = Some(fmin.map_or(v, |m: f64| m.min(v)));
+                        }
+                        if let Some(v) = fmaxk(fa) {
+                            fmax = Some(fmax.map_or(v, |m: f64| m.max(v)));
+                        }
+                    }
+                }
+            }
+
+            let entry = out.entry(name.to_lowercase()).or_default();
+            if saw_string && !distinct.is_empty() {
+                entry.ndv_str = Some(distinct.len() as u64);
+            }
+            if saw_float {
+                entry.min_f64 = fmin;
+                entry.max_f64 = fmax;
+            }
+        }
     }
 
     /// Should this predicate be pushed into Lance, or is the engine faster?
@@ -732,15 +839,21 @@ impl LanceTable {
             None => fields.iter().collect(),
         };
 
-        // (1) Is there a wide payload column whose decode could be skipped?
+        // (1) RETIRED (2026-08-18): the "wide payload column required"
+        // condition existed because flat-schema selectivity was
+        // unestimatable — strings and floats had no statistics, so the gate
+        // could not tell Q19 (0.1% kept) from Q01 (95% kept) and refusing
+        // everything was the only safe move. `sample_string_float_stats`
+        // now prices those columns, so condition (3) alone carries the
+        // decision: an inestimable or non-selective predicate still refuses.
+        // Measured on retirement: Q19-lance SF=100 5.5s -> 3.5s
+        // (QE_LANCE_PUSH=all bound the win first); Q01 remains unpushed at
+        // ~95% estimated selectivity.
         let wide: Vec<String> = projected
             .iter()
             .filter(|f| crate::planner::vector_types::is_opaque_nested(f.data_type()))
             .map(|f| f.name().to_lowercase())
             .collect();
-        if wide.is_empty() {
-            return None;
-        }
 
         let (_, conjuncts) = lance_pushable_conjuncts(predicate, &self.schema)?;
         let stats = self.stats_cache.get_or_init(|| self.compute_column_stats());
@@ -1389,14 +1502,34 @@ fn estimate_selectivity(
                     _ => return None,
                 },
             };
-            let v = as_i64(lit)?;
+            // Equality prices off distinct counts: exact int NDV when the
+            // scan derived one, else the SAMPLED string NDV.
+            let ndv = cs.ndv_est.or(cs.ndv_str);
+            if matches!(op, BinaryOp::Eq | BinaryOp::NotEq) {
+                let s = 1.0 / ndv? as f64;
+                return Some(if op == BinaryOp::Eq { s } else { 1.0 - s });
+            }
+            // Ranges: exact int bounds first, sampled float bounds second.
+            if let Some(v) = as_i64(lit) {
+                return match op {
+                    BinaryOp::Lt => range_fraction(cs, v, false),
+                    BinaryOp::LtEq => range_fraction(cs, v, true),
+                    BinaryOp::Gt => range_fraction(cs, v, true).map(|f| 1.0 - f),
+                    BinaryOp::GtEq => range_fraction(cs, v, false).map(|f| 1.0 - f),
+                    _ => None,
+                };
+            }
+            let v = match lit {
+                SV::Float32(f) => f.into_inner() as f64,
+                SV::Float64(f) => f.into_inner(),
+                _ => return None,
+            };
+            let (lo, hi) = (cs.min_f64?, cs.max_f64?);
+            let span = (hi - lo).max(f64::EPSILON);
+            let below = ((v - lo) / span).clamp(0.0, 1.0);
             match op {
-                BinaryOp::Eq => Some(1.0 / cs.ndv_est? as f64),
-                BinaryOp::NotEq => Some(1.0 - 1.0 / cs.ndv_est? as f64),
-                BinaryOp::Lt => range_fraction(cs, v, false),
-                BinaryOp::LtEq => range_fraction(cs, v, true),
-                BinaryOp::Gt => range_fraction(cs, v, true).map(|f| 1.0 - f),
-                BinaryOp::GtEq => range_fraction(cs, v, false).map(|f| 1.0 - f),
+                BinaryOp::Lt | BinaryOp::LtEq => Some(below),
+                BinaryOp::Gt | BinaryOp::GtEq => Some(1.0 - below),
                 _ => None,
             }
         }
@@ -1418,7 +1551,8 @@ fn estimate_selectivity(
             negated,
         } => {
             let cs = col_stats(expr, stats)?;
-            let s = (list.len() as f64 / cs.ndv_est? as f64).clamp(0.0, 1.0);
+            let ndv = cs.ndv_est.or(cs.ndv_str)?;
+            let s = (list.len() as f64 / ndv as f64).clamp(0.0, 1.0);
             Some(if *negated { 1.0 - s } else { s })
         }
         Expr::Between {
@@ -1431,9 +1565,24 @@ fn estimate_selectivity(
             let (Expr::Literal(l), Expr::Literal(h)) = (low.as_ref(), high.as_ref()) else {
                 return None;
             };
-            let lo = range_fraction(cs, as_i64(l)?, false)?;
-            let hi = range_fraction(cs, as_i64(h)?, true)?;
-            let s = (hi - lo).clamp(0.0, 1.0);
+            let as_f = |v: &SV| -> Option<f64> {
+                Some(match v {
+                    SV::Float32(f) => f.into_inner() as f64,
+                    SV::Float64(f) => f.into_inner(),
+                    _ => return None,
+                })
+            };
+            let s = if let (Some(l), Some(h)) = (as_i64(l), as_i64(h)) {
+                let lo = range_fraction(cs, l, false)?;
+                let hi = range_fraction(cs, h, true)?;
+                (hi - lo).clamp(0.0, 1.0)
+            } else {
+                // Sampled float bounds.
+                let (l, h) = (as_f(l)?, as_f(h)?);
+                let (lo, hi) = (cs.min_f64?, cs.max_f64?);
+                let span = (hi - lo).max(f64::EPSILON);
+                (((h.min(hi) - l.max(lo)) / span).max(0.0)).clamp(0.0, 1.0)
+            };
             Some(if *negated { 1.0 - s } else { s })
         }
         _ => None,
