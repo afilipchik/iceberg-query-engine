@@ -462,9 +462,6 @@ fn merge_raw_sum_states_to_batches(
     // Null-group accumulators merged across states up front; also gather the
     // global key range and group count to pick the merge strategy.
     let mut raw_null: Option<Vec<AccumulatorState>> = None;
-    let mut gmin = i64::MAX;
-    let mut gmax = i64::MIN;
-    let mut total = 0usize;
     let mut prepared: Vec<AggregationState> = Vec::with_capacity(states.len());
     for mut st in states {
         if let Some(n) = st.raw_null.take() {
@@ -477,14 +474,36 @@ fn merge_raw_sum_states_to_batches(
                 None => raw_null = Some(n),
             }
         }
-        total += st.raw_sums.len();
-        for k in st.raw_sums.keys() {
-            let v = *k as i64;
-            gmin = gmin.min(v);
-            gmax = gmax.max(v);
-        }
         prepared.push(st);
     }
+
+    // Range/count probe and the shard scatter both iterate EVERY map entry;
+    // sequential passes cost 1.4s of Q18's subquery aggregate at SF=100
+    // (150M groups). Per-state work is independent — parallelize both.
+    let per_state: Vec<(usize, i64, i64)> = prepared
+        .par_iter()
+        .map(|st| {
+            let mut mn = i64::MAX;
+            let mut mx = i64::MIN;
+            for k in st.raw_sums.keys() {
+                let v = *k as i64;
+                mn = mn.min(v);
+                mx = mx.max(v);
+            }
+            (st.raw_sums.len(), mn, mx)
+        })
+        .collect();
+    let total: usize = per_state.iter().map(|(n, _, _)| n).sum();
+    let gmin = per_state
+        .iter()
+        .map(|(_, mn, _)| *mn)
+        .min()
+        .unwrap_or(i64::MAX);
+    let gmax = per_state
+        .iter()
+        .map(|(_, _, mx)| *mx)
+        .max()
+        .unwrap_or(i64::MIN);
 
     let p = merge_shard_count(total);
     let range = (gmax as i128 - gmin as i128 + 1).max(1) as u64;
@@ -494,12 +513,12 @@ fn merge_raw_sum_states_to_batches(
 
     let sharded: Vec<Vec<Vec<(u64, f64)>>> = if dense {
         prepared
-            .into_iter()
+            .into_par_iter()
             .map(|st| st.into_range_sum_shards(p, gmin, w))
             .collect()
     } else {
         prepared
-            .into_iter()
+            .into_par_iter()
             .map(|st| st.into_raw_sum_shards(p))
             .collect()
     };
