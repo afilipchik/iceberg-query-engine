@@ -249,3 +249,57 @@ buffer pool, which is a fourth project).
   SF=100: Q6 (.7x), Q9 (.8x), Q15 (.8x), Q19 (.4x).
 * Next: Q18/Q21-class join-probe drain (fused probe→aggregate, 2a) and
   Q10's decoration gather — both scoped above.
+
+## CCPM duckdb-parity epic (2026-08-18) — 89.3s → 72.7s at SF=100
+
+Baseline re-pinned at HEAD (89.3s warm parquet / 102.4s lance; DuckDB on
+the same files re-measured per query: 40.1s / 69.1s). Four levers
+shipped, every one attribution-first:
+
+1. **Runtime-filter bitmap cap 64M→2^31 bits** (commit 170217c): the old
+   cap was an SF=10 artifact — o_orderkey's domain fits at SF=10 and is
+   ~600M at SF=100, so Q4/Q18-class filters were silently unpublished.
+   Q4 3.50→1.74s; −1.2..1.5s each on Q3/Q8/Q10/Q21.
+2. **PackedJoinKeys moved after the fixpoint loop** (same commit): inside
+   the loop, the next iteration's JoinReorder rebuilt the join graph
+   without the packed edge — Q5 SF=10 planned a 21B-row CROSS join and
+   FAILED (shipped broken in ad3881a; SF=10 sweeps would have caught it);
+   at SF=100 the same re-run silently cost Q5 ~4s. Q5 7.93→3.69s.
+3. **Dictionary-preserving join gather + mixed dict/int agg fast path +
+   vectorized YEAR** (commit cb6f2ba): small-build (≤4096 rows) string
+   columns leave `create_joined_batch` as Dictionary(Int32,Utf8) — take
+   indices ARE the keys — and survive every downstream gather; the
+   combined agg path packs dict indices with small-range ints
+   (EXTRACT(YEAR)). Q9 −2.8s parquet / −8.2s lance. Exposed and fixed
+   TWO latent wrong-answer bugs: the per-batch packed→index cache
+   survived perfect-hash rehashes (stride changes move every flat index),
+   and DictString raw_key packed 7 bytes vs String's 8 (mixed batches
+   split groups). Also: extract_group_value/extract_join_key returned
+   Null for dict arrays — the silent one-group collapse class.
+4. **Parallelized raw-sum merge** (commit 6c41285): Q18's subquery agg
+   (604M rows→150M groups) had two sequential passes over every map
+   entry. Subquery 4.36→3.05s (DuckDB 2.0), Q18 8.57→7.6s.
+5. **Lance: sampled string/float statistics replace the wide-column
+   pushdown gate** (commit a5c9635): first-fragment samples make string
+   Eq/IN and float ranges estimable; the 10% selectivity limit alone now
+   gates. Q19-lance 5.5→3.3s; Q01 still refuses at ~95%.
+
+**Final: SF=100 parquet 72.7s warm, 22/22 cell-valid = 1.81x
+like-for-like (was 2.23x), 1.08x vs the stored native baseline. SF=10:
+7.63s parquet / 7.36s IPC, ALL 22 CELL-EXACT. Lance: high sweep variance
+on this box (56GB dataset + query RSS exceed the cache); single-query
+warm A/Bs: Q9 20.8s, Q19 3.3s, Q10 2.37s ≈ duck-lance parity.**
+
+**Named residues (program-level, not story-level):** Q9 (18.7s) is
+CPU-saturation-bound — ~600s CPU across probes/agg/scans on 32 cores;
+software prefetch measured NEUTRAL and was reverted. Q18 (7.6s) residue
+is the 150M-group scan+process floor (~4ns/row) plus lance's
+runtime-filter architecture gap. Both point at radix-partitioned
+(cache-resident) joins/aggregation and selection-vector execution — 2b
+generalized, unchanged as the program's next rewrite.
+
+**Ops note:** systemd-oomd killed the terminal scope (and the session)
+at 58% memory pressure during this epic's SF=100 window; every heavy
+command now runs through `scripts/oomsafe.sh` (own transient scope =
+oomd kill target; MemoryHigh only for builds — it counts page cache and
+throttled a capped benchmark sweep +2.2s).

@@ -1,7 +1,7 @@
 ---
 name: duckdb-parity
 description: Close the like-for-like gap to DuckDB on both parquet (2.21x) and lance (1.30x) at SF=100 via fused probe-aggregate, deferred join gather, Q4 attribution, and Lance predicate pushdown
-status: backlog
+status: completed
 created: 2026-08-18T00:32:07Z
 ---
 

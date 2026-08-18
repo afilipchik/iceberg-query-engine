@@ -1003,13 +1003,24 @@ Based on the codebase structure, these appear to be planned but not fully implem
   `SpillableHashJoinExec` still materializes the build side before deciding to
   spill (known hole, fixed by the Phase-5 streaming spill rewrite, see ROADMAP).
 
-## SF=100: the four-way matrix (2026-08-17, warm, same machine, duckdb 1.4.4)
+## SF=100: the four-way matrix (2026-08-18, warm, same machine, duckdb 1.4.4)
 
 | storage | engine | DuckDB on the SAME files | ratio |
 |---|---|---|---|
-| parquet (identical files) | 87.1s | 39.4s (`read_parquet` views) | 2.21x |
-| lance (identical files) | 98.3s | 75.7s (community `lance` ext) | **1.30x** |
+| parquet (identical files) | **72.7s** | 40.1s (`read_parquet` views) | **1.81x** |
+| lance (identical files) | ~101s (high variance, see below) | 69.1s (community `lance` ext) | ~1.47x |
 | DuckDB native (in-mem) | — | 65.8s (Q9 alone 36.4s) | — |
+
+The 2026-08-18 duckdb-parity epic took parquet 89.3→72.7s (runtime-filter
+bitmap cap 64M→2^31 bits; PackedJoinKeys moved after the optimizer
+fixpoint loop — this also FIXED a Q5 SF=10 cross-join planning failure
+shipped in ad3881a; dictionary-preserving join gather; parallelized
+raw-sum merge). Lance SWEEP totals on this box carry ±5-8% variance
+(56GB dataset + query RSS exceed what stays page-cached next to the
+32GB parquet); warm single-query A/Bs are the honest lance numbers:
+Q9 20.8s (−8.2s from dict gather), Q19 3.3s (−2.2s from pushdown),
+Q10 2.37s ≈ duck-lance parity. Full evidence: PARITY-PLAN.md epic
+section + .claude/epics/duckdb-parity/.
 
 `scripts/duckdb_files_bench_sf100.py` reproduces the DuckDB side. Note the
 inversion: DuckDB-native is SLOWER than DuckDB-parquet at SF=100 because
@@ -1020,33 +1031,42 @@ on identical lance it is 1.30x, and the engine beats DuckDB's lance
 reader outright on Q1 (3.9 vs 7.9s), Q6 (1.5 vs 11.8s) and Q15
 (1.8 vs 3.4s).
 
-## TPC-H Benchmark Status (SF=100 LANCE, 2026-08-17)
+## TPC-H Benchmark Status (SF=100 LANCE, updated 2026-08-18)
 
-**Warm 98.3s = 1.47x DuckDB native, 1.13x the engine's own parquet path
-(87.1s); 22/22 cell-exact vs `data/sf100_duckdb_results`.** Dataset:
-`data/tpch-100gb-lance` (56GB vs 32GB parquet), written by the engine's own
-`write-lance --from-parquet` in ~7 min (lineitem 600M rows in 5.4 min).
-Cold first pass 118.1s. Disjoint-agg mode fires through Lance too (Q13
-2.9s, same as parquet — LanceTable's column stats feed the same hint).
-Largest Lance-vs-parquet gaps: Q19 5.3s vs 1.2s (the OR-of-IN-lists
-predicate is refused by the Lance pushdown whitelist, so it full-decodes),
-Q10 5.5 vs 3.9, Q18 11.5 vs 9.1. Run:
-`benchmark-lance --path data/tpch-100gb-lance --sf 100`.
+**Sweep ~101s (±5-8% run variance on this box — see the four-way matrix
+note); 22/22 successful, SF=10 lance ALL 22 CELL-EXACT vs
+DuckDB-over-Lance.** Dataset: `data/tpch-100gb-lance` (56GB vs 32GB
+parquet), written by the engine's own `write-lance --from-parquet`.
+Disjoint-agg mode fires through Lance too. The 2026-08-18 epic closed
+the two biggest lance-specific gaps: **Q19 5.5→3.3s** (sampled
+string/float statistics let the pushdown gate price its OR-of-IN-lists —
+the wide-column requirement is retired, the 10% selectivity limit alone
+gates) and **Q9 29.0→20.8s** (dictionary-preserving join gather).
+Q10/Q18 plans are byte-identical to parquet's; Q10 warm ≈ duck-lance
+parity (2.37 vs 2.35s), Q18's remaining ~2s is the runtime-filter
+architecture gap (lance scans at planning time, so probe decode can't be
+bitmap-pruned). Run: `benchmark-lance --path data/tpch-100gb-lance --sf 100`.
 
-## TPC-H Benchmark Status (SF=100, 2026-08-17)
+## TPC-H Benchmark Status (SF=100, 2026-08-18)
 
-**87.1s vs DuckDB native 67.1s = 1.30x; 22/22 cell-exact.** Q6/Q9/Q15/Q19
-run FASTER than DuckDB. Fused-aggregate disjoint mode (stats-gated on
-dense int key ranges 2M..64M) took Q13 from 5.9x to 2.3x. Remaining top
-gaps: Q10 3.5x, Q16 2.8x, Q11 2.6x, Q13 2.3x. Run via
-`scripts/sf100_full_benchmark.sh`; validate VALUES against
-`data/sf100_duckdb_results` — a Q11 wrong-answer bug returned exactly the
-right ROW COUNT (see PARITY-PLAN round 2: row counts are not answers).
+**72.7s vs DuckDB native 67.1s = 1.08x; vs DuckDB on the same parquet
+40.1s = 1.81x; 22/22 cell-valid.** Q6/Q9/Q15/Q19 run faster than native
+DuckDB. Worst absolute: Q9 18.7s (saturation-bound; see PARITY-PLAN
+residues), Q18 7.6s, Q21 5.5s, Q20 5.0s. Worst like-for-like ratios:
+Q1 2.8x, Q16 2.7x, Q10 2.0x. Run via `scripts/sf100_full_benchmark.sh`
+(THROUGH `scripts/oomsafe.sh` — systemd-oomd killed a session during an
+uncontained sweep); validate VALUES against `data/sf100_duckdb_results`
+— a Q11 wrong-answer bug returned exactly the right ROW COUNT (row
+counts are not answers). Do NOT set OOMSAFE_MEMHIGH on measurement
+runs: MemoryHigh counts page cache and throttled a capped sweep +2.2s.
 
 ## TPC-H Benchmark Status (SF=10, updated 2026-08-17)
 
 **7.45s parquet / 6.37s with the IPC sidecar cache (`QE_IPC_CACHE=1`) vs
-DuckDB native re-baselined 3.32s = 2.2x / 1.92x. 22/22 pass, 22/22
+DuckDB native re-baselined 3.32s = 2.2x / 1.92x. (Re-measured 2026-08-18
+after the duckdb-parity epic: 7.63s / 7.36s in a page-cache-contended
+window, ALL 22 CELL-EXACT — treat the IPC delta as noise until a clean
+serialized re-run.) 22/22 pass, 22/22
 cell-exact vs DuckDB, 959 tests green in BOTH modes.** The cache is an
 Arrow-IPC-per-row-group sidecar read back mmap zero-copy
 (`storage/ipc_cache.rs`, arrow `FileDecoder`); it stays opt-in because it

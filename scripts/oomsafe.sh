@@ -11,8 +11,17 @@
 # the job's reclaim pressure inside its own cgroup in the first place.
 #
 # Usage: scripts/oomsafe.sh <command...>
-#   OOMSAFE_MEMHIGH=70G scripts/oomsafe.sh ./target/release/query_engine ...
-MEM_HIGH="${OOMSAFE_MEMHIGH:-96G}"
-exec systemd-run --user --scope --quiet --collect \
-  -p MemoryHigh="$MEM_HIGH" \
-  -- "$@"
+#   OOMSAFE_MEMHIGH=48G scripts/oomsafe.sh cargo test ...   # cap builds/tests
+#   scripts/oomsafe.sh ./scripts/sf100_full_benchmark.sh     # benchmarks: NO cap
+#
+# MemoryHigh counts the scope's PAGE CACHE, not just anon memory — a
+# capped SF=100 sweep reads ~32GB of parquet into its own cgroup and gets
+# reclaim-throttled (+2.2s measured on the suite). Benchmarks therefore
+# run scope-only (still the oomd kill target); set OOMSAFE_MEMHIGH only
+# for builds/tests where throttling is acceptable.
+if [ -n "$OOMSAFE_MEMHIGH" ]; then
+  exec systemd-run --user --scope --quiet --collect \
+    -p MemoryHigh="$OOMSAFE_MEMHIGH" \
+    -- "$@"
+fi
+exec systemd-run --user --scope --quiet --collect -- "$@"

@@ -1,9 +1,9 @@
 ---
 name: duckdb-parity
-status: in-progress
+status: completed
 created: 2026-08-18T00:32:07Z
 updated: 2026-08-18T00:32:07Z
-progress: 50%
+progress: 100%
 prd: .claude/prds/duckdb-parity.md
 github: (will be set on sync)
 ---
@@ -129,3 +129,36 @@ Estimated total effort: 28-45 hours (measurement wall time dominates several)
 - 2a is the largest lever (M-L, touches the two hottest operators).
   2b-lite L (highest risk, gated behind 2a). Others S-M.
 - Total: one long working session with serialized measurement windows.
+
+## Epic close-out (2026-08-18)
+
+**SF=100 parquet: 89.3 → 72.7s warm, 22/22 cell-valid every sweep.
+Like-for-like vs DuckDB on the same files: 2.23x → 1.81x. vs native:
+1.08x.** SF=10: 7.63s parquet / 7.36s IPC, ALL 22 CELL-EXACT (G3 MET).
+Lance: sweep totals carry ±5-8% cache variance on this box; warm A/Bs:
+Q9 29.0→20.8s, Q19 5.5→3.3s, Q10 2.37s ≈ duck-lance parity.
+
+Per-query (final sweep, ms): Q1 3367, Q2 458, Q3 3976, Q4 1878, Q5 3746,
+Q6 953, Q7 3060, Q8 2919, Q9 18738, Q10 2697, Q11 276, Q12 1389,
+Q13 2973, Q14 1036, Q15 844, Q16 1875, Q17 2363, Q18 7563, Q19 1308,
+Q20 5038, Q21 5484, Q22 747.
+
+Gates: G1 (≤60s, Q9≤16, Q18≤6) NOT met — the residue is named and
+program-level (Q9 is CPU-saturation-bound; radix-partitioned joins /
+selection vectors, PARITY-PLAN 2b). G2 (lance ≤88s, Q19≤2.5) partially:
+Q19 halved to 3.3s; sweep variance prevents an honest total claim.
+G3 MET.
+
+Beyond the numbers, the epic's attribution work found and fixed FOUR
+correctness bugs: the ad3881a Q5 SF=10 cross-join planning failure
+(PackedJoinKeys inside the fixpoint loop), the perfect-hash rehash
+invalidating the combined path's per-batch cache (latent wrong answers),
+the DictString 7-vs-8-byte raw-key pack (group splits on mixed batches),
+and the Null-fallthrough in extract_group_value/extract_join_key for
+dictionary arrays (silent one-group collapse class). Plus the ops
+lesson: systemd-oomd kills the terminal scope under benchmark pressure —
+scripts/oomsafe.sh now isolates every heavy run.
+
+Commits: df17bf8 (scaffolding+baseline), 170217c (RT caps + optimizer
+fix), cb6f2ba (dictionary gather), a5c9635 (lance sampled stats),
+6c41285 (raw-sum merge).
