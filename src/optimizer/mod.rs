@@ -148,12 +148,26 @@ impl Optimizer {
         max_iterations: usize,
         diag: bool,
     ) -> Result<LogicalPlan> {
+        // PackedJoinKeys rewrites a dual-column equi-join's ON into ONE
+        // packed EXPRESSION pair. JoinReorder's graph extraction only sees
+        // column=column predicates as edges, so if the fixpoint loop runs
+        // another iteration after the pack, JoinReorder rebuilds the join
+        // graph MINUS that edge and can manufacture a CROSS join (Q5 at
+        // SF=10 planned supplier x customer as a 21-billion-row cross).
+        // The pack is a pure key-representation change with no downstream
+        // rule dependencies, so it runs exactly once, AFTER the loop.
+        let (loop_rules, final_rules): (Vec<Arc<dyn OptimizerRule>>, Vec<Arc<dyn OptimizerRule>>) =
+            rules
+                .iter()
+                .cloned()
+                .partition(|r| r.name() != "PackedJoinKeys");
+
         let mut current = plan;
 
         for iter in 0..max_iterations {
             let mut changed = false;
 
-            for rule in rules {
+            for rule in &loop_rules {
                 // A failing rule must say WHICH rule failed: "Column not
                 // found: x" alone points at the user's SQL, when the defect is
                 // in whatever transformation manufactured the reference.
@@ -179,6 +193,20 @@ impl Optimizer {
             if !changed {
                 break;
             }
+        }
+
+        for rule in &final_rules {
+            let new_plan = rule.optimize(&current).map_err(|e| {
+                crate::error::QueryError::Internal(format!(
+                    "optimizer rule `{}` failed: {e}",
+                    rule.name()
+                ))
+            })?;
+            if diag && format!("{:?}", new_plan) != format!("{:?}", current) {
+                eprintln!("[OPT final rule={}] Plan changed", rule.name());
+                Self::print_plan_summary(&new_plan, 0);
+            }
+            current = new_plan;
         }
 
         Ok(current)

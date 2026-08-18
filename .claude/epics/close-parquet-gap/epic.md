@@ -42,3 +42,15 @@ epic delivered: the Q9 attribution that names the real mechanism, a
 proven-injective key-packing rule (+tests), and two honest negative
 results (IPC at SF=100, disjoint-mode scatter on sparse keys) that stop
 future sessions from re-trying them blind.
+
+## Bug found post-close (2026-08-18, fixed in duckdb-parity epic)
+
+Task 004's PackedJoinKeys rule, run INSIDE the optimizer's fixpoint
+loop, broke Q5 at SF=10: iteration N packs the dual-key join, iteration
+N+1's JoinReorder rebuilds its join graph from column=column predicates
+only, loses the packed edge, and plans supplier x customer as a
+21-billion-row CROSS join (fails loudly at the cross-join guard). At
+SF=100 the same re-run silently degraded Q5's plan by ~4s instead. The
+close-out QA ran SF=100 sweeps only — an SF=10 sweep would have caught
+it. Fix: PackedJoinKeys is applied once AFTER the fixpoint loop
+(optimizer/mod.rs), where JoinReorder can never see its output.

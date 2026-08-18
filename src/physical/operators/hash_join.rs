@@ -907,13 +907,21 @@ impl PhysicalOperator for HashJoinExec {
                             use crate::physical::operators::streaming_parquet_scan::RuntimeFilterPayload;
                             let min = keys.iter().copied().min().unwrap();
                             let max = keys.iter().copied().max().unwrap();
+                            // Bitmap width cap: 2^31 bits = 256MB. The old cap
+                            // (64M bits = 8MB) was tuned at SF=10, where
+                            // o_orderkey's whole domain fits; at SF=100 the
+                            // domain is ~600M and Q4/Q18-class filters (5-7M
+                            // build keys that prune >95% of a 600M-row probe)
+                            // were silently skipped. vec![0u64; ..] is calloc'd
+                            // zero pages, so an under-filled wide bitmap costs
+                            // its touched pages, not its width.
+                            const BITMAP_MAX_BITS: i64 = 2_147_483_648;
                             // Too wide for a bitmap and too many keys for a
                             // cheap set: publish nothing.
-                            let skip = (max - min) >= 64_000_000 && keys.len() > 4_000_000;
-                            // Bitmap for bounded domains: 64M bits = 8MB cap
+                            let skip = (max - min) >= BITMAP_MAX_BITS && keys.len() > 4_000_000;
                             let payload = if skip {
                                 None
-                            } else if (max - min) < 64_000_000 {
+                            } else if (max - min) < BITMAP_MAX_BITS {
                                 let width = (max - min) as usize + 1;
                                 let mut bits = vec![0u64; width.div_ceil(64)];
                                 for k in &keys {
