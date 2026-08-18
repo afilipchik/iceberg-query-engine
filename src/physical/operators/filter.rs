@@ -520,6 +520,20 @@ fn dict_literal_mask(
 }
 
 fn evaluate_binary_op(left: &ArrayRef, op: BinaryOp, right: &ArrayRef) -> Result<ArrayRef> {
+    // Join gathers may carry dictionary-encoded string columns (small-build
+    // encoding in hash_join). The comparison kernels below downcast by
+    // concrete type, so normalize dictionaries to their value type first;
+    // the cast is per-batch and only on expressions that actually touch an
+    // encoded column.
+    let normalize = |a: &ArrayRef| -> Result<ArrayRef> {
+        if let arrow::datatypes::DataType::Dictionary(_, value_type) = a.data_type() {
+            arrow::compute::cast(a.as_ref(), value_type).map_err(Into::into)
+        } else {
+            Ok(a.clone())
+        }
+    };
+    let left = &normalize(left)?;
+    let right = &normalize(right)?;
     // Handle type coercion
     let (left, right) = coerce_arrays(left, right)?;
 
@@ -1093,6 +1107,34 @@ fn evaluate_scalar_func(
             })?;
 
             if let Some(date32) = date_arr.as_any().downcast_ref::<Date32Array>() {
+                // YEAR is hot (Q7/Q8/Q9 group keys over 600M joined rows at
+                // SF=100): the branch-light civil-calendar algorithm runs at
+                // ~5ns/row where chrono's NaiveDate round-trip costs ~100ns.
+                // Nulls ride on the reused validity buffer; slots under a
+                // null hold garbage days, which the algorithm maps to SOME
+                // int that the null bit then hides — same contract as
+                // arrow's own kernels.
+                if matches!(func, ScalarFunction::Year) {
+                    #[inline]
+                    fn year_of_epoch_days(days: i32) -> i32 {
+                        let z = days as i64 + 719_468;
+                        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+                        let doe = z - era * 146_097;
+                        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+                        let y = yoe + era * 400;
+                        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+                        let mp = (5 * doy + 2) / 153;
+                        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+                        (y + if m <= 2 { 1 } else { 0 }) as i32
+                    }
+                    let years: arrow::buffer::ScalarBuffer<i32> = date32
+                        .values()
+                        .iter()
+                        .map(|&d| year_of_epoch_days(d))
+                        .collect();
+                    let result = Int32Array::new(years, date32.nulls().cloned());
+                    return Ok(Arc::new(result));
+                }
                 use chrono::Datelike;
                 let result: Int32Array = date32
                     .iter()

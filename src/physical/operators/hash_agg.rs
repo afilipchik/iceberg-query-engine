@@ -2139,6 +2139,25 @@ fn extract_group_value(arr: &ArrayRef, row: usize) -> GroupValue {
     if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
         return GroupValue::Bool(a.value(row));
     }
+    // Dictionary-encoded strings from small-build join gathers: resolve the
+    // key to its value. Falling through to Null here would silently merge
+    // EVERY row into one group — the exact wrong-answer class the
+    // vector-types guards exist to prevent.
+    if let Some(a) = arr
+        .as_any()
+        .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int32Type>>()
+    {
+        if let Some(values) = a
+            .values()
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+        {
+            if let Some(key) = a.key(row) {
+                return GroupValue::String(values.value(key).to_string());
+            }
+        }
+        return GroupValue::Null;
+    }
 
     GroupValue::Null
 }

@@ -79,18 +79,48 @@ impl PhysicalOperator for SortExec {
             return Ok(Box::pin(stream::empty()));
         }
 
+        // Input batches may carry dictionary-encoded string columns
+        // (small-build join gathers), so their ACTUAL schema can differ from
+        // the declared one. When every batch agrees, concat under the actual
+        // schema (concat keeps dictionaries); mixed encodings are normalized
+        // to plain first.
+        let all_batches = {
+            let first_schema = all_batches[0].schema();
+            if all_batches.iter().all(|b| b.schema() == first_schema) {
+                all_batches
+            } else {
+                all_batches
+                    .into_iter()
+                    .map(|b| {
+                        let cols: std::result::Result<Vec<ArrayRef>, arrow::error::ArrowError> = b
+                            .columns()
+                            .iter()
+                            .map(|c| match c.data_type() {
+                                arrow::datatypes::DataType::Dictionary(_, v) => {
+                                    compute::cast(c.as_ref(), v)
+                                }
+                                _ => Ok(c.clone()),
+                            })
+                            .collect();
+                        RecordBatch::try_new(self.schema.clone(), cols?).map_err(Into::into)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
+        let actual_schema = all_batches[0].schema();
+
         // Check if Utf8 columns risk exceeding the 2GB i32 offset limit
-        let needs_large_utf8 = check_string_overflow_risk(&self.schema, &all_batches);
+        let needs_large_utf8 = check_string_overflow_risk(&actual_schema, &all_batches);
 
         let (working_schema, working_batches) = if needs_large_utf8 {
-            let schema = promote_utf8_schema(&self.schema);
+            let schema = promote_utf8_schema(&actual_schema);
             let batches = all_batches
                 .iter()
                 .map(|b| promote_utf8_batch(b))
                 .collect::<Result<Vec<_>>>()?;
             (schema, batches)
         } else {
-            (self.schema.clone(), all_batches)
+            (actual_schema, all_batches)
         };
 
         let batch = concat_batches(&working_schema, &working_batches)?;

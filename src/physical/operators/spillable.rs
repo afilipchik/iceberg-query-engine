@@ -960,6 +960,14 @@ impl SpillableHashAggregateExec {
                 batches = crate::physical::operators::filter_batches(batches, pred)?;
             }
         }
+        if std::env::var("QE_AGG_PROF").is_ok() {
+            use std::sync::atomic::Ordering as O;
+            eprintln!(
+                "[agg-prof] group-eval: {:.1}ms; agg-eval: {:.1}ms (cumulative across workers)",
+                crate::physical::morsel_agg::AGG_PROF_GROUP_NS.load(O::Relaxed) as f64 / 1e6,
+                crate::physical::morsel_agg::AGG_PROF_AGGEVAL_NS.load(O::Relaxed) as f64 / 1e6,
+            );
+        }
         if timing {
             eprintln!(
                 "[fused-agg] drain(join+scan+send): {:?}; workers done: {:?}; merge {} state-groups -> out: {:?}; worker busy sum: {:.1}ms; total: {:?}",

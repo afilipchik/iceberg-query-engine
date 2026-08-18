@@ -30,7 +30,7 @@ pub enum QueryError {
     Io(#[from] std::io::Error),
 
     #[error("Arrow error: {0}")]
-    Arrow(#[from] arrow::error::ArrowError),
+    Arrow(arrow::error::ArrowError),
 
     #[error("Parquet error: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),
@@ -49,6 +49,21 @@ pub enum QueryError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+}
+
+impl From<arrow::error::ArrowError> for QueryError {
+    fn from(e: arrow::error::ArrowError) -> Self {
+        // QE_ERR_BT=1: print where an arrow error entered the engine —
+        // schema-mismatch errors surface far from the operator that built
+        // the offending batch.
+        if std::env::var("QE_ERR_BT").is_ok() {
+            eprintln!(
+                "[err-bt] ArrowError: {e}\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+        QueryError::Arrow(e)
+    }
 }
 
 impl From<sqlparser::parser::ParserError> for QueryError {

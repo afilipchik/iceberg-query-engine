@@ -1519,6 +1519,23 @@ fn extract_join_key(arrays: &[ArrayRef], row: usize) -> JoinKey {
             if let Some(a) = arr.as_any().downcast_ref::<arrow::array::Date32Array>() {
                 return JoinValue::Int64(a.value(row) as i64);
             }
+            // Dictionary-encoded strings (small-build join gathers): resolve
+            // key -> value. Falling through to Null would make every row of a
+            // dict-keyed join compare equal — silent wrong matches.
+            if let Some(a) = arr
+                .as_any()
+                .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int32Type>>()
+            {
+                if let (Some(values), Some(key)) = (
+                    a.values()
+                        .as_any()
+                        .downcast_ref::<arrow::array::StringArray>(),
+                    a.key(row),
+                ) {
+                    return JoinValue::String(values.value(key).to_string());
+                }
+                return JoinValue::Null;
+            }
 
             JoinValue::Null
         })
@@ -1566,7 +1583,7 @@ fn create_combined_batch(
         build_columns.into_iter().chain(probe_columns).collect()
     };
 
-    RecordBatch::try_new(combined_schema.clone(), all_columns).map_err(Into::into)
+    batch_with_actual_types(combined_schema, all_columns)
 }
 
 /// Apply the non-equi part of an ON clause to the candidate (build row, probe
@@ -3322,10 +3339,30 @@ fn create_joined_batch(
         } else {
             build_indices.iter().map(|&(_, r)| r as u32).collect()
         };
+        // Small-build string columns come out DICTIONARY-encoded: the take
+        // indices already ARE dictionary keys into the build column, so the
+        // encoding is free, and it survives every downstream take-gather.
+        // What it buys: a group key like n_name (25 nations decorated onto
+        // 600M joined rows in Q9) reaches the aggregate as indices instead
+        // of strings — the per-row hash+verify of the string path was 40%
+        // of Q9's CPU at SF=100. 4096 keeps the values array trivially
+        // small and Int32 keys exact.
+        let dict_encode = build_batches[0].num_rows() <= 4096
+            && !matches!(std::env::var("QE_DICT_GATHER").as_deref(), Ok("0"));
         build_batches[0]
             .columns()
             .iter()
-            .map(|col| compute::take(col.as_ref(), &take_arr, None).map_err(Into::into))
+            .map(|col| {
+                if dict_encode && col.data_type() == &arrow::datatypes::DataType::Utf8 {
+                    let keys: arrow::array::Int32Array =
+                        take_arr.iter().map(|v| v.map(|u| u as i32)).collect();
+                    arrow::array::DictionaryArray::try_new(keys, col.clone())
+                        .map(|d| std::sync::Arc::new(d) as ArrayRef)
+                        .map_err(Into::into)
+                } else {
+                    compute::take(col.as_ref(), &take_arr, None).map_err(Into::into)
+                }
+            })
             .collect()
     } else {
         (0..build_batches[0].num_columns())
@@ -3359,7 +3396,38 @@ fn create_joined_batch(
         build_columns.into_iter().chain(probe_columns).collect()
     };
 
-    RecordBatch::try_new(output_schema.clone(), columns).map_err(Into::into)
+    batch_with_actual_types(output_schema, columns)
+}
+
+/// Build a RecordBatch, adjusting declared field types to the columns'
+/// ACTUAL types where they differ. Dictionary-encoded string columns (see
+/// the small-build encoding in `create_joined_batch`) legitimately carry
+/// `Dictionary(Int32, Utf8)` where the logical schema says `Utf8`;
+/// consumers resolve columns by name/position and either read dictionaries
+/// natively (the aggregation fast path) or normalize with a cast.
+fn batch_with_actual_types(declared: &SchemaRef, columns: Vec<ArrayRef>) -> Result<RecordBatch> {
+    let schema_matches = columns
+        .iter()
+        .zip(declared.fields())
+        .all(|(c, f)| c.data_type() == f.data_type());
+    let schema = if schema_matches {
+        declared.clone()
+    } else {
+        let fields: Vec<arrow::datatypes::Field> = declared
+            .fields()
+            .iter()
+            .zip(&columns)
+            .map(|(f, c)| {
+                if f.data_type() == c.data_type() {
+                    f.as_ref().clone()
+                } else {
+                    arrow::datatypes::Field::new(f.name(), c.data_type().clone(), true)
+                }
+            })
+            .collect();
+        std::sync::Arc::new(arrow::datatypes::Schema::new(fields))
+    };
+    RecordBatch::try_new(schema, columns).map_err(Into::into)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3412,10 +3480,25 @@ fn create_build_only_batch(
         } else {
             indices.iter().map(|&(_, r)| r as u32).collect()
         };
+        // Mirror create_joined_batch's small-build dictionary encoding so
+        // matched and unmatched batches from the same join carry identical
+        // schemas (a later concat of mixed encodings would fail loudly).
+        let dict_encode = build_batches[0].num_rows() <= 4096
+            && !matches!(std::env::var("QE_DICT_GATHER").as_deref(), Ok("0"));
         build_batches[0]
             .columns()
             .iter()
-            .map(|col| compute::take(col.as_ref(), &take_arr, None).map_err(Into::into))
+            .map(|col| {
+                if dict_encode && col.data_type() == &arrow::datatypes::DataType::Utf8 {
+                    let keys: arrow::array::Int32Array =
+                        take_arr.iter().map(|v| v.map(|u| u as i32)).collect();
+                    arrow::array::DictionaryArray::try_new(keys, col.clone())
+                        .map(|d| std::sync::Arc::new(d) as ArrayRef)
+                        .map_err(Into::into)
+                } else {
+                    compute::take(col.as_ref(), &take_arr, None).map_err(Into::into)
+                }
+            })
             .collect()
     } else {
         (0..build_batches[0].num_columns())
@@ -3446,7 +3529,7 @@ fn create_build_only_batch(
         build_columns.into_iter().chain(null_columns).collect()
     };
 
-    RecordBatch::try_new(output_schema.clone(), columns).map_err(Into::into)
+    batch_with_actual_types(output_schema, columns)
 }
 
 fn gather_column(

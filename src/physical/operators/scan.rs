@@ -296,32 +296,58 @@ impl PhysicalOperator for MemoryTableExec {
             .map(|(_, batch)| batch.clone())
             .collect();
 
+        // Re-wrapping with the logical schema preserves qualified names
+        // (e.g., "n1.n_name" vs "n2.n_name" for self-joins), but the FIELD
+        // TYPES must follow the actual columns: intermediate results routed
+        // through here (ExternalSortExec's in-memory path, subquery
+        // materialization) may carry dictionary-encoded string columns from
+        // small-build join gathers.
+        let rewrap = |columns: Vec<arrow::array::ArrayRef>| -> Result<RecordBatch> {
+            let types_match = columns
+                .iter()
+                .zip(self.schema.fields())
+                .all(|(c, f)| c.data_type() == f.data_type());
+            let schema = if types_match {
+                self.schema.clone()
+            } else {
+                Arc::new(arrow::datatypes::Schema::new(
+                    self.schema
+                        .fields()
+                        .iter()
+                        .zip(&columns)
+                        .map(|(f, c)| {
+                            if f.data_type() == c.data_type() {
+                                f.as_ref().clone()
+                            } else {
+                                arrow::datatypes::Field::new(f.name(), c.data_type().clone(), true)
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                ))
+            };
+            RecordBatch::try_new(schema, columns).map_err(Into::into)
+        };
         let batches = match &self.projection {
             Some(indices) => partition_batches
                 .iter()
                 .map(|batch| {
                     let columns: Vec<_> =
                         indices.iter().map(|&i| batch.column(i).clone()).collect();
-                    RecordBatch::try_new(self.schema.clone(), columns).map_err(Into::into)
+                    rewrap(columns)
                 })
                 .collect::<Result<Vec<_>>>()?,
-            None => {
-                // Re-wrap batches with the logical schema to preserve qualified names
-                // (e.g., "n1.n_name" vs "n2.n_name" for self-joins)
-                partition_batches
-                    .into_iter()
-                    .map(|batch| {
-                        if batch.schema() != self.schema
-                            && batch.num_columns() == self.schema.fields().len()
-                        {
-                            RecordBatch::try_new(self.schema.clone(), batch.columns().to_vec())
-                                .map_err(Into::into)
-                        } else {
-                            Ok(batch)
-                        }
-                    })
-                    .collect::<Result<Vec<_>>>()?
-            }
+            None => partition_batches
+                .into_iter()
+                .map(|batch| {
+                    if batch.schema() != self.schema
+                        && batch.num_columns() == self.schema.fields().len()
+                    {
+                        rewrap(batch.columns().to_vec())
+                    } else {
+                        Ok(batch)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?,
         };
 
         let stream = stream::iter(batches.into_iter().map(Ok));

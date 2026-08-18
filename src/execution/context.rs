@@ -388,6 +388,53 @@ impl ExecutionContext {
         let schema = physical.schema();
         let row_count: usize = all_batches.iter().map(|b| b.num_rows()).sum();
 
+        // Dictionary-encoded columns (small-build join gathers) are an
+        // internal representation; results hand plain arrays to formatters,
+        // CSV writers and tests. Cast at the boundary — proportional to
+        // OUTPUT size only.
+        let all_batches = all_batches
+            .into_iter()
+            .map(|b| {
+                if b.columns()
+                    .iter()
+                    .any(|c| matches!(c.data_type(), arrow::datatypes::DataType::Dictionary(_, _)))
+                {
+                    let cols: std::result::Result<Vec<_>, arrow::error::ArrowError> = b
+                        .columns()
+                        .iter()
+                        .map(|c| match c.data_type() {
+                            arrow::datatypes::DataType::Dictionary(_, v) => {
+                                arrow::compute::cast(c.as_ref(), v)
+                            }
+                            _ => Ok(c.clone()),
+                        })
+                        .collect();
+                    let cols =
+                        cols.map_err(|e| crate::error::QueryError::Execution(e.to_string()))?;
+                    let fields: Vec<arrow::datatypes::Field> = b
+                        .schema()
+                        .fields()
+                        .iter()
+                        .zip(cols.iter())
+                        .map(|(f, c): (_, &arrow::array::ArrayRef)| {
+                            arrow::datatypes::Field::new(
+                                f.name(),
+                                c.data_type().clone(),
+                                f.is_nullable(),
+                            )
+                        })
+                        .collect();
+                    RecordBatch::try_new(
+                        std::sync::Arc::new(arrow::datatypes::Schema::new(fields)),
+                        cols,
+                    )
+                    .map_err(|e| crate::error::QueryError::Execution(e.to_string()))
+                } else {
+                    Ok(b)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         Ok(QueryResult {
             schema,
             batches: all_batches,

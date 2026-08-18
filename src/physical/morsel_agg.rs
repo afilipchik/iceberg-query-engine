@@ -51,6 +51,10 @@ pub(crate) fn merge_entries_into_map(
 /// when the group count is large. Shared by MorselAggregateExec,
 /// HashAggregateExec's morsel-parallel path, and the fused streaming path in
 /// SpillableHashAggregateExec.
+/// QE_AGG_PROF=1 section timers (ns), printed by the fused-agg driver.
+pub static AGG_PROF_GROUP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static AGG_PROF_AGGEVAL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) fn merge_states_to_batches(
     states: Vec<AggregationState>,
     agg_funcs: &[AggregateFunction],
@@ -1285,17 +1289,22 @@ impl<'a> TypedArrayAccessor<'a> {
                     u64::MAX
                 } else {
                     // Key on the VALUE bytes, not the index: different row
-                    // groups/files may carry different dictionaries. Value
-                    // lookup is one indirection; bytes-pack matches the
-                    // String arm so mixed dict/plain states merge cleanly.
+                    // groups/files may carry different dictionaries. The
+                    // pack must be BYTE-IDENTICAL to the String arm below or
+                    // mixed dict/plain batches feeding one state split the
+                    // same string into two groups (it packed take(7) while
+                    // String packs min(8): every >=8-char value diverged —
+                    // caught as a distributed-Q9 wrong answer when join
+                    // gathers started emitting dictionaries).
                     let values = arr.values().as_any().downcast_ref::<StringArray>().unwrap();
                     let s = values.value(arr.key(row).unwrap_or(0));
-                    let b = s.as_bytes();
-                    let mut key = (b.len() as u64) << 56;
-                    for (i, &byte) in b.iter().take(7).enumerate() {
+                    let bytes = s.as_bytes();
+                    let len = bytes.len().min(8);
+                    let mut key = 0u64;
+                    for (i, &byte) in bytes.iter().take(len).enumerate() {
                         key |= (byte as u64) << (i * 8);
                     }
-                    key
+                    key | ((bytes.len() as u64) << 56)
                 }
             }
             TypedArrayAccessor::Int64(arr) => {
@@ -1700,15 +1709,30 @@ impl AggregationState {
             self.init_perfect_hash(group_by_exprs.len());
         }
 
+        let prof = std::env::var("QE_AGG_PROF").is_ok();
+        let t0 = prof.then(std::time::Instant::now);
         // Evaluate expressions once per batch
         let group_arrays: Vec<ArrayRef> = group_by_exprs
             .iter()
             .map(|expr| evaluate_expr(batch, expr))
             .collect::<Result<Vec<_>>>()?;
+        if let Some(t) = t0 {
+            AGG_PROF_GROUP_NS.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        let t1 = prof.then(std::time::Instant::now);
         let agg_arrays: Vec<ArrayRef> = agg_input_exprs
             .iter()
             .map(|expr| evaluate_expr(batch, expr))
             .collect::<Result<Vec<_>>>()?;
+        if let Some(t) = t1 {
+            AGG_PROF_AGGEVAL_NS.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
 
         // Pre-downcast for typed access
         let group_accessors: Vec<TypedArrayAccessor> = group_arrays
@@ -1725,25 +1749,81 @@ impl AggregationState {
         // perfect-hash index ONCE per distinct key combination per batch
         // (packed table lookup per row afterwards).
         if !self.overflowed && !group_by_exprs.is_empty() {
-            let dicts: Option<Vec<&arrow::array::DictionaryArray<arrow::datatypes::Int32Type>>> =
-                group_accessors
-                    .iter()
-                    .map(|a| match a {
-                        TypedArrayAccessor::DictString(d)
-                            if d.values().len() <= 64 && d.null_count() == 0 =>
-                        {
-                            Some(*d)
-                        }
-                        _ => None,
-                    })
-                    .collect();
-            if let Some(dicts) = dicts {
-                if dicts.len() <= 2 {
-                    let shift = 6 * (dicts.len() - 1);
-                    let table_size = 1usize << (6 * dicts.len());
+            // Fast combined-key components: a dictionary-encoded string's KEY
+            // INDEX, or a null-free integer column whose per-batch range fits
+            // 6 bits ((v - min) is the component — covers EXTRACT(YEAR ...)
+            // and other small derived ints, which is how join-decorated
+            // shapes like Q9's (n_name, o_year) reach this path).
+            enum FastComp<'k> {
+                Dict(&'k [i32]),
+                IntOff { vals: Vec<i64>, min: i64 },
+            }
+            impl FastComp<'_> {
+                #[inline]
+                fn component(&self, row: usize) -> usize {
+                    match self {
+                        FastComp::Dict(keys) => keys[row] as usize,
+                        FastComp::IntOff { vals, min } => (vals[row] - min) as usize,
+                    }
+                }
+            }
+            let int_comp = |vals: Vec<i64>| -> Option<FastComp<'static>> {
+                let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+                for &v in &vals {
+                    lo = lo.min(v);
+                    hi = hi.max(v);
+                }
+                if vals.is_empty() || hi - lo <= 63 {
+                    let min = if vals.is_empty() { 0 } else { lo };
+                    Some(FastComp::IntOff { vals, min })
+                } else {
+                    None
+                }
+            };
+            let comps: Option<Vec<FastComp>> = group_accessors
+                .iter()
+                .map(|a| match a {
+                    TypedArrayAccessor::DictString(d)
+                        if d.values().len() <= 64 && d.null_count() == 0 =>
+                    {
+                        Some(FastComp::Dict(d.keys().values()))
+                    }
+                    TypedArrayAccessor::Int64(arr) if arr.null_count() == 0 => {
+                        int_comp(arr.values().to_vec())
+                    }
+                    TypedArrayAccessor::Int32(arr) if arr.null_count() == 0 => {
+                        int_comp(arr.values().iter().map(|&v| v as i64).collect())
+                    }
+                    TypedArrayAccessor::Date32(arr) if arr.null_count() == 0 => {
+                        int_comp(arr.values().iter().map(|&v| v as i64).collect())
+                    }
+                    _ => None,
+                })
+                .collect();
+            // At least one DICTIONARY column must be present: an all-int key
+            // set is already served well by the raw-key path, and requiring a
+            // dict keeps this from hijacking shapes it wasn't measured on.
+            let comps = comps.filter(|c| {
+                c.iter().any(|k| matches!(k, FastComp::Dict(_)))
+                    && !matches!(std::env::var("QE_AGG_FAST").as_deref(), Ok("0"))
+            });
+            if std::env::var("QE_AGG_PATH").is_ok() {
+                eprintln!(
+                    "[agg-path] combined={} types={:?}",
+                    comps.as_ref().map(|c| c.len()).unwrap_or(0),
+                    group_arrays
+                        .iter()
+                        .map(|a| a.data_type().clone())
+                        .collect::<Vec<_>>()
+                );
+            }
+            if let Some(comps) = comps {
+                if comps.len() <= 2 {
+                    let shift = 6 * (comps.len() - 1);
+                    let table_size = 1usize << (6 * comps.len());
                     let mut table: Vec<u16> = vec![u16::MAX; table_size];
-                    let keys0 = dicts[0].keys().values();
-                    let keys1 = dicts.get(1).map(|d| d.keys().values());
+                    let keys0 = &comps[0];
+                    let keys1 = comps.get(1);
                     let all_f64_inputs = agg_accessors.iter().all(
                         |a| matches!(a, TypedArrayAccessor::Float64(arr) if arr.null_count() == 0),
                     );
@@ -1762,13 +1842,25 @@ impl AggregationState {
                     };
                     for row in 0..num_rows {
                         let packed = match keys1 {
-                            Some(k1) => ((keys0[row] as usize) << shift) | (k1[row] as usize),
-                            None => keys0[row] as usize,
+                            Some(k1) => (keys0.component(row) << shift) | k1.component(row),
+                            None => keys0.component(row),
                         };
                         let mut idx = table[packed] as usize;
                         if idx == u16::MAX as usize {
+                            // A new key id can change the perfect-hash
+                            // STRIDES, which MOVES every existing group's
+                            // flat index — cached table entries then point
+                            // at other groups' accumulators. Detect the
+                            // stride change and drop the cache. (This was
+                            // latent in the dict-only version of this path:
+                            // it survived only when discovery order never
+                            // rehashed after the first cache fills.)
+                            let strides_before = self.key_strides.clone();
                             match self.get_or_assign_perfect_index(&group_accessors, row) {
                                 Some(i) => {
+                                    if self.key_strides != strides_before {
+                                        table.iter_mut().for_each(|t| *t = u16::MAX);
+                                    }
                                     table[packed] = i as u16;
                                     idx = i;
                                 }

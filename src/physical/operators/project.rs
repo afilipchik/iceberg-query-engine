@@ -152,12 +152,39 @@ fn project_batch(
         })
         .collect();
 
+    // Dictionary-encoded columns pass through Column projections unchanged
+    // (small-build join gathers); adjust declared field types to the actual
+    // array types so the batch validates. See hash_join's
+    // batch_with_actual_types for the contract.
+    let schema = if columns
+        .iter()
+        .zip(schema.fields())
+        .all(|(c, f)| c.data_type() == f.data_type())
+    {
+        schema.clone()
+    } else {
+        Arc::new(arrow::datatypes::Schema::new(
+            schema
+                .fields()
+                .iter()
+                .zip(&columns)
+                .map(|(f, c)| {
+                    if f.data_type() == c.data_type() {
+                        f.as_ref().clone()
+                    } else {
+                        arrow::datatypes::Field::new(f.name(), c.data_type().clone(), true)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ))
+    };
+
     // Row count must be stated explicitly: a projection may legitimately have
     // no columns (`SELECT COUNT(*)` shapes reduced to nothing), and a batch
     // with no columns cannot infer its length.
     let options =
         arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-    RecordBatch::try_new_with_options(schema.clone(), columns, &options).map_err(Into::into)
+    RecordBatch::try_new_with_options(schema, columns, &options).map_err(Into::into)
 }
 
 #[cfg(test)]
