@@ -335,3 +335,20 @@ like-for-like.** Remaining residues, all at measured floors: Q18 7.5s
 scan-side ratios. The next structural lever would be true streaming
 fusion (skip materializing final-join outputs entirely) or the owned
 storage format — both program-scale.
+
+## CCPM streaming-fusion epic (2026-08-18) — 65.1s; the intermediate-vector lesson
+
+001 re-attributed post-pruning and CORRECTED the fusion premise: the
+aggregate's expression work only relocates onto the same core budget
+(the fused streaming agg already overlaps) — the removable cost was the
+probe's INTERMEDIATE VECTORS: matches Vec<(u32,u32,u32)> re-packed into
+(usize,usize)/usize index vectors, ~24GB of write+readback on Q9 alone.
+`probe_batch_into` (closure emission) + `create_joined_batch_u32` now
+feed u32 take vectors directly on the Inner/unfiltered fast layouts.
+**SF=100 66.1→65.1s, Q9 12.1s, Q9-lance 12.7s; all cell-exact.** The
+full scalar fused sink was declined: remaining ceiling ~1s spread thin.
+
+Day total: 89.3 → 65.1s (2.23x → 1.62x like-for-like, 0.97x native).
+What remains is decode/bandwidth-floor territory: Q18 7.4s (150M-group
+subquery), Q1 2.8x / Q16 2.7x (scan-side) — the owned-format /
+decode-path programs.

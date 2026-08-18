@@ -1007,7 +1007,7 @@ Based on the codebase structure, these appear to be planned but not fully implem
 
 | storage | engine | DuckDB on the SAME files | ratio |
 |---|---|---|---|
-| parquet (identical files) | **66.1s** | 40.1s (`read_parquet` views) | **1.65x** |
+| parquet (identical files) | **65.1s** | 40.1s (`read_parquet` views) | **1.62x** |
 | lance (identical files) | ~101s (high variance, see below) | 69.1s (community `lance` ext) | ~1.47x |
 | DuckDB native (in-mem) | — | 65.8s (Q9 alone 36.4s) | — |
 
@@ -1049,9 +1049,10 @@ bitmap-pruned). Run: `benchmark-lance --path data/tpch-100gb-lance --sf 100`.
 
 ## TPC-H Benchmark Status (SF=100, 2026-08-18)
 
-**66.1s vs DuckDB native 67.1s = 0.99x — the engine now runs the suite
+**65.1s vs DuckDB native 67.1s = 0.97x — the engine runs the suite
 FASTER than DuckDB's own native tables; vs DuckDB on the same parquet
-40.1s = 1.65x; 22/22 cell-valid.** Join-output pruning (ON-only columns
+40.1s = 1.62x; 22/22 cell-valid.** Direct u32 match emission (commit
+609509d) added Q9 13.6->12.1s on top of join-output pruning. Join-output pruning (ON-only columns
 never gathered, commit 8d2a2b3) took Q9 18.7->13.6s on top of the
 duckdb-parity epic's wins; `examples/radix_bench.rs` records why radix
 partitioning is REFUTED on this box (probes are MLP-bound at 3.8ns/row). Q6/Q9/Q15/Q19 run faster than native
