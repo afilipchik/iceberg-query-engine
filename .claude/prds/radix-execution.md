@@ -1,7 +1,7 @@
 ---
 name: radix-execution
 description: Radix-partitioned (cache-resident) hash join probes and high-NDV aggregation to attack the Q9/Q18-class CPU-saturation residue left by the duckdb-parity epic
-status: backlog
+status: completed
 created: 2026-08-18T14:18:20Z
 ---
 

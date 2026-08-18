@@ -303,3 +303,35 @@ at 58% memory pressure during this epic's SF=100 window; every heavy
 command now runs through `scripts/oomsafe.sh` (own transient scope =
 oomd kill target; MemoryHigh only for builds — it counts page cache and
 throttled a capped benchmark sweep +2.2s).
+
+## CCPM radix-execution epic (2026-08-18) — 66.1s: the engine passes DuckDB native
+
+Evidence-first epic that REFUTED its own premise and won anyway:
+
+1. `examples/radix_bench.rs`: a VHT-mirror monolithic table probes at
+   **3.8 ns/row wall on 32 threads** — out-of-order cores sustain ~10
+   overlapping misses (memory-level parallelism), so radix partitioning
+   LOSES at every P (0.88–0.95x). Radix joins AND radix aggregation are
+   refuted on this hardware; the "DRAM-latency-chain" model behind
+   PARITY-PLAN 2b was wrong for probes.
+2. `HJ_PROF=1` phase attribution: Q9's cost was never the hash lookup —
+   gather+batch construction was ~75% of the partsupp probe pipeline.
+3. **Join-output pruning** (the actual fix): a planner usage pre-pass
+   records which output columns each Inner join's ancestors reference;
+   the physical join drops the rest — ON-only keys like
+   ps_partkey/ps_suppkey/o_orderkey — from its output schema, row store
+   (stride 24B→8B) and every gather. `QE_JOIN_PRUNE=0` / 
+   `QE_PRUNE_DEBUG=1`.
+
+**Final: SF=100 parquet 66.1s warm, 22/22 cell-valid — FASTER than
+DuckDB's native-table baseline (67.1s, 0.9x) and 1.65x DuckDB on the
+identical parquet (40.1s). Q9 13.6s (epic gate ≤15s MET). Lance
+inherits: Q9-lance 20.8→15.2s, SF=10-lance 6.87s ALL 22 CELL-EXACT.
+SF=10 parquet 7.55s cell-exact. 14/14 suites green.**
+
+Session total (both epics): **89.3 → 66.1s (−26%), 2.23x → 1.65x
+like-for-like.** Remaining residues, all at measured floors: Q18 7.5s
+(150M-group subquery at ~bandwidth + second lineitem pass), Q1/Q16
+scan-side ratios. The next structural lever would be true streaming
+fusion (skip materializing final-join outputs entirely) or the owned
+storage format — both program-scale.

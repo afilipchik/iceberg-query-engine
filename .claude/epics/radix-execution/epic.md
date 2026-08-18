@@ -1,9 +1,9 @@
 ---
 name: radix-execution
-status: backlog
+status: completed
 created: 2026-08-18T14:18:20Z
 updated: 2026-08-18T14:18:20Z
-progress: 0%
+progress: 100%
 prd: .claude/prds/radix-execution.md
 github: (will be set on sync)
 ---
@@ -102,3 +102,22 @@ Total tasks: 5
 Parallel tasks: 1
 Sequential tasks: 4
 Estimated total effort: 15-29 hours (one hour if 001 says stop)
+
+## Epic close-out (2026-08-18)
+
+The kill-switch epic worked exactly as designed: task 001's
+microbenchmark REFUTED radix partitioning in under an hour (probes are
+memory-level-parallelism-bound at 3.8 ns/row wall; scatter only adds
+work), task 002's HJ_PROF attribution named the real cost
+(gather+batch ~75% of Q9's probe pipeline), and task 003 shipped the
+fix that evidence pointed at instead: **join-output pruning** — ON-only
+columns dropped from Inner-join outputs, row stores and gathers.
+
+**SF=100 parquet 72.7 → 66.1s (0.9x DuckDB NATIVE — first time under),
+1.65x like-for-like. Q9 18.7 → 13.6s (gate MET). Lance: Q9 20.8 → 15.2s,
+SF=10 6.87s ALL CELL-EXACT. No regressions; 14/14 suites green.**
+Task 004 (radix aggregation) refuted without implementation by the same
+MLP argument. Q18's ≤6.5s gate not met — its residue is at measured
+bandwidth floors, recorded in PARITY-PLAN.
+
+Commits: e817a6a (scaffolding), 8d2a2b3 (pruning + profiler + bench).
