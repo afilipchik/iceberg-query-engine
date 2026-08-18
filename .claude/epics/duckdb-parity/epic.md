@@ -3,7 +3,7 @@ name: duckdb-parity
 status: in-progress
 created: 2026-08-18T00:32:07Z
 updated: 2026-08-18T00:32:07Z
-progress: 12%
+progress: 50%
 prd: .claude/prds/duckdb-parity.md
 github: (will be set on sync)
 ---
