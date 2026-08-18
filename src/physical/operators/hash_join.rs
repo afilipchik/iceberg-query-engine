@@ -412,6 +412,76 @@ impl VectorizedHashTable {
     /// Probe the hash table with a batch of probe keys.
     /// Returns matched (build_batch_idx, build_row_idx, probe_row_idx) triples.
     #[inline]
+    /// Closure-emitting probe for the fast key layouts (direct-address and
+    /// zero-copy i64). Returns false when only the generic layout can serve
+    /// — the caller then uses `probe_batch`. Exists because materializing
+    /// matches as Vec<(u32,u32,u32)> and re-packing them into
+    /// (usize,usize)/usize index vectors cost ~24GB of write+readback on
+    /// Q9's two 604M-row joins (HJ_PROF idx-build ~37s cumulative).
+    fn probe_batch_into(
+        &self,
+        probe_key_arrays: &[ArrayRef],
+        num_rows: usize,
+        mut emit: impl FnMut(u32, u32, u32),
+    ) -> bool {
+        if let Some((kmin, kmax)) = self.direct {
+            if let Some(pa) = probe_key_arrays[0].as_any().downcast_ref::<Int64Array>() {
+                let vals = pa.values();
+                let nulls = pa.nulls();
+                for probe_row in 0..num_rows {
+                    if let Some(nb) = nulls {
+                        if !nb.is_valid(probe_row) {
+                            continue;
+                        }
+                    }
+                    let k = vals[probe_row];
+                    if k < kmin || k > kmax {
+                        continue;
+                    }
+                    let mut entry = self.heads[(k - kmin) as usize];
+                    while entry != u32::MAX {
+                        let (bb, br) = self.entries[entry as usize];
+                        emit(bb, br, probe_row as u32);
+                        entry = self.next[entry as usize];
+                    }
+                }
+                return true;
+            }
+        }
+        if let Some(build_bufs) = &self.i64_key_bufs {
+            let probe_bufs: Option<Vec<&Int64Array>> = probe_key_arrays
+                .iter()
+                .map(|a| a.as_any().downcast_ref::<Int64Array>())
+                .collect();
+            if let Some(probe_arrs) = probe_bufs {
+                let hashes = vectorized_hash::hash_arrays(probe_key_arrays, num_rows);
+                for probe_row in 0..num_rows {
+                    if probe_arrs.iter().any(|a| a.is_null(probe_row)) {
+                        continue;
+                    }
+                    let bucket = hashes[probe_row] as usize & self.mask;
+                    let mut entry = self.heads[bucket];
+                    while entry != u32::MAX {
+                        let (bb, br) = self.entries[entry as usize];
+                        let mut eq = true;
+                        for (col, pa) in probe_arrs.iter().enumerate() {
+                            if build_bufs[col][bb as usize][br as usize] != pa.value(probe_row) {
+                                eq = false;
+                                break;
+                            }
+                        }
+                        if eq {
+                            emit(bb, br, probe_row as u32);
+                        }
+                        entry = self.next[entry as usize];
+                    }
+                }
+                return true;
+            }
+        }
+        false
+    }
+
     fn probe_batch(&self, probe_key_arrays: &[ArrayRef], num_rows: usize) -> Vec<(u32, u32, u32)> {
         let mut matches = Vec::new();
 
@@ -2493,6 +2563,15 @@ fn probe_vectorized(
                     acc.fetch_add(t.elapsed().as_nanos() as u64, AOrd::Relaxed);
                 }
             };
+            // Direct-emission fast path: Inner + no filter + (row store or a
+            // single concat'd build batch) — matches go straight into u32
+            // take vectors, skipping the tuple Vec and the usize re-pack
+            // (Q9: ~24GB of intermediate traffic across its two big joins).
+            let u32_path = filter.is_none()
+                && (row_store
+                    .map(|(st, _)| st.nrows < u32::MAX as usize)
+                    .unwrap_or(false)
+                    || build_batches.len() <= 1);
             let batch_results: Vec<Result<Option<RecordBatch>>> = probe_batches
                 .par_iter()
                 .map(|probe_batch| {
@@ -2504,6 +2583,53 @@ fn probe_vectorized(
                     let probe_key_arrays = probe_key_arrays?;
                     lap(t, &t_key);
                     let n_rows = probe_batch.num_rows();
+                    if u32_path {
+                        let t = clk(prof);
+                        let mut build_rows: Vec<u32> = Vec::with_capacity(n_rows);
+                        let mut probe_rows: Vec<u32> = Vec::with_capacity(n_rows);
+                        let served = match row_store {
+                            Some((_, offs)) => {
+                                vht.probe_batch_into(&probe_key_arrays, n_rows, |bb, br, pr| {
+                                    build_rows.push((offs[bb as usize] + br as usize) as u32);
+                                    probe_rows.push(pr);
+                                })
+                            }
+                            None => {
+                                vht.probe_batch_into(&probe_key_arrays, n_rows, |bb, br, pr| {
+                                    debug_assert_eq!(bb, 0);
+                                    build_rows.push(br);
+                                    probe_rows.push(pr);
+                                })
+                            }
+                        };
+                        lap(t, &t_probe);
+                        if served {
+                            if build_rows.is_empty() {
+                                return Ok(None);
+                            }
+                            let t = clk(prof);
+                            let pruned_probe;
+                            let gather_probe: &RecordBatch = match probe_keep {
+                                Some(keep) if keep.iter().any(|k| !k) => {
+                                    pruned_probe = prune_batch_columns(probe_batch, keep);
+                                    &pruned_probe
+                                }
+                                _ => probe_batch,
+                            };
+                            let batch = create_joined_batch_u32(
+                                build_batches,
+                                gather_probe,
+                                build_rows,
+                                probe_rows,
+                                swapped,
+                                output_schema,
+                                row_store,
+                            )?;
+                            lap(t, &t_gather);
+                            return Ok(Some(batch));
+                        }
+                        // Generic key layout: fall through to the tuple path.
+                    }
                     let t = clk(prof);
                     let matches = vht.probe_batch(&probe_key_arrays, n_rows);
                     lap(t, &t_probe);
@@ -3568,6 +3694,115 @@ fn create_joined_batch(
 /// `Dictionary(Int32, Utf8)` where the logical schema says `Utf8`;
 /// consumers resolve columns by name/position and either read dictionaries
 /// natively (the aggregation fast path) or normalize with a cast.
+/// Row-store gather where the row ids are already GLOBAL (offsets applied
+/// at emission). Mirror of `gather_build_from_row_store` minus the
+/// per-match (batch_idx, row_idx) resolution.
+fn gather_build_from_row_store_global(store: &RowStore, rows: &[u32]) -> Vec<ArrayRef> {
+    use arrow::datatypes::DataType;
+    enum Buf {
+        I64(Vec<i64>),
+        F64(Vec<f64>),
+        I32(Vec<i32>),
+        D32(Vec<i32>),
+    }
+    let n = rows.len();
+    let mut bufs: Vec<Buf> = store
+        .cols
+        .iter()
+        .map(|(_, _, dt)| match dt {
+            DataType::Int64 => Buf::I64(Vec::with_capacity(n)),
+            DataType::Float64 => Buf::F64(Vec::with_capacity(n)),
+            DataType::Int32 => Buf::I32(Vec::with_capacity(n)),
+            DataType::Date32 => Buf::D32(Vec::with_capacity(n)),
+            _ => unreachable!("row-store eligibility admits only fixed-width columns"),
+        })
+        .collect();
+    let stride = store.stride;
+    for &row in rows {
+        let base = row as usize * stride;
+        for (k, &(off, _, _)) in store.cols.iter().enumerate() {
+            let p = base + off;
+            match &mut bufs[k] {
+                Buf::I64(v) => v.push(i64::from_le_bytes(store.data[p..p + 8].try_into().unwrap())),
+                Buf::F64(v) => v.push(f64::from_le_bytes(store.data[p..p + 8].try_into().unwrap())),
+                Buf::I32(v) | Buf::D32(v) => {
+                    v.push(i32::from_le_bytes(store.data[p..p + 4].try_into().unwrap()))
+                }
+            }
+        }
+    }
+    bufs.into_iter()
+        .map(|b| -> ArrayRef {
+            match b {
+                Buf::I64(v) => Arc::new(Int64Array::from(v)),
+                Buf::F64(v) => Arc::new(arrow::array::Float64Array::from(v)),
+                Buf::I32(v) => Arc::new(arrow::array::Int32Array::from(v)),
+                Buf::D32(v) => Arc::new(arrow::array::Date32Array::from(v)),
+            }
+        })
+        .collect()
+}
+
+/// Joined-batch construction from u32 row ids emitted DIRECTLY by
+/// `probe_batch_into` — no intermediate match tuples, no usize index
+/// vectors, no take-array rebuild. Inner/unfiltered fast path only:
+/// `build_rows` are single-batch row ids, or GLOBAL rows when a row
+/// store serves the gather.
+#[allow(clippy::too_many_arguments)]
+fn create_joined_batch_u32(
+    build_batches: &[RecordBatch],
+    probe_batch: &RecordBatch,
+    build_rows: Vec<u32>,
+    probe_rows: Vec<u32>,
+    swapped: bool,
+    output_schema: &SchemaRef,
+    row_store: Option<(&RowStore, &[usize])>,
+) -> Result<RecordBatch> {
+    let build_columns: Vec<ArrayRef> = if let Some((store, _)) = row_store {
+        gather_build_from_row_store_global(store, &build_rows)
+    } else if build_batches.is_empty() || build_batches[0].num_columns() == 0 {
+        Vec::new()
+    } else {
+        let dict_encode = build_batches[0].num_rows() <= 4096;
+        let take_arr = UInt32Array::from(build_rows);
+        build_batches[0]
+            .columns()
+            .iter()
+            .map(|col| {
+                if dict_encode && col.data_type() == &arrow::datatypes::DataType::Utf8 {
+                    let keys: arrow::array::Int32Array =
+                        take_arr.iter().map(|v| v.map(|u| u as i32)).collect();
+                    arrow::array::DictionaryArray::try_new(keys, col.clone())
+                        .map(|d| std::sync::Arc::new(d) as ArrayRef)
+                        .map_err(Into::into)
+                } else {
+                    compute::take(col.as_ref(), &take_arr, None).map_err(Into::into)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    let identity = probe_rows.len() == probe_batch.num_rows()
+        && probe_rows.iter().enumerate().all(|(i, &p)| p as usize == i);
+    let probe_columns: Vec<ArrayRef> = if identity {
+        probe_batch.columns().to_vec()
+    } else {
+        let probe_index_arr = UInt32Array::from(probe_rows);
+        probe_batch
+            .columns()
+            .iter()
+            .map(|col| compute::take(col.as_ref(), &probe_index_arr, None).map_err(Into::into))
+            .collect::<Result<Vec<ArrayRef>>>()?
+    };
+
+    let columns: Vec<ArrayRef> = if swapped {
+        probe_columns.into_iter().chain(build_columns).collect()
+    } else {
+        build_columns.into_iter().chain(probe_columns).collect()
+    };
+    batch_with_actual_types(output_schema, columns)
+}
+
 /// Column-subset view of a batch (Arc-level, no data copy). Used by
 /// join-output pruning to drop ON-only probe columns after key eval.
 fn prune_batch_columns(b: &RecordBatch, keep: &[bool]) -> RecordBatch {
