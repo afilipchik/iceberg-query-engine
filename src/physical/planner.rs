@@ -54,6 +54,12 @@ pub struct PhysicalPlanner {
             ),
         >,
     >,
+    /// Per-Inner-join ancestor reference sets keyed by `&JoinNode` address,
+    /// computed by `analyze_join_output_usage` before planning. At join
+    /// construction the refs become a retention mask over the PHYSICAL
+    /// (left ++ right) output columns: unmatched columns (typically
+    /// ON-only keys) are dropped from the join's output and never gathered.
+    join_retained: RefCell<HashMap<usize, Vec<crate::planner::Column>>>,
 }
 
 impl Default for PhysicalPlanner {
@@ -74,6 +80,7 @@ impl PhysicalPlanner {
             cte_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             pending_agg_filter: RefCell::new(None),
             streaming_scans: RefCell::new(HashMap::new()),
+            join_retained: RefCell::new(HashMap::new()),
         }
     }
 
@@ -88,6 +95,7 @@ impl PhysicalPlanner {
             cte_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             pending_agg_filter: RefCell::new(None),
             streaming_scans: RefCell::new(HashMap::new()),
+            join_retained: RefCell::new(HashMap::new()),
         }
     }
 
@@ -876,6 +884,97 @@ impl PhysicalPlanner {
     }
 
     /// Convert a logical plan to a physical plan
+    /// Top-down walk computing, per Inner join, which of its output columns
+    /// any ANCESTOR references. `needed == None` means "assume everything"
+    /// (the safe default for shapes this walk doesn't model). Conservative
+    /// by construction: a wrong mask can only KEEP too much (no pruning
+    /// benefit), never drop a referenced column — every reference set is a
+    /// superset of true usage, and unmodelled nodes reset to None.
+    fn analyze_join_output_usage(
+        &self,
+        plan: &LogicalPlan,
+        needed: Option<Vec<crate::planner::Column>>,
+    ) {
+        use crate::optimizer::rules::eager_aggregation::collect_columns;
+        use crate::planner::Column;
+        let refs_of = |exprs: &[&Expr]| -> Option<Vec<Column>> {
+            // A subquery inside any expression can reference columns this
+            // walk cannot see; give up on the whole subtree.
+            if exprs.iter().any(|e| e.contains_subquery()) {
+                return None;
+            }
+            let mut out = Vec::new();
+            for e in exprs {
+                collect_columns(e, &mut out);
+            }
+            Some(out)
+        };
+        let extend =
+            |base: &Option<Vec<Column>>, more: Option<Vec<Column>>| -> Option<Vec<Column>> {
+                match (base, more) {
+                    (Some(b), Some(mut m)) => {
+                        m.extend(b.iter().cloned());
+                        Some(m)
+                    }
+                    _ => None,
+                }
+            };
+        match plan {
+            LogicalPlan::Project(n) => {
+                let child = refs_of(&n.exprs.iter().collect::<Vec<_>>());
+                self.analyze_join_output_usage(&n.input, child);
+            }
+            LogicalPlan::Aggregate(n) => {
+                let exprs: Vec<&Expr> = n.group_by.iter().chain(n.aggregates.iter()).collect();
+                let child = refs_of(&exprs);
+                self.analyze_join_output_usage(&n.input, child);
+            }
+            LogicalPlan::Filter(n) => {
+                let child = extend(&needed, refs_of(&[&n.predicate]));
+                self.analyze_join_output_usage(&n.input, child);
+            }
+            LogicalPlan::Sort(n) => {
+                let keys: Vec<&Expr> = n.order_by.iter().map(|s| &s.expr).collect();
+                let child = extend(&needed, refs_of(&keys));
+                self.analyze_join_output_usage(&n.input, child);
+            }
+            LogicalPlan::Limit(n) => {
+                self.analyze_join_output_usage(&n.input, needed);
+            }
+            LogicalPlan::Join(n) => {
+                if n.join_type == crate::planner::JoinType::Inner && n.filter.is_none() {
+                    if let Some(need) = &needed {
+                        self.join_retained
+                            .borrow_mut()
+                            .insert(n as *const _ as usize, need.clone());
+                    }
+                }
+                let mut on_refs: Vec<&Expr> = Vec::new();
+                for (l, r) in &n.on {
+                    on_refs.push(l);
+                    on_refs.push(r);
+                }
+                if let Some(f) = &n.filter {
+                    on_refs.push(f);
+                }
+                let child = extend(&needed, refs_of(&on_refs));
+                self.analyze_join_output_usage(&n.left, child.clone());
+                self.analyze_join_output_usage(&n.right, child);
+            }
+            LogicalPlan::Scan(_)
+            | LogicalPlan::EmptyRelation(_)
+            | LogicalPlan::Values(_)
+            | LogicalPlan::DelimGet(_) => {}
+            // Distinct/Union/SubqueryAlias/DelimJoin/VectorSearch and anything
+            // else: semantics not modelled — everything below is needed.
+            other => {
+                for child in other.children() {
+                    self.analyze_join_output_usage(child, None);
+                }
+            }
+        }
+    }
+
     pub fn create_physical_plan(&self, logical: &LogicalPlan) -> Result<Arc<dyn PhysicalOperator>> {
         // Pre-materialize CTEs that are referenced multiple times to ensure
         // identical results (avoids floating-point non-determinism from parallel aggregation).
@@ -892,6 +991,15 @@ impl PhysicalPlanner {
         self.materialize_shared_ctes(logical)?;
         // Pre-scan tables that are accessed multiple times to avoid redundant parquet reads
         self.prescan_shared_tables(logical);
+        // Join-output pruning analysis: which columns of each Inner join's
+        // output do its ANCESTORS actually reference? ON-only columns (the
+        // usual case: surrogate keys) are dead the instant the probe
+        // completes, yet the join gathers, materializes and ships them
+        // through every downstream batch. Q9 at SF=100 dragged
+        // ps_partkey+ps_suppkey (2 of the partsupp build's 3 columns) and
+        // o_orderkey through ~604M-row gathers this way — HJ_PROF measured
+        // gather+batch at ~75% of the probe pipeline.
+        self.analyze_join_output_usage(logical, None);
         self.create_physical_plan_inner(logical)
     }
 
@@ -1244,6 +1352,51 @@ impl PhysicalPlanner {
                     .with_build_right(build_right_for_left);
                     join.probe_runtime_filter = probe_rt_filter.clone();
                     join.probe_runtime_filter_pair = rt_pair;
+                    // Join-output pruning: match the ancestors' reference set
+                    // against the PHYSICAL (left ++ right) columns; unmatched
+                    // ones are ON-only and never gathered. Physical field
+                    // names may carry a dotted qualifier ("n1.n_name").
+                    let retained_mask: Option<Vec<bool>> = self
+                        .join_retained
+                        .borrow()
+                        .get(&(node as *const _ as usize))
+                        .filter(|_| !matches!(std::env::var("QE_JOIN_PRUNE").as_deref(), Ok("0")))
+                        .map(|need| {
+                            let schemas: Vec<SchemaRef> =
+                                join.children().iter().map(|c| c.schema()).collect();
+                            schemas
+                                .iter()
+                                .flat_map(|sc| sc.fields().iter())
+                                .map(|f| {
+                                    let (frel, fname) = match f.name().split_once('.') {
+                                        Some((r, n)) => (Some(r), n),
+                                        None => (None, f.name().as_str()),
+                                    };
+                                    need.iter().any(|c| {
+                                        c.name.eq_ignore_ascii_case(fname)
+                                            && match (&c.relation, frel) {
+                                                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                                                _ => true,
+                                            }
+                                    })
+                                })
+                                .collect()
+                        })
+                        .filter(|m: &Vec<bool>| m.iter().any(|k| !k) && m.iter().any(|k| *k));
+                    if std::env::var("QE_PRUNE_DEBUG").is_ok() {
+                        if let Some(m) = &retained_mask {
+                            eprintln!(
+                                "[prune] join wired: {} of {} cols kept (on: {:?})",
+                                m.iter().filter(|k| **k).count(),
+                                m.len(),
+                                node.on
+                                    .iter()
+                                    .map(|(l, r)| format!("{l}={r}"))
+                                    .collect::<Vec<_>>()
+                            );
+                        }
+                    }
+                    join.set_retained(retained_mask);
 
                     // Semi/Anti and the outer join types evaluate the ON
                     // predicate inside the join; only Inner/Cross may post-filter

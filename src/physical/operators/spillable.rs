@@ -98,6 +98,8 @@ pub struct SpillableHashJoinExec {
     pub probe_runtime_filter: Option<crate::physical::operators::SharedRuntimeFilter>,
     /// Which equi pair the runtime filter applies to.
     pub probe_runtime_filter_pair: usize,
+    /// Join-output retention mask (see HashJoinExec::retained).
+    pub retained: Option<Vec<bool>>,
     left: Arc<dyn PhysicalOperator>,
     right: Arc<dyn PhysicalOperator>,
     on: Vec<(Expr, Expr)>,
@@ -191,6 +193,7 @@ impl SpillableHashJoinExec {
             build_decision: OnceCell::new(),
             probe_runtime_filter: None,
             probe_runtime_filter_pair: 0,
+            retained: None,
         }
     }
 
@@ -204,6 +207,29 @@ impl SpillableHashJoinExec {
     pub fn with_filter(mut self, filter: Option<Expr>) -> Self {
         self.filter = filter;
         self
+    }
+
+    /// Join-output retention mask over the FULL (left ++ right) column
+    /// order: false = no ancestor references the column (ON-only keys), so
+    /// it is dropped from the output schema and never gathered. Inner,
+    /// unfiltered joins only — set by the planner's usage analysis.
+    pub fn set_retained(&mut self, mask: Option<Vec<bool>>) {
+        if let Some(m) = &mask {
+            if m.len() == self.schema.fields().len() {
+                let fields: Vec<_> = self
+                    .schema
+                    .fields()
+                    .iter()
+                    .zip(m)
+                    .filter(|(_, keep)| **keep)
+                    .map(|(f, _)| f.clone())
+                    .collect();
+                self.schema = Arc::new(Schema::new(fields));
+            } else {
+                return;
+            }
+        }
+        self.retained = mask;
     }
 }
 
@@ -311,6 +337,7 @@ impl PhysicalOperator for SpillableHashJoinExec {
                         .with_build_right(self.build_right);
                         hj.probe_runtime_filter = self.probe_runtime_filter.clone();
                         hj.probe_runtime_filter_pair = self.probe_runtime_filter_pair;
+                        hj.set_retained(self.retained.clone());
                         Arc::new(hj)
                     } else {
                         let mut hj = crate::physical::operators::HashJoinExec::new(
@@ -322,6 +349,7 @@ impl PhysicalOperator for SpillableHashJoinExec {
                         .with_build_right(self.build_right);
                         hj.probe_runtime_filter = self.probe_runtime_filter.clone();
                         hj.probe_runtime_filter_pair = self.probe_runtime_filter_pair;
+                        hj.set_retained(self.retained.clone());
                         Arc::new(hj)
                     };
                     Ok::<_, QueryError>(BuildDecision::InMemory(hash_join))
@@ -558,6 +586,7 @@ impl SpillableHashJoinExec {
                                 self.join_type,
                                 swapped,
                                 &self.schema,
+                                self.retained.as_deref(),
                             )?;
                             results.extend(matched);
                         }
@@ -606,6 +635,7 @@ impl SpillableHashJoinExec {
             self.join_type,
             swapped,
             &self.schema,
+            self.retained.as_deref(),
         )
     }
 }
@@ -2330,6 +2360,7 @@ fn build_hash_table(
     Ok(table)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn probe_partition(
     build_batches: &[RecordBatch],
     probe_batches: &[RecordBatch],
@@ -2338,6 +2369,7 @@ fn probe_partition(
     _join_type: JoinType, // TODO: handle all join types
     swapped: bool,
     output_schema: &SchemaRef,
+    retained: Option<&[bool]>,
 ) -> Result<Vec<RecordBatch>> {
     // Simplified probe - for inner join only
     // Full implementation would handle all join types
@@ -2376,6 +2408,7 @@ fn probe_partition(
                 &probe_indices,
                 swapped,
                 output_schema,
+                retained,
             )?;
             results.push(batch);
         }
@@ -2384,6 +2417,7 @@ fn probe_partition(
     Ok(results)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_joined_batch(
     build_batches: &[RecordBatch],
     probe_batch: &RecordBatch,
@@ -2391,6 +2425,7 @@ fn create_joined_batch(
     probe_indices: &[usize],
     swapped: bool,
     output_schema: &SchemaRef,
+    retained: Option<&[bool]>,
 ) -> Result<RecordBatch> {
     // Gather build columns
     let build_columns: Result<Vec<ArrayRef>> = if build_batches.is_empty() {
@@ -2417,6 +2452,19 @@ fn create_joined_batch(
         probe_columns.into_iter().chain(build_columns).collect()
     } else {
         build_columns.into_iter().chain(probe_columns).collect()
+    };
+
+    // Retention mask (join-output pruning): the spill path gathers full
+    // width and drops the unreferenced columns here — correctness only,
+    // the delegate path is where pruning saves the gather itself.
+    let columns: Vec<ArrayRef> = match retained {
+        Some(mask) if mask.len() == columns.len() => columns
+            .into_iter()
+            .zip(mask)
+            .filter(|(_, keep)| **keep)
+            .map(|(c, _)| c)
+            .collect(),
+        _ => columns,
     };
 
     RecordBatch::try_new(output_schema.clone(), columns).map_err(Into::into)

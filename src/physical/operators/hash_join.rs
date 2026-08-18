@@ -629,6 +629,13 @@ pub struct HashJoinExec {
     /// When true, build hash table from right side (smaller) instead of left.
     /// Used for Left joins where the right side is much smaller than the left.
     build_right: bool,
+    /// Join-output retention mask over the FULL (left ++ right) column
+    /// order: false = referenced by NOTHING above this join (typically an
+    /// ON-only key). Pruned columns are dropped from the output schema and
+    /// never gathered — HJ_PROF put gather+batch at ~75% of Q9's probe
+    /// pipeline, and 2 of the partsupp build's 3 columns were dead weight.
+    /// Set only for Inner, unfiltered joins by the planner's usage pass.
+    retained: Option<Vec<bool>>,
 }
 
 impl std::fmt::Debug for HashJoinExec {
@@ -714,6 +721,7 @@ impl HashJoinExec {
             build_right: false,
             probe_runtime_filter: None,
             probe_runtime_filter_pair: 0,
+            retained: None,
         }
     }
 
@@ -722,6 +730,32 @@ impl HashJoinExec {
     pub fn with_build_right(mut self, build_right: bool) -> Self {
         self.build_right = build_right;
         self
+    }
+
+    /// Apply a join-output retention mask (see the `retained` field). The
+    /// output schema shrinks to the kept columns; a mask whose length does
+    /// not match the full combined width is ignored (Semi/Anti schemas).
+    pub fn set_retained(&mut self, mask: Option<Vec<bool>>) {
+        let Some(m) = mask else {
+            return;
+        };
+        if self.join_type != JoinType::Inner
+            || self.filter.is_some()
+            || m.len() != self.combined_schema.fields().len()
+            || m.len() != self.schema.fields().len()
+        {
+            return;
+        }
+        let fields: Vec<_> = self
+            .schema
+            .fields()
+            .iter()
+            .zip(&m)
+            .filter(|(_, keep)| **keep)
+            .map(|(f, _)| f.clone())
+            .collect();
+        self.schema = Arc::new(Schema::new(fields));
+        self.retained = Some(m);
     }
 }
 
@@ -942,6 +976,29 @@ impl PhysicalOperator for HashJoinExec {
                     }
                 }
 
+                // Join-output pruning: the build side's contribution to the
+                // gather. `retained` indexes (left ++ right); the build side
+                // is left or right per `swapped`.
+                let left_len = self.left.schema().fields().len();
+                let build_keep: Option<Vec<bool>> = self.retained.as_ref().map(|m| {
+                    if swapped {
+                        m[left_len..].to_vec()
+                    } else {
+                        m[..left_len].to_vec()
+                    }
+                });
+                let prune = prune_batch_columns;
+                // Row store and gather work over the PRUNED build columns:
+                // dropping ON-only keys shrinks the row-store stride (Q9's
+                // partsupp: 3 cols -> 1) and can even make string-carrying
+                // builds row-store-eligible once the strings are dropped.
+                let rs_batches: Vec<RecordBatch> = match &build_keep {
+                    Some(keep) if keep.iter().any(|k| !k) => {
+                        build_batches.iter().map(|b| prune(b, keep)).collect()
+                    }
+                    _ => build_batches.clone(),
+                };
+
                 // Row-store eligibility: Inner join, no join filter, build
                 // side not swapped, every build column fixed-width
                 // (Int64/Float64/Int32/Date32) and null-free across all
@@ -954,9 +1011,9 @@ impl PhysicalOperator for HashJoinExec {
                     && self.filter.is_none()
                     && !swapped
                     && total_build_rows >= 100_000
-                    && !build_batches.is_empty()
-                    && build_batches[0].num_columns() > 0
-                    && build_batches.iter().all(|b| {
+                    && !rs_batches.is_empty()
+                    && rs_batches[0].num_columns() > 0
+                    && rs_batches.iter().all(|b| {
                         b.columns().iter().all(|c| {
                             c.null_count() == 0
                                 && matches!(
@@ -1014,7 +1071,7 @@ impl PhysicalOperator for HashJoinExec {
                     );
                 }
                 let row_store = if row_store_eligible {
-                    Some(RowStore::build(&build_batches))
+                    Some(RowStore::build(&rs_batches))
                 } else {
                     None
                 };
@@ -1113,6 +1170,18 @@ impl PhysicalOperator for HashJoinExec {
                     None
                 };
 
+                // With a retention mask, the cached batches keep only the
+                // gather-relevant columns — every consumer reachable for an
+                // Inner, unfiltered join (the only shape the planner masks)
+                // reads them for gather or row counts only; the hash tables
+                // above were built from the full batches and are
+                // self-contained.
+                let build_batches = match &build_keep {
+                    Some(keep) if keep.iter().any(|k| !k) => {
+                        build_batches.iter().map(|b| prune(b, keep)).collect()
+                    }
+                    _ => build_batches,
+                };
                 Ok::<_, crate::error::QueryError>(BuildSideCache {
                     batches: build_batches,
                     hash_table,
@@ -1178,6 +1247,16 @@ impl PhysicalOperator for HashJoinExec {
 
         let t_probe = std::time::Instant::now();
         let row_store = cache.row_store.as_ref().map(|(rs, ro)| (rs, ro.as_slice()));
+        // Join-output pruning: the probe side's keep flags (the build side's
+        // were applied when the cache pruned its batches).
+        let left_len = self.left.schema().fields().len();
+        let probe_keep: Option<Vec<bool>> = self.retained.as_ref().map(|m| {
+            if swapped {
+                m[..left_len].to_vec()
+            } else {
+                m[left_len..].to_vec()
+            }
+        });
         let mut result = probe_hash_table(
             &cache.batches,
             &probe_batches,
@@ -1192,6 +1271,7 @@ impl PhysicalOperator for HashJoinExec {
             &self.combined_schema,
             cache.build_matched.as_deref(),
             row_store,
+            probe_keep.as_deref(),
         )?;
 
         // Emit unmatched BUILD rows exactly once: the last probe partition to
@@ -1907,6 +1987,7 @@ fn resolve_column_in_combined(
 /// Processes probe rows in parallel chunks using rayon, with direct Int64 array access
 /// to avoid per-row JoinKey allocation overhead.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn probe_inner_i64_parallel(
     build_batches: &[RecordBatch],
     probe_batches: &[RecordBatch],
@@ -1915,6 +1996,7 @@ fn probe_inner_i64_parallel(
     swapped: bool,
     output_schema: &SchemaRef,
     row_store: Option<(&RowStore, &[usize])>,
+    probe_keep: Option<&[bool]>,
 ) -> Result<Vec<RecordBatch>> {
     const CHUNK_SIZE: usize = 65536;
 
@@ -1983,9 +2065,17 @@ fn probe_inner_i64_parallel(
         }
 
         if !all_build_indices.is_empty() {
+            let pruned_probe;
+            let gather_probe: &RecordBatch = match probe_keep {
+                Some(keep) if keep.iter().any(|k| !k) => {
+                    pruned_probe = prune_batch_columns(probe_batch, keep);
+                    &pruned_probe
+                }
+                _ => probe_batch,
+            };
             let batch = create_joined_batch(
                 build_batches,
-                probe_batch,
+                gather_probe,
                 &all_build_indices,
                 &all_probe_indices,
                 swapped,
@@ -2332,6 +2422,7 @@ fn create_single_row_combined_batch(
 /// hash computation and comparison.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn probe_vectorized(
     build_batches: &[RecordBatch],
     probe_batches: &[RecordBatch],
@@ -2344,6 +2435,7 @@ fn probe_vectorized(
     combined_schema: &SchemaRef,
     shared_build_matched: Option<&[Vec<std::sync::atomic::AtomicBool>]>,
     row_store: Option<(&RowStore, &[usize])>,
+    probe_keep: Option<&[bool]>,
 ) -> Result<Vec<RecordBatch>> {
     let mut results = Vec::new();
 
@@ -2382,25 +2474,51 @@ fn probe_vectorized(
         && matches!(join_type, JoinType::Inner | JoinType::Left)
     {
         if join_type == JoinType::Inner || join_type == JoinType::Cross {
+            // HJ_PROF=1: per-phase wall-in-section accumulators across all
+            // probe threads. The 001 microbench put the pure hash probe at
+            // 3.8 ns/row; the in-engine partitions run 900-1500 ns/row —
+            // this is the instrument that says where the other 99.6% goes.
+            let prof = std::env::var("HJ_PROF").is_ok();
+            use std::sync::atomic::{AtomicU64, Ordering as AOrd};
+            let (t_key, t_probe, t_idx, t_filter, t_gather) = (
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            );
+            let clk = |on: bool| on.then(std::time::Instant::now);
+            let lap = |t: Option<std::time::Instant>, acc: &AtomicU64| {
+                if let Some(t) = t {
+                    acc.fetch_add(t.elapsed().as_nanos() as u64, AOrd::Relaxed);
+                }
+            };
             let batch_results: Vec<Result<Option<RecordBatch>>> = probe_batches
                 .par_iter()
                 .map(|probe_batch| {
+                    let t = clk(prof);
                     let probe_key_arrays: Result<Vec<ArrayRef>> = probe_key_exprs
                         .iter()
                         .map(|e| evaluate_expr(probe_batch, e))
                         .collect();
                     let probe_key_arrays = probe_key_arrays?;
+                    lap(t, &t_key);
                     let n_rows = probe_batch.num_rows();
+                    let t = clk(prof);
                     let matches = vht.probe_batch(&probe_key_arrays, n_rows);
+                    lap(t, &t_probe);
                     if matches.is_empty() {
                         return Ok(None);
                     }
+                    let t = clk(prof);
                     let mut build_indices: Vec<(usize, usize)> = Vec::with_capacity(matches.len());
                     let mut probe_indices: Vec<usize> = Vec::with_capacity(matches.len());
                     for (bb, br, pr) in matches {
                         build_indices.push((bb as usize, br as usize));
                         probe_indices.push(pr as usize);
                     }
+                    lap(t, &t_idx);
+                    let t = clk(prof);
                     let (build_indices, probe_indices) = match filter {
                         Some(f) => filter_candidate_pairs(
                             build_batches,
@@ -2413,21 +2531,46 @@ fn probe_vectorized(
                         )?,
                         None => (build_indices, probe_indices),
                     };
+                    lap(t, &t_filter);
                     if build_indices.is_empty() {
                         return Ok(None);
                     }
+                    let t = clk(prof);
+                    // Join-output pruning: drop ON-only probe columns now
+                    // that the keys have been evaluated; the output schema
+                    // was pruned to match at plan time.
+                    let pruned_probe;
+                    let gather_probe: &RecordBatch = match probe_keep {
+                        Some(keep) if keep.iter().any(|k| !k) => {
+                            pruned_probe = prune_batch_columns(probe_batch, keep);
+                            &pruned_probe
+                        }
+                        _ => probe_batch,
+                    };
                     let batch = create_joined_batch(
                         build_batches,
-                        probe_batch,
+                        gather_probe,
                         &build_indices,
                         &probe_indices,
                         swapped,
                         output_schema,
                         row_store,
                     )?;
+                    lap(t, &t_gather);
                     Ok(Some(batch))
                 })
                 .collect();
+            if prof {
+                eprintln!(
+                    "[hj-prof] key-eval: {:.0}ms; vht-probe: {:.0}ms; idx-build: {:.0}ms; filter: {:.0}ms; gather+batch: {:.0}ms (cumulative across threads; build_keys={:?})",
+                    t_key.load(AOrd::Relaxed) as f64 / 1e6,
+                    t_probe.load(AOrd::Relaxed) as f64 / 1e6,
+                    t_idx.load(AOrd::Relaxed) as f64 / 1e6,
+                    t_filter.load(AOrd::Relaxed) as f64 / 1e6,
+                    t_gather.load(AOrd::Relaxed) as f64 / 1e6,
+                    probe_key_exprs.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
+                );
+            }
             for result in batch_results {
                 if let Some(batch) = result? {
                     results.push(batch);
@@ -2577,9 +2720,17 @@ fn probe_vectorized(
                 };
 
                 if !all_build_indices.is_empty() {
+                    let pruned_probe;
+                    let gather_probe: &RecordBatch = match probe_keep {
+                        Some(keep) if keep.iter().any(|k| !k) => {
+                            pruned_probe = prune_batch_columns(probe_batch, keep);
+                            &pruned_probe
+                        }
+                        _ => probe_batch,
+                    };
                     let batch = create_joined_batch(
                         build_batches,
-                        probe_batch,
+                        gather_probe,
                         &all_build_indices,
                         &all_probe_indices,
                         swapped,
@@ -2899,6 +3050,7 @@ fn probe_vectorized(
 
 #[allow(clippy::needless_range_loop)] // Index needed for parallel array access
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn probe_hash_table(
     build_batches: &[RecordBatch],
     probe_batches: &[RecordBatch],
@@ -2913,6 +3065,7 @@ fn probe_hash_table(
     combined_schema: &SchemaRef,
     shared_build_matched: Option<&[Vec<std::sync::atomic::AtomicBool>]>,
     row_store: Option<(&RowStore, &[usize])>,
+    probe_keep: Option<&[bool]>,
 ) -> Result<Vec<RecordBatch>> {
     let total_probe_rows: usize = probe_batches.iter().map(|b| b.num_rows()).sum();
 
@@ -2940,6 +3093,7 @@ fn probe_hash_table(
                 combined_schema,
                 shared_build_matched,
                 row_store,
+                probe_keep,
             );
         }
     }
@@ -2972,6 +3126,7 @@ fn probe_hash_table(
                 swapped,
                 output_schema,
                 row_store,
+                probe_keep,
             );
         }
     }
@@ -3050,9 +3205,17 @@ fn probe_hash_table(
         match join_type {
             JoinType::Inner | JoinType::Cross => {
                 if !build_indices.is_empty() {
+                    let pruned_probe;
+                    let gather_probe: &RecordBatch = match probe_keep {
+                        Some(keep) if keep.iter().any(|k| !k) => {
+                            pruned_probe = prune_batch_columns(probe_batch, keep);
+                            &pruned_probe
+                        }
+                        _ => probe_batch,
+                    };
                     let batch = create_joined_batch(
                         build_batches,
-                        probe_batch,
+                        gather_probe,
                         &build_indices,
                         &probe_indices,
                         swapped,
@@ -3405,6 +3568,23 @@ fn create_joined_batch(
 /// `Dictionary(Int32, Utf8)` where the logical schema says `Utf8`;
 /// consumers resolve columns by name/position and either read dictionaries
 /// natively (the aggregation fast path) or normalize with a cast.
+/// Column-subset view of a batch (Arc-level, no data copy). Used by
+/// join-output pruning to drop ON-only probe columns after key eval.
+fn prune_batch_columns(b: &RecordBatch, keep: &[bool]) -> RecordBatch {
+    let (fields, cols): (Vec<_>, Vec<_>) = b
+        .schema()
+        .fields()
+        .iter()
+        .zip(b.columns())
+        .zip(keep)
+        .filter(|(_, k)| **k)
+        .map(|((f, c), _)| (f.clone(), c.clone()))
+        .unzip();
+    let opts = arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(b.num_rows()));
+    RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), cols, &opts)
+        .expect("pruned batch: same rows, subset of columns")
+}
+
 fn batch_with_actual_types(declared: &SchemaRef, columns: Vec<ArrayRef>) -> Result<RecordBatch> {
     let schema_matches = columns
         .iter()

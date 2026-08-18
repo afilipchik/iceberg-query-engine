@@ -719,7 +719,7 @@ fn column_in_schema(c: &crate::planner::Column, schema: &PlanSchema) -> bool {
     }
 }
 
-fn collect_columns(e: &Expr, out: &mut Vec<crate::planner::Column>) {
+pub(crate) fn collect_columns(e: &Expr, out: &mut Vec<crate::planner::Column>) {
     match e {
         Expr::Column(c) => out.push(c.clone()),
         _ => {
@@ -742,7 +742,7 @@ fn expr_only_references_schema(e: &Expr, schema: &PlanSchema) -> bool {
     !cols.is_empty() && cols.iter().all(|c| column_in_schema(c, schema))
 }
 
-fn expr_children(e: &Expr) -> Vec<&Expr> {
+pub(crate) fn expr_children(e: &Expr) -> Vec<&Expr> {
     match e {
         Expr::BinaryExpr { left, right, .. } => vec![left, right],
         Expr::UnaryExpr { expr, .. } => vec![expr],

@@ -3,7 +3,7 @@
 //! Implements rule-based and cost-based optimization
 
 mod cost;
-mod rules;
+pub(crate) mod rules;
 
 pub use cost::*;
 pub use rules::*;

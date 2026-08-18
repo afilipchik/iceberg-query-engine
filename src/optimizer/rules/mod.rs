@@ -2,7 +2,7 @@
 
 mod constant_folding;
 mod derive_or_predicates;
-mod eager_aggregation;
+pub(crate) mod eager_aggregation;
 mod flatten_dependent_join;
 mod group_key_reduction;
 mod having_total_cse;
