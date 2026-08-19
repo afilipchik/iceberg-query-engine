@@ -428,7 +428,29 @@ impl PhysicalOperator for StreamingParquetScanExec {
                     // once per DICTIONARY VALUE there, and post-load evaluation
                     // over materialized strings measurably loses (Q13
                     // 425→538ms when this guard was missing).
-                    if let (Some(dir), None) = (ipc_dirs.get(&work.file_path), &dict_schema) {
+                    let ipc_dir = ipc_dirs.get(&work.file_path).filter(|dir| {
+                        // v2 sidecars store low-cardinality strings dict-
+                        // encoded; a dict-coercion scan may take the IPC path
+                        // when every column it wants coerced is stored dict
+                        // (wrap_batch casts survivors back to Utf8 exactly
+                        // like the parquet RowFilter path).
+                        match &dict_schema {
+                            None => true,
+                            Some(ds) => {
+                                let stored = crate::storage::ipc_cache::sidecar_dict_cols(dir);
+                                ds.fields()
+                                    .iter()
+                                    .filter(|f| {
+                                        matches!(
+                                            f.data_type(),
+                                            arrow::datatypes::DataType::Dictionary(_, _)
+                                        )
+                                    })
+                                    .all(|f| stored.contains(&f.name().to_lowercase()))
+                            }
+                        }
+                    });
+                    if let Some(dir) = ipc_dir {
                         match ipc_read_work(
                             dir,
                             &work,
@@ -790,11 +812,7 @@ fn wrap_batch(
     schema: &SchemaRef,
     coerce_back: &[usize],
 ) -> Result<RecordBatch> {
-    let needs_cast = !coerce_back.is_empty();
-    if !needs_cast && (batch.schema() == *schema || batch.num_columns() != schema.fields().len()) {
-        return Ok(batch);
-    }
-    if batch.num_columns() != schema.fields().len() {
+    if batch.schema() == *schema || batch.num_columns() != schema.fields().len() {
         return Ok(batch);
     }
     let mut cols = batch.columns().to_vec();
@@ -807,6 +825,20 @@ fn wrap_batch(
                 cols[i] = arrow::compute::cast(&cols[i], &arrow::datatypes::DataType::Utf8)
                     .map_err(|e| QueryError::Execution(e.to_string()))?;
             }
+        }
+    }
+    // v2 IPC sidecars store low-cardinality strings dictionary-encoded;
+    // any remaining dict column whose declared field is Utf8 casts back
+    // here (survivors only — filters already ran).
+    for (i, f) in schema.fields().iter().enumerate() {
+        if f.data_type() == &arrow::datatypes::DataType::Utf8
+            && matches!(
+                cols[i].data_type(),
+                arrow::datatypes::DataType::Dictionary(_, _)
+            )
+        {
+            cols[i] = arrow::compute::cast(&cols[i], &arrow::datatypes::DataType::Utf8)
+                .map_err(|e| QueryError::Execution(e.to_string()))?;
         }
     }
     RecordBatch::try_new(schema.clone(), cols)

@@ -314,8 +314,26 @@ impl ParallelParquetSource {
     pub fn read_row_group(&self, work: &RowGroupWork) -> Result<Vec<RecordBatch>> {
         // IPC sidecar: decode-free read of the row group; the scan filter
         // (if any) applies vectorized post-load unless zone maps proved it
-        // ALWAYS_TRUE. Dictionary-coercion scans keep the parquet path.
-        if self.dict_schema.is_none() {
+        // ALWAYS_TRUE. v2 sidecars store low-cardinality strings
+        // dictionary-encoded, so a dict-coercion scan takes the IPC path
+        // whenever every column it wants coerced is stored dict; only a
+        // request the sidecar cannot serve falls back to parquet.
+        let ipc_serves = match self.ipc_dirs.get(work.file_idx) {
+            Some(Some(dir)) => match &self.dict_schema {
+                None => true,
+                Some(ds) => {
+                    let stored = crate::storage::ipc_cache::sidecar_dict_cols(dir);
+                    ds.fields()
+                        .iter()
+                        .filter(|f| {
+                            matches!(f.data_type(), arrow::datatypes::DataType::Dictionary(_, _))
+                        })
+                        .all(|f| stored.contains(&f.name().to_lowercase()))
+                }
+            },
+            _ => false,
+        };
+        if ipc_serves {
             if let Some(Some(dir)) = self.ipc_dirs.get(work.file_idx) {
                 let mut batches = crate::storage::ipc_cache::read_row_group(
                     dir,

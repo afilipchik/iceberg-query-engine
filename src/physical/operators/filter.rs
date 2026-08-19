@@ -906,7 +906,19 @@ fn evaluate_scalar_func(
         .iter()
         .map(|a| evaluate_expr_internal(batch, a, subquery_executor))
         .collect();
-    let evaluated_args = evaluated_args?;
+    // Scalar functions downcast to concrete array types; dictionary-encoded
+    // inputs (v2 IPC sidecars, small-build join gathers) normalize to their
+    // value type here — one choke point instead of 100+ per-function arms.
+    let evaluated_args: Vec<ArrayRef> = evaluated_args?
+        .into_iter()
+        .map(|a| {
+            if let arrow::datatypes::DataType::Dictionary(_, v) = a.data_type() {
+                arrow::compute::cast(a.as_ref(), &v.clone()).map_err(Into::into)
+            } else {
+                Ok(a)
+            }
+        })
+        .collect::<Result<_>>()?;
 
     match func {
         ScalarFunction::Upper => {

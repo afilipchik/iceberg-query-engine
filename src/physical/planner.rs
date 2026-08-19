@@ -1111,9 +1111,25 @@ impl PhysicalPlanner {
                                         batch.column(cached_pos).clone()
                                     })
                                     .collect();
+                                // Field TYPES follow the actual columns: v2
+                                // IPC sidecars serve low-cardinality strings
+                                // dictionary-encoded, and the logical schema
+                                // still says Utf8.
                                 let fields: Vec<_> = requested_indices
                                     .iter()
-                                    .map(|&i| logical_schema.field(i).clone())
+                                    .zip(columns.iter())
+                                    .map(|(&i, c)| {
+                                        let f = logical_schema.field(i);
+                                        if f.data_type() == c.data_type() {
+                                            f.clone()
+                                        } else {
+                                            arrow::datatypes::Field::new(
+                                                f.name(),
+                                                c.data_type().clone(),
+                                                true,
+                                            )
+                                        }
+                                    })
                                     .collect();
                                 let schema = Arc::new(Schema::new(fields));
                                 arrow::record_batch::RecordBatch::try_new(schema, columns).map_err(
