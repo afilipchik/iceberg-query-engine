@@ -1008,6 +1008,7 @@ Based on the codebase structure, these appear to be planned but not fully implem
 | storage | engine | DuckDB on the SAME files | ratio |
 |---|---|---|---|
 | parquet (identical files) | **65.1s** | 40.1s (`read_parquet` views) | **1.62x** |
+| parquet + v2 IPC sidecars (auto) | **48.3s** | 65.8s native-premise | **0.72x native** |
 | lance (identical files) | ~101s (high variance, see below) | 69.1s (community `lance` ext) | ~1.47x |
 | DuckDB native (in-mem) | — | 65.8s (Q9 alone 36.4s) | — |
 
@@ -1049,9 +1050,15 @@ bitmap-pruned). Run: `benchmark-lance --path data/tpch-100gb-lance --sf 100`.
 
 ## TPC-H Benchmark Status (SF=100, 2026-08-18)
 
-**65.1s vs DuckDB native 67.1s = 0.97x — the engine runs the suite
-FASTER than DuckDB's own native tables; vs DuckDB on the same parquet
-40.1s = 1.62x; 22/22 cell-valid.** Direct u32 match emission (commit
+**With v2 IPC sidecars (2026-08-19, commit 2a9a6b4): 48.3s warm =
+0.72x DuckDB native, 1.21x DuckDB on the same parquet; 22/22
+cell-valid. Cache-off premise: 65.1s = 0.97x native / 1.62x
+like-for-like.** QE_IPC_CACHE now defaults to AUTO (uses fresh
+sidecars, never builds; =1 builds ~2.6x parquet's disk; =0 off).
+v2 sidecars store low-cardinality strings dictionary-encoded so
+dict-coercion scans (Q1/Q13/Q16) no longer fall back to parquet —
+that fallback's page-cache contention was the REAL cause of the older
+'IPC no benefit at SF=100' verdict. Direct u32 match emission (commit
 609509d) added Q9 13.6->12.1s on top of join-output pruning. Join-output pruning (ON-only columns
 never gathered, commit 8d2a2b3) took Q9 18.7->13.6s on top of the
 duckdb-parity epic's wins; `examples/radix_bench.rs` records why radix

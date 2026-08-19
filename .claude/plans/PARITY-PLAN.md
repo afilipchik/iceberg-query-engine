@@ -352,3 +352,34 @@ Day total: 89.3 → 65.1s (2.23x → 1.62x like-for-like, 0.97x native).
 What remains is decode/bandwidth-floor territory: Q18 7.4s (150M-group
 subquery), Q1 2.8x / Q16 2.7x (scan-side) — the owned-format /
 decode-path programs.
+
+## CCPM decode-path + ipc-default epics (2026-08-19) — 48.3s: 0.72x DuckDB native
+
+The IPC A/B attribution (v1 sidecars) put arrow-rs decode at ~8-10s
+suite-wide AND exposed why the 2026-08-17 SF=100 verdict said "no
+benefit": dict-coercion scans (Q1/Q13/Q16) kept the parquet path, so
+IPC mode held 85GB of sidecars AND 32GB of parquet hot — the loss was
+page-cache contention, not the cache. **v2 sidecars store every
+fully-dict-encoded string column as Dictionary(Int32,Utf8)** (wide
+dicts demoted at build), the read gates serve dict-coercion scans when
+the request ⊆ stored, and QE_IPC_CACHE gains AUTO mode (use fresh
+sidecars, never build; =1 builds; =0 off).
+
+Arrow-rs sharp edges for the record: IPC FileWriter forbids per-batch
+dictionary replacement (unify via row-group concat, re-slice 64k), and
+parquet-derived schemas give every dict field dict_id 0
+(preserve_dict_id(false)). A failing sidecar build now warns loudly —
+it silently cost 2-3x per query while falling back.
+
+**SF=100 warm: 48.3s, 22/22 cell-valid = 0.72x DuckDB NATIVE and 1.21x
+DuckDB reading the same parquet. SF=10 warm: 5.1s. Same-parquet-premise
+(cache off): 65.1-65.8s, still reported alongside.** Q18 6.3s (its old
+6.5s gate finally met), Q3 2.2s, Q5 2.1s, Q21 3.3s. Q9 remains 14.1s
+under IPC (mmap + 50GB join RSS pressure) vs 12.1s parquet — the one
+query where the cache loses; a per-query fallback was NOT added
+(complexity vs 2s on one query; recorded).
+
+Program status after five epics in two days: **89.3 → 48.3s on the
+engine's best premise (0.72x native), 65.1s like-for-like (1.62x).**
+The remaining like-for-like gap is arrow-rs decode itself — bespoke
+decoders (Rewrite 3 option 3) are the only path left on that premise.
