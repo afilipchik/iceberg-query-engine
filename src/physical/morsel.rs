@@ -339,12 +339,14 @@ impl ParallelParquetSource {
                     dir,
                     work.row_group_idx,
                     self.projection.as_deref(),
+                    None,
                 )?;
                 if let Some((expr, _)) = &self.row_filter {
                     if !work.filter_all_true {
                         batches = crate::physical::operators::filter_batches(batches, expr)?;
                     }
                 }
+                batches = crate::storage::ipc_cache::reslice_large(batches, 16384, 8192);
                 return Ok(batches);
             }
         }

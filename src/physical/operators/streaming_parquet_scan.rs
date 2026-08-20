@@ -755,8 +755,12 @@ fn ipc_read_work(
         }
     };
 
-    let mut batches =
-        crate::storage::ipc_cache::read_row_group(dir, work.row_group_idx, read_set.as_deref())?;
+    let mut batches = crate::storage::ipc_cache::read_row_group(
+        dir,
+        work.row_group_idx,
+        read_set.as_deref(),
+        None,
+    )?;
 
     if let Some((expr, _)) = filter_spec {
         batches = crate::physical::operators::filter_batches(batches, expr)?;
@@ -786,6 +790,9 @@ fn ipc_read_work(
         }
         batches = kept;
     }
+
+    // Survivor-size-gated 8k re-slice (see ipc_cache::reslice_large).
+    batches = crate::storage::ipc_cache::reslice_large(batches, 16384, 8192);
 
     // Project down to the requested output columns, in output order, and
     // re-wrap with the logical (qualified-name) schema.

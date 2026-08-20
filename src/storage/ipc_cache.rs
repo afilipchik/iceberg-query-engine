@@ -403,6 +403,7 @@ pub fn read_row_group(
     dir: &Path,
     rg_idx: usize,
     projection: Option<&[usize]>,
+    slice: Option<usize>,
 ) -> Result<Vec<RecordBatch>> {
     use arrow::buffer::Buffer;
     use arrow::ipc::reader::{read_footer_length, FileDecoder};
@@ -421,6 +422,12 @@ pub fn read_row_group(
             "{} is truncated ({len} bytes)",
             path.display()
         )));
+    }
+    // QE_IPC_WILLNEED=1: hint the kernel to read ahead — probing whether
+    // Q9-class regressions are first-touch fault storms (idea #2 of the
+    // perf-marathon scoreboard).
+    if std::env::var("QE_IPC_WILLNEED").as_deref() == Ok("1") {
+        let _ = mmap.advise(memmap2::Advice::WillNeed);
     }
     let mmap = std::sync::Arc::new(mmap);
     let ptr = std::ptr::NonNull::new(mmap.as_ptr() as *mut u8)
@@ -471,5 +478,41 @@ pub fn read_row_group(
             out.push(batch);
         }
     }
+    if let Some(n) = slice.map(|v| slice_rows().unwrap_or(v)) {
+        out = reslice_large(out, n, n);
+    }
     Ok(out)
+}
+
+/// Re-slice batches of >= `min` rows into `to`-row zero-copy views. 64k IPC
+/// batches thrashed L2 in accumulation and probe loops (SF=100: Q9 -4.2s,
+/// Q1 -1.1s, Q13 -0.6s) — but slicing SMALL filtered survivors multiplied
+/// per-batch fixed costs into a +50..450ms smear across a dozen queries,
+/// and the eager/prescan path fed a >250x cliff in Q2's subquery machinery.
+/// Callers therefore slice POST-filter, and only what is still large.
+pub fn reslice_large(batches: Vec<RecordBatch>, min: usize, to: usize) -> Vec<RecordBatch> {
+    let mut out = Vec::with_capacity(batches.len() * 2);
+    for b in batches {
+        if b.num_rows() >= min.max(to + 1) {
+            let mut off = 0;
+            while off < b.num_rows() {
+                let len = (b.num_rows() - off).min(to);
+                out.push(b.slice(off, len));
+                off += len;
+            }
+        } else {
+            out.push(b);
+        }
+    }
+    out
+}
+
+fn slice_rows() -> Option<usize> {
+    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("QE_IPC_SLICE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+    })
 }

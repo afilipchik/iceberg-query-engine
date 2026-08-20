@@ -325,7 +325,7 @@ impl ParquetTable {
                 let n = md.metadata().num_row_groups();
                 let per_rg: Result<Vec<Vec<RecordBatch>>> = (0..n)
                     .into_par_iter()
-                    .map(|rg| crate::storage::ipc_cache::read_row_group(&dir, rg, projection))
+                    .map(|rg| crate::storage::ipc_cache::read_row_group(&dir, rg, projection, None))
                     .collect();
                 return Ok(per_rg?.into_iter().flatten().collect());
             }
@@ -465,6 +465,7 @@ impl ParquetTable {
                                 &dir,
                                 rg,
                                 read_set.as_deref(),
+                                None,
                             )?;
                             if can_filter {
                                 batches = crate::physical::operators::filter_batches(
