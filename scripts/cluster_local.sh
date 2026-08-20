@@ -34,6 +34,10 @@ STATE_DIR=".scratch/cluster-local"
 # When set, nodes register tables from a Gravitino metastore instead of --data.
 METASTORE="${QE_METASTORE:-}"
 METASTORE_SCHEMA="${QE_METASTORE_SCHEMA:-tpch}"
+# Node memory limit passed through to `serve` (gather mode refuses shapes
+# whose shard bytes exceed HALF of this; SF>=10 validation needs more than
+# the engine default).
+MEMORY_LIMIT="${QE_MEMORY_LIMIT:-}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
@@ -57,6 +61,7 @@ while [[ $# -gt 0 ]]; do
         --nodes)     NODES="$2"; shift 2 ;;
         --metastore) METASTORE="$2"; shift 2 ;;
         --metastore-schema) METASTORE_SCHEMA="$2"; shift 2 ;;
+        --memory-limit) MEMORY_LIMIT="$2"; shift 2 ;;
         *)           break ;;
     esac
 done
@@ -135,6 +140,10 @@ cmd_start() {
     if [[ -n "$METASTORE" ]]; then
         source_args=(--metastore "$METASTORE" --metastore-schema "$METASTORE_SCHEMA")
         info "tables from metastore $METASTORE schema $METASTORE_SCHEMA"
+    fi
+    if [[ -n "$MEMORY_LIMIT" ]]; then
+        source_args+=(--memory-limit "$MEMORY_LIMIT")
+        info "node memory limit $MEMORY_LIMIT"
     fi
     for ((i = 0; i < NODES; i++)); do
         "$BINARY" serve \
