@@ -1,7 +1,7 @@
 ---
 name: perf-marathon
 description: Iterate performance ideas with measured verdicts until SF=100 warm-IPC ≤45s or ≥10 ideas tested; validate the week's changes work distributed (correctness + perf, sidecar interplay)
-status: active
+status: completed
 created: 2026-08-20T03:38:14Z
 ---
 

@@ -383,3 +383,17 @@ Program status after five epics in two days: **89.3 → 48.3s on the
 engine's best premise (0.72x native), 65.1s like-for-like (1.62x).**
 The remaining like-for-like gap is arrow-rs decode itself — bespoke
 decoders (Rewrite 3 option 3) are the only path left on that premise.
+
+## CCPM perf-marathon epic (2026-08-20) — 47.1s; distributed re-validated
+
+11-verdict scoreboard (.claude/epics/perf-marathon/IDEAS.md). Headline
+WIN: survivor-size-gated 8k re-slice of IPC batches (64k batches
+thrashed L2 in accumulation/probe loops; naive slicing hit a >250x Q2
+subquery cliff and a per-batch-cost smear — the correct gate is
+post-filter survivor size ≥16k). Q9 −4.5s to duck-parquet PARITY, Q1
+−1.1s, Q13 −0.5s; suite 48.3→47.1s (0.70x native). Distributed: M1+M2
+gates PASS at SF=10 × 3 real processes, all cache modes; shards bypass
+sidecars BY DESIGN (correct, and the recorded future idea is rg-aligned
+splits so workers inherit the cache). Remaining residues collapse into
+one class — big sparse aggregates (Q18/Q20/Q13) — future item: dense
+group-id remapping.

@@ -1008,7 +1008,7 @@ Based on the codebase structure, these appear to be planned but not fully implem
 | storage | engine | DuckDB on the SAME files | ratio |
 |---|---|---|---|
 | parquet (identical files) | **65.1s** | 40.1s (`read_parquet` views) | **1.62x** |
-| parquet + v2 IPC sidecars (auto) | **48.3s** | 65.8s native-premise | **0.72x native** |
+| parquet + v2 IPC sidecars (auto) | **47.1s** | 65.8s native-premise | **0.70x native** |
 | lance (identical files) | ~101s (high variance, see below) | 69.1s (community `lance` ext) | ~1.47x |
 | DuckDB native (in-mem) | — | 65.8s (Q9 alone 36.4s) | — |
 
