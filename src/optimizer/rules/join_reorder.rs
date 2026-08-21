@@ -85,6 +85,9 @@ impl JoinReorder {
     /// are also optimized.
     fn reorder_expr(&self, expr: &Expr) -> Result<Expr> {
         match expr {
+            // Window expressions never reach the optimizer (the binder
+            // replaces them with columns); nothing to reorder if one did.
+            Expr::WindowFunction(_) => Ok(expr.clone()),
             Expr::ScalarSubquery(subquery) => {
                 let reordered = self.reorder(subquery)?;
                 Ok(Expr::ScalarSubquery(Arc::new(reordered)))
@@ -236,6 +239,14 @@ impl JoinReorder {
 
     fn reorder(&self, plan: &LogicalPlan) -> Result<LogicalPlan> {
         match plan {
+            LogicalPlan::Window(node) => {
+                let input = self.reorder(&node.input)?;
+                Ok(LogicalPlan::Window(crate::planner::WindowNode {
+                    input: Arc::new(input),
+                    window_exprs: node.window_exprs.clone(),
+                    schema: node.schema.clone(),
+                }))
+            }
             LogicalPlan::Filter(node) => {
                 // Check if input contains joins that need reordering
                 // If so, we need to pass filter predicates down to help with join ordering

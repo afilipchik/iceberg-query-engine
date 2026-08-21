@@ -82,6 +82,20 @@ impl ProjectionPushdown {
                 }
                 self.collect_recursive(&node.input, required);
             }
+            LogicalPlan::Window(node) => {
+                for (_, w) in &node.window_exprs {
+                    for e in &w.args {
+                        self.extract_columns_from_expr(e, required);
+                    }
+                    for e in &w.partition_by {
+                        self.extract_columns_from_expr(e, required);
+                    }
+                    for o in &w.order_by {
+                        self.extract_columns_from_expr(&o.expr, required);
+                    }
+                }
+                self.collect_recursive(&node.input, required);
+            }
             LogicalPlan::Sort(node) => {
                 for sort_expr in &node.order_by {
                     self.extract_columns_from_expr(&sort_expr.expr, required);
@@ -528,6 +542,17 @@ impl ProjectionPushdown {
                     input: Arc::new(input),
                     group_by: node.group_by.clone(),
                     aggregates: node.aggregates.clone(),
+                    schema: node.schema.clone(),
+                }))
+            }
+
+            // Window output = ALL input columns + the window columns (schema
+            // fixed at bind time), so nothing may be pruned beneath it.
+            LogicalPlan::Window(node) => {
+                let input = self.pushdown(&node.input, required, true)?;
+                Ok(LogicalPlan::Window(crate::planner::WindowNode {
+                    input: Arc::new(input),
+                    window_exprs: node.window_exprs.clone(),
                     schema: node.schema.clone(),
                 }))
             }

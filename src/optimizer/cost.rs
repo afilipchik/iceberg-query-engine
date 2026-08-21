@@ -115,6 +115,8 @@ impl CostEstimator {
                 column_stats: vec![],
             },
 
+            LogicalPlan::Window(node) => self.estimate_statistics(&node.input),
+
             LogicalPlan::Filter(node) => {
                 let input_stats = self.estimate_statistics(&node.input);
                 // Assume filter passes 30% of rows
@@ -284,6 +286,13 @@ impl CostEstimator {
             LogicalPlan::Filter(node) => {
                 let input_cost = self.estimate(&node.input);
                 input_cost + Cost::new(row_count * self.filter_cost_per_row, 0.0, 0.0)
+            }
+
+            // Window: a sort plus a per-row evaluation pass.
+            LogicalPlan::Window(node) => {
+                let input_cost = self.estimate(&node.input);
+                let sort_cost = row_count * (row_count.max(2.0)).log2() * 0.1;
+                input_cost + Cost::new(sort_cost + row_count, 0.0, row_count * 8.0)
             }
 
             LogicalPlan::Project(node) => {

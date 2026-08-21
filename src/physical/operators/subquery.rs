@@ -884,6 +884,31 @@ fn substitute_columns_in_plan(
                 predicate: new_predicate,
             }))
         }
+        LogicalPlan::Window(node) => {
+            let new_input = substitute_columns_in_plan(&node.input, column_values, local_tables)?;
+            let window_exprs = node
+                .window_exprs
+                .iter()
+                .map(|(name, w)| {
+                    let mut w = w.clone();
+                    for a in &mut w.args {
+                        *a = substitute_columns_in_expr(a, column_values, local_tables);
+                    }
+                    for p in &mut w.partition_by {
+                        *p = substitute_columns_in_expr(p, column_values, local_tables);
+                    }
+                    for o in &mut w.order_by {
+                        o.expr = substitute_columns_in_expr(&o.expr, column_values, local_tables);
+                    }
+                    (name.clone(), w)
+                })
+                .collect();
+            Ok(LogicalPlan::Window(WindowNode {
+                input: Arc::new(new_input),
+                window_exprs,
+                schema: node.schema.clone(),
+            }))
+        }
         LogicalPlan::Project(node) => {
             let new_exprs: Vec<Expr> = node
                 .exprs

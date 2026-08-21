@@ -333,6 +333,7 @@ fn walk_plan(plan: &LogicalPlan, tables: &mut Vec<String>, has_agg: &mut bool) -
             }
         }
         LogicalPlan::Filter(node) => check_expr(&node.predicate)?,
+        LogicalPlan::Window(_) => return Err(unsupported("window functions")),
         LogicalPlan::Project(node) => {
             for e in &node.exprs {
                 check_expr(e)?;
@@ -449,6 +450,17 @@ fn visit_expr(expr: &Expr, f: &mut impl FnMut(&Expr)) {
         }
         Expr::UnaryExpr { expr, .. } | Expr::Cast { expr, .. } | Expr::Alias { expr, .. } => {
             visit_expr(expr, f)
+        }
+        Expr::WindowFunction(w) => {
+            for a in &w.args {
+                visit_expr(a, f);
+            }
+            for p in &w.partition_by {
+                visit_expr(p, f);
+            }
+            for o in &w.order_by {
+                visit_expr(&o.expr, f);
+            }
         }
         Expr::Aggregate { args, .. } | Expr::ScalarFunc { args, .. } => {
             for a in args {

@@ -870,6 +870,141 @@ impl SortExpr {
     }
 }
 
+/// The SQL-standard window functions, plus a carrier for ordinary aggregates
+/// used with OVER.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WindowFunc {
+    RowNumber,
+    Rank,
+    DenseRank,
+    PercentRank,
+    CumeDist,
+    Ntile,
+    Lag,
+    Lead,
+    FirstValue,
+    LastValue,
+    NthValue,
+    /// `SUM(x) OVER (...)` and friends — the aggregate evaluated per frame.
+    Aggregate(AggregateFunction),
+}
+
+impl fmt::Display for WindowFunc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WindowFunc::RowNumber => write!(f, "ROW_NUMBER"),
+            WindowFunc::Rank => write!(f, "RANK"),
+            WindowFunc::DenseRank => write!(f, "DENSE_RANK"),
+            WindowFunc::PercentRank => write!(f, "PERCENT_RANK"),
+            WindowFunc::CumeDist => write!(f, "CUME_DIST"),
+            WindowFunc::Ntile => write!(f, "NTILE"),
+            WindowFunc::Lag => write!(f, "LAG"),
+            WindowFunc::Lead => write!(f, "LEAD"),
+            WindowFunc::FirstValue => write!(f, "FIRST_VALUE"),
+            WindowFunc::LastValue => write!(f, "LAST_VALUE"),
+            WindowFunc::NthValue => write!(f, "NTH_VALUE"),
+            WindowFunc::Aggregate(a) => write!(f, "{a}"),
+        }
+    }
+}
+
+/// ROWS or RANGE frame units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameUnits {
+    Rows,
+    Range,
+}
+
+/// One frame bound. Offsets are row counts for ROWS frames and order-key
+/// deltas for RANGE frames (RANGE offsets are validated at execution).
+#[derive(Debug, Clone, PartialEq)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(u64),
+    CurrentRow,
+    Following(u64),
+    UnboundedFollowing,
+}
+
+/// A window frame, always stored RESOLVED: when the query writes no frame,
+/// the binder materializes the standard's default (RANGE UNBOUNDED PRECEDING
+/// .. CURRENT ROW with ORDER BY; the whole partition without), and `explicit`
+/// records which case it was for display.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowFrame {
+    pub units: FrameUnits,
+    pub start: FrameBound,
+    pub end: FrameBound,
+    pub explicit: bool,
+}
+
+/// One window expression: `func(args) OVER (PARTITION BY .. ORDER BY .. frame)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowExpr {
+    pub func: WindowFunc,
+    pub args: Vec<Expr>,
+    pub partition_by: Vec<Expr>,
+    pub order_by: Vec<SortExpr>,
+    pub frame: WindowFrame,
+}
+
+impl fmt::Display for WindowExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}(", self.func)?;
+        for (i, a) in self.args.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{a}")?;
+        }
+        write!(f, ") OVER (")?;
+        if !self.partition_by.is_empty() {
+            write!(f, "PARTITION BY ")?;
+            for (i, p) in self.partition_by.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{p}")?;
+            }
+        }
+        if !self.order_by.is_empty() {
+            if !self.partition_by.is_empty() {
+                write!(f, " ")?;
+            }
+            write!(f, "ORDER BY ")?;
+            for (i, o) in self.order_by.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{}", o.expr)?;
+                if o.direction == SortDirection::Desc {
+                    write!(f, " DESC")?;
+                }
+            }
+        }
+        if self.frame.explicit {
+            let unit = match self.frame.units {
+                FrameUnits::Rows => "ROWS",
+                FrameUnits::Range => "RANGE",
+            };
+            let b = |b: &FrameBound| match b {
+                FrameBound::UnboundedPreceding => "UNBOUNDED PRECEDING".to_string(),
+                FrameBound::Preceding(n) => format!("{n} PRECEDING"),
+                FrameBound::CurrentRow => "CURRENT ROW".to_string(),
+                FrameBound::Following(n) => format!("{n} FOLLOWING"),
+                FrameBound::UnboundedFollowing => "UNBOUNDED FOLLOWING".to_string(),
+            };
+            write!(
+                f,
+                " {unit} BETWEEN {} AND {}",
+                b(&self.frame.start),
+                b(&self.frame.end)
+            )?;
+        }
+        write!(f, ")")
+    }
+}
+
 /// Logical expression
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
@@ -948,6 +1083,12 @@ pub enum Expr {
 
     /// Alias
     Alias { expr: Box<Expr>, name: String },
+
+    /// Window function application. Exists only between binding and the
+    /// binder's window-extraction pass, which replaces every occurrence with
+    /// a column reference into the Window plan node — the optimizer and the
+    /// executor never see this variant.
+    WindowFunction(Box<WindowExpr>),
 
     /// Wildcard (*)
     Wildcard,
@@ -1105,6 +1246,7 @@ impl Expr {
             Expr::ScalarSubquery(_) => "(subquery)".to_string(),
             Expr::Exists { .. } => "EXISTS(...)".to_string(),
             Expr::InSubquery { expr, .. } => format!("{} IN (subquery)", expr.output_name()),
+            Expr::WindowFunction(w) => w.to_string(),
             Expr::Wildcard => "*".to_string(),
             Expr::QualifiedWildcard(table) => format!("{}.*", table),
         }
@@ -1586,6 +1728,31 @@ impl Expr {
                 }
             }
             Expr::Alias { expr, .. } => expr.data_type(schema),
+            Expr::WindowFunction(w) => match &w.func {
+                // Counting functions are Int64; distribution functions Float64.
+                WindowFunc::RowNumber
+                | WindowFunc::Rank
+                | WindowFunc::DenseRank
+                | WindowFunc::Ntile => Ok(ArrowDataType::Int64),
+                WindowFunc::PercentRank | WindowFunc::CumeDist => Ok(ArrowDataType::Float64),
+                // Value functions carry their argument's type.
+                WindowFunc::Lag
+                | WindowFunc::Lead
+                | WindowFunc::FirstValue
+                | WindowFunc::LastValue
+                | WindowFunc::NthValue => w
+                    .args
+                    .first()
+                    .ok_or_else(|| QueryError::Bind(format!("{} requires an argument", w.func)))?
+                    .data_type(schema),
+                // Aggregates over windows type exactly like the aggregate.
+                WindowFunc::Aggregate(func) => Expr::Aggregate {
+                    func: func.clone(),
+                    args: w.args.clone(),
+                    distinct: false,
+                }
+                .data_type(schema),
+            },
             Expr::Wildcard | Expr::QualifiedWildcard(_) => Err(QueryError::Internal(
                 "Cannot determine type of wildcard".to_string(),
             )),
@@ -1733,6 +1900,7 @@ impl fmt::Display for Expr {
                 write!(f, "{} {}IN (subquery)", expr, not_str)
             }
             Expr::Alias { expr, name } => write!(f, "{} AS {}", expr, name),
+            Expr::WindowFunction(w) => write!(f, "{}", w),
             Expr::Wildcard => write!(f, "*"),
             Expr::QualifiedWildcard(table) => write!(f, "{}.*", table),
         }

@@ -1529,6 +1529,17 @@ impl PhysicalPlanner {
                 }
             }
 
+            LogicalPlan::Window(node) => {
+                let input = self.create_physical_plan_inner(&node.input)?;
+                let schema = plan_schema_to_arrow(&node.schema);
+                let exec = crate::physical::operators::WindowExec::try_new(
+                    input,
+                    node.window_exprs.clone(),
+                    schema,
+                )?;
+                Ok(Arc::new(exec))
+            }
+
             LogicalPlan::Sort(node) => {
                 let input = self.create_physical_plan_inner(&node.input)?;
                 if self.use_spillable() {

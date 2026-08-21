@@ -60,6 +60,26 @@ pub struct Binder<'a> {
     /// Outer scope columns for correlated subqueries (name -> (type, relation))
     #[allow(dead_code)] // Reserved for correlated subquery type checking
     outer_scope: HashMap<String, (ArrowDataType, Option<String>)>,
+    /// Named WINDOW clause definitions of the SELECT currently being bound.
+    named_windows: HashMap<String, ast::WindowSpec>,
+    /// True only while the SELECT list is being bound — the one place window
+    /// functions are allowed (v1; the standard also allows ORDER BY).
+    allow_window: bool,
+}
+
+/// A frame offset must be a non-negative integer literal (the standard allows
+/// expressions; v1 does not, and says so).
+fn frame_offset(e: &ast::Expr) -> Result<u64> {
+    match e {
+        ast::Expr::Value(ast::Value::Number(n, _)) => n.parse::<u64>().map_err(|_| {
+            QueryError::Bind(format!(
+                "frame offset must be a non-negative integer, got {n}"
+            ))
+        }),
+        other => Err(QueryError::NotImplemented(format!(
+            "non-literal window frame offset ({other})"
+        ))),
+    }
 }
 
 impl<'a> Binder<'a> {
@@ -70,6 +90,8 @@ impl<'a> Binder<'a> {
             table_aliases: HashMap::new(),
             ctes: HashMap::new(),
             outer_scope: HashMap::new(),
+            named_windows: HashMap::new(),
+            allow_window: false,
         }
     }
 
@@ -86,6 +108,8 @@ impl<'a> Binder<'a> {
             table_aliases: HashMap::new(),
             ctes,
             outer_scope,
+            named_windows: HashMap::new(),
+            allow_window: false,
         }
     }
 
@@ -363,6 +387,29 @@ impl<'a> Binder<'a> {
     }
 
     fn bind_select(&mut self, select: &ast::Select) -> Result<LogicalPlan> {
+        // Named WINDOW definitions for this SELECT; windows are allowed only
+        // while the SELECT list binds (set below), never in FROM/WHERE.
+        self.allow_window = false;
+        let saved_windows = std::mem::take(&mut self.named_windows);
+        for def in &select.named_window {
+            let key = def.0.value.to_lowercase();
+            match &def.1 {
+                ast::NamedWindowExpr::WindowSpec(spec) => {
+                    self.named_windows.insert(key, spec.clone());
+                }
+                ast::NamedWindowExpr::NamedWindow(base) => {
+                    let base_key = base.value.to_lowercase();
+                    let resolved = self.named_windows.get(&base_key).cloned().ok_or_else(|| {
+                        QueryError::Bind(format!(
+                            "window \"{}\" references undefined window \"{}\"",
+                            def.0.value, base.value
+                        ))
+                    })?;
+                    self.named_windows.insert(key, resolved);
+                }
+            }
+        }
+
         // 1. FROM clause
         let mut plan = self.bind_from(&select.from)?;
 
@@ -376,7 +423,10 @@ impl<'a> Binder<'a> {
             });
         }
 
-        // 3. GROUP BY and aggregates
+        // 3. GROUP BY and aggregates. Window functions become legal to bind
+        // from here on (they live in the SELECT list; extract_aggregates
+        // pre-binds it).
+        self.allow_window = true;
         let input_schema = plan.schema();
         let (group_by, mut aggregates, aggregate_aliases, mut has_aggregates) =
             self.extract_aggregates(&select.projection, &select.group_by, &input_schema)?;
@@ -466,6 +516,31 @@ impl<'a> Binder<'a> {
         } else {
             self.bind_projection(&select.projection, &proj_schema)?
         };
+
+        self.allow_window = false;
+        self.named_windows = saved_windows;
+
+        // 5b. Window extraction: pull every window expression out of the
+        // projection into a Window node below it; the projection keeps a
+        // column reference. See WindowNode.
+        let mut window_exprs: Vec<(String, crate::planner::logical_expr::WindowExpr)> = Vec::new();
+        let proj_exprs: Vec<Expr> = proj_exprs
+            .into_iter()
+            .map(|e| Self::extract_windows(e, &mut window_exprs))
+            .collect();
+        if !window_exprs.is_empty() {
+            let win_input_schema = plan.schema();
+            let mut fields = win_input_schema.fields().to_vec();
+            for (name, w) in &window_exprs {
+                let dt = Expr::WindowFunction(Box::new(w.clone())).data_type(&win_input_schema)?;
+                fields.push(SchemaField::new(name.clone(), dt));
+            }
+            plan = LogicalPlan::Window(crate::planner::WindowNode {
+                input: Arc::new(plan),
+                window_exprs,
+                schema: PlanSchema::new(fields),
+            });
+        }
 
         plan = LogicalPlan::Project(ProjectNode {
             input: Arc::new(plan),
@@ -1759,16 +1834,260 @@ impl<'a> Binder<'a> {
         )))
     }
 
+    /// Bind `func(args) OVER (spec | name)` into an `Expr::WindowFunction`.
+    fn bind_window_function(
+        &mut self,
+        name: &str,
+        func: &ast::Function,
+        over: &ast::WindowType,
+        schema: &PlanSchema,
+    ) -> Result<Expr> {
+        use crate::planner::logical_expr::{FrameBound, FrameUnits, WindowFrame, WindowFunc};
+
+        // Resolve the window spec, following one level of naming.
+        let spec: ast::WindowSpec = match over {
+            ast::WindowType::WindowSpec(s) => s.clone(),
+            ast::WindowType::NamedWindow(ident) => {
+                let key = ident.value.to_lowercase();
+                self.named_windows.get(&key).cloned().ok_or_else(|| {
+                    QueryError::Bind(format!("window \"{}\" is not defined", ident.value))
+                })?
+            }
+        };
+        if spec.window_name.is_some() {
+            return Err(QueryError::NotImplemented(
+                "window specification inheritance (OVER (base_window ...))".into(),
+            ));
+        }
+
+        // The function itself.
+        let wfunc = match name {
+            "ROW_NUMBER" => WindowFunc::RowNumber,
+            "RANK" => WindowFunc::Rank,
+            "DENSE_RANK" => WindowFunc::DenseRank,
+            "PERCENT_RANK" => WindowFunc::PercentRank,
+            "CUME_DIST" => WindowFunc::CumeDist,
+            "NTILE" => WindowFunc::Ntile,
+            "LAG" => WindowFunc::Lag,
+            "LEAD" => WindowFunc::Lead,
+            "FIRST_VALUE" => WindowFunc::FirstValue,
+            "LAST_VALUE" => WindowFunc::LastValue,
+            "NTH_VALUE" => WindowFunc::NthValue,
+            "COUNT" => WindowFunc::Aggregate(AggregateFunction::Count),
+            "SUM" => WindowFunc::Aggregate(AggregateFunction::Sum),
+            "AVG" => WindowFunc::Aggregate(AggregateFunction::Avg),
+            "MIN" => WindowFunc::Aggregate(AggregateFunction::Min),
+            "MAX" => WindowFunc::Aggregate(AggregateFunction::Max),
+            other => {
+                return Err(QueryError::NotImplemented(format!(
+                    "window function {other} OVER (...)"
+                )))
+            }
+        };
+
+        // Arguments (COUNT(*) carries a Wildcard argument).
+        let args: Vec<Expr> = match &func.args {
+            ast::FunctionArguments::None => vec![],
+            ast::FunctionArguments::Subquery(_) => {
+                return Err(QueryError::NotImplemented(
+                    "subquery arguments to a window function".into(),
+                ))
+            }
+            ast::FunctionArguments::List(list) => list
+                .args
+                .iter()
+                .map(|arg| match arg {
+                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e))
+                    | ast::FunctionArg::Named {
+                        arg: ast::FunctionArgExpr::Expr(e),
+                        ..
+                    } => self.bind_expr(e, schema),
+                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard)
+                    | ast::FunctionArg::Named {
+                        arg: ast::FunctionArgExpr::Wildcard,
+                        ..
+                    } => Ok(Expr::Wildcard),
+                    other => Err(QueryError::NotImplemented(format!(
+                        "window function argument {other:?}"
+                    ))),
+                })
+                .collect::<Result<_>>()?,
+        };
+
+        let partition_by: Vec<Expr> = spec
+            .partition_by
+            .iter()
+            .map(|e| self.bind_expr(e, schema))
+            .collect::<Result<_>>()?;
+        let order_by = self.bind_order_by(&spec.order_by, schema)?;
+
+        // The frame, stored RESOLVED (see WindowFrame docs).
+        let frame = match &spec.window_frame {
+            None => {
+                if order_by.is_empty() {
+                    WindowFrame {
+                        units: FrameUnits::Rows,
+                        start: FrameBound::UnboundedPreceding,
+                        end: FrameBound::UnboundedFollowing,
+                        explicit: false,
+                    }
+                } else {
+                    WindowFrame {
+                        units: FrameUnits::Range,
+                        start: FrameBound::UnboundedPreceding,
+                        end: FrameBound::CurrentRow,
+                        explicit: false,
+                    }
+                }
+            }
+            Some(f) => {
+                let units = match f.units {
+                    ast::WindowFrameUnits::Rows => FrameUnits::Rows,
+                    ast::WindowFrameUnits::Range => FrameUnits::Range,
+                    ast::WindowFrameUnits::Groups => {
+                        return Err(QueryError::NotImplemented("GROUPS window frames".into()))
+                    }
+                };
+                let bound = |b: &ast::WindowFrameBound, is_start: bool| -> Result<FrameBound> {
+                    Ok(match b {
+                        ast::WindowFrameBound::CurrentRow => FrameBound::CurrentRow,
+                        ast::WindowFrameBound::Preceding(None) => FrameBound::UnboundedPreceding,
+                        ast::WindowFrameBound::Following(None) => {
+                            if is_start {
+                                return Err(QueryError::Bind(
+                                    "frame cannot start at UNBOUNDED FOLLOWING".into(),
+                                ));
+                            }
+                            FrameBound::UnboundedFollowing
+                        }
+                        ast::WindowFrameBound::Preceding(Some(e)) => {
+                            FrameBound::Preceding(frame_offset(e)?)
+                        }
+                        ast::WindowFrameBound::Following(Some(e)) => {
+                            FrameBound::Following(frame_offset(e)?)
+                        }
+                    })
+                };
+                let start = bound(&f.start_bound, true)?;
+                let end = match &f.end_bound {
+                    Some(e) => bound(e, false)?,
+                    None => FrameBound::CurrentRow,
+                };
+                if matches!(end, FrameBound::UnboundedPreceding) {
+                    return Err(QueryError::Bind(
+                        "frame cannot end at UNBOUNDED PRECEDING".into(),
+                    ));
+                }
+                WindowFrame {
+                    units,
+                    start,
+                    end,
+                    explicit: true,
+                }
+            }
+        };
+
+        Ok(Expr::WindowFunction(Box::new(
+            crate::planner::logical_expr::WindowExpr {
+                func: wfunc,
+                args,
+                partition_by,
+                order_by,
+                frame,
+            },
+        )))
+    }
+
+    /// Replace every window function in `expr` with a column reference,
+    /// registering it (deduplicated) in `acc` as (`__wN`, expression).
+    fn extract_windows(
+        expr: Expr,
+        acc: &mut Vec<(String, crate::planner::logical_expr::WindowExpr)>,
+    ) -> Expr {
+        match expr {
+            Expr::WindowFunction(w) => {
+                if let Some((name, _)) = acc.iter().find(|(_, x)| x == w.as_ref()) {
+                    return Expr::Column(Column::new(name.clone()));
+                }
+                let name = format!("__w{}", acc.len());
+                acc.push((name.clone(), *w));
+                Expr::Column(Column::new(name))
+            }
+            Expr::BinaryExpr { left, op, right } => Expr::BinaryExpr {
+                left: Box::new(Self::extract_windows(*left, acc)),
+                op,
+                right: Box::new(Self::extract_windows(*right, acc)),
+            },
+            Expr::UnaryExpr { op, expr } => Expr::UnaryExpr {
+                op,
+                expr: Box::new(Self::extract_windows(*expr, acc)),
+            },
+            Expr::Cast { expr, data_type } => Expr::Cast {
+                expr: Box::new(Self::extract_windows(*expr, acc)),
+                data_type,
+            },
+            Expr::Alias { expr, name } => Expr::Alias {
+                expr: Box::new(Self::extract_windows(*expr, acc)),
+                name,
+            },
+            Expr::ScalarFunc { func, args } => Expr::ScalarFunc {
+                func,
+                args: args
+                    .into_iter()
+                    .map(|a| Self::extract_windows(a, acc))
+                    .collect(),
+            },
+            Expr::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => Expr::Case {
+                operand: operand.map(|o| Box::new(Self::extract_windows(*o, acc))),
+                when_then: when_then
+                    .into_iter()
+                    .map(|(w, t)| (Self::extract_windows(w, acc), Self::extract_windows(t, acc)))
+                    .collect(),
+                else_expr: else_expr.map(|e| Box::new(Self::extract_windows(*e, acc))),
+            },
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => Expr::InList {
+                expr: Box::new(Self::extract_windows(*expr, acc)),
+                list: list
+                    .into_iter()
+                    .map(|e| Self::extract_windows(e, acc))
+                    .collect(),
+                negated,
+            },
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => Expr::Between {
+                expr: Box::new(Self::extract_windows(*expr, acc)),
+                low: Box::new(Self::extract_windows(*low, acc)),
+                high: Box::new(Self::extract_windows(*high, acc)),
+                negated,
+            },
+            other => other,
+        }
+    }
+
     fn bind_function(&mut self, func: &ast::Function, schema: &PlanSchema) -> Result<Expr> {
         let name = func.name.to_string().to_uppercase();
 
-        // Window functions are not supported. Without this check, SUM(x) OVER (...)
-        // would silently bind as a plain aggregate and return wrong results.
-        if func.over.is_some() {
-            return Err(QueryError::NotImplemented(format!(
-                "Window functions ({} OVER ...)",
-                name
-            )));
+        // Window functions bind to Expr::WindowFunction — never as a plain
+        // aggregate, which would silently return wrong results.
+        if let Some(over) = &func.over {
+            if !self.allow_window {
+                return Err(QueryError::Bind(format!(
+                    "{name} OVER (...) is only allowed in the SELECT list"
+                )));
+            }
+            return self.bind_window_function(&name, func, over, schema);
         }
 
         // Extract arguments from the FunctionArguments

@@ -17,6 +17,7 @@ mod subquery;
 mod union;
 pub mod vector_search;
 pub mod vectorized_hash;
+mod window;
 
 pub use delim_join::{DelimGetExec, DelimJoinExec, DelimState};
 pub use filter::{evaluate_expr, filter_batches, FilterExec};
@@ -36,3 +37,4 @@ pub use subquery::{
 };
 pub use union::UnionExec;
 pub use vector_search::VectorSearchExec;
+pub use window::WindowExec;
