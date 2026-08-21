@@ -29,7 +29,6 @@ use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use arrow::ipc::writer::IpcWriteOptions;
-use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
@@ -113,9 +112,9 @@ fn parse_command(cmd: &[u8]) -> Result<(String, String), Status> {
 }
 
 /// Execution metadata, the Flight analogue of the `x-qe-*` response headers.
-/// Sent as a trailing metadata-only `FlightData` (no IPC header, only
-/// `app_metadata`), which Arrow clients surface as a data-less chunk after the
-/// last batch.
+/// Carried on the trailing zero-row batch message (see
+/// [`encode_flight_stream`]), which every Arrow client family surfaces as a
+/// final chunk with `app_metadata` set.
 fn outcome_metadata(outcome: &ExecOutcome) -> serde_json::Value {
     let mut m = serde_json::json!({
         "rows": outcome.result.row_count,
@@ -142,6 +141,61 @@ fn exec_error_status(e: ExecError) -> Status {
         ExecError::Query(e) => query_error_status(&e),
         ExecError::TaskFailed(e) => Status::internal(format!("query task failed: {e}")),
     }
+}
+
+/// Largest row count encoded into one `FlightData`. gRPC clients default to a
+/// 4MB receive limit; the engine's ~8k-row batches with wide string columns
+/// can brush against it, so batches are re-sliced before encoding.
+const MAX_ENCODE_ROWS: usize = 4096;
+
+/// Encode a result as the DoGet message sequence: schema, then every batch
+/// (dictionaries included), then a zero-row batch of the same schema whose
+/// `app_metadata` carries the execution facts.
+///
+/// Hand-rolled rather than `FlightDataEncoderBuilder` for one interop reason:
+/// there is no metadata-ONLY trailer both client families accept. arrow-rs'
+/// decoder refuses an empty `data_header` ("Error decoding root message") and
+/// Arrow C++ / pyarrow refuses a NONE-typed one ("Header-type … is not
+/// RecordBatch"). A zero-row RecordBatch message is legal everywhere, decodes
+/// to nothing, and its `app_metadata` rides along in both implementations.
+fn encode_flight_stream(
+    batches: Vec<arrow::record_batch::RecordBatch>,
+    schema: arrow::datatypes::SchemaRef,
+    metadata: Bytes,
+) -> Result<Vec<FlightData>, Status> {
+    use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
+
+    let opts = IpcWriteOptions::default();
+    let generator = IpcDataGenerator::default();
+    // Replacement allowed, same as arrow's own StreamWriter: the trailing
+    // empty batch re-announces (empty) dictionaries for dictionary columns.
+    let mut tracker = DictionaryTracker::new(false);
+    let ipc_err =
+        |e: arrow::error::ArrowError| Status::internal(format!("flight encoding failed: {e}"));
+
+    let mut out: Vec<FlightData> = Vec::new();
+    out.push(SchemaAsIpc::new(&schema, &opts).into());
+    let trailer_batch = arrow::record_batch::RecordBatch::new_empty(schema.clone());
+    for batch in batches.iter().chain(std::iter::once(&trailer_batch)) {
+        let mut offset = 0;
+        loop {
+            let len = (batch.num_rows() - offset).min(MAX_ENCODE_ROWS);
+            let slice = batch.slice(offset, len);
+            let (dicts, data) = generator
+                .encoded_batch(&slice, &mut tracker, &opts)
+                .map_err(ipc_err)?;
+            for d in dicts {
+                out.push(d.into());
+            }
+            out.push(data.into());
+            offset += len;
+            if offset >= batch.num_rows() {
+                break;
+            }
+        }
+    }
+    out.last_mut().expect("at least the trailer").app_metadata = metadata;
+    Ok(out)
 }
 
 /// The Flight front door. Cheap to clone; state is shared with the HTTP server.
@@ -344,20 +398,10 @@ impl FlightService for QeFlightService {
             .unwrap_or_else(|| outcome.result.schema.clone());
         let batches = outcome.result.batches;
 
-        let encoded = FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .build(futures::stream::iter(batches.into_iter().map(Ok)))
-            .map(|r| r.map_err(|e| Status::internal(format!("flight encoding failed: {e}"))));
-
-        // Trailing metadata-only message — the Flight analogue of the x-qe-*
-        // headers, after the data so it can carry execution facts.
-        let trailer = futures::stream::once(async move {
-            Ok(FlightData {
-                app_metadata: metadata,
-                ..Default::default()
-            })
-        });
-        Ok(Response::new(encoded.chain(trailer).boxed()))
+        let messages = encode_flight_stream(batches, schema, metadata)?;
+        Ok(Response::new(
+            futures::stream::iter(messages.into_iter().map(Ok)).boxed(),
+        ))
     }
 
     async fn do_put(
