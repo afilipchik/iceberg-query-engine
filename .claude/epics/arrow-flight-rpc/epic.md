@@ -1,9 +1,9 @@
 ---
 name: arrow-flight-rpc
-status: backlog
+status: completed
 created: 2026-08-21T13:40:26Z
-updated: 2026-08-21T13:40:26Z
-progress: 62%
+updated: 2026-08-21T14:25:42Z
+progress: 100%
 prd: .claude/prds/arrow-flight-rpc.md
 github: (will be set on sync)
 ---
@@ -134,14 +134,14 @@ drives the shipped binary.
 early) and streaming metadata ergonomics in arrow-flight 53 (task 4).
 
 ## Tasks Created
-- [ ] 001.md - Add arrow-flight/tonic dependencies with add-only lock diff (parallel: true)
-- [ ] 002.md - Extract execute_statement from the HTTP sql handler (parallel: true)
-- [ ] 003.md - Flight service skeleton and serve wiring (parallel: false)
-- [ ] 004.md - Query path — GetFlightInfo, DoGet, tickets, error mapping (parallel: false)
-- [ ] 005.md - Distributed parity — Flight on every node of a real cluster (parallel: false)
-- [ ] 006.md - Rust integration tests for the Flight endpoint (parallel: true)
-- [ ] 007.md - Python acceptance gate — pyarrow.flight TPC-H parity (parallel: true)
-- [ ] 008.md - Documentation — README, CLAUDE.md, design-note update (parallel: true)
+- [x] 001.md - Add arrow-flight/tonic dependencies with add-only lock diff (parallel: true)
+- [x] 002.md - Extract execute_statement from the HTTP sql handler (parallel: true)
+- [x] 003.md - Flight service skeleton and serve wiring (parallel: false)
+- [x] 004.md - Query path — GetFlightInfo, DoGet, tickets, error mapping (parallel: false)
+- [x] 005.md - Distributed parity — Flight on every node of a real cluster (parallel: false)
+- [x] 006.md - Rust integration tests for the Flight endpoint (parallel: true)
+- [x] 007.md - Python acceptance gate — pyarrow.flight TPC-H parity (parallel: true)
+- [x] 008.md - Documentation — README, CLAUDE.md, design-note update (parallel: true)
 
 Total tasks: 8
 Parallel tasks: 5
