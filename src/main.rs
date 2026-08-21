@@ -323,6 +323,11 @@ enum Commands {
         /// Grace period for in-flight requests after the listener closes.
         #[arg(long, default_value = "10000")]
         shutdown_grace_ms: u64,
+
+        /// Arrow Flight (gRPC) bind address. Default: the HTTP host with
+        /// port + 1. Pass `none` to disable the Flight endpoint.
+        #[arg(long)]
+        flight_bind: Option<String>,
     },
 }
 
@@ -1089,6 +1094,7 @@ async fn main() {
             probe_timeout_ms,
             drain_ms,
             shutdown_grace_ms,
+            flight_bind,
         } => {
             use query_engine::distributed::{serve, ServeOptions};
             use std::time::Duration;
@@ -1119,6 +1125,7 @@ async fn main() {
                 probe_timeout: Duration::from_millis(probe_timeout_ms),
                 drain: Duration::from_millis(drain_ms),
                 shutdown_grace: Duration::from_millis(shutdown_grace_ms),
+                flight_bind,
             };
 
             let loader = Box::new(move || {

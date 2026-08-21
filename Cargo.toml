@@ -103,6 +103,9 @@ http-body-util = "0.1"
 # runs its own hyper/h2 stack; our direct hyper dependency keeps http1-only.
 arrow-flight = "53"
 tonic = "0.12"
+# TcpListenerStream for the flight server's incoming socket stream. Already in
+# the lock as tonic's own dependency, so naming it adds no lock entries.
+tokio-stream = { version = "0.1", features = ["net"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }

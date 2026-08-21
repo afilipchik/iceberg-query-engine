@@ -93,6 +93,11 @@ pub struct ServeOptions {
     pub drain: Duration,
     /// Grace period for in-flight requests once the listener is closed.
     pub shutdown_grace: Duration,
+    /// Arrow Flight (gRPC) bind address. `None` derives it from the bound HTTP
+    /// address: same host, port + 1 — or another ephemeral port when the HTTP
+    /// port was ephemeral, so tests binding `:0` stay collision-free. The
+    /// literal `"none"` disables the Flight endpoint entirely.
+    pub flight_bind: Option<String>,
 }
 
 impl Default for ServeOptions {
@@ -108,6 +113,7 @@ impl Default for ServeOptions {
             probe_timeout: Duration::from_millis(1000),
             drain: Duration::ZERO,
             shutdown_grace: Duration::from_secs(10),
+            flight_bind: None,
         }
     }
 }
@@ -132,6 +138,9 @@ fn query_runtime() -> &'static tokio::runtime::Runtime {
 pub struct NodeState {
     pub node_id: NodeId,
     pub address: String,
+    /// Advertised `host:port` of this node's Arrow Flight endpoint, when one
+    /// is running: the advertised HTTP host with the bound Flight port.
+    pub flight_address: Option<String>,
     pub membership: Arc<Membership>,
     /// `None` until the loader finishes. Readiness is defined by this.
     context: RwLock<Option<Arc<ExecutionContext>>>,
@@ -147,10 +156,16 @@ pub struct NodeState {
 }
 
 impl NodeState {
-    fn new(node_id: NodeId, address: String, membership: Arc<Membership>) -> Self {
+    fn new(
+        node_id: NodeId,
+        address: String,
+        flight_address: Option<String>,
+        membership: Arc<Membership>,
+    ) -> Self {
         Self {
             node_id,
             address,
+            flight_address,
             membership,
             context: RwLock::new(None),
             load_error: RwLock::new(None),
@@ -198,15 +213,22 @@ impl NodeState {
 /// [`ServerHandle::shutdown`].
 pub struct ServerHandle {
     local_addr: SocketAddr,
+    flight_addr: Option<SocketAddr>,
     state: Arc<NodeState>,
     shutdown_tx: watch::Sender<bool>,
     join: tokio::task::JoinHandle<()>,
+    flight_join: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ServerHandle {
     /// The address actually bound. Meaningful when `bind` used port 0.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// The Arrow Flight address actually bound, when Flight is enabled.
+    pub fn flight_addr(&self) -> Option<SocketAddr> {
+        self.flight_addr
     }
 
     pub fn state(&self) -> &Arc<NodeState> {
@@ -238,6 +260,9 @@ impl ServerHandle {
     pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(true);
         let _ = self.join.await;
+        if let Some(fj) = self.flight_join {
+            let _ = fj.await;
+        }
     }
 }
 
@@ -255,6 +280,43 @@ pub async fn spawn(opts: ServeOptions, loader: TableLoader) -> Result<ServerHand
 
     let address = derive_advertise(local_addr, opts.advertise.as_deref());
     let node_id = derive_node_id(opts.node_id, &address);
+
+    // Arrow Flight listener, bound BEFORE NodeState exists so the advertised
+    // flight address is a construction-time fact, not a mutable one.
+    let flight_listener = match opts.flight_bind.as_deref() {
+        Some("none") => None,
+        explicit => {
+            let bind = match explicit {
+                Some(addr) => addr.to_string(),
+                // Derive: same host as the HTTP bind; port + 1, or another
+                // ephemeral port when HTTP was ephemeral (a fixed "+1" off an
+                // ephemeral port would race other processes for it).
+                None => {
+                    let port = if local_addr.port() == 0 || opts.bind.ends_with(":0") {
+                        0
+                    } else {
+                        local_addr.port().checked_add(1).unwrap_or(0)
+                    };
+                    format!("{}:{}", local_addr.ip(), port)
+                }
+            };
+            let l = TcpListener::bind(&bind)
+                .await
+                .map_err(|e| QueryError::Execution(format!("cannot bind flight {bind}: {e}")))?;
+            Some(l)
+        }
+    };
+    let flight_addr = match &flight_listener {
+        Some(l) => Some(l.local_addr().map_err(|e| {
+            QueryError::Execution(format!("cannot read bound flight address: {e}"))
+        })?),
+        None => None,
+    };
+    // Advertised flight address: the advertised HTTP host, the flight port.
+    let flight_address = flight_addr.map(|fa| {
+        let host = address.rsplit_once(':').map(|(h, _)| h).unwrap_or(&address);
+        format!("{host}:{}", fa.port())
+    });
 
     let discovery = match &opts.peers_dns {
         Some(name) => Discovery::Dns {
@@ -274,8 +336,22 @@ pub async fn spawn(opts: ServeOptions, loader: TableLoader) -> Result<ServerHand
     );
 
     let membership = Arc::new(Membership::new(node_id, address.clone(), discovery));
-    let state = Arc::new(NodeState::new(node_id, address, membership));
+    let state = Arc::new(NodeState::new(node_id, address, flight_address, membership));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // Arrow Flight server, sharing the shutdown signal with the HTTP side.
+    let flight_join = flight_listener.map(|listener| {
+        tracing::info!(
+            node_id,
+            flight = %flight_addr.expect("addr read above"),
+            "serve: flight listening"
+        );
+        crate::distributed::flight::spawn_flight_server(
+            listener,
+            state.clone(),
+            shutdown_rx.clone(),
+        )
+    });
 
     // Table loading: on a blocking thread, because registering Parquet tables
     // reads footers. `/healthz` answers throughout; `/readyz` flips when done.
@@ -327,9 +403,11 @@ pub async fn spawn(opts: ServeOptions, loader: TableLoader) -> Result<ServerHand
 
     Ok(ServerHandle {
         local_addr,
+        flight_addr,
         state,
         shutdown_tx,
         join,
+        flight_join,
     })
 }
 
@@ -341,12 +419,21 @@ pub async fn spawn(opts: ServeOptions, loader: TableLoader) -> Result<ServerHand
 /// crash — including to anyone debugging a genuine crash.
 pub async fn serve(opts: ServeOptions, loader: TableLoader) -> Result<()> {
     let handle = spawn(opts, loader).await?;
-    println!(
-        "query_engine serve: node {} listening on {} (advertising {})",
-        handle.node_id(),
-        handle.local_addr(),
-        handle.address()
-    );
+    match handle.flight_addr() {
+        Some(f) => println!(
+            "query_engine serve: node {} listening on {} (advertising {}), flight on {}",
+            handle.node_id(),
+            handle.local_addr(),
+            handle.address(),
+            f
+        ),
+        None => println!(
+            "query_engine serve: node {} listening on {} (advertising {}), flight disabled",
+            handle.node_id(),
+            handle.local_addr(),
+            handle.address()
+        ),
+    }
 
     wait_for_signal().await;
     tracing::info!("serve: signal received, shutting down");
@@ -956,7 +1043,7 @@ fn readyz(state: &Arc<NodeState>) -> Response<Full<Bytes>> {
 }
 
 #[derive(serde::Serialize)]
-struct ClusterView {
+pub(crate) struct ClusterView {
     node: NodeView,
     discovery: DiscoveryView,
     member_count: usize,
@@ -967,6 +1054,9 @@ struct ClusterView {
 struct NodeView {
     id: NodeId,
     address: String,
+    /// Advertised Arrow Flight address, absent when Flight is disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    flight: Option<String>,
     ready: bool,
     tables: Vec<String>,
     uptime_ms: u64,
@@ -984,13 +1074,16 @@ struct DiscoveryView {
     last_error: Option<String>,
 }
 
-fn cluster(state: &Arc<NodeState>) -> Response<Full<Bytes>> {
+/// The membership view served by `GET /cluster` — and, byte-identically, by
+/// the Flight `DoAction("cluster")`.
+pub(crate) fn cluster_view(state: &Arc<NodeState>) -> ClusterView {
     let discovery = state.membership.discovery();
     let members = state.membership.members();
-    let view = ClusterView {
+    ClusterView {
         node: NodeView {
             id: state.node_id,
             address: state.address.clone(),
+            flight: state.flight_address.clone(),
             ready: state.ready(),
             tables: state
                 .context()
@@ -1014,7 +1107,11 @@ fn cluster(state: &Arc<NodeState>) -> Response<Full<Bytes>> {
         },
         member_count: members.len(),
         members,
-    };
+    }
+}
+
+fn cluster(state: &Arc<NodeState>) -> Response<Full<Bytes>> {
+    let view = cluster_view(state);
     match serde_json::to_vec_pretty(&view) {
         Ok(bytes) => raw_response(StatusCode::OK, "application/json", bytes),
         Err(e) => error_response(
