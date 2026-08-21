@@ -986,9 +986,8 @@ Based on the codebase structure, these appear to be planned but not fully implem
   delete files and does no partition pruning yet. The old JSON-manifest stub
   in `src/physical/operators/iceberg.rs` is dead code kept only for its
   stats-pruning scaffolding.
-- **Window functions** - ROW_NUMBER, RANK, DENSE_RANK, LEAD, LAG, etc.
-  - Requires new WindowExpr, WindowNode, and WindowExec infrastructure
-  - See plan at `.claude/plans/trino-function-implementation.md` Phase 6
+- ~~Window functions~~ — DONE 2026-08-21 (standard-sql-completion epic),
+  see the "Window functions" section below
 - **Array/Map type support** - Complex nested data types
   - Array functions: array_agg, array_distinct, array_join, filter, transform, etc.
   - Map functions: map_keys, map_values, map_entries, element_at, etc.
@@ -1655,6 +1654,56 @@ which id lands at rank 10 is arbitrary in any implementation. The exact path
 matches the GPU float64 ground truth on all 10 queries at every rank, with
 category precision@10 = 1.000.
 
+## Window Functions & Standard-SQL Completion (2026-08-21)
+
+The standard-sql-completion epic (`.claude/epics/standard-sql-completion/`)
+closed the gaps a 59-probe battery found (`scripts/sql_feature_probe.py`,
+55/59 green; the 4 remaining are RECURSIVE CTE, BETWEEN SYMMETRIC
+(sqlparser 0.52 cannot parse it), NATURAL JOIN, LATERAL — all refused, not
+mis-answered).
+
+**Window functions** — all of: ROW_NUMBER, RANK, DENSE_RANK, PERCENT_RANK,
+CUME_DIST, NTILE(n), LAG/LEAD(x[,off[,default]]), FIRST/LAST/NTH_VALUE, and
+COUNT/SUM/AVG/MIN/MAX over windows. PARTITION BY, multi-key ORDER BY
+(default NULLS LAST for ASC, Postgres-style), ROWS frames exact, RANGE
+frames for UNBOUNDED/CURRENT bounds plus numeric offsets over ONE
+numeric/date key, named `WINDOW w AS (...)` clauses, windows inside scalar
+expressions, several windows per SELECT.
+
+- Architecture: binder extracts window exprs post-HAVING into a
+  `Window` logical node (`__wN` output columns) below the final projection
+  (`binder.rs::bind_window_function` / `extract_windows`);
+  `WindowExec` (`src/physical/operators/window.rs`) sorts a permutation per
+  window spec, walks partitions/peer groups (arrow partition kernel),
+  resolves frames per row, scatters results back to input order.
+  COUNT/SUM/AVG are O(1)-per-row via prefix sums; MIN/MAX recompute frames.
+- Refused BY NAME (never silently wrong): STDDEV etc. OVER, GROUPS frames,
+  EXCLUDE, IGNORE NULLS, non-literal frame offsets/NTILE/LAG args, RANGE
+  offsets over unsupported key types, windows outside the SELECT list.
+- Optimizer: predicate pushdown stops at Window (barrier); NO column
+  pruning beneath it (its bind-time schema carries every input column —
+  lifting this is a perf follow-up); scatter planning rejects windows by
+  name, so distributed execution uses the GATHER path (verified on a
+  3-node cluster via HTTP + Flight, `window_gather` in flight_validate.py).
+- Perf status: single-threaded, input fully materialized (same class as
+  SortExec); morsel/spill treatment is a future epic.
+
+**Grouping extensions** — GROUP BY GROUPING SETS/ROLLUP/CUBE desugar in the
+binder to UNION ALL of plain aggregates (typed-NULL padding, GROUPING()
+bitmask constants per branch). Refused by name: mixing with plain GROUP BY
+items, HAVING, wildcard/complex projections.
+
+**Expression forms** — IS [NOT] DISTINCT FROM (CASE desugar); ANY/SOME/ALL
+(= ANY -> IN, <> ALL -> NOT IN, ordering ops -> MIN/MAX scalar subquery
+with emptiness guard; NULL-element corner semantics follow MIN/MAX skip
+behavior); OVERLAY (SUBSTRING/CONCAT desugar); `expr ± INTERVAL 'n' unit`
+-> DATE_ADD (calendar-correct months); GROUP BY <ordinal> resolves into the
+SELECT list.
+
+Gates: `scripts/window_validate.py` (63 DuckDB-compared cases; QE_BINARY
+env selects the binary) and `tests/window_functions.rs` (9 hermetic
+semantics tests). Both must stay green.
+
 ## Recently Implemented Features
 
 - **Hardware Topology Awareness** (2026-08-09) — `src/execution/topology.rs`
@@ -1915,6 +1964,9 @@ category precision@10 = 1.000.
 | Predicate pushdown | `src/optimizer/rules/predicate_pushdown.rs` |
 | Projection pushdown | `src/optimizer/rules/projection_pushdown.rs` |
 | Physical execution | `src/physical/operators/*.rs` |
+| Window execution | `src/physical/operators/window.rs` |
+| Window/grouping DuckDB gate | `scripts/window_validate.py` |
+| SQL feature probe | `scripts/sql_feature_probe.py` |
 | Morsel aggregation operator | `src/physical/operators/morsel_agg.rs` |
 | Morsel framework | `src/physical/morsel.rs`, `src/physical/morsel_agg.rs` |
 | Subquery execution | `src/physical/operators/subquery.rs` |

@@ -6,6 +6,8 @@ A high-performance SQL query engine built from scratch in Rust, designed for ana
 
 - **Full SQL Support**: SELECT, JOIN, GROUP BY, ORDER BY, LIMIT, UNION, and more
 - **Trino SQL Compatibility**: 100+ functions including math, string, date/time, regex, JSON, and aggregates
+- **Window Functions**: the full SQL-standard suite — ROW_NUMBER, RANK, DENSE_RANK, PERCENT_RANK, CUME_DIST, NTILE, LAG, LEAD, FIRST/LAST/NTH_VALUE, and COUNT/SUM/AVG/MIN/MAX over ROWS/RANGE frames, with PARTITION BY and named WINDOW clauses
+- **Grouping Extensions**: GROUPING SETS, ROLLUP, CUBE with GROUPING()
 - **Correlated Subqueries**: EXISTS, NOT EXISTS, IN, NOT IN, scalar subqueries
 - **TPC-H Benchmark**: All 22 TPC-H queries passing (160+ SQL tests total)
 - **Parquet Support**: Read Parquet files and directories directly
@@ -347,6 +349,19 @@ See `CLAUDE.md` for the full benchmark history and methodology.*
 ### Conditional Functions (6)
 `COALESCE`, `NULLIF`, `CASE`, `IF`, `GREATEST`, `LEAST`
 
+### Window Functions (16)
+`ROW_NUMBER`, `RANK`, `DENSE_RANK`, `PERCENT_RANK`, `CUME_DIST`, `NTILE`,
+`LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`, plus `COUNT`,
+`SUM`, `AVG`, `MIN`, `MAX` over windows — `PARTITION BY`, multi-key
+`ORDER BY`, `ROWS`/`RANGE` frames, named `WINDOW` clauses:
+
+```sql
+SELECT o_custkey,
+       o_totalprice - LAG(o_totalprice) OVER w AS delta,
+       SUM(o_totalprice) OVER (w ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS r3
+FROM orders WINDOW w AS (PARTITION BY o_custkey ORDER BY o_orderdate);
+```
+
 ### JSON Functions (14)
 `JSON_EXTRACT`, `JSON_EXTRACT_SCALAR`, `JSON_ARRAY_LENGTH`, `JSON_ARRAY_GET`, `JSON_ARRAY_CONTAINS`, `JSON_SIZE`, `JSON_PARSE`, `JSON_FORMAT`, `JSON_KEYS`, `IS_JSON_SCALAR`, `JSON_QUERY`, `JSON_VALUE`, `JSON_EXISTS`
 
@@ -378,7 +393,8 @@ See `CLAUDE.md` for the full benchmark history and methodology.*
 - [x] Parallel execution (morsel-driven, NUMA/topology-aware)
 - [x] Cost-based join ordering (DPsize from file statistics)
 - [x] Distributed execution (`serve` mode: scatter/gather over N nodes)
-- [ ] Window functions (ROW_NUMBER, RANK, etc.)
+- [x] Window functions (full SQL-standard suite, DuckDB-validated)
+- [x] GROUPING SETS / ROLLUP / CUBE
 - [ ] Array/Map type support
 - [ ] Iceberg partition pruning + row-level deletes
 
