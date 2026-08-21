@@ -1109,6 +1109,18 @@ uncontained sweep); validate VALUES against `data/sf100_duckdb_results`
 counts are not answers). Do NOT set OOMSAFE_MEMHIGH on measurement
 runs: MemoryHigh counts page cache and throttled a capped sweep +2.2s.
 
+## TPC-H Benchmark Status (SF=1, 2026-08-21)
+
+**1.38s warm vs DuckDB 1.4.4: 0.97s over the same parquet (1.42x) and
+0.44s native in-memory tables (3.11x); 22/22 CELL-EXACT.** Best of 3 per
+query, 16 duck threads, data `data/tpch-1gb` (current generator,
+regenerated same day). Engine WINS like-for-like on Q02/Q09/Q15/Q20/Q21
+and beats native DuckDB on Q09 (124 vs 169ms — native Q09 pathology
+already seen at SF=100 persists at SF=1). Per-query table in README.
+Method: `benchmark-parquet --path data/tpch-1gb --iterations 3` +
+`.scratch/sf1/duck_bench.py` pattern (queries extracted from
+src/tpch/queries.rs; Q11 threshold needs no adjustment at SF=1).
+
 ## TPC-H Benchmark Status (SF=10, updated 2026-08-17)
 
 **7.45s parquet / 6.37s with the IPC sidecar cache (`QE_IPC_CACHE=1`) vs

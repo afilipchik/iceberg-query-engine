@@ -332,6 +332,44 @@ Lance:                   ~101s   (DuckDB's lance extension: 69.1s)
 *Measured 2026-08 on an i9-13900KF (8P+16E cores), parallel execution.
 See `CLAUDE.md` for the full benchmark history and methodology.*
 
+### TPC-H SF=1 (measured 2026-08-21)
+
+All 22 queries, warm, best of 3 per query, **results cell-exact vs DuckDB**.
+Both engines read the identical parquet files ("same parquet"); the native
+column is DuckDB's best case (data pre-loaded into in-memory tables, decode
+excluded). DuckDB 1.4.4, 16 threads.
+
+| Query | Engine | DuckDB (same parquet) | DuckDB (native) |
+|-------|--------|----------------------|-----------------|
+| Q01 | 74ms | 43ms | 14ms |
+| Q02 | 17ms | 25ms | 7ms |
+| Q03 | 95ms | 39ms | 11ms |
+| Q04 | 71ms | 28ms | 10ms |
+| Q05 | 61ms | 37ms | 9ms |
+| Q06 | 21ms | 13ms | 4ms |
+| Q07 | 112ms | 42ms | 11ms |
+| Q08 | 80ms | 49ms | 11ms |
+| Q09 | 124ms | 148ms | 169ms |
+| Q10 | 105ms | 48ms | 16ms |
+| Q11 | 19ms | 12ms | 3ms |
+| Q12 | 68ms | 41ms | 13ms |
+| Q13 | 63ms | 46ms | 15ms |
+| Q14 | 25ms | 22ms | 9ms |
+| Q15 | 15ms | 19ms | 5ms |
+| Q16 | 25ms | 26ms | 10ms |
+| Q17 | 39ms | 31ms | 10ms |
+| Q18 | 104ms | 94ms | 32ms |
+| Q19 | 74ms | 31ms | 17ms |
+| Q20 | 66ms | 69ms | 24ms |
+| Q21 | 66ms | 83ms | 35ms |
+| Q22 | 55ms | 27ms | 8ms |
+| **Total** | **1.38s** | **0.97s** | **0.44s** |
+
+Overall: **1.42x** DuckDB on the same files, **3.11x** its native-table best
+case. The engine wins Q02, Q09, Q15, Q20 and Q21 like-for-like, and beats
+even native DuckDB on Q09 (124ms vs 169ms).
+
+
 ## Supported Functions
 
 ### Math Functions (28)
