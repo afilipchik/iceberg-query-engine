@@ -180,6 +180,12 @@ QUICK_CHECKS = [
      "force", True),
     # Forced local must say so on both doors.
     ("forced_local", "SELECT COUNT(*) AS n FROM orders", "off", False),
+    # Window functions (standard-sql-completion epic) travel the gather path
+    # when distribution is forced; auto answers locally naming the reason.
+    ("window_gather",
+     "SELECT o_custkey, SUM(o_totalprice) OVER (PARTITION BY o_custkey ORDER BY o_orderkey) AS rt "
+     "FROM orders WHERE o_custkey < 50",
+     "force", True),
 ]
 
 

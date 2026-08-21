@@ -60,6 +60,63 @@ pub struct Binder<'a> {
     /// Outer scope columns for correlated subqueries (name -> (type, relation))
     #[allow(dead_code)] // Reserved for correlated subquery type checking
     outer_scope: HashMap<String, (ArrowDataType, Option<String>)>,
+    /// Named WINDOW clause definitions of the SELECT currently being bound.
+    named_windows: HashMap<String, ast::WindowSpec>,
+    /// True only while the SELECT list is being bound — the one place window
+    /// functions are allowed (v1; the standard also allows ORDER BY).
+    allow_window: bool,
+}
+
+/// `a IS [NOT] DISTINCT FROM b` as a CASE over IS NULL tests — null-safe
+/// equality without new evaluator machinery.
+fn is_distinct_expr(a: Expr, b: Expr, negated: bool) -> Expr {
+    let is_null = |e: &Expr| Expr::UnaryExpr {
+        op: UnaryOp::IsNull,
+        expr: Box::new(e.clone()),
+    };
+    let both_null = Expr::BinaryExpr {
+        left: Box::new(is_null(&a)),
+        op: BinaryOp::And,
+        right: Box::new(is_null(&b)),
+    };
+    let either_null = Expr::BinaryExpr {
+        left: Box::new(is_null(&a)),
+        op: BinaryOp::Or,
+        right: Box::new(is_null(&b)),
+    };
+    let (t_both, t_one, cmp_op) = if negated {
+        // IS NOT DISTINCT FROM: null-safe equality
+        (true, false, BinaryOp::Eq)
+    } else {
+        (false, true, BinaryOp::NotEq)
+    };
+    Expr::Case {
+        operand: None,
+        when_then: vec![
+            (both_null, Expr::Literal(ScalarValue::Boolean(t_both))),
+            (either_null, Expr::Literal(ScalarValue::Boolean(t_one))),
+        ],
+        else_expr: Some(Box::new(Expr::BinaryExpr {
+            left: Box::new(a),
+            op: cmp_op,
+            right: Box::new(b),
+        })),
+    }
+}
+
+/// A frame offset must be a non-negative integer literal (the standard allows
+/// expressions; v1 does not, and says so).
+fn frame_offset(e: &ast::Expr) -> Result<u64> {
+    match e {
+        ast::Expr::Value(ast::Value::Number(n, _)) => n.parse::<u64>().map_err(|_| {
+            QueryError::Bind(format!(
+                "frame offset must be a non-negative integer, got {n}"
+            ))
+        }),
+        other => Err(QueryError::NotImplemented(format!(
+            "non-literal window frame offset ({other})"
+        ))),
+    }
 }
 
 impl<'a> Binder<'a> {
@@ -70,6 +127,8 @@ impl<'a> Binder<'a> {
             table_aliases: HashMap::new(),
             ctes: HashMap::new(),
             outer_scope: HashMap::new(),
+            named_windows: HashMap::new(),
+            allow_window: false,
         }
     }
 
@@ -86,6 +145,8 @@ impl<'a> Binder<'a> {
             table_aliases: HashMap::new(),
             ctes,
             outer_scope,
+            named_windows: HashMap::new(),
+            allow_window: false,
         }
     }
 
@@ -363,6 +424,29 @@ impl<'a> Binder<'a> {
     }
 
     fn bind_select(&mut self, select: &ast::Select) -> Result<LogicalPlan> {
+        // Named WINDOW definitions for this SELECT; windows are allowed only
+        // while the SELECT list binds (set below), never in FROM/WHERE.
+        self.allow_window = false;
+        let saved_windows = std::mem::take(&mut self.named_windows);
+        for def in &select.named_window {
+            let key = def.0.value.to_lowercase();
+            match &def.1 {
+                ast::NamedWindowExpr::WindowSpec(spec) => {
+                    self.named_windows.insert(key, spec.clone());
+                }
+                ast::NamedWindowExpr::NamedWindow(base) => {
+                    let base_key = base.value.to_lowercase();
+                    let resolved = self.named_windows.get(&base_key).cloned().ok_or_else(|| {
+                        QueryError::Bind(format!(
+                            "window \"{}\" references undefined window \"{}\"",
+                            def.0.value, base.value
+                        ))
+                    })?;
+                    self.named_windows.insert(key, resolved);
+                }
+            }
+        }
+
         // 1. FROM clause
         let mut plan = self.bind_from(&select.from)?;
 
@@ -376,7 +460,26 @@ impl<'a> Binder<'a> {
             });
         }
 
-        // 3. GROUP BY and aggregates
+        // 3a. GROUPING SETS / ROLLUP / CUBE desugar to a UNION ALL of plain
+        // aggregates (one branch per set) — no new physical operator.
+        if let ast::GroupByExpr::Expressions(gexprs, _) = &select.group_by {
+            let has_sets = gexprs.iter().any(|e| {
+                matches!(
+                    e,
+                    SqlExpr::GroupingSets(_) | SqlExpr::Rollup(_) | SqlExpr::Cube(_)
+                )
+            });
+            if has_sets {
+                self.allow_window = false;
+                self.named_windows = saved_windows;
+                return self.bind_grouping_sets(select, plan, gexprs);
+            }
+        }
+
+        // 3. GROUP BY and aggregates. Window functions become legal to bind
+        // from here on (they live in the SELECT list; extract_aggregates
+        // pre-binds it).
+        self.allow_window = true;
         let input_schema = plan.schema();
         let (group_by, mut aggregates, aggregate_aliases, mut has_aggregates) =
             self.extract_aggregates(&select.projection, &select.group_by, &input_schema)?;
@@ -467,6 +570,31 @@ impl<'a> Binder<'a> {
             self.bind_projection(&select.projection, &proj_schema)?
         };
 
+        self.allow_window = false;
+        self.named_windows = saved_windows;
+
+        // 5b. Window extraction: pull every window expression out of the
+        // projection into a Window node below it; the projection keeps a
+        // column reference. See WindowNode.
+        let mut window_exprs: Vec<(String, crate::planner::logical_expr::WindowExpr)> = Vec::new();
+        let proj_exprs: Vec<Expr> = proj_exprs
+            .into_iter()
+            .map(|e| Self::extract_windows(e, &mut window_exprs))
+            .collect();
+        if !window_exprs.is_empty() {
+            let win_input_schema = plan.schema();
+            let mut fields = win_input_schema.fields().to_vec();
+            for (name, w) in &window_exprs {
+                let dt = Expr::WindowFunction(Box::new(w.clone())).data_type(&win_input_schema)?;
+                fields.push(SchemaField::new(name.clone(), dt));
+            }
+            plan = LogicalPlan::Window(crate::planner::WindowNode {
+                input: Arc::new(plan),
+                window_exprs,
+                schema: PlanSchema::new(fields),
+            });
+        }
+
         plan = LogicalPlan::Project(ProjectNode {
             input: Arc::new(plan),
             exprs: proj_exprs,
@@ -496,6 +624,390 @@ impl<'a> Binder<'a> {
         }
 
         Ok(plan)
+    }
+
+    /// `expr ± INTERVAL 'n' unit` as a DATE_ADD call.
+    fn bind_interval_add(
+        &mut self,
+        base: Expr,
+        iv: &ast::Interval,
+        negate: bool,
+        schema: &PlanSchema,
+    ) -> Result<Expr> {
+        let value = self.bind_expr(&iv.value, schema)?;
+        // INTERVAL '3' DAY -> value literal "3"; INTERVAL '3 days' -> "3 days".
+        let (mut n, mut unit) = match &value {
+            Expr::Literal(ScalarValue::Utf8(s)) => {
+                let parts: Vec<&str> = s.split_whitespace().collect();
+                let n: i64 = parts
+                    .first()
+                    .and_then(|p| p.parse().ok())
+                    .ok_or_else(|| QueryError::Bind(format!("malformed interval {s:?}")))?;
+                (
+                    n,
+                    parts.get(1).map(|u| u.trim_end_matches('s').to_lowercase()),
+                )
+            }
+            Expr::Literal(ScalarValue::Int64(n)) => (*n, None),
+            other => {
+                return Err(QueryError::NotImplemented(format!(
+                    "non-literal INTERVAL value ({other})"
+                )))
+            }
+        };
+        if unit.is_none() {
+            unit = iv.leading_field.as_ref().map(|f| match f {
+                ast::DateTimeField::Year => "year".to_string(),
+                ast::DateTimeField::Month => "month".to_string(),
+                ast::DateTimeField::Week(_) => "week".to_string(),
+                ast::DateTimeField::Day => "day".to_string(),
+                ast::DateTimeField::Hour => "hour".to_string(),
+                ast::DateTimeField::Minute => "minute".to_string(),
+                ast::DateTimeField::Second => "second".to_string(),
+                other => format!("{other:?}").to_lowercase(),
+            });
+        }
+        let unit = unit.unwrap_or_else(|| "day".to_string());
+        if negate {
+            n = -n;
+        }
+        Ok(Expr::ScalarFunc {
+            func: ScalarFunction::DateAdd,
+            args: vec![
+                Expr::Literal(ScalarValue::Utf8(unit)),
+                Expr::Literal(ScalarValue::Int64(n)),
+                base,
+            ],
+        })
+    }
+
+    /// `x op ANY/SOME/ALL (subquery)` desugar. `= ANY` and `<> ALL` are
+    /// exactly IN / NOT IN; ordering comparisons reduce to MIN/MAX of the
+    /// subquery with an emptiness guard (ANY over nothing = FALSE, ALL over
+    /// nothing = TRUE). NULL elements in the subquery follow MIN/MAX
+    /// semantics (ignored), which deviates from the standard's three-valued
+    /// answer only in NULL-element corner cases.
+    fn bind_quantified(
+        &mut self,
+        left: &SqlExpr,
+        op: &ast::BinaryOperator,
+        right: &SqlExpr,
+        any: bool,
+        schema: &PlanSchema,
+    ) -> Result<Expr> {
+        let SqlExpr::Subquery(query) = right else {
+            return Err(QueryError::NotImplemented(
+                "ANY/ALL over a non-subquery expression".into(),
+            ));
+        };
+        let lhs = self.bind_expr(left, schema)?;
+        let subplan = Arc::new(self.bind_query(query)?);
+        use ast::BinaryOperator as B;
+        match (op, any) {
+            (B::Eq, true) => Ok(Expr::InSubquery {
+                expr: Box::new(lhs),
+                subquery: subplan,
+                negated: false,
+            }),
+            (B::NotEq, false) => Ok(Expr::InSubquery {
+                expr: Box::new(lhs),
+                subquery: subplan,
+                negated: true,
+            }),
+            (B::Gt | B::GtEq | B::Lt | B::LtEq, _) => {
+                // ANY: compare against the easiest element (MIN for >/>=,
+                // MAX for </<=); ALL: against the hardest.
+                let want_min = match (op, any) {
+                    (B::Gt | B::GtEq, true) => true,
+                    (B::Lt | B::LtEq, true) => false,
+                    (B::Gt | B::GtEq, false) => false,
+                    (B::Lt | B::LtEq, false) => true,
+                    _ => unreachable!(),
+                };
+                let sub_schema = subplan.schema();
+                if sub_schema.fields().len() != 1 {
+                    return Err(QueryError::Bind(
+                        "ANY/ALL subquery must return exactly one column".into(),
+                    ));
+                }
+                let col = Expr::Column(Column::new(sub_schema.fields()[0].name.clone()));
+                let agg = Expr::Aggregate {
+                    func: if want_min {
+                        AggregateFunction::Min
+                    } else {
+                        AggregateFunction::Max
+                    },
+                    args: vec![col.clone()],
+                    distinct: false,
+                };
+                let cnt = Expr::Aggregate {
+                    func: AggregateFunction::Count,
+                    args: vec![col.clone()],
+                    distinct: false,
+                };
+                let sub_arrow = subplan.schema();
+                let agg_field = SchemaField::new(agg.output_name(), agg.data_type(&sub_arrow)?);
+                let extreme_plan = Arc::new(LogicalPlan::Aggregate(AggregateNode {
+                    input: subplan.clone(),
+                    group_by: vec![],
+                    aggregates: vec![agg],
+                    schema: PlanSchema::new(vec![agg_field]),
+                }));
+                let cnt_field = SchemaField::new(cnt.output_name(), ArrowDataType::Int64);
+                let count_plan = Arc::new(LogicalPlan::Aggregate(AggregateNode {
+                    input: subplan.clone(),
+                    group_by: vec![],
+                    aggregates: vec![cnt],
+                    schema: PlanSchema::new(vec![cnt_field]),
+                }));
+                let bop = self.convert_binary_op(op)?;
+                let cmp = Expr::BinaryExpr {
+                    left: Box::new(lhs),
+                    op: bop,
+                    right: Box::new(Expr::ScalarSubquery(extreme_plan)),
+                };
+                let empty = Expr::BinaryExpr {
+                    left: Box::new(Expr::ScalarSubquery(count_plan)),
+                    op: BinaryOp::Eq,
+                    right: Box::new(Expr::Literal(ScalarValue::Int64(0))),
+                };
+                // ANY over empty = FALSE; ALL over empty = TRUE.
+                Ok(Expr::Case {
+                    operand: None,
+                    when_then: vec![(empty, Expr::Literal(ScalarValue::Boolean(!any)))],
+                    else_expr: Some(Box::new(cmp)),
+                })
+            }
+            other => Err(QueryError::NotImplemented(format!(
+                "quantified comparison {other:?}"
+            ))),
+        }
+    }
+
+    /// Desugar `GROUP BY GROUPING SETS / ROLLUP / CUBE` into
+    /// `UNION ALL` of ordinary aggregates. Each branch pads the group columns
+    /// absent from its set with typed NULLs; `GROUPING(...)` calls in the
+    /// SELECT list become per-branch constants.
+    fn bind_grouping_sets(
+        &mut self,
+        select: &ast::Select,
+        input: LogicalPlan,
+        gexprs: &[SqlExpr],
+    ) -> Result<LogicalPlan> {
+        if gexprs.len() != 1 {
+            return Err(QueryError::NotImplemented(
+                "GROUPING SETS/ROLLUP/CUBE combined with other GROUP BY items".into(),
+            ));
+        }
+        if select.having.is_some() {
+            return Err(QueryError::NotImplemented(
+                "HAVING with GROUPING SETS/ROLLUP/CUBE".into(),
+            ));
+        }
+        let input_schema = input.schema();
+        let input = Arc::new(input);
+
+        // Expand to the list of grouping sets (each: the AST exprs grouped).
+        let sets: Vec<Vec<&SqlExpr>> = match &gexprs[0] {
+            SqlExpr::GroupingSets(groups) => groups.iter().map(|g| g.iter().collect()).collect(),
+            SqlExpr::Rollup(groups) => {
+                // ROLLUP(a, b) -> [a,b], [a], []
+                let mut out: Vec<Vec<&SqlExpr>> = Vec::new();
+                for k in (0..=groups.len()).rev() {
+                    out.push(groups[..k].iter().flatten().collect());
+                }
+                out
+            }
+            SqlExpr::Cube(groups) => {
+                // CUBE(a, b) -> every subset, standard order.
+                let m = groups.len();
+                let mut out: Vec<Vec<&SqlExpr>> = Vec::new();
+                for mask in (0..(1usize << m)).rev() {
+                    let mut set = Vec::new();
+                    for (bit, g) in groups.iter().enumerate() {
+                        if mask & (1 << (m - 1 - bit)) != 0 {
+                            set.extend(g.iter());
+                        }
+                    }
+                    out.push(set);
+                }
+                out
+            }
+            _ => unreachable!("caller checked"),
+        };
+
+        // The ordered union of all group expressions across the sets.
+        let mut union_exprs: Vec<Expr> = Vec::new();
+        let mut union_names: Vec<String> = Vec::new();
+        let mut set_membership: Vec<Vec<bool>> = Vec::new();
+        let mut bound_sets: Vec<Vec<Expr>> = Vec::new();
+        for set in &sets {
+            let mut bound = Vec::new();
+            for e in set {
+                let b = self.bind_expr(e, &input_schema)?;
+                if !union_exprs.contains(&b) {
+                    union_names.push(b.output_name());
+                    union_exprs.push(b.clone());
+                }
+                bound.push(b);
+            }
+            bound_sets.push(bound);
+        }
+        for bound in &bound_sets {
+            set_membership.push(union_exprs.iter().map(|u| bound.contains(u)).collect());
+        }
+
+        // Aggregates and GROUPING(...) calls from the SELECT list.
+        let mut aggregates: Vec<Expr> = Vec::new();
+        let mut grouping_calls: Vec<Vec<Expr>> = Vec::new(); // arg lists
+        let mut out_items: Vec<(Expr, String)> = Vec::new(); // shape of final projection
+        enum Item {
+            Group(usize),
+            Agg(usize),
+            Grouping(usize),
+        }
+        let mut item_plan: Vec<(Item, String)> = Vec::new();
+        for item in &select.projection {
+            let (raw, alias) = match item {
+                SelectItem::UnnamedExpr(e) => (e, None),
+                SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
+                _ => {
+                    return Err(QueryError::NotImplemented(
+                        "wildcard projection with GROUPING SETS".into(),
+                    ))
+                }
+            };
+            // GROUPING(...) — constant per branch.
+            if let SqlExpr::Function(f) = raw {
+                if f.name.to_string().to_uppercase() == "GROUPING" {
+                    let args: Vec<Expr> = match &f.args {
+                        ast::FunctionArguments::List(l) => l
+                            .args
+                            .iter()
+                            .map(|a| match a {
+                                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
+                                    self.bind_expr(e, &input_schema)
+                                }
+                                other => {
+                                    Err(QueryError::Bind(format!("GROUPING argument {other:?}")))
+                                }
+                            })
+                            .collect::<Result<_>>()?,
+                        _ => vec![],
+                    };
+                    for a in &args {
+                        if !union_exprs.contains(a) {
+                            return Err(QueryError::Bind(format!(
+                                "GROUPING argument {a} is not a grouping column"
+                            )));
+                        }
+                    }
+                    let name = alias.unwrap_or_else(|| "grouping".to_string());
+                    item_plan.push((Item::Grouping(grouping_calls.len()), name));
+                    grouping_calls.push(args);
+                    continue;
+                }
+            }
+            let bound = self.bind_expr(raw, &input_schema)?;
+            let name = alias.unwrap_or_else(|| bound.output_name());
+            if let Some(gi) = union_exprs.iter().position(|u| *u == bound) {
+                item_plan.push((Item::Group(gi), name));
+            } else if bound.contains_aggregate() {
+                if !matches!(bound, Expr::Aggregate { .. }) {
+                    return Err(QueryError::NotImplemented(
+                        "expressions over aggregates with GROUPING SETS".into(),
+                    ));
+                }
+                let ai = aggregates
+                    .iter()
+                    .position(|a| *a == bound)
+                    .unwrap_or_else(|| {
+                        aggregates.push(bound.clone());
+                        aggregates.len() - 1
+                    });
+                item_plan.push((Item::Agg(ai), name));
+            } else {
+                return Err(QueryError::NotImplemented(format!(
+                    "SELECT item {bound} with GROUPING SETS must be a grouping column, \
+                     an aggregate, or GROUPING(...)"
+                )));
+            }
+        }
+        drop(out_items);
+
+        // One aggregate + projection branch per set, then UNION ALL.
+        let mut branches: Vec<Arc<LogicalPlan>> = Vec::new();
+        let mut union_schema_fields: Option<Vec<SchemaField>> = None;
+        for (si, bound) in bound_sets.iter().enumerate() {
+            let mut agg_fields = Vec::new();
+            for e in bound {
+                agg_fields.push(e.to_field(&input_schema)?);
+            }
+            for a in &aggregates {
+                agg_fields.push(SchemaField::new(
+                    a.output_name(),
+                    a.data_type(&input_schema)?,
+                ));
+            }
+            let agg_plan = LogicalPlan::Aggregate(AggregateNode {
+                input: input.clone(),
+                group_by: bound.clone(),
+                aggregates: aggregates.clone(),
+                schema: PlanSchema::new(agg_fields),
+            });
+            let agg_schema = agg_plan.schema();
+
+            // Projection: the final SELECT shape, NULL-padding absent groups.
+            let mut proj_exprs = Vec::new();
+            let mut proj_fields = Vec::new();
+            for (item, name) in &item_plan {
+                let e = match item {
+                    Item::Group(gi) => {
+                        if set_membership[si][*gi] {
+                            Expr::Column(Column::new(union_names[*gi].clone()))
+                        } else {
+                            Expr::Cast {
+                                expr: Box::new(Expr::Literal(ScalarValue::Null)),
+                                data_type: union_exprs[*gi].data_type(&input_schema)?,
+                            }
+                        }
+                    }
+                    Item::Agg(ai) => Expr::Column(Column::new(aggregates[*ai].output_name())),
+                    Item::Grouping(ci) => {
+                        let mut v: i64 = 0;
+                        for a in &grouping_calls[*ci] {
+                            let gi = union_exprs.iter().position(|u| u == a).expect("checked");
+                            v = (v << 1) | (!set_membership[si][gi]) as i64;
+                        }
+                        Expr::Literal(ScalarValue::Int64(v))
+                    }
+                };
+                let dt = match item {
+                    Item::Group(gi) => union_exprs[*gi].data_type(&input_schema)?,
+                    Item::Agg(_) => e.data_type(&agg_schema)?,
+                    Item::Grouping(_) => ArrowDataType::Int64,
+                };
+                proj_fields.push(SchemaField::new(name.clone(), dt));
+                proj_exprs.push(Expr::Alias {
+                    expr: Box::new(e),
+                    name: name.clone(),
+                });
+            }
+            if union_schema_fields.is_none() {
+                union_schema_fields = Some(proj_fields.clone());
+            }
+            branches.push(Arc::new(LogicalPlan::Project(ProjectNode {
+                input: Arc::new(agg_plan),
+                exprs: proj_exprs,
+                schema: PlanSchema::new(proj_fields),
+            })));
+        }
+
+        Ok(LogicalPlan::Union(crate::planner::UnionNode {
+            inputs: branches,
+            schema: PlanSchema::new(union_schema_fields.expect("at least one set")),
+            all: true,
+        }))
     }
 
     fn bind_from(&mut self, from: &[ast::TableWithJoins]) -> Result<LogicalPlan> {
@@ -1179,9 +1691,33 @@ impl<'a> Binder<'a> {
         let mut aggregate_aliases = Vec::new();
         let mut has_aggregates = false;
 
-        // Parse GROUP BY
+        // Parse GROUP BY. An integer literal is an ORDINAL into the SELECT
+        // list (standard), never a constant group key.
         if let ast::GroupByExpr::Expressions(exprs, _) = group_by {
             for expr in exprs {
+                if let SqlExpr::Value(ast::Value::Number(n, _)) = expr {
+                    if let Ok(ord) = n.parse::<usize>() {
+                        if ord == 0 || ord > projection.len() {
+                            return Err(QueryError::Bind(format!(
+                                "GROUP BY position {ord} is out of range (1-{})",
+                                projection.len()
+                            )));
+                        }
+                        let item = &projection[ord - 1];
+                        let target = match item {
+                            SelectItem::UnnamedExpr(e) => e,
+                            SelectItem::ExprWithAlias { expr, .. } => expr,
+                            other => {
+                                return Err(QueryError::Bind(format!(
+                                    "GROUP BY position {ord} refers to {other}, which is not \
+                                     an expression"
+                                )))
+                            }
+                        };
+                        group_by_exprs.push(self.bind_expr(target, schema)?);
+                        continue;
+                    }
+                }
                 group_by_exprs.push(self.bind_expr(expr, schema)?);
             }
         }
@@ -1378,6 +1914,21 @@ impl<'a> Binder<'a> {
             // optimizer rule would then walk.
             SqlExpr::Array(arr) => self.bind_array_literal(&arr.elem, schema),
             SqlExpr::BinaryOp { left, op, right } => {
+                // `expr + INTERVAL 'n' unit` / `expr - INTERVAL ...` desugar
+                // to DATE_ADD, which does calendar-correct month arithmetic.
+                if matches!(op, ast::BinaryOperator::Plus | ast::BinaryOperator::Minus) {
+                    let negate = matches!(op, ast::BinaryOperator::Minus);
+                    if let SqlExpr::Interval(iv) = right.as_ref() {
+                        let base = self.bind_expr(left, schema)?;
+                        return self.bind_interval_add(base, iv, negate, schema);
+                    }
+                    if let SqlExpr::Interval(iv) = left.as_ref() {
+                        if !negate {
+                            let base = self.bind_expr(right, schema)?;
+                            return self.bind_interval_add(base, iv, false, schema);
+                        }
+                    }
+                }
                 let left_expr = self.bind_expr(left, schema)?;
                 let right_expr = self.bind_expr(right, schema)?;
                 let binary_op = self.convert_binary_op(op)?;
@@ -1602,6 +2153,75 @@ impl<'a> Binder<'a> {
                     right: Box::new(bound_pattern),
                 })
             }
+            SqlExpr::IsDistinctFrom(a, b) => {
+                let a = self.bind_expr(a, schema)?;
+                let b = self.bind_expr(b, schema)?;
+                Ok(is_distinct_expr(a, b, false))
+            }
+            SqlExpr::IsNotDistinctFrom(a, b) => {
+                let a = self.bind_expr(a, schema)?;
+                let b = self.bind_expr(b, schema)?;
+                Ok(is_distinct_expr(a, b, true))
+            }
+            SqlExpr::AnyOp {
+                left,
+                compare_op,
+                right,
+                ..
+            } => self.bind_quantified(left, compare_op, right, true, schema),
+            SqlExpr::AllOp {
+                left,
+                compare_op,
+                right,
+            } => self.bind_quantified(left, compare_op, right, false, schema),
+            SqlExpr::Overlay {
+                expr,
+                overlay_what,
+                overlay_from,
+                overlay_for,
+            } => {
+                // OVERLAY(s PLACING r FROM p [FOR l]) ==
+                // SUBSTRING(s, 1, p-1) || r || SUBSTRING(s, p + l)
+                // with l defaulting to LENGTH(r).
+                let s = self.bind_expr(expr, schema)?;
+                let r = self.bind_expr(overlay_what, schema)?;
+                let p = self.bind_expr(overlay_from, schema)?;
+                let l = match overlay_for {
+                    Some(e) => self.bind_expr(e, schema)?,
+                    None => Expr::ScalarFunc {
+                        func: ScalarFunction::Length,
+                        args: vec![r.clone()],
+                    },
+                };
+                let one = || Expr::Literal(ScalarValue::Int64(1));
+                let prefix = Expr::ScalarFunc {
+                    func: ScalarFunction::Substring,
+                    args: vec![
+                        s.clone(),
+                        one(),
+                        Expr::BinaryExpr {
+                            left: Box::new(p.clone()),
+                            op: BinaryOp::Subtract,
+                            right: Box::new(one()),
+                        },
+                    ],
+                };
+                let suffix = Expr::ScalarFunc {
+                    func: ScalarFunction::Substring,
+                    args: vec![
+                        s,
+                        Expr::BinaryExpr {
+                            left: Box::new(p),
+                            op: BinaryOp::Add,
+                            right: Box::new(l),
+                        },
+                    ],
+                };
+                Ok(Expr::ScalarFunc {
+                    func: ScalarFunction::Concat,
+                    args: vec![prefix, r, suffix],
+                })
+            }
             SqlExpr::Interval(interval) => {
                 // Simple interval handling
                 let value = self.bind_expr(&interval.value, schema)?;
@@ -1759,16 +2379,260 @@ impl<'a> Binder<'a> {
         )))
     }
 
+    /// Bind `func(args) OVER (spec | name)` into an `Expr::WindowFunction`.
+    fn bind_window_function(
+        &mut self,
+        name: &str,
+        func: &ast::Function,
+        over: &ast::WindowType,
+        schema: &PlanSchema,
+    ) -> Result<Expr> {
+        use crate::planner::logical_expr::{FrameBound, FrameUnits, WindowFrame, WindowFunc};
+
+        // Resolve the window spec, following one level of naming.
+        let spec: ast::WindowSpec = match over {
+            ast::WindowType::WindowSpec(s) => s.clone(),
+            ast::WindowType::NamedWindow(ident) => {
+                let key = ident.value.to_lowercase();
+                self.named_windows.get(&key).cloned().ok_or_else(|| {
+                    QueryError::Bind(format!("window \"{}\" is not defined", ident.value))
+                })?
+            }
+        };
+        if spec.window_name.is_some() {
+            return Err(QueryError::NotImplemented(
+                "window specification inheritance (OVER (base_window ...))".into(),
+            ));
+        }
+
+        // The function itself.
+        let wfunc = match name {
+            "ROW_NUMBER" => WindowFunc::RowNumber,
+            "RANK" => WindowFunc::Rank,
+            "DENSE_RANK" => WindowFunc::DenseRank,
+            "PERCENT_RANK" => WindowFunc::PercentRank,
+            "CUME_DIST" => WindowFunc::CumeDist,
+            "NTILE" => WindowFunc::Ntile,
+            "LAG" => WindowFunc::Lag,
+            "LEAD" => WindowFunc::Lead,
+            "FIRST_VALUE" => WindowFunc::FirstValue,
+            "LAST_VALUE" => WindowFunc::LastValue,
+            "NTH_VALUE" => WindowFunc::NthValue,
+            "COUNT" => WindowFunc::Aggregate(AggregateFunction::Count),
+            "SUM" => WindowFunc::Aggregate(AggregateFunction::Sum),
+            "AVG" => WindowFunc::Aggregate(AggregateFunction::Avg),
+            "MIN" => WindowFunc::Aggregate(AggregateFunction::Min),
+            "MAX" => WindowFunc::Aggregate(AggregateFunction::Max),
+            other => {
+                return Err(QueryError::NotImplemented(format!(
+                    "window function {other} OVER (...)"
+                )))
+            }
+        };
+
+        // Arguments (COUNT(*) carries a Wildcard argument).
+        let args: Vec<Expr> = match &func.args {
+            ast::FunctionArguments::None => vec![],
+            ast::FunctionArguments::Subquery(_) => {
+                return Err(QueryError::NotImplemented(
+                    "subquery arguments to a window function".into(),
+                ))
+            }
+            ast::FunctionArguments::List(list) => list
+                .args
+                .iter()
+                .map(|arg| match arg {
+                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e))
+                    | ast::FunctionArg::Named {
+                        arg: ast::FunctionArgExpr::Expr(e),
+                        ..
+                    } => self.bind_expr(e, schema),
+                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard)
+                    | ast::FunctionArg::Named {
+                        arg: ast::FunctionArgExpr::Wildcard,
+                        ..
+                    } => Ok(Expr::Wildcard),
+                    other => Err(QueryError::NotImplemented(format!(
+                        "window function argument {other:?}"
+                    ))),
+                })
+                .collect::<Result<_>>()?,
+        };
+
+        let partition_by: Vec<Expr> = spec
+            .partition_by
+            .iter()
+            .map(|e| self.bind_expr(e, schema))
+            .collect::<Result<_>>()?;
+        let order_by = self.bind_order_by(&spec.order_by, schema)?;
+
+        // The frame, stored RESOLVED (see WindowFrame docs).
+        let frame = match &spec.window_frame {
+            None => {
+                if order_by.is_empty() {
+                    WindowFrame {
+                        units: FrameUnits::Rows,
+                        start: FrameBound::UnboundedPreceding,
+                        end: FrameBound::UnboundedFollowing,
+                        explicit: false,
+                    }
+                } else {
+                    WindowFrame {
+                        units: FrameUnits::Range,
+                        start: FrameBound::UnboundedPreceding,
+                        end: FrameBound::CurrentRow,
+                        explicit: false,
+                    }
+                }
+            }
+            Some(f) => {
+                let units = match f.units {
+                    ast::WindowFrameUnits::Rows => FrameUnits::Rows,
+                    ast::WindowFrameUnits::Range => FrameUnits::Range,
+                    ast::WindowFrameUnits::Groups => {
+                        return Err(QueryError::NotImplemented("GROUPS window frames".into()))
+                    }
+                };
+                let bound = |b: &ast::WindowFrameBound, is_start: bool| -> Result<FrameBound> {
+                    Ok(match b {
+                        ast::WindowFrameBound::CurrentRow => FrameBound::CurrentRow,
+                        ast::WindowFrameBound::Preceding(None) => FrameBound::UnboundedPreceding,
+                        ast::WindowFrameBound::Following(None) => {
+                            if is_start {
+                                return Err(QueryError::Bind(
+                                    "frame cannot start at UNBOUNDED FOLLOWING".into(),
+                                ));
+                            }
+                            FrameBound::UnboundedFollowing
+                        }
+                        ast::WindowFrameBound::Preceding(Some(e)) => {
+                            FrameBound::Preceding(frame_offset(e)?)
+                        }
+                        ast::WindowFrameBound::Following(Some(e)) => {
+                            FrameBound::Following(frame_offset(e)?)
+                        }
+                    })
+                };
+                let start = bound(&f.start_bound, true)?;
+                let end = match &f.end_bound {
+                    Some(e) => bound(e, false)?,
+                    None => FrameBound::CurrentRow,
+                };
+                if matches!(end, FrameBound::UnboundedPreceding) {
+                    return Err(QueryError::Bind(
+                        "frame cannot end at UNBOUNDED PRECEDING".into(),
+                    ));
+                }
+                WindowFrame {
+                    units,
+                    start,
+                    end,
+                    explicit: true,
+                }
+            }
+        };
+
+        Ok(Expr::WindowFunction(Box::new(
+            crate::planner::logical_expr::WindowExpr {
+                func: wfunc,
+                args,
+                partition_by,
+                order_by,
+                frame,
+            },
+        )))
+    }
+
+    /// Replace every window function in `expr` with a column reference,
+    /// registering it (deduplicated) in `acc` as (`__wN`, expression).
+    fn extract_windows(
+        expr: Expr,
+        acc: &mut Vec<(String, crate::planner::logical_expr::WindowExpr)>,
+    ) -> Expr {
+        match expr {
+            Expr::WindowFunction(w) => {
+                if let Some((name, _)) = acc.iter().find(|(_, x)| x == w.as_ref()) {
+                    return Expr::Column(Column::new(name.clone()));
+                }
+                let name = format!("__w{}", acc.len());
+                acc.push((name.clone(), *w));
+                Expr::Column(Column::new(name))
+            }
+            Expr::BinaryExpr { left, op, right } => Expr::BinaryExpr {
+                left: Box::new(Self::extract_windows(*left, acc)),
+                op,
+                right: Box::new(Self::extract_windows(*right, acc)),
+            },
+            Expr::UnaryExpr { op, expr } => Expr::UnaryExpr {
+                op,
+                expr: Box::new(Self::extract_windows(*expr, acc)),
+            },
+            Expr::Cast { expr, data_type } => Expr::Cast {
+                expr: Box::new(Self::extract_windows(*expr, acc)),
+                data_type,
+            },
+            Expr::Alias { expr, name } => Expr::Alias {
+                expr: Box::new(Self::extract_windows(*expr, acc)),
+                name,
+            },
+            Expr::ScalarFunc { func, args } => Expr::ScalarFunc {
+                func,
+                args: args
+                    .into_iter()
+                    .map(|a| Self::extract_windows(a, acc))
+                    .collect(),
+            },
+            Expr::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => Expr::Case {
+                operand: operand.map(|o| Box::new(Self::extract_windows(*o, acc))),
+                when_then: when_then
+                    .into_iter()
+                    .map(|(w, t)| (Self::extract_windows(w, acc), Self::extract_windows(t, acc)))
+                    .collect(),
+                else_expr: else_expr.map(|e| Box::new(Self::extract_windows(*e, acc))),
+            },
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => Expr::InList {
+                expr: Box::new(Self::extract_windows(*expr, acc)),
+                list: list
+                    .into_iter()
+                    .map(|e| Self::extract_windows(e, acc))
+                    .collect(),
+                negated,
+            },
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => Expr::Between {
+                expr: Box::new(Self::extract_windows(*expr, acc)),
+                low: Box::new(Self::extract_windows(*low, acc)),
+                high: Box::new(Self::extract_windows(*high, acc)),
+                negated,
+            },
+            other => other,
+        }
+    }
+
     fn bind_function(&mut self, func: &ast::Function, schema: &PlanSchema) -> Result<Expr> {
         let name = func.name.to_string().to_uppercase();
 
-        // Window functions are not supported. Without this check, SUM(x) OVER (...)
-        // would silently bind as a plain aggregate and return wrong results.
-        if func.over.is_some() {
-            return Err(QueryError::NotImplemented(format!(
-                "Window functions ({} OVER ...)",
-                name
-            )));
+        // Window functions bind to Expr::WindowFunction — never as a plain
+        // aggregate, which would silently return wrong results.
+        if let Some(over) = &func.over {
+            if !self.allow_window {
+                return Err(QueryError::Bind(format!(
+                    "{name} OVER (...) is only allowed in the SELECT list"
+                )));
+            }
+            return self.bind_window_function(&name, func, over, schema);
         }
 
         // Extract arguments from the FunctionArguments

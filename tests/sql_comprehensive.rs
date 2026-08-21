@@ -1435,28 +1435,58 @@ mod complex_queries {
                 ROW_NUMBER() OVER (ORDER BY age DESC) as rank
             FROM users
         "#;
-        let result = ctx.sql(sql).await;
-        // Window functions are not implemented. The binder must reject them
-        // explicitly — silently binding OVER(...) as a plain aggregate would
-        // return wrong results.
-        let err = result.expect_err("window functions must be rejected, not silently mis-bound");
-        assert!(
-            err.to_string().contains("Window functions"),
-            "unexpected error: {err}"
-        );
+        // ROW_NUMBER landed with the standard-sql-completion epic: the oldest
+        // user gets rank 1.
+        let result = ctx.sql(sql).await.expect("window query runs");
+        let rank_idx = result
+            .schema
+            .fields()
+            .iter()
+            .position(|f| f.name() == "rank")
+            .expect("rank column");
+        let age_idx = result
+            .schema
+            .fields()
+            .iter()
+            .position(|f| f.name() == "age")
+            .expect("age column");
+        let batch = &result.batches[0];
+        let ranks = batch
+            .column(rank_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let ages = batch
+            .column(age_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let max_age = (0..ages.len()).map(|i| ages.value(i)).max().unwrap();
+        let rank1_row = (0..ranks.len()).find(|&i| ranks.value(i) == 1).unwrap();
+        assert_eq!(ages.value(rank1_row), max_age, "rank 1 = oldest");
     }
 
     #[tokio::test]
     async fn test_aggregate_over_rejected() {
         let ctx = create_test_context();
+        // SUM(x) OVER (...) now BINDS as a window expression; execution of
+        // window aggregates arrives later in the epic, so today this must
+        // fail as an unimplemented WINDOW function — never bind as a plain
+        // aggregate (which would silently return one wrong row).
         let result = ctx
             .sql("SELECT SUM(age) OVER (PARTITION BY active) FROM users")
             .await;
-        let err = result.expect_err("SUM(x) OVER (...) must be rejected, not silently mis-bound");
-        assert!(
-            err.to_string().contains("Window functions"),
-            "unexpected error: {err}"
-        );
+        match result {
+            Ok(r) => {
+                // Once window aggregates land, every input row keeps its own
+                // partition total — 5 rows, not 1.
+                assert_eq!(r.row_count, 5, "window aggregate must be per-row");
+            }
+            Err(e) => assert!(
+                e.to_string().contains("window function"),
+                "unexpected error: {e}"
+            ),
+        }
     }
 
     #[tokio::test]

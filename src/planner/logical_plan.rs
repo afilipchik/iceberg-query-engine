@@ -49,6 +49,8 @@ pub enum LogicalPlan {
     Join(JoinNode),
     /// Aggregation (GROUP BY)
     Aggregate(AggregateNode),
+    /// Window function evaluation
+    Window(WindowNode),
     /// Sort (ORDER BY)
     Sort(SortNode),
     /// Limit
@@ -87,6 +89,7 @@ impl LogicalPlan {
             LogicalPlan::Project(node) => node.schema.clone(),
             LogicalPlan::Join(node) => node.schema.clone(),
             LogicalPlan::Aggregate(node) => node.schema.clone(),
+            LogicalPlan::Window(node) => node.schema.clone(),
             LogicalPlan::Sort(node) => node.input.schema(),
             LogicalPlan::Limit(node) => node.input.schema(),
             LogicalPlan::Distinct(node) => node.input.schema(),
@@ -108,6 +111,7 @@ impl LogicalPlan {
             LogicalPlan::Project(node) => vec![&node.input],
             LogicalPlan::Join(node) => vec![&node.left, &node.right],
             LogicalPlan::Aggregate(node) => vec![&node.input],
+            LogicalPlan::Window(node) => vec![&node.input],
             LogicalPlan::Sort(node) => vec![&node.input],
             LogicalPlan::Limit(node) => vec![&node.input],
             LogicalPlan::Distinct(node) => vec![&node.input],
@@ -149,6 +153,11 @@ impl LogicalPlan {
                 input: children.into_iter().next().unwrap(),
                 group_by: node.group_by.clone(),
                 aggregates: node.aggregates.clone(),
+                schema: node.schema.clone(),
+            }),
+            LogicalPlan::Window(node) => LogicalPlan::Window(WindowNode {
+                input: children.into_iter().next().unwrap(),
+                window_exprs: node.window_exprs.clone(),
                 schema: node.schema.clone(),
             }),
             LogicalPlan::Sort(node) => LogicalPlan::Sort(SortNode {
@@ -245,6 +254,19 @@ impl LogicalPlan {
         let prefix = "  ".repeat(indent);
 
         match self {
+            LogicalPlan::Window(node) => {
+                writeln!(
+                    f,
+                    "{}Window: [{}]",
+                    prefix,
+                    node.window_exprs
+                        .iter()
+                        .map(|(n, w)| format!("{n}: {w}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )?;
+                node.input.fmt_indent(f, indent + 1)?;
+            }
             LogicalPlan::Scan(node) => {
                 writeln!(
                     f,
@@ -435,6 +457,18 @@ pub struct AggregateNode {
     pub input: Arc<LogicalPlan>,
     pub group_by: Vec<Expr>,
     pub aggregates: Vec<Expr>,
+    pub schema: PlanSchema,
+}
+
+/// Window node: evaluates window expressions over the input, appending one
+/// column per expression to the input's schema. Created only by the binder's
+/// window-extraction pass; the projection above it references the appended
+/// columns by name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowNode {
+    pub input: Arc<LogicalPlan>,
+    /// (output column name, window expression), in appended-column order.
+    pub window_exprs: Vec<(String, crate::planner::logical_expr::WindowExpr)>,
     pub schema: PlanSchema,
 }
 

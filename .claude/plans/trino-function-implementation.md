@@ -246,7 +246,15 @@ TYPEOF, UUID
 
 ---
 
-### Priority 5: Window Functions (Requires Architecture Change)
+### Priority 5: Window Functions — DONE 2026-08-21 (standard-sql-completion epic)
+
+> Landed: WindowExpr/WindowNode/WindowExec exactly as sketched below, all 11
+> standard functions + COUNT/SUM/AVG/MIN/MAX over ROWS/RANGE frames, named
+> WINDOW clauses. Gates: scripts/window_validate.py (63 DuckDB-compared
+> cases), tests/window_functions.rs (hermetic semantics). Not done: STDDEV
+> etc. OVER, IGNORE NULLS, GROUPS frames, EXCLUDE — refused by name.
+
+### (original sketch) Priority 5: Window Functions (Requires Architecture Change)
 
 #### Not Implemented (~11 functions)
 | Function | Signature | Complexity | Notes |

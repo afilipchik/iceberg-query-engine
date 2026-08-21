@@ -413,6 +413,28 @@ impl PredicatePushdown {
                 }
             }
 
+            // A predicate above a Window may reference window outputs, and even
+            // one on plain columns would change which rows enter each frame if
+            // it slipped below. Everything stops here (partition-key pushthrough
+            // is a legal future refinement).
+            LogicalPlan::Window(node) => {
+                let input = self.pushdown(&node.input, vec![])?;
+                let win = LogicalPlan::Window(crate::planner::WindowNode {
+                    input: Arc::new(input),
+                    window_exprs: node.window_exprs.clone(),
+                    schema: node.schema.clone(),
+                });
+                if predicates.is_empty() {
+                    Ok(win)
+                } else {
+                    let combined = self.combine_predicates(predicates);
+                    Ok(LogicalPlan::Filter(FilterNode {
+                        input: Arc::new(win),
+                        predicate: combined,
+                    }))
+                }
+            }
+
             LogicalPlan::Aggregate(node) => {
                 // Cannot push predicates through aggregation in general
                 // Could push predicates on group-by columns
