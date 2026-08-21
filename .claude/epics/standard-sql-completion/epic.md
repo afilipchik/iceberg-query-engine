@@ -1,9 +1,9 @@
 ---
 name: standard-sql-completion
-status: backlog
+status: completed
 created: 2026-08-21T15:16:42Z
-updated: 2026-08-21T15:16:42Z
-progress: 0%
+updated: 2026-08-21T15:55:51Z
+progress: 100%
 prd: .claude/prds/standard-sql-completion.md
 github: (will be set on sync)
 ---
@@ -142,16 +142,16 @@ comparison in the same task — no "tests later".
 most correctness risk; DuckDB comparison per-function keeps it honest.
 
 ## Tasks Created
-- [ ] 001.md - Window plumbing end to end (ROW_NUMBER only) (parallel: true)
-- [ ] 002.md - WindowExec partition, peer and frame engine (parallel: false)
-- [ ] 003.md - Ranking family: RANK, DENSE_RANK, PERCENT_RANK, CUME_DIST, NTILE (parallel: true)
-- [ ] 004.md - Navigation family: LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE (parallel: true)
-- [ ] 005.md - Aggregates over windows: COUNT, SUM, AVG, MIN, MAX (parallel: true)
-- [ ] 006.md - Grouping extensions: GROUPING SETS, ROLLUP, CUBE, GROUPING() (parallel: true)
-- [ ] 007.md - Expression gaps: IS DISTINCT FROM, ANY/ALL, OVERLAY, date+interval, ordinal fix (parallel: true)
-- [ ] 008.md - DuckDB-validated window and grouping suite + probe promotion (parallel: false)
-- [ ] 009.md - Distributed + Flight verification of window queries (parallel: true)
-- [ ] 010.md - Docs: CLAUDE.md, README, plan status flip (parallel: true)
+- [x] 001.md - Window plumbing end to end (ROW_NUMBER only) (parallel: true)
+- [x] 002.md - WindowExec partition, peer and frame engine (parallel: false)
+- [x] 003.md - Ranking family: RANK, DENSE_RANK, PERCENT_RANK, CUME_DIST, NTILE (parallel: true)
+- [x] 004.md - Navigation family: LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE (parallel: true)
+- [x] 005.md - Aggregates over windows: COUNT, SUM, AVG, MIN, MAX (parallel: true)
+- [x] 006.md - Grouping extensions: GROUPING SETS, ROLLUP, CUBE, GROUPING() (parallel: true)
+- [x] 007.md - Expression gaps: IS DISTINCT FROM, ANY/ALL, OVERLAY, date+interval, ordinal fix (parallel: true)
+- [x] 008.md - DuckDB-validated window and grouping suite + probe promotion (parallel: false)
+- [x] 009.md - Distributed + Flight verification of window queries (parallel: true)
+- [x] 010.md - Docs: CLAUDE.md, README, plan status flip (parallel: true)
 
 Total tasks: 10
 Parallel tasks: 8
