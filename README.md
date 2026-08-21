@@ -9,6 +9,9 @@ A high-performance SQL query engine built from scratch in Rust, designed for ana
 - **Correlated Subqueries**: EXISTS, NOT EXISTS, IN, NOT IN, scalar subqueries
 - **TPC-H Benchmark**: All 22 TPC-H queries passing (160+ SQL tests total)
 - **Parquet Support**: Read Parquet files and directories directly
+- **Lance Support** (feature `lance`): Read and write Lance datasets, with version time travel and vector search
+- **Iceberg Support**: Read Apache Iceberg tables (v1/v2 metadata, Avro manifests, snapshot time travel)
+- **Vector Search**: k-NN over embedding columns (`cosine_distance`, `l2_distance`, …), exact by default with opt-in IVF_PQ index pushdown
 - **Larger-Than-Memory**: Spillable operators for datasets exceeding available RAM
 - **Interactive REPL**: SQL shell with history and tab completion
 - **Streaming Execution**: Memory-efficient processing via Arrow RecordBatch streams
@@ -31,6 +34,21 @@ cargo build --release
 ```
 
 The binary will be at `./target/release/query_engine`.
+
+### Optional: Lance support
+
+The Lance reader/writer is behind the `lance` feature and needs `protoc`
+(lance-table's build script compiles `.proto` files):
+
+```bash
+# e.g. apt install protobuf-compiler / brew install protobuf
+cargo build --release --features lance
+# or point at a local protoc:
+PROTOC=/path/to/protoc cargo build --release --features lance
+```
+
+The `lance` crate is pinned to 0.23.x deliberately — it is the last version
+built against arrow 53, the arrow major this engine uses. Do not bump it.
 
 ## Testing
 
@@ -111,6 +129,10 @@ sql> .quit
 | `.schema <table>` | Show table schema |
 | `.load <path> <name>` | Load Parquet file as table |
 | `.tpch <path>` | Load all TPC-H tables |
+| `.lance <path> <name> [version]` | Load Lance dataset, optionally at a historical version (feature `lance`) |
+| `.lance-versions <path>` | List a Lance dataset's versions (feature `lance`) |
+| `.tpch-lance <path>` | Load all TPC-H tables from Lance datasets (feature `lance`) |
+| `.mode <format>` | Set output format (table, csv, json, vertical) |
 
 ## CLI Commands
 
@@ -156,6 +178,47 @@ sql> .quit
     --query "SELECT * FROM lineitem LIMIT 5"
 ```
 
+### Lance Datasets (feature `lance`)
+
+Read, write, time-travel and benchmark Lance datasets:
+
+```bash
+# Load a Lance dataset and query it
+./target/release/query_engine load-lance \
+    --path ./data/orders.lance --name orders \
+    --query "SELECT COUNT(*) FROM orders"
+
+# Convert Parquet to Lance, streamed (never materializes either side)
+./target/release/query_engine write-lance \
+    --from-parquet ./data/tpch-10mb --out ./data/tpch-10mb-lance
+
+# CREATE TABLE AS SELECT, in effect: run SQL and write the result
+./target/release/query_engine write-lance \
+    --sql "SELECT * FROM orders WHERE o_totalprice > 100000" \
+    --tables ./data/tpch-10mb --out ./data/big_orders.lance
+
+# Time travel: list versions, query an old one
+./target/release/query_engine lance-versions --path ./data/orders.lance
+./target/release/query_engine load-lance --path ./data/orders.lance \
+    --name o --version 1 --query "SELECT COUNT(*) FROM o"
+
+# TPC-H benchmark over Lance datasets
+./target/release/query_engine benchmark-lance \
+    --path ./data/tpch-10mb-lance --iterations 3
+```
+
+Vector columns (`FixedSizeList<Float32, N>` embeddings) are searchable in SQL:
+
+```sql
+SELECT id, category, text FROM vectors
+ORDER BY cosine_distance(embedding, [0.013, -0.041, ...])
+LIMIT 10;
+```
+
+Results are exact (brute force) by default. Build an IVF_PQ index with
+`create-lance-index` and set `QE_VECTOR_SEARCH=indexed` to opt into
+approximate index-backed search (~20x faster, recall ≈ 0.9).
+
 ## Architecture
 
 ```
@@ -199,7 +262,7 @@ src/
 ├── planner/         # Query planning and binding
 ├── optimizer/       # Query optimization rules
 ├── physical/        # Physical operators (scan, filter, join, aggregate, subquery, etc.)
-├── storage/         # Table providers (Parquet, Iceberg planned)
+├── storage/         # Table providers (Parquet, Lance, Iceberg)
 ├── execution/       # Execution context and utilities
 ├── metastore/       # Branching metastore REST API client
 └── tpch/            # TPC-H benchmark queries and data generator
@@ -219,17 +282,22 @@ tests/
 | `clap` | CLI framework |
 | `rustyline` | REPL line editing |
 | `reqwest` | HTTP client for metastore |
+| `apache-avro` | Iceberg manifest lists/files |
+| `lance` | Lance dataset reader/writer (optional, `--features lance`) |
 
 ## Performance
 
-Benchmark results on TPC-H SF=0.1 (100MB dataset):
+TPC-H SF=100 (100GB), warm, all 22 queries, validated cell-exact against
+DuckDB:
 
 ```
-All 22 TPC-H queries: ~70 seconds total
-Average query time: ~3 seconds
+Parquet:                  65.1s  (DuckDB on the same files: 40.1s)
+Parquet + IPC sidecars:   47.1s  (0.70x DuckDB native tables)
+Lance:                   ~101s   (DuckDB's lance extension: 69.1s)
 ```
 
-*Results measured on Apple M1, single-threaded execution*
+*Measured 2026-08 on an i9-13900KF (8P+16E cores), parallel execution.
+See `CLAUDE.md` for the full benchmark history and methodology.*
 
 ## Supported Functions
 
@@ -274,11 +342,14 @@ Average query time: ~3 seconds
 - [x] All 22 TPC-H queries passing
 - [x] Trino-compatible SQL functions (100+)
 - [x] Larger-than-memory dataset support
-- [ ] Apache Iceberg table support
+- [x] Lance dataset support (read/write, time travel, vector search)
+- [x] Apache Iceberg table support (read, snapshot time travel)
+- [x] Parallel execution (morsel-driven, NUMA/topology-aware)
+- [x] Cost-based join ordering (DPsize from file statistics)
+- [x] Distributed execution (`serve` mode: scatter/gather over N nodes)
 - [ ] Window functions (ROW_NUMBER, RANK, etc.)
 - [ ] Array/Map type support
-- [ ] Parallel execution
-- [ ] Cost-based optimization
+- [ ] Iceberg partition pruning + row-level deletes
 
 ## License
 
