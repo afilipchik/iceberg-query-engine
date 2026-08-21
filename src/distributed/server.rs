@@ -14,10 +14,15 @@
 //!
 //! `hyper 1.11`, `hyper-util` and `http-body-util` are already in `Cargo.lock`
 //! (they arrive under `--features lance`), so naming them adds zero new lock
-//! entries. `tonic` and `arrow-flight` are **not** in the lock, and pulling
-//! them risks forcing an arrow-major bump against the arrow-53 pin that Lance
-//! requires — a single-node regression traded for a transport convenience. We
-//! implement Flight's *semantics* (Arrow IPC bodies) without the Flight crate.
+//! entries. `tonic` and `arrow-flight` were originally **not** in the lock,
+//! and pulling them risked forcing an arrow-major bump against the arrow-53
+//! pin that Lance requires. We implement Flight's *semantics* (Arrow IPC
+//! bodies) without the Flight crate for all INTERNAL traffic.
+//!
+//! AMENDED 2026-08-21: arrow-flight 53/tonic 0.12 are now in the tree for the
+//! CLIENT-FACING endpoint only (`src/distributed/flight.rs`, see the Cargo.toml
+//! note — the addition was proven lock-add-only). This module's HTTP transport
+//! and `/fragment` remain exactly as described above.
 //!
 //! # Threading
 //!
