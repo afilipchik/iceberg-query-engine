@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Probe the engine with standard-SQL features and record what fails."""
-import subprocess, json, sys
+import os, subprocess, json, sys
+
+BINARY = os.environ.get("QE_BINARY", "./target/release/query_engine")
 
 PROBES = [
     # Window functions: ranking
@@ -73,7 +75,7 @@ PROBES = [
 results = {}
 for name, sql in PROBES:
     p = subprocess.run(
-        ["./target/release/query_engine", "sql", sql, "--sf", "0.001"],
+        [BINARY, "sql", sql, "--sf", "0.001"],
         capture_output=True, text=True, timeout=120)
     out = p.stdout + p.stderr
     failed = ("error" in out.lower() or "Error" in out) and "rows in" not in out

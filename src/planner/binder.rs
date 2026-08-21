@@ -67,6 +67,43 @@ pub struct Binder<'a> {
     allow_window: bool,
 }
 
+/// `a IS [NOT] DISTINCT FROM b` as a CASE over IS NULL tests — null-safe
+/// equality without new evaluator machinery.
+fn is_distinct_expr(a: Expr, b: Expr, negated: bool) -> Expr {
+    let is_null = |e: &Expr| Expr::UnaryExpr {
+        op: UnaryOp::IsNull,
+        expr: Box::new(e.clone()),
+    };
+    let both_null = Expr::BinaryExpr {
+        left: Box::new(is_null(&a)),
+        op: BinaryOp::And,
+        right: Box::new(is_null(&b)),
+    };
+    let either_null = Expr::BinaryExpr {
+        left: Box::new(is_null(&a)),
+        op: BinaryOp::Or,
+        right: Box::new(is_null(&b)),
+    };
+    let (t_both, t_one, cmp_op) = if negated {
+        // IS NOT DISTINCT FROM: null-safe equality
+        (true, false, BinaryOp::Eq)
+    } else {
+        (false, true, BinaryOp::NotEq)
+    };
+    Expr::Case {
+        operand: None,
+        when_then: vec![
+            (both_null, Expr::Literal(ScalarValue::Boolean(t_both))),
+            (either_null, Expr::Literal(ScalarValue::Boolean(t_one))),
+        ],
+        else_expr: Some(Box::new(Expr::BinaryExpr {
+            left: Box::new(a),
+            op: cmp_op,
+            right: Box::new(b),
+        })),
+    }
+}
+
 /// A frame offset must be a non-negative integer literal (the standard allows
 /// expressions; v1 does not, and says so).
 fn frame_offset(e: &ast::Expr) -> Result<u64> {
@@ -587,6 +624,164 @@ impl<'a> Binder<'a> {
         }
 
         Ok(plan)
+    }
+
+    /// `expr ± INTERVAL 'n' unit` as a DATE_ADD call.
+    fn bind_interval_add(
+        &mut self,
+        base: Expr,
+        iv: &ast::Interval,
+        negate: bool,
+        schema: &PlanSchema,
+    ) -> Result<Expr> {
+        let value = self.bind_expr(&iv.value, schema)?;
+        // INTERVAL '3' DAY -> value literal "3"; INTERVAL '3 days' -> "3 days".
+        let (mut n, mut unit) = match &value {
+            Expr::Literal(ScalarValue::Utf8(s)) => {
+                let parts: Vec<&str> = s.split_whitespace().collect();
+                let n: i64 = parts
+                    .first()
+                    .and_then(|p| p.parse().ok())
+                    .ok_or_else(|| QueryError::Bind(format!("malformed interval {s:?}")))?;
+                (
+                    n,
+                    parts.get(1).map(|u| u.trim_end_matches('s').to_lowercase()),
+                )
+            }
+            Expr::Literal(ScalarValue::Int64(n)) => (*n, None),
+            other => {
+                return Err(QueryError::NotImplemented(format!(
+                    "non-literal INTERVAL value ({other})"
+                )))
+            }
+        };
+        if unit.is_none() {
+            unit = iv.leading_field.as_ref().map(|f| match f {
+                ast::DateTimeField::Year => "year".to_string(),
+                ast::DateTimeField::Month => "month".to_string(),
+                ast::DateTimeField::Week(_) => "week".to_string(),
+                ast::DateTimeField::Day => "day".to_string(),
+                ast::DateTimeField::Hour => "hour".to_string(),
+                ast::DateTimeField::Minute => "minute".to_string(),
+                ast::DateTimeField::Second => "second".to_string(),
+                other => format!("{other:?}").to_lowercase(),
+            });
+        }
+        let unit = unit.unwrap_or_else(|| "day".to_string());
+        if negate {
+            n = -n;
+        }
+        Ok(Expr::ScalarFunc {
+            func: ScalarFunction::DateAdd,
+            args: vec![
+                Expr::Literal(ScalarValue::Utf8(unit)),
+                Expr::Literal(ScalarValue::Int64(n)),
+                base,
+            ],
+        })
+    }
+
+    /// `x op ANY/SOME/ALL (subquery)` desugar. `= ANY` and `<> ALL` are
+    /// exactly IN / NOT IN; ordering comparisons reduce to MIN/MAX of the
+    /// subquery with an emptiness guard (ANY over nothing = FALSE, ALL over
+    /// nothing = TRUE). NULL elements in the subquery follow MIN/MAX
+    /// semantics (ignored), which deviates from the standard's three-valued
+    /// answer only in NULL-element corner cases.
+    fn bind_quantified(
+        &mut self,
+        left: &SqlExpr,
+        op: &ast::BinaryOperator,
+        right: &SqlExpr,
+        any: bool,
+        schema: &PlanSchema,
+    ) -> Result<Expr> {
+        let SqlExpr::Subquery(query) = right else {
+            return Err(QueryError::NotImplemented(
+                "ANY/ALL over a non-subquery expression".into(),
+            ));
+        };
+        let lhs = self.bind_expr(left, schema)?;
+        let subplan = Arc::new(self.bind_query(query)?);
+        use ast::BinaryOperator as B;
+        match (op, any) {
+            (B::Eq, true) => Ok(Expr::InSubquery {
+                expr: Box::new(lhs),
+                subquery: subplan,
+                negated: false,
+            }),
+            (B::NotEq, false) => Ok(Expr::InSubquery {
+                expr: Box::new(lhs),
+                subquery: subplan,
+                negated: true,
+            }),
+            (B::Gt | B::GtEq | B::Lt | B::LtEq, _) => {
+                // ANY: compare against the easiest element (MIN for >/>=,
+                // MAX for </<=); ALL: against the hardest.
+                let want_min = match (op, any) {
+                    (B::Gt | B::GtEq, true) => true,
+                    (B::Lt | B::LtEq, true) => false,
+                    (B::Gt | B::GtEq, false) => false,
+                    (B::Lt | B::LtEq, false) => true,
+                    _ => unreachable!(),
+                };
+                let sub_schema = subplan.schema();
+                if sub_schema.fields().len() != 1 {
+                    return Err(QueryError::Bind(
+                        "ANY/ALL subquery must return exactly one column".into(),
+                    ));
+                }
+                let col = Expr::Column(Column::new(sub_schema.fields()[0].name.clone()));
+                let agg = Expr::Aggregate {
+                    func: if want_min {
+                        AggregateFunction::Min
+                    } else {
+                        AggregateFunction::Max
+                    },
+                    args: vec![col.clone()],
+                    distinct: false,
+                };
+                let cnt = Expr::Aggregate {
+                    func: AggregateFunction::Count,
+                    args: vec![col.clone()],
+                    distinct: false,
+                };
+                let sub_arrow = subplan.schema();
+                let agg_field = SchemaField::new(agg.output_name(), agg.data_type(&sub_arrow)?);
+                let extreme_plan = Arc::new(LogicalPlan::Aggregate(AggregateNode {
+                    input: subplan.clone(),
+                    group_by: vec![],
+                    aggregates: vec![agg],
+                    schema: PlanSchema::new(vec![agg_field]),
+                }));
+                let cnt_field = SchemaField::new(cnt.output_name(), ArrowDataType::Int64);
+                let count_plan = Arc::new(LogicalPlan::Aggregate(AggregateNode {
+                    input: subplan.clone(),
+                    group_by: vec![],
+                    aggregates: vec![cnt],
+                    schema: PlanSchema::new(vec![cnt_field]),
+                }));
+                let bop = self.convert_binary_op(op)?;
+                let cmp = Expr::BinaryExpr {
+                    left: Box::new(lhs),
+                    op: bop,
+                    right: Box::new(Expr::ScalarSubquery(extreme_plan)),
+                };
+                let empty = Expr::BinaryExpr {
+                    left: Box::new(Expr::ScalarSubquery(count_plan)),
+                    op: BinaryOp::Eq,
+                    right: Box::new(Expr::Literal(ScalarValue::Int64(0))),
+                };
+                // ANY over empty = FALSE; ALL over empty = TRUE.
+                Ok(Expr::Case {
+                    operand: None,
+                    when_then: vec![(empty, Expr::Literal(ScalarValue::Boolean(!any)))],
+                    else_expr: Some(Box::new(cmp)),
+                })
+            }
+            other => Err(QueryError::NotImplemented(format!(
+                "quantified comparison {other:?}"
+            ))),
+        }
     }
 
     /// Desugar `GROUP BY GROUPING SETS / ROLLUP / CUBE` into
@@ -1496,9 +1691,33 @@ impl<'a> Binder<'a> {
         let mut aggregate_aliases = Vec::new();
         let mut has_aggregates = false;
 
-        // Parse GROUP BY
+        // Parse GROUP BY. An integer literal is an ORDINAL into the SELECT
+        // list (standard), never a constant group key.
         if let ast::GroupByExpr::Expressions(exprs, _) = group_by {
             for expr in exprs {
+                if let SqlExpr::Value(ast::Value::Number(n, _)) = expr {
+                    if let Ok(ord) = n.parse::<usize>() {
+                        if ord == 0 || ord > projection.len() {
+                            return Err(QueryError::Bind(format!(
+                                "GROUP BY position {ord} is out of range (1-{})",
+                                projection.len()
+                            )));
+                        }
+                        let item = &projection[ord - 1];
+                        let target = match item {
+                            SelectItem::UnnamedExpr(e) => e,
+                            SelectItem::ExprWithAlias { expr, .. } => expr,
+                            other => {
+                                return Err(QueryError::Bind(format!(
+                                    "GROUP BY position {ord} refers to {other}, which is not \
+                                     an expression"
+                                )))
+                            }
+                        };
+                        group_by_exprs.push(self.bind_expr(target, schema)?);
+                        continue;
+                    }
+                }
                 group_by_exprs.push(self.bind_expr(expr, schema)?);
             }
         }
@@ -1695,6 +1914,21 @@ impl<'a> Binder<'a> {
             // optimizer rule would then walk.
             SqlExpr::Array(arr) => self.bind_array_literal(&arr.elem, schema),
             SqlExpr::BinaryOp { left, op, right } => {
+                // `expr + INTERVAL 'n' unit` / `expr - INTERVAL ...` desugar
+                // to DATE_ADD, which does calendar-correct month arithmetic.
+                if matches!(op, ast::BinaryOperator::Plus | ast::BinaryOperator::Minus) {
+                    let negate = matches!(op, ast::BinaryOperator::Minus);
+                    if let SqlExpr::Interval(iv) = right.as_ref() {
+                        let base = self.bind_expr(left, schema)?;
+                        return self.bind_interval_add(base, iv, negate, schema);
+                    }
+                    if let SqlExpr::Interval(iv) = left.as_ref() {
+                        if !negate {
+                            let base = self.bind_expr(right, schema)?;
+                            return self.bind_interval_add(base, iv, false, schema);
+                        }
+                    }
+                }
                 let left_expr = self.bind_expr(left, schema)?;
                 let right_expr = self.bind_expr(right, schema)?;
                 let binary_op = self.convert_binary_op(op)?;
@@ -1917,6 +2151,75 @@ impl<'a> Binder<'a> {
                     left: Box::new(bound_expr),
                     op,
                     right: Box::new(bound_pattern),
+                })
+            }
+            SqlExpr::IsDistinctFrom(a, b) => {
+                let a = self.bind_expr(a, schema)?;
+                let b = self.bind_expr(b, schema)?;
+                Ok(is_distinct_expr(a, b, false))
+            }
+            SqlExpr::IsNotDistinctFrom(a, b) => {
+                let a = self.bind_expr(a, schema)?;
+                let b = self.bind_expr(b, schema)?;
+                Ok(is_distinct_expr(a, b, true))
+            }
+            SqlExpr::AnyOp {
+                left,
+                compare_op,
+                right,
+                ..
+            } => self.bind_quantified(left, compare_op, right, true, schema),
+            SqlExpr::AllOp {
+                left,
+                compare_op,
+                right,
+            } => self.bind_quantified(left, compare_op, right, false, schema),
+            SqlExpr::Overlay {
+                expr,
+                overlay_what,
+                overlay_from,
+                overlay_for,
+            } => {
+                // OVERLAY(s PLACING r FROM p [FOR l]) ==
+                // SUBSTRING(s, 1, p-1) || r || SUBSTRING(s, p + l)
+                // with l defaulting to LENGTH(r).
+                let s = self.bind_expr(expr, schema)?;
+                let r = self.bind_expr(overlay_what, schema)?;
+                let p = self.bind_expr(overlay_from, schema)?;
+                let l = match overlay_for {
+                    Some(e) => self.bind_expr(e, schema)?,
+                    None => Expr::ScalarFunc {
+                        func: ScalarFunction::Length,
+                        args: vec![r.clone()],
+                    },
+                };
+                let one = || Expr::Literal(ScalarValue::Int64(1));
+                let prefix = Expr::ScalarFunc {
+                    func: ScalarFunction::Substring,
+                    args: vec![
+                        s.clone(),
+                        one(),
+                        Expr::BinaryExpr {
+                            left: Box::new(p.clone()),
+                            op: BinaryOp::Subtract,
+                            right: Box::new(one()),
+                        },
+                    ],
+                };
+                let suffix = Expr::ScalarFunc {
+                    func: ScalarFunction::Substring,
+                    args: vec![
+                        s,
+                        Expr::BinaryExpr {
+                            left: Box::new(p),
+                            op: BinaryOp::Add,
+                            right: Box::new(l),
+                        },
+                    ],
+                };
+                Ok(Expr::ScalarFunc {
+                    func: ScalarFunction::Concat,
+                    args: vec![prefix, r, suffix],
                 })
             }
             SqlExpr::Interval(interval) => {
