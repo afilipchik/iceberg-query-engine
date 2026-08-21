@@ -3,7 +3,7 @@ name: arrow-flight-rpc
 status: backlog
 created: 2026-08-21T13:40:26Z
 updated: 2026-08-21T13:40:26Z
-progress: 0%
+progress: 62%
 prd: .claude/prds/arrow-flight-rpc.md
 github: (will be set on sync)
 ---
