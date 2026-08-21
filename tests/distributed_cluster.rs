@@ -1082,9 +1082,9 @@ async fn what_cannot_be_distributed_is_refused_by_name() {
     }
 
     let cases: &[(&str, &str)] = &[
-        // The engine itself has no window functions yet; gather widens
-        // distributed support to exactly the local envelope, never past it.
-        ("SELECT SUM(l_quantity) OVER () FROM lineitem", "indow"),
+        // Window functions run distributed through the GATHER path since the
+        // standard-sql-completion epic; what stays refused is the shape with
+        // nothing to shard, and non-SELECT statements.
         // No base table: there is nothing to shard.
         ("SELECT 1", "no base table"),
         ("DROP TABLE lineitem", "only SELECT"),
