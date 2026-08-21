@@ -423,6 +423,22 @@ impl<'a> Binder<'a> {
             });
         }
 
+        // 3a. GROUPING SETS / ROLLUP / CUBE desugar to a UNION ALL of plain
+        // aggregates (one branch per set) — no new physical operator.
+        if let ast::GroupByExpr::Expressions(gexprs, _) = &select.group_by {
+            let has_sets = gexprs.iter().any(|e| {
+                matches!(
+                    e,
+                    SqlExpr::GroupingSets(_) | SqlExpr::Rollup(_) | SqlExpr::Cube(_)
+                )
+            });
+            if has_sets {
+                self.allow_window = false;
+                self.named_windows = saved_windows;
+                return self.bind_grouping_sets(select, plan, gexprs);
+            }
+        }
+
         // 3. GROUP BY and aggregates. Window functions become legal to bind
         // from here on (they live in the SELECT list; extract_aggregates
         // pre-binds it).
@@ -571,6 +587,232 @@ impl<'a> Binder<'a> {
         }
 
         Ok(plan)
+    }
+
+    /// Desugar `GROUP BY GROUPING SETS / ROLLUP / CUBE` into
+    /// `UNION ALL` of ordinary aggregates. Each branch pads the group columns
+    /// absent from its set with typed NULLs; `GROUPING(...)` calls in the
+    /// SELECT list become per-branch constants.
+    fn bind_grouping_sets(
+        &mut self,
+        select: &ast::Select,
+        input: LogicalPlan,
+        gexprs: &[SqlExpr],
+    ) -> Result<LogicalPlan> {
+        if gexprs.len() != 1 {
+            return Err(QueryError::NotImplemented(
+                "GROUPING SETS/ROLLUP/CUBE combined with other GROUP BY items".into(),
+            ));
+        }
+        if select.having.is_some() {
+            return Err(QueryError::NotImplemented(
+                "HAVING with GROUPING SETS/ROLLUP/CUBE".into(),
+            ));
+        }
+        let input_schema = input.schema();
+        let input = Arc::new(input);
+
+        // Expand to the list of grouping sets (each: the AST exprs grouped).
+        let sets: Vec<Vec<&SqlExpr>> = match &gexprs[0] {
+            SqlExpr::GroupingSets(groups) => groups.iter().map(|g| g.iter().collect()).collect(),
+            SqlExpr::Rollup(groups) => {
+                // ROLLUP(a, b) -> [a,b], [a], []
+                let mut out: Vec<Vec<&SqlExpr>> = Vec::new();
+                for k in (0..=groups.len()).rev() {
+                    out.push(groups[..k].iter().flatten().collect());
+                }
+                out
+            }
+            SqlExpr::Cube(groups) => {
+                // CUBE(a, b) -> every subset, standard order.
+                let m = groups.len();
+                let mut out: Vec<Vec<&SqlExpr>> = Vec::new();
+                for mask in (0..(1usize << m)).rev() {
+                    let mut set = Vec::new();
+                    for (bit, g) in groups.iter().enumerate() {
+                        if mask & (1 << (m - 1 - bit)) != 0 {
+                            set.extend(g.iter());
+                        }
+                    }
+                    out.push(set);
+                }
+                out
+            }
+            _ => unreachable!("caller checked"),
+        };
+
+        // The ordered union of all group expressions across the sets.
+        let mut union_exprs: Vec<Expr> = Vec::new();
+        let mut union_names: Vec<String> = Vec::new();
+        let mut set_membership: Vec<Vec<bool>> = Vec::new();
+        let mut bound_sets: Vec<Vec<Expr>> = Vec::new();
+        for set in &sets {
+            let mut bound = Vec::new();
+            for e in set {
+                let b = self.bind_expr(e, &input_schema)?;
+                if !union_exprs.contains(&b) {
+                    union_names.push(b.output_name());
+                    union_exprs.push(b.clone());
+                }
+                bound.push(b);
+            }
+            bound_sets.push(bound);
+        }
+        for bound in &bound_sets {
+            set_membership.push(union_exprs.iter().map(|u| bound.contains(u)).collect());
+        }
+
+        // Aggregates and GROUPING(...) calls from the SELECT list.
+        let mut aggregates: Vec<Expr> = Vec::new();
+        let mut grouping_calls: Vec<Vec<Expr>> = Vec::new(); // arg lists
+        let mut out_items: Vec<(Expr, String)> = Vec::new(); // shape of final projection
+        enum Item {
+            Group(usize),
+            Agg(usize),
+            Grouping(usize),
+        }
+        let mut item_plan: Vec<(Item, String)> = Vec::new();
+        for item in &select.projection {
+            let (raw, alias) = match item {
+                SelectItem::UnnamedExpr(e) => (e, None),
+                SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
+                _ => {
+                    return Err(QueryError::NotImplemented(
+                        "wildcard projection with GROUPING SETS".into(),
+                    ))
+                }
+            };
+            // GROUPING(...) — constant per branch.
+            if let SqlExpr::Function(f) = raw {
+                if f.name.to_string().to_uppercase() == "GROUPING" {
+                    let args: Vec<Expr> = match &f.args {
+                        ast::FunctionArguments::List(l) => l
+                            .args
+                            .iter()
+                            .map(|a| match a {
+                                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
+                                    self.bind_expr(e, &input_schema)
+                                }
+                                other => {
+                                    Err(QueryError::Bind(format!("GROUPING argument {other:?}")))
+                                }
+                            })
+                            .collect::<Result<_>>()?,
+                        _ => vec![],
+                    };
+                    for a in &args {
+                        if !union_exprs.contains(a) {
+                            return Err(QueryError::Bind(format!(
+                                "GROUPING argument {a} is not a grouping column"
+                            )));
+                        }
+                    }
+                    let name = alias.unwrap_or_else(|| "grouping".to_string());
+                    item_plan.push((Item::Grouping(grouping_calls.len()), name));
+                    grouping_calls.push(args);
+                    continue;
+                }
+            }
+            let bound = self.bind_expr(raw, &input_schema)?;
+            let name = alias.unwrap_or_else(|| bound.output_name());
+            if let Some(gi) = union_exprs.iter().position(|u| *u == bound) {
+                item_plan.push((Item::Group(gi), name));
+            } else if bound.contains_aggregate() {
+                if !matches!(bound, Expr::Aggregate { .. }) {
+                    return Err(QueryError::NotImplemented(
+                        "expressions over aggregates with GROUPING SETS".into(),
+                    ));
+                }
+                let ai = aggregates
+                    .iter()
+                    .position(|a| *a == bound)
+                    .unwrap_or_else(|| {
+                        aggregates.push(bound.clone());
+                        aggregates.len() - 1
+                    });
+                item_plan.push((Item::Agg(ai), name));
+            } else {
+                return Err(QueryError::NotImplemented(format!(
+                    "SELECT item {bound} with GROUPING SETS must be a grouping column, \
+                     an aggregate, or GROUPING(...)"
+                )));
+            }
+        }
+        drop(out_items);
+
+        // One aggregate + projection branch per set, then UNION ALL.
+        let mut branches: Vec<Arc<LogicalPlan>> = Vec::new();
+        let mut union_schema_fields: Option<Vec<SchemaField>> = None;
+        for (si, bound) in bound_sets.iter().enumerate() {
+            let mut agg_fields = Vec::new();
+            for e in bound {
+                agg_fields.push(e.to_field(&input_schema)?);
+            }
+            for a in &aggregates {
+                agg_fields.push(SchemaField::new(
+                    a.output_name(),
+                    a.data_type(&input_schema)?,
+                ));
+            }
+            let agg_plan = LogicalPlan::Aggregate(AggregateNode {
+                input: input.clone(),
+                group_by: bound.clone(),
+                aggregates: aggregates.clone(),
+                schema: PlanSchema::new(agg_fields),
+            });
+            let agg_schema = agg_plan.schema();
+
+            // Projection: the final SELECT shape, NULL-padding absent groups.
+            let mut proj_exprs = Vec::new();
+            let mut proj_fields = Vec::new();
+            for (item, name) in &item_plan {
+                let e = match item {
+                    Item::Group(gi) => {
+                        if set_membership[si][*gi] {
+                            Expr::Column(Column::new(union_names[*gi].clone()))
+                        } else {
+                            Expr::Cast {
+                                expr: Box::new(Expr::Literal(ScalarValue::Null)),
+                                data_type: union_exprs[*gi].data_type(&input_schema)?,
+                            }
+                        }
+                    }
+                    Item::Agg(ai) => Expr::Column(Column::new(aggregates[*ai].output_name())),
+                    Item::Grouping(ci) => {
+                        let mut v: i64 = 0;
+                        for a in &grouping_calls[*ci] {
+                            let gi = union_exprs.iter().position(|u| u == a).expect("checked");
+                            v = (v << 1) | (!set_membership[si][gi]) as i64;
+                        }
+                        Expr::Literal(ScalarValue::Int64(v))
+                    }
+                };
+                let dt = match item {
+                    Item::Group(gi) => union_exprs[*gi].data_type(&input_schema)?,
+                    Item::Agg(_) => e.data_type(&agg_schema)?,
+                    Item::Grouping(_) => ArrowDataType::Int64,
+                };
+                proj_fields.push(SchemaField::new(name.clone(), dt));
+                proj_exprs.push(Expr::Alias {
+                    expr: Box::new(e),
+                    name: name.clone(),
+                });
+            }
+            if union_schema_fields.is_none() {
+                union_schema_fields = Some(proj_fields.clone());
+            }
+            branches.push(Arc::new(LogicalPlan::Project(ProjectNode {
+                input: Arc::new(agg_plan),
+                exprs: proj_exprs,
+                schema: PlanSchema::new(proj_fields),
+            })));
+        }
+
+        Ok(LogicalPlan::Union(crate::planner::UnionNode {
+            inputs: branches,
+            schema: PlanSchema::new(union_schema_fields.expect("at least one set")),
+            all: true,
+        }))
     }
 
     fn bind_from(&mut self, from: &[ast::TableWithJoins]) -> Result<LogicalPlan> {
