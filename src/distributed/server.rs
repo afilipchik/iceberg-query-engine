@@ -336,6 +336,7 @@ pub async fn spawn(opts: ServeOptions, loader: TableLoader) -> Result<ServerHand
     );
 
     let membership = Arc::new(Membership::new(node_id, address.clone(), discovery));
+    membership.set_self_flight(flight_address.clone());
     let state = Arc::new(NodeState::new(node_id, address, flight_address, membership));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -662,10 +663,15 @@ async fn probe_once(state: &Arc<NodeState>, timeout: Duration) {
         async move {
             match http_client::get(&addr, "/healthz", timeout).await {
                 Ok(resp) if resp.is_success() => {
-                    let node_id = serde_json::from_slice::<serde_json::Value>(&resp.body)
-                        .ok()
+                    let parsed = serde_json::from_slice::<serde_json::Value>(&resp.body).ok();
+                    let node_id = parsed
+                        .as_ref()
                         .and_then(|v| v.get("node_id").and_then(|n| n.as_u64()));
-                    state.membership.record_up(&addr, node_id);
+                    let flight = parsed
+                        .as_ref()
+                        .and_then(|v| v.get("flight").and_then(|f| f.as_str()))
+                        .map(str::to_string);
+                    state.membership.record_up(&addr, node_id, flight);
                 }
                 Ok(resp) => state
                     .membership
@@ -995,12 +1001,15 @@ fn splits(state: &Arc<NodeState>, query: &str) -> Response<Full<Bytes>> {
 /// anything it depends on becomes a reason for Kubernetes to kill a healthy
 /// pod. It reports identity too, which is how peers learn each other's node ids.
 fn healthz(state: &Arc<NodeState>) -> Response<Full<Bytes>> {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "status": "ok",
         "node_id": state.node_id,
         "address": state.address,
         "uptime_ms": state.uptime().as_millis() as u64,
     });
+    if let Some(f) = &state.flight_address {
+        body["flight"] = serde_json::json!(f);
+    }
     json_response(StatusCode::OK, &body)
 }
 

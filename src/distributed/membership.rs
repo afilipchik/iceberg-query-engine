@@ -60,6 +60,10 @@ pub struct Member {
     pub address: String,
     /// Learned from the member's own `/healthz`; `None` until first contact.
     pub node_id: Option<NodeId>,
+    /// The member's Arrow Flight address, learned the same way; absent until
+    /// first contact or when the member runs with Flight disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flight: Option<String>,
     /// True for the node serving this view.
     pub is_self: bool,
     pub status: PeerStatus,
@@ -125,6 +129,7 @@ pub enum MembershipChange {
 #[derive(Debug)]
 struct PeerRecord {
     node_id: Option<NodeId>,
+    flight: Option<String>,
     status: PeerStatus,
     last_seen_unix_ms: Option<u64>,
     last_error: Option<String>,
@@ -135,6 +140,7 @@ impl PeerRecord {
     fn new() -> Self {
         Self {
             node_id: None,
+            flight: None,
             status: PeerStatus::Unknown,
             last_seen_unix_ms: None,
             last_error: None,
@@ -164,6 +170,10 @@ struct State {
 pub struct Membership {
     self_id: NodeId,
     self_address: String,
+    /// This node's own Flight address, set once at server startup (the
+    /// listener binds after `Membership` is constructed in some tests, so it
+    /// is a setter rather than a constructor argument).
+    self_flight: Mutex<Option<String>>,
     /// Behind a lock because it is replaceable at runtime: reconfiguring the
     /// peer list is a legitimate operation (and it is how the integration tests
     /// wire three ephemeral-port nodes together after they have all bound).
@@ -176,6 +186,7 @@ impl Membership {
         Self {
             self_id,
             self_address: self_address.into(),
+            self_flight: Mutex::new(None),
             discovery: Mutex::new(discovery),
             state: Mutex::new(State {
                 peers: BTreeMap::new(),
@@ -264,8 +275,14 @@ impl Membership {
         state.last_resolve_error = Some(err.into());
     }
 
+    /// This node's own Flight address, reflected in `members()` and gossiped
+    /// to peers via `/healthz`.
+    pub fn set_self_flight(&self, flight: Option<String>) {
+        *self.self_flight.lock() = flight;
+    }
+
     /// Record a successful probe of `address`.
-    pub fn record_up(&self, address: &str, node_id: Option<NodeId>) {
+    pub fn record_up(&self, address: &str, node_id: Option<NodeId>, flight: Option<String>) {
         let mut state = self.state.lock();
         if let Some(p) = state.peers.get_mut(address) {
             let was_down = p.status != PeerStatus::Up;
@@ -275,6 +292,9 @@ impl Membership {
             p.consecutive_failures = 0;
             if node_id.is_some() {
                 p.node_id = node_id;
+            }
+            if flight.is_some() {
+                p.flight = flight;
             }
             if was_down {
                 state.generation += 1;
@@ -308,6 +328,7 @@ impl Membership {
             .map(|(address, p)| Member {
                 address: address.clone(),
                 node_id: p.node_id,
+                flight: p.flight.clone(),
                 is_self: false,
                 status: p.status,
                 last_seen_unix_ms: p.last_seen_unix_ms,
@@ -318,6 +339,7 @@ impl Membership {
         members.push(Member {
             address: self.self_address.clone(),
             node_id: Some(self.self_id),
+            flight: self.self_flight.lock().clone(),
             is_self: true,
             // Answering this request is the proof.
             status: PeerStatus::Up,
@@ -508,7 +530,7 @@ mod tests {
     fn resolution_is_idempotent_and_preserves_probe_state() {
         let mem = m();
         mem.set_members(mem.discovery().resolve().unwrap());
-        mem.record_up("127.0.0.1:7002", Some(1));
+        mem.record_up("127.0.0.1:7002", Some(1), None);
         let gen_before = mem.generation();
 
         let changes = mem.set_members(mem.discovery().resolve().unwrap());
@@ -543,7 +565,7 @@ mod tests {
     fn an_unreachable_peer_is_marked_not_removed() {
         let mem = m();
         mem.set_members(mem.discovery().resolve().unwrap());
-        mem.record_up("127.0.0.1:7002", Some(1));
+        mem.record_up("127.0.0.1:7002", Some(1), None);
         mem.record_down("127.0.0.1:7002", "connection refused");
         mem.record_down("127.0.0.1:7002", "connection refused");
 
