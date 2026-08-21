@@ -364,6 +364,8 @@ async fn main() {
 
     // Allow any same-user process to attach a debugger/sampler when requested
     // (yama ptrace_scope=1 otherwise restricts attach to ancestors).
+    // Linux-only: prctl/PR_SET_PTRACER (and yama itself) don't exist elsewhere.
+    #[cfg(target_os = "linux")]
     if std::env::var("QUERY_PTRACE_ANY").is_ok() {
         unsafe {
             libc::prctl(libc::PR_SET_PTRACER, -1i64, 0, 0, 0);
