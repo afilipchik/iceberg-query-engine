@@ -12,6 +12,7 @@ A high-performance SQL query engine built from scratch in Rust, designed for ana
 - **Lance Support** (feature `lance`): Read and write Lance datasets, with version time travel and vector search
 - **Iceberg Support**: Read Apache Iceberg tables (v1/v2 metadata, Avro manifests, snapshot time travel)
 - **Vector Search**: k-NN over embedding columns (`cosine_distance`, `l2_distance`, …), exact by default with opt-in IVF_PQ index pushdown
+- **Arrow Flight RPC**: standard gRPC endpoint (`serve --flight-bind`) — query from `pyarrow.flight` or any Flight client, single-node or distributed
 - **Larger-Than-Memory**: Spillable operators for datasets exceeding available RAM
 - **Interactive REPL**: SQL shell with history and tab completion
 - **Streaming Execution**: Memory-efficient processing via Arrow RecordBatch streams
@@ -218,6 +219,36 @@ LIMIT 10;
 Results are exact (brute force) by default. Build an IVF_PQ index with
 `create-lance-index` and set `QE_VECTOR_SEARCH=indexed` to opt into
 approximate index-backed search (~20x faster, recall ≈ 0.9).
+
+### Arrow Flight RPC
+
+`serve` exposes an Arrow Flight (gRPC) endpoint next to its HTTP API — the
+same engine, reachable from any Flight client with zero custom glue:
+
+```bash
+# Flight listens on the HTTP port + 1 by default (here: 7778).
+# --flight-bind <addr> overrides it; --flight-bind none disables it.
+./target/release/query_engine serve --bind 0.0.0.0:7777 --data ./data/tpch-10mb
+```
+
+```python
+import pyarrow.flight as fl
+
+client = fl.connect("grpc://localhost:7778")
+info = client.get_flight_info(
+    fl.FlightDescriptor.for_command(b"SELECT COUNT(*) AS n FROM lineitem"))
+table = client.do_get(info.endpoints[0].ticket).read_all()
+print(table.to_pydict())
+```
+
+`list_flights` enumerates the registered tables, `get_schema` returns a
+table's (or a query's) schema without executing, and
+`do_action("cluster")` returns the membership view. In a cluster, every
+node serves Flight; a query sent to any node runs through the same
+auto/scatter/gather machinery as `POST /sql`, and the final stream chunk
+carries execution metadata (rows, elapsed, distributed, shard count) as
+JSON in `app_metadata`. Send `{"sql": "...", "mode": "force"}` as the
+command to require distributed execution (`off` forces local).
 
 ## Architecture
 

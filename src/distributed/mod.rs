@@ -32,6 +32,7 @@
 //! ```
 
 pub mod coordinator;
+pub(crate) mod flight;
 pub mod gather;
 pub mod http_client;
 pub mod membership;

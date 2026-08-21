@@ -68,6 +68,10 @@ done
 
 port_of() { echo $((BASE_PORT + $1)); }
 addr_of() { echo "127.0.0.1:$(port_of "$1")"; }
+# Flight ports live +100 above the HTTP block: node HTTP ports are consecutive,
+# so the serve default (HTTP port + 1) would collide with the next node.
+flight_port_of() { echo $((BASE_PORT + 100 + $1)); }
+flight_addr_of() { echo "127.0.0.1:$(flight_port_of "$1")"; }
 
 peer_list() {
     local n="$1" out=""
@@ -148,6 +152,7 @@ cmd_start() {
     for ((i = 0; i < NODES; i++)); do
         "$BINARY" serve \
             --bind "127.0.0.1:$(port_of "$i")" \
+            --flight-bind "127.0.0.1:$(flight_port_of "$i")" \
             --node-id "$i" \
             --peers "$peers" \
             "${source_args[@]}" \
@@ -231,7 +236,7 @@ cmd_verify() {
     echo -e "${BOLD}=== M1 acceptance gate, $n local processes ===${NC}"
 
     # 1. Identical membership view on every node.
-    info "1/4  /cluster agrees on every node"
+    info "1/5  /cluster agrees on every node"
     if ! wait_converged "$n" 60; then
         bad "the cluster never converged on an all-up $n-member view"
         failures=$((failures + 1))
@@ -266,7 +271,7 @@ cmd_verify() {
     #    associative, so the last bits legitimately differ. The distributed
     #    answers are gated separately by `verify-m2`, against DuckDB, with the
     #    same numeric tolerance the DuckDB-validated suite uses.
-    info "2/4  TPC-H results match the single-process binary, byte for byte (local path)"
+    info "2/5  TPC-H results match the single-process binary, byte for byte (local path)"
     mkdir -p "$STATE_DIR/verify" "$STATE_DIR/ref"
     for q in 1 3 6 10 12; do
         local qq; qq="$(printf 'q%02d' "$q")"
@@ -300,7 +305,7 @@ cmd_verify() {
     done
 
     # 3. Health/readiness semantics.
-    info "3/4  /healthz and /readyz"
+    info "3/5  /healthz and /readyz"
     for ((i = 0; i < n; i++)); do
         local h r
         h="$(curl -s -o /dev/null -w '%{http_code}' "http://$(addr_of "$i")/healthz")"
@@ -312,8 +317,30 @@ cmd_verify() {
         fi
     done
 
-    # 4. SIGTERM the last node; the rest must report it down and keep serving.
-    info "4/4  SIGTERM node $((n - 1)); survivors must mark it down, not crash"
+    # 4. Arrow Flight parity: the same statement over Flight and over HTTP
+    #    must agree on every node — values AND the distributed/shards facts.
+    #    Runs BEFORE the SIGTERM step, which takes a node down.
+    info "4/5  Arrow Flight answers match POST /sql on every node"
+    local py=".venv/bin/python"
+    if [[ ! -x "$py" ]]; then
+        bad "$py not found; the Flight gate needs pyarrow"; failures=$((failures + 1))
+    else
+        local fagree=1
+        for ((i = 0; i < n; i++)); do
+            if ! "$py" scripts/flight_validate.py --node "$(flight_addr_of "$i")" \
+                    --http "$(addr_of "$i")" --quick; then
+                fagree=0; bad "Flight/HTTP parity failed on node $i"
+            fi
+        done
+        if [[ $fagree -eq 1 ]]; then
+            ok "Flight == HTTP on all $n nodes (values and distribution facts)"
+        else
+            failures=$((failures + 1))
+        fi
+    fi
+
+    # 5. SIGTERM the last node; the rest must report it down and keep serving.
+    info "5/5  SIGTERM node $((n - 1)); survivors must mark it down, not crash"
     local victim=$((n - 1)) vpid
     vpid="$(cat "$STATE_DIR/node$victim.pid")"
     kill -TERM "$vpid"
@@ -337,7 +364,7 @@ cmd_verify() {
         noticed=1
         for ((i = 0; i < victim; i++)); do
             curl -s "http://$(addr_of "$i")/cluster" \
-                | grep -A3 "\"$(addr_of "$victim")\"" | grep -q '"status": *"down"' || noticed=0
+                | grep -A5 "\"$(addr_of "$victim")\"" | grep -q '"status": *"down"' || noticed=0
         done
         [[ $noticed -eq 1 ]] && break
         sleep 0.5

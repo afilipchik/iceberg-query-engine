@@ -14,10 +14,15 @@
 //!
 //! `hyper 1.11`, `hyper-util` and `http-body-util` are already in `Cargo.lock`
 //! (they arrive under `--features lance`), so naming them adds zero new lock
-//! entries. `tonic` and `arrow-flight` are **not** in the lock, and pulling
-//! them risks forcing an arrow-major bump against the arrow-53 pin that Lance
-//! requires — a single-node regression traded for a transport convenience. We
-//! implement Flight's *semantics* (Arrow IPC bodies) without the Flight crate.
+//! entries. `tonic` and `arrow-flight` were originally **not** in the lock,
+//! and pulling them risked forcing an arrow-major bump against the arrow-53
+//! pin that Lance requires. We implement Flight's *semantics* (Arrow IPC
+//! bodies) without the Flight crate for all INTERNAL traffic.
+//!
+//! AMENDED 2026-08-21: arrow-flight 53/tonic 0.12 are now in the tree for the
+//! CLIENT-FACING endpoint only (`src/distributed/flight.rs`, see the Cargo.toml
+//! note — the addition was proven lock-add-only). This module's HTTP transport
+//! and `/fragment` remain exactly as described above.
 //!
 //! # Threading
 //!
@@ -93,6 +98,11 @@ pub struct ServeOptions {
     pub drain: Duration,
     /// Grace period for in-flight requests once the listener is closed.
     pub shutdown_grace: Duration,
+    /// Arrow Flight (gRPC) bind address. `None` derives it from the bound HTTP
+    /// address: same host, port + 1 — or another ephemeral port when the HTTP
+    /// port was ephemeral, so tests binding `:0` stay collision-free. The
+    /// literal `"none"` disables the Flight endpoint entirely.
+    pub flight_bind: Option<String>,
 }
 
 impl Default for ServeOptions {
@@ -108,6 +118,7 @@ impl Default for ServeOptions {
             probe_timeout: Duration::from_millis(1000),
             drain: Duration::ZERO,
             shutdown_grace: Duration::from_secs(10),
+            flight_bind: None,
         }
     }
 }
@@ -132,6 +143,9 @@ fn query_runtime() -> &'static tokio::runtime::Runtime {
 pub struct NodeState {
     pub node_id: NodeId,
     pub address: String,
+    /// Advertised `host:port` of this node's Arrow Flight endpoint, when one
+    /// is running: the advertised HTTP host with the bound Flight port.
+    pub flight_address: Option<String>,
     pub membership: Arc<Membership>,
     /// `None` until the loader finishes. Readiness is defined by this.
     context: RwLock<Option<Arc<ExecutionContext>>>,
@@ -147,10 +161,16 @@ pub struct NodeState {
 }
 
 impl NodeState {
-    fn new(node_id: NodeId, address: String, membership: Arc<Membership>) -> Self {
+    fn new(
+        node_id: NodeId,
+        address: String,
+        flight_address: Option<String>,
+        membership: Arc<Membership>,
+    ) -> Self {
         Self {
             node_id,
             address,
+            flight_address,
             membership,
             context: RwLock::new(None),
             load_error: RwLock::new(None),
@@ -198,15 +218,22 @@ impl NodeState {
 /// [`ServerHandle::shutdown`].
 pub struct ServerHandle {
     local_addr: SocketAddr,
+    flight_addr: Option<SocketAddr>,
     state: Arc<NodeState>,
     shutdown_tx: watch::Sender<bool>,
     join: tokio::task::JoinHandle<()>,
+    flight_join: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ServerHandle {
     /// The address actually bound. Meaningful when `bind` used port 0.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// The Arrow Flight address actually bound, when Flight is enabled.
+    pub fn flight_addr(&self) -> Option<SocketAddr> {
+        self.flight_addr
     }
 
     pub fn state(&self) -> &Arc<NodeState> {
@@ -238,6 +265,9 @@ impl ServerHandle {
     pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(true);
         let _ = self.join.await;
+        if let Some(fj) = self.flight_join {
+            let _ = fj.await;
+        }
     }
 }
 
@@ -255,6 +285,43 @@ pub async fn spawn(opts: ServeOptions, loader: TableLoader) -> Result<ServerHand
 
     let address = derive_advertise(local_addr, opts.advertise.as_deref());
     let node_id = derive_node_id(opts.node_id, &address);
+
+    // Arrow Flight listener, bound BEFORE NodeState exists so the advertised
+    // flight address is a construction-time fact, not a mutable one.
+    let flight_listener = match opts.flight_bind.as_deref() {
+        Some("none") => None,
+        explicit => {
+            let bind = match explicit {
+                Some(addr) => addr.to_string(),
+                // Derive: same host as the HTTP bind; port + 1, or another
+                // ephemeral port when HTTP was ephemeral (a fixed "+1" off an
+                // ephemeral port would race other processes for it).
+                None => {
+                    let port = if local_addr.port() == 0 || opts.bind.ends_with(":0") {
+                        0
+                    } else {
+                        local_addr.port().checked_add(1).unwrap_or(0)
+                    };
+                    format!("{}:{}", local_addr.ip(), port)
+                }
+            };
+            let l = TcpListener::bind(&bind)
+                .await
+                .map_err(|e| QueryError::Execution(format!("cannot bind flight {bind}: {e}")))?;
+            Some(l)
+        }
+    };
+    let flight_addr = match &flight_listener {
+        Some(l) => Some(l.local_addr().map_err(|e| {
+            QueryError::Execution(format!("cannot read bound flight address: {e}"))
+        })?),
+        None => None,
+    };
+    // Advertised flight address: the advertised HTTP host, the flight port.
+    let flight_address = flight_addr.map(|fa| {
+        let host = address.rsplit_once(':').map(|(h, _)| h).unwrap_or(&address);
+        format!("{host}:{}", fa.port())
+    });
 
     let discovery = match &opts.peers_dns {
         Some(name) => Discovery::Dns {
@@ -274,8 +341,23 @@ pub async fn spawn(opts: ServeOptions, loader: TableLoader) -> Result<ServerHand
     );
 
     let membership = Arc::new(Membership::new(node_id, address.clone(), discovery));
-    let state = Arc::new(NodeState::new(node_id, address, membership));
+    membership.set_self_flight(flight_address.clone());
+    let state = Arc::new(NodeState::new(node_id, address, flight_address, membership));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // Arrow Flight server, sharing the shutdown signal with the HTTP side.
+    let flight_join = flight_listener.map(|listener| {
+        tracing::info!(
+            node_id,
+            flight = %flight_addr.expect("addr read above"),
+            "serve: flight listening"
+        );
+        crate::distributed::flight::spawn_flight_server(
+            listener,
+            state.clone(),
+            shutdown_rx.clone(),
+        )
+    });
 
     // Table loading: on a blocking thread, because registering Parquet tables
     // reads footers. `/healthz` answers throughout; `/readyz` flips when done.
@@ -327,9 +409,11 @@ pub async fn spawn(opts: ServeOptions, loader: TableLoader) -> Result<ServerHand
 
     Ok(ServerHandle {
         local_addr,
+        flight_addr,
         state,
         shutdown_tx,
         join,
+        flight_join,
     })
 }
 
@@ -341,12 +425,21 @@ pub async fn spawn(opts: ServeOptions, loader: TableLoader) -> Result<ServerHand
 /// crash — including to anyone debugging a genuine crash.
 pub async fn serve(opts: ServeOptions, loader: TableLoader) -> Result<()> {
     let handle = spawn(opts, loader).await?;
-    println!(
-        "query_engine serve: node {} listening on {} (advertising {})",
-        handle.node_id(),
-        handle.local_addr(),
-        handle.address()
-    );
+    match handle.flight_addr() {
+        Some(f) => println!(
+            "query_engine serve: node {} listening on {} (advertising {}), flight on {}",
+            handle.node_id(),
+            handle.local_addr(),
+            handle.address(),
+            f
+        ),
+        None => println!(
+            "query_engine serve: node {} listening on {} (advertising {}), flight disabled",
+            handle.node_id(),
+            handle.local_addr(),
+            handle.address()
+        ),
+    }
 
     wait_for_signal().await;
     tracing::info!("serve: signal received, shutting down");
@@ -575,10 +668,15 @@ async fn probe_once(state: &Arc<NodeState>, timeout: Duration) {
         async move {
             match http_client::get(&addr, "/healthz", timeout).await {
                 Ok(resp) if resp.is_success() => {
-                    let node_id = serde_json::from_slice::<serde_json::Value>(&resp.body)
-                        .ok()
+                    let parsed = serde_json::from_slice::<serde_json::Value>(&resp.body).ok();
+                    let node_id = parsed
+                        .as_ref()
                         .and_then(|v| v.get("node_id").and_then(|n| n.as_u64()));
-                    state.membership.record_up(&addr, node_id);
+                    let flight = parsed
+                        .as_ref()
+                        .and_then(|v| v.get("flight").and_then(|f| f.as_str()))
+                        .map(str::to_string);
+                    state.membership.record_up(&addr, node_id, flight);
                 }
                 Ok(resp) => state
                     .membership
@@ -658,7 +756,7 @@ fn index(state: &Arc<NodeState>) -> Response<Full<Bytes>> {
 
 /// How a `/sql` request should be executed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DistMode {
+pub(crate) enum DistMode {
     /// Distribute when the cluster has peers and the shape is supported;
     /// otherwise run locally over this node's full copy of the data. The
     /// response always says which happened and, when it fell back, why.
@@ -908,12 +1006,15 @@ fn splits(state: &Arc<NodeState>, query: &str) -> Response<Full<Bytes>> {
 /// anything it depends on becomes a reason for Kubernetes to kill a healthy
 /// pod. It reports identity too, which is how peers learn each other's node ids.
 fn healthz(state: &Arc<NodeState>) -> Response<Full<Bytes>> {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "status": "ok",
         "node_id": state.node_id,
         "address": state.address,
         "uptime_ms": state.uptime().as_millis() as u64,
     });
+    if let Some(f) = &state.flight_address {
+        body["flight"] = serde_json::json!(f);
+    }
     json_response(StatusCode::OK, &body)
 }
 
@@ -956,7 +1057,7 @@ fn readyz(state: &Arc<NodeState>) -> Response<Full<Bytes>> {
 }
 
 #[derive(serde::Serialize)]
-struct ClusterView {
+pub(crate) struct ClusterView {
     node: NodeView,
     discovery: DiscoveryView,
     member_count: usize,
@@ -967,6 +1068,9 @@ struct ClusterView {
 struct NodeView {
     id: NodeId,
     address: String,
+    /// Advertised Arrow Flight address, absent when Flight is disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    flight: Option<String>,
     ready: bool,
     tables: Vec<String>,
     uptime_ms: u64,
@@ -984,13 +1088,16 @@ struct DiscoveryView {
     last_error: Option<String>,
 }
 
-fn cluster(state: &Arc<NodeState>) -> Response<Full<Bytes>> {
+/// The membership view served by `GET /cluster` — and, byte-identically, by
+/// the Flight `DoAction("cluster")`.
+pub(crate) fn cluster_view(state: &Arc<NodeState>) -> ClusterView {
     let discovery = state.membership.discovery();
     let members = state.membership.members();
-    let view = ClusterView {
+    ClusterView {
         node: NodeView {
             id: state.node_id,
             address: state.address.clone(),
+            flight: state.flight_address.clone(),
             ready: state.ready(),
             tables: state
                 .context()
@@ -1014,7 +1121,11 @@ fn cluster(state: &Arc<NodeState>) -> Response<Full<Bytes>> {
         },
         member_count: members.len(),
         members,
-    };
+    }
+}
+
+fn cluster(state: &Arc<NodeState>) -> Response<Full<Bytes>> {
+    let view = cluster_view(state);
     match serde_json::to_vec_pretty(&view) {
         Ok(bytes) => raw_response(StatusCode::OK, "application/json", bytes),
         Err(e) => error_response(
@@ -1064,6 +1175,106 @@ impl ResultFormat {
     }
 }
 
+/// Outcome of one statement run through the node's shared local-vs-distributed
+/// decision path. Both front doors — HTTP `/sql` and the Flight endpoint — are
+/// built from this, so they can never disagree about when a query distributes.
+pub(crate) struct ExecOutcome {
+    pub(crate) result: QueryResult,
+    pub(crate) distribution: Option<crate::distributed::Distribution>,
+    pub(crate) fallback_reason: Option<String>,
+    pub(crate) elapsed_ms: f64,
+}
+
+/// Why a statement did not produce a result, separated from `QueryError` so
+/// each front door maps readiness and infrastructure failures to its own
+/// status vocabulary (HTTP: 503/4xx/500; Flight: Unavailable/…/Internal)
+/// without string-matching.
+pub(crate) enum ExecError {
+    /// Tables not loaded (or failed to load) — the node cannot answer yet.
+    NotReady(String),
+    /// The engine rejected or failed the statement.
+    Query(QueryError),
+    /// The spawned query task itself died (runtime join error).
+    TaskFailed(String),
+}
+
+/// Execute one SQL statement: readiness check, the distribute-or-local
+/// decision, and the run itself, off the caller's runtime.
+pub(crate) async fn execute_statement(
+    state: &Arc<NodeState>,
+    statement: &str,
+    mode: DistMode,
+) -> std::result::Result<ExecOutcome, ExecError> {
+    let Some(ctx) = state.context() else {
+        let reason = state
+            .load_error()
+            .map(|e| format!("tables failed to load: {e}"))
+            .unwrap_or_else(|| "tables are still loading".to_string());
+        return Err(ExecError::NotReady(reason));
+    };
+
+    state.queries_total.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+
+    // Decide local vs distributed BEFORE any fan-out, and only ever fall back
+    // for a capability reason. A fallback triggered by an execution failure
+    // would hide a broken cluster behind a correct-looking answer.
+    let members = participants(state);
+    let (distribute, fallback_reason) = match mode {
+        DistMode::Off => (false, Some("distributed=0 requested".to_string())),
+        DistMode::Force => (true, None),
+        DistMode::Auto => {
+            if members.len() < 2 {
+                (false, Some("only one cluster member is up".to_string()))
+            } else {
+                match crate::distributed::plan_distributed(&ctx, statement) {
+                    Ok(_) => (true, None),
+                    Err(e) => (false, Some(e.to_string())),
+                }
+            }
+        }
+    };
+
+    // Off the caller's runtime — see the module docs.
+    let statement = statement.to_string();
+    let joined = query_runtime()
+        .spawn(async move {
+            if !distribute {
+                let result = ctx.sql(&statement).await?;
+                return Ok::<_, QueryError>((result, None));
+            }
+            let transport = HttpTransport {
+                timeout: crate::distributed::coordinator::DEFAULT_FRAGMENT_TIMEOUT,
+            };
+            // Auto mode only reaches here when the exact scatter-gather plan
+            // succeeded, so this takes the scatter path; distributed=1 also
+            // covers every other SELECT via the gather path.
+            let out =
+                crate::distributed::execute_any_distributed(&ctx, &statement, &members, &transport)
+                    .await?;
+            Ok((out.result, Some(out.distribution)))
+        })
+        .await;
+
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    match joined {
+        Ok(Ok((result, distribution))) => Ok(ExecOutcome {
+            result,
+            distribution,
+            fallback_reason,
+            elapsed_ms,
+        }),
+        Ok(Err(e)) => {
+            state.queries_failed.fetch_add(1, Ordering::Relaxed);
+            Err(ExecError::Query(e))
+        }
+        Err(e) => {
+            state.queries_failed.fetch_add(1, Ordering::Relaxed);
+            Err(ExecError::TaskFailed(e.to_string()))
+        }
+    }
+}
+
 async fn sql(req: Request<Incoming>, state: &Arc<NodeState>, query: &str) -> Response<Full<Bytes>> {
     let format = match ResultFormat::parse(query) {
         Ok(f) => f,
@@ -1074,13 +1285,16 @@ async fn sql(req: Request<Incoming>, state: &Arc<NodeState>, query: &str) -> Res
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
     };
 
-    let Some(ctx) = state.context() else {
+    // Readiness is checked before the body is read so a not-ready node answers
+    // 503 even to an oversized request; execute_statement re-checks for the
+    // front doors that have no body phase.
+    if state.context().is_none() {
         let reason = state
             .load_error()
             .map(|e| format!("tables failed to load: {e}"))
             .unwrap_or_else(|| "tables are still loading".to_string());
         return error_response(StatusCode::SERVICE_UNAVAILABLE, &reason);
-    };
+    }
 
     let body = match Limited::new(req.into_body(), MAX_SQL_BODY_BYTES)
         .collect()
@@ -1102,55 +1316,31 @@ async fn sql(req: Request<Incoming>, state: &Arc<NodeState>, query: &str) -> Res
         return error_response(StatusCode::BAD_REQUEST, "empty SQL body");
     }
 
-    state.queries_total.fetch_add(1, Ordering::Relaxed);
-    let started = Instant::now();
+    let outcome = execute_statement(state, &statement, mode).await;
 
-    // Decide local vs distributed BEFORE any fan-out, and only ever fall back
-    // for a capability reason. A fallback triggered by an execution failure
-    // would hide a broken cluster behind a correct-looking answer.
-    let members = participants(state);
-    let (distribute, fallback_reason) = match mode {
-        DistMode::Off => (false, Some("distributed=0 requested".to_string())),
-        DistMode::Force => (true, None),
-        DistMode::Auto => {
-            if members.len() < 2 {
-                (false, Some("only one cluster member is up".to_string()))
-            } else {
-                match crate::distributed::plan_distributed(&ctx, &statement) {
-                    Ok(_) => (true, None),
-                    Err(e) => (false, Some(e.to_string())),
+    match outcome {
+        Ok(ExecOutcome {
+            result,
+            distribution,
+            fallback_reason,
+            elapsed_ms,
+        }) => {
+            let rows = result.row_count;
+            let bytes = match encode(&result, format) {
+                Ok(b) => b,
+                Err(e) => {
+                    state.queries_failed.fetch_add(1, Ordering::Relaxed);
+                    let status = if matches!(e, QueryError::NotImplemented(_)) {
+                        StatusCode::NOT_IMPLEMENTED
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    };
+                    let mut resp = error_response(status, &e.to_string());
+                    resp.headers_mut()
+                        .insert("x-qe-distributed", "false".parse().expect("ascii"));
+                    return resp;
                 }
-            }
-        }
-    };
-
-    // Off the HTTP runtime — see the module docs.
-    let joined = query_runtime()
-        .spawn(async move {
-            if !distribute {
-                let result = ctx.sql(&statement).await?;
-                let rows = result.row_count;
-                let encoded = encode(&result, format)?;
-                return Ok::<_, QueryError>((encoded, rows, None));
-            }
-            let transport = HttpTransport {
-                timeout: crate::distributed::coordinator::DEFAULT_FRAGMENT_TIMEOUT,
             };
-            // Auto mode only reaches here when the exact scatter-gather plan
-            // succeeded, so this takes the scatter path; distributed=1 also
-            // covers every other SELECT via the gather path.
-            let out =
-                crate::distributed::execute_any_distributed(&ctx, &statement, &members, &transport)
-                    .await?;
-            let rows = out.result.row_count;
-            let encoded = encode(&out.result, format)?;
-            Ok((encoded, rows, Some(out.distribution)))
-        })
-        .await;
-
-    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-    match joined {
-        Ok(Ok((bytes, rows, distribution))) => {
             let mut resp = raw_response(StatusCode::OK, format.content_type(), bytes);
             let h = resp.headers_mut();
             h.insert("x-qe-rows", rows.to_string().parse().expect("numeric"));
@@ -1198,8 +1388,10 @@ async fn sql(req: Request<Incoming>, state: &Arc<NodeState>, query: &str) -> Res
             }
             resp
         }
-        Ok(Err(e)) => {
-            state.queries_failed.fetch_add(1, Ordering::Relaxed);
+        Err(ExecError::NotReady(reason)) => {
+            error_response(StatusCode::SERVICE_UNAVAILABLE, &reason)
+        }
+        Err(ExecError::Query(e)) => {
             let status = if matches!(e, QueryError::NotImplemented(_)) {
                 StatusCode::NOT_IMPLEMENTED
             } else {
@@ -1210,13 +1402,10 @@ async fn sql(req: Request<Incoming>, state: &Arc<NodeState>, query: &str) -> Res
                 .insert("x-qe-distributed", "false".parse().expect("ascii"));
             resp
         }
-        Err(e) => {
-            state.queries_failed.fetch_add(1, Ordering::Relaxed);
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("query task failed: {e}"),
-            )
-        }
+        Err(ExecError::TaskFailed(e)) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("query task failed: {e}"),
+        ),
     }
 }
 

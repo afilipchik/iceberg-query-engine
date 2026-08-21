@@ -117,6 +117,17 @@ The partial/final aggregate split already exists: `AccumulatorState` is a closed
 
 **Graft 2 — Flight semantics, not the Flight crate (from Design C).** VERIFIED in `Cargo.lock`: `arrow-ipc 53.4.1` (:290), `hyper 1.11.0` (:2662), `prost 0.13.5` (:4286), `dashmap 6.1.0` (:1461), `parking_lot 0.12.5` (:4026) are all present; **`tonic` and `arrow-flight` are not**. The arrow-53 pin is deliberate (Lance requires it), and a transport that forces an arrow bump is an instant single-node regression risk. We own the `ShuffleTransport` trait and implement Flight's *semantics* (Arrow IPC bodies, ticket/mailbox descriptors, DoGet-shaped pull RPCs) over hyper. Note `bincode` is **not** in the lock; use `serde` + `prost` or add `bincode` explicitly.
 
+> **AMENDMENT 2026-08-21 (arrow-flight-rpc epic).** The ruling above is
+> UNCHANGED for the internal transport: `/fragment` and gather still run on
+> hyper + arrow-ipc, and nodes never dial each other over gRPC. What changed:
+> `arrow-flight = "53"` + `tonic 0.12` were added for the CLIENT-FACING
+> endpoint (`serve --flight-bind`, `src/distributed/flight.rs`). The risk this
+> ruling guarded against — a forced arrow-major bump breaking the Lance pin —
+> was shown void for the 53.x line: the Cargo.lock diff on addition was
+> verified ADD-ONLY (arrow stayed 53.4.1, prost stayed 0.13.5; ten new
+> entries, zero moved). See `.claude/epics/arrow-flight-rpc/`.
+
+
 **Graft 3 — replica-group routing promoted to P1 (from Design B).** Justified entirely by Section 0. Design A placed it at Phase 7; the measured data says it is the largest win available and it doubles as the experimental control.
 
 ### 1.4 What was rejected
@@ -130,6 +141,7 @@ The partial/final aggregate split already exists: `AccumulatorState` is a closed
 | Pinot broker scatter/gather | Cannot do a distributed join without building this exchange machinery anyway. |
 | ClickHouse two-phase-only | Cannot express multi-shuffle plans (Q09). |
 | `arrow-flight` / `tonic` | Absent from the lock; risks the arrow-53 Lance pin. |
+
 | Speculative duplicate execution | Needs idempotent re-execution over materialized inputs; doubles peak memory. The token/sequence buffer covers the dominant failure class far more cheaply. |
 | DataFusion `preserve_order` repartition | Allocates `N_in x N_out` channels — over a network, `N^2` streams. |
 | All approximation-for-scale knobs | Pinot `numGroupsLimit`, `maxRowsInJoin`/`JoinOverFlowMode`, leaf-local group trim, ClickHouse `distributed_group_by_no_merge` / `distributed_product_mode=allow`, Trino `LowMemoryKiller`. Cell-exactness vs DuckDB is what makes every number here trustworthy. We take Trino's accounting and observability and leave the killer. |

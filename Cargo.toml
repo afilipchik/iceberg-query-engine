@@ -93,6 +93,20 @@ hyper = { version = "1", default-features = false, features = ["server", "http1"
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 http-body-util = "0.1"
 
+# Arrow Flight endpoint (src/distributed/flight.rs) — AMENDMENT 2026-08-21 to
+# the note above: the "no tonic/arrow-flight" ruling was about the INTERNAL
+# shuffle/fragment transport, which stays on hyper + arrow-ipc. This is the
+# CLIENT-FACING endpoint (`serve --flight-bind`), and arrow-flight tracks
+# arrow majors: the 53.x line builds against exactly the arrow 53 pin Lance
+# requires, so the risk the ruling guarded against does not arise. Verified on
+# addition: the Cargo.lock diff was ADD-ONLY (no existing crate moved). tonic
+# runs its own hyper/h2 stack; our direct hyper dependency keeps http1-only.
+arrow-flight = "53"
+tonic = "0.12"
+# TcpListenerStream for the flight server's incoming socket stream. Already in
+# the lock as tonic's own dependency, so naming it adds no lock entries.
+tokio-stream = { version = "0.1", features = ["net"] }
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 rustyline = { version = "14", features = ["with-fuzzy"] }

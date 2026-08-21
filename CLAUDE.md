@@ -789,6 +789,44 @@ fixed before M3 (shuffle).
 | `POST /sql` | Body is the statement. `?format=arrow (default)|json|csv`; `?distributed=auto (default)|1|0`. Headers report `x-qe-distributed`, `x-qe-distribution` (full JSON), `x-qe-imbalance`, `x-qe-shards`. |
 | `POST /fragment` | One shard of a distributed query (internal). Digest-checked. |
 
+**Arrow Flight endpoint (2026-08-21, `src/distributed/flight.rs`).** `serve`
+also runs an Arrow Flight gRPC server: `--flight-bind <addr>` (default = HTTP
+port + 1, ephemeral when HTTP binds `:0`, `none` disables). Both front doors
+run the SAME `execute_statement` path extracted from the HTTP handler, so
+Flight can never disagree with `/sql` about when a query distributes.
+
+| Flight RPC | Meaning |
+|------------|---------|
+| `ListFlights` | One `FlightInfo` per registered table (path descriptor + schema, no endpoints). |
+| `GetSchema` | Path descriptor = table schema; cmd descriptor = query result schema, PLAN-ONLY (`physical_plan()`, no execution). |
+| `GetFlightInfo` | cmd = raw SQL bytes, or JSON `{"sql", "mode": "auto|force|off"}`. Plans, returns schema + ONE endpoint with a stateless v1 JSON ticket `{"v":1,"sql","mode"}` (1MB cap, same as `MAX_SQL_BODY_BYTES`) and EMPTY locations (= fetch from this connection, per spec). |
+| `DoGet` | Validates the ticket, executes via `execute_statement`, streams schema + batches + a trailing ZERO-ROW batch whose `app_metadata` is the execution JSON (`rows`, `elapsed_ms`, `distributed`, `shards`, `imbalance`, `skipped_reason`, full `distribution`) — the `x-qe-*` header analogue. |
+| `DoAction("cluster")` | The `GET /cluster` JSON, byte-identical (`cluster_view()` shared). |
+| everything else | `Status::unimplemented`, naming the RPC. |
+
+Load-bearing details:
+- **Error mapping** (`query_error_status`): Parse/Bind/Type/Plan →
+  `InvalidArgument`; TableNotFound/ColumnNotFound → `NotFound`;
+  NotImplemented → `Unimplemented`; tables-not-loaded → `Unavailable`;
+  rest → `Internal`. Message = the engine's error Display, verbatim.
+- **The metadata trailer is a zero-row RecordBatch, not a metadata-only
+  message, and that is not optional**: arrow-rs 53's `FlightDataDecoder`
+  refuses an empty `data_header` while Arrow C++/pyarrow refuses a NONE-typed
+  one — a zero-row batch is the only shape both families decode. DoGet
+  hand-encodes with `IpcDataGenerator` (batches re-sliced to <=4096 rows for
+  gRPC's 4MB default frame limit) instead of `FlightDataEncoderBuilder`.
+- **Membership gossips flight addresses**: `/healthz` carries the node's
+  advertised flight address, the prober records it, and `/cluster` +
+  `DoAction("cluster")` list it per member. Nodes never dial each other's
+  Flight ports — internal traffic stays on the hyper transport ("Flight
+  semantics, not the Flight crate" holds for the interior; arrow-flight 53
+  was added for the client edge only, with an ADD-ONLY Cargo.lock diff).
+- Gates: `tests/flight_tests.rs` (8 in-process tests incl. a 3-node real-TCP
+  scatter through Flight) and `scripts/flight_validate.py` (pyarrow; all 22
+  TPC-H Flight==HTTP at SF=0.01/0.1 single-node and per-node on a 3-process
+  cluster; `--quick` runs inside `cluster_local.sh verify` as step 4/5).
+  Cluster harness flight ports live at BASE_PORT+100+i.
+
 **Execution paths under `distributed=1`** (`src/distributed/`):
 
 * **Scatter (M2, `plan.rs`+`coordinator.rs`)** — single-table scans/filters/
@@ -1895,6 +1933,9 @@ category precision@10 = 1.000.
 | Streaming Parquet reader | `src/storage/parquet.rs` (StreamingParquetReader) |
 | Async Parquet reader | `src/storage/parquet.rs` (AsyncParquetReader) |
 | Server mode (`serve`) | `src/distributed/server.rs` |
+| Arrow Flight endpoint | `src/distributed/flight.rs` |
+| Flight integration tests | `tests/flight_tests.rs` |
+| Flight acceptance gate (pyarrow) | `scripts/flight_validate.py` |
 | Peer discovery / membership | `src/distributed/membership.rs` |
 | M1 cluster tests | `tests/distributed_cluster.rs` |
 | Local N-process cluster harness | `scripts/cluster_local.sh` |
