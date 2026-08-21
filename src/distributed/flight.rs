@@ -29,23 +29,120 @@ use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use arrow::ipc::writer::IpcWriteOptions;
+use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::{
-    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
+    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaAsIpc, SchemaResult, Ticket,
 };
 use futures::StreamExt;
+use hyper::body::Bytes;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::error::QueryError;
 
-use super::server::NodeState;
+use super::server::{execute_statement, DistMode, ExecError, ExecOutcome, NodeState};
 
 /// SQL statements and tickets share the HTTP body cap: a ticket is a statement
 /// plus a few fixed fields, and an unbounded ticket is an unbounded allocation.
 pub(crate) const MAX_TICKET_BYTES: usize = 1024 * 1024;
+
+/// The self-contained `DoGet` ticket. Stateless on purpose: any node that can
+/// serve `/sql` can serve any ticket it (or a peer) minted — no server-side
+/// query registry, no expiry machinery, and a node crash between
+/// `GetFlightInfo` and `DoGet` costs the client one retry, not a session.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct QueryTicket {
+    v: u32,
+    sql: String,
+    #[serde(default = "default_mode")]
+    mode: String,
+}
+
+fn default_mode() -> String {
+    "auto".to_string()
+}
+
+/// `distributed=` values, shared vocabulary with the HTTP query string.
+fn parse_mode(mode: &str) -> Result<DistMode, Status> {
+    match mode {
+        "auto" => Ok(DistMode::Auto),
+        "1" | "true" | "yes" | "force" => Ok(DistMode::Force),
+        "0" | "false" | "no" | "local" | "off" => Ok(DistMode::Off),
+        other => Err(Status::invalid_argument(format!(
+            "unknown distributed mode {other:?}; expected auto, force or off"
+        ))),
+    }
+}
+
+/// A command descriptor is either raw SQL bytes, or — when it starts with
+/// `{` — a JSON object `{"sql": "...", "mode": "auto|force|off"}` for clients
+/// that need to pick the distribution mode.
+fn parse_command(cmd: &[u8]) -> Result<(String, String), Status> {
+    if cmd.len() > MAX_TICKET_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "command exceeds {MAX_TICKET_BYTES} bytes"
+        )));
+    }
+    let text = std::str::from_utf8(cmd)
+        .map_err(|_| Status::invalid_argument("command is not valid UTF-8"))?
+        .trim();
+    if text.is_empty() {
+        return Err(Status::invalid_argument("empty command"));
+    }
+    if text.starts_with('{') {
+        #[derive(serde::Deserialize)]
+        struct Cmd {
+            sql: String,
+            #[serde(default = "default_mode")]
+            mode: String,
+        }
+        let c: Cmd = serde_json::from_str(text)
+            .map_err(|e| Status::invalid_argument(format!("malformed command JSON: {e}")))?;
+        let sql = c.sql.trim().to_string();
+        if sql.is_empty() {
+            return Err(Status::invalid_argument("empty sql in command JSON"));
+        }
+        parse_mode(&c.mode)?;
+        Ok((sql, c.mode))
+    } else {
+        Ok((text.to_string(), default_mode()))
+    }
+}
+
+/// Execution metadata, the Flight analogue of the `x-qe-*` response headers.
+/// Sent as a trailing metadata-only `FlightData` (no IPC header, only
+/// `app_metadata`), which Arrow clients surface as a data-less chunk after the
+/// last batch.
+fn outcome_metadata(outcome: &ExecOutcome) -> serde_json::Value {
+    let mut m = serde_json::json!({
+        "rows": outcome.result.row_count,
+        "elapsed_ms": outcome.elapsed_ms,
+        "distributed": outcome.distribution.is_some(),
+    });
+    if let Some(d) = &outcome.distribution {
+        m["shards"] = serde_json::json!(d.nodes.len());
+        m["imbalance"] = serde_json::json!(d.imbalance);
+        m["wall_time_spread"] = serde_json::json!(d.wall_time_spread);
+        if let Ok(full) = serde_json::to_value(d) {
+            m["distribution"] = full;
+        }
+    }
+    if let Some(reason) = &outcome.fallback_reason {
+        m["skipped_reason"] = serde_json::json!(reason);
+    }
+    m
+}
+
+fn exec_error_status(e: ExecError) -> Status {
+    match e {
+        ExecError::NotReady(reason) => Status::unavailable(reason),
+        ExecError::Query(e) => query_error_status(&e),
+        ExecError::TaskFailed(e) => Status::internal(format!("query task failed: {e}")),
+    }
+}
 
 /// The Flight front door. Cheap to clone; state is shared with the HTTP server.
 #[derive(Clone)]
@@ -137,9 +234,44 @@ impl FlightService for QeFlightService {
 
     async fn get_flight_info(
         &self,
-        _request: Request<FlightDescriptor>,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        Err(Status::unimplemented("GetFlightInfo"))
+        let descriptor = request.into_inner();
+        if descriptor.cmd.is_empty() {
+            return Err(Status::invalid_argument(
+                "GetFlightInfo needs a command descriptor carrying SQL",
+            ));
+        }
+        let (sql, mode) = parse_command(&descriptor.cmd)?;
+        let ctx = self.context()?;
+
+        // Plan only — the query runs in DoGet. Planning is what validates the
+        // SQL and yields the result schema; a plan that fails here fails with
+        // the same status DoGet would have produced.
+        let schema = ctx
+            .physical_plan(&sql)
+            .map_err(|e| query_error_status(&e))?
+            .schema();
+
+        let ticket = QueryTicket { v: 1, sql, mode };
+        let ticket_bytes =
+            serde_json::to_vec(&ticket).map_err(|e| Status::internal(e.to_string()))?;
+
+        // One endpoint, no locations: per the Flight spec an empty location
+        // list means "fetch from the service you are talking to", which is
+        // exactly the contract — this node coordinates scatter/gather
+        // internally. (An advertised address here would break clients that
+        // cannot resolve the cluster-internal hostname.)
+        let endpoint = FlightEndpoint::new().with_ticket(Ticket::new(ticket_bytes));
+        let info = FlightInfo::new()
+            .try_with_schema(&schema)
+            .map_err(|e| Status::internal(format!("cannot encode schema: {e}")))?
+            .with_descriptor(descriptor)
+            .with_endpoint(endpoint)
+            .with_app_metadata(Bytes::from(
+                serde_json::json!({"node_id": self.state.node_id}).to_string(),
+            ));
+        Ok(Response::new(info))
     }
 
     async fn poll_flight_info(
@@ -162,16 +294,70 @@ impl FlightService for QeFlightService {
                 .ok_or_else(|| Status::not_found(format!("no such table: {name}")))?;
             return Ok(Response::new(schema_to_result(&schema)?));
         }
+        // Command descriptor: the result schema of the SQL, plan-only.
+        if !descriptor.cmd.is_empty() {
+            let (sql, _mode) = parse_command(&descriptor.cmd)?;
+            let schema = ctx
+                .physical_plan(&sql)
+                .map_err(|e| query_error_status(&e))?
+                .schema();
+            return Ok(Response::new(schema_to_result(&schema)?));
+        }
         Err(Status::invalid_argument(
-            "GetSchema needs a path descriptor naming a table",
+            "GetSchema needs a path descriptor naming a table or a command descriptor carrying SQL",
         ))
     }
 
     async fn do_get(
         &self,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        Err(Status::unimplemented("DoGet"))
+        let ticket = request.into_inner().ticket;
+        if ticket.len() > MAX_TICKET_BYTES {
+            return Err(Status::invalid_argument(format!(
+                "ticket exceeds {MAX_TICKET_BYTES} bytes"
+            )));
+        }
+        let ticket: QueryTicket = serde_json::from_slice(&ticket)
+            .map_err(|e| Status::invalid_argument(format!("malformed ticket: {e}")))?;
+        if ticket.v != 1 {
+            return Err(Status::invalid_argument(format!(
+                "unknown ticket version {}",
+                ticket.v
+            )));
+        }
+        let mode = parse_mode(&ticket.mode)?;
+
+        let outcome = execute_statement(&self.state, &ticket.sql, mode)
+            .await
+            .map_err(exec_error_status)?;
+
+        let metadata = Bytes::from(outcome_metadata(&outcome).to_string());
+
+        // Same schema convention as the HTTP encoder: be governed by the data
+        // when there is any, by the plan's description only when there is none.
+        let schema = outcome
+            .result
+            .batches
+            .first()
+            .map(|b| b.schema())
+            .unwrap_or_else(|| outcome.result.schema.clone());
+        let batches = outcome.result.batches;
+
+        let encoded = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(futures::stream::iter(batches.into_iter().map(Ok)))
+            .map(|r| r.map_err(|e| Status::internal(format!("flight encoding failed: {e}"))));
+
+        // Trailing metadata-only message — the Flight analogue of the x-qe-*
+        // headers, after the data so it can carry execution facts.
+        let trailer = futures::stream::once(async move {
+            Ok(FlightData {
+                app_metadata: metadata,
+                ..Default::default()
+            })
+        });
+        Ok(Response::new(encoded.chain(trailer).boxed()))
     }
 
     async fn do_put(
