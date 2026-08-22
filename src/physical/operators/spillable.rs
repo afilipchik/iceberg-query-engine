@@ -24,7 +24,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use std::fmt;
 use std::fs::File;
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

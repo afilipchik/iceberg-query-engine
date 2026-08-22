@@ -33,9 +33,7 @@
 //! `QE_COMPILE=0` disables compilation everywhere (the established
 //! diagnostic-switch pattern): consumers ask [`compilation_enabled`].
 
-use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array,
-};
+use arrow::array::{Array, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 

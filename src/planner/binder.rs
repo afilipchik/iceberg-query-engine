@@ -108,7 +108,10 @@ fn is_distinct_expr(a: Expr, b: Expr, negated: bool) -> Expr {
 /// expressions; v1 does not, and says so).
 fn frame_offset(e: &ast::Expr) -> Result<u64> {
     match e {
-        ast::Expr::Value(ast::Value::Number(n, _)) => n.parse::<u64>().map_err(|_| {
+        ast::Expr::Value(ast::ValueWithSpan {
+            value: ast::Value::Number(n, _),
+            ..
+        }) => n.parse::<u64>().map_err(|_| {
             QueryError::Bind(format!(
                 "frame offset must be a non-negative integer, got {n}"
             ))
@@ -202,8 +205,14 @@ impl<'a> Binder<'a> {
         // above the LIMIT. See `extend_projection_for_sort`.
         let mut trim_to: Option<PlanSchema> = None;
         if let Some(ref order_by_clause) = query.order_by {
-            if !order_by_clause.exprs.is_empty() {
-                let order_by = self.bind_order_by(&order_by_clause.exprs, &plan.schema())?;
+            let order_exprs: &[ast::OrderByExpr] = match &order_by_clause.kind {
+                ast::OrderByKind::Expressions(exprs) => exprs,
+                ast::OrderByKind::All(_) => {
+                    return Err(QueryError::NotImplemented("ORDER BY ALL".into()))
+                }
+            };
+            if !order_exprs.is_empty() {
+                let order_by = self.bind_order_by(order_exprs, &plan.schema())?;
                 let (extended, trim) = extend_projection_for_sort(plan, &order_by)?;
                 trim_to = trim;
                 plan = LogicalPlan::Sort(SortNode {
@@ -218,16 +227,29 @@ impl<'a> Binder<'a> {
         // The trimming projection is deliberately applied *after* LIMIT: a
         // projection between Sort and Limit would break the physical planner's
         // Sort+Limit fusion and turn a top-k into a full sort.
-        if query.limit.is_some() || query.offset.is_some() {
-            let skip = query
-                .offset
-                .as_ref()
+        let (q_limit, q_offset) = match &query.limit_clause {
+            None => (None, None),
+            Some(ast::LimitClause::LimitOffset {
+                limit,
+                offset,
+                limit_by,
+            }) => {
+                if !limit_by.is_empty() {
+                    return Err(QueryError::NotImplemented("LIMIT ... BY".into()));
+                }
+                (limit.as_ref(), offset.as_ref())
+            }
+            Some(other) => {
+                return Err(QueryError::NotImplemented(format!(
+                    "this LIMIT form ({other:?})"
+                )))
+            }
+        };
+        if q_limit.is_some() || q_offset.is_some() {
+            let skip = q_offset
                 .and_then(|o| self.expr_to_usize(&o.value).ok())
                 .unwrap_or(0);
-            let fetch = query
-                .limit
-                .as_ref()
-                .and_then(|l| self.expr_to_usize(l).ok());
+            let fetch = q_limit.and_then(|l| self.expr_to_usize(l).ok());
 
             plan = LogicalPlan::Limit(LimitNode {
                 input: Arc::new(plan),
@@ -284,6 +306,9 @@ impl<'a> Binder<'a> {
                 let right_plan = self.bind_set_expr(right)?;
 
                 match op {
+                    ast::SetOperator::Minus => {
+                        return Err(QueryError::NotImplemented("MINUS (use EXCEPT)".to_string()))
+                    }
                     ast::SetOperator::Union => {
                         let schema = left_plan.schema();
                         // UNION ALL keeps duplicates, plain UNION removes them
@@ -618,6 +643,11 @@ impl<'a> Binder<'a> {
                 ast::Distinct::On(_) => {
                     return Err(QueryError::NotImplemented(
                         "DISTINCT ON not supported".to_string(),
+                    ));
+                }
+                ast::Distinct::All => {
+                    return Err(QueryError::NotImplemented(
+                        "DISTINCT ALL not supported".to_string(),
                     ));
                 }
             }
@@ -1161,11 +1191,11 @@ impl<'a> Binder<'a> {
         join: &ast::Join,
     ) -> Result<LogicalPlan> {
         let join_type = match &join.join_operator {
-            ast::JoinOperator::Inner(_) => JoinType::Inner,
-            ast::JoinOperator::LeftOuter(_) => JoinType::Left,
-            ast::JoinOperator::RightOuter(_) => JoinType::Right,
+            ast::JoinOperator::Join(_) | ast::JoinOperator::Inner(_) => JoinType::Inner,
+            ast::JoinOperator::Left(_) | ast::JoinOperator::LeftOuter(_) => JoinType::Left,
+            ast::JoinOperator::Right(_) | ast::JoinOperator::RightOuter(_) => JoinType::Right,
             ast::JoinOperator::FullOuter(_) => JoinType::Full,
-            ast::JoinOperator::CrossJoin => JoinType::Cross,
+            ast::JoinOperator::CrossJoin(_) => JoinType::Cross,
             ast::JoinOperator::LeftSemi(_) => JoinType::Semi,
             ast::JoinOperator::LeftAnti(_) => JoinType::Anti,
             _ => {
@@ -1181,7 +1211,10 @@ impl<'a> Binder<'a> {
         let combined_schema = left_schema.merge(&right_schema);
 
         let (on, filter) = match &join.join_operator {
-            ast::JoinOperator::Inner(constraint)
+            ast::JoinOperator::Join(constraint)
+            | ast::JoinOperator::Inner(constraint)
+            | ast::JoinOperator::Left(constraint)
+            | ast::JoinOperator::Right(constraint)
             | ast::JoinOperator::LeftOuter(constraint)
             | ast::JoinOperator::RightOuter(constraint)
             | ast::JoinOperator::FullOuter(constraint)
@@ -1189,7 +1222,7 @@ impl<'a> Binder<'a> {
             | ast::JoinOperator::LeftAnti(constraint) => {
                 self.bind_join_constraint(constraint, &combined_schema)?
             }
-            ast::JoinOperator::CrossJoin => (vec![], None),
+            ast::JoinOperator::CrossJoin(_) => (vec![], None),
             _ => (vec![], None),
         };
 
@@ -1226,7 +1259,10 @@ impl<'a> Binder<'a> {
                 let on: Vec<(Expr, Expr)> = cols
                     .iter()
                     .map(|col| {
-                        let name = &col.value;
+                        let name = &match col.0.first() {
+                            Some(ast::ObjectNamePart::Identifier(i)) => i.value.clone(),
+                            _ => col.to_string(),
+                        };
                         (Expr::column(name.clone()), Expr::column(name.clone()))
                     })
                     .collect();
@@ -1326,7 +1362,10 @@ impl<'a> Binder<'a> {
                     }
                 }
                 SelectItem::QualifiedWildcard(name, _) => {
-                    let table_name = name.table_name();
+                    let table_name = match name {
+                        ast::SelectItemQualifiedWildcardKind::ObjectName(o) => o.table_name(),
+                        other => other.to_string(),
+                    };
                     for field in schema.fields() {
                         if field.relation.as_deref() == Some(&table_name) {
                             exprs.push(Expr::Column(Column {
@@ -1336,6 +1375,11 @@ impl<'a> Binder<'a> {
                             fields.push(field.clone());
                         }
                     }
+                }
+                SelectItem::ExprWithAliases { .. } => {
+                    return Err(QueryError::NotImplemented(
+                        "multi-alias SELECT items".into(),
+                    ));
                 }
             }
         }
@@ -1400,7 +1444,10 @@ impl<'a> Binder<'a> {
                     }
                 }
                 SelectItem::QualifiedWildcard(name, _) => {
-                    let table_name = name.table_name();
+                    let table_name = match name {
+                        ast::SelectItemQualifiedWildcardKind::ObjectName(o) => o.table_name(),
+                        other => other.to_string(),
+                    };
                     for field in agg_schema.fields() {
                         if field.relation.as_deref() == Some(&table_name) {
                             exprs.push(Expr::Column(Column {
@@ -1410,6 +1457,11 @@ impl<'a> Binder<'a> {
                             fields.push(field.clone());
                         }
                     }
+                }
+                SelectItem::ExprWithAliases { .. } => {
+                    return Err(QueryError::NotImplemented(
+                        "multi-alias SELECT items".into(),
+                    ));
                 }
             }
         }
@@ -1699,7 +1751,11 @@ impl<'a> Binder<'a> {
         // list (standard), never a constant group key.
         if let ast::GroupByExpr::Expressions(exprs, _) = group_by {
             for expr in exprs {
-                if let SqlExpr::Value(ast::Value::Number(n, _)) = expr {
+                if let SqlExpr::Value(ast::ValueWithSpan {
+                    value: ast::Value::Number(n, _),
+                    ..
+                }) = expr
+                {
                     if let Ok(ord) = n.parse::<usize>() {
                         if ord == 0 || ord > projection.len() {
                             return Err(QueryError::Bind(format!(
@@ -1748,6 +1804,11 @@ impl<'a> Binder<'a> {
                         aggregate_aliases.push(Some(alias.value.clone()));
                         has_aggregates = true;
                     }
+                }
+                SelectItem::ExprWithAliases { .. } => {
+                    return Err(QueryError::NotImplemented(
+                        "multi-alias SELECT items".into(),
+                    ));
                 }
                 _ => {}
             }
@@ -1816,7 +1877,10 @@ impl<'a> Binder<'a> {
             .map(|o| {
                 // Handle column number references (e.g., ORDER BY 2)
                 let expr = match &o.expr {
-                    SqlExpr::Value(ast::Value::Number(n, _)) => {
+                    SqlExpr::Value(ast::ValueWithSpan {
+                        value: ast::Value::Number(n, _),
+                        ..
+                    }) => {
                         if let Ok(col_num) = n.parse::<usize>() {
                             if col_num > 0 && col_num <= schema.fields().len() {
                                 // Column numbers are 1-indexed
@@ -1839,12 +1903,12 @@ impl<'a> Binder<'a> {
                 // order by whatever byte-wise comparison the kernel happens to
                 // do. Reject it, naming the column.
                 crate::planner::vector_types::require_scalar(&expr, schema, "ORDER BY")?;
-                let direction = if o.asc.unwrap_or(true) {
+                let direction = if o.options.asc.unwrap_or(true) {
                     SortDirection::Asc
                 } else {
                     SortDirection::Desc
                 };
-                let nulls = match o.nulls_first {
+                let nulls = match o.options.nulls_first {
                     Some(true) => NullOrdering::NullsFirst,
                     Some(false) => NullOrdering::NullsLast,
                     None => NullOrdering::NullsLast,
@@ -2040,8 +2104,8 @@ impl<'a> Binder<'a> {
             SqlExpr::Case {
                 operand,
                 conditions,
-                results,
                 else_result,
+                ..
             } => {
                 let bound_operand = operand
                     .as_ref()
@@ -2051,10 +2115,9 @@ impl<'a> Binder<'a> {
 
                 let when_then: Result<Vec<(Expr, Expr)>> = conditions
                     .iter()
-                    .zip(results.iter())
-                    .map(|(when, then)| {
-                        let bound_when = self.bind_expr(when, schema)?;
-                        let bound_then = self.bind_expr(then, schema)?;
+                    .map(|cw| {
+                        let bound_when = self.bind_expr(&cw.condition, schema)?;
+                        let bound_then = self.bind_expr(&cw.result, schema)?;
                         Ok((bound_when, bound_then))
                     })
                     .collect();
@@ -2240,9 +2303,18 @@ impl<'a> Binder<'a> {
                 }
                 Ok(value)
             }
-            SqlExpr::TypedString { data_type, value } => {
+            SqlExpr::TypedString(ast::TypedString {
+                data_type, value, ..
+            }) => {
                 if data_type == &ast::DataType::Date {
                     // Parse date string
+                    let value = match &value.value {
+                        ast::Value::SingleQuotedString(s) | ast::Value::DoubleQuotedString(s) => {
+                            s.clone()
+                        }
+                        other => other.to_string(),
+                    };
+                    let value = value.as_str();
                     if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
                         let days = date
                             .signed_duration_since(
@@ -2252,7 +2324,7 @@ impl<'a> Binder<'a> {
                         return Ok(Expr::Literal(ScalarValue::Date32(days)));
                     }
                 }
-                Ok(Expr::Literal(ScalarValue::Utf8(value.clone())))
+                Ok(Expr::Literal(ScalarValue::Utf8(value.to_string())))
             }
             SqlExpr::Ceil { expr, .. } => {
                 let arg = self.bind_expr(expr, schema)?;
@@ -2659,6 +2731,11 @@ impl<'a> Binder<'a> {
                     ast::FunctionArgExpr::QualifiedWildcard(name) => {
                         Ok(Expr::QualifiedWildcard(name.to_string()))
                     }
+                    ast::FunctionArgExpr::WildcardWithOptions(_) => {
+                        Err(QueryError::NotImplemented(
+                            "wildcard with options as a function argument".into(),
+                        ))
+                    }
                 },
                 ast::FunctionArg::Named { arg, .. } => match arg {
                     ast::FunctionArgExpr::Expr(e) => self.bind_expr(e, schema),
@@ -2666,7 +2743,15 @@ impl<'a> Binder<'a> {
                     ast::FunctionArgExpr::QualifiedWildcard(name) => {
                         Ok(Expr::QualifiedWildcard(name.to_string()))
                     }
+                    ast::FunctionArgExpr::WildcardWithOptions(_) => {
+                        Err(QueryError::NotImplemented(
+                            "wildcard with options as a function argument".into(),
+                        ))
+                    }
                 },
+                ast::FunctionArg::ExprNamed { .. } => Err(QueryError::NotImplemented(
+                    "expression-named function arguments".into(),
+                )),
             })
             .collect();
         let args = args?;
@@ -3887,7 +3972,7 @@ impl<'a> Binder<'a> {
             ast::DataType::Int(_) | ast::DataType::Integer(_) => Ok(ArrowDataType::Int32),
             ast::DataType::BigInt(_) => Ok(ArrowDataType::Int64),
             ast::DataType::Real => Ok(ArrowDataType::Float32),
-            ast::DataType::Float(_) | ast::DataType::Double | ast::DataType::DoublePrecision => {
+            ast::DataType::Float(_) | ast::DataType::Double(_) | ast::DataType::DoublePrecision => {
                 Ok(ArrowDataType::Float64)
             }
             ast::DataType::Decimal(info) | ast::DataType::Numeric(info) => match info {
@@ -3914,7 +3999,10 @@ impl<'a> Binder<'a> {
 
     fn expr_to_usize(&self, expr: &SqlExpr) -> Result<usize> {
         match expr {
-            SqlExpr::Value(ast::Value::Number(n, _)) => n
+            SqlExpr::Value(ast::ValueWithSpan {
+                value: ast::Value::Number(n, _),
+                ..
+            }) => n
                 .parse::<usize>()
                 .map_err(|_| QueryError::Parse(format!("Cannot parse as usize: {}", n))),
             _ => Err(QueryError::Parse(format!(

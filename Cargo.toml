@@ -16,7 +16,7 @@ resolver = "3"
 
 [dependencies]
 # SQL Parsing
-sqlparser = "0.52"
+sqlparser = "0.62"
 
 # Arrow ecosystem
 arrow = { version = "58", features = ["ffi", "chrono-tz", "prettyprint"] }
@@ -77,7 +77,7 @@ rust-stemmers = "1.2"
 reqwest = { version = "0.13", features = ["json"] }
 
 # Avro, for Iceberg manifest lists and manifest files (src/storage/iceberg.rs).
-# Arrow-independent: this cannot move the arrow-53 pin the Lance feature needs.
+# Arrow-independent: this cannot move the arrow-58 pin the Lance feature needs.
 # Default features only — Iceberg manifests use the null and deflate codecs,
 # both supported without optional codec features.
 apache-avro = "0.22"
@@ -85,7 +85,7 @@ apache-avro = "0.22"
 # HTTP server for `query_engine serve` (src/distributed/). Deliberately hyper +
 # arrow-ipc rather than tonic/arrow-flight: all three crates below are ALREADY
 # in Cargo.lock (pulled in under `--features lance` via object_store/aws-sdk),
-# so naming them here adds ZERO new lock entries and cannot move the arrow-53
+# so naming them here adds ZERO new lock entries and cannot move the arrow-58
 # pin that Lance requires. `http1`+`server` only — the `http2` feature would
 # pull h2 into the default build for no benefit. See
 # .claude/plans/DISTRIBUTED-DESIGN.md "Flight semantics, not the Flight crate".
@@ -97,10 +97,11 @@ http-body-util = "0.1"
 # the note above: the "no tonic/arrow-flight" ruling was about the INTERNAL
 # shuffle/fragment transport, which stays on hyper + arrow-ipc. This is the
 # CLIENT-FACING endpoint (`serve --flight-bind`), and arrow-flight tracks
-# arrow majors: the 53.x line builds against exactly the arrow 53 pin Lance
+# arrow majors: the 58.x line builds against exactly the arrow 58 pin Lance
 # requires, so the risk the ruling guarded against does not arise. Verified on
-# addition: the Cargo.lock diff was ADD-ONLY (no existing crate moved). tonic
-# runs its own hyper/h2 stack; our direct hyper dependency keeps http1-only.
+# addition (at arrow 53): the Cargo.lock diff was ADD-ONLY (no existing crate
+# moved); moved to 58 with the whole cluster in the 2026-08-22 dependency
+# epic. tonic runs its own hyper/h2 stack; our direct hyper stays http1-only.
 arrow-flight = "58"
 tonic = "0.14"
 # TcpListenerStream for the flight server's incoming socket stream. Already in
@@ -119,14 +120,16 @@ mimalloc = "0.1.52"
 memmap2 = "0.9.11"
 
 # Lance columnar format (OPTIONAL — see [features] below).
-# Pinned to 0.23.x on purpose: 0.23 is the last line that builds against
-# arrow 53, the same arrow major this engine uses, so Lance's RecordBatch IS
-# our RecordBatch and no IPC/FFI bridge is needed. lance 0.25+/10.x require
-# arrow 54/55/58 and would fork the arrow version in-tree. Do not bump.
+# lance and arrow move TOGETHER: lance 10 builds against arrow 58, the same
+# arrow major this engine uses, so Lance's RecordBatch IS our RecordBatch and
+# no IPC/FFI bridge is needed. (Historically pinned lance 0.23 <-> arrow 53;
+# both moved atomically in the 2026-08-22 dependency epic.) An arrow-59 move
+# waits for a lance line built against 59 — bumping either alone forks arrow
+# in-tree.
 # Building this feature also needs `protoc` on PATH or in $PROTOC
 # (lance-table's build script compiles .proto files).
 lance = { version = "10", default-features = false, optional = true }
-# Already in the tree as transitive dependencies of lance 0.23.2 — naming them
+# Already in the tree as transitive dependencies of lance 10 — naming them
 # here adds no compilation, only the direct import paths the WRITE path needs:
 # `DatasetIndexExt`/`IndexType` for create_index, and `MetricType` for the
 # index's distance function. lance re-exports neither. Same pin, same reason.
@@ -136,10 +139,11 @@ lance-linalg = { version = "10", optional = true }
 # Apache Pulsar integration (OPTIONAL — see [features]). Topics-as-tables:
 # the admin REST API is the catalog (discovery, schema registry, bounded-read
 # watermarks) and the WebSocket reader API delivers the messages. The native
-# pulsar-rs client was REJECTED: 6.8 requires chrono >= 0.4.41, which is
-# incompatible with the arrow-53 pin (newer chrono breaks arrow-arith 53.x) —
-# the resolver downgraded arrow chasing it. tungstenite is a small sync
-# WebSocket client whose tree stays inside the existing lock families.
+# pulsar-rs client was REJECTED at adoption time: it required chrono >= 0.4.41,
+# which conflicted with the then-current arrow-53 pin. That conflict is gone
+# (chrono is 0.4.45 under arrow 58), but the ruling stands on size: tungstenite
+# is a small sync WebSocket client whose tree stays inside the existing lock
+# families, and the REST+WebSocket pair covers everything the feature needs.
 tungstenite = { version = "0.30", optional = true, default-features = false, features = [
     "handshake",
 ] }

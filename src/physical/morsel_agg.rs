@@ -18,7 +18,7 @@ use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use hashbrown::HashMap;
 use rayon::prelude::*;
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -2358,11 +2358,11 @@ impl AggregationState {
             (0..p).map(|_| Vec::new()).collect();
         let mut push = |key: GroupKey, accs: Vec<AccumulatorState>| {
             // EXPLICITLY seeded: partition routing must give the same answer for
-        // the same key from every call site. hashbrown 0.14's default hasher
-        // happened to be deterministic across instances (ahash with fixed
-        // fallback keys); 0.17's foldhash seeds PER INSTANCE, which shattered
-        // groups across partitions. Never rely on a default for this.
-        let mut hasher = xxhash_rust::xxh64::Xxh64::new(0x517c_c1b7_2722_0a95);
+            // the same key from every call site. hashbrown 0.14's default hasher
+            // happened to be deterministic across instances (ahash with fixed
+            // fallback keys); 0.17's foldhash seeds PER INSTANCE, which shattered
+            // groups across partitions. Never rely on a default for this.
+            let mut hasher = xxhash_rust::xxh64::Xxh64::new(0x517c_c1b7_2722_0a95);
             key.hash(&mut hasher);
             shards[(hasher.finish() as usize) % p].push((key, accs));
         };
