@@ -2903,7 +2903,7 @@ fn evaluate_scalar_func(
                         opt.map(|s| {
                             let mut hasher = Md5::new();
                             hasher.update(s.as_bytes());
-                            format!("{:x}", hasher.finalize())
+                            hex::encode(hasher.finalize())
                         })
                     })
                     .collect();
@@ -2925,7 +2925,7 @@ fn evaluate_scalar_func(
                         opt.map(|s| {
                             let mut hasher = Sha1::new();
                             hasher.update(s.as_bytes());
-                            format!("{:x}", hasher.finalize())
+                            hex::encode(hasher.finalize())
                         })
                     })
                     .collect();
@@ -2947,7 +2947,7 @@ fn evaluate_scalar_func(
                         opt.map(|s| {
                             let mut hasher = Sha256::new();
                             hasher.update(s.as_bytes());
-                            format!("{:x}", hasher.finalize())
+                            hex::encode(hasher.finalize())
                         })
                     })
                     .collect();
@@ -2969,7 +2969,7 @@ fn evaluate_scalar_func(
                         opt.map(|s| {
                             let mut hasher = Sha512::new();
                             hasher.update(s.as_bytes());
-                            format!("{:x}", hasher.finalize())
+                            hex::encode(hasher.finalize())
                         })
                     })
                     .collect();
@@ -4867,7 +4867,7 @@ fn evaluate_scalar_func(
         | ScalarFunction::HmacSha1
         | ScalarFunction::HmacSha256
         | ScalarFunction::HmacSha512 => {
-            use hmac::{Hmac, Mac};
+            use hmac::{Hmac, KeyInit, Mac};
 
             if evaluated_args.len() < 2 {
                 return Err(QueryError::InvalidArgument(

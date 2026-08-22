@@ -2084,7 +2084,12 @@ fn partition_batch_by_hash(
 
     for row in 0..batch.num_rows() {
         let key = extract_join_key(&key_arrays, row);
-        let mut hasher = hashbrown::hash_map::DefaultHashBuilder::default().build_hasher();
+        // EXPLICITLY seeded: partition routing must give the same answer for
+        // the same key from every call site. hashbrown 0.14's default hasher
+        // happened to be deterministic across instances (ahash with fixed
+        // fallback keys); 0.17's foldhash seeds PER INSTANCE, which shattered
+        // groups across partitions. Never rely on a default for this.
+        let mut hasher = xxhash_rust::xxh64::Xxh64::new(0x517c_c1b7_2722_0a95);
         key.hash(&mut hasher);
         let partition = (hasher.finish() as usize) % num_partitions;
         partition_indices[partition].push(row);

@@ -37,7 +37,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Error handling
-thiserror = "1.0"
+thiserror = "2"
 anyhow = "1"
 
 # Concurrency
@@ -48,39 +48,39 @@ num_cpus = "1.16"
 # Utilities
 chrono = "0.4"
 rust_decimal = { version = "1", features = ["serde"] }
-ordered-float = "4"
-hashbrown = "0.14"
+ordered-float = "5"
+hashbrown = "0.17"
 parking_lot = "0.12"
 rayon = "1"
 num-traits = "0.2"
-itertools = "0.13"
-rand = "0.8"
+itertools = "0.15"
+rand = "0.8"  # HELD BACK: rand 0.9+ changed sampling algorithms; the TPC-H generator must stay byte-deterministic (data<->CSV/fixture coupling)
 bytes = "1"
 regex = "1"
-base64 = "0.21"
+base64 = "0.23"
 data-encoding = "2"
-md-5 = "0.10"
-sha1 = "0.10"
-sha2 = "0.10"
+md-5 = "0.11"
+sha1 = "0.11"
+sha2 = "0.11"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 hex = "0.4"
 percent-encoding = "2"
 crc32fast = "1"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
-hmac = "0.12"
+hmac = "0.13"
 unicode-normalization = "0.1"
-statrs = "0.17"
+statrs = "0.19"
 rust-stemmers = "1.2"
 
 # HTTP Client (for metastore)
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 
 # Avro, for Iceberg manifest lists and manifest files (src/storage/iceberg.rs).
 # Arrow-independent: this cannot move the arrow-53 pin the Lance feature needs.
 # Default features only — Iceberg manifests use the null and deflate codecs,
 # both supported without optional codec features.
-apache-avro = "0.17"
+apache-avro = "0.22"
 
 # HTTP server for `query_engine serve` (src/distributed/). Deliberately hyper +
 # arrow-ipc rather than tonic/arrow-flight: all three crates below are ALREADY
@@ -109,7 +109,7 @@ tokio-stream = { version = "0.1", features = ["net"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
-rustyline = { version = "14", features = ["with-fuzzy"] }
+rustyline = { version = "17", features = ["with-fuzzy"] }
 dirs-next = "2"
 
 # Logging
@@ -140,7 +140,7 @@ lance-linalg = { version = "0.23", optional = true }
 # incompatible with the arrow-53 pin (newer chrono breaks arrow-arith 53.x) —
 # the resolver downgraded arrow chasing it. tungstenite is a small sync
 # WebSocket client whose tree stays inside the existing lock families.
-tungstenite = { version = "0.24", optional = true, default-features = false, features = [
+tungstenite = { version = "0.30", optional = true, default-features = false, features = [
     "handshake",
 ] }
 
@@ -175,7 +175,7 @@ gpu = ["dep:cudarc"]
 pulsar = ["dep:tungstenite"]
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
 pretty_assertions = "1"
 csv = "1"

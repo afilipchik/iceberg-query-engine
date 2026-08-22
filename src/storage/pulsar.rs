@@ -328,7 +328,7 @@ impl PulsarTable {
             // Ack so the reader's receiver queue keeps flowing.
             let ack = format!("{{\"messageId\":\"{msg_id}\"}}");
             socket
-                .send(tungstenite::Message::Text(ack))
+                .send(tungstenite::Message::Text(ack.into()))
                 .map_err(|e| QueryError::Storage(format!("pulsar ack: {e}")))?;
 
             let (ledger, entry, batch_idx) = decode_message_id(&msg_id).ok_or_else(|| {
