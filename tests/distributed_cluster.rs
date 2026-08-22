@@ -1042,9 +1042,9 @@ async fn every_engine_supported_shape_is_answered_distributed() {
         }
     }
 
-    // A multi-table query must report a contribution from every node for
-    // every table it gathered — that is what makes it distributed rather than
-    // locally answered with extra steps.
+    // A join SCATTERS since the distributed-pushdown epic: the largest
+    // once-referenced table is sharded, the rest read from replicas, and the
+    // per-node contributions cover the sharded table.
     let resp = dsql(
         &addrs[1],
         "SELECT COUNT(*) AS n FROM lineitem JOIN orders ON l_orderkey = o_orderkey",
@@ -1055,7 +1055,7 @@ async fn every_engine_supported_shape_is_answered_distributed() {
             .expect("distribution header"),
     )
     .expect("distribution header is JSON");
-    assert_eq!(dist["shape"], "gather");
+    assert_eq!(dist["shape"], "two_phase");
     let tables_seen: std::collections::BTreeSet<&str> = dist["nodes"]
         .as_array()
         .unwrap()
@@ -1064,8 +1064,8 @@ async fn every_engine_supported_shape_is_answered_distributed() {
         .collect();
     assert_eq!(
         tables_seen.into_iter().collect::<Vec<_>>(),
-        vec!["lineitem", "orders"],
-        "both joined tables must have been gathered"
+        vec!["lineitem"],
+        "the sharded table is the per-node contribution"
     );
 
     shutdown_all(nodes).await;
@@ -1106,10 +1106,8 @@ async fn what_cannot_be_distributed_is_refused_by_name() {
         );
     }
 
-    // ...and in `auto` mode a gather-shaped query is answered LOCALLY over
-    // this node's full copy of the data, with the response saying so and why:
-    // when every node already holds all the data, moving it first is never
-    // the faster correct answer. `distributed=1` remains the way to force it.
+    // ...and in `auto` mode a scatter-eligible join now DISTRIBUTES (the
+    // pushdown epic): partial states move, tables do not.
     let resp = http_client::post_text(
         &addrs[0],
         "/sql?format=csv&distributed=auto",
@@ -1119,13 +1117,7 @@ async fn what_cannot_be_distributed_is_refused_by_name() {
     .await
     .unwrap();
     assert!(resp.is_success(), "{} {}", resp.status, resp.text());
-    assert_eq!(resp.header("x-qe-distributed"), Some("false"));
-    assert!(
-        resp.header("x-qe-distributed-skipped")
-            .is_some_and(|r| r.contains("cross-shard joins")),
-        "auto mode must record WHY it did not distribute: {:?}",
-        resp.header("x-qe-distributed-skipped")
-    );
+    assert_eq!(resp.header("x-qe-distributed"), Some("true"));
 
     shutdown_all(nodes).await;
 }

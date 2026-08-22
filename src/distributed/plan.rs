@@ -49,8 +49,9 @@ pub const PARTIAL_TABLE: &str = "qe_dist_partial";
 const GROUP_PREFIX: &str = "qe_g";
 const AGG_PREFIX: &str = "qe_a";
 
-const SUPPORTED: &str = "distributed execution supports a single-table scan with \
-                         WHERE/SELECT and COUNT/SUM/MIN/MAX/AVG (with or without GROUP BY)";
+const SUPPORTED: &str = "distributed execution supports queries over one sharded table \
+                         joined with replicated tables, with COUNT/SUM/MIN/MAX/AVG, \
+                         GROUP BY, HAVING, ORDER BY and LIMIT";
 
 fn unsupported(reason: impl std::fmt::Display) -> QueryError {
     QueryError::NotImplemented(format!("{reason}; {SUPPORTED}"))
@@ -68,6 +69,10 @@ pub enum MergeShape {
     /// Two-phase: workers compute partial aggregates, the initiator merges them
     /// with [`DistributedPlan::final_sql`].
     TwoPhase,
+    /// Workers return their locally-sorted (and, when a LIMIT exists,
+    /// truncated) rows; the initiator re-sorts the union and applies the
+    /// exact LIMIT/OFFSET via [`DistributedPlan::final_sql`].
+    TopN,
     /// General path: workers stream their shard of every referenced table to
     /// the initiator, which runs the original statement over the gathered
     /// columns. Chosen only when neither exact shape above applies. See
@@ -99,7 +104,7 @@ pub struct DistributedPlan {
 /// never a quiet fallback — for anything outside the supported set.
 pub fn plan_distributed(ctx: &ExecutionContext, sql: &str) -> Result<DistributedPlan> {
     let stmt = crate::parser::parse_sql(sql)?;
-    let select = structural_check(&stmt)?;
+    let (select, ol) = structural_check(&stmt)?;
 
     // Bind with the engine's own binder. A NotImplemented from here (window
     // functions, unsupported syntax) is re-flavoured so the caller is told what
@@ -108,7 +113,7 @@ pub fn plan_distributed(ctx: &ExecutionContext, sql: &str) -> Result<Distributed
         QueryError::NotImplemented(msg) => unsupported(msg),
         other => other,
     })?;
-    let caps = capability_check(&logical)?;
+    let caps = capability_check(ctx, &logical)?;
 
     let output_names: Vec<String> = logical
         .schema()
@@ -122,21 +127,31 @@ pub fn plan_distributed(ctx: &ExecutionContext, sql: &str) -> Result<Distributed
             if !modifiers.is_empty() {
                 return Err(unsupported("GROUP BY with ROLLUP/CUBE/GROUPING SETS"));
             }
-            exprs.clone()
+            // GROUP BY may name a projection ALIAS or ordinal (Q7-style
+            // `GROUP BY supp_nation`); the rewriter needs the underlying
+            // expression, because the partial SELECT re-aliases everything.
+            exprs
+                .iter()
+                .map(|g| resolve_group_item(g, select))
+                .collect::<Result<Vec<_>>>()?
         }
         sa::GroupByExpr::All(_) => return Err(unsupported("GROUP BY ALL")),
     };
 
-    // No aggregation and no grouping: the shards concatenate. Nothing to
-    // rewrite, so nothing can be rewritten wrongly.
+    // No aggregation and no grouping: the shards concatenate — with an
+    // optional TopN pre-truncation and a merge-stage sort when the statement
+    // orders or limits.
     if !caps.has_aggregate && group_exprs.is_empty() {
-        return Ok(DistributedPlan {
-            table: caps.table,
-            partial_sql: sql.trim().trim_end_matches(';').to_string(),
-            final_sql: None,
-            shape: MergeShape::Concat,
-            output_names,
-        });
+        if ol.is_empty() {
+            return Ok(DistributedPlan {
+                table: caps.table,
+                partial_sql: sql.trim().trim_end_matches(';').to_string(),
+                final_sql: None,
+                shape: MergeShape::Concat,
+                output_names,
+            });
+        }
+        return plan_topn(select, &ol, caps.table, output_names);
     }
 
     if select.projection.len() != output_names.len() {
@@ -173,8 +188,10 @@ pub fn plan_distributed(ctx: &ExecutionContext, sql: &str) -> Result<Distributed
         None => None,
     };
 
+    let final_order = rewrite_order_by(&ol.order_by, &output_names, &mut rw)?;
     let partial_sql = rw.partial_sql(select, &group_exprs);
-    let final_sql = rw.final_sql(final_projection, final_having);
+    let mut final_sql = rw.final_sql(final_projection, final_having);
+    push_order_limit(&mut final_sql, &final_order, &ol);
 
     // Net 3: every leaf identifier of the merge query must be an alias this
     // module generated. See the module docs for why this is load-bearing.
@@ -189,11 +206,196 @@ pub fn plan_distributed(ctx: &ExecutionContext, sql: &str) -> Result<Distributed
     })
 }
 
+/// Resolve a GROUP BY item that names a projection alias or ordinal to the
+/// underlying projection expression.
+fn resolve_group_item(g: &sa::Expr, select: &sa::Select) -> Result<sa::Expr> {
+    match g {
+        sa::Expr::Identifier(id) => {
+            for item in &select.projection {
+                if let sa::SelectItem::ExprWithAlias { expr, alias } = item {
+                    if alias.value == id.value {
+                        return Ok(expr.clone());
+                    }
+                }
+            }
+            Ok(g.clone())
+        }
+        sa::Expr::Value(sa::Value::Number(n, _)) => {
+            let ord: usize = n
+                .parse()
+                .map_err(|_| unsupported(format!("GROUP BY position {n}")))?;
+            match select.projection.get(ord.wrapping_sub(1)) {
+                Some(sa::SelectItem::UnnamedExpr(e))
+                | Some(sa::SelectItem::ExprWithAlias { expr: e, .. }) => Ok(e.clone()),
+                _ => Err(unsupported(format!("GROUP BY position {ord}"))),
+            }
+        }
+        other => Ok(other.clone()),
+    }
+}
+
+/// Render one ORDER BY item's direction suffix.
+fn order_suffix(o: &sa::OrderByExpr) -> String {
+    let mut out = String::new();
+    match o.asc {
+        Some(false) => out.push_str(" DESC"),
+        Some(true) => out.push_str(" ASC"),
+        None => {}
+    }
+    match o.nulls_first {
+        Some(true) => out.push_str(" NULLS FIRST"),
+        Some(false) => out.push_str(" NULLS LAST"),
+        None => {}
+    }
+    out
+}
+
+/// Map the statement's ORDER BY onto the MERGE query's vocabulary: an output
+/// alias (quoted), an ordinal (resolved to its output alias), a GROUP BY key
+/// or a decomposable aggregate (through the rewriter).
+fn rewrite_order_by(
+    order_by: &[sa::OrderByExpr],
+    output_names: &[String],
+    rw: &mut Rewriter,
+) -> Result<Vec<String>> {
+    let mut out = Vec::with_capacity(order_by.len());
+    for o in order_by {
+        let rendered = match &o.expr {
+            sa::Expr::Value(sa::Value::Number(n, _)) => {
+                let ord: usize = n
+                    .parse()
+                    .map_err(|_| unsupported(format!("ORDER BY position {n}")))?;
+                if ord == 0 || ord > output_names.len() {
+                    return Err(unsupported(format!(
+                        "ORDER BY position {ord} is out of range"
+                    )));
+                }
+                format!("\"{}\"", output_names[ord - 1])
+            }
+            sa::Expr::Identifier(id) if output_names.iter().any(|n| *n == id.value) => {
+                format!("\"{}\"", id.value)
+            }
+            e => rw.rewrite(e)?.to_string(),
+        };
+        out.push(format!("{rendered}{}", order_suffix(o)));
+    }
+    Ok(out)
+}
+
+/// Append the merge-stage ORDER BY / LIMIT / OFFSET.
+fn push_order_limit(sql: &mut String, order: &[String], ol: &OrderLimit) {
+    if !order.is_empty() {
+        sql.push_str(" ORDER BY ");
+        sql.push_str(&order.join(", "));
+    }
+    if let Some(l) = ol.limit {
+        sql.push_str(&format!(" LIMIT {l}"));
+    }
+    if let Some(o) = ol.offset {
+        sql.push_str(&format!(" OFFSET {o}"));
+    }
+}
+
+/// The TopN shape: workers run the (join-and-filter) query verbatim, sorted
+/// and pre-truncated to LIMIT+OFFSET rows when a limit exists; the initiator
+/// re-sorts the union and applies the exact LIMIT/OFFSET.
+fn plan_topn(
+    select: &sa::Select,
+    ol: &OrderLimit,
+    table: String,
+    output_names: Vec<String>,
+) -> Result<DistributedPlan> {
+    // Merge-stage ORDER BY may only use columns the partial rows carry:
+    // output aliases/columns or ordinals.
+    let mut final_order = Vec::with_capacity(ol.order_by.len());
+    for o in &ol.order_by {
+        let name = match &o.expr {
+            sa::Expr::Value(sa::Value::Number(n, _)) => {
+                let ord: usize = n
+                    .parse()
+                    .map_err(|_| unsupported(format!("ORDER BY position {n}")))?;
+                if ord == 0 || ord > output_names.len() {
+                    return Err(unsupported(format!(
+                        "ORDER BY position {ord} is out of range"
+                    )));
+                }
+                output_names[ord - 1].clone()
+            }
+            sa::Expr::Identifier(id) if output_names.iter().any(|n| *n == id.value) => {
+                id.value.clone()
+            }
+            sa::Expr::CompoundIdentifier(parts)
+                if parts
+                    .last()
+                    .map(|p| output_names.iter().any(|n| *n == p.value))
+                    .unwrap_or(false) =>
+            {
+                parts.last().expect("checked").value.clone()
+            }
+            other => {
+                return Err(unsupported(format!(
+                    "ORDER BY over an expression not in the SELECT list ({other})"
+                )))
+            }
+        };
+        final_order.push(format!("\"{name}\"{}", order_suffix(o)));
+    }
+
+    let mut partial_sql = select.to_string();
+    if let Some(limit) = ol.limit {
+        // Pre-truncate each shard: a shard's contribution to the global
+        // top-N is within ITS OWN top-(N+offset).
+        let keep = limit + ol.offset.unwrap_or(0);
+        if !ol.order_by.is_empty() {
+            partial_sql.push_str(" ORDER BY ");
+            partial_sql.push_str(
+                &ol.order_by
+                    .iter()
+                    .map(|o| o.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+        partial_sql.push_str(&format!(" LIMIT {keep}"));
+    }
+
+    let mut final_sql = format!(
+        "SELECT {} FROM {PARTIAL_TABLE}",
+        output_names
+            .iter()
+            .map(|n| format!("\"{n}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    push_order_limit(&mut final_sql, &final_order, ol);
+
+    Ok(DistributedPlan {
+        table,
+        partial_sql,
+        final_sql: Some(final_sql),
+        shape: MergeShape::TopN,
+        output_names,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Net 1: structure of the parsed statement
 // ---------------------------------------------------------------------------
 
-fn structural_check(stmt: &sa::Statement) -> Result<&sa::Select> {
+/// The statement's trailing clauses, applied at the MERGE stage.
+struct OrderLimit {
+    order_by: Vec<sa::OrderByExpr>,
+    limit: Option<u64>,
+    offset: Option<u64>,
+}
+
+impl OrderLimit {
+    fn is_empty(&self) -> bool {
+        self.order_by.is_empty() && self.limit.is_none() && self.offset.is_none()
+    }
+}
+
+fn structural_check(stmt: &sa::Statement) -> Result<(&sa::Select, OrderLimit)> {
     let query = match stmt {
         sa::Statement::Query(q) => q,
         other => {
@@ -207,20 +409,48 @@ fn structural_check(stmt: &sa::Statement) -> Result<&sa::Select> {
     if query.with.is_some() {
         return Err(unsupported("common table expressions (WITH)"));
     }
-    if query.order_by.is_some() {
-        // Rejected rather than merged-then-sorted, deliberately: pushing
-        // ORDER BY to the workers sorts each shard independently, and the
-        // concatenation of sorted shards is not sorted. Doing it correctly
-        // means a final global sort, which is M3's job.
-        return Err(unsupported("global ORDER BY"));
-    }
-    if query.limit.is_some() || query.offset.is_some() || query.fetch.is_some() {
-        // A LIMIT evaluated per shard returns N rows per node, not N rows.
-        return Err(unsupported("global LIMIT/OFFSET/FETCH"));
+    // ORDER BY / LIMIT / OFFSET are legal: they run at the MERGE stage (and,
+    // for the TopN shape, additionally as a per-shard pre-truncation — the
+    // ClickHouse distributed_push_down_limit / Trino partial-TopN pattern).
+    let order_by = match &query.order_by {
+        None => Vec::new(),
+        Some(ob) => {
+            if ob.interpolate.is_some() {
+                return Err(unsupported("ORDER BY ... INTERPOLATE"));
+            }
+            ob.exprs.clone()
+        }
+    };
+    let limit = match &query.limit {
+        None => None,
+        Some(sa::Expr::Value(sa::Value::Number(n, _))) => Some(
+            n.parse::<u64>()
+                .map_err(|_| unsupported(format!("non-integer LIMIT ({n})")))?,
+        ),
+        Some(other) => return Err(unsupported(format!("non-literal LIMIT ({other})"))),
+    };
+    let offset = match &query.offset {
+        None => None,
+        Some(sa::Offset {
+            value: sa::Expr::Value(sa::Value::Number(n, _)),
+            ..
+        }) => Some(
+            n.parse::<u64>()
+                .map_err(|_| unsupported(format!("non-integer OFFSET ({n})")))?,
+        ),
+        Some(other) => return Err(unsupported(format!("non-literal OFFSET ({})", other.value))),
+    };
+    if query.fetch.is_some() {
+        return Err(unsupported("FETCH FIRST (use LIMIT)"));
     }
     if !query.limit_by.is_empty() {
         return Err(unsupported("LIMIT ... BY"));
     }
+    let ol = OrderLimit {
+        order_by,
+        limit,
+        offset,
+    };
 
     let select = match query.body.as_ref() {
         sa::SetExpr::Select(s) => s.as_ref(),
@@ -262,36 +492,29 @@ fn structural_check(stmt: &sa::Statement) -> Result<&sa::Select> {
         return Err(unsupported("CONNECT BY"));
     }
 
-    match select.from.len() {
-        1 => {}
-        0 => return Err(unsupported("a SELECT with no FROM clause")),
-        n => {
-            return Err(unsupported(format!(
-                "cross-shard joins (FROM lists {n} tables)"
-            )))
+    if select.from.is_empty() {
+        return Err(unsupported("a SELECT with no FROM clause"));
+    }
+    // Joins, comma-joins and derived tables are all legal now: they execute
+    // VERBATIM on each worker against its shard of the elected table plus its
+    // full replicas of every other table. Only table-valued functions stay
+    // out (nothing to shard, nothing replicated).
+    fn check_factor(f: &sa::TableFactor) -> Result<()> {
+        match f {
+            sa::TableFactor::Table { args: Some(_), .. } => {
+                Err(unsupported("table-valued functions"))
+            }
+            _ => Ok(()),
         }
     }
-    if !select.from[0].joins.is_empty() {
-        return Err(unsupported("cross-shard joins (JOIN)"));
-    }
-    match &select.from[0].relation {
-        sa::TableFactor::Table { args: Some(_), .. } => {
-            return Err(unsupported("table-valued functions"))
-        }
-        sa::TableFactor::Table { .. } => {}
-        sa::TableFactor::Derived { .. } => {
-            return Err(unsupported("subqueries in FROM (derived tables)"))
-        }
-        sa::TableFactor::NestedJoin { .. } => return Err(unsupported("cross-shard joins (JOIN)")),
-        other => {
-            return Err(unsupported(format!(
-                "this FROM item ({})",
-                first_word(&other.to_string())
-            )))
+    for twj in &select.from {
+        check_factor(&twj.relation)?;
+        for j in &twj.joins {
+            check_factor(&j.relation)?;
         }
     }
 
-    Ok(select)
+    Ok((select, ol))
 }
 
 fn first_word(s: &str) -> String {
@@ -307,77 +530,266 @@ struct Capabilities {
     has_aggregate: bool,
 }
 
-fn capability_check(plan: &LogicalPlan) -> Result<Capabilities> {
-    let mut tables: Vec<String> = Vec::new();
-    let mut has_aggregate = false;
-    walk_plan(plan, &mut tables, &mut has_aggregate)?;
+/// One scan's census entry.
+#[derive(Default)]
+struct TableCensus {
+    count: usize,
+    /// True when SOME reference sits in the main FROM tree on a shard-safe
+    /// join side, outside any subquery expression.
+    eligible_once: bool,
+}
 
-    match tables.len() {
-        1 => Ok(Capabilities {
-            table: tables.remove(0),
-            has_aggregate,
+#[derive(Default)]
+struct Census {
+    tables: std::collections::BTreeMap<String, TableCensus>,
+    main_aggregates: usize,
+}
+
+#[derive(Clone, Copy)]
+struct WalkFlags {
+    /// Inside a subquery EXPRESSION's plan (EXISTS / IN / scalar).
+    in_subquery: bool,
+    /// Inside a derived table (SubqueryAlias) of the main tree.
+    in_derived: bool,
+    /// This subtree's rows partition the result (shard-safe side).
+    shard_safe: bool,
+}
+
+/// The capability check: census every table reference with its position,
+/// refuse the shapes union-decomposability cannot cover, and elect the
+/// largest shard-safe table.
+///
+/// Correctness rule (the ClickHouse sharded-fact model): running the query
+/// per shard of table T and merging is exact when (a) T is referenced exactly
+/// once, in the main FROM tree, on the preserved side of every outer join on
+/// its path, and never inside a subquery expression — so every result row
+/// derives from exactly one T row and subqueries see full replicas; and
+/// (b) at most one aggregate level sits above it, with mergeable functions.
+fn capability_check(ctx: &ExecutionContext, plan: &LogicalPlan) -> Result<Capabilities> {
+    let mut census = Census::default();
+    walk_census(
+        plan,
+        &mut census,
+        WalkFlags {
+            in_subquery: false,
+            in_derived: false,
+            shard_safe: true,
+        },
+    )?;
+
+    if census.main_aggregates > 1 {
+        return Err(unsupported(
+            "more than one aggregation level over the sharded table",
+        ));
+    }
+
+    let mut best: Option<(String, u64)> = None;
+    for (name, tc) in &census.tables {
+        if tc.count == 1 && tc.eligible_once {
+            let size = ctx
+                .table_provider(name)
+                .and_then(|p| p.statistics())
+                .map(|st| {
+                    if st.total_byte_size > 0 {
+                        st.total_byte_size as u64
+                    } else {
+                        st.row_count as u64
+                    }
+                })
+                .unwrap_or(0);
+            if best.as_ref().map(|(_, b)| size > *b).unwrap_or(true) {
+                best = Some((name.clone(), size));
+            }
+        }
+    }
+    match best {
+        Some((table, _)) => Ok(Capabilities {
+            table,
+            has_aggregate: census.main_aggregates > 0,
         }),
-        0 => Err(unsupported("a query that scans no table")),
-        n => Err(unsupported(format!(
-            "cross-shard joins ({n} tables scanned)"
-        ))),
+        None => Err(unsupported(
+            "no shard-eligible table (every table is referenced more than once, \
+             only inside subqueries, or on the null-supplying side of an outer join)",
+        )),
     }
 }
 
-fn walk_plan(plan: &LogicalPlan, tables: &mut Vec<String>, has_agg: &mut bool) -> Result<()> {
+fn walk_census(plan: &LogicalPlan, census: &mut Census, flags: WalkFlags) -> Result<()> {
+    use crate::planner::JoinType;
     match plan {
         LogicalPlan::Scan(node) => {
-            tables.push(node.table_name.clone());
+            let entry = census.tables.entry(node.table_name.clone()).or_default();
+            entry.count += 1;
+            if !flags.in_subquery && flags.shard_safe {
+                entry.eligible_once = true;
+            }
             if let Some(f) = &node.filter {
-                check_expr(f)?;
+                census_expr(f, census, &flags)?;
             }
         }
-        LogicalPlan::Filter(node) => check_expr(&node.predicate)?,
-        LogicalPlan::Window(_) => return Err(unsupported("window functions")),
+        LogicalPlan::Filter(node) => {
+            census_expr(&node.predicate, census, &flags)?;
+            walk_census(&node.input, census, flags)?;
+        }
         LogicalPlan::Project(node) => {
             for e in &node.exprs {
-                check_expr(e)?;
+                census_expr(e, census, &flags)?;
             }
+            walk_census(&node.input, census, flags)?;
         }
         LogicalPlan::Aggregate(node) => {
-            *has_agg = true;
+            if flags.in_derived && !flags.in_subquery {
+                return Err(unsupported("aggregates inside derived tables"));
+            }
+            if !flags.in_subquery {
+                census.main_aggregates += 1;
+                for e in &node.aggregates {
+                    check_agg_decomposable(e)?;
+                }
+            }
             for e in node.group_by.iter().chain(node.aggregates.iter()) {
-                check_expr(e)?;
+                census_expr(e, census, &flags)?;
+            }
+            walk_census(&node.input, census, flags)?;
+        }
+        LogicalPlan::Join(node) => {
+            for (l, r) in &node.on {
+                census_expr(l, census, &flags)?;
+                census_expr(r, census, &flags)?;
+            }
+            if let Some(f) = &node.filter {
+                census_expr(f, census, &flags)?;
+            }
+            // Shard-safety per side: sharding the null-supplying side of an
+            // outer join duplicates the preserved side's unmatched rows in
+            // every shard; sharding the build side of a semi/anti join can
+            // match one probe row in several shards.
+            let (left_safe, right_safe) = match node.join_type {
+                JoinType::Inner | JoinType::Cross => (flags.shard_safe, flags.shard_safe),
+                JoinType::Left | JoinType::Semi | JoinType::Anti => (flags.shard_safe, false),
+                JoinType::Right => (false, flags.shard_safe),
+                JoinType::Full => (false, false),
+                _ => (false, false),
+            };
+            walk_census(
+                &node.left,
+                census,
+                WalkFlags {
+                    shard_safe: left_safe,
+                    ..flags
+                },
+            )?;
+            walk_census(
+                &node.right,
+                census,
+                WalkFlags {
+                    shard_safe: right_safe,
+                    ..flags
+                },
+            )?;
+        }
+        LogicalPlan::SubqueryAlias(node) => {
+            walk_census(
+                &node.input,
+                census,
+                WalkFlags {
+                    in_derived: true,
+                    ..flags
+                },
+            )?;
+        }
+        LogicalPlan::Sort(node) => {
+            // A per-shard sort inside a derived table is harmless (order
+            // without LIMIT carries no meaning); the top-level sort runs at
+            // the merge stage.
+            for e in &node.order_by {
+                census_expr(&e.expr, census, &flags)?;
+            }
+            walk_census(&node.input, census, flags)?;
+        }
+        LogicalPlan::Limit(node) => {
+            if (flags.in_derived) && !flags.in_subquery {
+                // LIMIT evaluated per shard inside a derived table changes
+                // which rows exist — not decomposable.
+                return Err(unsupported("LIMIT inside a derived table"));
+            }
+            walk_census(&node.input, census, flags)?;
+        }
+        LogicalPlan::Distinct(node) => {
+            if !flags.in_subquery {
+                return Err(unsupported("SELECT DISTINCT"));
+            }
+            walk_census(&node.input, census, flags)?;
+        }
+        LogicalPlan::Window(node) => {
+            if !flags.in_subquery {
+                return Err(unsupported("window functions"));
+            }
+            for (_, w) in &node.window_exprs {
+                for e in w.args.iter().chain(w.partition_by.iter()) {
+                    census_expr(e, census, &flags)?;
+                }
+                for o in &w.order_by {
+                    census_expr(&o.expr, census, &flags)?;
+                }
+            }
+            walk_census(&node.input, census, flags)?;
+        }
+        LogicalPlan::Union(node) => {
+            if !flags.in_subquery {
+                return Err(unsupported("set operations (UNION/EXCEPT/INTERSECT)"));
+            }
+            for c in &node.inputs {
+                walk_census(c, census, flags)?;
             }
         }
-        LogicalPlan::Join(_) | LogicalPlan::DelimJoin(_) => {
-            return Err(unsupported("cross-shard joins"))
-        }
-        LogicalPlan::Sort(_) => return Err(unsupported("global ORDER BY")),
-        LogicalPlan::Limit(_) => return Err(unsupported("global LIMIT/OFFSET")),
-        LogicalPlan::Distinct(_) => return Err(unsupported("SELECT DISTINCT")),
-        LogicalPlan::Union(_) => {
-            return Err(unsupported("set operations (UNION/EXCEPT/INTERSECT)"))
-        }
-        LogicalPlan::SubqueryAlias(_) => {
-            return Err(unsupported("subqueries in FROM (derived tables)"))
-        }
         LogicalPlan::Values(_) | LogicalPlan::EmptyRelation(_) => {
-            return Err(unsupported("VALUES / an empty relation"))
+            if !flags.in_subquery {
+                return Err(unsupported("VALUES / an empty relation"));
+            }
         }
-        LogicalPlan::DelimGet(_) => return Err(unsupported("decorrelated subqueries")),
+        LogicalPlan::DelimJoin(_) | LogicalPlan::DelimGet(_) => {
+            return Err(unsupported("decorrelated subqueries"))
+        }
         LogicalPlan::VectorSearch(_) => {
             return Err(unsupported("vector search (ORDER BY distance)"))
         }
     }
-    for child in plan.children() {
-        walk_plan(child, tables, has_agg)?;
-    }
     Ok(())
 }
 
-/// Reject subqueries and unsupported aggregates anywhere in an expression.
-fn check_expr(expr: &Expr) -> Result<()> {
-    if expr.contains_subquery() {
-        return Err(unsupported(
-            "correlated or uncorrelated subqueries (EXISTS / IN / scalar)",
-        ));
+/// Census the subquery plans embedded in an expression. Tables referenced
+/// only here can never be the sharded one — on a worker the subquery runs
+/// against full replicas, which is exactly what makes correlated lookups and
+/// global scalar aggregates shard-invariant.
+fn census_expr(expr: &Expr, census: &mut Census, flags: &WalkFlags) -> Result<()> {
+    let mut result = Ok(());
+    let mut plans: Vec<std::sync::Arc<LogicalPlan>> = Vec::new();
+    visit_expr(expr, &mut |e| match e {
+        Expr::ScalarSubquery(p) => plans.push(p.clone()),
+        Expr::Exists { subquery, .. } | Expr::InSubquery { subquery, .. } => {
+            plans.push(subquery.clone())
+        }
+        _ => {}
+    });
+    for p in plans {
+        if let Err(e) = walk_census(
+            &p,
+            census,
+            WalkFlags {
+                in_subquery: true,
+                shard_safe: false,
+                in_derived: flags.in_derived,
+            },
+        ) {
+            result = Err(e);
+        }
     }
+    result
+}
+
+/// Refuse aggregate functions with no exact partial/final split.
+fn check_agg_decomposable(expr: &Expr) -> Result<()> {
     let mut bad: Option<String> = None;
     visit_expr(expr, &mut |e| {
         if bad.is_some() {
@@ -769,7 +1181,14 @@ impl Rewriter {
                 .join(", "),
         );
         out.push_str(" FROM ");
-        out.push_str(&select.from[0].to_string());
+        out.push_str(
+            &select
+                .from
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
         if let Some(w) = &select.selection {
             out.push_str(" WHERE ");
             out.push_str(&w.to_string());
@@ -877,6 +1296,14 @@ fn check_identifier(word: &str, final_sql: &str) -> Result<()> {
 /// Words that may legitimately appear bare in a merge query. Anything else is a
 /// column reference that should not have survived the rewrite.
 const SQL_KEYWORDS: &[&str] = &[
+    "ORDER",
+    "DESC",
+    "ASC",
+    "LIMIT",
+    "OFFSET",
+    "NULLS",
+    "FIRST",
+    "LAST",
     "SELECT",
     "FROM",
     "WHERE",
@@ -1122,41 +1549,78 @@ mod tests {
     }
 
     #[test]
+    fn joins_shard_the_largest_once_referenced_table() {
+        let ctx = ctx();
+        let p = plan_distributed(
+            &ctx,
+            "SELECT o_orderpriority, COUNT(*) AS n FROM orders, lineitem \
+             WHERE o_orderkey = l_orderkey GROUP BY o_orderpriority",
+        )
+        .expect("join scatter");
+        assert_eq!(p.table, "lineitem", "largest once-referenced table wins");
+        assert_eq!(p.shape, MergeShape::TwoPhase);
+        assert!(p.partial_sql.contains("FROM orders, lineitem"));
+    }
+
+    #[test]
+    fn subquery_tables_are_replicated_not_sharded() {
+        let ctx = ctx();
+        // lineitem appears only inside the EXISTS: orders is the shard table.
+        let p = plan_distributed(
+            &ctx,
+            "SELECT o_orderpriority, COUNT(*) AS n FROM orders WHERE EXISTS \
+             (SELECT 1 FROM lineitem WHERE l_orderkey = o_orderkey) GROUP BY o_orderpriority",
+        )
+        .expect("exists scatter");
+        assert_eq!(p.table, "orders");
+    }
+
+    #[test]
+    fn order_by_and_limit_move_to_the_merge_stage() {
+        let ctx = ctx();
+        let p = plan_distributed(
+            &ctx,
+            "SELECT l_orderkey, SUM(l_quantity) AS q FROM lineitem \
+             GROUP BY l_orderkey ORDER BY q DESC, l_orderkey LIMIT 10",
+        )
+        .expect("agg topn scatter");
+        assert_eq!(p.shape, MergeShape::TwoPhase);
+        assert!(!p.partial_sql.contains("ORDER BY"), "{}", p.partial_sql);
+        assert!(!p.partial_sql.contains("LIMIT"), "{}", p.partial_sql);
+        let f = p.final_sql.expect("merge sql");
+        assert!(
+            f.contains("ORDER BY \"q\" DESC, \"l_orderkey\" LIMIT 10"),
+            "{f}"
+        );
+    }
+
+    #[test]
+    fn plain_topn_pre_truncates_each_shard() {
+        let ctx = ctx();
+        let p = plan_distributed(
+            &ctx,
+            "SELECT l_orderkey, l_quantity FROM lineitem \
+             WHERE l_quantity > 45 ORDER BY l_quantity DESC LIMIT 5 OFFSET 2",
+        )
+        .expect("topn scatter");
+        assert_eq!(p.shape, MergeShape::TopN);
+        assert!(p.partial_sql.ends_with("LIMIT 7"), "{}", p.partial_sql);
+        let f = p.final_sql.expect("merge sql");
+        assert!(
+            f.contains("ORDER BY \"l_quantity\" DESC LIMIT 5 OFFSET 2"),
+            "{f}"
+        );
+    }
+
+    #[test]
     fn every_unsupported_shape_is_named_in_its_rejection() {
         let cases: &[(&str, &str)] = &[
-            (
-                "SELECT COUNT(*) FROM lineitem, orders WHERE l_orderkey = o_orderkey",
-                "cross-shard joins",
-            ),
-            (
-                "SELECT COUNT(*) FROM lineitem JOIN orders ON l_orderkey = o_orderkey",
-                "cross-shard joins",
-            ),
+            // Non-decomposable aggregates.
             (
                 "SELECT COUNT(DISTINCT l_orderkey) FROM lineitem",
                 "COUNT(DISTINCT",
             ),
-            (
-                "SELECT SUM(DISTINCT l_quantity) FROM lineitem",
-                "DISTINCT",
-            ),
-            (
-                "SELECT COUNT(*) FROM lineitem WHERE l_orderkey IN (SELECT o_orderkey FROM orders)",
-                "subqueries",
-            ),
-            (
-                "SELECT COUNT(*) FROM lineitem WHERE EXISTS (SELECT 1 FROM orders)",
-                "subqueries",
-            ),
-            (
-                "SELECT COUNT(*) FROM lineitem WHERE l_quantity > (SELECT AVG(l_quantity) FROM lineitem)",
-                "subqueries",
-            ),
-            (
-                "SELECT l_orderkey FROM lineitem ORDER BY l_orderkey LIMIT 10",
-                "global ORDER BY",
-            ),
-            ("SELECT l_orderkey FROM lineitem LIMIT 10", "global LIMIT"),
+            ("SELECT SUM(DISTINCT l_quantity) FROM lineitem", "DISTINCT"),
             (
                 "SELECT STDDEV(l_quantity) FROM lineitem",
                 "STDDEV(l_quantity) has no exact partial/final split",
@@ -1165,11 +1629,39 @@ mod tests {
                 "SELECT APPROX_DISTINCT(l_orderkey) FROM lineitem",
                 "APPROX_DISTINCT",
             ),
+            // Windows and DISTINCT change per-shard row visibility.
             (
                 "SELECT SUM(l_quantity) OVER () FROM lineitem",
-                "Window function",
+                "window",
+            ),
+            ("SELECT DISTINCT l_orderkey FROM lineitem", "DISTINCT"),
+            // Every table referenced twice, or only inside subqueries:
+            // nothing is shard-eligible.
+            (
+                "SELECT COUNT(*) FROM lineitem a, lineitem b WHERE a.l_orderkey = b.l_orderkey",
+                "no shard-eligible table",
             ),
             (
+                "SELECT COUNT(*) FROM lineitem WHERE l_quantity > (SELECT AVG(l_quantity) FROM lineitem)",
+                "no shard-eligible table",
+            ),
+            // Outer joins: the null-supplying side cannot be sharded, and
+            // with the preserved side referenced twice nothing is eligible.
+            (
+                "SELECT COUNT(*) FROM orders LEFT JOIN lineitem ON o_orderkey = l_orderkey \
+                 WHERE o_custkey IN (SELECT o_custkey FROM orders)",
+                "no shard-eligible table",
+            ),
+            // Two aggregation levels over the sharded table.
+            (
+                "SELECT MAX(n) FROM (SELECT COUNT(*) AS n FROM lineitem GROUP BY l_orderkey) t",
+                "aggregates inside derived tables",
+            ),
+            // A per-shard LIMIT inside a derived table changes which rows exist.
+            (
+                "SELECT COUNT(*) FROM (SELECT l_orderkey FROM lineitem LIMIT 10) t",
+                "LIMIT inside a derived table",
+            ),            (
                 "SELECT DISTINCT l_returnflag FROM lineitem",
                 "SELECT DISTINCT",
             ),
@@ -1180,10 +1672,6 @@ mod tests {
             (
                 "WITH x AS (SELECT * FROM lineitem) SELECT COUNT(*) FROM x",
                 "common table expressions",
-            ),
-            (
-                "SELECT COUNT(*) FROM (SELECT * FROM lineitem) t",
-                "subqueries in FROM",
             ),
         ];
         for (sql, needle) in cases {

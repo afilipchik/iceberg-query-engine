@@ -412,6 +412,54 @@ page cache — this measures *coordination overhead*, not scaling. The honest
 win is correctness: forced-distributed answers are byte-comparable to the
 single-process oracle on every query, from any node.
 
+### TPC-H SF=1, distributed — after the pushdown epic (measured 2026-08-22)
+
+The distributed-pushdown epic replaced ship-the-table with the
+ClickHouse/Trino playbook: workers run the whole query over their shard of
+ONE elected table (the largest referenced exactly once, on a shard-safe join
+path) joined against full local replicas, and ship back partial aggregate
+states (AVG travels as sum+count) or local TopN rows; the initiator merges
+states and applies HAVING / ORDER BY / LIMIT. 17 of 22 queries now scatter;
+the five that gather (Q11, Q13, Q15, Q16, Q22) reference every table twice,
+nest aggregates, or use COUNT(DISTINCT) — each refused by name, never
+answered wrongly.
+
+| Query | Distributed (now) | Distributed (before) | Single-process | Path |
+|-------|-------------------|----------------------|----------------|------|
+| Q01 | 87ms | 250ms | 74ms | scatter |
+| Q02 | 33ms | 46ms | 17ms | scatter (TopN) |
+| Q03 | 127ms | 162ms | 95ms | scatter |
+| Q04 | 119ms | 92ms | 71ms | scatter |
+| Q05 | 107ms | 733ms | 61ms | scatter |
+| Q06 | 62ms | 66ms | 21ms | scatter |
+| Q07 | 125ms | 197ms | 112ms | scatter |
+| Q08 | 124ms | 247ms | 80ms | scatter |
+| Q09 | 194ms | 794ms | 124ms | scatter |
+| Q10 | 140ms | 196ms | 105ms | scatter |
+| Q11 | 26ms | 31ms | 19ms | gather |
+| Q12 | 58ms | 140ms | 68ms | scatter |
+| Q13 | 77ms | 97ms | 63ms | gather |
+| Q14 | 48ms | 131ms | 25ms | scatter |
+| Q15 | 141ms | 127ms | 15ms | gather |
+| Q16 | 34ms | 41ms | 25ms | gather |
+| Q17 | 65ms | 141ms | 39ms | scatter |
+| Q18 | 154ms | 151ms | 104ms | scatter |
+| Q19 | 89ms | 287ms | 74ms | scatter |
+| Q20 | 138ms | 199ms | 66ms | scatter (TopN) |
+| Q21 | 110ms | 163ms | 66ms | scatter |
+| Q22 | 35ms | 40ms | 55ms | gather |
+| **Total** | **2.09s** | **4.33s** | **1.38s** | |
+
+**2.07x faster than the pre-epic distributed run**, all 22 queries still
+cell-exact vs DuckDB under `distributed=1`. The heavy joins collapsed: Q05
+733ms -> 107ms, Q09 794ms -> 194ms — partial states cross the wire instead
+of table shards. The residual gap to single-process (~0.7s across 22
+queries) is per-query fan-out overhead (HTTP round-trips, IPC encode/decode,
+merge planning), which is fixed cost per query: at SF=1 the queries are tiny
+(median ~60ms), so ~30-50ms of coordination is visible; it amortizes at
+larger scale factors and is the target of M3's pipelined exchanges.
+
+
 
 
 ## Supported Functions
