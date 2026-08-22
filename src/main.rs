@@ -328,6 +328,16 @@ enum Commands {
         /// port + 1. Pass `none` to disable the Flight endpoint.
         #[arg(long)]
         flight_bind: Option<String>,
+
+        /// Pulsar broker web-service URL (`http://host:8080`): every
+        /// schema'd topic of --pulsar-namespace registers as a table
+        /// (requires --features pulsar).
+        #[arg(long)]
+        pulsar_admin: Option<String>,
+
+        /// Pulsar namespace as tenant/namespace (default public/default).
+        #[arg(long, default_value = "public/default")]
+        pulsar_namespace: String,
     },
 }
 
@@ -1113,11 +1123,13 @@ async fn main() {
             drain_ms,
             shutdown_grace_ms,
             flight_bind,
+            pulsar_admin,
+            pulsar_namespace,
         } => {
             use query_engine::distributed::{serve, ServeOptions};
             use std::time::Duration;
 
-            if data.is_none() && tables.is_none() && metastore.is_none() {
+            if data.is_none() && tables.is_none() && metastore.is_none() && pulsar_admin.is_none() {
                 eprintln!(
                     "serve: nothing to serve. Pass --data <tpch-dir>, --tables <dir>, \
                      and/or --metastore <url>."
@@ -1147,7 +1159,14 @@ async fn main() {
             };
 
             let loader = Box::new(move || {
-                build_serve_context(&data, &tables, &metastore_source, &memory_limit)
+                build_serve_context(
+                    &data,
+                    &tables,
+                    &metastore_source,
+                    &pulsar_admin,
+                    &pulsar_namespace,
+                    &memory_limit,
+                )
             });
             if let Err(e) = serve(opts, loader).await {
                 eprintln!("serve: {}", e);
@@ -1167,22 +1186,20 @@ fn build_serve_context(
     data: &Option<PathBuf>,
     tables: &Option<PathBuf>,
     metastore: &Option<query_engine::metastore::GravitinoSource>,
+    pulsar_admin: &Option<String>,
+    pulsar_namespace: &str,
     memory_limit: &Option<String>,
 ) -> query_engine::Result<ExecutionContext> {
     use query_engine::error::QueryError;
 
+    // NO GPU offload for serve nodes: the cluster gates demand byte-exact
+    // local answers, and GPU float reduction order differs in the last bits.
     let mut ctx = match memory_limit {
         Some(limit) => {
-            let mut config = query_engine::ExecutionConfig::new().with_memory_limit_str(limit)?;
-            config.gpu_offload = true;
+            let config = query_engine::ExecutionConfig::new().with_memory_limit_str(limit)?;
             ExecutionContext::with_config(config)
         }
-        None => {
-            let mut c = ExecutionContext::new();
-            #[cfg(feature = "gpu")]
-            c.enable_gpu_offload();
-            c
-        }
+        None => ExecutionContext::new(),
     };
 
     if let Some(dir) = data {
@@ -1278,6 +1295,37 @@ fn build_serve_context(
             source.schema,
             names.join(", ")
         );
+    }
+
+    if let Some(admin) = pulsar_admin {
+        #[cfg(feature = "pulsar")]
+        {
+            let (tenant, namespace) = pulsar_namespace.split_once('/').ok_or_else(|| {
+                QueryError::Storage(format!(
+                    "--pulsar-namespace must be tenant/namespace, got `{pulsar_namespace}`"
+                ))
+            })?;
+            let source = query_engine::storage::PulsarSource {
+                admin_url: admin.trim_end_matches('/').to_string(),
+                tenant: tenant.to_string(),
+                namespace: namespace.to_string(),
+            };
+            let names = query_engine::storage::register_pulsar_namespace(&mut ctx, &source)?;
+            eprintln!(
+                "pulsar {}: registered {} topic(s) from {}: {}",
+                admin,
+                names.len(),
+                pulsar_namespace,
+                names.join(", ")
+            );
+        }
+        #[cfg(not(feature = "pulsar"))]
+        {
+            let _ = admin;
+            return Err(QueryError::NotImplemented(
+                "--pulsar-admin requires a binary built with --features pulsar".into(),
+            ));
+        }
     }
 
     Ok(ctx)
@@ -1601,6 +1649,44 @@ async fn handle_dot_command(
                     Err(e) => {
                         eprintln!("Error loading '{}': {}\n", path.display(), e);
                     }
+                }
+            }
+        }
+        #[cfg(feature = "pulsar")]
+        ".pulsar" => {
+            if parts.len() < 3 {
+                eprintln!("Usage: .pulsar <admin-url> <tenant/namespace>\n");
+            } else {
+                let (tenant, namespace) = match parts[2].split_once('/') {
+                    Some((t, n)) => (t.to_string(), n.to_string()),
+                    None => {
+                        eprintln!("namespace must be tenant/namespace\n");
+                        return true;
+                    }
+                };
+                let source = query_engine::storage::PulsarSource {
+                    admin_url: parts[1].trim_end_matches('/').to_string(),
+                    tenant,
+                    namespace,
+                };
+                let start = Instant::now();
+                match query_engine::storage::register_pulsar_namespace(ctx, &source) {
+                    Ok(names) => {
+                        for name in &names {
+                            if let Some(schema) = ctx.table_schema(name) {
+                                let columns: Vec<String> =
+                                    schema.fields().iter().map(|f| f.name().clone()).collect();
+                                helper.register_table(name, columns);
+                            }
+                        }
+                        println!(
+                            "Registered {} pulsar topic(s) in {:.3}ms: {}\n",
+                            names.len(),
+                            start.elapsed().as_secs_f64() * 1000.0,
+                            names.join(", ")
+                        );
+                    }
+                    Err(e) => eprintln!("Error registering pulsar namespace: {e}\n"),
                 }
             }
         }

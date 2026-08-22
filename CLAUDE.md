@@ -1686,6 +1686,43 @@ which id lands at rank 10 is arbitrary in any implementation. The exact path
 matches the GPU float64 ground truth on all 10 queries at every rank, with
 category precision@10 = 1.000.
 
+## Catalog Integrations: Gravitino relational + Pulsar (2026-08-22)
+
+Epic `.claude/epics/catalog-integrations/`.
+
+**Gravitino** (`src/metastore/gravitino.rs`): `register_all` now detects the
+catalog TYPE. Fileset catalogs keep the exact gated path; RELATIONAL
+catalogs list tables via `.../schemas/{s}/tables`, load each and register
+`properties.location` through the Iceberg reader (local/file URIs only;
+other types/providers refused by name). Hermetic tests run a canned
+Gravitino over a real socket against the committed iceberg fixture.
+metastore_demo.sh gate re-verified PASS. The hand-rolled HTTP client sends
+`Accept: ...gravitino.v1+json, application/json` — Pulsar's Jersey answers
+406 without the latter.
+
+**Pulsar** (`src/storage/pulsar.rs`, `--features pulsar`): a namespace is
+the catalog. Admin REST lists topics + serves schemas; scans are BOUNDED
+SNAPSHOTS (earliest → lastMessageId fetched at scan start, batched
+boundaries honored by decoding the WS message id's protobuf varints);
+messages arrive over the broker's WebSocket reader API via tungstenite.
+**pulsar-rs was REJECTED with evidence**: it requires chrono >=0.4.41 and
+the resolver DOWNGRADED arrow to a broken 53.4.0 chasing it — tungstenite
+adds exactly two lock entries. JSON + AVRO schema types (both are Avro
+record schemas) map to arrow scalars with nullable unions; `__key` +
+`__publish_time` metadata columns; refusals BY NAME for schemaless topics,
+non-record schemas, unsupported field types, undecodable payloads;
+`QE_PULSAR_MAX_MESSAGES` caps snapshots (refuse, never OOM). Pulsar tables
+have no splits and no parquet_files, so scatter election and GPU offload
+skip them by construction.
+
+Wiring: `serve --pulsar-admin http://host:8085 --pulsar-namespace t/ns`,
+REPL `.pulsar <admin> <t/ns>`. Infra: `scripts/pulsar_local.sh`
+(standalone 4.0.5, repo JDK17, ports 6650/8085, inactive-topic GC DISABLED
+— it deletes idle test topics in ~60s and ate the first gate run);
+`scripts/pulsar_demo.sh` = acceptance gate (10k rows/topic through BOTH
+decode paths, exact values, discovery + refusal checks): PASS.
+`examples/pulsar_produce.rs` is the deterministic producer.
+
 ## GPU Aggregate Offload — priced, implemented, KEPT (2026-08-22)
 
 `--features gpu` (`src/physical/gpu.rs`, epic `.claude/epics/gpu-acceleration/`).

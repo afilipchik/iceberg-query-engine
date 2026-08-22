@@ -26,5 +26,11 @@ pub mod lance_write;
 #[cfg(feature = "lance")]
 pub use lance_write::{LanceWriteMode, LanceWriteResult};
 
+/// Apache Pulsar topics as tables. Requires `--features pulsar`.
+#[cfg(feature = "pulsar")]
+pub mod pulsar;
+#[cfg(feature = "pulsar")]
+pub use pulsar::{register_pulsar_namespace, PulsarSource, PulsarTable};
+
 pub mod ipc_cache;
 pub mod metadata_cache;
