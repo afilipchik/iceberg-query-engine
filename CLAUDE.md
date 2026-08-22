@@ -1686,6 +1686,46 @@ which id lands at rank 10 is arbitrary in any implementation. The exact path
 matches the GPU float64 ground truth on all 10 queries at every rank, with
 category precision@10 = 1.000.
 
+## GPU Aggregate Offload — priced, implemented, KEPT (2026-08-22)
+
+`--features gpu` (`src/physical/gpu.rs`, epic `.claude/epics/gpu-acceleration/`).
+The research question "can the GPU accelerate this engine" has a hardware-
+dependent answer, and this box's RTX 5090 (32GB VRAM ~1.8TB/s, PCIe Gen5)
+answers YES for exactly one regime — the one every successful GPU database
+(RAPIDS, HeavyDB, Crystal) lives in: **fused aggregates over DEVICE-RESIDENT
+columns**. The pricing bench (`examples/gpu_price_bench.rs`) showed warm
+kernels 28-33x the 32-thread CPU while a cold PCIe upload LOSES — so the
+architecture routes to the GPU only when columns are already resident; the
+first query runs the CPU path unchanged and triggers background uploads.
+There is no path where the GPU makes a query slower.
+
+Measured warm (best of 5): Q6 shape **39.5x** SF=1 / **58.7x** SF=10; full
+Q1 (10 aggregates, 6 groups) **17.0x** / **8.9x**. Equivalence battery vs
+CPU: ALL PASS at the distributed 1e-6 float tolerance.
+
+Load-bearing decisions (each forced by a real failure):
+- Cache identity = hash of the parquet FILE LIST. Table names collide across
+  contexts and raw Arc pointers suffer ABA through allocator reuse (a freed
+  MemoryTable's address got recycled and served stale device data). Only
+  parquet providers offload.
+- Distributed/serve contexts NEVER offload (`config.gpu_offload=false` in
+  fragment contexts; serve never opts in): the VRAM cache would alias shards
+  with full tables, and the M1/M2 gates demand byte-exact local answers
+  while GPU float reduction order differs in the last bits. Offload is
+  OPT-IN per context — the single-process CLI paths (repl/sql/load-parquet/
+  benchmark-parquet/query) call `ctx.enable_gpu_offload()`.
+- Bare COUNT(*) refused (needs no columns => no device length source).
+- Kernel: descriptor-driven (preds: conjunctive single-col compares; inputs:
+  col, a*b, a*(1-b), a*(1-b)*(1+c); SUM/MIN/MAX/COUNT/AVG), per-thread
+  register bins capped at 96 group*slot (Q1's 10 aggregates x 6 groups = 72;
+  the cap was 48 and Q1 silently stayed on the CPU — watch for that).
+- cudarc 0.19 dynamic-loading + cuda-13000; kernels NVRTC-compiled at
+  runtime; **libnvrtc comes from the repo .venv's nvidia pip wheel** — gpu
+  builds need `LD_LIBRARY_PATH=$PWD/.venv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib`.
+- `QE_GPU=0` kills routing at plan time even in a gpu build.
+- Not done (documented): eviction/QE_GPU_CACHE_MB cap, GPU joins, GPU
+  parquet decode, Lance/Iceberg providers, distributed-worker GPU.
+
 ## Expression Compilation — researched, priced, narrowly adopted (2026-08-22)
 
 The "modern engines compile queries" question, answered with measurements
