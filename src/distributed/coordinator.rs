@@ -200,7 +200,11 @@ pub fn shard_context(
     // only the sharded table overridden. This is what lets a partial query
     // join its shard against replicated dimension tables (the ClickHouse
     // sharded-fact / replicated-dims model; distributed-pushdown epic).
-    let mut ctx = ExecutionContext::with_config(base.config().clone());
+    let mut config = base.config().clone();
+    // Never GPU-offload inside a shard context — the device column cache is
+    // keyed by table name, and this context's tables are SHARDS.
+    config.gpu_offload = false;
+    let mut ctx = ExecutionContext::with_config(config);
     for name in base.table_names() {
         if name != table {
             if let Some(p) = base.table_provider(&name) {

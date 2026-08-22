@@ -23,7 +23,9 @@ fn main() {
     println!("rows = {n} (~SF=10 lineitem)");
 
     // Host columns, TPC-H-flavored values.
-    let price: Vec<f64> = (0..n).map(|i| 900.0 + (i % 100_000) as f64 * 0.01).collect();
+    let price: Vec<f64> = (0..n)
+        .map(|i| 900.0 + (i % 100_000) as f64 * 0.01)
+        .collect();
     let disc: Vec<f64> = (0..n).map(|i| (i % 11) as f64 * 0.01).collect();
     let tax: Vec<f64> = (0..n).map(|i| (i % 9) as f64 * 0.01).collect();
     let qty: Vec<f64> = (0..n).map(|i| (i % 50) as f64 + 1.0).collect();
@@ -128,7 +130,12 @@ extern "C" __global__ void q1_kernel(
     // warmup + timed GPU Q6
     for _ in 0..3 {
         let mut b = stream.launch_builder(&q6);
-        b.arg(&d_price).arg(&d_disc).arg(&d_qty).arg(&d_ship).arg(&nn).arg(&mut d_bs);
+        b.arg(&d_price)
+            .arg(&d_disc)
+            .arg(&d_qty)
+            .arg(&d_ship)
+            .arg(&nn)
+            .arg(&mut d_bs);
         unsafe { b.launch(cfg) }.unwrap();
     }
     stream.synchronize().unwrap();
@@ -136,7 +143,12 @@ extern "C" __global__ void q1_kernel(
     let t0 = Instant::now();
     for _ in 0..iters {
         let mut b = stream.launch_builder(&q6);
-        b.arg(&d_price).arg(&d_disc).arg(&d_qty).arg(&d_ship).arg(&nn).arg(&mut d_bs);
+        b.arg(&d_price)
+            .arg(&d_disc)
+            .arg(&d_qty)
+            .arg(&d_ship)
+            .arg(&nn)
+            .arg(&mut d_bs);
         unsafe { b.launch(cfg) }.unwrap();
     }
     stream.synchronize().unwrap();
@@ -147,14 +159,24 @@ extern "C" __global__ void q1_kernel(
     // timed GPU Q1
     for _ in 0..3 {
         let mut b = stream.launch_builder(&q1);
-        b.arg(&d_price).arg(&d_disc).arg(&d_tax).arg(&d_qty).arg(&nn).arg(&mut d_bs);
+        b.arg(&d_price)
+            .arg(&d_disc)
+            .arg(&d_tax)
+            .arg(&d_qty)
+            .arg(&nn)
+            .arg(&mut d_bs);
         unsafe { b.launch(cfg) }.unwrap();
     }
     stream.synchronize().unwrap();
     let t0 = Instant::now();
     for _ in 0..iters {
         let mut b = stream.launch_builder(&q1);
-        b.arg(&d_price).arg(&d_disc).arg(&d_tax).arg(&d_qty).arg(&nn).arg(&mut d_bs);
+        b.arg(&d_price)
+            .arg(&d_disc)
+            .arg(&d_tax)
+            .arg(&d_qty)
+            .arg(&nn)
+            .arg(&mut d_bs);
         unsafe { b.launch(cfg) }.unwrap();
     }
     stream.synchronize().unwrap();
@@ -204,15 +226,34 @@ extern "C" __global__ void q1_kernel(
                     a
                 },
             )
-            .reduce(|| (0.0, 0.0, 0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3));
+            .reduce(
+                || (0.0, 0.0, 0.0, 0.0),
+                |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3),
+            );
     }
     let c1t = t0.elapsed().as_secs_f64() / cpu_iters as f64;
 
     println!("\nQ6 shape  (filter+sum, 3.5 cols):");
-    println!("  GPU warm: {:8.3} ms   CPU: {:8.3} ms   speedup {:5.1}x", g6 * 1e3, c6 * 1e3, c6 / g6);
-    println!("  GPU cold (incl. its share of upload): {:8.3} ms", g6 * 1e3 + up * 1e3 * (28.0 / 36.0));
+    println!(
+        "  GPU warm: {:8.3} ms   CPU: {:8.3} ms   speedup {:5.1}x",
+        g6 * 1e3,
+        c6 * 1e3,
+        c6 / g6
+    );
+    println!(
+        "  GPU cold (incl. its share of upload): {:8.3} ms",
+        g6 * 1e3 + up * 1e3 * (28.0 / 36.0)
+    );
     println!("  checksum gpu={g6_sum:.3} cpu={c6_sum:.3}");
     println!("Q1 shape  (4 sums over arith chain, 4 cols):");
-    println!("  GPU warm: {:8.3} ms   CPU: {:8.3} ms   speedup {:5.1}x", g1 * 1e3, c1t * 1e3, c1t / g1);
-    println!("  (cpu checksums {:.1} {:.1} {:.1} {:.1})", c1.0, c1.1, c1.2, c1.3);
+    println!(
+        "  GPU warm: {:8.3} ms   CPU: {:8.3} ms   speedup {:5.1}x",
+        g1 * 1e3,
+        c1t * 1e3,
+        c1t / g1
+    );
+    println!(
+        "  (cpu checksums {:.1} {:.1} {:.1} {:.1})",
+        c1.0, c1.1, c1.2, c1.3
+    );
 }
