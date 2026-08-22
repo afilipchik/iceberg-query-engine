@@ -1111,6 +1111,14 @@ runs: MemoryHigh counts page cache and throttled a capped sweep +2.2s.
 
 ## TPC-H Benchmark Status (SF=1, 2026-08-21)
 
+**Distributed, 3 workers (same day): 4.33s forced-distributed
+(distributed=1), 22/22 CELL-EXACT vs DuckDB.** Q06 scatters (two_phase,
+imbalance 1.01); the other 21 gather (joins / global ORDER BY). ~3.1x
+single-process — gather re-ships shards per query over loopback and 3
+nodes share one host's bandwidth, so this measures coordination, not
+scaling. `scripts/cluster_local.sh start 3 --data ./data/tpch-1gb` +
+`.scratch/sf1/dist_bench.py` pattern.
+
 **1.38s warm vs DuckDB 1.4.4: 0.97s over the same parquet (1.42x) and
 0.44s native in-memory tables (3.11x); 22/22 CELL-EXACT.** Best of 3 per
 query, 16 duck threads, data `data/tpch-1gb` (current generator,

@@ -369,6 +369,50 @@ Overall: **1.42x** DuckDB on the same files, **3.11x** its native-table best
 case. The engine wins Q02, Q09, Q15, Q20 and Q21 like-for-like, and beats
 even native DuckDB on Q09 (124ms vs 169ms).
 
+### TPC-H SF=1, distributed — 3 workers (measured 2026-08-21)
+
+The same 22 queries against a 3-process cluster (`cluster_local.sh start 3`,
+real TCP, one host) with `distributed=1` — every query FORCED through
+distributed execution, never answered locally. Results again cell-exact vs
+DuckDB. One query (Q06) runs the scatter path (per-shard partial aggregates,
+one row shipped per node, imbalance 1.01); the other 21 have joins or global
+ORDER BY and run the gather path (workers stream their table shards to the
+initiator, which runs the original query).
+
+| Query | Distributed (3 nodes) | Single-process | Path |
+|-------|----------------------|----------------|------|
+| Q01 | 250ms | 74ms | gather |
+| Q02 | 46ms | 17ms | gather |
+| Q03 | 162ms | 95ms | gather |
+| Q04 | 92ms | 71ms | gather |
+| Q05 | 733ms | 61ms | gather |
+| Q06 | 66ms | 21ms | scatter |
+| Q07 | 197ms | 112ms | gather |
+| Q08 | 247ms | 80ms | gather |
+| Q09 | 794ms | 124ms | gather |
+| Q10 | 196ms | 105ms | gather |
+| Q11 | 31ms | 19ms | gather |
+| Q12 | 140ms | 68ms | gather |
+| Q13 | 97ms | 63ms | gather |
+| Q14 | 131ms | 25ms | gather |
+| Q15 | 127ms | 15ms | gather |
+| Q16 | 41ms | 25ms | gather |
+| Q17 | 141ms | 39ms | gather |
+| Q18 | 151ms | 104ms | gather |
+| Q19 | 287ms | 74ms | gather |
+| Q20 | 199ms | 66ms | gather |
+| Q21 | 163ms | 66ms | gather |
+| Q22 | 40ms | 55ms | gather |
+| **Total** | **4.33s** | **1.38s** | |
+
+Distributed is ~3.1x the single-process time at this scale: 21 of 22 queries
+pay gather's shipping cost (each query re-streams its input shards over
+loopback TCP), and 3 nodes on one host share the same memory bandwidth and
+page cache — this measures *coordination overhead*, not scaling. The honest
+win is correctness: forced-distributed answers are byte-comparable to the
+single-process oracle on every query, from any node.
+
+
 
 ## Supported Functions
 
