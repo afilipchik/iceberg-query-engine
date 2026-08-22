@@ -1,9 +1,9 @@
 ---
 name: catalog-integrations
-status: backlog
+status: completed
 created: 2026-08-22T15:25:08Z
-updated: 2026-08-22T15:25:08Z
-progress: 0%
+updated: 2026-08-22T15:56:33Z
+progress: 100%
 prd: .claude/prds/catalog-integrations.md
 github: (will be set on sync)
 ---
