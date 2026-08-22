@@ -597,19 +597,20 @@ async fn offset_is_honoured_on_both_paths() {
         "OFFSET must not disable the pushdown"
     );
 
-    // Ranks 3..5 of the ground truth, which for this query has no tie in that
-    // window (ranks 3 and 4 tie with each other, so both are acceptable at
-    // position 0; rank 5 is unique).
-    let (full, _) = ids_and_categories(&exact, &sql_ids_only(&gt[0].vector, 5, None)).await;
-    let expected: Vec<i64> = full[2..5].to_vec();
-
+    // OFFSET is a MECHANICS contract, tested per path against that path's
+    // OWN top-5: the window must be exactly its ranks 3..5. Demanding the
+    // exact path's ranks from the INDEXED path would make an approximate
+    // method's recall a hard equality — it held under lance 0.23's index by
+    // luck and broke on lance 10's. Recall has its own gated test.
     for (name, ctx) in [("exact", &exact), ("indexed", &indexed)] {
+        let (full, _) = ids_and_categories(ctx, &sql_ids_only(&gt[0].vector, 5, None)).await;
+        let expected: Vec<i64> = full[2..5].to_vec();
         let (ids, _) = ids_and_categories(ctx, &sql).await;
         assert_eq!(ids.len(), 3, "{} returned {} rows", name, ids.len());
         assert_eq!(
             ids.iter().collect::<std::collections::HashSet<_>>(),
             expected.iter().collect::<std::collections::HashSet<_>>(),
-            "{}: OFFSET 2 LIMIT 3 should be ranks 3-5, got {:?} want {:?}",
+            "{}: OFFSET 2 LIMIT 3 should be ranks 3-5 of its own top-5, got {:?} want {:?}",
             name,
             ids,
             expected
