@@ -65,11 +65,18 @@ fn main() {
     let rows = 8192usize;
     let nbatches = 64usize;
     let batches: Vec<RecordBatch> = (0..nbatches).map(|_| batch(rows)).collect();
-    println!("rows/batch={rows}, batches={nbatches} (~{}k rows/iter)\n", rows * nbatches / 1000);
+    println!(
+        "rows/batch={rows}, batches={nbatches} (~{}k rows/iter)\n",
+        rows * nbatches / 1000
+    );
 
     // ---- Shape 1: Q1's aggregate input  price * (1-disc) * (1+tax) ----
     let q1 = bin(
-        bin(col("l_extendedprice"), BinaryOp::Multiply, bin(lit(1.0), BinaryOp::Subtract, col("l_discount"))),
+        bin(
+            col("l_extendedprice"),
+            BinaryOp::Multiply,
+            bin(lit(1.0), BinaryOp::Subtract, col("l_discount")),
+        ),
         BinaryOp::Multiply,
         bin(lit(1.0), BinaryOp::Add, col("l_tax")),
     );
@@ -146,6 +153,19 @@ fn main() {
             let a = query_engine::physical::operators::evaluate_expr(b, &q6).unwrap();
             let a = a.as_any().downcast_ref::<BooleanArray>().unwrap();
             s += a.true_count() as f64;
+        }
+        s
+    });
+    let q6_compiled = query_engine::physical::compiled_expr::CompiledPredicate::compile(
+        &q6,
+        &batches[0].schema(),
+    )
+    .expect("q6 compiles");
+    time("Q6 predicate: COMPILED (this epic)", iters, || {
+        let mut s = 0.0;
+        for b in &batches {
+            let m = q6_compiled.evaluate(b).unwrap();
+            s += m.true_count() as f64;
         }
         s
     });

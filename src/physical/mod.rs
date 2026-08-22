@@ -2,6 +2,7 @@
 //!
 //! Converts logical plans to physical plans and executes them
 
+pub mod compiled_expr;
 pub mod morsel;
 pub mod morsel_agg;
 pub mod operators;

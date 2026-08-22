@@ -547,18 +547,12 @@ impl ParquetTable {
                         builder.parquet_schema(),
                         indices.iter().copied(),
                     );
-                    let expr = expr.clone();
+                    let evaluator =
+                        crate::physical::compiled_expr::PredicateEvaluator::new(expr.clone());
                     let pred = ArrowPredicateFn::new(mask, move |batch: RecordBatch| {
-                        let arr = crate::physical::operators::evaluate_expr(&batch, &expr)
-                            .map_err(|e| arrow::error::ArrowError::ComputeError(e.to_string()))?;
-                        arr.as_any()
-                            .downcast_ref::<arrow::array::BooleanArray>()
-                            .cloned()
-                            .ok_or_else(|| {
-                                arrow::error::ArrowError::ComputeError(
-                                    "row filter did not evaluate to boolean".into(),
-                                )
-                            })
+                        evaluator
+                            .evaluate(&batch)
+                            .map_err(|e| arrow::error::ArrowError::ComputeError(e.to_string()))
                     });
                     builder.with_row_filter(RowFilter::new(vec![Box::new(pred)]))
                 } else {
