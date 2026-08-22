@@ -1383,6 +1383,10 @@ impl<'a> Binder<'a> {
                     )?;
                     let aliased = converted.alias(alias.value.clone());
                     field.name = alias.value.clone();
+                    // An explicit alias names a NEW output column; keeping the
+                    // source column's qualifier would render it "n1.alias" and
+                    // make the alias unaddressable by its own name.
+                    field.relation = None;
                     exprs.push(aliased);
                     fields.push(field);
                 }

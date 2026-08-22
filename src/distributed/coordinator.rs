@@ -625,6 +625,11 @@ async fn merge(
                 .first()
                 .map(|b| b.schema())
                 .ok_or_else(|| QueryError::Execution("no shard returned a schema".into()))?;
+            // Empty shards ship schema-only placeholders (decode_ipc); drop
+            // them so an all-empty answer matches the single-process engine,
+            // which returns no batches for a rowless plain select.
+            let batches: Vec<RecordBatch> =
+                batches.into_iter().filter(|b| b.num_rows() > 0).collect();
             let row_count = batches.iter().map(|b| b.num_rows()).sum();
             Ok(QueryResult {
                 schema,
@@ -640,11 +645,11 @@ async fn merge(
                 "merge() called with MergeShape::Gather — a scatter plan cannot carry it".into(),
             ));
         }
-        MergeShape::TwoPhase => {
+        MergeShape::TwoPhase | MergeShape::TopN => {
             let final_sql = plan
                 .final_sql
                 .as_ref()
-                .expect("TwoPhase always carries a merge query");
+                .expect("TwoPhase/TopN always carry a merge query");
             let schema = batches
                 .first()
                 .map(|b| b.schema())
@@ -655,7 +660,15 @@ async fn merge(
             // it gets the engine's real aggregation — including its NULL and
             // type semantics — rather than a hand-rolled reduction that would
             // have to reimplement them and could disagree.
-            ctx.sql(final_sql).await
+            let mut result = ctx.sql(final_sql).await?;
+            // TopN finals are plain selects; the single-process engine emits
+            // NO batches for a rowless plain select, while an aggregate's
+            // empty answer keeps its zero-row batch. Match it exactly — the
+            // acceptance gate diffs CSV byte for byte.
+            if matches!(plan.shape, MergeShape::TopN) && result.row_count == 0 {
+                result.batches.clear();
+            }
+            Ok(result)
         }
     }
 }
@@ -707,11 +720,19 @@ fn unify(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
 }
 
 /// Decode an Arrow IPC stream into batches.
+///
+/// An empty shard answers with a schema-only stream; that schema must
+/// survive as a zero-row batch, or the merge stage cannot even register the
+/// partial table (Q20-shaped TopN over a selective filter hits this).
 pub fn decode_ipc(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
     let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)?;
+    let schema = reader.schema();
     let mut out = Vec::new();
     for b in reader {
         out.push(b?);
+    }
+    if out.is_empty() {
+        out.push(RecordBatch::new_empty(schema));
     }
     Ok(out)
 }
@@ -1005,9 +1026,12 @@ mod tests {
     async fn unsupported_shapes_never_reach_the_wire() {
         let base = ctx();
         for sql in [
-            "SELECT COUNT(*) FROM lineitem JOIN orders ON l_orderkey = o_orderkey",
+            // Joins and ORDER BY scatter since the distributed-pushdown
+            // epic; what must never reach the wire is what cannot be
+            // decomposed at all.
             "SELECT COUNT(DISTINCT l_orderkey) FROM lineitem",
-            "SELECT l_orderkey FROM lineitem ORDER BY l_orderkey",
+            "SELECT STDDEV(l_quantity) FROM lineitem",
+            "SELECT COUNT(*) FROM lineitem a, lineitem b WHERE a.l_orderkey = b.l_orderkey",
         ] {
             // `Dead` would error on any fan-out, so reaching NotImplemented
             // proves the rejection happened before the first request.
