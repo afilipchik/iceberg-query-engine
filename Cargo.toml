@@ -133,6 +133,17 @@ lance = { version = "0.23", default-features = false, optional = true }
 lance-index = { version = "0.23", optional = true }
 lance-linalg = { version = "0.23", optional = true }
 
+# Apache Pulsar integration (OPTIONAL — see [features]). Topics-as-tables:
+# the admin REST API is the catalog (discovery, schema registry, bounded-read
+# watermarks) and the WebSocket reader API delivers the messages. The native
+# pulsar-rs client was REJECTED: 6.8 requires chrono >= 0.4.41, which is
+# incompatible with the arrow-53 pin (newer chrono breaks arrow-arith 53.x) —
+# the resolver downgraded arrow chasing it. tungstenite is a small sync
+# WebSocket client whose tree stays inside the existing lock families.
+tungstenite = { version = "0.24", optional = true, default-features = false, features = [
+    "handshake",
+] }
+
 # GPU offload (OPTIONAL — see [features]). cudarc is pure Rust over the CUDA
 # driver API + NVRTC: kernels are CUDA C strings compiled AT RUNTIME by
 # libnvrtc, so there is no nvcc, no build script, no bindgen. dynamic-loading
@@ -159,6 +170,9 @@ lance = ["dep:lance", "dep:lance-index", "dep:lance-linalg"]
 # GPU-resident aggregate offload (src/physical/gpu/). Off by default: the
 # default build has zero CUDA surface. Needs an NVIDIA driver at runtime.
 gpu = ["dep:cudarc"]
+# Pulsar topics as tables (src/storage/pulsar.rs): serve --pulsar-*, REPL
+# .pulsar. Off by default; needs a reachable broker at runtime.
+pulsar = ["dep:tungstenite"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

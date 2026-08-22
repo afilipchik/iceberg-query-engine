@@ -38,6 +38,11 @@ start)
     mkdir -p "$STATE"
     info "starting pulsar standalone (broker 6650, admin 8085)"
     sed -i 's/^webServicePort=.*/webServicePort=8085/' "$PULSAR_HOME/conf/standalone.conf"
+    # A test broker must not garbage-collect idle topics between produce and
+    # query (standalone deletes subscription-less inactive topics in ~60s).
+    sed -i 's/^brokerDeleteInactiveTopicsEnabled=.*/brokerDeleteInactiveTopicsEnabled=false/' "$PULSAR_HOME/conf/standalone.conf"
+    grep -q '^brokerDeleteInactiveTopicsEnabled=false' "$PULSAR_HOME/conf/standalone.conf" \
+        || echo 'brokerDeleteInactiveTopicsEnabled=false' >> "$PULSAR_HOME/conf/standalone.conf"
     PULSAR_STANDALONE_USE_ZOOKEEPER="" nohup "$PULSAR_HOME/bin/pulsar" standalone -nss -nfw \
         > "$LOG" 2>&1 &
     echo $! > "$PIDFILE"

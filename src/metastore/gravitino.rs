@@ -322,7 +322,7 @@ fn local_path(uri: &str) -> Option<PathBuf> {
 /// one per call. A metastore fetch is a handful of small local GETs at node
 /// startup; a TcpStream and 30 lines is the whole requirement. HTTPS is
 /// refused by name rather than half-supported.
-fn http_get(base_url: &str, path: &str) -> Result<Vec<u8>> {
+pub(crate) fn http_get(base_url: &str, path: &str) -> Result<Vec<u8>> {
     let hostport = base_url
         .strip_prefix("http://")
         .ok_or_else(|| {
@@ -340,7 +340,7 @@ fn http_get(base_url: &str, path: &str) -> Result<Vec<u8>> {
         .map_err(|e| QueryError::Storage(format!("metastore {base_url}: socket: {e}")))?;
 
     let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {hostport}\r\nAccept: application/vnd.gravitino.v1+json\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: {hostport}\r\nAccept: application/vnd.gravitino.v1+json, application/json\r\nConnection: close\r\n\r\n"
     );
     stream
         .write_all(req.as_bytes())

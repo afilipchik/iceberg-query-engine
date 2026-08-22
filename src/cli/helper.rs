@@ -176,6 +176,7 @@ pub const DOT_COMMANDS: &[&str] = &[
     ".tables",
     ".schema",
     ".load",
+    ".pulsar",
     ".tpch",
     ".mode",
     ".format",
