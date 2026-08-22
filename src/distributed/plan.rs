@@ -173,6 +173,9 @@ pub fn plan_distributed(ctx: &ExecutionContext, sql: &str) -> Result<Distributed
                     "wildcard (SELECT *) in an aggregated or grouped query",
                 ))
             }
+            sa::SelectItem::ExprWithAliases { .. } => {
+                return Err(unsupported("multi-alias SELECT items"))
+            }
         };
         let rewritten = rw.rewrite(expr)?;
         final_projection.push(sa::SelectItem::ExprWithAlias {
@@ -220,7 +223,10 @@ fn resolve_group_item(g: &sa::Expr, select: &sa::Select) -> Result<sa::Expr> {
             }
             Ok(g.clone())
         }
-        sa::Expr::Value(sa::Value::Number(n, _)) => {
+        sa::Expr::Value(sa::ValueWithSpan {
+            value: sa::Value::Number(n, _),
+            ..
+        }) => {
             let ord: usize = n
                 .parse()
                 .map_err(|_| unsupported(format!("GROUP BY position {n}")))?;
@@ -237,12 +243,12 @@ fn resolve_group_item(g: &sa::Expr, select: &sa::Select) -> Result<sa::Expr> {
 /// Render one ORDER BY item's direction suffix.
 fn order_suffix(o: &sa::OrderByExpr) -> String {
     let mut out = String::new();
-    match o.asc {
+    match o.options.asc {
         Some(false) => out.push_str(" DESC"),
         Some(true) => out.push_str(" ASC"),
         None => {}
     }
-    match o.nulls_first {
+    match o.options.nulls_first {
         Some(true) => out.push_str(" NULLS FIRST"),
         Some(false) => out.push_str(" NULLS LAST"),
         None => {}
@@ -261,7 +267,10 @@ fn rewrite_order_by(
     let mut out = Vec::with_capacity(order_by.len());
     for o in order_by {
         let rendered = match &o.expr {
-            sa::Expr::Value(sa::Value::Number(n, _)) => {
+            sa::Expr::Value(sa::ValueWithSpan {
+                value: sa::Value::Number(n, _),
+                ..
+            }) => {
                 let ord: usize = n
                     .parse()
                     .map_err(|_| unsupported(format!("ORDER BY position {n}")))?;
@@ -310,7 +319,10 @@ fn plan_topn(
     let mut final_order = Vec::with_capacity(ol.order_by.len());
     for o in &ol.order_by {
         let name = match &o.expr {
-            sa::Expr::Value(sa::Value::Number(n, _)) => {
+            sa::Expr::Value(sa::ValueWithSpan {
+                value: sa::Value::Number(n, _),
+                ..
+            }) => {
                 let ord: usize = n
                     .parse()
                     .map_err(|_| unsupported(format!("ORDER BY position {n}")))?;
@@ -418,34 +430,60 @@ fn structural_check(stmt: &sa::Statement) -> Result<(&sa::Select, OrderLimit)> {
             if ob.interpolate.is_some() {
                 return Err(unsupported("ORDER BY ... INTERPOLATE"));
             }
-            ob.exprs.clone()
+            match &ob.kind {
+                sa::OrderByKind::Expressions(exprs) => exprs.clone(),
+                sa::OrderByKind::All(_) => {
+                    return Err(unsupported("ORDER BY ALL"));
+                }
+            }
         }
     };
-    let limit = match &query.limit {
-        None => None,
-        Some(sa::Expr::Value(sa::Value::Number(n, _))) => Some(
-            n.parse::<u64>()
-                .map_err(|_| unsupported(format!("non-integer LIMIT ({n})")))?,
-        ),
-        Some(other) => return Err(unsupported(format!("non-literal LIMIT ({other})"))),
-    };
-    let offset = match &query.offset {
-        None => None,
-        Some(sa::Offset {
-            value: sa::Expr::Value(sa::Value::Number(n, _)),
-            ..
-        }) => Some(
-            n.parse::<u64>()
-                .map_err(|_| unsupported(format!("non-integer OFFSET ({n})")))?,
-        ),
-        Some(other) => return Err(unsupported(format!("non-literal OFFSET ({})", other.value))),
+    let (limit, offset) = match &query.limit_clause {
+        None => (None, None),
+        Some(sa::LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        }) => {
+            if !limit_by.is_empty() {
+                return Err(unsupported("LIMIT ... BY"));
+            }
+            let l = match limit {
+                None => None,
+                Some(sa::Expr::Value(sa::ValueWithSpan {
+                    value: sa::Value::Number(n, _),
+                    ..
+                })) => Some(
+                    n.parse::<u64>()
+                        .map_err(|_| unsupported(format!("non-integer LIMIT ({n})")))?,
+                ),
+                Some(other) => return Err(unsupported(format!("non-literal LIMIT ({other})"))),
+            };
+            let o = match offset {
+                None => None,
+                Some(sa::Offset {
+                    value:
+                        sa::Expr::Value(sa::ValueWithSpan {
+                            value: sa::Value::Number(n, _),
+                            ..
+                        }),
+                    ..
+                }) => Some(
+                    n.parse::<u64>()
+                        .map_err(|_| unsupported(format!("non-integer OFFSET ({n})")))?,
+                ),
+                Some(other) => {
+                    return Err(unsupported(format!("non-literal OFFSET ({})", other.value)))
+                }
+            };
+            (l, o)
+        }
+        Some(other) => return Err(unsupported(format!("this LIMIT form ({other:?})"))),
     };
     if query.fetch.is_some() {
         return Err(unsupported("FETCH FIRST (use LIMIT)"));
     }
-    if !query.limit_by.is_empty() {
-        return Err(unsupported("LIMIT ... BY"));
-    }
+
     let ol = OrderLimit {
         order_by,
         limit,
@@ -488,7 +526,7 @@ fn structural_check(stmt: &sa::Statement) -> Result<(&sa::Select, OrderLimit)> {
     {
         return Err(unsupported("CLUSTER BY / DISTRIBUTE BY / SORT BY"));
     }
-    if select.connect_by.is_some() {
+    if !select.connect_by.is_empty() {
         return Err(unsupported("CONNECT BY"));
     }
 
@@ -989,17 +1027,20 @@ impl Rewriter {
                 expr,
                 data_type,
                 format,
+                array,
             } => sa::Expr::Cast {
                 kind: kind.clone(),
                 expr: Box::new(self.rewrite(expr)?),
                 data_type: data_type.clone(),
                 format: format.clone(),
+                array: *array,
             },
             sa::Expr::Case {
                 operand,
                 conditions,
-                results,
                 else_result,
+                case_token,
+                end_token,
             } => sa::Expr::Case {
                 operand: match operand {
                     Some(o) => Some(Box::new(self.rewrite(o)?)),
@@ -1007,16 +1048,19 @@ impl Rewriter {
                 },
                 conditions: conditions
                     .iter()
-                    .map(|c| self.rewrite(c))
-                    .collect::<Result<Vec<_>>>()?,
-                results: results
-                    .iter()
-                    .map(|r| self.rewrite(r))
+                    .map(|c| {
+                        Ok(sa::CaseWhen {
+                            condition: self.rewrite(&c.condition)?,
+                            result: self.rewrite(&c.result)?,
+                        })
+                    })
                     .collect::<Result<Vec<_>>>()?,
                 else_result: match else_result {
                     Some(x) => Some(Box::new(self.rewrite(x)?)),
                     None => None,
                 },
+                case_token: case_token.clone(),
+                end_token: end_token.clone(),
             },
             sa::Expr::IsNull(x) => sa::Expr::IsNull(Box::new(self.rewrite(x)?)),
             sa::Expr::IsNotNull(x) => sa::Expr::IsNotNull(Box::new(self.rewrite(x)?)),
@@ -1409,7 +1453,10 @@ fn unnamed(e: sa::Expr) -> sa::FunctionArg {
 
 fn call(name: &str, args: Vec<sa::FunctionArg>) -> sa::Expr {
     sa::Expr::Function(sa::Function {
-        name: sa::ObjectName(vec![sa::Ident::new(name.to_string())]),
+        uses_odbc_syntax: false,
+        name: sa::ObjectName(vec![sa::ObjectNamePart::Identifier(sa::Ident::new(
+            name.to_string(),
+        ))]),
         parameters: sa::FunctionArguments::None,
         args: sa::FunctionArguments::List(sa::FunctionArgumentList {
             duplicate_treatment: None,
@@ -1425,9 +1472,10 @@ fn call(name: &str, args: Vec<sa::FunctionArg>) -> sa::Expr {
 
 fn cast_double(e: sa::Expr) -> sa::Expr {
     sa::Expr::Cast {
+        array: false,
         kind: sa::CastKind::Cast,
         expr: Box::new(e),
-        data_type: sa::DataType::Double,
+        data_type: sa::DataType::Double(sa::ExactNumberInfo::None),
         format: None,
     }
 }

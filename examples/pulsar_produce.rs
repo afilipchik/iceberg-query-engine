@@ -76,7 +76,7 @@ fn main() {
                 "payload": base64::engine::general_purpose::STANDARD.encode(&payload),
                 "key": format!("k{}", i % 100),
             });
-            ws.send(tungstenite::Message::Text(msg.to_string()))
+            ws.send(tungstenite::Message::Text(msg.to_string().into()))
                 .expect("send");
             // Read the ack to keep the socket flowing.
             loop {

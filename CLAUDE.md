@@ -49,6 +49,27 @@ This ensures consistent code formatting across the codebase.
 - When adding new operators, they MUST handle memory limits and spill to disk when needed
 - Never add a parameter that lets users opt out of memory safety
 
+### Sandboxed Build Rule
+
+**EVERY BUILD, TEST, OR BENCHMARK COMMAND MUST RUN THROUGH `scripts/claude-safe-build.sh`.**
+
+```bash
+scripts/claude-safe-build.sh cargo test --release --features lance
+SAFE_BUILD_MEM=48G SAFE_BUILD_JOBS=8 scripts/claude-safe-build.sh cargo bench --bench tpch
+```
+
+The wrapper runs the command in its own transient cgroup scope
+(`systemd-run --user --scope`) with a hard 80G memory cap and
+CARGO_BUILD_JOBS=8 (the release profile uses fat LTO with codegen-units=1, so each link is a multi-GB job). If a build exceeds the cap, the kernel kills
+processes inside that scope only and cargo fails cleanly (exit 137).
+
+Why: on 2026-08-22 a bare `cargo test --release --features lance` peaked
+at 105G inside the terminal's cgroup; systemd-oomd killed the whole
+terminal scope — including the Claude session and remote-control bridge.
+A build must never share a cgroup with the session that launched it.
+Never run bare `cargo build/test/bench` for release or heavy-feature
+builds; there is no situation where bypassing the wrapper is worth it.
+
 ### Benchmark Timeout Rule
 
 **SET BENCHMARK TIMEOUT TO 10x DUCKDB EXECUTION TIME.**
@@ -1722,6 +1743,42 @@ REPL `.pulsar <admin> <t/ns>`. Infra: `scripts/pulsar_local.sh`
 `scripts/pulsar_demo.sh` = acceptance gate (10k rows/topic through BOTH
 decode paths, exact values, discovery + refusal checks): PASS.
 `examples/pulsar_produce.rs` is the deterministic producer.
+
+## Dependency Modernization — every crate to latest-or-verdict (2026-08-22)
+
+Staged, gated upgrade of the whole dependency tree (epic
+`dependency-modernization`). Final state, with every gate green (default 988 /
+lance 1052 / gpu 988 / pulsar 991 tests, M1 + M2 cluster gates, forced-
+distributed TPC-H sweep cell-exact vs DuckDB, pyarrow Flight interop,
+SF=1 benchmark 1.33–1.35s avg — ~10% faster than pre-epic from the newer
+parquet/arrow kernels):
+
+- **Arrow cluster (atomic move)**: arrow/parquet/arrow-flight 53 → 58.4,
+  tonic 0.14, chrono 0.4.45, lance 0.23 → 10.0. NOT arrow 59.2: lance 10 is
+  built against arrow 58; bumping arrow alone would fork arrow in-tree.
+  Re-evaluate when a lance line on arrow 59 ships.
+- **sqlparser 0.52 → 0.62**: AST churn absorbed in binder + distributed AST
+  rewriter (ValueWithSpan, OrderByKind, LimitClause, CaseWhen,
+  ObjectNamePart, JoinOperator variants). New syntax forms the engine does
+  not support (ORDER BY ALL, LIMIT ... BY, multi-alias SELECT items) are
+  rejected by name, not silently misplanned.
+- **Independents**: thiserror 2, itertools 0.15, ordered-float 5, statrs
+  0.19, hashbrown 0.17, base64 0.23, tungstenite 0.30, rand 0.10, digest
+  family 0.11/0.13, reqwest 0.13, apache-avro 0.22, criterion 0.8.
+  Old majors still in Cargo.lock are transitive-only.
+- **Deferred with reasons**: rustyline stays 17 (18's `with-fuzzy` pins a
+  conflicting dep); libc stays 0.2 by policy (1.0 is an alpha prerelease).
+- **Bugs found by the upgrade gates** (both in `hash_agg.rs` partial-state
+  merge, both pre-existing): (1) variance/stddev merge applied Chan's
+  centered-M2 correction to RAW Σx² states, inflating every merged variance —
+  caught because the M2 gate's distributed STDDEV drifted 6.7e-6 off DuckDB;
+  (2) SKEWNESS/KURTOSIS merges dropped Σx²/Σx³/Σx⁴ entirely. Both fixed:
+  raw power sums now merge by plain addition.
+- **Known issue (pre-existing, out of epic scope)**: the morsel-parallel
+  path maps SKEWNESS/KURTOSIS to `AccumulatorState::Count` ("default for
+  unsupported"), so single-process skew/kurt over parquet-scale data
+  returns NULL (`morsel_agg.rs`, `_ => AccumulatorState::Count(0)`).
+  Distributed skew/kurt works and matches DuckDB.
 
 ## GPU Aggregate Offload — priced, implemented, KEPT (2026-08-22)
 

@@ -532,7 +532,12 @@ impl Highlighter for ReplHelper {
         Cow::Owned(format!("\x1b[2;37m{}\x1b[0m", hint))
     }
 
-    fn highlight_char(&self, _line: &str, _pos: usize, _forced: bool) -> bool {
+    fn highlight_char(
+        &self,
+        _line: &str,
+        _pos: usize,
+        _kind: rustyline::highlight::CmdKind,
+    ) -> bool {
         // Return true to trigger re-highlighting
         true
     }

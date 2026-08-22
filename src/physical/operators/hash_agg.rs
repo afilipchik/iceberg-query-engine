@@ -1430,17 +1430,22 @@ fn merge_accumulator_states(
         | AggregateFunction::StddevPop
         | AggregateFunction::Variance
         | AggregateFunction::VarSamp
-        | AggregateFunction::VarPop => {
-            // Use Welford's online algorithm for parallel merge
-            let n1 = target.count as f64;
-            let n2 = source.count as f64;
-            let n = n1 + n2;
-            if n > 0.0 {
-                let delta = source.sum / n2.max(1.0) - target.sum / n1.max(1.0);
-                target.sum += source.sum;
-                target.sum_squares += source.sum_squares + delta * delta * n1 * n2 / n;
-                target.count += source.count;
-            }
+        | AggregateFunction::VarPop
+        | AggregateFunction::Skewness
+        | AggregateFunction::Kurtosis => {
+            // These states hold RAW power sums Σx²/Σx³/Σx⁴ (see the update
+            // path), not centered moments, so partial states merge by plain
+            // addition. The previous Chan-style `delta²·n1·n2/n` term belongs
+            // only to the centered representation; applied to raw sums it
+            // inflated every merged variance (caught by the M2 gate's
+            // distributed STDDEV check, drifting 6.7e-6 above DuckDB).
+            // Skewness/Kurtosis previously fell to the default arm, which
+            // dropped their higher moments entirely on merge.
+            target.count += source.count;
+            target.sum += source.sum;
+            target.sum_squares += source.sum_squares;
+            target.sum_cubes += source.sum_cubes;
+            target.sum_fourth += source.sum_fourth;
         }
         _ => {
             // For other functions, just merge counts and sums

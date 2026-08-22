@@ -249,7 +249,8 @@ pub fn create_vector_index(
     replace: bool,
 ) -> Result<LanceWriteResult> {
     use lance::index::vector::VectorIndexParams;
-    use lance_index::{DatasetIndexExt, IndexType};
+    use lance::index::DatasetIndexExt;
+    use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
 
     let path = path.as_ref().to_path_buf();
@@ -338,6 +339,7 @@ pub fn create_vector_index(
         let params = VectorIndexParams::ivf_pq(partitions, 8, sub_vectors, metric_type, 50);
         ds.create_index(&[&column], IndexType::Vector, None, &params, replace)
             .await
+            .map(|_metadata| ())
             .map_err(|e| lance_err(&format!("create_index on {}", column), e))?;
 
         // Re-open so the reported version reflects the committed manifest.

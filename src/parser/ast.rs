@@ -28,7 +28,10 @@ impl ObjectNameExt for ObjectName {
     fn table_name(&self) -> String {
         self.0
             .iter()
-            .map(|i| i.value.clone())
+            .map(|part| match part {
+                sqlparser::ast::ObjectNamePart::Identifier(i) => i.value.clone(),
+                other => other.to_string(),
+            })
             .collect::<Vec<_>>()
             .join(".")
     }
