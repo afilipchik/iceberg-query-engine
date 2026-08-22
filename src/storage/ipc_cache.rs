@@ -157,7 +157,7 @@ fn build_sidecar(parquet_path: &Path, dir: &Path, src_meta: &std::fs::Metadata) 
                 && (0..n_rg).all(|rg| {
                     let col = md.metadata().row_group(rg).column(*i);
                     col.dictionary_page_offset().is_some()
-                        && col.encodings().iter().all(|e| {
+                        && col.encodings().all(|e| {
                             matches!(
                                 e,
                                 parquet::basic::Encoding::PLAIN_DICTIONARY
@@ -316,7 +316,9 @@ fn build_sidecar(parquet_path: &Path, dir: &Path, src_meta: &std::fs::Metadata) 
         // makes the second dict field look like a forbidden replacement.
         // preserve_dict_id(false) has the writer assign unique ids.
         #[allow(deprecated)]
-        let opts = arrow::ipc::writer::IpcWriteOptions::default().with_preserve_dict_id(false);
+        // arrow 54+ removed preserve_dict_id: dictionary ids are always
+        // assigned automatically now, which is what `false` asked for.
+        let opts = arrow::ipc::writer::IpcWriteOptions::default();
         let mut w = arrow::ipc::writer::FileWriter::try_new_with_options(
             std::io::BufWriter::new(f),
             &schema,

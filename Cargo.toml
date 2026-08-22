@@ -19,13 +19,13 @@ resolver = "3"
 sqlparser = "0.52"
 
 # Arrow ecosystem
-arrow = { version = "53", features = ["ffi", "chrono-tz", "prettyprint"] }
-arrow-array = "53"
-arrow-schema = "53"
-arrow-select = "53"
-arrow-ord = "53"
-arrow-cast = "53"
-parquet = { version = "53", features = ["async"] }
+arrow = { version = "58", features = ["ffi", "chrono-tz", "prettyprint"] }
+arrow-array = "58"
+arrow-schema = "58"
+arrow-select = "58"
+arrow-ord = "58"
+arrow-cast = "58"
+parquet = { version = "58", features = ["async"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -101,8 +101,8 @@ http-body-util = "0.1"
 # requires, so the risk the ruling guarded against does not arise. Verified on
 # addition: the Cargo.lock diff was ADD-ONLY (no existing crate moved). tonic
 # runs its own hyper/h2 stack; our direct hyper dependency keeps http1-only.
-arrow-flight = "53"
-tonic = "0.12"
+arrow-flight = "58"
+tonic = "0.14"
 # TcpListenerStream for the flight server's incoming socket stream. Already in
 # the lock as tonic's own dependency, so naming it adds no lock entries.
 tokio-stream = { version = "0.1", features = ["net"] }
@@ -125,13 +125,13 @@ memmap2 = "0.9.11"
 # arrow 54/55/58 and would fork the arrow version in-tree. Do not bump.
 # Building this feature also needs `protoc` on PATH or in $PROTOC
 # (lance-table's build script compiles .proto files).
-lance = { version = "0.23", default-features = false, optional = true }
+lance = { version = "10", default-features = false, optional = true }
 # Already in the tree as transitive dependencies of lance 0.23.2 — naming them
 # here adds no compilation, only the direct import paths the WRITE path needs:
 # `DatasetIndexExt`/`IndexType` for create_index, and `MetricType` for the
 # index's distance function. lance re-exports neither. Same pin, same reason.
-lance-index = { version = "0.23", optional = true }
-lance-linalg = { version = "0.23", optional = true }
+lance-index = { version = "10", optional = true }
+lance-linalg = { version = "10", optional = true }
 
 # Apache Pulsar integration (OPTIONAL — see [features]). Topics-as-tables:
 # the admin REST API is the catalog (discovery, schema registry, bounded-read
