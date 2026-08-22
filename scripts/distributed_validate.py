@@ -108,9 +108,10 @@ GATHER_QUERIES = [
 # must contain; the point is that the reason is specific, not merely an error.
 # The list is short on purpose: gather widened distributed support to exactly
 # the local engine's envelope, so what remains is what the ENGINE cannot run
-# (windows), what has nothing to shard, and what is not a SELECT.
+# what has nothing to shard, and what is not a SELECT. (Window functions
+# run distributed through the gather path since the standard-sql-completion
+# epic, so they no longer belong here.)
 REJECTIONS = [
-    ("window function", "SELECT SUM(l_quantity) OVER () FROM lineitem", "indow"),
     ("no base table", "SELECT 1", "no base table"),
     ("non-SELECT", "DROP TABLE lineitem", "only SELECT"),
 ]
