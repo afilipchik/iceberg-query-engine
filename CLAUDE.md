@@ -1111,7 +1111,19 @@ runs: MemoryHigh counts page cache and throttled a capped sweep +2.2s.
 
 ## TPC-H Benchmark Status (SF=1, 2026-08-21)
 
-**Distributed, 3 workers (same day): 4.33s forced-distributed
+**Distributed pushdown (2026-08-22 epic): 2.09s forced-distributed —
+2.07x faster; 17/22 scatter (15 two_phase + 2 top_n), 22/22 CELL-EXACT
+vs DuckDB.** Scatter now covers joins + subqueries + HAVING/ORDER/LIMIT
+via the ClickHouse sharded-fact/replicated-dims model: one elected table
+(largest, referenced exactly once, shard-safe join path) is sharded,
+everything else reads worker-local replicas; merge stage finishes
+HAVING/ORDER BY/LIMIT; TopN pre-truncates per shard. Gather remains for
+Q11/Q13/Q15/Q16/Q22 (dup references / nested aggs / COUNT DISTINCT).
+Fragment contexts register the FULL catalog (coordinator.rs). Election
+and safety rules: src/distributed/plan.rs census. Residual ~30-50ms/query
+fan-out overhead is the M3 target.
+
+**Pre-epic record: 4.33s forced-distributed
 (distributed=1), 22/22 CELL-EXACT vs DuckDB.** Q06 scatters (two_phase,
 imbalance 1.01); the other 21 gather (joins / global ORDER BY). ~3.1x
 single-process — gather re-ships shards per query over loopback and 3

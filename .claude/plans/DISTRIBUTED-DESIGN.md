@@ -148,6 +148,20 @@ The partial/final aggregate split already exists: `AccumulatorState` is a closed
 
 ---
 
+> **AMENDMENT 2026-08-22 (distributed-pushdown epic).** Before M3's full
+> exchanges, the scatter path was generalized to the ClickHouse
+> sharded-fact/replicated-dims model combined with Trino's partial/final
+> discipline: joins, subqueries, HAVING, ORDER BY and LIMIT scatter when ONE
+> table is electable (referenced exactly once, main FROM tree, preserved side
+> of outer joins); workers execute the whole statement over their shard plus
+> full replicas; the merge stage finishes states + HAVING + ORDER BY + LIMIT;
+> TopN pre-truncates per shard (distributed_push_down_limit / partial-TopN).
+> What was deliberately NOT taken: Trino's repartitioned joins and pipelined
+> exchanges (that IS M3), ClickHouse GLOBAL JOIN broadcast (unneeded — every
+> node replicates all tables here), distributed dynamic filters. SF=1 result:
+> 4.33s -> 2.09s, 17/22 scatter, 22/22 cell-exact. See
+> `.claude/epics/distributed-pushdown/`.
+
 ## 2. Architecture
 
 ### 2.1 Node roles and process model
