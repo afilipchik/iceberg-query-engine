@@ -62,7 +62,80 @@ pub struct Fileset {
     pub file: Option<String>,
 }
 
+/// One relational table, as the engine consumes it.
+#[derive(Debug, Clone)]
+pub struct RelationalTable {
+    pub name: String,
+    pub location: String,
+}
+
 impl GravitinoSource {
+    fn catalog_path(&self) -> String {
+        format!("/api/metalakes/{}/catalogs/{}", self.metalake, self.catalog)
+    }
+
+    fn tables_path(&self) -> String {
+        format!(
+            "/api/metalakes/{}/catalogs/{}/schemas/{}/tables",
+            self.metalake, self.catalog, self.schema
+        )
+    }
+
+    /// The catalog's TYPE (`fileset`, `relational`, `messaging`, ...) —
+    /// decides which listing API applies.
+    pub fn catalog_type(&self) -> Result<String> {
+        let v = self.get_json(&self.catalog_path())?;
+        v["catalog"]["type"]
+            .as_str()
+            .map(|s| s.to_lowercase())
+            .ok_or_else(|| {
+                QueryError::Storage(format!(
+                    "metastore catalog {}/{} has no type field",
+                    self.metalake, self.catalog
+                ))
+            })
+    }
+
+    /// Names of every table in a RELATIONAL schema, sorted.
+    pub fn list_tables(&self) -> Result<Vec<String>> {
+        let v = self.get_json(&self.tables_path())?;
+        let mut names: Vec<String> = v["identifiers"]
+            .as_array()
+            .ok_or_else(|| {
+                QueryError::Storage(format!(
+                    "metastore {}: table list response has no identifiers array",
+                    self.base_url
+                ))
+            })?
+            .iter()
+            .filter_map(|i| i["name"].as_str().map(|s| s.to_string()))
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+
+    /// One relational table. The location comes from the table's
+    /// `properties.location` (where Gravitino's lakehouse-iceberg catalog
+    /// surfaces the Iceberg table directory).
+    pub fn get_table(&self, name: &str) -> Result<RelationalTable> {
+        let v = self.get_json(&format!("{}/{name}", self.tables_path()))?;
+        let t = &v["table"];
+        let location = t["properties"]["location"]
+            .as_str()
+            .or_else(|| t["storageLocation"].as_str())
+            .ok_or_else(|| {
+                QueryError::Storage(format!(
+                    "metastore table `{name}` exposes no location property; \
+                     this engine reads Iceberg tables by their directory"
+                ))
+            })?
+            .to_string();
+        Ok(RelationalTable {
+            name: name.to_string(),
+            location,
+        })
+    }
+
     fn filesets_path(&self) -> String {
         format!(
             "/api/metalakes/{}/catalogs/{}/schemas/{}/filesets",
@@ -121,6 +194,43 @@ impl GravitinoSource {
     /// serving a PARTIAL catalog would answer joins with "table not found"
     /// on exactly the tables that matter.
     pub fn register_all(&self, ctx: &mut ExecutionContext) -> Result<Vec<String>> {
+        match self.catalog_type()?.as_str() {
+            "fileset" => self.register_filesets(ctx),
+            "relational" => self.register_relational(ctx),
+            other => Err(QueryError::NotImplemented(format!(
+                "metastore catalog {}/{} has type `{other}`; fileset and \
+                 relational catalogs are supported",
+                self.metalake, self.catalog
+            ))),
+        }
+    }
+
+    /// Every table of a RELATIONAL schema, registered through the Iceberg
+    /// reader. Gravitino's relational providers are Iceberg-family; a table
+    /// whose directory is not an Iceberg table fails loudly at registration.
+    fn register_relational(&self, ctx: &mut ExecutionContext) -> Result<Vec<String>> {
+        let names = self.list_tables()?;
+        if names.is_empty() {
+            return Err(QueryError::Storage(format!(
+                "metastore schema {}/{}/{} contains no tables; nothing to serve",
+                self.metalake, self.catalog, self.schema
+            )));
+        }
+        for name in &names {
+            let t = self.get_table(name)?;
+            let dir = local_path(&t.location).ok_or_else(|| {
+                QueryError::NotImplemented(format!(
+                    "table `{name}` points at `{}`; only file:// and local paths are \
+                     supported",
+                    t.location
+                ))
+            })?;
+            ctx.register_iceberg(name, &dir, None)?;
+        }
+        Ok(names)
+    }
+
+    fn register_filesets(&self, ctx: &mut ExecutionContext) -> Result<Vec<String>> {
         let names = self.list_filesets()?;
         if names.is_empty() {
             return Err(QueryError::Storage(format!(
@@ -348,6 +458,91 @@ mod tests {
         let got = http_get(&format!("http://{addr}"), "/api/x").unwrap();
         assert_eq!(got, br#"{"code":0,"identifiers":[]}"#);
         t.join().unwrap();
+    }
+
+    /// A canned Gravitino that serves one RELATIONAL catalog with one
+    /// Iceberg table pointing at the committed fixture. Routes by path.
+    fn mock_relational_server(iceberg_dir: &str) -> std::net::SocketAddr {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dir = iceberg_dir.to_string();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut s) = conn else { break };
+                let mut buf = [0u8; 2048];
+                let n = std::io::Read::read(&mut s, &mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req.split_whitespace().nth(1).unwrap_or("/");
+                let body = if path.ends_with("/tables/orders") {
+                    format!(
+                        r#"{{"code":0,"table":{{"name":"orders","properties":{{"location":"file://{dir}"}}}}}}"#
+                    )
+                } else if path.ends_with("/tables") {
+                    r#"{"code":0,"identifiers":[{"name":"orders"}]}"#.to_string()
+                } else if path.ends_with("/catalogs/lakehouse") {
+                    r#"{"code":0,"catalog":{"name":"lakehouse","type":"relational","provider":"lakehouse-iceberg"}}"#.to_string()
+                } else if path.ends_with("/catalogs/msgs") {
+                    r#"{"code":0,"catalog":{"name":"msgs","type":"messaging"}}"#.to_string()
+                } else {
+                    r#"{"code":404,"type":"NotFound","message":"?"}"#.to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn relational_catalog_registers_iceberg_tables() {
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/data/tpch-1mb-iceberg/orders");
+        if !std::path::Path::new(fixture).exists() {
+            panic!("committed iceberg fixture missing: {fixture}");
+        }
+        let addr = mock_relational_server(fixture);
+        let src = GravitinoSource {
+            base_url: format!("http://{addr}"),
+            metalake: "lake".into(),
+            catalog: "lakehouse".into(),
+            schema: "s".into(),
+        };
+        assert_eq!(src.catalog_type().unwrap(), "relational");
+        assert_eq!(src.list_tables().unwrap(), vec!["orders".to_string()]);
+        let mut ctx = ExecutionContext::new();
+        let names = src.register_all(&mut ctx).unwrap();
+        assert_eq!(names, vec!["orders".to_string()]);
+        // The registered table is the REAL fixture: 1600 rows at the current
+        // snapshot (the metastore gate's own number).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let r = rt
+            .block_on(ctx.sql("SELECT COUNT(*) AS n FROM orders"))
+            .unwrap();
+        let n = r.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 1600);
+    }
+
+    #[test]
+    fn unsupported_catalog_types_are_refused_by_name() {
+        let addr = mock_relational_server("/nowhere");
+        let src = GravitinoSource {
+            base_url: format!("http://{addr}"),
+            metalake: "lake".into(),
+            catalog: "msgs".into(),
+            schema: "s".into(),
+        };
+        let mut ctx = ExecutionContext::new();
+        let err = src.register_all(&mut ctx).unwrap_err().to_string();
+        assert!(err.contains("messaging"), "must name the type: {err}");
     }
 
     #[test]
