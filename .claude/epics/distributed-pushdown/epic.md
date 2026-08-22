@@ -1,9 +1,9 @@
 ---
 name: distributed-pushdown
-status: backlog
+status: completed
 created: 2026-08-22T05:07:38Z
-updated: 2026-08-22T05:07:38Z
-progress: 0%
+updated: 2026-08-22T05:30:28Z
+progress: 100%
 prd: .claude/prds/distributed-pushdown.md
 github: (will be set on sync)
 ---
@@ -111,11 +111,11 @@ scattered costs a wrong answer.
 the DuckDB gate catches what reasoning misses.
 
 ## Tasks Created
-- [ ] 001.md - Fragment contexts carry the full catalog (parallel: true)
-- [ ] 002.md - Scatter planner: census, safety rules, shard election (parallel: false)
-- [ ] 003.md - Rewriter: verbatim FROM, final HAVING/ORDER/LIMIT, TopN shape (parallel: false)
-- [ ] 004.md - Correctness gate: 22 TPC-H forced-distributed vs DuckDB + shapes (parallel: false)
-- [ ] 005.md - Benchmark 3 workers SF=1 and publish (parallel: false)
+- [x] 001.md - Fragment contexts carry the full catalog (parallel: true)
+- [x] 002.md - Scatter planner: census, safety rules, shard election (parallel: false)
+- [x] 003.md - Rewriter: verbatim FROM, final HAVING/ORDER/LIMIT, TopN shape (parallel: false)
+- [x] 004.md - Correctness gate: 22 TPC-H forced-distributed vs DuckDB + shapes (parallel: false)
+- [x] 005.md - Benchmark 3 workers SF=1 and publish (parallel: false)
 
 Total tasks: 5
 Parallel tasks: 1
