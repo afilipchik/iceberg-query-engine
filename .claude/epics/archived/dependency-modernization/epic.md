@@ -1,9 +1,9 @@
 ---
 name: dependency-modernization
-status: in-progress
+status: completed
 created: 2026-08-22T16:34:05Z
-updated: 2026-08-22T19:26:29Z
-progress: 60%
+updated: 2026-08-22T20:54:15Z
+progress: 100%
 prd: .claude/prds/dependency-modernization.md
 github: (will be set on sync)
 ---
@@ -23,8 +23,8 @@ Staged upgrade to latest. Tasks:
 ## Tasks Created
 - [x] 001.md - Independent crates batch (parallel: false)
 - [x] 002.md - Arrow cluster + lance + chrono + tonic (parallel: false)
-- [ ] 003.md - sqlparser to latest (parallel: false)
-- [ ] 004.md - Publish verdicts and merge (parallel: false)
+- [x] 003.md - sqlparser to latest (parallel: false)
+- [x] 004.md - Publish verdicts and merge (parallel: false)
 - [x] 005.md - OOM-safe build sandbox (inserted 2026-08-22 after the
       cargo/oomd incident; all remaining builds go through
       scripts/claude-safe-build.sh)

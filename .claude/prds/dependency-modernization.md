@@ -1,7 +1,7 @@
 ---
 name: dependency-modernization
 description: Upgrade every dependency to latest where possible, staged and gated; report the impossible ones with evidence
-status: backlog
+status: completed
 created: 2026-08-22T16:34:05Z
 ---
 
