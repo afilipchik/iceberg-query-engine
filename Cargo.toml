@@ -133,6 +133,20 @@ lance = { version = "0.23", default-features = false, optional = true }
 lance-index = { version = "0.23", optional = true }
 lance-linalg = { version = "0.23", optional = true }
 
+# GPU offload (OPTIONAL — see [features]). cudarc is pure Rust over the CUDA
+# driver API + NVRTC: kernels are CUDA C strings compiled AT RUNTIME by
+# libnvrtc, so there is no nvcc, no build script, no bindgen. dynamic-loading
+# dlopens libcuda/libnvrtc at first use — a `--features gpu` binary still
+# runs (and cleanly reports no GPU) on machines without a driver.
+cudarc = { version = "0.19", optional = true, default-features = false, features = [
+    "std",
+    "driver",
+    "nvrtc",
+    "dynamic-loading",
+    # Driver 580.x implements the CUDA 13.0 driver API.
+    "cuda-13000",
+] }
+
 [features]
 default = []
 # Enables the Lance table provider (src/storage/lance.rs), the Lance writer
@@ -142,6 +156,9 @@ default = []
 # so the ~490-crate Lance tree (incl. DataFusion) is never compiled — and never
 # able to perturb — the default benchmark build.
 lance = ["dep:lance", "dep:lance-index", "dep:lance-linalg"]
+# GPU-resident aggregate offload (src/physical/gpu/). Off by default: the
+# default build has zero CUDA surface. Needs an NVIDIA driver at runtime.
+gpu = ["dep:cudarc"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
