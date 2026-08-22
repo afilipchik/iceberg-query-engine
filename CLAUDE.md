@@ -1686,6 +1686,38 @@ which id lands at rank 10 is arbitrary in any implementation. The exact path
 matches the GPU float64 ground truth on all 10 queries at every rank, with
 category precision@10 = 1.000.
 
+## Expression Compilation — researched, priced, narrowly adopted (2026-08-22)
+
+The "modern engines compile queries" question, answered with measurements
+(`examples/expr_compile_bench.rs`, epic `.claude/epics/expression-compilation/`):
+
+- **Full JIT (LLVM/Cranelift) REFUTED for this engine.** Arrow's SIMD kernels
+  already beat a hand-fused loop on standalone arithmetic (0.544 vs 0.638ms /
+  524k rows). The compilation camp's real wins are pipeline FUSION, and the
+  memory-bound side of this engine (decode, MLP-bound probes) is where
+  Kersten et al. (VLDB'18) show compilation does not pay. Photon and DuckDB
+  reached the same conclusion for the same architecture.
+- **What survived measurement**: temporaries in predicate masks (a Q6-shaped
+  predicate = 5 kernel passes + 5 intermediates, 4.4x worse than fused).
+  `src/physical/compiled_expr.rs` compiles in-subset predicates ONCE per
+  operator into a flat register program over 1024-row L1 slabs: 2.6x the
+  interpreter on the mask microbench (80% of the hand-fused ceiling).
+  Subset: numeric cols, f64 arithmetic, same-type comparisons, strict
+  AND/OR/NOT, BETWEEN; null-strict validity = AND of leaf validities
+  (bit-identical to kernels — equivalence tests). Everything else keeps the
+  interpreter; `QE_COMPILE=0` kills it. Wired into FilterExec + both parquet
+  RowFilter sites.
+- **Honest suite-level result: ~0% at SF=1** (1.53 vs 1.50s avg, inside this
+  box's noise); best-of-5 per query: Q6 -7%, Q19 -4.4%, Q12 -1.4% — real but
+  small, because TPC-H predicates ride the decoder RowFilter where DECODE
+  dominates. Kept because it is never slower, wins where predicates actually
+  bite (post-join filters, gathered distributed tables, memory tables), and
+  costs zero dependencies. Getting the register machine from 2.2x SLOWER
+  than the interpreter to 2.6x faster took three measured iterations:
+  hoist per-row operand dispatch, monomorphize comparison loops (enum match
+  per element blocks vectorization), pack mask bits per chunk
+  (append_packed_range) instead of per-bit appends.
+
 ## Window Functions & Standard-SQL Completion (2026-08-21)
 
 The standard-sql-completion epic (`.claude/epics/standard-sql-completion/`)

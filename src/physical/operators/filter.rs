@@ -27,6 +27,8 @@ pub struct FilterExec {
     schema: SchemaRef,
     /// Optional subquery executor for handling subqueries in predicates
     subquery_executor: Option<SubqueryExecutor>,
+    /// Fused mask evaluation for in-subset predicates (compiled_expr).
+    evaluator: Arc<crate::physical::compiled_expr::PredicateEvaluator>,
 }
 
 impl fmt::Debug for FilterExec {
@@ -41,11 +43,15 @@ impl fmt::Debug for FilterExec {
 impl FilterExec {
     pub fn new(input: Arc<dyn PhysicalOperator>, predicate: Expr) -> Self {
         let schema = input.schema();
+        let evaluator = Arc::new(crate::physical::compiled_expr::PredicateEvaluator::new(
+            predicate.clone(),
+        ));
         Self {
             input,
             predicate,
             schema,
             subquery_executor: None,
+            evaluator,
         }
     }
 
@@ -79,11 +85,13 @@ impl PhysicalOperator for FilterExec {
         let schema = self.schema.clone();
         let has_subqueries = predicate.contains_subquery();
         let subquery_exec = self.subquery_executor.clone();
+        let evaluator = self.evaluator.clone();
 
         let filtered_stream = input_stream.and_then(move |batch| {
             let pred = predicate.clone();
             let schema = schema.clone();
             let subquery_exec = subquery_exec.clone();
+            let evaluator = evaluator.clone();
             async move {
                 if has_subqueries {
                     if let Some(exec) = subquery_exec {
@@ -94,7 +102,16 @@ impl PhysicalOperator for FilterExec {
                         ))
                     }
                 } else {
-                    evaluate_filter(&batch, &pred, &schema)
+                    // Fused mask when the predicate compiled; interpreter
+                    // otherwise — identical masks either way (compiled_expr
+                    // equivalence tests).
+                    let mask = evaluator.evaluate(&batch)?;
+                    let filtered: Result<Vec<ArrayRef>> = batch
+                        .columns()
+                        .iter()
+                        .map(|col| compute::filter(col.as_ref(), &mask).map_err(Into::into))
+                        .collect();
+                    RecordBatch::try_new(batch.schema(), filtered?).map_err(Into::into)
                 }
             }
         });
