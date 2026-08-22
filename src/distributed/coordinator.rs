@@ -196,7 +196,18 @@ pub fn shard_context(
                  distributed_splits and shard_by_splits must be implemented together"
         ))
     })??;
+    // The fragment sees the FULL catalog — every table the node serves — with
+    // only the sharded table overridden. This is what lets a partial query
+    // join its shard against replicated dimension tables (the ClickHouse
+    // sharded-fact / replicated-dims model; distributed-pushdown epic).
     let mut ctx = ExecutionContext::with_config(base.config().clone());
+    for name in base.table_names() {
+        if name != table {
+            if let Some(p) = base.table_provider(&name) {
+                ctx.register_table_provider(&name, p);
+            }
+        }
+    }
     ctx.register_table_provider(table, sharded);
     Ok((ctx, stats))
 }
