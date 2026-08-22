@@ -126,6 +126,13 @@ impl ExecutionContext {
     }
 
     /// Get the memory pool
+    /// Opt this context into GPU aggregate offload (`--features gpu`).
+    /// Single-process CLI entry points call it; serve and distributed
+    /// contexts never do (their gates require byte-exact CPU answers).
+    pub fn enable_gpu_offload(&mut self) {
+        self.config.gpu_offload = true;
+    }
+
     pub fn memory_pool(&self) -> &SharedMemoryPool {
         &self.memory_pool
     }

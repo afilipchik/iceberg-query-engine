@@ -1003,6 +1003,83 @@ impl PhysicalPlanner {
         self.create_physical_plan_inner(logical)
     }
 
+    /// The normal (CPU) lowering of an Aggregate node: morsel path for
+    /// parquet sources, spillable or plain hash aggregation otherwise.
+    /// Split out so the GPU wrapper can delegate to it.
+    fn lower_aggregate_cpu(
+        &self,
+        node: &crate::planner::AggregateNode,
+    ) -> Result<Arc<dyn PhysicalOperator>> {
+        // Take any pending HAVING predicate up front so aggregates
+        // nested inside this one's input can never consume it.
+        let post_filter = self.pending_agg_filter.borrow_mut().take();
+        // Convert logical aggregate expressions to physical
+        let aggregates = extract_aggregates(&node.aggregates);
+
+        let schema = plan_schema_to_arrow(&node.schema);
+
+        // Try morsel execution for Parquet-based aggregations
+        // Skip morsel path for DISTINCT aggregates (not yet supported)
+        let has_distinct = aggregates.iter().any(|a| a.distinct);
+        if self.use_morsel_execution() && !has_distinct {
+            if let Some((files, input_schema, filter, projection)) =
+                self.try_extract_parquet_source(&node.input)
+            {
+                // Use morsel-driven parallel aggregation
+                let morsel_agg = MorselAggregateExec::new(
+                    files,
+                    input_schema,
+                    projection,
+                    filter,
+                    node.group_by.clone(),
+                    aggregates,
+                    schema,
+                )
+                .with_post_filter(post_filter);
+                return Ok(Arc::new(morsel_agg));
+            }
+        }
+
+        // Fall back to regular execution
+        let input = self.create_physical_plan_inner(&node.input)?;
+
+        if self.use_spillable() {
+            // Convert to spillable AggregateExpr type
+            let spillable_aggs: Vec<crate::physical::operators::spillable::AggregateExpr> =
+                aggregates
+                    .into_iter()
+                    .map(|a| crate::physical::operators::spillable::AggregateExpr {
+                        func: a.func,
+                        input: a.input,
+                        distinct: a.distinct,
+                        second_arg: a.second_arg,
+                    })
+                    .collect();
+
+            let disjoint = self.disjoint_group_hint(&node.group_by);
+            let agg = SpillableHashAggregateExec::new(
+                input,
+                node.group_by.clone(),
+                spillable_aggs,
+                schema,
+                self.memory_pool.clone().unwrap(),
+                self.config.clone().unwrap(),
+            )
+            .with_post_filter(post_filter)
+            .with_disjoint_groups(disjoint);
+            Ok(Arc::new(agg))
+        } else {
+            let agg = HashAggregateExec::new(input, node.group_by.clone(), aggregates, schema);
+            match post_filter {
+                Some(pred) => {
+                    let filter = self.create_filter(Arc::new(agg), pred);
+                    Ok(Arc::new(filter))
+                }
+                None => Ok(Arc::new(agg)),
+            }
+        }
+    }
+
     fn create_physical_plan_inner(
         &self,
         logical: &LogicalPlan,
@@ -1458,75 +1535,23 @@ impl PhysicalPlanner {
             }
 
             LogicalPlan::Aggregate(node) => {
-                // Take any pending HAVING predicate up front so aggregates
-                // nested inside this one's input can never consume it.
-                let post_filter = self.pending_agg_filter.borrow_mut().take();
-                // Convert logical aggregate expressions to physical
-                let aggregates = extract_aggregates(&node.aggregates);
-
-                let schema = plan_schema_to_arrow(&node.schema);
-
-                // Try morsel execution for Parquet-based aggregations
-                // Skip morsel path for DISTINCT aggregates (not yet supported)
-                let has_distinct = aggregates.iter().any(|a| a.distinct);
-                if self.use_morsel_execution() && !has_distinct {
-                    if let Some((files, input_schema, filter, projection)) =
-                        self.try_extract_parquet_source(&node.input)
-                    {
-                        // Use morsel-driven parallel aggregation
-                        let morsel_agg = MorselAggregateExec::new(
-                            files,
-                            input_schema,
-                            projection,
-                            filter,
-                            node.group_by.clone(),
-                            aggregates,
-                            schema,
-                        )
-                        .with_post_filter(post_filter);
-                        return Ok(Arc::new(morsel_agg));
-                    }
-                }
-
-                // Fall back to regular execution
-                let input = self.create_physical_plan_inner(&node.input)?;
-
-                if self.use_spillable() {
-                    // Convert to spillable AggregateExpr type
-                    let spillable_aggs: Vec<crate::physical::operators::spillable::AggregateExpr> =
-                        aggregates
-                            .into_iter()
-                            .map(|a| crate::physical::operators::spillable::AggregateExpr {
-                                func: a.func,
-                                input: a.input,
-                                distinct: a.distinct,
-                                second_arg: a.second_arg,
-                            })
-                            .collect();
-
-                    let disjoint = self.disjoint_group_hint(&node.group_by);
-                    let agg = SpillableHashAggregateExec::new(
-                        input,
-                        node.group_by.clone(),
-                        spillable_aggs,
-                        schema,
-                        self.memory_pool.clone().unwrap(),
-                        self.config.clone().unwrap(),
-                    )
-                    .with_post_filter(post_filter)
-                    .with_disjoint_groups(disjoint);
-                    Ok(Arc::new(agg))
-                } else {
-                    let agg =
-                        HashAggregateExec::new(input, node.group_by.clone(), aggregates, schema);
-                    match post_filter {
-                        Some(pred) => {
-                            let filter = self.create_filter(Arc::new(agg), pred);
-                            Ok(Arc::new(filter))
+                // GPU offload wrapper: when the shape is describable, the
+                // normal operator is built anyway and the wrapper delegates
+                // to it until the columns are device-resident (never slower).
+                #[cfg(feature = "gpu")]
+                {
+                    let offload_ok = self.config.as_ref().map_or(true, |c| c.gpu_offload);
+                    if offload_ok && self.pending_agg_filter.borrow().is_none() {
+                        if let Some(gplan) = crate::physical::gpu::plan_gpu_agg(node, &self.tables)
+                        {
+                            let inner = self.lower_aggregate_cpu(node)?;
+                            return Ok(Arc::new(crate::physical::gpu::GpuAggExec::new(
+                                gplan, inner,
+                            )));
                         }
-                        None => Ok(Arc::new(agg)),
                     }
                 }
+                self.lower_aggregate_cpu(node)
             }
 
             LogicalPlan::Window(node) => {
@@ -1896,7 +1921,7 @@ impl PhysicalPlanner {
 }
 
 /// Convert PlanSchema to Arrow Schema
-fn plan_schema_to_arrow(plan_schema: &PlanSchema) -> SchemaRef {
+pub(crate) fn plan_schema_to_arrow(plan_schema: &PlanSchema) -> SchemaRef {
     let fields: Vec<Field> = plan_schema
         .fields()
         .iter()

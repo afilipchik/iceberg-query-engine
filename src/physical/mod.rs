@@ -3,6 +3,8 @@
 //! Converts logical plans to physical plans and executes them
 
 pub mod compiled_expr;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod morsel;
 pub mod morsel_agg;
 pub mod operators;

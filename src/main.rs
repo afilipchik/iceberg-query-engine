@@ -400,6 +400,8 @@ async fn main() {
             let start = Instant::now();
 
             let mut ctx = ExecutionContext::new();
+            #[cfg(feature = "gpu")]
+            ctx.enable_gpu_offload();
             let mut gen = TpchGenerator::new(sf);
             gen.generate_all(&mut ctx);
 
@@ -431,6 +433,8 @@ async fn main() {
                     println!();
 
                     let mut ctx = ExecutionContext::new();
+                    #[cfg(feature = "gpu")]
+                    ctx.enable_gpu_offload();
                     let mut gen = TpchGenerator::new(sf);
                     gen.generate_all(&mut ctx);
 
@@ -477,6 +481,8 @@ async fn main() {
             println!();
 
             let mut ctx = ExecutionContext::new();
+            #[cfg(feature = "gpu")]
+            ctx.enable_gpu_offload();
             let mut gen = TpchGenerator::new(sf);
             gen.generate_all(&mut ctx);
 
@@ -536,6 +542,8 @@ async fn main() {
 
         Commands::Sql { query, sf } => {
             let mut ctx = ExecutionContext::new();
+            #[cfg(feature = "gpu")]
+            ctx.enable_gpu_offload();
             let mut gen = TpchGenerator::new(sf);
             gen.generate_all(&mut ctx);
 
@@ -555,6 +563,8 @@ async fn main() {
         Commands::LoadParquet { path, name, query } => {
             let start = Instant::now();
             let mut ctx = ExecutionContext::new();
+            #[cfg(feature = "gpu")]
+            ctx.enable_gpu_offload();
 
             println!("Loading Parquet from: {}", path.display());
 
@@ -613,6 +623,8 @@ async fn main() {
                 (((sf * 4.0).max(1.0) as usize) * 1024 * 1024 * 1024).min(MAX_MEMORY);
             println!("Memory limit: {} GB", memory_limit / (1024 * 1024 * 1024));
             let mut ctx = ExecutionContext::with_memory_limit(memory_limit);
+            #[cfg(feature = "gpu")]
+            ctx.enable_gpu_offload();
 
             // Load all TPC-H tables from Parquet files
             let tables = [
@@ -758,6 +770,8 @@ async fn main() {
                         std::process::exit(1);
                     };
                     let mut ctx = ExecutionContext::new();
+                    #[cfg(feature = "gpu")]
+                    ctx.enable_gpu_offload();
                     // Register every parquet file in the directory under its
                     // stem, so the query can name tables normally.
                     match std::fs::read_dir(&dir) {
@@ -898,6 +912,8 @@ async fn main() {
         } => {
             let start = Instant::now();
             let mut ctx = ExecutionContext::new();
+            #[cfg(feature = "gpu")]
+            ctx.enable_gpu_offload();
 
             match version {
                 Some(v) => println!(
@@ -967,6 +983,8 @@ async fn main() {
                 (((sf * 4.0).max(1.0) as usize) * 1024 * 1024 * 1024).min(MAX_MEMORY);
             println!("Memory limit: {} GB", memory_limit / (1024 * 1024 * 1024));
             let mut ctx = ExecutionContext::with_memory_limit(memory_limit);
+            #[cfg(feature = "gpu")]
+            ctx.enable_gpu_offload();
 
             for table in &TPCH_TABLES {
                 let dataset_path = path.join(format!("{}.lance", table));
@@ -1155,10 +1173,16 @@ fn build_serve_context(
 
     let mut ctx = match memory_limit {
         Some(limit) => {
-            let config = query_engine::ExecutionConfig::new().with_memory_limit_str(limit)?;
+            let mut config = query_engine::ExecutionConfig::new().with_memory_limit_str(limit)?;
+            config.gpu_offload = true;
             ExecutionContext::with_config(config)
         }
-        None => ExecutionContext::new(),
+        None => {
+            let mut c = ExecutionContext::new();
+            #[cfg(feature = "gpu")]
+            c.enable_gpu_offload();
+            c
+        }
     };
 
     if let Some(dir) = data {
@@ -1363,6 +1387,8 @@ async fn run_repl(
     println!();
 
     let mut ctx = ExecutionContext::new();
+    #[cfg(feature = "gpu")]
+    ctx.enable_gpu_offload();
     let mut state = ReplState::new();
     let helper = Arc::new(ReplHelper::new());
 

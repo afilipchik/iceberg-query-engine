@@ -256,6 +256,12 @@ pub struct ExecutionConfig {
     /// Batch size for streaming reads
     pub batch_size: usize,
 
+    /// Allow GPU aggregate offload (`--features gpu`). OFF by default and
+    /// opted in only by the single-process CLI paths: GPU float reductions
+    /// differ from the CPU in the last bits, and the serve/distributed
+    /// gates demand byte-exact local answers.
+    pub gpu_offload: bool,
+
     /// Whether to prefer sort-merge join over hash join for large tables
     pub prefer_sort_merge_join: bool,
 
@@ -323,6 +329,7 @@ impl Default for ExecutionConfig {
             spill_path: std::env::temp_dir().join("query_engine_spill"),
             spill_partitions: 64,
             batch_size: 8192,
+            gpu_offload: false,
             prefer_sort_merge_join: false,
             enable_stats_pruning: true,
             spill_threshold: 0.8,

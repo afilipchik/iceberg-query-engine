@@ -15,6 +15,7 @@ A high-performance SQL query engine built from scratch in Rust, designed for ana
 - **Iceberg Support**: Read Apache Iceberg tables (v1/v2 metadata, Avro manifests, snapshot time travel)
 - **Vector Search**: k-NN over embedding columns (`cosine_distance`, `l2_distance`, …), exact by default with opt-in IVF_PQ index pushdown
 - **Arrow Flight RPC**: standard gRPC endpoint (`serve --flight-bind`) — query from `pyarrow.flight` or any Flight client, single-node or distributed
+- **GPU Aggregate Offload** (feature `gpu`): fused filter+aggregate kernels over VRAM-resident columns — 39-59x on Q6-shaped scans, 9-17x on Q1-shaped grouped aggregates (RTX 5090); first touch stays on the CPU and uploads in the background, so the GPU is never slower
 - **Larger-Than-Memory**: Spillable operators for datasets exceeding available RAM
 - **Interactive REPL**: SQL shell with history and tab completion
 - **Streaming Execution**: Memory-efficient processing via Arrow RecordBatch streams
