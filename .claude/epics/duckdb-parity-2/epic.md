@@ -1,9 +1,9 @@
 ---
 name: duckdb-parity-2
-status: backlog
+status: in-progress
 created: 2026-08-23T00:38:20Z
-updated: 2026-08-23T00:38:20Z
-progress: 0%
+updated: 2026-08-23T01:17:37Z
+progress: 43%
 prd: .claude/prds/duckdb-parity-2.md
 github: (will be set on sync)
 ---
@@ -98,11 +98,11 @@ Estimated total effort: 15-24 hours (measurement wall time and the M-effort join
 - Total: one to two focused working sessions, matching the pace of the six prior epics in this program.
 
 ## Tasks Created
-- [ ] 001.md - IPC-cache defaults/documentation fix + CLAUDE.md re-baseline (parallel: true)
-- [ ] 002.md - Q13: disjoint-aggregation threshold investigation + fix (parallel: false)
+- [x] 001.md - IPC-cache defaults/documentation fix + CLAUDE.md re-baseline (parallel: true)
+- [x] 002.md - Q13: disjoint-aggregation threshold investigation + fix (parallel: false)
 - [ ] 003.md - Q13: join-output-pruning + runtime-filter extension to filtered outer joins (parallel: false)
 - [ ] 004.md - Q16: anti-join parallel-probe investigation + fix (parallel: false)
-- [ ] 005.md - Q16: distinct_set hasher swap (parallel: true)
+- [x] 005.md - Q16: distinct_set hasher swap (parallel: true)
 - [ ] 006.md - Dense group-id remapping, Stage 0 + Stage 1 (parallel: false)
 - [ ] 007.md - QA close-out — full suites, cell-exact SF=10+SF=100, docs, epic close (parallel: false)
 
@@ -110,3 +110,41 @@ Total tasks: 7
 Parallel tasks: 2
 Sequential tasks: 5
 Estimated total effort: 15-24 hours
+
+## Phase 1 checkpoint (2026-08-23)
+
+Tasks 001, 002, 005 shipped (branch `epic/duckdb-parity-2`, not yet merged
+to main). Full suite green throughout (988 tests, 0 failed) after every
+commit and again on the fully-combined state; `disjoint_aggregation_
+matches_plain_aggregation_exactly` and `tests/duckdb_validated.rs`
+(cell-exact) unaffected. All numbers below are clean, serialized SF=10
+`safe_benchmark.sh` runs (3 iterations, one premise at a time — an
+earlier attempt to run both premises concurrently produced visibly
+contended, discarded numbers, e.g. Q16/Q22 going the wrong direction
+under cache-on; the project's own "measurements serialized" rule holds).
+
+| | cache-off total | like-for-like (vs 4.37s) | native ratio | cache-on total | like-for-like | native ratio |
+|---|---|---|---|---|---|---|
+| Before phase 1 | 8.86s | 2.03x | 2.88x | 5.99s | 1.37x | 1.80x |
+| After phase 1 | **7.32s** | **1.68x** | **2.2x** | **5.79s** | **1.32x** | **1.7x** |
+
+Q13 (task 002's target): 457.7ms/3.4x → **290.0ms/2.1x** (cache-off,
+-36.6%); 275.5ms/2.0x (cache-on). Matches task 002's isolated
+measurement (-40.2%, 223ms→31ms on the merge phase specifically) within
+normal run-to-run noise once folded into the full 22-query sweep.
+
+Q16 (task 005's target): 194.9ms/4.6x → 199.0ms/4.7x (cache-off,
+essentially flat, as expected — the hasher swap was never the dominant
+cause); 201.4ms/4.7x (cache-on). Its larger cause (anti-join running on
+1 of 32 threads) is still open, task 004.
+
+Task 002 also surfaced a new, small, out-of-scope finding for task 006:
+at SF=100, `finalize_disjoint_states` still pays real merge-machinery
+cost (~205ms/iter) for a single oversized (>65,536-group) disjoint
+worker state — a targeted follow-up, not evidence the larger
+dense-group-id rewrite is needed. Recorded in `002.md` and
+`updates/002/stream-A.md`.
+
+Remaining: 003 (Q13 join-pruning), 004 (Q16 anti-join parallelism), 006
+(dense group-id Stage 0+1, now informed by 002's outcome — Q13 no
+longer needs it), 007 (QA close-out).
