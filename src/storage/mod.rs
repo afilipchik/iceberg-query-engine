@@ -34,3 +34,22 @@ pub use pulsar::{register_pulsar_namespace, PulsarSource, PulsarTable};
 
 pub mod ipc_cache;
 pub mod metadata_cache;
+
+/// Native table manifest (identity/versioning/statistics format). Task 002
+/// of the native-tables-foundation epic; sibling to `native_write.rs` (003)
+/// and `native_table.rs` (004).
+pub mod native_manifest;
+
+/// Native table write path (bulk-load from parquet/Iceberg/Lance/query
+/// results). Task 003 of the native-tables-foundation epic; calls into
+/// `native_manifest` (002) for the format. A module is otherwise never
+/// compiled, so this registration line is unavoidable.
+pub mod native_write;
+
+/// Native table `TableProvider` (read/registration/distributed splits).
+/// Task 004 of the native-tables-foundation epic; calls into
+/// `native_manifest` (004) for the format and `ipc_cache` for segment
+/// reads. A module is otherwise never compiled, so this registration line
+/// is unavoidable — same reasoning as `native_manifest`'s own line above.
+pub mod native_table;
+pub use native_table::NativeTable;

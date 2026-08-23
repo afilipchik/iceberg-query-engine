@@ -1,18 +1,20 @@
 //! Execution context - main entry point for query execution
 
-use crate::error::Result;
+use crate::error::{QueryError, Result};
 use crate::execution::{create_memory_pool, ExecutionConfig, SharedMemoryPool, SpillMetrics};
 use crate::optimizer::Optimizer;
 use crate::parser;
 use crate::physical::operators::{MemoryTable, TableProvider};
-use crate::physical::{PhysicalOperator, PhysicalPlanner};
+use crate::physical::{PhysicalOperator, PhysicalPlanner, RecordBatchStream};
 use crate::planner::{Binder, InMemoryCatalog, LogicalPlan, PlanSchema, SchemaField};
-use crate::storage::ParquetTable;
-use arrow::datatypes::{Schema, SchemaRef};
+use crate::storage::native_manifest;
+use crate::storage::native_write::{self, NativeWriteMode};
+use crate::storage::{NativeTable, ParquetTable};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -52,6 +54,28 @@ pub struct QueryMetrics {
     pub files_pruned_by_partition: usize,
 }
 
+/// What `ExecutionContext::create_table_as_select` produced.
+#[derive(Debug, Clone)]
+pub struct CreateTableAsSelectResult {
+    /// The name the table was registered under (`ct.name` from the SQL).
+    pub table_name: String,
+    /// The native table's stable identity (UUID v4) — unchanged across a
+    /// replace of a table that already existed at this name.
+    pub table_id: String,
+    /// The snapshot version the write committed (1 for a brand-new table,
+    /// else the previous version + 1).
+    pub version: u64,
+    /// Rows written.
+    pub rows: u64,
+    /// Number of Arrow IPC segment files the table now has.
+    pub segments: usize,
+    /// The written table's schema (== the SELECT's output schema).
+    pub schema: SchemaRef,
+    /// Wall-clock time for the whole parse-bind-plan-execute-write-register
+    /// sequence.
+    pub elapsed: Duration,
+}
+
 /// Execution context - manages tables and executes queries
 pub struct ExecutionContext {
     catalog: InMemoryCatalog,
@@ -63,6 +87,14 @@ pub struct ExecutionContext {
     memory_pool: SharedMemoryPool,
     /// Execution configuration
     config: ExecutionConfig,
+    /// Directory `CREATE TABLE <name> AS SELECT ...` writes new native
+    /// tables under, as `<native_table_root>/<name>`. SQL has no LOCATION
+    /// clause here (refused by name — see `planner::binder`'s CreateTable
+    /// validation), so the destination must come from context state rather
+    /// than the statement text; overridable via `with_native_table_root`
+    /// (tests/CLI point this at a specific directory), defaults to
+    /// `./native_tables` so the REPL's zero-config case still works.
+    native_table_root: PathBuf,
 }
 
 impl Default for ExecutionContext {
@@ -82,6 +114,7 @@ impl ExecutionContext {
             parallel_partitions: rayon::current_num_threads(),
             memory_pool,
             config,
+            native_table_root: PathBuf::from("./native_tables"),
         }
     }
 
@@ -96,6 +129,7 @@ impl ExecutionContext {
             parallel_partitions: rayon::current_num_threads(),
             memory_pool,
             config,
+            native_table_root: PathBuf::from("./native_tables"),
         }
     }
 
@@ -109,7 +143,22 @@ impl ExecutionContext {
             parallel_partitions: rayon::current_num_threads(),
             memory_pool,
             config,
+            native_table_root: PathBuf::from("./native_tables"),
         }
+    }
+
+    /// Override the directory `create_table_as_select` writes new native
+    /// tables under (default `./native_tables`, relative to the process's
+    /// CWD). Tests and CLI entrypoints that want a specific/temp location
+    /// call this; the REPL's zero-config default just uses it as-is.
+    pub fn with_native_table_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.native_table_root = root.into();
+        self
+    }
+
+    /// The directory new native tables are (or would be) written under.
+    pub fn native_table_root(&self) -> &Path {
+        &self.native_table_root
     }
 
     /// Collect table statistics from all registered table providers
@@ -297,6 +346,29 @@ impl ExecutionContext {
         Ok(())
     }
 
+    /// Register an existing native table directory (task 002/003's manifest
+    /// + Arrow IPC segment format) — mirrors `register_iceberg`/
+    /// `register_lance`. Reads and fully validates `_manifest.json`; a
+    /// missing or corrupt manifest is a clear `Err`.
+    pub fn register_native_table(
+        &mut self,
+        name: impl Into<String>,
+        path: impl AsRef<Path>,
+    ) -> Result<()> {
+        // `NativeTable::scan()` is not spill-aware (task 006 measured this
+        // directly: a 60M-row native table's full-table scan needed ~1.6GB
+        // peak RSS and was OOM-killed under a bare 1GiB cgroup cap, while
+        // the identical query over the identical data as plain Parquet
+        // finished in 109ms — see `native_table.rs`'s module doc). Give it
+        // the SAME admission-control budget `spillable.rs` already computes
+        // at 7 call sites (`memory_limit * spill_threshold`) so a scan that
+        // plainly cannot fit refuses cleanly instead of risking OOM.
+        let budget = (self.config.memory_limit as f64 * self.config.spill_threshold) as u64;
+        let table = NativeTable::try_new(path)?.with_memory_budget(Some(budget));
+        self.register_table_provider(name, Arc::new(table));
+        Ok(())
+    }
+
     /// Execute a SQL query and return results
     pub async fn sql(&self, query: &str) -> Result<QueryResult> {
         let start = Instant::now();
@@ -306,6 +378,26 @@ impl ExecutionContext {
         let parse_start = Instant::now();
         let stmt = parser::parse_sql(query)?;
         metrics.parse_time = parse_start.elapsed();
+
+        // `CREATE TABLE ... AS SELECT` needs `&mut self` (registering the
+        // written table mutates `self.tables`/`self.catalog`) and a
+        // genuinely streaming write (see `create_table_as_select`'s doc).
+        // Both are incompatible with this method's `&self`, fully-
+        // materializing signature, so this is refused HERE rather than
+        // silently binding just the inner SELECT and returning ITS rows —
+        // which is what would happen if this fell through to the ordinary
+        // bind/plan/execute path below: the statement would appear to
+        // "succeed" while never writing or registering anything.
+        if crate::planner::create_table_target_name(&stmt).is_some() {
+            return Err(QueryError::InvalidArgument(
+                "CREATE TABLE ... AS SELECT must run through \
+                 ExecutionContext::create_table_as_select (the REPL calls this \
+                 automatically) — sql() cannot register the result (it takes &self) and \
+                 would otherwise silently execute only the inner SELECT without writing \
+                 or registering anything"
+                    .to_string(),
+            ));
+        }
 
         // Plan
         let plan_start = Instant::now();
@@ -401,45 +493,7 @@ impl ExecutionContext {
         // OUTPUT size only.
         let all_batches = all_batches
             .into_iter()
-            .map(|b| {
-                if b.columns()
-                    .iter()
-                    .any(|c| matches!(c.data_type(), arrow::datatypes::DataType::Dictionary(_, _)))
-                {
-                    let cols: std::result::Result<Vec<_>, arrow::error::ArrowError> = b
-                        .columns()
-                        .iter()
-                        .map(|c| match c.data_type() {
-                            arrow::datatypes::DataType::Dictionary(_, v) => {
-                                arrow::compute::cast(c.as_ref(), v)
-                            }
-                            _ => Ok(c.clone()),
-                        })
-                        .collect();
-                    let cols =
-                        cols.map_err(|e| crate::error::QueryError::Execution(e.to_string()))?;
-                    let fields: Vec<arrow::datatypes::Field> = b
-                        .schema()
-                        .fields()
-                        .iter()
-                        .zip(cols.iter())
-                        .map(|(f, c): (_, &arrow::array::ArrayRef)| {
-                            arrow::datatypes::Field::new(
-                                f.name(),
-                                c.data_type().clone(),
-                                f.is_nullable(),
-                            )
-                        })
-                        .collect();
-                    RecordBatch::try_new(
-                        std::sync::Arc::new(arrow::datatypes::Schema::new(fields)),
-                        cols,
-                    )
-                    .map_err(|e| crate::error::QueryError::Execution(e.to_string()))
-                } else {
-                    Ok(b)
-                }
-            })
+            .map(decode_dictionary_batch)
             .collect::<Result<Vec<_>>>()?;
 
         Ok(QueryResult {
@@ -447,6 +501,151 @@ impl ExecutionContext {
             batches: all_batches,
             row_count,
             metrics,
+        })
+    }
+
+    /// Execute `CREATE TABLE <name> AS SELECT ...` end to end: parse, bind
+    /// the inner `SELECT` via the ordinary `Binder::bind()` path (which also
+    /// validates the `CREATE TABLE` clause is a shape this epic supports —
+    /// see `planner::binder`'s `require_supported_create_table_shape`), plan
+    /// and optimize it exactly like [`sql`](Self::sql), then drive its
+    /// `RecordBatchStream` DIRECTLY into task 003's native-table writer
+    /// (`native_write::write_batches`) — never collecting it into a
+    /// `Vec<RecordBatch>` first, unlike `sql()`. Registers the freshly
+    /// written table under its target name (`native_table_root().join(name)`)
+    /// so a subsequent query in the SAME session can read it immediately.
+    ///
+    /// `&mut self`, unlike `sql()`'s `&self`: registering the new table
+    /// mutates `self.tables`/`self.catalog`, and a genuinely streaming write
+    /// needs the plan's stream driven directly rather than via `sql()`'s
+    /// collecting wrapper.
+    ///
+    /// An existing native table at the target directory is replaced
+    /// wholesale (`NativeWriteMode::Overwrite` — this epic is full-table
+    /// bulk-load/replace only, never partial `INSERT`); its `table_id`
+    /// survives the replace (only `snapshot.version` bumps), matching
+    /// `native_manifest`'s own identity contract. Any other kind of
+    /// pre-existing, non-native directory at that path is refused rather
+    /// than silently overwritten.
+    pub async fn create_table_as_select(&mut self, sql: &str) -> Result<CreateTableAsSelectResult> {
+        let start = Instant::now();
+        let stmt = parser::parse_sql(sql)?;
+        let table_name = crate::planner::create_table_target_name(&stmt).ok_or_else(|| {
+            QueryError::InvalidArgument(format!(
+                "create_table_as_select expects a CREATE TABLE ... AS SELECT statement, got: {sql}"
+            ))
+        })?;
+
+        let mut binder = Binder::new(&self.catalog);
+        // Validates the CREATE TABLE's shape (refusing every unsupported
+        // clause by name — OR REPLACE, TEMPORARY, PARTITION BY, LIKE,
+        // CLONE, ...) AND binds the inner SELECT in one call: see
+        // `Binder::bind()`'s `Statement::CreateTable` arm.
+        let logical = binder.bind(&stmt)?;
+
+        let table_stats = self.collect_table_statistics();
+        let optimized = if table_stats.is_empty() {
+            self.optimizer.optimize(logical)?
+        } else {
+            let optimizer = Optimizer::new().with_table_statistics(table_stats);
+            optimizer.optimize(logical)?
+        };
+        if std::env::var("PLAN_DEBUG").is_ok() {
+            eprintln!("[plan]\n{}", optimized);
+        }
+
+        let mut planner =
+            PhysicalPlanner::with_config(self.memory_pool.clone(), self.config.clone());
+        for (name, provider) in &self.tables {
+            planner.register_table(name.clone(), provider.clone());
+        }
+        planner.enable_subquery_execution();
+        let physical = planner.create_physical_plan(&optimized)?;
+        // A bare `SELECT * FROM t` (no explicit column list) binds through
+        // `Binder::bind_select_items`'s `SelectItem::Wildcard` arm, which
+        // reuses the scan's OWN `SchemaField`s verbatim — including their
+        // `relation` (this engine's self-join disambiguation, e.g.
+        // "n1.n_name" vs "n2.n_name") — unlike an explicit column list,
+        // whose fields are rebuilt unqualified. So `physical.schema()` can
+        // carry table-qualified Arrow field names like `"orders.o_orderkey"`
+        // for that shape specifically (confirmed empirically, not assumed:
+        // `SELECT * FROM orders` vs `SELECT o_orderkey FROM orders` produce
+        // different-shaped schemas from the SAME table today). That is a
+        // pre-existing, general engine property harmless for a transient
+        // `QueryResult` (as `sql()` returns), but wrong to bake permanently
+        // into a persisted table's column names — a subsequent `SELECT
+        // o_orderkey FROM <this table>` must work. `output_schema_for_
+        // native_write` strips that qualification (and normalizes
+        // Dictionary types to their plain value type, matching what
+        // `decode_dictionary_batch` below actually produces) so the WRITTEN
+        // table gets ordinary column names, without touching the general
+        // wildcard-binding behavior other callers rely on.
+        let write_schema = output_schema_for_native_write(&physical.schema())?;
+
+        // Drive every output partition's stream directly, then merge them
+        // into ONE stream — the writer takes a single `RecordBatchStream`.
+        // An unordered interleave is fine: unlike `sql()`, nothing here
+        // needs partition-ordered output, only every row exactly once.
+        // Each batch is normalized to plain (non-dictionary) columns AND
+        // re-wrapped with `write_schema` (same arrays, new field
+        // metadata — `RecordBatch::try_new` does not copy column buffers)
+        // so every batch reaching the writer already has its final,
+        // persisted shape: the writer's own dictionary-candidate detection
+        // (task 003, an Arrow-side equivalent of `ipc_cache.rs`'s
+        // parquet-metadata-based technique) sees plain columns to analyze,
+        // under their final unqualified names.
+        let num_partitions = physical.output_partitions().max(1);
+        let mut streams: Vec<RecordBatchStream> = Vec::with_capacity(num_partitions);
+        for partition_id in 0..num_partitions {
+            let stream = physical.execute(partition_id).await.map_err(|e| {
+                QueryError::Execution(format!("Partition {partition_id} execution failed: {e}"))
+            })?;
+            let out_schema = write_schema.clone();
+            let decoded: RecordBatchStream = Box::pin(stream.and_then(move |b| {
+                let out_schema = out_schema.clone();
+                async move {
+                    let b = decode_dictionary_batch(b)?;
+                    RecordBatch::try_new(out_schema, b.columns().to_vec())
+                        .map_err(|e| QueryError::Execution(e.to_string()))
+                }
+            }));
+            streams.push(decoded);
+        }
+        let merged: RecordBatchStream = Box::pin(futures::stream::select_all(streams));
+
+        // Create for a genuinely fresh destination, Overwrite when a native
+        // table already lives there (bumps snapshot.version, preserves
+        // table_id) — `write_batches`'s own safety contract handles every
+        // other case (a non-empty, non-native directory; a `Create` target
+        // that already exists) by refusing rather than deleting anything,
+        // so no separate pre-check is needed here.
+        let out_dir = self.native_table_root.join(&table_name);
+        let mode = if native_manifest::is_native_table_dir(&out_dir) {
+            NativeWriteMode::Overwrite
+        } else {
+            NativeWriteMode::Create
+        };
+
+        let write_result =
+            native_write::write_batches(merged, write_schema.clone(), &out_dir, mode)
+                .await
+                .map_err(|e| {
+                    QueryError::Storage(format!("CREATE TABLE {table_name} AS SELECT: {e}"))
+                })?;
+
+        // Make the freshly written table immediately queryable in this
+        // session — the whole point of this being an ExecutionContext
+        // method rather than a bare CLI writer.
+        self.register_native_table(&table_name, &out_dir)?;
+
+        Ok(CreateTableAsSelectResult {
+            table_name,
+            table_id: write_result.table_id,
+            version: write_result.version,
+            rows: write_result.rows,
+            segments: write_result.segments,
+            schema: write_schema,
+            elapsed: start.elapsed(),
         })
     }
 
@@ -502,6 +701,78 @@ impl ExecutionContext {
     pub fn table_provider(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
         self.tables.get(name).cloned()
     }
+}
+
+/// Cast every Dictionary-encoded column of `b` back to its plain value type.
+///
+/// Dictionary encoding (small-build join gathers, v2 IPC sidecar reads) is
+/// an internal representation; both `sql()`'s collected results and
+/// `create_table_as_select`'s streamed write hand plain arrays across their
+/// respective boundaries (formatters/CSV writers/tests on one side, task
+/// 003's own dictionary-candidate re-detection on the other) rather than
+/// leaking this engine's internal choice of encoding into either. Cost is
+/// proportional to the batch itself, never to a whole table.
+fn decode_dictionary_batch(b: RecordBatch) -> Result<RecordBatch> {
+    if !b
+        .columns()
+        .iter()
+        .any(|c| matches!(c.data_type(), arrow::datatypes::DataType::Dictionary(_, _)))
+    {
+        return Ok(b);
+    }
+    let cols: std::result::Result<Vec<_>, arrow::error::ArrowError> = b
+        .columns()
+        .iter()
+        .map(|c| match c.data_type() {
+            arrow::datatypes::DataType::Dictionary(_, v) => arrow::compute::cast(c.as_ref(), v),
+            _ => Ok(c.clone()),
+        })
+        .collect();
+    let cols = cols.map_err(|e| QueryError::Execution(e.to_string()))?;
+    let fields: Vec<arrow::datatypes::Field> = b
+        .schema()
+        .fields()
+        .iter()
+        .zip(cols.iter())
+        .map(|(f, c): (_, &arrow::array::ArrayRef)| {
+            arrow::datatypes::Field::new(f.name(), c.data_type().clone(), f.is_nullable())
+        })
+        .collect();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)
+        .map_err(|e| QueryError::Execution(e.to_string()))
+}
+
+/// The schema a native table written by `create_table_as_select` should
+/// declare, derived from the SELECT's own physical output schema: every
+/// field name is stripped to its unqualified form (the part after the last
+/// `.`, if any — see `create_table_as_select`'s call-site comment for why
+/// qualification can appear at all) and every Dictionary-encoded field's
+/// declared type is normalized to its plain value type (matching what
+/// `decode_dictionary_batch` actually produces for each batch). A name
+/// collision after stripping — two output columns that only differed by
+/// table qualification — is refused with a clear, actionable error rather
+/// than silently producing a table with duplicate/ambiguous column names.
+fn output_schema_for_native_write(schema: &Schema) -> Result<SchemaRef> {
+    let mut seen = std::collections::HashSet::with_capacity(schema.fields().len());
+    let mut fields = Vec::with_capacity(schema.fields().len());
+    for f in schema.fields() {
+        let short = f.name().rsplit('.').next().unwrap_or(f.name());
+        if !seen.insert(short.to_lowercase()) {
+            return Err(QueryError::InvalidArgument(format!(
+                "CREATE TABLE ... AS SELECT: output column `{}` collides with another \
+                 output column named `{short}` once this engine's internal table \
+                 qualification is stripped for the persisted table's column name — give \
+                 it an explicit alias (e.g. `SELECT a.x AS a_x, b.x AS b_x`)",
+                f.name()
+            )));
+        }
+        let data_type = match f.data_type() {
+            DataType::Dictionary(_, value) => value.as_ref().clone(),
+            other => other.clone(),
+        };
+        fields.push(Field::new(short, data_type, f.is_nullable()));
+    }
+    Ok(Arc::new(Schema::new(fields)))
 }
 
 /// Convert Arrow schema to PlanSchema

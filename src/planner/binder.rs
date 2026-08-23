@@ -122,6 +122,221 @@ fn frame_offset(e: &ast::Expr) -> Result<u64> {
     }
 }
 
+/// If `stmt` is a `CREATE TABLE` statement, its target table name —
+/// regardless of whether the statement is otherwise a shape this binder's
+/// `bind()` will accept. Deliberately does NOT validate: that happens once,
+/// inside `bind()` (`require_supported_create_table_shape`), so there is a
+/// single source of truth for "is this CREATE TABLE supported." Callers
+/// (e.g. `ExecutionContext`'s CTAS entrypoint) call this first to learn what
+/// to register the written table as, then call `bind()` to both validate
+/// the statement's shape and bind its inner `SELECT`.
+pub fn create_table_target_name(stmt: &Statement) -> Option<String> {
+    match stmt {
+        Statement::CreateTable(ct) => Some(ct.name.table_name()),
+        _ => None,
+    }
+}
+
+/// Refuse, by name, every `CREATE TABLE` clause this epic does not
+/// implement. Mirrors this binder's existing "match the supported shape,
+/// `NotImplemented` the rest" convention (used throughout for window
+/// functions, GROUPING SETS, join types, etc.) applied to sqlparser's
+/// `CreateTable` struct, which carries ~60 fields covering Postgres, Hive,
+/// Snowflake, BigQuery, Redshift and ClickHouse syntax extensions this
+/// engine has no semantic equivalent for. Only `name` and `query` are
+/// consumed (by `Binder::bind()`'s `Statement::CreateTable` arm); every
+/// other field must be at its "not specified" value or this returns a
+/// specific `QueryError::NotImplemented` naming the clause — never a
+/// silent downgrade to "ignore the clause and proceed."
+fn require_supported_create_table_shape(ct: &ast::CreateTable) -> Result<()> {
+    fn refuse(clause: &str) -> QueryError {
+        QueryError::NotImplemented(format!(
+            "CREATE TABLE ... AS SELECT: `{clause}` is not supported — this epic is \
+             full-table bulk-load/replace only (no partitioning, no external/temporary \
+             tables, no engine-specific storage/policy clauses)"
+        ))
+    }
+    if ct.or_replace {
+        return Err(refuse("OR REPLACE"));
+    }
+    if ct.temporary {
+        return Err(refuse("TEMPORARY"));
+    }
+    if ct.external {
+        return Err(refuse("EXTERNAL"));
+    }
+    if ct.dynamic {
+        return Err(refuse("DYNAMIC"));
+    }
+    if ct.global.is_some() {
+        return Err(refuse("GLOBAL/LOCAL"));
+    }
+    if ct.if_not_exists {
+        // Honoring the real semantics (skip silently if the table already
+        // exists) would require detecting an existing table and NOT
+        // replacing it — this epic's write path always replaces, so
+        // accepting this flag and ignoring it would silently change what
+        // the statement means rather than doing what it says.
+        return Err(refuse("IF NOT EXISTS"));
+    }
+    if ct.transient {
+        return Err(refuse("TRANSIENT"));
+    }
+    if ct.volatile {
+        return Err(refuse("VOLATILE"));
+    }
+    if ct.iceberg {
+        return Err(refuse("ICEBERG"));
+    }
+    if ct.snapshot {
+        return Err(refuse("SNAPSHOT"));
+    }
+    if !ct.columns.is_empty() {
+        return Err(refuse(
+            "an explicit column list (CREATE TABLE t (a, b) AS SELECT ...)",
+        ));
+    }
+    if !ct.constraints.is_empty() {
+        return Err(refuse("table constraints"));
+    }
+    if ct.hive_distribution != ast::HiveDistributionStyle::NONE {
+        return Err(refuse("Hive distribution clauses"));
+    }
+    if ct.hive_formats.is_some() {
+        return Err(refuse("Hive ROW FORMAT clauses"));
+    }
+    if ct.table_options != ast::CreateTableOptions::None {
+        return Err(refuse("table options (WITH/OPTIONS/TBLPROPERTIES)"));
+    }
+    if ct.file_format.is_some() {
+        return Err(refuse("STORED AS <file format>"));
+    }
+    if ct.location.is_some() {
+        return Err(refuse("LOCATION"));
+    }
+    if ct.without_rowid {
+        return Err(refuse("WITHOUT ROWID"));
+    }
+    if ct.like.is_some() {
+        return Err(refuse("LIKE"));
+    }
+    if ct.clone.is_some() {
+        return Err(refuse("CLONE"));
+    }
+    if ct.version.is_some() {
+        return Err(refuse("a table version (FOR VERSION AS OF)"));
+    }
+    if ct.comment.is_some() {
+        return Err(refuse("COMMENT"));
+    }
+    if ct.on_commit.is_some() {
+        return Err(refuse("ON COMMIT"));
+    }
+    if ct.on_cluster.is_some() {
+        return Err(refuse("ON CLUSTER"));
+    }
+    if ct.primary_key.is_some() {
+        return Err(refuse("PRIMARY KEY"));
+    }
+    if ct.order_by.is_some() {
+        return Err(refuse("table-level ORDER BY"));
+    }
+    if ct.partition_by.is_some() {
+        return Err(refuse("PARTITION BY"));
+    }
+    if ct.cluster_by.is_some() {
+        return Err(refuse("CLUSTER BY"));
+    }
+    if ct.clustered_by.is_some() {
+        return Err(refuse("CLUSTERED BY"));
+    }
+    if ct.inherits.is_some() {
+        return Err(refuse("INHERITS"));
+    }
+    if ct.partition_of.is_some() {
+        return Err(refuse("PARTITION OF"));
+    }
+    if ct.for_values.is_some() {
+        return Err(refuse("FOR VALUES"));
+    }
+    if ct.strict {
+        return Err(refuse("STRICT"));
+    }
+    if ct.copy_grants {
+        return Err(refuse("COPY GRANTS"));
+    }
+    if ct.enable_schema_evolution.is_some() {
+        return Err(refuse("ENABLE_SCHEMA_EVOLUTION"));
+    }
+    if ct.change_tracking.is_some() {
+        return Err(refuse("CHANGE_TRACKING"));
+    }
+    if ct.data_retention_time_in_days.is_some() {
+        return Err(refuse("DATA_RETENTION_TIME_IN_DAYS"));
+    }
+    if ct.max_data_extension_time_in_days.is_some() {
+        return Err(refuse("MAX_DATA_EXTENSION_TIME_IN_DAYS"));
+    }
+    if ct.default_ddl_collation.is_some() {
+        return Err(refuse("DEFAULT_DDL_COLLATION"));
+    }
+    if ct.with_aggregation_policy.is_some() {
+        return Err(refuse("WITH AGGREGATION POLICY"));
+    }
+    if ct.with_row_access_policy.is_some() {
+        return Err(refuse("WITH ROW ACCESS POLICY"));
+    }
+    if ct.with_storage_lifecycle_policy.is_some() {
+        return Err(refuse("WITH STORAGE LIFECYCLE POLICY"));
+    }
+    if ct.with_tags.is_some() {
+        return Err(refuse("WITH TAG"));
+    }
+    if ct.external_volume.is_some() {
+        return Err(refuse("EXTERNAL_VOLUME"));
+    }
+    if ct.base_location.is_some() {
+        return Err(refuse("BASE_LOCATION"));
+    }
+    if ct.catalog.is_some() {
+        return Err(refuse("CATALOG"));
+    }
+    if ct.catalog_sync.is_some() {
+        return Err(refuse("CATALOG_SYNC"));
+    }
+    if ct.storage_serialization_policy.is_some() {
+        return Err(refuse("STORAGE_SERIALIZATION_POLICY"));
+    }
+    if ct.target_lag.is_some() {
+        return Err(refuse("TARGET_LAG"));
+    }
+    if ct.warehouse.is_some() {
+        return Err(refuse("WAREHOUSE"));
+    }
+    if ct.refresh_mode.is_some() {
+        return Err(refuse("REFRESH_MODE"));
+    }
+    if ct.initialize.is_some() {
+        return Err(refuse("INITIALIZE"));
+    }
+    if ct.require_user {
+        return Err(refuse("REQUIRE USER"));
+    }
+    if ct.diststyle.is_some() {
+        return Err(refuse("DISTSTYLE"));
+    }
+    if ct.distkey.is_some() {
+        return Err(refuse("DISTKEY"));
+    }
+    if ct.sortkey.is_some() {
+        return Err(refuse("SORTKEY"));
+    }
+    if ct.backup.is_some() {
+        return Err(refuse("BACKUP"));
+    }
+    Ok(())
+}
+
 impl<'a> Binder<'a> {
     pub fn new(catalog: &'a dyn Catalog) -> Self {
         Self {
@@ -172,6 +387,33 @@ impl<'a> Binder<'a> {
     pub fn bind(&mut self, stmt: &Statement) -> Result<LogicalPlan> {
         match stmt {
             Statement::Query(query) => self.bind_query(query),
+            // `CREATE TABLE <name> AS SELECT ...` (native-tables-foundation
+            // epic, task 004). This binds and returns ONLY the inner
+            // SELECT's LogicalPlan — the same shape `Statement::Query`
+            // produces — because `LogicalPlan` has no DDL node and none is
+            // needed: the target table name is recovered separately (see
+            // `create_table_target_name`) by whichever `ExecutionContext`
+            // entrypoint drives the CTAS write, since binding a query and
+            // deciding what to do with its result are different jobs. Every
+            // `CreateTable` struct field this epic does not support is
+            // refused BY NAME (`require_supported_create_table_shape`),
+            // never silently ignored — see that function for the full list
+            // (OR REPLACE, TEMPORARY, PARTITION BY, LIKE, CLONE, and ~50
+            // more Hive/Snowflake/BigQuery/Redshift/ClickHouse-specific
+            // clauses this engine has no equivalent for).
+            Statement::CreateTable(ct) => {
+                require_supported_create_table_shape(ct)?;
+                let query = ct.query.as_deref().ok_or_else(|| {
+                    QueryError::NotImplemented(
+                        "CREATE TABLE without AS SELECT (a columns-only definition, to be \
+                         populated later via INSERT) is not supported — this epic is \
+                         full-table bulk-load/replace only. Use \
+                         CREATE TABLE <name> AS SELECT ..."
+                            .to_string(),
+                    )
+                })?;
+                self.bind_query(query)
+            }
             _ => Err(QueryError::NotImplemented(format!(
                 "Statement type not supported: {:?}",
                 stmt

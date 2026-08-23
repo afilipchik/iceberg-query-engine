@@ -4,6 +4,7 @@ mod cli;
 
 use clap::{Parser, Subcommand};
 use cli::{OutputFormat, OutputFormatter, ReplHelper};
+use futures::StreamExt;
 use query_engine::execution::{print_results, ExecutionContext};
 use query_engine::tpch::{self, TpchGenerator};
 use rustyline::error::ReadlineError;
@@ -222,6 +223,65 @@ enum Commands {
         save_csv: Option<PathBuf>,
     },
 
+    /// Write a native table from Parquet, Iceberg, Lance, or a SQL query
+    /// (task 003 of the native-tables-foundation epic). Exactly one of
+    /// --from-parquet/--from-iceberg/--from-lance/--sql must be given.
+    WriteNative {
+        /// Source Parquet file or directory.
+        #[arg(long)]
+        from_parquet: Option<PathBuf>,
+
+        /// Source Apache Iceberg table directory.
+        #[arg(long)]
+        from_iceberg: Option<PathBuf>,
+
+        /// Iceberg snapshot id (only with --from-iceberg; default: current).
+        #[arg(long)]
+        iceberg_snapshot: Option<i64>,
+
+        /// Source Lance dataset directory (requires --features lance).
+        #[cfg(feature = "lance")]
+        #[arg(long)]
+        from_lance: Option<PathBuf>,
+
+        /// Source SQL query. Requires --tables. This is the CREATE TABLE
+        /// ... AS SELECT shape: the query's physical plan is streamed
+        /// directly into the writer batch-by-batch, never materialized
+        /// first (see src/storage/native_write.rs's module doc).
+        #[arg(long)]
+        sql: Option<String>,
+
+        /// Directory of Parquet files to register before running --sql.
+        #[arg(long)]
+        tables: Option<PathBuf>,
+
+        /// Destination native table directory.
+        #[arg(short, long)]
+        out: PathBuf,
+
+        /// create (default, fails if it exists) | overwrite
+        #[arg(long, default_value = "create")]
+        mode: String,
+    },
+
+    /// Load a native table and print its manifest; optionally run a query
+    /// against it. The query path fully materializes the table into memory
+    /// first (a CLI validation convenience, NOT the production read path —
+    /// that is the `TableProvider` in src/storage/native_table.rs).
+    LoadNative {
+        /// Path to a native table directory (written by write-native).
+        #[arg(short, long)]
+        path: PathBuf,
+
+        /// Table name to register for --query.
+        #[arg(short, long, default_value = "t")]
+        name: String,
+
+        /// SQL query to execute (if omitted, just prints the manifest).
+        #[arg(short, long)]
+        query: Option<String>,
+    },
+
     /// Start interactive SQL shell (REPL)
     Repl {
         /// Optional: Preload TPC-H tables from Parquet directory
@@ -345,6 +405,30 @@ enum Commands {
 const TPCH_TABLES: [&str; 8] = [
     "nation", "region", "part", "supplier", "partsupp", "customer", "orders", "lineitem",
 ];
+
+/// Strip any `table.` qualifier from every field name in `schema`.
+///
+/// `write-native --sql`'s physical plan schema carries QUALIFIED names for
+/// a bare `SELECT *` ("orders.o_orderkey", not "o_orderkey" --
+/// `SelectItem::Wildcard` preserves `field.relation` in the binder, a
+/// pre-existing property of `bind_query`, not introduced by this command).
+/// A native table written from such a query should get normal column
+/// names, matching what an explicit column list already produces.
+fn unqualified_schema(schema: &arrow::datatypes::Schema) -> arrow::datatypes::SchemaRef {
+    Arc::new(arrow::datatypes::Schema::new(
+        schema
+            .fields()
+            .iter()
+            .map(|f| {
+                let name = match f.name().rsplit_once('.') {
+                    Some((_, col)) => col.to_string(),
+                    None => f.name().clone(),
+                };
+                arrow::datatypes::Field::new(name, f.data_type().clone(), f.is_nullable())
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
 
 /// Auto-detect TPC-H scale factor from a data directory name.
 fn detect_sf(path: &Path) -> f64 {
@@ -1095,6 +1179,223 @@ async fn main() {
             println!("Successful queries: {}/{}", successful, results.len());
         }
 
+        Commands::WriteNative {
+            from_parquet,
+            from_iceberg,
+            iceberg_snapshot,
+            #[cfg(feature = "lance")]
+            from_lance,
+            sql,
+            tables,
+            out,
+            mode,
+        } => {
+            use query_engine::storage::native_write::{self, NativeWriteMode};
+            let mode: NativeWriteMode = match mode.parse() {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            let mut present = 0;
+            if from_parquet.is_some() {
+                present += 1;
+            }
+            if from_iceberg.is_some() {
+                present += 1;
+            }
+            #[cfg(feature = "lance")]
+            if from_lance.is_some() {
+                present += 1;
+            }
+            if sql.is_some() {
+                present += 1;
+            }
+            if present != 1 {
+                eprintln!(
+                    "Error: pass exactly one of --from-parquet, --from-iceberg, --from-lance, --sql"
+                );
+                std::process::exit(1);
+            }
+
+            let start = Instant::now();
+            let result = if let Some(src) = from_parquet {
+                println!(
+                    "Converting Parquet {} -> {} ({:?})",
+                    src.display(),
+                    out.display(),
+                    mode
+                );
+                native_write::write_from_parquet(&src, &out, mode).await
+            } else if let Some(src) = from_iceberg {
+                println!(
+                    "Converting Iceberg {} -> {} ({:?}, snapshot={:?})",
+                    src.display(),
+                    out.display(),
+                    mode,
+                    iceberg_snapshot
+                );
+                native_write::write_from_iceberg(&src, &out, mode, iceberg_snapshot).await
+            } else if let Some(query) = sql {
+                let Some(dir) = tables else {
+                    eprintln!("Error: --sql needs --tables <parquet directory>");
+                    std::process::exit(1);
+                };
+                let mut ctx = ExecutionContext::new();
+                match std::fs::read_dir(&dir) {
+                    Ok(entries) => {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p.extension().is_some_and(|e| e == "parquet") {
+                                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                                    if let Err(e) = ctx.register_parquet(stem, &p) {
+                                        eprintln!("Warning: {} not registered: {}", stem, e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error reading {}: {}", dir.display(), e);
+                        std::process::exit(1);
+                    }
+                }
+                println!("Planning: {}", query);
+                let physical = match ctx.physical_plan(&query) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                // `SELECT *`'s physical schema carries QUALIFIED field names
+                // ("orders.o_orderkey", not "o_orderkey" -- SelectItem::
+                // Wildcard preserves field.relation in the binder; a
+                // pre-existing property, not introduced here). Strip any
+                // `table.` prefix so a native table written via --sql gets
+                // normal column names, matching what an explicit column
+                // list already produces.
+                let physical_schema = physical.schema();
+                let schema = unqualified_schema(&physical_schema);
+                let n = physical.output_partitions().max(1);
+                let mut streams = Vec::with_capacity(n);
+                let mut stream_err = None;
+                for i in 0..n {
+                    match physical.execute(i).await {
+                        Ok(s) => streams.push(s),
+                        Err(e) => {
+                            stream_err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                if let Some(e) = stream_err {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+                // Merge every partition into ONE stream and hand it straight
+                // to the writer -- streamed, never materialized via
+                // ExecutionContext::sql()'s collecting wrapper (see
+                // native_write.rs's module doc for why that matters).
+                let renamed_schema = schema.clone();
+                let merged: query_engine::physical::RecordBatchStream =
+                    Box::pin(futures::stream::select_all(streams).map(move |res| {
+                        res.and_then(|batch| {
+                            arrow::record_batch::RecordBatch::try_new(
+                                renamed_schema.clone(),
+                                batch.columns().to_vec(),
+                            )
+                            .map_err(Into::into)
+                        })
+                    }));
+                println!("Running (streamed, not materialized): {}", query);
+                native_write::write_batches(merged, schema, &out, mode).await
+            } else {
+                #[cfg(feature = "lance")]
+                {
+                    let src = from_lance.expect("checked exactly one source is present");
+                    println!(
+                        "Converting Lance {} -> {} ({:?})",
+                        src.display(),
+                        out.display(),
+                        mode
+                    );
+                    native_write::write_from_lance(&src, &out, mode).await
+                }
+                #[cfg(not(feature = "lance"))]
+                unreachable!("checked exactly one source is present")
+            };
+
+            match result {
+                Ok(r) => {
+                    println!(
+                        "Wrote {} ({} rows, {} segments, table_id={}, now at version {}) in {:?}",
+                        out.display(),
+                        r.rows,
+                        r.segments,
+                        r.table_id,
+                        r.version,
+                        start.elapsed()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Commands::LoadNative { path, name, query } => {
+            use query_engine::storage::{native_manifest, native_write};
+            let start = Instant::now();
+            let manifest = match native_manifest::read_manifest(&path) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            println!("Native table: {}", path.display());
+            println!("  table_id: {}", manifest.table_id);
+            println!("  version:  {}", manifest.snapshot.version);
+            println!("  rows:     {}", manifest.snapshot.row_count);
+            println!("  segments: {}", manifest.segments.len());
+            let schema = manifest.arrow_schema();
+            println!("Schema: {} columns", schema.fields().len());
+            for field in schema.fields() {
+                println!("  - {}: {:?}", field.name(), field.data_type());
+            }
+            println!("Loaded manifest in {:?}", start.elapsed());
+
+            if let Some(sql) = query {
+                println!();
+                println!(
+                    "Running query (whole table materialized for this CLI command -- NOT the \
+                     production streaming read path): {}",
+                    sql
+                );
+                match native_write::read_back(&path) {
+                    Ok((schema, batches)) => {
+                        let mut ctx = ExecutionContext::new();
+                        ctx.register_table(name.clone(), schema, batches);
+                        match ctx.sql(&sql).await {
+                            Ok(result) => print_results(&result),
+                            Err(e) => {
+                                eprintln!("Error: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error reading back {}: {}", path.display(), e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+
         Commands::Repl {
             tpch,
             #[cfg(feature = "lance")]
@@ -1241,6 +1542,18 @@ fn build_serve_context(
             // deleted. Detection order is a correctness matter here.
             if path.is_dir() && query_engine::storage::iceberg::is_iceberg_dir(&path) {
                 ctx.register_iceberg(&name, &path, None)?;
+                registered += 1;
+                continue;
+            }
+
+            // Native tables (native-tables-foundation epic, task 004): a
+            // directory holding `_manifest.json`. Structurally disjoint
+            // from both Iceberg (no `.metadata.json`) and Lance (no
+            // `.lance` extension, and no parquet files either), so check
+            // order relative to them doesn't matter — grouped here because
+            // it is the same kind of self-describing-directory detection.
+            if path.is_dir() && query_engine::storage::native_table::is_native_table_dir(&path) {
+                ctx.register_native_table(&name, &path)?;
                 registered += 1;
                 continue;
             }
@@ -1514,23 +1827,52 @@ async fn run_repl(
                     continue;
                 }
 
-                // Execute SQL query
+                // Execute SQL query. `CREATE TABLE ... AS SELECT` is DDL: it
+                // needs `&mut ctx` to register the written table, so it is
+                // routed to `create_table_as_select` rather than `sql()`
+                // (which now refuses it outright — see
+                // `ExecutionContext::sql`'s doc comment for why). Parsed
+                // once up front purely to make that routing decision; on a
+                // parse failure this falls through to `sql()`, which
+                // re-parses and reports the same error the user would
+                // otherwise see.
                 let start = Instant::now();
-                match ctx.sql(line).await {
-                    Ok(result) => {
-                        // Use the configured output format
-                        if let Err(e) = state.formatter.print(&result.batches) {
-                            eprintln!("Error formatting output: {}", e);
+                match query_engine::parser::parse_sql(line) {
+                    Ok(stmt)
+                        if query_engine::planner::create_table_target_name(&stmt).is_some() =>
+                    {
+                        match ctx.create_table_as_select(line).await {
+                            Ok(r) => {
+                                println!(
+                                    "Created table '{}' ({} rows, {} segment(s), now at version {}) in {:.3}ms\n",
+                                    r.table_name,
+                                    r.rows,
+                                    r.segments,
+                                    r.version,
+                                    start.elapsed().as_secs_f64() * 1000.0
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("Error: {}\n", e);
+                            }
                         }
-                        println!(
-                            "({} rows in {:.3}ms)\n",
-                            result.row_count,
-                            start.elapsed().as_secs_f64() * 1000.0
-                        );
                     }
-                    Err(e) => {
-                        eprintln!("Error: {}\n", e);
-                    }
+                    _ => match ctx.sql(line).await {
+                        Ok(result) => {
+                            // Use the configured output format
+                            if let Err(e) = state.formatter.print(&result.batches) {
+                                eprintln!("Error formatting output: {}", e);
+                            }
+                            println!(
+                                "({} rows in {:.3}ms)\n",
+                                result.row_count,
+                                start.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {}\n", e);
+                        }
+                    },
                 }
             }
             Err(ReadlineError::Interrupted) => {

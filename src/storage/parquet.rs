@@ -608,6 +608,10 @@ impl TableProvider for ParquetTable {
         self.schema.clone()
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn scan(&self, projection: Option<&[usize]>) -> Result<Vec<RecordBatch>> {
         let mut all_batches = Vec::new();
 

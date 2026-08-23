@@ -54,6 +54,23 @@ pub trait TableProvider: Send + Sync + fmt::Debug {
     /// Get the schema of the table
     fn schema(&self) -> SchemaRef;
 
+    /// Type-erased downcast escape hatch. Lets a caller that must recognize
+    /// one SPECIFIC concrete provider type recover it from a type-erased
+    /// `Arc<dyn TableProvider>`/`&dyn TableProvider` handle, without adding
+    /// a provider-specific capability method to this trait itself.
+    ///
+    /// Used by `src/physical/planner.rs`'s dense-direct-address aggregate
+    /// routing (task 005 of the native-tables-foundation epic) to
+    /// recognize a `NativeTable` specifically. Deliberately NOT something
+    /// every non-Parquet provider can satisfy generically: widening that
+    /// fast path to arbitrary providers (e.g. Lance) was investigated and
+    /// rejected on its own merits (see CLAUDE.md's "Tried, measured,
+    /// REJECTED" table), so a shared capability method would be the wrong
+    /// shape here — an explicit downcast keeps that boundary intentional.
+    ///
+    /// Every implementor: `fn as_any(&self) -> &dyn std::any::Any { self }`.
+    fn as_any(&self) -> &dyn std::any::Any;
+
     /// Get all batches from the table
     fn scan(&self, projection: Option<&[usize]>) -> Result<Vec<RecordBatch>>;
 
@@ -77,6 +94,41 @@ pub trait TableProvider: Send + Sync + fmt::Debug {
     /// Returns None for non-Parquet tables (e.g., MemoryTable)
     fn parquet_files(&self) -> Option<Vec<PathBuf>> {
         None
+    }
+
+    /// A stable, hashable identity for this provider's currently-loaded
+    /// data. `None` means "no stable identity available" — the provider is
+    /// then ineligible for any mechanism that needs to detect "this is the
+    /// same data as last time" vs. "this data changed/reloaded" (today:
+    /// `GpuAggPlan::pid()` in `src/physical/gpu.rs`, the GPU-resident
+    /// aggregate offload cache key). Two calls returning equal bytes are
+    /// treated as identical data; a provider whose underlying data changes
+    /// (e.g. a table reload/replace) MUST return different bytes afterward,
+    /// or a resident cache keyed on this identity would silently serve
+    /// stale results.
+    ///
+    /// Default: derived from [`parquet_files`](Self::parquet_files) — `None`
+    /// unless that returns `Some`, in which case a hash of the file list.
+    /// This is exactly `GpuAggPlan::pid()`'s pre-existing, already-validated
+    /// behavior, generalized here so a provider opts in by overriding
+    /// EITHER method (a Parquet-backed provider typically only needs
+    /// `parquet_files`; a provider with no file list of its own, e.g. a
+    /// future native-table format with its own manifest version/snapshot
+    /// marker, overrides `identity` directly) rather than `pid()` needing to
+    /// special-case provider types by name. A provider that must NEVER be
+    /// identity-eligible (e.g. `ShardedParquetTable`, whose distributed
+    /// shards must never alias the GPU cache's full-table entries) achieves
+    /// that today simply by its existing `parquet_files() -> None` override
+    /// — no separate override of this method is needed for that guarantee
+    /// to hold.
+    fn identity(&self) -> Option<Vec<u8>> {
+        let files = self.parquet_files()?;
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for f in &files {
+            f.hash(&mut h);
+        }
+        Some(h.finish().to_le_bytes().to_vec())
     }
 
     /// Serve a k-nearest-neighbour search from a vector index, if this provider
@@ -156,6 +208,10 @@ impl MemoryTable {
 impl TableProvider for MemoryTable {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn scan(&self, projection: Option<&[usize]>) -> Result<Vec<RecordBatch>> {

@@ -495,6 +495,10 @@ impl TableProvider for PulsarTable {
         self.schema.clone()
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn scan(&self, projection: Option<&[usize]>) -> Result<Vec<RecordBatch>> {
         let batch = self.read_all()?;
         let batch = match projection {

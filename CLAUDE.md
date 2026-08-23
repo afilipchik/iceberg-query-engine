@@ -980,6 +980,34 @@ iceberg/parquet). Reproduce: `.venv/bin/python
 scripts/iceberg_bench_compare.py --iceberg-dir data/tpch-10gb-iceberg
 --sf 10 --iterations 2`.
 
+### Native table commands (default build, 2026-08-23)
+
+Full design/capabilities/benchmarks in the "Native Tables" section below;
+this is just the CLI/SQL surface.
+
+```bash
+# Bulk-load from an existing source (task 003) -- streamed, bounded memory
+query_engine write-native --from-parquet data/tpch-10gb/orders.parquet \
+    --out data/orders_native --mode create   # or --from-iceberg / --from-lance (--features lance)
+# CREATE TABLE ... AS SELECT shape: streams the query's physical plan
+# straight into the writer, never materializes it (src/storage/native_write.rs)
+query_engine write-native --sql "SELECT * FROM orders WHERE o_totalprice > 100000" \
+    --tables data/tpch-10gb --out data/big_orders_native
+
+# Print a native table's manifest, optionally query it (materializing --
+# a CLI validation convenience, not the production read path)
+query_engine load-native --path data/orders_native --query "SELECT COUNT(*) FROM t"
+
+# `serve --tables <dir>` auto-detects a native table subdirectory
+# (`_manifest.json` present) exactly like it does Iceberg/Lance dirs
+query_engine serve --tables data/tpch-10gb-native --memory-limit 40G
+```
+
+`CREATE TABLE <name> AS SELECT ...` also works through
+`ExecutionContext::create_table_as_select` (the REPL calls this
+automatically) -- see "Native Tables" below for the precise boundary
+(NOT reachable through `sql()` or the distributed HTTP/Flight endpoints).
+
 ### Metastore: Apache Gravitino (2026-08-15)
 
 `src/metastore/gravitino.rs` + `serve --metastore <url>
@@ -1958,6 +1986,45 @@ QE_IPC_CACHE=0 [QE_GPU=0] scripts/safe_benchmark.sh --data ./data/tpch-10gb
 `benchmark-parquet --query N --iterations 6` (same env) for the warm
 per-query numbers.
 
+**CPU/GPU split on NATIVE TABLES (2026-08-23, native-tables-foundation
+task 008): the parquet "no full-query win" verdict above does NOT
+transfer — Q6's shape shows a real, reproducible, order-of-magnitude
+win.** Task 007 generalized GPU eligibility to native tables
+(`TableProvider::identity()`) but left a live end-to-end query
+unexercised; task 008 ran one. Methodology note first: `serve` (and
+therefore the HTTP-driven benchmark harness `native_bench_compare.py`
+uses) is a "distributed context," where GPU offload is intentionally
+never enabled (same reasoning as always) — so measuring this needed a
+single-process path, and `load-native --query` turned out to be the
+wrong tool too (it materializes through `native_write::read_back` into a
+plain `MemoryTable`, which has no `identity()` override and could never
+pass the eligibility gate regardless of `enable_gpu_offload()`). Neither
+gap was fixed (both predate this task, out of scope); `examples/
+native_gpu_check.rs` (new, permanent) calls `register_native_table` (the
+real provider) + `enable_gpu_offload()` directly instead. VRAM growth
+confirmed independently (`nvidia-smi` sampled every 0.3s, RTX 5090):
+**1048 → 3858 MiB** the moment the run touches `lineitem`'s columns —
+offload genuinely engages for a real `NativeTable`, not assumed:
+
+| query | CPU steady (avg) | GPU cold (iter 1) | GPU warm (iters 2-6 avg) | verdict |
+|---|---|---|---|---|
+| Q6 (single SUM, no GROUP BY) | ~140ms | ~2.0-2.2s | **~7-8ms** | **~18-20x faster end to end** |
+| Q1 (10 aggs, GROUP BY x2) | ~597ms | ~0.8-1.1s | ~505-623ms | flat (matches parquet's own Q1 result) |
+
+Reproduced twice, Q6's warm number consistent both times (7-8ms). The
+mechanism is the SAME kernel as the parquet path; what changed is the
+denominator — a native table has NO decode step (mmap-resident Arrow,
+not parquet row-group/dictionary decode), so for a shape simple enough
+that the reduction kernel is a meaningful share of total wall time (Q6:
+one ungrouped SUM), the kernel's own speedup finally shows up end to end
+instead of being hidden behind scan/decode cost. Q1's multi-aggregate/
+GROUP BY shape stays flat, same as it did over parquet — that shape's
+bottleneck is something other than scan/decode or the reduction kernel
+(not investigated further). Reproduce: `LD_LIBRARY_PATH=$PWD/.venv/
+lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib NATIVE_DIR=data/
+tpch-10gb-native/lineitem cargo run --release --features gpu --example
+native_gpu_check` (add `QE_GPU=0` for the CPU leg).
+
 ## Expression Compilation — researched, priced, narrowly adopted (2026-08-22)
 
 The "modern engines compile queries" question, answered with measurements
@@ -2039,6 +2106,246 @@ SELECT list.
 Gates: `scripts/window_validate.py` (63 DuckDB-compared cases; QE_BINARY
 env selects the binary) and `tests/window_functions.rs` (9 hermetic
 semantics tests). Both must stay green.
+
+## Native Tables (native-tables-foundation epic, phase 1 of 4, 2026-08-23)
+
+A first-class, writable, independently-persistent table format — phase 1
+("foundation") of the four-phase `native-tables` PRD
+(`.claude/prds/native-tables.md`; phases 2-4 are mutation, GPU/RAM/disk
+tiering, and materialized rollups, none built yet). Generalizes the
+engine's existing Arrow-IPC sidecar cache (`src/storage/ipc_cache.rs`,
+already measured faster than DuckDB's own native storage at SF=100) from
+an opportunistic read-through cache tied to shadowing a specific parquet
+file into a table type a user can `CREATE`/bulk-load/query independently.
+Epic tasks 001-008, `.claude/epics/archived/native-tables-foundation/`.
+
+**Modules** (three new sibling files under `src/storage/`, mirroring the
+existing `lance.rs`/`lance_write.rs` split): `native_manifest.rs` (task
+002 — manifest format, identity/versioning, zone-map statistics),
+`native_write.rs` (task 003 — the write path), `native_table.rs` (task
+004 — the `TableProvider` implementation). `ipc_cache.rs` itself is
+UNCHANGED — its `read_row_group`/`sidecar_dict_cols` functions were
+already parameterized purely by directory + segment index, so native
+tables call them directly with zero refactor.
+
+### Format
+
+One `_manifest.json` per table directory (JSON, not Arrow IPC/Parquet or
+Iceberg's Avro format — chosen because the manifest is metadata, KBs to
+low MBs even for a large table, read once at open time, never on the
+per-row hot path, so JSON's zero-copy cost never materializes; see task
+001's Outcome for the full tradeoff analysis): a stable `table_id` (UUID,
+generated once at creation, independent of any source file's path/mtime/
+size — the decoupled-identity model this epic exists to build), the
+Arrow schema, a `snapshot { version, row_count, created_at_ms }` marker
+bumped on every full-table replace, and a `segments[]` list each naming
+one Arrow IPC file (`rg_{id:05}.arrow` — NOT a free choice; `ipc_cache`'s
+reader hard-codes this name) with its own row count/byte size/per-column
+min-max-null-count statistics, plus a table-level rollup of the same
+shape computed once at write time (O(1) for `TableProvider::
+statistics()`). Segments themselves are unchanged from the existing IPC
+sidecar: mmap zero-copy via `Buffer::from_custom_allocation`, low-
+cardinality Utf8 columns dictionary-coerced — decided ONCE from the first
+segment written and applied uniformly to every later segment (a
+deliberate difference from the parquet-shadowing sidecar, which
+re-decides per row group; forced by the manifest declaring one Arrow type
+per column for the whole table).
+
+### Write path
+
+`write_batches`/`write_from_parquet`/`write_from_iceberg`/`write_from_lance`
+(`--features lance`), modeled on `lance_write.rs`: streams a
+`RecordBatchStream` straight through, batch by batch, computing each
+segment's statistics from the already-buffered batch — never a second
+pass, never materializing the source. **Measured bounded memory,
+independent of source scale**: converting SF=10 `lineitem` (60,000,000
+rows, 2.8GB compressed parquet) peaked at ~406MB RSS in 12.3s (58
+segments, 5.3GB on disk); the full SF=10 warehouse (8 tables) writes in
+23.5s to 6.5GB total (SMALLER than the 9.6GB parquet source — dictionary
+coercion wins); the full SF=100 warehouse (600,000,000-row `lineitem`
+alone) writes in 209.6s to 65GB (again smaller than the 97GB parquet
+source). `Create` mode refuses an existing destination; `Overwrite`
+refuses a non-empty, non-native destination (protects against a wrong
+`--out` path) — every write stages into a temp directory and publishes
+atomically, so a failure mid-write leaves the destination untouched.
+
+### SQL DDL: `CREATE TABLE <name> AS SELECT ...`
+
+Landed as a NEW `&mut self` method, `ExecutionContext::
+create_table_as_select` — deliberately NOT a change to `sql()` (which
+takes `&self`, cannot register a table, and fully materializes results
+before returning). `sql()` explicitly refuses a `CREATE TABLE` statement
+with a message pointing at `create_table_as_select`, so a misdirected
+call fails loudly rather than silently running only the inner `SELECT`
+and writing/registering nothing. Reachable from: the REPL (dispatches
+automatically) and directly via `ExecutionContext`. **NOT reachable from
+`sql()`, the distributed HTTP `/sql` endpoint, or the Arrow Flight
+endpoint** — wiring those is unclaimed follow-up work, not attempted this
+epic. The query itself can be anything `bind_query()` already handles
+(joins, aggregates, subqueries, CTEs, window functions) — `sqlparser`
+0.62 already parses the full `CreateTable{ query: Some(Box<Query>) }`
+shape; a columns-only `CREATE TABLE t (a INT)` (no `AS SELECT`, `query:
+None`) and all other `CreateTable` clauses (`IF NOT EXISTS`, `TEMPORARY`,
+partitioning, etc.) are refused BY NAME, not silently ignored.
+
+### Registration and querying
+
+`ExecutionContext::register_native_table(name, path)`; `serve --tables
+<dir>` auto-detects a native-table subdirectory (`_manifest.json`
+present) exactly like it does Iceberg/Lance directories, structurally
+disjoint from both so detection order doesn't matter. Once registered, a
+native table is queried through the SAME generic physical-planner path
+every non-Parquet provider uses (no special-cased scan operator) — joins,
+filters, aggregates, GROUP BY all apply unchanged, and `TableProvider::
+statistics()` (never `None` — a direct O(1) copy of the manifest's
+rollup) feeds the same cost-based join reordering and `disjoint_group_hint`
+machinery every other table type does.
+
+### Dense-direct-address fast path (task 005)
+
+`try_execute_dense_direct` (`morsel_agg.rs` — the engine's fastest
+aggregation tier) previously read its key-range bounds from PARQUET FILE
+FOOTERS specifically, which would have made it silently unreachable for
+native tables (a real regression vs. parquet, not just a missed
+optimization). Generalized: `MorselAggregateExec` gained a
+`native_provider: Option<Arc<dyn TableProvider>>` field alongside the
+existing parquet `files: Vec<PathBuf>` field (the parquet code path is
+byte-for-byte unchanged), and a new planner extractor
+(`try_extract_native_dense_source`) routes eligible native-table scans
+into it, re-validating eligibility with the SAME shared functions the
+executor itself uses (so a planner/executor mismatch is structurally
+unreachable, not just untested). **Measured, not assumed**: a Q18-shaped
+`GROUP BY l_orderkey` over a native table (SF=1, 1,498,929 groups) took
+**6.1ms** for the dense-direct scan+accumulate step vs the parquet
+source's **41.7ms** in the same run (`AGG_TIMING=1`, `examples/
+native_dense_direct_check.rs`) — both legs agree on group count exactly.
+Eligibility is identical to parquet's (single unfiltered integer/date
+GROUP BY column, plain COUNT/SUM/AVG, key range ≤64,000,000) minus filter
+support: `NativeTable::scan_with_filter` has no pushdown at all (see
+Limitations below), so a filtered GROUP BY correctly falls through to the
+generic aggregate tier rather than silently aggregating unfiltered rows.
+
+### Memory safety
+
+**Write path**: safe by construction (streaming, bounded ~400MB
+regardless of source scale — measured above, not just designed for).
+**Read path**: `NativeTable::scan()` is NOT incremental — it materializes
+every active segment into one `Vec<RecordBatch>` (the same
+`MemoryTable`-shaped gap `LanceTable::scan()` also has; a genuinely
+streaming native-table scan comparable to `ParallelParquetSource` remains
+open follow-up work, materially larger than this epic's scope). Task 006
+added a hard admission-control check instead:
+`register_native_table` computes `memory_limit * spill_threshold` (the
+SAME formula `spillable.rs` already applies at 7 call sites) and
+`NativeTable::scan()` refuses BEFORE touching a single segment if the
+active segment set's on-disk size exceeds it, naming the exact byte
+counts. **Verified end to end, not just unit-tested**: the identical
+60,000,000-row full-table query that SIGKILL'd (exit 137, ~1.6GB peak
+RSS) under a bare 1GiB cgroup cap before this fix now returns a clean
+HTTP 400 in ~20ms citing the exact budget; raising `--memory-limit`
+appropriately lets the same query run correctly (588ms, matching every
+other run's values). **Consequence for anyone benchmarking native tables
+at scale**: size `--memory-limit` generously and explicitly — unlike
+Parquet's streaming path, which needs no such cap, a native-table query
+against SF=10/SF=100-scale data WILL refuse cleanly under the engine's
+1GiB default. This doc's own benchmark commands below always pass one.
+
+### GPU-offload eligibility (task 007)
+
+`TableProvider::identity() -> Option<Vec<u8>>` (new trait method,
+default `None`) is the single mechanism `GpuAggPlan::pid()`'s cache key
+and `plan_gpu_agg`'s eligibility gate both now use, replacing an inlined
+`parquet_files()`-only hash. A provider opts in by overriding either
+`parquet_files()` (the common case — Parquet/Iceberg tables get a
+correct `identity()` for free from the trait's own default) or
+`identity()` directly (native tables: `table_id` bytes ++ little-endian
+`version` bytes — stable across repeated queries against the same loaded
+table, changes on every full-table replace, exactly the cache-
+invalidation behavior the mechanism needs). A SHARDED native-table
+provider (`only_segments: Some(_)`) returns `None`, mirroring
+`ShardedParquetTable`'s own reasoning — a GPU cache keyed on the whole
+table's identity must never alias a worker's partial shard. Distributed/
+`serve` contexts still never enable GPU offload at all
+(`ExecutionConfig::gpu_offload` defaults `false`, forced `false` again in
+fragment contexts), independent of and unaffected by this change.
+
+### Current limitations (explicit, matching this epic's own G5 boundary and the PRD's phase plan)
+
+- **No mutation.** `INSERT`/`UPDATE`/`DELETE` are not implemented —
+  `Statement::Insert` falls through the binder's catch-all
+  `NotImplemented` exactly as before this epic. A "load" is always a
+  full-table replace (`write-native --mode overwrite` / re-running
+  `CREATE TABLE ... AS SELECT`). Phase 2 of the PRD.
+- **No filter/row-group pruning at scan level.** `NativeTable::
+  scan_with_filter` has no predicate pushdown at all; every query reads
+  every active segment in full and relies on a post-scan `FilterExec` for
+  correctness (always cell-exact — never a wrong answer). This has a
+  real, measured cost at scale, found by this epic's own QA close-out
+  (task 008): parquet's row-group statistics let it skip most of the
+  work for date-range-filtered queries before a join ever sees those
+  rows; native tables cannot, so their post-filter join inputs are
+  larger. For 3 of 22 TPC-H queries (Q4, Q12, Q13 — at scale-dependent
+  thresholds: only Q12 at SF=10, all three at SF=100) this pushes a
+  join's build side across the `SpillableHashJoinExec` spill threshold,
+  which (a pre-existing characteristic of that operator, not introduced
+  by this epic — see its own doc comment) fully materializes the build
+  side before deciding to spill, then spills as many small Parquet
+  files, and refuses outright rather than guessing when a non-INNER
+  join's build side is the one that's oversized. Root-caused with a live
+  `gdb` thread dump (caught a thread inside `parquet::column::writer`
+  mid-query — direct evidence, not inference) and filesystem evidence
+  (`/tmp/query_engine_spill/join_*/build_*.parquet`, hundreds of files,
+  actively growing). Always a safe, clean refusal or a slow-but-correct
+  completion — never wrong data. Closing this for real means either
+  scan-level pruning for native tables or a streaming rewrite of the
+  join spill path — both real, separately-scoped future work, not a
+  same-task fix.
+- **No distributed participation yet.** A native table registers and
+  reads correctly on a single `serve` node (including via `--tables`
+  auto-detection), and `distributed_splits`/`shard_by_splits` are real,
+  non-`None` implementations (one `Split` per segment) — but multi-node
+  SCATTER/GATHER planning for native tables is explicitly out of scope
+  for this epic (its own G5 criterion only requires NOT breaking existing
+  parquet/Iceberg/Lance distributed behavior, confirmed by the M1/M2
+  gates) and has not been validated on a real cluster.
+- **GPU/RAM/disk tiering and materialized rollups are not built** —
+  phases 3 and 4 of the PRD. This epic only kept the GPU-offload identity
+  hook open (above) so that work isn't blocked from zero.
+
+### Benchmarks (2026-08-23, task 008 close-out)
+
+Both scales load `data/tpch-{10gb,100gb}` (plain parquet) into native
+tables via `write-native --from-parquet`, then compare the ENGINE
+reading its OWN native tables against DuckDB reading the SAME source
+data two ways — plain parquet (`read_parquet` views) and, at SF=10 only
+(no SF=100 Iceberg fixture exists), the engine's own Iceberg tables
+(`data/tpch-10gb-iceberg`, `iceberg_scan`) — per this program's standing
+"report every premise separately" convention.
+
+| scale | queries | engine total | vs DuckDB-parquet | vs DuckDB-iceberg |
+|---|---|---|---|---|
+| SF=10 | 22/22 cell-exact | **5.324s** | 4.321s → **1.23x** | 6.888s → **0.77x (engine faster)** |
+| SF=100 | 19/22 cell-exact + successful (Q4/Q12/Q13: see Limitations) | **75.17s** | 50.02s (same 19) → **1.50x** | n/a (no SF=100 Iceberg fixture) |
+
+Disk footprint, both scales: smaller than the parquet source it was
+loaded from (SF=10: 6.5GB vs 9.6GB; SF=100: 65GB vs 97GB) — dictionary
+coercion of low-cardinality strings outweighs parquet's own compression
+here. Reproduce: `.venv/bin/python scripts/native_bench_compare.py
+--write --source-dir data/tpch-10gb --native-dir data/tpch-10gb-native
+--binary target/release/query_engine` then `scripts/
+native_bench_compare.py --native-dir data/tpch-10gb-native --source-dir
+data/tpch-10gb --iceberg-dir data/tpch-10gb-iceberg --sf 10
+--memory-limit 40G --iterations 2` (SF=100: `--memory-limit 100G`, no
+`--iceberg-dir`, and exclude Q4/Q12/Q13 via `--queries` if a bounded run
+is wanted — see Limitations for why).
+
+**CPU vs GPU split** (`--features gpu`, per this program's standing
+convention of reporting these as separate rows): see the "GPU Aggregate
+Offload" section's own CPU/GPU-split subsection below for the combined
+parquet+native-table finding — task 007 confirmed the offload path is
+reachable for native tables (identity plumbing unit-tested end to end);
+task 008 measured whether it produces a full-query win at native-table
+scale.
 
 ## Recently Implemented Features
 
