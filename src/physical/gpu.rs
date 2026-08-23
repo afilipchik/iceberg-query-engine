@@ -10,8 +10,14 @@
 //! slower.
 //!
 //! Scope (v1, deliberately narrow):
-//! - Shape: `Aggregate(Filter?(Scan(parquet table)))` — after the optimizer
-//!   has pushed the WHERE into the scan.
+//! - Shape: `Aggregate(Filter?(Scan(table)))` — after the optimizer has
+//!   pushed the WHERE into the scan. The scanned table's provider must have
+//!   a stable identity (`TableProvider::identity()`, used as the resident-
+//!   cache key by `GpuAggPlan::pid()`) — today that means parquet-backed
+//!   tables (the trait's default derives identity from `parquet_files()`);
+//!   any future provider with its own stable identity (e.g. a native
+//!   table's manifest version) is eligible the same way, without this
+//!   module needing to special-case provider types by name.
 //! - Aggregates: COUNT(*) / COUNT(col) / SUM / MIN / MAX / AVG over Float64
 //!   columns, plus the two TPC-H fused forms `a*(1-b)` and `a*(1-b)*(1+c)`.
 //! - Filters: conjunctions of single-column numeric comparisons (the same
@@ -137,18 +143,19 @@ impl GpuAggPlan {
         out
     }
 
-    /// Cache identity: a hash of the provider's PARQUET FILE LIST. Table
-    /// names collide across contexts (tests, shards, re-registration) and
-    /// raw provider pointers can be reallocated at the same address (ABA);
-    /// the file list is the data's own stable identity. Non-parquet
-    /// providers are never offloaded (plan_gpu_agg refuses them).
+    /// Cache identity: derived from `TableProvider::identity()` (default:
+    /// a hash of the provider's PARQUET FILE LIST — see that method's doc
+    /// comment in `src/physical/operators/scan.rs`; unchanged behavior for
+    /// every parquet-backed provider). Table names collide across contexts
+    /// (tests, shards, re-registration) and raw provider pointers can be
+    /// reallocated at the same address (ABA); a stable data identity avoids
+    /// both. Providers with no identity are never offloaded (`plan_gpu_agg`
+    /// refuses them via the same `identity()` call).
     fn pid(&self) -> usize {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        if let Some(files) = self.provider.parquet_files() {
-            for f in files {
-                f.hash(&mut h);
-            }
+        if let Some(id) = self.provider.identity() {
+            id.hash(&mut h);
         }
         h.finish() as usize
     }
@@ -204,9 +211,15 @@ pub fn plan_gpu_agg(
         collect_preds(f, &mut preds)?;
     }
     let provider = tables.get(&scan.table_name)?.clone();
-    // Only parquet-backed tables: their file list is the cache identity, and
-    // they are the long-lived tables a resident cache pays off for.
-    provider.parquet_files()?;
+    // Any provider with a stable, hashable identity (`TableProvider::
+    // identity()`): today that's parquet-backed tables (file list, via the
+    // trait's default) and, once a native-table provider opts in by
+    // overriding `identity()` directly, native tables too (manifest
+    // `table_id` + `snapshot.version`). A provider with no identity
+    // (MemoryTable, a sharded/distributed provider, ...) is refused here —
+    // `pid()` would collide for all of them and the resident cache would
+    // alias unrelated datasets.
+    provider.identity()?;
 
     // Group keys: none, or plain string columns.
     let mut group_cols = Vec::new();
