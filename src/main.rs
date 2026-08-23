@@ -4,6 +4,7 @@ mod cli;
 
 use clap::{Parser, Subcommand};
 use cli::{OutputFormat, OutputFormatter, ReplHelper};
+use futures::StreamExt;
 use query_engine::execution::{print_results, ExecutionContext};
 use query_engine::tpch::{self, TpchGenerator};
 use rustyline::error::ReadlineError;
@@ -404,6 +405,30 @@ enum Commands {
 const TPCH_TABLES: [&str; 8] = [
     "nation", "region", "part", "supplier", "partsupp", "customer", "orders", "lineitem",
 ];
+
+/// Strip any `table.` qualifier from every field name in `schema`.
+///
+/// `write-native --sql`'s physical plan schema carries QUALIFIED names for
+/// a bare `SELECT *` ("orders.o_orderkey", not "o_orderkey" --
+/// `SelectItem::Wildcard` preserves `field.relation` in the binder, a
+/// pre-existing property of `bind_query`, not introduced by this command).
+/// A native table written from such a query should get normal column
+/// names, matching what an explicit column list already produces.
+fn unqualified_schema(schema: &arrow::datatypes::Schema) -> arrow::datatypes::SchemaRef {
+    Arc::new(arrow::datatypes::Schema::new(
+        schema
+            .fields()
+            .iter()
+            .map(|f| {
+                let name = match f.name().rsplit_once('.') {
+                    Some((_, col)) => col.to_string(),
+                    None => f.name().clone(),
+                };
+                arrow::datatypes::Field::new(name, f.data_type().clone(), f.is_nullable())
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
 
 /// Auto-detect TPC-H scale factor from a data directory name.
 fn detect_sf(path: &Path) -> f64 {
@@ -1245,7 +1270,15 @@ async fn main() {
                         std::process::exit(1);
                     }
                 };
-                let schema = physical.schema();
+                // `SELECT *`'s physical schema carries QUALIFIED field names
+                // ("orders.o_orderkey", not "o_orderkey" -- SelectItem::
+                // Wildcard preserves field.relation in the binder; a
+                // pre-existing property, not introduced here). Strip any
+                // `table.` prefix so a native table written via --sql gets
+                // normal column names, matching what an explicit column
+                // list already produces.
+                let physical_schema = physical.schema();
+                let schema = unqualified_schema(&physical_schema);
                 let n = physical.output_partitions().max(1);
                 let mut streams = Vec::with_capacity(n);
                 let mut stream_err = None;
@@ -1266,8 +1299,17 @@ async fn main() {
                 // to the writer -- streamed, never materialized via
                 // ExecutionContext::sql()'s collecting wrapper (see
                 // native_write.rs's module doc for why that matters).
+                let renamed_schema = schema.clone();
                 let merged: query_engine::physical::RecordBatchStream =
-                    Box::pin(futures::stream::select_all(streams));
+                    Box::pin(futures::stream::select_all(streams).map(move |res| {
+                        res.and_then(|batch| {
+                            arrow::record_batch::RecordBatch::try_new(
+                                renamed_schema.clone(),
+                                batch.columns().to_vec(),
+                            )
+                            .map_err(Into::into)
+                        })
+                    }));
                 println!("Running (streamed, not materialized): {}", query);
                 native_write::write_batches(merged, schema, &out, mode).await
             } else {
