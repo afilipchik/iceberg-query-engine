@@ -128,9 +128,13 @@ See .claude/epics/native-tables-foundation/003.md
   mention of the filename), leaving the peer's uncommitted hunks
   untouched in the working tree for their own commit. Committed as
   `6df5703 "Task 003: write path — bulk-load from parquet/Iceberg/Lance/
-  query results"`. A second, small follow-up commit added the
+  query results"`. A second, small follow-up commit,
+  `a34f460 "Task 003: close out — unqualify wildcard columns in
+  write-native --sql, docs, real-data validation"`, added the
   `unqualified_schema` fix (found after the first commit, via the peer's
-  report).
+  report) plus this closeout documentation, using the identical
+  hunk-splitting technique since `main.rs` again had the peer's
+  concurrent, still-uncommitted edits interleaved with mine.
 - Verified builds clean (through `scripts/claude-safe-build.sh`) under
   default features (`cargo check`, both lib and bin) and `--features
   lance` (`cargo check`, via the repo's vendored `.scratch/tools/protoc`)
