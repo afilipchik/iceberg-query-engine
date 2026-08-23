@@ -1366,14 +1366,42 @@ impl PhysicalOperator for HashJoinExec {
             probe_keep.as_deref(),
         )?;
 
-        // Emit unmatched BUILD rows exactly once: the last probe partition to
-        // finish scans the shared matched bits.
+        // Emit unmatched BUILD rows exactly once PER FULL ROUND: the last
+        // probe partition of a round scans the shared matched bits.
+        //
+        // `build_cache` is a `OnceCell` — the build side (hash table +
+        // `matched` bits + this counter) is intentionally computed ONCE and
+        // SHARED across every call to `execute()`, however many there are.
+        // Almost always that is exactly `output_partitions()` calls, one per
+        // partition, and `done == target` on the last one. But
+        // `SpillableHashAggregateExec::execute_fused_streaming` (task 008,
+        // native-tables-foundation QA) can drive this SAME child through its
+        // ENTIRE `0..output_partitions()` range, discover a tripped
+        // group-count budget only after every partition already finished
+        // (each partition's `execute(p).await` fully computes that
+        // partition's probe synchronously, so the round always completes
+        // before the caller can observe the abort), and then fall through to
+        // `collect_input_partitions_concurrently`, which re-executes the
+        // SAME `0..output_partitions()` range a SECOND time. Comparing for
+        // exact equality only ever fires on the FIRST such round (`done`
+        // sails past `target` on every later round and never lands on it
+        // again), so every subsequent round's actually-used output silently
+        // lost every unmatched build row — reproduced concretely as TPC-H
+        // Q13 losing its "customers with zero orders" bucket (23 rows
+        // instead of 24) against native tables at SF=10, the shape that
+        // happens to trip the fused path's budget. Checking for a multiple
+        // of `target` instead makes each round self-contained: the matched
+        // bits reflect the same true match/no-match facts regardless of
+        // which round is asking, so recomputing "unmatched" once per round
+        // is correct (and free — an abandoned round's own output, unmatched
+        // batch included, is simply discarded along with the rest of it).
         if let Some(matched) = &cache.build_matched {
             let done = cache
                 .completed_partitions
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
                 + 1;
-            if done == self.output_partitions().max(1) {
+            let target = self.output_partitions().max(1);
+            if done % target == 0 {
                 let mut unmatched: Vec<(usize, usize)> = Vec::new();
                 for (batch_idx, flags) in matched.iter().enumerate() {
                     for (row_idx, flag) in flags.iter().enumerate() {
@@ -4673,6 +4701,80 @@ mod tests {
         }
         // Every left row survives: 10 match a right row, 1990 NULL-extend.
         assert_eq!(total_rows, 2000);
+    }
+
+    /// Task 008 (native-tables-foundation QA) regression: the shared
+    /// `build_matched`/`completed_partitions` state on a join's cached
+    /// `BuildSideCache` must correctly re-emit unmatched BUILD rows on EVERY
+    /// full round through `0..output_partitions()`, not just the first.
+    /// `SpillableHashAggregateExec::execute_fused_streaming` can drive its
+    /// child through that entire range, discover its own group-count budget
+    /// tripped only after the round already finished, and fall through to
+    /// `collect_input_partitions_concurrently`, which re-executes the SAME
+    /// range a second time on the SAME `HashJoinExec` (its build cache is a
+    /// `OnceCell`, intentionally computed once and shared). Comparing the
+    /// completion counter for exact equality against `target` only ever
+    /// fires once (the counter sails past `target` on every later round and
+    /// never lands on it again) -- reproduced concretely as TPC-H Q13
+    /// against native tables at SF=10 losing its "customers with zero
+    /// orders" bucket (23 rows instead of 24) because the round whose
+    /// output was actually used was the SECOND one. Fixed by checking
+    /// `done % target == 0` instead, so each round is self-contained.
+    #[tokio::test]
+    async fn left_join_reemits_unmatched_build_rows_on_a_second_full_round() {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        // 1000 build-side rows, 300 of which have a matching probe row -- 700
+        // must NULL-extend, both times the full partition range is driven.
+        let left_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from((0..1000).collect::<Vec<i64>>()))],
+        )
+        .unwrap();
+        let right_schema = Arc::new(Schema::new(vec![Field::new("rk", DataType::Int64, false)]));
+        // 4 probe batches totalling 1200 rows (over MemoryTableExec's
+        // <1000-rows "small table" single-partition threshold, so
+        // output_partitions() > 1 -- the bug requires more than one
+        // partition to manifest at all) but each repeating the SAME 300
+        // distinct keys (0..299), so build keys 300..999 (700 of them)
+        // never appear on the probe side and must NULL-extend.
+        let right_batches: Vec<RecordBatch> = (0..4)
+            .map(|_| {
+                let vals: Vec<i64> = (0..300).collect();
+                RecordBatch::try_new(right_schema.clone(), vec![Arc::new(Int64Array::from(vals))])
+                    .unwrap()
+            })
+            .collect();
+
+        let left_scan = Arc::new(MemoryTableExec::new("l", schema, vec![left_batch], None));
+        let right_scan = Arc::new(MemoryTableExec::new("r", right_schema, right_batches, None));
+
+        let join = HashJoinExec::new(
+            left_scan,
+            right_scan,
+            vec![(Expr::column("k"), Expr::column("rk"))],
+            JoinType::Left,
+        );
+        let partitions = join.output_partitions();
+        assert!(
+            partitions > 1,
+            "test needs >1 probe partition to be meaningful"
+        );
+
+        for round in 0..2 {
+            let mut total_rows = 0usize;
+            for p in 0..partitions {
+                let stream = join.execute(p).await.unwrap();
+                let results: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+                total_rows += results.iter().map(|b| b.num_rows()).sum::<usize>();
+            }
+            // Keys 0..299 each match all 4 probe batches (1200 matched
+            // rows); keys 300..999 match nothing and NULL-extend (700 rows).
+            assert_eq!(
+                total_rows, 1900,
+                "round {round}: expected 1200 matched + 700 NULL-extended = 1900 rows, \
+                 got {total_rows} -- the unmatched-row emission did not fire on this round"
+            );
+        }
     }
 
     /// White-box: a Left join with a filter, a build-side column referenced
