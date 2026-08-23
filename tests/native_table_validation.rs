@@ -8,6 +8,20 @@
 //! streamed into `native_write::write_batches` -> `NativeTable` registered
 //! -> queried again through the ordinary `sql()` path.
 //!
+//! Also covers task 005 (dense-direct-address fast-path compatibility):
+//! `native_table_matches_source_on_a_dense_direct_group_by_cell_exact`
+//! exercises `MorselAggregateExec`'s native-mode routing
+//! (`try_execute_dense_direct` reading key bounds from
+//! `TableProvider::statistics()` instead of parquet footers), and
+//! `native_table_matches_source_on_a_filtered_group_by_cell_exact` pins
+//! that a filtered GROUP BY correctly stays OFF that path (no fallback
+//! tier exists once native mode is selected, so misrouting there would be
+//! a hard error, not just a slow query). A real large-scale (SF=1,
+//! 6,000,000-row `lineitem`) measurement confirming the fast path actually
+//! fires, via `AGG_TIMING=1`, lives in
+//! `examples/native_dense_direct_check.rs` rather than as a `#[test]`
+//! (stderr-diagnostic output isn't a natural fit for the test harness).
+//!
 //! Requires `data/tpch-1mb` (committed fixture; CI regenerates it
 //! deterministically — see CLAUDE.md's "data<->CSV coupling" note).
 
@@ -101,6 +115,63 @@ async fn native_table_matches_source_on_an_aggregate_cell_exact() {
     let sql = "SELECT o_orderstatus, COUNT(*) AS n, SUM(o_totalprice) AS total, \
                AVG(o_totalprice) AS avg_price FROM {} GROUP BY o_orderstatus \
                ORDER BY o_orderstatus";
+    let src = ctx
+        .sql(&sql.replace("{}", "orders_src"))
+        .await
+        .expect("source query");
+    let native = ctx
+        .sql(&sql.replace("{}", "orders_native"))
+        .await
+        .expect("native query");
+    assert_eq!(src.row_count, native.row_count);
+    assert!(src.row_count > 0);
+    assert_eq!(render(&src.batches), render(&native.batches));
+}
+
+/// Task 005 (dense-direct-address fast-path compatibility): a GROUP BY
+/// with a WHERE clause must NOT take the native dense-direct path
+/// (`try_extract_native_dense_source` refuses any scan-level filter, since
+/// `NativeTable::scan_with_filter` has no pushdown and
+/// `try_execute_dense_direct` never re-evaluates one) — it must keep using
+/// the ordinary generic aggregate tier, exactly as it did before this task.
+/// Otherwise-identical shape to the dense-direct test above (single Int64
+/// group column, plain COUNT/SUM/AVG) specifically to isolate the filter as
+/// the only variable.
+#[tokio::test]
+async fn native_table_matches_source_on_a_filtered_group_by_cell_exact() {
+    let (ctx, _tmp) = build_native_orders_table().await;
+    let sql = "SELECT o_orderkey, COUNT(*) AS n, SUM(o_totalprice) AS total \
+               FROM {} WHERE o_totalprice > 100000 GROUP BY o_orderkey \
+               ORDER BY o_orderkey";
+    let src = ctx
+        .sql(&sql.replace("{}", "orders_src"))
+        .await
+        .expect("source query");
+    let native = ctx
+        .sql(&sql.replace("{}", "orders_native"))
+        .await
+        .expect("native query");
+    assert!(src.row_count > 0, "filter must actually select something");
+    assert_eq!(src.row_count, native.row_count);
+    assert_eq!(render(&src.batches), render(&native.batches));
+}
+
+/// Task 005 (dense-direct-address fast-path compatibility): GROUP BY a
+/// single plain Int64 column (`o_orderkey`, the orders primary key — every
+/// row its own group, exactly the "single int/date group key, large group
+/// count" shape the dense-direct path targets) with plain COUNT/SUM/AVG
+/// aggregates is exactly the shape `try_execute_dense_direct` accepts.
+/// Cell-exact against the same query over the Parquet source proves BOTH
+/// that the result is correct AND that routing didn't silently fall
+/// through to `MorselAggregateExec`'s native-mode error path (`execute()`'s
+/// safety net) — either would show up here, one as a wrong answer, the
+/// other as a hard `Err` that `.expect()` below turns into a panic.
+#[tokio::test]
+async fn native_table_matches_source_on_a_dense_direct_group_by_cell_exact() {
+    let (ctx, _tmp) = build_native_orders_table().await;
+    let sql = "SELECT o_orderkey, COUNT(*) AS n, SUM(o_totalprice) AS total, \
+               AVG(o_totalprice) AS avg_price FROM {} GROUP BY o_orderkey \
+               ORDER BY o_orderkey";
     let src = ctx
         .sql(&sql.replace("{}", "orders_src"))
         .await

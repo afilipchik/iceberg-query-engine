@@ -176,6 +176,55 @@ impl PhysicalPlanner {
         }
     }
 
+    /// Mirror of `try_extract_parquet_source`, scoped to the dense-direct-
+    /// address aggregate fast path's native-table support (task 005 of the
+    /// native-tables-foundation epic): a native table has no parquet
+    /// footer/row-group structure for `try_execute_dense_direct`'s existing
+    /// machinery to read, but it DOES implement the same generic
+    /// `TableProvider::{statistics, scan_with_filter}` surface that
+    /// machinery can drive instead once threaded through
+    /// (`MorselAggregateExec::with_native_provider`).
+    ///
+    /// Deliberately narrower than the parquet extractor:
+    /// - No `Filter` arm, and a Scan-level `filter` is refused: unlike the
+    ///   Parquet branch (which only trusts a filter the parquet decoder's
+    ///   own RowFilter has fully applied), `NativeTable::scan_with_filter`
+    ///   has NO pushdown at all (see its doc comment) and
+    ///   `try_execute_dense_direct` never re-evaluates a filter itself —
+    ///   accepting a filtered native scan here would silently aggregate
+    ///   unfiltered rows.
+    /// - Only matches a provider that downcasts to `NativeTable` — NOT
+    ///   every non-Parquet provider. Widening the parquet-only
+    ///   dense-direct fast path to arbitrary providers (Lance, MemoryTable,
+    ///   ...) was investigated for Lance specifically and rejected (see
+    ///   CLAUDE.md's "Tried, measured, REJECTED" table); this keeps that
+    ///   boundary intentional rather than incidental.
+    fn try_extract_native_dense_source(
+        &self,
+        plan: &LogicalPlan,
+    ) -> Option<(
+        Arc<dyn TableProvider>,
+        arrow::datatypes::SchemaRef,
+        Option<Vec<usize>>,
+    )> {
+        match plan {
+            LogicalPlan::Scan(node) => {
+                if node.filter.is_some() {
+                    return None;
+                }
+                let provider = self.tables.get(&node.table_name)?;
+                provider
+                    .as_any()
+                    .downcast_ref::<crate::storage::NativeTable>()?;
+                let input_schema = provider.schema();
+                let projection = node.projection.clone();
+                Some((provider.clone(), input_schema, projection))
+            }
+            LogicalPlan::Project(node) => self.try_extract_native_dense_source(&node.input),
+            _ => None,
+        }
+    }
+
     /// Helper to create a FilterExec with subquery executor if needed
     fn create_filter(&self, input: Arc<dyn PhysicalOperator>, predicate: Expr) -> FilterExec {
         let has_subquery = predicate.contains_subquery();
@@ -1092,6 +1141,46 @@ impl PhysicalPlanner {
                 )
                 .with_post_filter(post_filter);
                 return Ok(Arc::new(morsel_agg));
+            } else if let Some((provider, input_schema, projection)) =
+                self.try_extract_native_dense_source(&node.input)
+            {
+                // Native-table dense-direct-address routing (task 005).
+                // `MorselAggregateExec`'s native mode has no generic
+                // (hash-table) fallback tier the way its Parquet mode does
+                // (that tier is built entirely around
+                // `ParallelParquetSource` over a file list, which a native
+                // table doesn't have) — so this planner-time check must be
+                // exactly as strict as `try_execute_dense_direct` itself,
+                // not an approximation of it. Both halves are the SAME
+                // functions `try_execute_dense_direct` uses at execution
+                // time (`dense_direct_shape`/`dense_direct_key_bounds`), so
+                // the two can never disagree.
+                let eligible = crate::physical::operators::dense_direct_shape(
+                    &node.group_by,
+                    &aggregates,
+                    &input_schema,
+                )
+                .is_some_and(|(key_name, _, _)| {
+                    crate::physical::operators::dense_direct_key_bounds(
+                        provider.as_ref(),
+                        &key_name.to_lowercase(),
+                    )
+                    .is_some()
+                });
+                if eligible {
+                    let morsel_agg = MorselAggregateExec::new(
+                        Vec::new(),
+                        input_schema,
+                        projection,
+                        None,
+                        node.group_by.clone(),
+                        aggregates,
+                        schema,
+                    )
+                    .with_post_filter(post_filter)
+                    .with_native_provider(provider);
+                    return Ok(Arc::new(morsel_agg));
+                }
             }
         }
 

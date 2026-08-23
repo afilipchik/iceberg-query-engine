@@ -26,6 +26,7 @@ pub use hash_join::HashJoinExec;
 pub use iceberg::{IcebergScanExec, PartitionFilter};
 pub use limit::LimitExec;
 pub use morsel_agg::MorselAggregateExec;
+pub(crate) use morsel_agg::{dense_direct_key_bounds, dense_direct_shape};
 pub use parquet::{ParquetScanExec, ParquetTable, ParquetWriter};
 pub use project::ProjectExec;
 pub use scan::{ColumnStatistics, MemoryTable, MemoryTableExec, TableProvider, TableStatistics};

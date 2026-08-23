@@ -227,6 +227,10 @@ impl TableProvider for NativeTable {
         self.logical_schema()
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     /// `table_id` (stable across a full-table replace) + `snapshot.version`
     /// (bumped by one on every replace) — exactly the pair task 001's
     /// Outcome recommends for GPU-cache identity (task 007), and the only

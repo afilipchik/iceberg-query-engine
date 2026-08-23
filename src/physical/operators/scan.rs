@@ -54,6 +54,23 @@ pub trait TableProvider: Send + Sync + fmt::Debug {
     /// Get the schema of the table
     fn schema(&self) -> SchemaRef;
 
+    /// Type-erased downcast escape hatch. Lets a caller that must recognize
+    /// one SPECIFIC concrete provider type recover it from a type-erased
+    /// `Arc<dyn TableProvider>`/`&dyn TableProvider` handle, without adding
+    /// a provider-specific capability method to this trait itself.
+    ///
+    /// Used by `src/physical/planner.rs`'s dense-direct-address aggregate
+    /// routing (task 005 of the native-tables-foundation epic) to
+    /// recognize a `NativeTable` specifically. Deliberately NOT something
+    /// every non-Parquet provider can satisfy generically: widening that
+    /// fast path to arbitrary providers (e.g. Lance) was investigated and
+    /// rejected on its own merits (see CLAUDE.md's "Tried, measured,
+    /// REJECTED" table), so a shared capability method would be the wrong
+    /// shape here — an explicit downcast keeps that boundary intentional.
+    ///
+    /// Every implementor: `fn as_any(&self) -> &dyn std::any::Any { self }`.
+    fn as_any(&self) -> &dyn std::any::Any;
+
     /// Get all batches from the table
     fn scan(&self, projection: Option<&[usize]>) -> Result<Vec<RecordBatch>>;
 
@@ -191,6 +208,10 @@ impl MemoryTable {
 impl TableProvider for MemoryTable {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn scan(&self, projection: Option<&[usize]>) -> Result<Vec<RecordBatch>> {

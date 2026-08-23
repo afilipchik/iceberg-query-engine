@@ -229,6 +229,10 @@ impl TableProvider for ShardedParquetTable {
         self.schema.clone()
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn scan(&self, projection: Option<&[usize]>) -> Result<Vec<RecordBatch>> {
         self.scan_impl(projection, None)
     }
