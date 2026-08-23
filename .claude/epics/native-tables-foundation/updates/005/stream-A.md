@@ -2,7 +2,7 @@
 issue: 005
 stream: main
 started: 2026-08-23T20:19:44Z
-status: in_progress
+status: completed
 ---
 ## Scope
 See .claude/epics/native-tables-foundation/005.md
@@ -172,10 +172,13 @@ there land in a commit of their own, so my commit's diff to that file stays
 exactly my own hunk. `git status --short` will be re-checked immediately
 before committing.
 
-## Next
-- Read back the `AGG_TIMING=1` example output once the background run
-  finishes; confirm the `(native)` tag appears.
-- Run the full default-build test suite (`cargo test --release`).
-- Wait for task 006 to commit `native_table.rs`/`context.rs`, then extract
-  and commit only my own hunks.
-- Close out: update 005.md frontmatter + Outcome section.
+## Done
+
+Committed `baf9e15` ("Task 005: generalize dense-direct-address fast path
+for native tables") — 12 files, 917 insertions / 264 deletions. Verified
+`git status --short` post-commit shows ONLY task 006's remaining files
+(`006.md`, `updates/006/stream-A.md`, `src/execution/context.rs`,
+`src/storage/native_table.rs` — the last with exactly their memory-budget
+diff, my `as_any` hunk cleanly absorbed into HEAD with zero trace left in
+the working-tree diff). See `005.md`'s Outcome section for the full
+close-out summary.
