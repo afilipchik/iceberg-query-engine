@@ -1,7 +1,7 @@
 ---
 name: duckdb-parity-2
 description: Close the residual SF=10 gap after 6 completed parity epics — measurement-default fix plus Q13/Q16's newly-attributed two-cause-each root problems
-status: backlog
+status: completed
 created: 2026-08-23T00:38:20Z
 ---
 

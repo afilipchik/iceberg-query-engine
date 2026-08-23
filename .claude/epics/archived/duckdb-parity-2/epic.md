@@ -1,9 +1,9 @@
 ---
 name: duckdb-parity-2
-status: in-progress
+status: completed
 created: 2026-08-23T00:38:20Z
-updated: 2026-08-23T09:05:00Z
-progress: 86%
+updated: 2026-08-23T10:30:00Z
+progress: 100%
 prd: .claude/prds/duckdb-parity-2.md
 github: (will be set on sync)
 ---
@@ -104,7 +104,7 @@ Estimated total effort: 15-24 hours (measurement wall time and the M-effort join
 - [x] 004.md - Q16: anti-join parallel-probe investigation + fix (parallel: false)
 - [x] 005.md - Q16: distinct_set hasher swap (parallel: true)
 - [x] 006.md - Dense group-id remapping, Stage 0 + Stage 1 (parallel: false)
-- [ ] 007.md - QA close-out — full suites, cell-exact SF=10+SF=100, docs, epic close (parallel: false)
+- [x] 007.md - QA close-out — full suites, cell-exact SF=10+SF=100, docs, epic close (parallel: false)
 
 Total tasks: 7
 Parallel tasks: 2
@@ -148,3 +148,153 @@ dense-group-id rewrite is needed. Recorded in `002.md` and
 Remaining: 003 (Q13 join-pruning), 004 (Q16 anti-join parallelism), 006
 (dense group-id Stage 0+1, now informed by 002's outcome — Q13 no
 longer needs it), 007 (QA close-out).
+
+## Epic close-out (2026-08-23)
+
+All 7 tasks shipped and validated on branch `epic/duckdb-parity-2`
+(commits `ff3fa97`..`9042a64` for 001-006, plus this task's docs/archive
+commits). Full suite green in **all four feature combinations** (default
+995/0/1, lance 1059/0/2, gpu 995/0/1, pulsar 998/0/1 — passed/failed/
+ignored), 22/22 CELL-EXACT at SF=10 **and** SF=100, `cargo fmt --all
+-- --check` clean, M1 + M2 distributed gates PASS.
+
+### Headline: whole-program before/after (SF=10, both cache premises)
+
+| | cache-off total | like-for-like | native ratio | cache-on total | like-for-like | native ratio |
+|---|---|---|---|---|---|---|
+| Epic start (pre-001) | 8.86s | 2.03x | 2.88x | 5.99s | 1.37x | 1.80x |
+| After phase 1 (001+002+005) | 7.32s | 1.68x | 2.2x | 5.79s | 1.32x | 1.7x |
+| **Epic end (all 6 tasks, this close-out)** | **7.03s** | **1.67x** | **2.1x** | **5.75s** | **1.36x** | **1.7x** |
+
+Net epic-wide: cache-off **-20.7%** (8.86s→7.03s), cache-on **-4.0%**
+(5.99s→5.75s) — cache-off moved more because it's the premise where
+Q13/Q16's costs aren't already partly masked by the IPC sidecar path.
+Like-for-like DuckDB reference re-measured fresh this session (4.22s,
+consistent with the 4.18-4.37s band seen across this epic's several
+measurement sessions — normal run-to-run system noise, not a moving
+target).
+
+### Q13 and Q16: this epic's two named targets
+
+| query | before (PRD band) | after (tight, best-of-8, this task) | improvement |
+|---|---|---|---|
+| Q13 | 415-500ms | cache-off 259.9ms avg / cache-on 223.0ms avg | **~37-48%** |
+| Q16 | 153-224ms | cache-off 131.4ms avg / cache-on 114.9ms avg | **~23-49%** |
+
+Q13's win came almost entirely from task 002 (disjoint-aggregation
+threshold, 2M→1M floor, -40.2% on its own controlled measurement); task
+003's join-output-pruning + runtime-filter extension shipped correctly,
+fully tested, and is now generally available for filtered outer joins —
+but delivered a measured **negligible** additional effect on Q13
+specifically, because the pre-existing `ProjectionPushdown` rule had
+already cut its join inputs to 4 columns before task 003's own gate ever
+ran. Q16's win came almost entirely from task 004 (anti-join batch-
+parallel probe, an oversight fix — `JoinType::Anti` simply wasn't in the
+gate `Inner`/`Left` matched — 41.5ms→6.2ms on the 8M-row probe itself,
+~21% total-query, this epic's single largest individual win) with a
+secondary, confirmed win on **Q22** (~18% faster, same VHT-served
+unfiltered-anti-join shape); task 005's hasher swap landed as required
+but was, as predicted going in, a minority contributor.
+
+### G1-G5 (PRD success criteria): all MET
+
+- **G1 (methodology)** — MET. `ipc_cache.rs` doc now matches the true
+  `Auto` default; `benchmark-parquet` and `safe_benchmark.sh` both print
+  the active cache premise; CLAUDE.md's SF=10 section states the
+  like-for-like ratio (1.67x/1.36x) alongside native, matching the SF=100
+  four-way matrix's format.
+- **G2 (Q13)** — MET, not fully closed (PRD explicitly doesn't require
+  full DuckDB parity). Measurably improved (~37-48%); both fixes
+  attempted and individually measured, including the honest negative
+  result on task 003's specific contribution. Named residue: Q13
+  permanently cannot take the direct u32 match-emission fast path
+  (`hash_join.rs`'s `u32_path`, gated `filter.is_none()`) so it always
+  pays a double gather of the wide `o_comment` filter column — evaluated,
+  scoped out (join→aggregate fusion for this shape was declined, per
+  `streaming-fusion`'s prior finding for the simpler Inner-only case).
+- **G3 (Q16)** — MET. Measurably improved (~23-49%); anti-join fix
+  attempted and measured as a real, large win; hasher swap landed
+  regardless of its individual size, as required.
+- **G4 (no regression)** — MET. 22/22 cell-exact at SF=10 AND SF=100 (this
+  task's own fresh validation, not carried over from an earlier session);
+  full suite green in all 4 feature combinations; benchmark sanity
+  re-run and reported (SF=10 dual-premise + SF=100 confirmatory sweep,
+  Q9=11.21s/Q18=4.86s both unregressed).
+- **G5 (forward-looking)** — MET. Dense-group-id staged design is
+  committed (`examples/dense_group_id_bench.rs`, task 006's design notes).
+  Stage 0 kill-switch **CLEARS** (24.5-44.5% win, 1M-50M groups,
+  1-aggregate shape — with an honest nuance recorded: the win degrades to
+  +10.8% at 2 aggregates and reverses to -9.9% at 3, so any future Stage 1
+  should scope narrowly). Stage 1 correctly **did NOT implement**, per the
+  gate's own rule ("Stage 0 clearing alone is not sufficient... don't
+  force Stage 1 against a query that doesn't need it") — post-fix
+  measurement showed neither Q10 nor Q20 reaches the boxed `raw_groups`
+  tier Stage 1 would replace; both already bypass it via the independently
+  -shipped, leaner `raw_sums` tier. A smaller, directly-evidenced fix
+  shipped instead: `finalize_disjoint_states`' single-state fast path
+  (SF=100 Q13 merge step ~205ms/iter → ~168ms/iter).
+
+### New this task: Iceberg-table and CPU/GPU-split benchmarks
+
+**Iceberg vs plain parquet (SF=10)**: engine 8.325s vs DuckDB-`iceberg_scan`
+6.745s = **1.23x** (row counts match all 22 queries). Reported alongside,
+not instead of, the plain-parquet numbers (1.67x cache-off / 1.36x
+cache-on) per this program's "report multiple premises separately"
+convention. Notable: Iceberg's manifest/snapshot indirection costs the
+engine only ~+18.5% over its own parquet baseline but costs DuckDB's
+`iceberg_scan` ~+60% over its own like-for-like baseline — the
+competitive ratio actually *narrows* under Iceberg. New committed script:
+`scripts/iceberg_bench_compare.py`.
+
+**CPU vs GPU split (SF=10, `--features gpu`)**: full-suite CPU-only
+(7.03-7.17s) vs GPU-enabled single cold pass (7.87s, worse — expected,
+first-touch-always-CPU + un-amortized async upload). Targeted warm
+per-query measurement (Q1/Q6/Q14/Q15, GPU engagement independently
+confirmed via `nvidia-smi` VRAM 1066→1572 MiB) found **no measurable
+full-query win on any of them**, including Q1/Q6 which structurally
+*are* eligible for offload. Root cause, confirmed rather than assumed:
+the previously-documented "Q6 shape 58.7x, Q1 17.0x" numbers are from an
+isolated kernel microbenchmark (`gpu_price_bench.rs`, synthetic
+already-VRAM-resident data, no scan/decode overhead) — a real result at
+the kernel level, but at the full-query level scan+decode dominates
+Q1/Q6's wall time, not the final reduction, so the kernel speedup never
+shows up end-to-end at SF=10. This is a genuine, well-evidenced
+correction to how the GPU offload epic's own numbers should be read, not
+a regression of anything — the GPU mechanism itself is unchanged and
+still correctly never makes a query slower once warm.
+
+### Residues (named as one class, matching this program's convention)
+
+1. **Q13's permanent double-gather of `o_comment`** — architectural, out
+   of scope (fusion evaluated and declined). The remaining lever, if ever
+   revisited, is a Q13-specific fused filtered-join→aggregate path, which
+   `streaming-fusion` already declined for the simpler Inner-only case.
+2. **Dense-group-id Stage 1** — correctly deferred, not abandoned. Design
+   and Stage 0 evidence live in the repo (`006.md`,
+   `examples/dense_group_id_bench.rs`) for a future epic to re-open
+   against a freshly-confirmed query; note the aggregate-count nuance
+   (win at 1 agg, reversal at 3) when scoping it.
+3. **GPU offload's kernel-vs-full-query gap** — the mechanism is
+   correctly implemented and never regresses a query, but its documented
+   speedup does not yet reach full TPC-H wall time at SF=10 because scan/
+   decode dominates. Future work with a plausible payoff: GPU-side decode,
+   or measuring at a scale where the aggregate is a larger wall-time
+   share.
+4. **Sidecar disk-cost policy** (2.6x parquet footprint) remains an
+   explicit product decision, not a performance question — unchanged from
+   the PRD's own Out of Scope note.
+
+### Commits
+
+`ff3fa97` (start) → `d9aeef4`+`6058ff7` (001) → `62900b7`+`169974e` (002) →
+`ebf6b82`+`1383cb7`+`2371da3` (003) → `eba694d`+`5e44ca4` (005) →
+`ee9997c`+`1540a9a`+`8c176d9`+`f9c7403` (006) →
+`ab86423`+`642428d`+`9042a64` (004) → this task's docs/archive commits.
+
+### Archival
+
+Epic moved to `.claude/epics/archived/duckdb-parity-2/` as this task's
+final step, mirroring `dependency-modernization`'s archival pattern
+(`git mv`, commit `ee4414e`). Not merged to `main` — that decision and
+action is left to the user/orchestrating session per this task's own
+instructions.
