@@ -79,6 +79,33 @@ pub(crate) fn merge_states_to_batches_filtered(
     const PARALLEL_MERGE_MIN_GROUPS: usize = 65_536;
     let total_groups: usize = states.iter().map(|s| s.group_count()).sum();
 
+    // A single state has no cross-state duplicate keys to reconcile, so the
+    // shard-then-parallel-merge machinery below (built to combine MULTIPLE
+    // threads' overlapping group sets) is pure overhead for it, at any group
+    // count. This matters most for disjoint-aggregation finalize
+    // (`finalize_disjoint_states` calls in here with exactly one already-
+    // disjoint worker state at a time): before this fix, a single oversized
+    // (>65,536-group) worker state still paid real shard/rehash cost to
+    // "merge" with nothing -- ~205ms/iteration measured on Q13 at SF=100
+    // (469K groups/worker; SF=10's 46.9K groups/worker stays under the
+    // threshold, so this never fired there). The worker's keys are HASH-
+    // scattered across the full key range by the disjoint scatter, so the
+    // `dense` range check below reads false even though the true key domain
+    // is dense -- see duckdb-parity-2 tasks 002 and 006. `demote_raw_sums`
+    // is the only prep genuinely needed first: `AggregationState::
+    // build_output` already unions the perfect-hash, GroupKey and raw_groups
+    // representations correctly on its own, but — unlike every other
+    // consumer in this file — does not know about the bare-f64 `raw_sums`
+    // representation, so skipping this step would silently drop any group
+    // that took the bare-sum ingest fast path.
+    if states.len() == 1 {
+        let mut state = states.into_iter().next().unwrap();
+        state.demote_raw_sums();
+        return Ok(build_filtered_output(&state, schema, post_filter)?
+            .into_iter()
+            .collect());
+    }
+
     // Full-raw pipeline for a single integer group column: shard, merge, and
     // build output on raw u64 keys. The GroupKey pipeline converts every group
     // to Vec<ScalarValue> and re-hashes it during the shard merge — profiling

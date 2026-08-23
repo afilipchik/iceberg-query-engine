@@ -355,10 +355,32 @@ impl PhysicalPlanner {
     /// a DENSE key space: NDV >= 1M and range <= 2x NDV. That is the regime
     /// where every worker's shared-channel partial state spans the whole key
     /// range and the merge pays workers-fold overlap (Q13's c_custkey,
-    /// NDV=range=15M: merge 4.3s shared vs 0.1ms disjoint at SF=100).
+    /// NDV=range=15M: merge 4.3s shared vs 0.1ms disjoint at SF=100 — an old
+    /// generic-merge measurement, kept for the shape it documents; the
+    /// CURRENT dense range-shard merge costs ~223ms at SF=10's 1.5M-range
+    /// c_custkey, `[raw-merge]` profiling, see task 002).
     /// Sparse keys (l_orderkey, range 4x NDV) measured a net LOSS under the
     /// scatter, and low-NDV keys pay scatter for a merge that was already
     /// trivial — both stay on the shared channel.
+    ///
+    /// Lower bound 1,000,000 (task 002, duckdb-parity-2 epic, 2026-08-22):
+    /// SF=10's c_custkey range is 1,500,000, under the floor this replaced
+    /// (2,000,000) — that floor was set from the SF=100 case alone with no
+    /// SF=10-scale measurement. `examples/disjoint_merge_bench.rs` isolates
+    /// the merge step at range/mult combinations bracketing 1.5M (mult =
+    /// TPC-H's fixed 10:1 orders:customer ratio) and found disjoint mode a
+    /// net win EVERYWHERE tested, 500K through 5M range and mult 3 through
+    /// 40, 1.55x-2.85x faster end to end (scatter cost included) with no
+    /// sign of a crossover approaching from below — at SF=10's exact shape
+    /// (range=1.5M, mult=10): ~1.9-2.0x. The bench's structural prediction
+    /// (8.59x worker-state duplication at range=15M, mult=10) matches this
+    /// function's own SF=100 doc citation (126M partial slots for 15M
+    /// groups) to within 2%, and its absolute SF=10 merge-step timing
+    /// (~150-200ms) matches the real measured 223ms `[raw-merge]` number
+    /// closely enough to trust its verdict at the untested 1.5M point.
+    /// 1,000,000 (not the lower bracket points also measured, e.g. 500K) was
+    /// chosen to stay inside the directly-tested range rather than
+    /// extrapolate below it.
     fn disjoint_group_hint(&self, group_by: &[Expr]) -> bool {
         if group_by.len() != 1 {
             return false;
@@ -378,10 +400,10 @@ impl PhysicalPlanner {
                         // scatter for a merge that was already cheap. The
                         // pathological shared-merge case is a dense DIRECT-
                         // ADDRESS key domain, and that is a RANGE property:
-                        // c_custkey (range 15M) qualifies, l_orderkey does
-                        // not.
+                        // c_custkey (range 15M at SF=100, 1.5M at SF=10)
+                        // qualifies, l_orderkey does not.
                         let range = max.saturating_sub(min).saturating_add(1).max(1) as u64;
-                        return (2_000_000..=64_000_000).contains(&range);
+                        return (1_000_000..=64_000_000).contains(&range);
                     }
                 }
             }
@@ -884,12 +906,14 @@ impl PhysicalPlanner {
     }
 
     /// Convert a logical plan to a physical plan
-    /// Top-down walk computing, per Inner join, which of its output columns
-    /// any ANCESTOR references. `needed == None` means "assume everything"
-    /// (the safe default for shapes this walk doesn't model). Conservative
-    /// by construction: a wrong mask can only KEEP too much (no pruning
-    /// benefit), never drop a referenced column — every reference set is a
-    /// superset of true usage, and unmodelled nodes reset to None.
+    /// Top-down walk computing, per Inner/Left/Right/Full join, which of its
+    /// output columns any ANCESTOR references. `needed == None` means
+    /// "assume everything" (the safe default for shapes this walk doesn't
+    /// model). Conservative by construction: a wrong mask can only KEEP too
+    /// much (no pruning benefit), never drop a referenced column — every
+    /// reference set is a superset of true usage, and unmodelled nodes reset
+    /// to None. Semi/Anti (left-only-width schema) and Cross (no ON-clause
+    /// to force-keep against) are out of scope and never get a mask.
     fn analyze_join_output_usage(
         &self,
         plan: &LogicalPlan,
@@ -942,11 +966,42 @@ impl PhysicalPlanner {
                 self.analyze_join_output_usage(&n.input, needed);
             }
             LogicalPlan::Join(n) => {
-                if n.join_type == crate::planner::JoinType::Inner && n.filter.is_none() {
+                // Pruning is safe for the join types whose output width and
+                // NULL-extension semantics the physical probe paths fully
+                // implement (Inner/Left/Right/Full — see HashJoinExec's and
+                // SpillableHashJoinExec's set_retained). Semi/Anti keep a
+                // left-only-width schema that needs separate handling and
+                // Cross has no ON-clause; both stay excluded. A filter
+                // containing a subquery can reference columns this walk
+                // cannot see, so it bails to "keep everything" — the same
+                // safe default `refs_of` uses below for ancestor exprs.
+                let prune_eligible = matches!(
+                    n.join_type,
+                    crate::planner::JoinType::Inner
+                        | crate::planner::JoinType::Left
+                        | crate::planner::JoinType::Right
+                        | crate::planner::JoinType::Full
+                ) && n
+                    .filter
+                    .as_ref()
+                    .map(|f| !f.contains_subquery())
+                    .unwrap_or(true);
+                if prune_eligible {
                     if let Some(need) = &needed {
+                        // Force-keep: any column the ON-clause filter itself
+                        // references stays in the join's output regardless
+                        // of downstream need. The filter is evaluated INSIDE
+                        // the join on candidate (build, probe) pairs — using
+                        // the already-pruned build cache — before NULL
+                        // extension is decided, so it needs the column even
+                        // when nothing above the join ever selects it.
+                        let mut retained = need.clone();
+                        if let Some(f) = &n.filter {
+                            collect_columns(f, &mut retained);
+                        }
                         self.join_retained
                             .borrow_mut()
-                            .insert(n as *const _ as usize, need.clone());
+                            .insert(n as *const _ as usize, retained);
                     }
                 }
                 let mut on_refs: Vec<&Expr> = Vec::new();
@@ -1373,12 +1428,25 @@ impl PhysicalPlanner {
                 // Runtime join-key filter: joins with a single plain
                 // probe-key column over a streaming parquet scan decode only
                 // rows whose key exists in the (small) build side. Safe for
-                // Inner; also for Semi and Anti when the build is the LEFT
-                // side (probe rows outside the build key set can never mark
-                // a build row — for swapped Semi/Anti the probe rows ARE the
-                // output and Anti would drop exactly the rows it must keep).
-                let rt_eligible = matches!(node.join_type, JoinType::Inner)
-                    || (is_semi_anti && !build_right_for_left);
+                // Inner; also for Semi, Anti and Left when the build is the
+                // LEFT side (probe rows outside the build key set can never
+                // match a build row, and for Left the PRESERVED side is the
+                // build side, so a dropped probe row was never going to
+                // reach the output either way). NOT safe when the build
+                // flips to the right: for swapped Semi/Anti the probe rows
+                // ARE the output (Anti would drop exactly the rows it must
+                // keep), and for Left the probe side would then be the
+                // preserved one (unmatched rows must still NULL-extend).
+                // Right/Full are excluded too: Right always builds from its
+                // own (preserved) right side, so the wiring below — which
+                // targets the physical RIGHT child as "the probe scan" —
+                // would target the wrong side; Full preserves both sides, so
+                // no side may be dropped from the scan at all.
+                let build_prefers_left = matches!(
+                    node.join_type,
+                    JoinType::Left | JoinType::Semi | JoinType::Anti
+                ) && !build_right_for_left;
+                let rt_eligible = matches!(node.join_type, JoinType::Inner) || build_prefers_left;
                 // Multi-key joins publish a partial filter on the first
                 // column pair (a correct superset of matching rows).
                 let rt_pair = on

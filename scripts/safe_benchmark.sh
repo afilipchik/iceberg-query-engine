@@ -202,6 +202,17 @@ log "Memory limit: $MEM_LIMIT | Data: $DATA_DIR | Isolation: $ISOLATION_METHOD"
 log "Timeout multiplier: ${TIMEOUT_MULTIPLIER}x DuckDB | Min timeout: ${MIN_TIMEOUT}s"
 log "Queries: ${QUERY_LIST[*]}"
 log "Iterations: $ITERATIONS"
+
+# IPC-cache premise: state it unambiguously so a reader never has to check
+# `ls data/*/*.qeipc` and cross-reference QE_IPC_CACHE by hand (src/storage/
+# ipc_cache.rs). Unset defaults to Auto: an existing fresh sidecar is used
+# silently, but none is ever built — NOT the same as cache-off.
+case "${QE_IPC_CACHE:-}" in
+    0) CACHE_PREMISE="OFF (QE_IPC_CACHE=0: sidecars ignored, pure parquet decode)" ;;
+    1) CACHE_PREMISE="BUILD (QE_IPC_CACHE=1: builds missing/stale sidecars and uses them)" ;;
+    *) CACHE_PREMISE="AUTO (QE_IPC_CACHE unset, the default: uses an existing fresh sidecar if present, never builds one)" ;;
+esac
+log "Cache premise: $CACHE_PREMISE"
 log "Log: $LOG_FILE"
 echo "" | tee -a "$LOG_FILE"
 

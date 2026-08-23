@@ -13,7 +13,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use futures::stream::{self, TryStreamExt};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use rayon::prelude::*;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -312,7 +312,7 @@ struct AccumulatorState {
     max_i64: Option<i64>,
     min_str: Option<String>,
     max_str: Option<String>,
-    distinct_set: Option<std::collections::HashSet<GroupValue>>,
+    distinct_set: Option<HashSet<GroupValue>>,
     // Boolean aggregate states
     bool_and: Option<bool>,
     bool_or: Option<bool>,
@@ -2183,9 +2183,7 @@ fn update_accumulator(
         AggregateFunction::CountDistinct => {
             if !input.is_null(row) {
                 let value = extract_group_value(input, row);
-                let set = state
-                    .distinct_set
-                    .get_or_insert_with(std::collections::HashSet::new);
+                let set = state.distinct_set.get_or_insert_with(HashSet::new);
                 set.insert(value);
             }
         }
@@ -2194,9 +2192,7 @@ fn update_accumulator(
                 if distinct {
                     // For SUM(DISTINCT), collect values in distinct_set
                     let value = extract_group_value(input, row);
-                    let set = state
-                        .distinct_set
-                        .get_or_insert_with(std::collections::HashSet::new);
+                    let set = state.distinct_set.get_or_insert_with(HashSet::new);
                     set.insert(value);
                 } else {
                     state.count += 1;
@@ -2446,9 +2442,7 @@ fn update_accumulator(
             // Use distinct set for approximate distinct
             if !input.is_null(row) {
                 let value = extract_group_value(input, row);
-                let set = state
-                    .distinct_set
-                    .get_or_insert_with(std::collections::HashSet::new);
+                let set = state.distinct_set.get_or_insert_with(HashSet::new);
                 set.insert(value);
             }
         }

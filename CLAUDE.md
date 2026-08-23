@@ -945,7 +945,40 @@ files, empty tables, remote URIs. Registration:
 parquet-dir test — order is a correctness matter) and `.lance` datasets.
 Fixtures: `scripts/iceberg_gen.py` (pyiceberg in `.venv`) regenerates
 `data/tpch-{1,10}mb-iceberg`; the 1mb `orders` has TWO snapshots
-(1500 rows, then +100 → 1600) for time-travel tests.
+(1500 rows, then +100 → 1600) for time-travel tests. `data/tpch-10gb-iceberg`
+is the SF=10 warehouse (8 tables, 2 snapshots each) used by the benchmark
+below.
+
+**Iceberg-table benchmark vs plain parquet (2026-08-23,
+`duckdb-parity-2` close-out).** `benchmark-parquet` does NOT auto-detect
+Iceberg (it hardcodes `<table>.parquet` lookups); `serve --tables <dir>`
+does. `scripts/iceberg_bench_compare.py` (new) drives that HTTP surface —
+`serve --tables data/tpch-10gb-iceberg`, POSTs the 22 queries to `/sql` —
+against DuckDB's `INSTALL/LOAD iceberg; iceberg_scan(<highest-numbered
+metadata.json>)` (the pattern `iceberg_gen.py`'s own `read_back_duckdb()`
+uses; pointing `iceberg_scan` at the bare directory fails with a
+version-guessing error on this SqlCatalog-layout warehouse, which has no
+`version-hint.text`).
+
+| premise | engine total | DuckDB total | ratio |
+|---|---|---|---|
+| plain parquet, cache-off | 7.03s | 4.22s (like-for-like, `read_parquet` views) | 1.67x |
+| plain parquet, cache-on | 5.75s | 4.22s | 1.36x |
+| **Iceberg** (`iceberg_scan` / `serve --tables`) | **8.325s** | **6.745s** | **1.23x** |
+
+Row counts match on all 22 queries (engine-Iceberg vs DuckDB-Iceberg).
+**Iceberg's manifest/snapshot indirection is real overhead on both
+sides, but asymmetric**: it costs the engine only ~+18.5% over its own
+plain-parquet cache-off baseline (7.03s→8.325s, since Iceberg resolves to
+an ordinary `ParquetTable` and pays little beyond metadata/manifest
+parsing), but costs DuckDB's `iceberg_scan` ~+60% over its own
+like-for-like baseline (4.22s→6.745s) — so the competitive RATIO actually
+narrows under Iceberg (1.23x) versus plain parquet (1.36-1.67x). Report
+both premises, matching this doc's own "report multiple premises
+separately" convention (cache-on/off, native/like-for-like, now also
+iceberg/parquet). Reproduce: `.venv/bin/python
+scripts/iceberg_bench_compare.py --iceberg-dir data/tpch-10gb-iceberg
+--sf 10 --iterations 2`.
 
 ### Metastore: Apache Gravitino (2026-08-15)
 
@@ -1130,6 +1163,20 @@ uncontained sweep); validate VALUES against `data/sf100_duckdb_results`
 counts are not answers). Do NOT set OOMSAFE_MEMHIGH on measurement
 runs: MemoryHigh counts page cache and throttled a capped sweep +2.2s.
 
+**Confirmatory re-check (2026-08-23, `duckdb-parity-2` close-out)**: not a
+full re-run of the numbers above (none of that epic's fixes target SF=100
+scale by design), just a regression check. `.venv/bin/python
+scripts/sf100_engine_validate.py`-class sweep, `data/tpch-100gb`, AUTO
+cache premise (fresh sidecars, resolves to cache-on-equivalent): **50.66s
+total, 22/22 successful, 22/22 CELL-EXACT** (`.scratch/validate22_sf100.py`
+against a fresh DuckDB oracle — not row-count-only; Q13's data-dependent
+2-row answer at SF=100, down from 24 at SF=10, verified correct rather than
+assumed). **Q9 = 11.21s, Q18 = 4.86s** — both inside/better than the
+ranges above, unregressed, consistent with tasks 002/003/006's own SF=100
+spot-checks during the epic. `finalize_disjoint_states`' single-state fast
+path (shipped by task 006) is the only SF=100-relevant change this epic
+made; it is additive (Q13 merge-step only), not a suite-wide rewrite.
+
 ## TPC-H Benchmark Status (SF=1, 2026-08-21)
 
 **Distributed pushdown (2026-08-22 epic): 2.09s forced-distributed —
@@ -1162,23 +1209,71 @@ Method: `benchmark-parquet --path data/tpch-1gb --iterations 3` +
 `.scratch/sf1/duck_bench.py` pattern (queries extracted from
 src/tpch/queries.rs; Q11 threshold needs no adjustment at SF=1).
 
-## TPC-H Benchmark Status (SF=10, updated 2026-08-17)
+## TPC-H Benchmark Status (SF=10, updated 2026-08-23)
 
-**7.45s parquet / 6.37s with the IPC sidecar cache (`QE_IPC_CACHE=1`) vs
-DuckDB native re-baselined 3.32s = 2.2x / 1.92x. (Re-measured 2026-08-18
-after the duckdb-parity epic: 7.63s / 7.36s in a page-cache-contended
-window, ALL 22 CELL-EXACT — treat the IPC delta as noise until a clean
-serialized re-run.) 22/22 pass, 22/22
-cell-exact vs DuckDB, 959 tests green in BOTH modes.** The cache is an
-Arrow-IPC-per-row-group sidecar read back mmap zero-copy
-(`storage/ipc_cache.rs`, arrow `FileDecoder`); it stays opt-in because it
-costs ~2.6x parquet's footprint on disk. Guards that are load-bearing:
-dictionary-coercion scans and string-filtered eager scans keep the parquet
-path (decoder evaluates over dictionary values; post-load walks 60M
-strings — Q19 132→332ms when that guard was missing). The 2026-08-16 BMAD
-round in `.claude/plans/PARITY-PLAN.md` has the full story, including
-three latent engine bugs it exposed (single-shot spilled-join build,
-stream-ending empty row group, capacity-counting batch estimates).
+**Re-baselined again at the close of `duckdb-parity-2` (six tasks: IPC-cache
+defaults, Q13 disjoint-threshold + join-pruning, Q16 anti-join parallelism +
+hasher swap, dense-group-id Stage 0). Both IPC-cache premises forced and
+stated explicitly, as established by the prior (2026-08-22) re-baseline.
+22/22 pass in each premise, 995 tests green (default build); 22/22
+CELL-EXACT at SF=10 AND SF=100.**
+
+| cache premise | engine total | vs DuckDB native (3.32s) | vs DuckDB on the SAME parquet (4.22s, `read_parquet` views) |
+|---|---|---|---|
+| `QE_IPC_CACHE=0` (off) | **7.03s** | 2.1x | **1.67x** |
+| `QE_IPC_CACHE=1` (build) | **5.75s** | 1.7x | **1.36x** |
+| unset (`Mode::Auto`, the default) | same as the `build` row when fresh sidecars already exist (true for every committed `.qeipc` fixture, incl. `data/tpch-10gb`); same as the `off` row on a clean checkout | — | — |
+
+Improved from the 2026-08-22 re-baseline (7.40s/2.23x/1.77x cache-off,
+5.88s/1.77x/1.41x cache-on) by `duckdb-parity-2`'s combined Q13+Q16 fixes.
+**Q13 and Q16 residue status** (this epic's two named target queries,
+PRD bands "Q13 415-500ms", "Q16 153-224ms" depending on premise):
+
+| query | cause | fix | before (band) | after (tight, best-of-8) |
+|---|---|---|---|---|
+| Q13 | agg-side: `disjoint_group_hint` floor (2M) excluded SF=10's 1.5M `c_custkey` range | floor lowered to 1M | 415-500ms | cache-off 259.9ms avg (min 239.3ms) / cache-on 223.0ms avg (min 206.3ms) — **~37-48% faster** |
+| Q13 | join-side: filtered LEFT join excluded from output-pruning + runtime-filter (Inner-only gates) | gates extended to Inner/Left/Right/Full + no-subquery-filter | (bundled above) | shipped, tested, CORRECT — but measured NEGLIGIBLE wall-clock effect on Q13 specifically: `ProjectionPushdown` had already cut its join inputs to 4 columns pre-existing, so this task's own pruning only drops one more (redundant `o_custkey`); Q13's residual join-side cost is a **permanent double-gather of `o_comment`** (the `u32_path` fast-emission stays `filter.is_none()`-gated), out of scope for this epic. Mechanism is now correctly available for OTHER filtered-outer-join queries even though it didn't move Q13. |
+| Q16 | `JoinType::Anti` excluded from the batch-parallel-probe gate (oversight, not correctness) — 8M-row NOT-IN probe ran on 1 of 32 threads | gate widened to include `Semi`/`Anti` | 153-224ms | cache-off 131.4ms avg (min 113.0ms) / cache-on 114.9ms avg (min 98.2ms) — **~23-49% faster**, the epic's single largest individual win (anti-probe itself: 41.5ms->6.2ms, 6.7x). Secondary win: **Q22 also ~18% faster** (same VHT-served anti-join shape). |
+| Q16 | `distinct_set` used `std::collections::HashSet` (SipHash) instead of `hashbrown` | swapped to `hashbrown::HashSet` | (bundled above) | landed, zero-risk; real but minority contributor as predicted going in |
+
+Dense-group-id remapping (the program's long-standing "next lever," named
+since `perf-marathon`): Stage 0 kill-switch microbenchmark **CLEARS**
+(24.5-44.5% isolated win, 1M-50M groups, 1-aggregate shape) but Stage 1
+correctly **did not proceed** — neither Q10 nor Q20 reaches the boxed
+`raw_groups` tier Stage 1 would replace; both already bypass it via the
+leaner `raw_sums` tier (`GroupKeyReduction`/`EagerAggregation`). A smaller,
+in-scope fix shipped instead: `finalize_disjoint_states`' single-state fast
+path (SF=100 Q13 merge step ~205ms/iter -> ~168ms/iter). Full design +
+Stage 0 evidence stay in the repo for a future epic to re-open Stage 1
+against a freshly-confirmed query.
+
+Like-for-like is the number that was missing here before the 2026-08-22
+update — the SF=100 four-way matrix already reported it, this section
+didn't, breaking this doc's own "Honesty note" convention (PARITY-PLAN.md).
+`Mode::Auto` never BUILDS a sidecar on its own — it only uses
+one that is already fresh on disk — because a full sidecar tree costs
+~2.6x parquet's footprint; see `storage/ipc_cache.rs`'s module doc for the
+tri-state semantics. `benchmark-parquet`'s startup log and
+`safe_benchmark.sh`'s header both now print the active cache premise, so a
+run's own output states unambiguously what it measured. The cache itself
+is an Arrow-IPC-per-row-group sidecar read back mmap zero-copy
+(`storage/ipc_cache.rs`, arrow `FileDecoder`). Guards that are
+load-bearing: dictionary-coercion scans and string-filtered eager scans
+keep the parquet path (decoder evaluates over dictionary values; post-load
+walks 60M strings — Q19 132→332ms when that guard was missing). The
+2026-08-16 BMAD round in `.claude/plans/PARITY-PLAN.md` has the full
+story, including three latent engine bugs it exposed (single-shot spilled-
+join build, stream-ending empty row group, capacity-counting batch
+estimates).
+
+Reproduce: `QE_IPC_CACHE=0 scripts/safe_benchmark.sh --data
+./data/tpch-10gb --iterations 3` / `QE_IPC_CACHE=1 scripts/safe_benchmark.sh
+--data ./data/tpch-10gb --iterations 3`; like-for-like DuckDB via
+`duckdb_rebaseline.py`'s `tpch_queries()` helper over `read_parquet` views
+on the same files, best-of-3 (the `duckdb_files_bench_sf100.py` pattern,
+pointed at SF=10). Tight single-query numbers (e.g. Q13/Q16 above): direct
+`benchmark-parquet --query N --iterations 8`, which avoids
+`safe_benchmark.sh`'s per-query systemd-run/timeout wrapper overhead.
 
 ## Previous status (SF=10, 2026-08-08 night, 48G cgroup)
 
@@ -1819,6 +1914,49 @@ Load-bearing decisions (each forced by a real failure):
 - `QE_GPU=0` kills routing at plan time even in a gpu build.
 - Not done (documented): eviction/QE_GPU_CACHE_MB cap, GPU joins, GPU
   parquet decode, Lance/Iceberg providers, distributed-worker GPU.
+
+**CPU vs GPU split, full SF=10 TPC-H (2026-08-23, `duckdb-parity-2`
+close-out).** Ran the SF=10 sweep both with and without GPU routing, as
+separate rows, `--features gpu` binary throughout (cache-off premise):
+
+| configuration | full-suite total | note |
+|---|---|---|
+| default build (no `gpu` feature) | 7.03s | true CPU-only binary |
+| `gpu` build, `QE_GPU=0` | 7.17s | CPU-only path inside a gpu build — within ~2% of the row above, confirms gpu-build harness overhead is negligible when routing is off |
+| `gpu` build, GPU enabled, single cold pass | 7.87s | **WORSE** — expected: first touch of any column is always CPU + triggers an async upload, and a single un-repeated 22-query pass never amortizes it (Q01 706ms vs 399ms CPU, Q06 352ms vs 102ms CPU, Q15 415ms vs 168ms CPU — all cold-upload artifacts) |
+
+Per this doc's own honest-expectations rule: most of `duckdb-parity-2`'s
+target queries (Q13/Q16/Q20 — join- or DISTINCT-heavy) were NOT separately
+GPU-measured, since the mechanism structurally cannot engage for them
+(no joins, no DISTINCT) — forcing that comparison would be measuring
+nothing. Q1/Q6/Q14/Q15 (the aggregate-eligible shapes) WERE measured warm
+(6 iterations, iteration 1 discarded as cold; GPU engagement independently
+CONFIRMED via `nvidia-smi`, VRAM 1066→1572 MiB during a run, not assumed):
+
+| query | CPU steady (avg) | GPU warm (avg) | delta |
+|---|---|---|---|
+| Q1 | ~302ms | ~315-430ms | none (flat to slightly worse) |
+| Q6 | ~93ms | ~94-100ms | **none** — essentially identical |
+| Q14 | ~132ms | ~136ms | none (also structurally ineligible: JOINs `part`) |
+| Q15 | ~127ms | ~132ms (1 outlier at 305ms) | inconclusive/flat |
+
+**Correcting finding**: the "Q6 shape 39.5x/58.7x, full Q1 17.0x/8.9x"
+numbers above are from `examples/gpu_price_bench.rs` — an ISOLATED KERNEL
+microbenchmark over synthetic, already-VRAM-resident columns, with NO
+scan/decode/plan overhead. That result is real and correctly measured at
+the kernel level. But at the FULL QUERY level (`benchmark-parquet` over
+real SF=10 parquet), scan+decode+filter — not the final SUM/aggregate
+reduction — dominates Q1/Q6's total wall time, so an even much-faster
+reduction kernel doesn't move total wall time measurably. Do not read the
+kernel-level numbers as full-query TPC-H speedups; they answer a narrower,
+still-useful question (is the reduction itself faster on the GPU — yes)
+than "does this query run faster end-to-end" (no, at this scale, because
+the reduction was never the bottleneck once scan/decode is included).
+Reproduce: `LD_LIBRARY_PATH=$PWD/.venv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib
+QE_IPC_CACHE=0 [QE_GPU=0] scripts/safe_benchmark.sh --data ./data/tpch-10gb
+--binary <gpu-featured binary> --iterations 3` for the full suite; direct
+`benchmark-parquet --query N --iterations 6` (same env) for the warm
+per-query numbers.
 
 ## Expression Compilation — researched, priced, narrowly adopted (2026-08-22)
 

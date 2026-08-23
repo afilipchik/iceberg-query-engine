@@ -805,12 +805,34 @@ impl HashJoinExec {
     /// Apply a join-output retention mask (see the `retained` field). The
     /// output schema shrinks to the kept columns; a mask whose length does
     /// not match the full combined width is ignored (Semi/Anti schemas).
+    ///
+    /// Gate condition — MUST stay identical to `SpillableHashJoinExec::
+    /// set_retained` and the planner's `analyze_join_output_usage` (three
+    /// gates that must move in lockstep; `SpillableHashJoinExec` delegates
+    /// to an inner `HashJoinExec` and calls this same method, so a gate that
+    /// diverges here silently un-prunes what the wrapper already narrowed
+    /// its own schema to — see the dedicated Spillable-level regression
+    /// test). Semi/Anti/Cross are excluded: Semi/Anti's schema is left-only
+    /// width (a mask sized for left++right never matches it) and Cross has
+    /// no ON-clause. A filter containing a subquery can reference columns
+    /// this operator's own filter-column bookkeeping never sees, so it
+    /// declines too (the planner already never hands one down, but the
+    /// operator-level gate stays independently correct).
     pub fn set_retained(&mut self, mask: Option<Vec<bool>>) {
         let Some(m) = mask else {
             return;
         };
-        if self.join_type != JoinType::Inner
-            || self.filter.is_some()
+        let type_ok = matches!(
+            self.join_type,
+            JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full
+        );
+        let filter_ok = self
+            .filter
+            .as_ref()
+            .map(|f| !f.contains_subquery())
+            .unwrap_or(true);
+        if !type_ok
+            || !filter_ok
             || m.len() != self.combined_schema.fields().len()
             || m.len() != self.schema.fields().len()
         {
@@ -1733,7 +1755,28 @@ fn create_combined_batch(
         build_columns.into_iter().chain(probe_columns).collect()
     };
 
-    batch_with_actual_types(combined_schema, all_columns)
+    // `combined_schema` is a field fixed once at HashJoinExec construction
+    // time from the FULL (unpruned) left/right schemas — join-output
+    // pruning can since have dropped columns from `build_batches` (the
+    // build cache) without it ever being updated, so using it here after a
+    // pruned build produces a column-count mismatch against `all_columns`.
+    // Build the schema from the batches actually being gathered instead,
+    // in the same build/probe order as `all_columns` above.
+    let actual_schema: SchemaRef = {
+        let build_fields: Vec<_> = build_batches
+            .first()
+            .map(|b| b.schema().fields().iter().cloned().collect())
+            .unwrap_or_default();
+        let probe_fields: Vec<_> = probe_batch.schema().fields().iter().cloned().collect();
+        let fields: Vec<_> = if swapped {
+            probe_fields.into_iter().chain(build_fields).collect()
+        } else {
+            build_fields.into_iter().chain(probe_fields).collect()
+        };
+        Arc::new(Schema::new(fields))
+    };
+
+    batch_with_actual_types(&actual_schema, all_columns)
 }
 
 /// Apply the non-equi part of an ON clause to the candidate (build row, probe
@@ -2536,12 +2579,90 @@ fn probe_vectorized(
             Vec::new()
         };
 
-    // Batch-level parallel probing for Inner/Left joins with many probe batches.
-    // With 8K-row Parquet batches, intra-batch chunk parallelism is ineffective.
-    // Process entire batches in parallel across rayon threads instead.
+    // Probe exactly one batch for Semi/Anti against the VHT. Used by both
+    // the batch-parallel branch below and the sequential fallback's own
+    // Semi/Anti arm, so there is exactly ONE implementation of "how do we
+    // probe a Semi/Anti batch", not two that can silently drift apart.
+    //   swapped  (build=right, probe=left=output): a probe row's matched
+    //     status is fully decided within THIS batch alone (the build side
+    //     is already 100% built before any probing starts), so the output
+    //     rows for this batch can be produced independently, in parallel.
+    //   !swapped (build=left=output): a build row can be matched by ANY
+    //     probe batch, so this only marks the SHARED `build_matched_atomic`
+    //     bits — relaxed, monotonic false->true stores are race-free no
+    //     matter how many threads write the same cell. The actual output
+    //     (matched build rows for Semi, unmatched for Anti) is assembled
+    //     once, after every batch has been probed, further below.
+    let probe_one_semi_anti_batch = |probe_batch: &RecordBatch| -> Result<Option<RecordBatch>> {
+        let probe_key_arrays: Result<Vec<ArrayRef>> = probe_key_exprs
+            .iter()
+            .map(|e| evaluate_expr(probe_batch, e))
+            .collect();
+        let probe_key_arrays = probe_key_arrays?;
+        let n_rows = probe_batch.num_rows();
+        let matches = vht.probe_batch(&probe_key_arrays, n_rows);
+        if swapped {
+            let is_semi = matches!(join_type, JoinType::Semi);
+            let mut matched = vec![false; n_rows];
+            for (_bb, _br, pr) in matches {
+                matched[pr as usize] = true;
+            }
+            let keep: Vec<u32> = (0..n_rows as u32)
+                .filter(|&i| matched[i as usize] == is_semi)
+                .collect();
+            if keep.is_empty() {
+                return Ok(None);
+            }
+            let take_idx = UInt32Array::from(keep);
+            let columns: std::result::Result<Vec<ArrayRef>, arrow::error::ArrowError> = probe_batch
+                .columns()
+                .iter()
+                .map(|col| arrow::compute::take(col, &take_idx, None))
+                .collect();
+            let batch = RecordBatch::try_new(
+                output_schema.clone(),
+                columns.map_err(|e| crate::error::QueryError::Execution(e.to_string()))?,
+            )?;
+            Ok(Some(batch))
+        } else {
+            for (bb, br, _pr) in matches {
+                build_matched_atomic[bb as usize][br as usize].store(true, Ordering::Relaxed);
+            }
+            Ok(None)
+        }
+    };
+
+    // Batch-level parallel probing for Inner/Left/Semi/Anti joins with many
+    // probe batches. With 8K-row Parquet batches, intra-batch chunk
+    // parallelism is ineffective. Process entire batches in parallel across
+    // rayon threads instead.
+    //
+    // Semi/Anti were excluded here historically. Investigated for task 004
+    // and confirmed an oversight, not a correctness requirement:
+    // `output_partitions()` (this operator's `execute()`) already forces
+    // Semi/Anti onto a single ASYNC partition so every probe batch is
+    // collected before this function ever runs — necessary, since a build
+    // row's matched status isn't final until every probe batch has been
+    // seen. That is a different axis from HOW the already-collected
+    // `probe_batches` slice is scanned inside one call to this function.
+    // The match-tracking above is already safe for concurrent writers
+    // (atomic, relaxed, monotonic false->true), and the sibling
+    // `probe_semi_anti_parallel` fallback (below, serves the non-VHT/
+    // filtered case) has probed Semi/Anti batch-parallel this same way
+    // since it was written, with the identical justification: "8K-row
+    // parquet batches are smaller than any useful intra-batch chunk, so
+    // chunking within a batch left the whole probe on one thread."
+    // `QE_SEMI_ANTI_PARALLEL=0` forces the old sequential-batch behavior,
+    // for A/B measurement.
+    let semi_anti_parallel_enabled =
+        !matches!(std::env::var("QE_SEMI_ANTI_PARALLEL").as_deref(), Ok("0"));
+    let mut semi_anti_batch_parallel_done = false;
     const MIN_BATCHES_FOR_PARALLEL: usize = 32;
     if probe_batches.len() >= MIN_BATCHES_FOR_PARALLEL
-        && matches!(join_type, JoinType::Inner | JoinType::Left)
+        && matches!(
+            join_type,
+            JoinType::Inner | JoinType::Left | JoinType::Semi | JoinType::Anti
+        )
     {
         if join_type == JoinType::Inner || join_type == JoinType::Cross {
             // HJ_PROF=1: per-phase wall-in-section accumulators across all
@@ -2702,6 +2823,22 @@ fn probe_vectorized(
                     results.push(batch);
                 }
             }
+            return Ok(results);
+        } else if matches!(join_type, JoinType::Semi | JoinType::Anti) {
+            if semi_anti_parallel_enabled {
+                let batch_results: Vec<Result<Option<RecordBatch>>> = probe_batches
+                    .par_iter()
+                    .map(|probe_batch| probe_one_semi_anti_batch(probe_batch))
+                    .collect();
+                for r in batch_results {
+                    if let Some(b) = r? {
+                        results.push(b);
+                    }
+                }
+                semi_anti_batch_parallel_done = true;
+            }
+            // else (QE_SEMI_ANTI_PARALLEL=0): fall through unchanged to the
+            // sequential per-batch loop below — the A/B control arm.
         } else {
             // Left join: each probe batch independently tracks its own unmatched rows
             let batch_results: Vec<Result<Option<RecordBatch>>> = probe_batches
@@ -2756,9 +2893,21 @@ fn probe_vectorized(
                     if bi.is_empty() && !probe_matched.iter().any(|&m| !m) {
                         return Ok(None);
                     }
+                    // Join-output pruning: drop ON-only/unneeded probe
+                    // columns now that keys and filter have been evaluated
+                    // (Q13's hot path: a filtered Left join with >=32 probe
+                    // batches lands here).
+                    let pruned_probe;
+                    let gather_probe: &RecordBatch = match probe_keep {
+                        Some(keep) if keep.iter().any(|k| !k) => {
+                            pruned_probe = prune_batch_columns(probe_batch, keep);
+                            &pruned_probe
+                        }
+                        _ => probe_batch,
+                    };
                     let batch = create_joined_batch_with_nulls(
                         build_batches,
-                        probe_batch,
+                        gather_probe,
                         &bi,
                         &pi,
                         &probe_matched,
@@ -2774,20 +2923,30 @@ fn probe_vectorized(
                     results.push(batch);
                 }
             }
+            // Left join with swapped=true handles unmatched probe (left) rows
+            // per-batch, so no post-processing is needed here. Unmatched
+            // build (right) rows are NOT emitted for Left join (only Full
+            // join needs that).
+            return Ok(results);
         }
-
-        // Note: Left join with swapped=true handles unmatched probe (left) rows per-batch,
-        // so no post-processing is needed here. Unmatched build (right) rows are NOT
-        // emitted for Left join (only Full join needs that).
-
-        return Ok(results);
     }
 
-    // Original sequential path for small batch counts and other join types
+    // Original sequential path for small batch counts and other join types.
+    // Also reached for Semi/Anti when `semi_anti_batch_parallel_done` is
+    // true, but with `sequential_probe_batches` forced empty just below:
+    // join_type is fixed for the whole call, so once the batch-parallel
+    // branch above has probed every batch there is nothing left for this
+    // loop to do — running it again would double-count matches and (for
+    // the swapped/output case) emit duplicate rows.
     // Chunk size for parallel processing
     const CHUNK_SIZE: usize = 65536;
+    let sequential_probe_batches: &[RecordBatch] = if semi_anti_batch_parallel_done {
+        &[]
+    } else {
+        probe_batches
+    };
 
-    for probe_batch in probe_batches {
+    for probe_batch in sequential_probe_batches {
         let probe_key_arrays: Result<Vec<ArrayRef>> = probe_key_exprs
             .iter()
             .map(|e| evaluate_expr(probe_batch, e))
@@ -2911,9 +3070,19 @@ fn probe_vectorized(
                 };
 
                 if !bi.is_empty() {
+                    // Join-output pruning: probe columns nothing downstream
+                    // needs were dropped from the output schema at plan time.
+                    let pruned_probe;
+                    let gather_probe: &RecordBatch = match probe_keep {
+                        Some(keep) if keep.iter().any(|k| !k) => {
+                            pruned_probe = prune_batch_columns(probe_batch, keep);
+                            &pruned_probe
+                        }
+                        _ => probe_batch,
+                    };
                     let batch = create_joined_batch_with_nulls(
                         build_batches,
-                        probe_batch,
+                        gather_probe,
                         &bi,
                         &pi,
                         &probe_matched,
@@ -2960,9 +3129,17 @@ fn probe_vectorized(
                 }
 
                 if !build_indices.is_empty() {
+                    let pruned_probe;
+                    let gather_probe: &RecordBatch = match probe_keep {
+                        Some(keep) if keep.iter().any(|k| !k) => {
+                            pruned_probe = prune_batch_columns(probe_batch, keep);
+                            &pruned_probe
+                        }
+                        _ => probe_batch,
+                    };
                     let batch = create_joined_batch(
                         build_batches,
-                        probe_batch,
+                        gather_probe,
                         &build_indices,
                         &probe_indices,
                         swapped,
@@ -3016,9 +3193,17 @@ fn probe_vectorized(
                     add_unmatched_probe(&build_indices, &probe_indices, &probe_matched, n_rows);
 
                 if !bi.is_empty() {
+                    let pruned_probe;
+                    let gather_probe: &RecordBatch = match probe_keep {
+                        Some(keep) if keep.iter().any(|k| !k) => {
+                            pruned_probe = prune_batch_columns(probe_batch, keep);
+                            &pruned_probe
+                        }
+                        _ => probe_batch,
+                    };
                     let batch = create_joined_batch(
                         build_batches,
-                        probe_batch,
+                        gather_probe,
                         &bi,
                         &pi,
                         swapped,
@@ -3030,70 +3215,12 @@ fn probe_vectorized(
             }
 
             JoinType::Semi | JoinType::Anti => {
-                if swapped {
-                    // When swapped: build=right, probe=left=output
-                    // Track which probe rows found matches and output probe rows directly
-                    let is_semi = join_type == JoinType::Semi;
-                    let probe_matched: Vec<AtomicBool> =
-                        (0..n_rows).map(|_| AtomicBool::new(false)).collect();
-
-                    let chunks: Vec<std::ops::Range<usize>> = (0..n_rows)
-                        .step_by(CHUNK_SIZE)
-                        .map(|start| start..std::cmp::min(start + CHUNK_SIZE, n_rows))
-                        .collect();
-
-                    chunks.par_iter().for_each(|range| {
-                        let chunk_len = range.end - range.start;
-                        let chunk_keys: Vec<ArrayRef> = probe_key_arrays
-                            .iter()
-                            .map(|a| a.slice(range.start, chunk_len))
-                            .collect();
-
-                        let matches = vht.probe_batch(&chunk_keys, chunk_len);
-                        for (_bb, _br, pr) in matches {
-                            probe_matched[range.start + pr as usize].store(true, Ordering::Relaxed);
-                        }
-                    });
-
-                    let keep: Vec<u32> = (0..n_rows as u32)
-                        .filter(|&i| probe_matched[i as usize].load(Ordering::Relaxed) == is_semi)
-                        .collect();
-
-                    if !keep.is_empty() {
-                        let take_idx = UInt32Array::from(keep);
-                        let columns: std::result::Result<Vec<ArrayRef>, arrow::error::ArrowError> =
-                            probe_batch
-                                .columns()
-                                .iter()
-                                .map(|col| arrow::compute::take(col, &take_idx, None))
-                                .collect();
-                        let batch = RecordBatch::try_new(
-                            output_schema.clone(),
-                            columns
-                                .map_err(|e| crate::error::QueryError::Execution(e.to_string()))?,
-                        )?;
-                        results.push(batch);
-                    }
-                } else {
-                    // Parallel vectorized Semi/Anti probe using rayon + atomic bools
-                    let chunks: Vec<std::ops::Range<usize>> = (0..n_rows)
-                        .step_by(CHUNK_SIZE)
-                        .map(|start| start..std::cmp::min(start + CHUNK_SIZE, n_rows))
-                        .collect();
-
-                    chunks.par_iter().for_each(|range| {
-                        let chunk_len = range.end - range.start;
-                        let chunk_keys: Vec<ArrayRef> = probe_key_arrays
-                            .iter()
-                            .map(|a| a.slice(range.start, chunk_len))
-                            .collect();
-
-                        let matches = vht.probe_batch(&chunk_keys, chunk_len);
-                        for (bb, br, _pr) in matches {
-                            build_matched_atomic[bb as usize][br as usize]
-                                .store(true, Ordering::Relaxed);
-                        }
-                    });
+                // Shared with the batch-parallel branch above
+                // (`probe_one_semi_anti_batch`) — see its doc comment. Only
+                // reached here when NOT already probed in parallel
+                // (`sequential_probe_batches` is forced empty otherwise).
+                if let Some(batch) = probe_one_semi_anti_batch(probe_batch)? {
+                    results.push(batch);
                 }
             }
 
@@ -3366,9 +3493,17 @@ fn probe_hash_table(
                 };
 
                 if !bi.is_empty() {
+                    let pruned_probe;
+                    let gather_probe: &RecordBatch = match probe_keep {
+                        Some(keep) if keep.iter().any(|k| !k) => {
+                            pruned_probe = prune_batch_columns(probe_batch, keep);
+                            &pruned_probe
+                        }
+                        _ => probe_batch,
+                    };
                     let batch = create_joined_batch_with_nulls(
                         build_batches,
-                        probe_batch,
+                        gather_probe,
                         &bi,
                         &pi,
                         &probe_matched,
@@ -3382,9 +3517,17 @@ fn probe_hash_table(
             JoinType::Right => {
                 // Similar to left but for build side
                 if !build_indices.is_empty() {
+                    let pruned_probe;
+                    let gather_probe: &RecordBatch = match probe_keep {
+                        Some(keep) if keep.iter().any(|k| !k) => {
+                            pruned_probe = prune_batch_columns(probe_batch, keep);
+                            &pruned_probe
+                        }
+                        _ => probe_batch,
+                    };
                     let batch = create_joined_batch(
                         build_batches,
-                        probe_batch,
+                        gather_probe,
                         &build_indices,
                         &probe_indices,
                         swapped,
@@ -3437,9 +3580,17 @@ fn probe_hash_table(
                     probe_batch.num_rows(),
                 );
                 if !bi.is_empty() {
+                    let pruned_probe;
+                    let gather_probe: &RecordBatch = match probe_keep {
+                        Some(keep) if keep.iter().any(|k| !k) => {
+                            pruned_probe = prune_batch_columns(probe_batch, keep);
+                            &pruned_probe
+                        }
+                        _ => probe_batch,
+                    };
                     let batch = create_joined_batch(
                         build_batches,
-                        probe_batch,
+                        gather_probe,
                         &bi,
                         &pi,
                         swapped,
@@ -4203,6 +4354,267 @@ mod tests {
         assert_eq!(total_rows, 2); // ids 3 and 4 don't exist in right
     }
 
+    /// Run an Anti/Semi join and return its single-i64-column output,
+    /// sorted, allowing NULL (represented as `i64::MIN`, out of range of
+    /// every value these tests use, so it can't collide with a real key).
+    ///
+    /// Parameters are named `left`/`right` (the operator's own terms), NOT
+    /// `probe`/`build`: which physical side (left or right) ends up as
+    /// probe is a function of `build_right` (see `execute()`), so a caller
+    /// wanting to force the >=32-batch parallel gate must put the many
+    /// batches on whichever side ends up as PROBE for the `build_right` it
+    /// passes — LEFT is probe when `build_right=true` (swapped), RIGHT is
+    /// probe when `build_right=false` (!swapped). Getting this backwards
+    /// doesn't fail loudly: the join still runs, just through the old
+    /// sequential path on both sides of the intended A/B, silently testing
+    /// nothing new (caught during this task's own development — see
+    /// `updates/004/stream-A.md`).
+    async fn run_semi_anti_i64(
+        left_schema: SchemaRef,
+        left_batches: Vec<RecordBatch>,
+        right_schema: SchemaRef,
+        right_batches: Vec<RecordBatch>,
+        join_type: JoinType,
+        build_right: bool,
+    ) -> Vec<i64> {
+        let left_scan = Arc::new(MemoryTableExec::new("l", left_schema, left_batches, None));
+        let right_scan = Arc::new(MemoryTableExec::new("r", right_schema, right_batches, None));
+        let join = HashJoinExec::new(
+            left_scan,
+            right_scan,
+            vec![(Expr::column("lk"), Expr::column("rk"))],
+            join_type,
+        )
+        .with_build_right(build_right);
+
+        let stream = join.execute(0).await.unwrap();
+        let results: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let mut out: Vec<i64> = Vec::new();
+        for batch in &results {
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                out.push(if col.is_null(i) {
+                    i64::MIN
+                } else {
+                    col.value(i)
+                });
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Task 004: the batch-parallel probe gate (`MIN_BATCHES_FOR_PARALLEL`,
+    /// `probe_vectorized`) now admits Anti (and Semi) — this mirrors Q16's
+    /// exact shape (`ps_suppkey NOT IN (SELECT s_suppkey FROM supplier
+    /// WHERE ...)`): a small, heavily-filtered BUILD side (`build_right`,
+    /// like the filtered `supplier` set) probed by a large LEFT side split
+    /// across >=32 batches (like `partsupp`), i.e. the `swapped=true`
+    /// branch of `probe_one_semi_anti_batch`. The build (right) side also
+    /// carries a NULL key, exercising the classic `NOT IN` NULL corner
+    /// independent of this change: `VectorizedHashTable::try_new` already
+    /// skips inserting NULL-keyed build rows for every join type (see its
+    /// `has_null` guard), so a NULL build key is never a match candidate
+    /// for anything — it does not "poison" the whole Anti output the way
+    /// SQL's `NOT IN` three-valued logic would for a `WHERE` clause. That
+    /// pre-existing behavior is independent of this task and is pinned
+    /// here only to confirm the parallel path didn't change it. The
+    /// load-bearing assertion is `sequential == parallel`: identical
+    /// logical join, scanned once via the pre-existing sequential fallback
+    /// (left/probe as a single batch, below `MIN_BATCHES_FOR_PARALLEL`)
+    /// and once via the new batch-parallel branch (left/probe split into
+    /// 40 one-row batches) — the scheduling difference must not change a
+    /// single row.
+    #[tokio::test]
+    async fn anti_join_batch_parallel_matches_sequential_swapped_with_null_build_key() {
+        const N: i64 = 40;
+        let ids: Vec<i64> = (1..=N).collect();
+        let left_schema = Arc::new(Schema::new(vec![Field::new("lk", DataType::Int64, false)]));
+        let right_schema = Arc::new(Schema::new(vec![Field::new("rk", DataType::Int64, true)]));
+        let right_batch = RecordBatch::try_new(
+            right_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(10), None, Some(30)]))],
+        )
+        .unwrap();
+
+        let left_one_batch = vec![RecordBatch::try_new(
+            left_schema.clone(),
+            vec![Arc::new(Int64Array::from(ids.clone()))],
+        )
+        .unwrap()];
+        let left_many_batches: Vec<RecordBatch> = ids
+            .iter()
+            .map(|&i| {
+                RecordBatch::try_new(
+                    left_schema.clone(),
+                    vec![Arc::new(Int64Array::from(vec![i]))],
+                )
+                .unwrap()
+            })
+            .collect();
+        assert!(left_many_batches.len() >= 32);
+
+        // build_right=true: build=right (small, NULL-bearing), probe=left.
+        let sequential = run_semi_anti_i64(
+            left_schema.clone(),
+            left_one_batch,
+            right_schema.clone(),
+            vec![right_batch.clone()],
+            JoinType::Anti,
+            true,
+        )
+        .await;
+        let parallel = run_semi_anti_i64(
+            left_schema,
+            left_many_batches,
+            right_schema,
+            vec![right_batch],
+            JoinType::Anti,
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            sequential, parallel,
+            "sequential and batch-parallel Anti probes must agree"
+        );
+        // All 40 left/probe ids except the two (10, 30) that match a
+        // non-NULL build key; the NULL build key matches nothing.
+        let expected: Vec<i64> = ids.into_iter().filter(|&i| i != 10 && i != 30).collect();
+        assert_eq!(sequential, expected);
+        assert_eq!(sequential.len(), 38);
+    }
+
+    /// Same as above but `!swapped` (`build_right=false`, build = LEFT =
+    /// output side, probe = RIGHT): exercises the OTHER half of
+    /// `probe_one_semi_anti_batch` (marking the shared `build_matched_atomic`
+    /// bits rather than producing per-batch output directly) and the
+    /// unchanged tail in `probe_vectorized` that turns those bits into the
+    /// final Anti batch. Since probe is RIGHT here, RIGHT is what gets
+    /// split into 40 batches to exercise the new gate; LEFT (build, small,
+    /// with the NULL key) stays fixed across both sub-calls. The NULL-keyed
+    /// build row can never be matched (see the sibling test's comment), so
+    /// it is the one row Anti keeps.
+    #[tokio::test]
+    async fn anti_join_batch_parallel_matches_sequential_not_swapped_with_null_build_key() {
+        const N: i64 = 40;
+        let ids: Vec<i64> = (1..=N).collect();
+        let left_schema = Arc::new(Schema::new(vec![Field::new("lk", DataType::Int64, true)]));
+        let right_schema = Arc::new(Schema::new(vec![Field::new("rk", DataType::Int64, false)]));
+        let left_batch = RecordBatch::try_new(
+            left_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(10), None, Some(30)]))],
+        )
+        .unwrap();
+
+        let right_one_batch = vec![RecordBatch::try_new(
+            right_schema.clone(),
+            vec![Arc::new(Int64Array::from(ids.clone()))],
+        )
+        .unwrap()];
+        let right_many_batches: Vec<RecordBatch> = ids
+            .iter()
+            .map(|&i| {
+                RecordBatch::try_new(
+                    right_schema.clone(),
+                    vec![Arc::new(Int64Array::from(vec![i]))],
+                )
+                .unwrap()
+            })
+            .collect();
+        assert!(right_many_batches.len() >= 32);
+
+        // build_right=false: build=left (small, NULL-bearing), probe=right.
+        let sequential = run_semi_anti_i64(
+            left_schema.clone(),
+            vec![left_batch.clone()],
+            right_schema.clone(),
+            right_one_batch,
+            JoinType::Anti,
+            false,
+        )
+        .await;
+        let parallel = run_semi_anti_i64(
+            left_schema,
+            vec![left_batch],
+            right_schema,
+            right_many_batches,
+            JoinType::Anti,
+            false,
+        )
+        .await;
+
+        assert_eq!(
+            sequential, parallel,
+            "sequential and batch-parallel Anti probes must agree"
+        );
+        // Left/build keys 10 and 30 both match a right/probe row and are
+        // excluded; the NULL left/build key matches nothing and is the
+        // sole Anti survivor.
+        assert_eq!(sequential, vec![i64::MIN]);
+    }
+
+    /// Semi's turn through the same gate (task 004 widened it to both Semi
+    /// and Anti): `swapped=true`, build = a small filtered right side.
+    #[tokio::test]
+    async fn semi_join_batch_parallel_matches_sequential_swapped() {
+        const N: i64 = 40;
+        let ids: Vec<i64> = (1..=N).collect();
+        let left_schema = Arc::new(Schema::new(vec![Field::new("lk", DataType::Int64, false)]));
+        let right_schema = Arc::new(Schema::new(vec![Field::new("rk", DataType::Int64, true)]));
+        let right_batch = RecordBatch::try_new(
+            right_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(10), None, Some(30)]))],
+        )
+        .unwrap();
+
+        let left_one_batch = vec![RecordBatch::try_new(
+            left_schema.clone(),
+            vec![Arc::new(Int64Array::from(ids.clone()))],
+        )
+        .unwrap()];
+        let left_many_batches: Vec<RecordBatch> = ids
+            .iter()
+            .map(|&i| {
+                RecordBatch::try_new(
+                    left_schema.clone(),
+                    vec![Arc::new(Int64Array::from(vec![i]))],
+                )
+                .unwrap()
+            })
+            .collect();
+        assert!(left_many_batches.len() >= 32);
+
+        let sequential = run_semi_anti_i64(
+            left_schema.clone(),
+            left_one_batch,
+            right_schema.clone(),
+            vec![right_batch.clone()],
+            JoinType::Semi,
+            true,
+        )
+        .await;
+        let parallel = run_semi_anti_i64(
+            left_schema,
+            left_many_batches,
+            right_schema,
+            vec![right_batch],
+            JoinType::Semi,
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            sequential, parallel,
+            "sequential and batch-parallel Semi probes must agree"
+        );
+        assert_eq!(sequential, vec![10, 30]);
+    }
+
     /// output_partitions() must report the PROBE side's partition count,
     /// because execute(partition) forwards its argument to
     /// probe_side.execute(partition). A Left join with build_right probes
@@ -4261,5 +4673,161 @@ mod tests {
         }
         // Every left row survives: 10 match a right row, 1990 NULL-extend.
         assert_eq!(total_rows, 2000);
+    }
+
+    /// White-box: a Left join with a filter, a build-side column referenced
+    /// ONLY by that filter (never selected downstream, so it survives
+    /// pruning purely via the force-keep rule), and >=32 probe batches —
+    /// the exact conditions that route through `probe_vectorized`'s Left
+    /// PARALLEL-batch branch (`MIN_BATCHES_FOR_PARALLEL`; Q13's actual hot
+    /// path at scale) rather than the small-input sequential fallback. This
+    /// exercises a pruned build side flowing into `filter_candidate_pairs`
+    /// through the real `execute()` path (using the real cached, pruned
+    /// build side) together with the `create_combined_batch` schema fix:
+    /// without the force-keep rule this mis-answers (the filter column is
+    /// pruned away before the filter can see it); without the schema fix it
+    /// hard-fails (stale `combined_schema` width vs the pruned build).
+    #[tokio::test]
+    async fn left_join_filtered_pruned_build_parallel_batch_path() {
+        const N: i64 = 40;
+
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("keep_left", DataType::Int64, false),
+            Field::new("filter_left", DataType::Int64, false),
+            Field::new("drop_left", DataType::Int64, false),
+        ]));
+        let ids: Vec<i64> = (1..=N).collect();
+        let left_batch = RecordBatch::try_new(
+            left_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids.clone())),
+                Arc::new(Int64Array::from(
+                    ids.iter().map(|i| i * 10).collect::<Vec<_>>(),
+                )),
+                // Odd ids pass the ON-filter (>5); even ids fail it and
+                // must NULL-extend on the right instead of matching.
+                Arc::new(Int64Array::from(
+                    ids.iter()
+                        .map(|i| if i % 2 == 1 { 10 } else { 3 })
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    ids.iter().map(|i| i * 1000).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("rid", DataType::Int64, false),
+            Field::new("keep_right", DataType::Int64, false),
+            Field::new("drop_right", DataType::Int64, false),
+        ]));
+        // One row per batch: >=32 batches forces the parallel-batch path
+        // (MIN_BATCHES_FOR_PARALLEL) instead of the sequential fallback.
+        let right_batches: Vec<RecordBatch> = ids
+            .iter()
+            .map(|&i| {
+                RecordBatch::try_new(
+                    right_schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(vec![i])),
+                        Arc::new(Int64Array::from(vec![i * 100])),
+                        Arc::new(Int64Array::from(vec![i * 9999])),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let left_scan = Arc::new(MemoryTableExec::new(
+            "l",
+            left_schema,
+            vec![left_batch],
+            None,
+        ));
+        let right_scan = Arc::new(MemoryTableExec::new("r", right_schema, right_batches, None));
+
+        let mut join = HashJoinExec::with_filter(
+            left_scan,
+            right_scan,
+            vec![(Expr::column("id"), Expr::column("rid"))],
+            JoinType::Left,
+            Some(
+                Expr::column("filter_left")
+                    .gt(Expr::literal(crate::planner::ScalarValue::Int64(5))),
+            ),
+        );
+
+        // Force-keep (filter_left) + downstream need (keep_left,
+        // keep_right); drop the join keys and the two never-referenced
+        // columns. Order: id, keep_left, filter_left, drop_left, rid,
+        // keep_right, drop_right.
+        join.set_retained(Some(vec![false, true, true, false, false, true, false]));
+        assert_eq!(join.schema().fields().len(), 3);
+
+        let stream = join.execute(0).await.unwrap();
+        let results: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let mut rows: Vec<(i64, i64, Option<i64>)> = Vec::new();
+        for batch in &results {
+            assert_eq!(
+                batch.num_columns(),
+                3,
+                "gathered batch must match the pruned (retained) schema width"
+            );
+            let keep_left = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let filter_left = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let keep_right = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                rows.push((
+                    keep_left.value(i),
+                    filter_left.value(i),
+                    if keep_right.is_null(i) {
+                        None
+                    } else {
+                        Some(keep_right.value(i))
+                    },
+                ));
+            }
+        }
+        rows.sort_by_key(|r| r.0);
+
+        assert_eq!(
+            rows.len(),
+            N as usize,
+            "every left row must survive exactly once"
+        );
+        for (idx, (kl, fl, kr)) in rows.iter().enumerate() {
+            let id = (idx + 1) as i64;
+            assert_eq!(*kl, id * 10);
+            if id % 2 == 1 {
+                assert_eq!(*fl, 10);
+                assert_eq!(
+                    *kr,
+                    Some(id * 100),
+                    "odd id {id} should match its probe row"
+                );
+            } else {
+                assert_eq!(*fl, 3);
+                assert_eq!(
+                    *kr, None,
+                    "even id {id} fails the ON-filter and must NULL-extend"
+                );
+            }
+        }
     }
 }

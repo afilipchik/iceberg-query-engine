@@ -210,24 +210,44 @@ impl SpillableHashJoinExec {
     }
 
     /// Join-output retention mask over the FULL (left ++ right) column
-    /// order: false = no ancestor references the column (ON-only keys), so
-    /// it is dropped from the output schema and never gathered. Inner,
-    /// unfiltered joins only — set by the planner's usage analysis.
+    /// order: false = no ancestor references the column (ON-only keys, or a
+    /// filter-only column nothing downstream selects), so it is dropped
+    /// from the output schema and never gathered. Set by the planner's
+    /// usage analysis for Inner/Left/Right/Full joins whose filter (if any)
+    /// contains no subquery.
+    ///
+    /// Gate condition — MUST stay identical to `HashJoinExec::set_retained`
+    /// and the planner's `analyze_join_output_usage` (three gates that must
+    /// move in lockstep). This wrapper delegates to an inner `HashJoinExec`
+    /// for the in-memory build path and forwards this exact mask to it
+    /// (`hj.set_retained(self.retained.clone())`); if that gate ever
+    /// disagreed with this one, `self.schema()` would report a narrower
+    /// width than the delegate's stream actually produces — a silent
+    /// schema/column-count mismatch a unit test on `HashJoinExec` alone
+    /// cannot catch (see the dedicated Spillable-level regression test).
     pub fn set_retained(&mut self, mask: Option<Vec<bool>>) {
         if let Some(m) = &mask {
-            if m.len() == self.schema.fields().len() {
-                let fields: Vec<_> = self
-                    .schema
-                    .fields()
-                    .iter()
-                    .zip(m)
-                    .filter(|(_, keep)| **keep)
-                    .map(|(f, _)| f.clone())
-                    .collect();
-                self.schema = Arc::new(Schema::new(fields));
-            } else {
+            let type_ok = matches!(
+                self.join_type,
+                JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full
+            );
+            let filter_ok = self
+                .filter
+                .as_ref()
+                .map(|f| !f.contains_subquery())
+                .unwrap_or(true);
+            if !type_ok || !filter_ok || m.len() != self.schema.fields().len() {
                 return;
             }
+            let fields: Vec<_> = self
+                .schema
+                .fields()
+                .iter()
+                .zip(m)
+                .filter(|(_, keep)| **keep)
+                .map(|(f, _)| f.clone())
+                .collect();
+            self.schema = Arc::new(Schema::new(fields));
         }
         self.retained = mask;
     }
@@ -2637,5 +2657,163 @@ mod tests {
                 b.1
             );
         }
+    }
+
+    /// Gate C (`SpillableHashJoinExec::set_retained`) must never diverge
+    /// from Gate B (`HashJoinExec::set_retained`). The wrapper narrows its
+    /// OWN `schema()` to the retained mask immediately in `set_retained`,
+    /// then separately hands the exact same mask to the inner
+    /// `HashJoinExec` it delegates to for the in-memory build path
+    /// (`hj.set_retained(self.retained.clone())`). If that inner gate ever
+    /// declined a mask this wrapper's gate accepted, `self.schema()` would
+    /// promise fewer columns than the delegate's stream actually returns —
+    /// a unit test on `HashJoinExec` alone can never see this, because it
+    /// never goes through the wrapper's OWN (separate) gate check.
+    #[tokio::test]
+    async fn spillable_hash_join_retained_mask_matches_delegate_schema() {
+        use arrow::array::Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use futures::TryStreamExt;
+
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("keep_left", DataType::Int64, false),
+            Field::new("filter_left", DataType::Int64, false),
+            Field::new("drop_left", DataType::Int64, false),
+        ]));
+        let left_batch = RecordBatch::try_new(
+            left_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6])),
+                Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50, 60])),
+                // Odd ids pass the ON-filter (>5), even ids fail it — a
+                // build-side (left) column referenced ONLY by the filter,
+                // never selected downstream: without force-keep this would
+                // be pruned away before the filter can evaluate it.
+                Arc::new(Int64Array::from(vec![10, 3, 10, 3, 10, 3])),
+                Arc::new(Int64Array::from(vec![111, 222, 333, 444, 555, 666])),
+            ],
+        )
+        .unwrap();
+
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("rid", DataType::Int64, false),
+            Field::new("keep_right", DataType::Int64, false),
+            Field::new("drop_right", DataType::Int64, false),
+        ]));
+        let right_batch = RecordBatch::try_new(
+            right_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6])),
+                Arc::new(Int64Array::from(vec![100, 200, 300, 400, 500, 600])),
+                Arc::new(Int64Array::from(vec![999, 998, 997, 996, 995, 994])),
+            ],
+        )
+        .unwrap();
+
+        let left: Arc<dyn PhysicalOperator> =
+            Arc::new(crate::physical::operators::MemoryTableExec::new(
+                "left_t",
+                left_schema,
+                vec![left_batch],
+                None,
+            ));
+        let right: Arc<dyn PhysicalOperator> =
+            Arc::new(crate::physical::operators::MemoryTableExec::new(
+                "right_t",
+                right_schema,
+                vec![right_batch],
+                None,
+            ));
+
+        let pool = crate::execution::create_memory_pool(64 * 1024 * 1024);
+        let config = ExecutionConfig::default();
+        let mut join = SpillableHashJoinExec::new(
+            left,
+            right,
+            vec![(Expr::column("id"), Expr::column("rid"))],
+            JoinType::Left,
+            pool,
+            config,
+        )
+        .with_filter(Some(
+            Expr::column("filter_left").gt(Expr::literal(crate::planner::ScalarValue::Int64(5))),
+        ));
+
+        // Force-keep (filter_left, referenced only by the ON predicate) +
+        // downstream need (keep_left, keep_right); drop the join keys and
+        // the two never-referenced columns. Order: id, keep_left,
+        // filter_left, drop_left, rid, keep_right, drop_right.
+        let mask = vec![false, true, true, false, false, true, false];
+        join.set_retained(Some(mask));
+
+        assert_eq!(
+            join.schema().fields().len(),
+            3,
+            "wrapper schema should already reflect the retained mask"
+        );
+        let join_schema = join.schema();
+        let field_names: Vec<&str> = join_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(field_names, vec!["keep_left", "filter_left", "keep_right"]);
+
+        let mut stream = join.execute(0).await.unwrap();
+        let mut rows: Vec<(i64, i64, Option<i64>)> = Vec::new();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            // Gate B/Gate C lockstep check: the ACTUAL batch schema must
+            // match the wrapper's advertised (already-narrowed) schema, in
+            // both width and field order/names — this is what would fail
+            // (column-count mismatch) if the two gates ever disagreed.
+            assert_eq!(
+                batch.schema().fields().len(),
+                join.schema().fields().len(),
+                "delegate produced a different column count than the wrapper's schema() promised"
+            );
+            for (a, b) in batch.schema().fields().iter().zip(join.schema().fields()) {
+                assert_eq!(a.name(), b.name());
+            }
+            let keep_left = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let filter_left = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let keep_right = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                rows.push((
+                    keep_left.value(i),
+                    filter_left.value(i),
+                    if keep_right.is_null(i) {
+                        None
+                    } else {
+                        Some(keep_right.value(i))
+                    },
+                ));
+            }
+        }
+        rows.sort_by_key(|r| r.0);
+        assert_eq!(
+            rows,
+            vec![
+                (10, 10, Some(100)),
+                (20, 3, None),
+                (30, 10, Some(300)),
+                (40, 3, None),
+                (50, 10, Some(500)),
+                (60, 3, None),
+            ],
+            "Left join + force-kept filter column + pruned join keys/unused columns"
+        );
     }
 }
