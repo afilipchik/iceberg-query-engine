@@ -1029,6 +1029,36 @@ FROM customer FULL OUTER JOIN orders
     ON c_custkey = o_custkey AND o_orderstatus = 'F'
 """, False))
 
+    # Join-output-pruning regression (duckdb-parity-2 task 003): every
+    # candidate match is rejected by the ON-filter, so every customer must
+    # survive with c_count=0 (not dropped, not miscounted). o_orderkey is
+    # force-kept for two independent reasons at once — the filter AND the
+    # downstream COUNT arg — and this exercises the all-false-mask branch of
+    # filter_candidate_pairs (no early "every candidate qualifies" shortcut).
+    queries.append(("join/left_all_filtered", """
+SELECT c_custkey, COUNT(o_orderkey) AS c_count
+FROM customer LEFT JOIN orders
+    ON c_custkey = o_custkey AND o_orderkey < 0
+WHERE c_custkey IN (1,2,3,4,5)
+GROUP BY c_custkey
+ORDER BY c_custkey
+""", True))
+
+    # Companion "some but not all filtered" case: a build-side (customer)
+    # column referenced ONLY by the ON-filter and never selected (mktsegment
+    # is a different, unrelated GROUP BY column), a probe-side (orders)
+    # column referenced ONLY by SUM (never by the filter), and a
+    # probe-side-only filter column (o_orderstatus) — three independently
+    # pruned/force-kept columns at once, over the full customer x orders
+    # relationship rather than a small LIMIT slice.
+    queries.append(("join/left_on_filter_mixed", """
+SELECT c_mktsegment, COUNT(o_orderkey) AS n_orders, SUM(o_totalprice) AS total_spent
+FROM customer LEFT JOIN orders
+    ON c_custkey = o_custkey AND o_orderstatus = 'O'
+GROUP BY c_mktsegment
+ORDER BY c_mktsegment
+""", True))
+
     # Pins ON-filter vs WHERE-filter semantics in BOTH directions on the same
     # join: the ON variant keeps every customer, the WHERE variant is an inner
     # join. A "fix" that collapses either one into the other fails here.

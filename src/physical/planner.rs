@@ -906,12 +906,14 @@ impl PhysicalPlanner {
     }
 
     /// Convert a logical plan to a physical plan
-    /// Top-down walk computing, per Inner join, which of its output columns
-    /// any ANCESTOR references. `needed == None` means "assume everything"
-    /// (the safe default for shapes this walk doesn't model). Conservative
-    /// by construction: a wrong mask can only KEEP too much (no pruning
-    /// benefit), never drop a referenced column — every reference set is a
-    /// superset of true usage, and unmodelled nodes reset to None.
+    /// Top-down walk computing, per Inner/Left/Right/Full join, which of its
+    /// output columns any ANCESTOR references. `needed == None` means
+    /// "assume everything" (the safe default for shapes this walk doesn't
+    /// model). Conservative by construction: a wrong mask can only KEEP too
+    /// much (no pruning benefit), never drop a referenced column — every
+    /// reference set is a superset of true usage, and unmodelled nodes reset
+    /// to None. Semi/Anti (left-only-width schema) and Cross (no ON-clause
+    /// to force-keep against) are out of scope and never get a mask.
     fn analyze_join_output_usage(
         &self,
         plan: &LogicalPlan,
@@ -964,11 +966,42 @@ impl PhysicalPlanner {
                 self.analyze_join_output_usage(&n.input, needed);
             }
             LogicalPlan::Join(n) => {
-                if n.join_type == crate::planner::JoinType::Inner && n.filter.is_none() {
+                // Pruning is safe for the join types whose output width and
+                // NULL-extension semantics the physical probe paths fully
+                // implement (Inner/Left/Right/Full — see HashJoinExec's and
+                // SpillableHashJoinExec's set_retained). Semi/Anti keep a
+                // left-only-width schema that needs separate handling and
+                // Cross has no ON-clause; both stay excluded. A filter
+                // containing a subquery can reference columns this walk
+                // cannot see, so it bails to "keep everything" — the same
+                // safe default `refs_of` uses below for ancestor exprs.
+                let prune_eligible = matches!(
+                    n.join_type,
+                    crate::planner::JoinType::Inner
+                        | crate::planner::JoinType::Left
+                        | crate::planner::JoinType::Right
+                        | crate::planner::JoinType::Full
+                ) && n
+                    .filter
+                    .as_ref()
+                    .map(|f| !f.contains_subquery())
+                    .unwrap_or(true);
+                if prune_eligible {
                     if let Some(need) = &needed {
+                        // Force-keep: any column the ON-clause filter itself
+                        // references stays in the join's output regardless
+                        // of downstream need. The filter is evaluated INSIDE
+                        // the join on candidate (build, probe) pairs — using
+                        // the already-pruned build cache — before NULL
+                        // extension is decided, so it needs the column even
+                        // when nothing above the join ever selects it.
+                        let mut retained = need.clone();
+                        if let Some(f) = &n.filter {
+                            collect_columns(f, &mut retained);
+                        }
                         self.join_retained
                             .borrow_mut()
-                            .insert(n as *const _ as usize, need.clone());
+                            .insert(n as *const _ as usize, retained);
                     }
                 }
                 let mut on_refs: Vec<&Expr> = Vec::new();
@@ -1395,12 +1428,25 @@ impl PhysicalPlanner {
                 // Runtime join-key filter: joins with a single plain
                 // probe-key column over a streaming parquet scan decode only
                 // rows whose key exists in the (small) build side. Safe for
-                // Inner; also for Semi and Anti when the build is the LEFT
-                // side (probe rows outside the build key set can never mark
-                // a build row — for swapped Semi/Anti the probe rows ARE the
-                // output and Anti would drop exactly the rows it must keep).
-                let rt_eligible = matches!(node.join_type, JoinType::Inner)
-                    || (is_semi_anti && !build_right_for_left);
+                // Inner; also for Semi, Anti and Left when the build is the
+                // LEFT side (probe rows outside the build key set can never
+                // match a build row, and for Left the PRESERVED side is the
+                // build side, so a dropped probe row was never going to
+                // reach the output either way). NOT safe when the build
+                // flips to the right: for swapped Semi/Anti the probe rows
+                // ARE the output (Anti would drop exactly the rows it must
+                // keep), and for Left the probe side would then be the
+                // preserved one (unmatched rows must still NULL-extend).
+                // Right/Full are excluded too: Right always builds from its
+                // own (preserved) right side, so the wiring below — which
+                // targets the physical RIGHT child as "the probe scan" —
+                // would target the wrong side; Full preserves both sides, so
+                // no side may be dropped from the scan at all.
+                let build_prefers_left = matches!(
+                    node.join_type,
+                    JoinType::Left | JoinType::Semi | JoinType::Anti
+                ) && !build_right_for_left;
+                let rt_eligible = matches!(node.join_type, JoinType::Inner) || build_prefers_left;
                 // Multi-key joins publish a partial filter on the first
                 // column pair (a correct superset of matching rows).
                 let rt_pair = on

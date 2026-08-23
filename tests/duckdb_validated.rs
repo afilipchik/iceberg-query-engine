@@ -504,6 +504,11 @@ duckdb_validated_test!(
 duckdb_validated_test!(validated_join_left_on_both_sides, "join/left_on_both_sides");
 duckdb_validated_test!(validated_join_right_on_filter, "join/right_on_filter");
 duckdb_validated_test!(validated_join_full_on_filter, "join/full_on_filter");
+duckdb_validated_test!(validated_join_left_all_filtered, "join/left_all_filtered");
+duckdb_validated_test!(
+    validated_join_left_on_filter_mixed,
+    "join/left_on_filter_mixed"
+);
 duckdb_validated_test!(validated_join_on_vs_where, "join/on_vs_where");
 duckdb_validated_test!(validated_join_inner_on_reversed, "join/inner_on_reversed");
 duckdb_validated_test!(validated_join_left_on_reversed, "join/left_on_reversed");

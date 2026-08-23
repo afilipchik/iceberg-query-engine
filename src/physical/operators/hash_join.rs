@@ -805,12 +805,34 @@ impl HashJoinExec {
     /// Apply a join-output retention mask (see the `retained` field). The
     /// output schema shrinks to the kept columns; a mask whose length does
     /// not match the full combined width is ignored (Semi/Anti schemas).
+    ///
+    /// Gate condition — MUST stay identical to `SpillableHashJoinExec::
+    /// set_retained` and the planner's `analyze_join_output_usage` (three
+    /// gates that must move in lockstep; `SpillableHashJoinExec` delegates
+    /// to an inner `HashJoinExec` and calls this same method, so a gate that
+    /// diverges here silently un-prunes what the wrapper already narrowed
+    /// its own schema to — see the dedicated Spillable-level regression
+    /// test). Semi/Anti/Cross are excluded: Semi/Anti's schema is left-only
+    /// width (a mask sized for left++right never matches it) and Cross has
+    /// no ON-clause. A filter containing a subquery can reference columns
+    /// this operator's own filter-column bookkeeping never sees, so it
+    /// declines too (the planner already never hands one down, but the
+    /// operator-level gate stays independently correct).
     pub fn set_retained(&mut self, mask: Option<Vec<bool>>) {
         let Some(m) = mask else {
             return;
         };
-        if self.join_type != JoinType::Inner
-            || self.filter.is_some()
+        let type_ok = matches!(
+            self.join_type,
+            JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full
+        );
+        let filter_ok = self
+            .filter
+            .as_ref()
+            .map(|f| !f.contains_subquery())
+            .unwrap_or(true);
+        if !type_ok
+            || !filter_ok
             || m.len() != self.combined_schema.fields().len()
             || m.len() != self.schema.fields().len()
         {
@@ -1733,7 +1755,28 @@ fn create_combined_batch(
         build_columns.into_iter().chain(probe_columns).collect()
     };
 
-    batch_with_actual_types(combined_schema, all_columns)
+    // `combined_schema` is a field fixed once at HashJoinExec construction
+    // time from the FULL (unpruned) left/right schemas — join-output
+    // pruning can since have dropped columns from `build_batches` (the
+    // build cache) without it ever being updated, so using it here after a
+    // pruned build produces a column-count mismatch against `all_columns`.
+    // Build the schema from the batches actually being gathered instead,
+    // in the same build/probe order as `all_columns` above.
+    let actual_schema: SchemaRef = {
+        let build_fields: Vec<_> = build_batches
+            .first()
+            .map(|b| b.schema().fields().iter().cloned().collect())
+            .unwrap_or_default();
+        let probe_fields: Vec<_> = probe_batch.schema().fields().iter().cloned().collect();
+        let fields: Vec<_> = if swapped {
+            probe_fields.into_iter().chain(build_fields).collect()
+        } else {
+            build_fields.into_iter().chain(probe_fields).collect()
+        };
+        Arc::new(Schema::new(fields))
+    };
+
+    batch_with_actual_types(&actual_schema, all_columns)
 }
 
 /// Apply the non-equi part of an ON clause to the candidate (build row, probe
@@ -2756,9 +2799,21 @@ fn probe_vectorized(
                     if bi.is_empty() && !probe_matched.iter().any(|&m| !m) {
                         return Ok(None);
                     }
+                    // Join-output pruning: drop ON-only/unneeded probe
+                    // columns now that keys and filter have been evaluated
+                    // (Q13's hot path: a filtered Left join with >=32 probe
+                    // batches lands here).
+                    let pruned_probe;
+                    let gather_probe: &RecordBatch = match probe_keep {
+                        Some(keep) if keep.iter().any(|k| !k) => {
+                            pruned_probe = prune_batch_columns(probe_batch, keep);
+                            &pruned_probe
+                        }
+                        _ => probe_batch,
+                    };
                     let batch = create_joined_batch_with_nulls(
                         build_batches,
-                        probe_batch,
+                        gather_probe,
                         &bi,
                         &pi,
                         &probe_matched,
@@ -2911,9 +2966,19 @@ fn probe_vectorized(
                 };
 
                 if !bi.is_empty() {
+                    // Join-output pruning: probe columns nothing downstream
+                    // needs were dropped from the output schema at plan time.
+                    let pruned_probe;
+                    let gather_probe: &RecordBatch = match probe_keep {
+                        Some(keep) if keep.iter().any(|k| !k) => {
+                            pruned_probe = prune_batch_columns(probe_batch, keep);
+                            &pruned_probe
+                        }
+                        _ => probe_batch,
+                    };
                     let batch = create_joined_batch_with_nulls(
                         build_batches,
-                        probe_batch,
+                        gather_probe,
                         &bi,
                         &pi,
                         &probe_matched,
@@ -2960,9 +3025,17 @@ fn probe_vectorized(
                 }
 
                 if !build_indices.is_empty() {
+                    let pruned_probe;
+                    let gather_probe: &RecordBatch = match probe_keep {
+                        Some(keep) if keep.iter().any(|k| !k) => {
+                            pruned_probe = prune_batch_columns(probe_batch, keep);
+                            &pruned_probe
+                        }
+                        _ => probe_batch,
+                    };
                     let batch = create_joined_batch(
                         build_batches,
-                        probe_batch,
+                        gather_probe,
                         &build_indices,
                         &probe_indices,
                         swapped,
@@ -3016,9 +3089,17 @@ fn probe_vectorized(
                     add_unmatched_probe(&build_indices, &probe_indices, &probe_matched, n_rows);
 
                 if !bi.is_empty() {
+                    let pruned_probe;
+                    let gather_probe: &RecordBatch = match probe_keep {
+                        Some(keep) if keep.iter().any(|k| !k) => {
+                            pruned_probe = prune_batch_columns(probe_batch, keep);
+                            &pruned_probe
+                        }
+                        _ => probe_batch,
+                    };
                     let batch = create_joined_batch(
                         build_batches,
-                        probe_batch,
+                        gather_probe,
                         &bi,
                         &pi,
                         swapped,
@@ -3366,9 +3447,17 @@ fn probe_hash_table(
                 };
 
                 if !bi.is_empty() {
+                    let pruned_probe;
+                    let gather_probe: &RecordBatch = match probe_keep {
+                        Some(keep) if keep.iter().any(|k| !k) => {
+                            pruned_probe = prune_batch_columns(probe_batch, keep);
+                            &pruned_probe
+                        }
+                        _ => probe_batch,
+                    };
                     let batch = create_joined_batch_with_nulls(
                         build_batches,
-                        probe_batch,
+                        gather_probe,
                         &bi,
                         &pi,
                         &probe_matched,
@@ -3382,9 +3471,17 @@ fn probe_hash_table(
             JoinType::Right => {
                 // Similar to left but for build side
                 if !build_indices.is_empty() {
+                    let pruned_probe;
+                    let gather_probe: &RecordBatch = match probe_keep {
+                        Some(keep) if keep.iter().any(|k| !k) => {
+                            pruned_probe = prune_batch_columns(probe_batch, keep);
+                            &pruned_probe
+                        }
+                        _ => probe_batch,
+                    };
                     let batch = create_joined_batch(
                         build_batches,
-                        probe_batch,
+                        gather_probe,
                         &build_indices,
                         &probe_indices,
                         swapped,
@@ -3437,9 +3534,17 @@ fn probe_hash_table(
                     probe_batch.num_rows(),
                 );
                 if !bi.is_empty() {
+                    let pruned_probe;
+                    let gather_probe: &RecordBatch = match probe_keep {
+                        Some(keep) if keep.iter().any(|k| !k) => {
+                            pruned_probe = prune_batch_columns(probe_batch, keep);
+                            &pruned_probe
+                        }
+                        _ => probe_batch,
+                    };
                     let batch = create_joined_batch(
                         build_batches,
-                        probe_batch,
+                        gather_probe,
                         &bi,
                         &pi,
                         swapped,
@@ -4261,5 +4366,161 @@ mod tests {
         }
         // Every left row survives: 10 match a right row, 1990 NULL-extend.
         assert_eq!(total_rows, 2000);
+    }
+
+    /// White-box: a Left join with a filter, a build-side column referenced
+    /// ONLY by that filter (never selected downstream, so it survives
+    /// pruning purely via the force-keep rule), and >=32 probe batches —
+    /// the exact conditions that route through `probe_vectorized`'s Left
+    /// PARALLEL-batch branch (`MIN_BATCHES_FOR_PARALLEL`; Q13's actual hot
+    /// path at scale) rather than the small-input sequential fallback. This
+    /// exercises a pruned build side flowing into `filter_candidate_pairs`
+    /// through the real `execute()` path (using the real cached, pruned
+    /// build side) together with the `create_combined_batch` schema fix:
+    /// without the force-keep rule this mis-answers (the filter column is
+    /// pruned away before the filter can see it); without the schema fix it
+    /// hard-fails (stale `combined_schema` width vs the pruned build).
+    #[tokio::test]
+    async fn left_join_filtered_pruned_build_parallel_batch_path() {
+        const N: i64 = 40;
+
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("keep_left", DataType::Int64, false),
+            Field::new("filter_left", DataType::Int64, false),
+            Field::new("drop_left", DataType::Int64, false),
+        ]));
+        let ids: Vec<i64> = (1..=N).collect();
+        let left_batch = RecordBatch::try_new(
+            left_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids.clone())),
+                Arc::new(Int64Array::from(
+                    ids.iter().map(|i| i * 10).collect::<Vec<_>>(),
+                )),
+                // Odd ids pass the ON-filter (>5); even ids fail it and
+                // must NULL-extend on the right instead of matching.
+                Arc::new(Int64Array::from(
+                    ids.iter()
+                        .map(|i| if i % 2 == 1 { 10 } else { 3 })
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    ids.iter().map(|i| i * 1000).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("rid", DataType::Int64, false),
+            Field::new("keep_right", DataType::Int64, false),
+            Field::new("drop_right", DataType::Int64, false),
+        ]));
+        // One row per batch: >=32 batches forces the parallel-batch path
+        // (MIN_BATCHES_FOR_PARALLEL) instead of the sequential fallback.
+        let right_batches: Vec<RecordBatch> = ids
+            .iter()
+            .map(|&i| {
+                RecordBatch::try_new(
+                    right_schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(vec![i])),
+                        Arc::new(Int64Array::from(vec![i * 100])),
+                        Arc::new(Int64Array::from(vec![i * 9999])),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let left_scan = Arc::new(MemoryTableExec::new(
+            "l",
+            left_schema,
+            vec![left_batch],
+            None,
+        ));
+        let right_scan = Arc::new(MemoryTableExec::new("r", right_schema, right_batches, None));
+
+        let mut join = HashJoinExec::with_filter(
+            left_scan,
+            right_scan,
+            vec![(Expr::column("id"), Expr::column("rid"))],
+            JoinType::Left,
+            Some(
+                Expr::column("filter_left")
+                    .gt(Expr::literal(crate::planner::ScalarValue::Int64(5))),
+            ),
+        );
+
+        // Force-keep (filter_left) + downstream need (keep_left,
+        // keep_right); drop the join keys and the two never-referenced
+        // columns. Order: id, keep_left, filter_left, drop_left, rid,
+        // keep_right, drop_right.
+        join.set_retained(Some(vec![false, true, true, false, false, true, false]));
+        assert_eq!(join.schema().fields().len(), 3);
+
+        let stream = join.execute(0).await.unwrap();
+        let results: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let mut rows: Vec<(i64, i64, Option<i64>)> = Vec::new();
+        for batch in &results {
+            assert_eq!(
+                batch.num_columns(),
+                3,
+                "gathered batch must match the pruned (retained) schema width"
+            );
+            let keep_left = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let filter_left = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let keep_right = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                rows.push((
+                    keep_left.value(i),
+                    filter_left.value(i),
+                    if keep_right.is_null(i) {
+                        None
+                    } else {
+                        Some(keep_right.value(i))
+                    },
+                ));
+            }
+        }
+        rows.sort_by_key(|r| r.0);
+
+        assert_eq!(
+            rows.len(),
+            N as usize,
+            "every left row must survive exactly once"
+        );
+        for (idx, (kl, fl, kr)) in rows.iter().enumerate() {
+            let id = (idx + 1) as i64;
+            assert_eq!(*kl, id * 10);
+            if id % 2 == 1 {
+                assert_eq!(*fl, 10);
+                assert_eq!(
+                    *kr,
+                    Some(id * 100),
+                    "odd id {id} should match its probe row"
+                );
+            } else {
+                assert_eq!(*fl, 3);
+                assert_eq!(
+                    *kr, None,
+                    "even id {id} fails the ON-filter and must NULL-extend"
+                );
+            }
+        }
     }
 }

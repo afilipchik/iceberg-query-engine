@@ -476,6 +476,20 @@
     "file": "join/full_on_filter.csv"
   },
   {
+    "id": "join/left_all_filtered",
+    "sql": "SELECT c_custkey, COUNT(o_orderkey) AS c_count\nFROM customer LEFT JOIN orders\n    ON c_custkey = o_custkey AND o_orderkey < 0\nWHERE c_custkey IN (1,2,3,4,5)\nGROUP BY c_custkey\nORDER BY c_custkey",
+    "ordered": true,
+    "row_count": 5,
+    "file": "join/left_all_filtered.csv"
+  },
+  {
+    "id": "join/left_on_filter_mixed",
+    "sql": "SELECT c_mktsegment, COUNT(o_orderkey) AS n_orders, SUM(o_totalprice) AS total_spent\nFROM customer LEFT JOIN orders\n    ON c_custkey = o_custkey AND o_orderstatus = 'O'\nGROUP BY c_mktsegment\nORDER BY c_mktsegment",
+    "ordered": true,
+    "row_count": 5,
+    "file": "join/left_on_filter_mixed.csv"
+  },
+  {
     "id": "join/on_vs_where",
     "sql": "SELECT 'a_on_clause' AS variant, COUNT(*) AS n_rows, COUNT(o_orderkey) AS n_matched\nFROM customer LEFT JOIN orders\n    ON c_custkey = o_custkey AND o_orderstatus = 'F'\nUNION ALL\nSELECT 'b_where_clause' AS variant, COUNT(*) AS n_rows, COUNT(o_orderkey) AS n_matched\nFROM customer LEFT JOIN orders\n    ON c_custkey = o_custkey\nWHERE o_orderstatus = 'F'\nORDER BY variant",
     "ordered": true,
