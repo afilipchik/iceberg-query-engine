@@ -3,7 +3,7 @@ name: native-tables-foundation
 status: in-progress
 created: 2026-08-23T07:42:14Z
 updated: 2026-08-23T19:17:32Z
-progress: 38%
+progress: 50%
 prd: .claude/prds/native-tables.md
 github: (will be set on sync)
 ---
@@ -204,7 +204,7 @@ the storage-format and TableProvider-integration tasks.
 - [ ] 004.md - TableProvider integration — splits, statistics, registration (parallel: true)
 - [ ] 005.md - Dense-direct-address fast-path compatibility (parallel: false)
 - [ ] 006.md - Memory safety — cap or spill integration (parallel: false)
-- [ ] 007.md - GPU-offload identity/eligibility generalization (parallel: true)
+- [x] 007.md - GPU-offload identity/eligibility generalization (parallel: true)
 - [ ] 008.md - QA close-out — cell-exact SF=10+SF=100, Iceberg comparison, CPU/GPU split, docs, epic close (parallel: false)
 
 Total tasks: 8
