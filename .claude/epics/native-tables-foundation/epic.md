@@ -3,7 +3,7 @@ name: native-tables-foundation
 status: in-progress
 created: 2026-08-23T07:42:14Z
 updated: 2026-08-23T19:17:32Z
-progress: 63%
+progress: 75%
 prd: .claude/prds/native-tables.md
 github: (will be set on sync)
 ---
@@ -203,7 +203,7 @@ the storage-format and TableProvider-integration tasks.
 - [x] 003.md - Write path — bulk-load from parquet/Iceberg/Lance/query results (parallel: true)
 - [x] 004.md - TableProvider integration — splits, statistics, registration (parallel: true)
 - [ ] 005.md - Dense-direct-address fast-path compatibility (parallel: false)
-- [ ] 006.md - Memory safety — cap or spill integration (parallel: false)
+- [x] 006.md - Memory safety — cap or spill integration (parallel: false)
 - [x] 007.md - GPU-offload identity/eligibility generalization (parallel: true)
 - [ ] 008.md - QA close-out — cell-exact SF=10+SF=100, Iceberg comparison, CPU/GPU split, docs, epic close (parallel: false)
 
