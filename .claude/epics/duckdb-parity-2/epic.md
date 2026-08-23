@@ -2,8 +2,8 @@
 name: duckdb-parity-2
 status: in-progress
 created: 2026-08-23T00:38:20Z
-updated: 2026-08-23T07:55:00Z
-progress: 57%
+updated: 2026-08-23T08:20:00Z
+progress: 71%
 prd: .claude/prds/duckdb-parity-2.md
 github: (will be set on sync)
 ---
@@ -103,7 +103,7 @@ Estimated total effort: 15-24 hours (measurement wall time and the M-effort join
 - [x] 003.md - Q13: join-output-pruning + runtime-filter extension to filtered outer joins (parallel: false)
 - [ ] 004.md - Q16: anti-join parallel-probe investigation + fix (parallel: false)
 - [x] 005.md - Q16: distinct_set hasher swap (parallel: true)
-- [ ] 006.md - Dense group-id remapping, Stage 0 + Stage 1 (parallel: false)
+- [x] 006.md - Dense group-id remapping, Stage 0 + Stage 1 (parallel: false)
 - [ ] 007.md - QA close-out — full suites, cell-exact SF=10+SF=100, docs, epic close (parallel: false)
 
 Total tasks: 7
