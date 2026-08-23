@@ -34,3 +34,8 @@ pub use pulsar::{register_pulsar_namespace, PulsarSource, PulsarTable};
 
 pub mod ipc_cache;
 pub mod metadata_cache;
+
+/// Native table manifest (identity/versioning/statistics format). Task 002
+/// of the native-tables-foundation epic; sibling to `native_write.rs` (003)
+/// and `native_table.rs` (004), neither of which exists yet.
+pub mod native_manifest;
