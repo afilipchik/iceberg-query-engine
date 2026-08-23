@@ -624,6 +624,10 @@ async fn main() {
             println!("Running TPC-H benchmark from Parquet files (SF={})", sf);
             println!("Path: {}", path.display());
             println!("Iterations: {}", iterations);
+            println!(
+                "IPC cache mode: {}",
+                query_engine::storage::ipc_cache::mode()
+            );
             println!();
 
             let start = Instant::now();

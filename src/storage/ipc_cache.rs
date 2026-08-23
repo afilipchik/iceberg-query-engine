@@ -10,7 +10,19 @@
 //!
 //! Memory safety: reads stream one row group at a time exactly like the
 //! parquet path; sidecar building is bounded by one row group per thread.
-//! Enabled via QE_IPC_CACHE=1 (default off until the gauntlet passes).
+//!
+//! Default (QE_IPC_CACHE unset) is `Mode::Auto`: if a fresh sidecar already
+//! exists on disk, it is used silently — but the engine never BUILDS one on
+//! its own initiative, since a full sidecar tree costs ~2.6x the parquet
+//! footprint on disk and nobody should pay that by surprise. That means a
+//! "plain" run with no env var set is NOT the cache-off premise; it is
+//! cache-on for any data directory that already has `.qeipc` sidecars
+//! (e.g. every fixture this repo pre-builds). `QE_IPC_CACHE=1` (`Mode::Build`)
+//! opts into building missing/stale sidecars; `QE_IPC_CACHE=0` (`Mode::Off`)
+//! disables the cache outright, ignoring any sidecars already on disk. See
+//! `Mode`'s own variant docs below for the exact tri-state semantics, and
+//! use `mode()`'s `Display` impl (or `benchmark-parquet`'s startup log) to
+//! see which premise a given run actually used.
 
 use crate::error::{QueryError, Result};
 use arrow::record_batch::RecordBatch;
@@ -28,6 +40,23 @@ pub enum Mode {
     Auto,
     /// QE_IPC_CACHE=1: build missing/stale sidecars and use them.
     Build,
+}
+
+impl std::fmt::Display for Mode {
+    /// One unambiguous line naming both the mode and the env var that
+    /// selects it, so callers never have to cross-reference `QE_IPC_CACHE`
+    /// against `ls data/*/*.qeipc` to know what a run actually measured.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Mode::Off => "off (QE_IPC_CACHE=0: sidecars ignored, pure parquet decode)",
+            Mode::Auto => {
+                "auto (QE_IPC_CACHE unset, the default: uses an existing fresh sidecar \
+                 if present, never builds one)"
+            }
+            Mode::Build => "build (QE_IPC_CACHE=1: builds missing/stale sidecars and uses them)",
+        };
+        write!(f, "{s}")
+    }
 }
 
 pub fn mode() -> Mode {

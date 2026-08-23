@@ -1162,23 +1162,46 @@ Method: `benchmark-parquet --path data/tpch-1gb --iterations 3` +
 `.scratch/sf1/duck_bench.py` pattern (queries extracted from
 src/tpch/queries.rs; Q11 threshold needs no adjustment at SF=1).
 
-## TPC-H Benchmark Status (SF=10, updated 2026-08-17)
+## TPC-H Benchmark Status (SF=10, updated 2026-08-22)
 
-**7.45s parquet / 6.37s with the IPC sidecar cache (`QE_IPC_CACHE=1`) vs
-DuckDB native re-baselined 3.32s = 2.2x / 1.92x. (Re-measured 2026-08-18
-after the duckdb-parity epic: 7.63s / 7.36s in a page-cache-contended
-window, ALL 22 CELL-EXACT — treat the IPC delta as noise until a clean
-serialized re-run.) 22/22 pass, 22/22
-cell-exact vs DuckDB, 959 tests green in BOTH modes.** The cache is an
-Arrow-IPC-per-row-group sidecar read back mmap zero-copy
-(`storage/ipc_cache.rs`, arrow `FileDecoder`); it stays opt-in because it
-costs ~2.6x parquet's footprint on disk. Guards that are load-bearing:
-dictionary-coercion scans and string-filtered eager scans keep the parquet
-path (decoder evaluates over dictionary values; post-load walks 60M
-strings — Q19 132→332ms when that guard was missing). The 2026-08-16 BMAD
-round in `.claude/plans/PARITY-PLAN.md` has the full story, including
-three latent engine bugs it exposed (single-shot spilled-join build,
-stream-ending empty row group, capacity-counting batch estimates).
+**Re-baselined post dependency-modernization (arrow 58.4, the 2026-08-22
+epic) with BOTH IPC-cache premises forced and stated explicitly — a
+"plain" run's premise depends on whether `.qeipc` sidecars already exist
+on disk, so an unlabeled number is not reproducible. 22/22 pass in each
+premise, 988 tests green (default build).**
+
+| cache premise | engine total | vs DuckDB native (3.32s) | vs DuckDB on the SAME parquet (4.18s, `read_parquet` views) |
+|---|---|---|---|
+| `QE_IPC_CACHE=0` (off) | **7.40s** | 2.23x | **1.77x** |
+| `QE_IPC_CACHE=1` (build) | **5.88s** | 1.77x | **1.41x** |
+| unset (`Mode::Auto`, the default) | same as the `build` row when fresh sidecars already exist (true for every committed `.qeipc` fixture, incl. `data/tpch-10gb`); same as the `off` row on a clean checkout | — | — |
+
+Like-for-like is the number that was missing here before this update —
+the SF=100 four-way matrix already reported it, this section didn't,
+breaking this doc's own "Honesty note" convention (PARITY-PLAN.md).
+Replaces the stale 2026-08-17/18 figures (7.45s/6.37s vs a native-only
+2.2x/1.92x). `Mode::Auto` never BUILDS a sidecar on its own — it only uses
+one that is already fresh on disk — because a full sidecar tree costs
+~2.6x parquet's footprint; see `storage/ipc_cache.rs`'s module doc for the
+tri-state semantics. `benchmark-parquet`'s startup log and
+`safe_benchmark.sh`'s header both now print the active cache premise, so a
+run's own output states unambiguously what it measured. The cache itself
+is an Arrow-IPC-per-row-group sidecar read back mmap zero-copy
+(`storage/ipc_cache.rs`, arrow `FileDecoder`). Guards that are
+load-bearing: dictionary-coercion scans and string-filtered eager scans
+keep the parquet path (decoder evaluates over dictionary values; post-load
+walks 60M strings — Q19 132→332ms when that guard was missing). The
+2026-08-16 BMAD round in `.claude/plans/PARITY-PLAN.md` has the full
+story, including three latent engine bugs it exposed (single-shot spilled-
+join build, stream-ending empty row group, capacity-counting batch
+estimates).
+
+Reproduce: `QE_IPC_CACHE=0 scripts/safe_benchmark.sh --data
+./data/tpch-10gb --iterations 3` / `QE_IPC_CACHE=1 scripts/safe_benchmark.sh
+--data ./data/tpch-10gb --iterations 3`; like-for-like DuckDB via
+`duckdb_rebaseline.py`'s `tpch_queries()` helper over `read_parquet` views
+on the same files, best-of-2 (the `duckdb_files_bench_sf100.py` pattern,
+pointed at SF=10).
 
 ## Previous status (SF=10, 2026-08-08 night, 48G cgroup)
 
