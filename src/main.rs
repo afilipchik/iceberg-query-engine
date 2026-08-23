@@ -1546,6 +1546,18 @@ fn build_serve_context(
                 continue;
             }
 
+            // Native tables (native-tables-foundation epic, task 004): a
+            // directory holding `_manifest.json`. Structurally disjoint
+            // from both Iceberg (no `.metadata.json`) and Lance (no
+            // `.lance` extension, and no parquet files either), so check
+            // order relative to them doesn't matter — grouped here because
+            // it is the same kind of self-describing-directory detection.
+            if path.is_dir() && query_engine::storage::native_table::is_native_table_dir(&path) {
+                ctx.register_native_table(&name, &path)?;
+                registered += 1;
+                continue;
+            }
+
             #[cfg(feature = "lance")]
             if path.is_dir() && path.extension().map(|e| e == "lance").unwrap_or(false) {
                 ctx.register_lance(&name, &path)?;
@@ -1815,23 +1827,52 @@ async fn run_repl(
                     continue;
                 }
 
-                // Execute SQL query
+                // Execute SQL query. `CREATE TABLE ... AS SELECT` is DDL: it
+                // needs `&mut ctx` to register the written table, so it is
+                // routed to `create_table_as_select` rather than `sql()`
+                // (which now refuses it outright — see
+                // `ExecutionContext::sql`'s doc comment for why). Parsed
+                // once up front purely to make that routing decision; on a
+                // parse failure this falls through to `sql()`, which
+                // re-parses and reports the same error the user would
+                // otherwise see.
                 let start = Instant::now();
-                match ctx.sql(line).await {
-                    Ok(result) => {
-                        // Use the configured output format
-                        if let Err(e) = state.formatter.print(&result.batches) {
-                            eprintln!("Error formatting output: {}", e);
+                match query_engine::parser::parse_sql(line) {
+                    Ok(stmt)
+                        if query_engine::planner::create_table_target_name(&stmt).is_some() =>
+                    {
+                        match ctx.create_table_as_select(line).await {
+                            Ok(r) => {
+                                println!(
+                                    "Created table '{}' ({} rows, {} segment(s), now at version {}) in {:.3}ms\n",
+                                    r.table_name,
+                                    r.rows,
+                                    r.segments,
+                                    r.version,
+                                    start.elapsed().as_secs_f64() * 1000.0
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("Error: {}\n", e);
+                            }
                         }
-                        println!(
-                            "({} rows in {:.3}ms)\n",
-                            result.row_count,
-                            start.elapsed().as_secs_f64() * 1000.0
-                        );
                     }
-                    Err(e) => {
-                        eprintln!("Error: {}\n", e);
-                    }
+                    _ => match ctx.sql(line).await {
+                        Ok(result) => {
+                            // Use the configured output format
+                            if let Err(e) = state.formatter.print(&result.batches) {
+                                eprintln!("Error formatting output: {}", e);
+                            }
+                            println!(
+                                "({} rows in {:.3}ms)\n",
+                                result.row_count,
+                                start.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {}\n", e);
+                        }
+                    },
                 }
             }
             Err(ReadlineError::Interrupted) => {
