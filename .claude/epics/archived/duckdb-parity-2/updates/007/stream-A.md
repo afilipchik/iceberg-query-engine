@@ -2,7 +2,8 @@
 issue: 007
 stream: main
 started: 2026-08-23T02:20:00Z
-status: in-progress
+status: completed
+completed: 2026-08-23T10:30:00Z
 ---
 ## Scope
 See .claude/epics/duckdb-parity-2/007.md — final QA close-out task for the
@@ -234,13 +235,47 @@ specifically) and for reproducibility during this task.
       perf-marathon's own standing finding "shards bypass sidecars by
       design." This was a confirmation check, not a new validation, as
       the task file anticipated.
-14. [ ] CLAUDE.md update (SF=10 section final numbers, Q13/Q16 residue
-    status)
-15. [ ] Epic close-out section in epic.md (perf-marathon style: headline
-    table, G1-G5 accounting, named residues, commit hashes)
-16. [ ] Move epic dir to .claude/epics/archived/duckdb-parity-2/ (git mv,
-    mirror ee4414e's dependency-modernization pattern)
-17. [ ] Final commit(s)
+14. [x] CLAUDE.md update (SF=10 section final numbers, Q13/Q16 residue
+    status, plus new Iceberg-benchmark and GPU-split subsections)
+15. [x] Epic close-out section in epic.md (headline table, G1-G5
+    accounting all MET, named residues as one class, commit hashes)
+16. [x] Moved epic dir to .claude/epics/archived/duckdb-parity-2/ via
+    `git mv` (mirrored ee4414e's dependency-modernization pattern exactly
+    -- verified: 001-006.md and updates/001-006 renamed 100% similarity,
+    007.md/epic.md renamed-with-modification since I'd already edited
+    them, new updates/007/stream-A.md added at the archived path).
+17. [x] Final commits: `2aeb9d5` (benchmark/CLAUDE.md work) and `ce564f4`
+    (close-out + archive + PRD status). Working tree clean after both.
+    NOT merged to main (confirmed: main's HEAD is at an unrelated prior
+    commit) -- left to the user/orchestrating session per instructions.
+
+## TASK COMPLETE (2026-08-23T10:30:00Z)
+
+All acceptance criteria met. Summary of final state:
+- 4/4 feature-combo suites green: default 995/0/1, lance 1059/0/2,
+  gpu 995/0/1, pulsar 998/0/1 (passed/failed/ignored).
+- 22/22 cell-exact SF=10 and SF=100 (fresh runs this session, not
+  carried over).
+- `cargo fmt --all -- --check` clean (verified twice: before touching
+  anything, and again since -- this task made zero Rust source changes).
+- M1 + M2 distributed gates PASS (`cluster_local.sh verify` /
+  `verify-m2`), plus `tests/distributed_cluster.rs` (19 tests) green as
+  part of the default suite.
+- SF=10 headline: cache-off 8.86s(epic-start)->7.03s, cache-on
+  5.99s->5.75s. Q13 415-500ms->223-260ms avg, Q16 153-224ms->115-131ms
+  avg.
+- New Iceberg-table benchmark (`scripts/iceberg_bench_compare.py`):
+  engine 8.325s vs DuckDB-iceberg 6.745s = 1.23x, row counts match all 22.
+- New CPU/GPU split: GPU engagement confirmed via VRAM, but no measurable
+  full-query win at SF=10 even for structurally-eligible queries (Q1/Q6)
+  -- scan/decode dominates, not the aggregate kernel. Documented as a
+  correcting finding against the GPU epic's own kernel-level numbers.
+- Epic G1-G5: all MET (see epic.md's close-out for full accounting).
+- No code regression found; no fix was needed (this task stayed
+  validation/docs-only as scoped).
+- Epic archived to `.claude/epics/archived/duckdb-parity-2/`, status
+  `completed`, progress `100%`. PRD status `completed`. Not merged to
+  main.
 
 Background agent (accbc8cd8e2675eb9) REPORTED BACK — findings folded in:
 
