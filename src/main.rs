@@ -222,6 +222,65 @@ enum Commands {
         save_csv: Option<PathBuf>,
     },
 
+    /// Write a native table from Parquet, Iceberg, Lance, or a SQL query
+    /// (task 003 of the native-tables-foundation epic). Exactly one of
+    /// --from-parquet/--from-iceberg/--from-lance/--sql must be given.
+    WriteNative {
+        /// Source Parquet file or directory.
+        #[arg(long)]
+        from_parquet: Option<PathBuf>,
+
+        /// Source Apache Iceberg table directory.
+        #[arg(long)]
+        from_iceberg: Option<PathBuf>,
+
+        /// Iceberg snapshot id (only with --from-iceberg; default: current).
+        #[arg(long)]
+        iceberg_snapshot: Option<i64>,
+
+        /// Source Lance dataset directory (requires --features lance).
+        #[cfg(feature = "lance")]
+        #[arg(long)]
+        from_lance: Option<PathBuf>,
+
+        /// Source SQL query. Requires --tables. This is the CREATE TABLE
+        /// ... AS SELECT shape: the query's physical plan is streamed
+        /// directly into the writer batch-by-batch, never materialized
+        /// first (see src/storage/native_write.rs's module doc).
+        #[arg(long)]
+        sql: Option<String>,
+
+        /// Directory of Parquet files to register before running --sql.
+        #[arg(long)]
+        tables: Option<PathBuf>,
+
+        /// Destination native table directory.
+        #[arg(short, long)]
+        out: PathBuf,
+
+        /// create (default, fails if it exists) | overwrite
+        #[arg(long, default_value = "create")]
+        mode: String,
+    },
+
+    /// Load a native table and print its manifest; optionally run a query
+    /// against it. The query path fully materializes the table into memory
+    /// first (a CLI validation convenience, NOT the production read path —
+    /// that is the `TableProvider` in src/storage/native_table.rs).
+    LoadNative {
+        /// Path to a native table directory (written by write-native).
+        #[arg(short, long)]
+        path: PathBuf,
+
+        /// Table name to register for --query.
+        #[arg(short, long, default_value = "t")]
+        name: String,
+
+        /// SQL query to execute (if omitted, just prints the manifest).
+        #[arg(short, long)]
+        query: Option<String>,
+    },
+
     /// Start interactive SQL shell (REPL)
     Repl {
         /// Optional: Preload TPC-H tables from Parquet directory
@@ -1093,6 +1152,206 @@ async fn main() {
 
             let successful = results.iter().filter(|(_, rows, _)| *rows > 0).count();
             println!("Successful queries: {}/{}", successful, results.len());
+        }
+
+        Commands::WriteNative {
+            from_parquet,
+            from_iceberg,
+            iceberg_snapshot,
+            #[cfg(feature = "lance")]
+            from_lance,
+            sql,
+            tables,
+            out,
+            mode,
+        } => {
+            use query_engine::storage::native_write::{self, NativeWriteMode};
+            let mode: NativeWriteMode = match mode.parse() {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            let mut present = 0;
+            if from_parquet.is_some() {
+                present += 1;
+            }
+            if from_iceberg.is_some() {
+                present += 1;
+            }
+            #[cfg(feature = "lance")]
+            if from_lance.is_some() {
+                present += 1;
+            }
+            if sql.is_some() {
+                present += 1;
+            }
+            if present != 1 {
+                eprintln!(
+                    "Error: pass exactly one of --from-parquet, --from-iceberg, --from-lance, --sql"
+                );
+                std::process::exit(1);
+            }
+
+            let start = Instant::now();
+            let result = if let Some(src) = from_parquet {
+                println!(
+                    "Converting Parquet {} -> {} ({:?})",
+                    src.display(),
+                    out.display(),
+                    mode
+                );
+                native_write::write_from_parquet(&src, &out, mode).await
+            } else if let Some(src) = from_iceberg {
+                println!(
+                    "Converting Iceberg {} -> {} ({:?}, snapshot={:?})",
+                    src.display(),
+                    out.display(),
+                    mode,
+                    iceberg_snapshot
+                );
+                native_write::write_from_iceberg(&src, &out, mode, iceberg_snapshot).await
+            } else if let Some(query) = sql {
+                let Some(dir) = tables else {
+                    eprintln!("Error: --sql needs --tables <parquet directory>");
+                    std::process::exit(1);
+                };
+                let mut ctx = ExecutionContext::new();
+                match std::fs::read_dir(&dir) {
+                    Ok(entries) => {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p.extension().is_some_and(|e| e == "parquet") {
+                                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                                    if let Err(e) = ctx.register_parquet(stem, &p) {
+                                        eprintln!("Warning: {} not registered: {}", stem, e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error reading {}: {}", dir.display(), e);
+                        std::process::exit(1);
+                    }
+                }
+                println!("Planning: {}", query);
+                let physical = match ctx.physical_plan(&query) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                let schema = physical.schema();
+                let n = physical.output_partitions().max(1);
+                let mut streams = Vec::with_capacity(n);
+                let mut stream_err = None;
+                for i in 0..n {
+                    match physical.execute(i).await {
+                        Ok(s) => streams.push(s),
+                        Err(e) => {
+                            stream_err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                if let Some(e) = stream_err {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+                // Merge every partition into ONE stream and hand it straight
+                // to the writer -- streamed, never materialized via
+                // ExecutionContext::sql()'s collecting wrapper (see
+                // native_write.rs's module doc for why that matters).
+                let merged: query_engine::physical::RecordBatchStream =
+                    Box::pin(futures::stream::select_all(streams));
+                println!("Running (streamed, not materialized): {}", query);
+                native_write::write_batches(merged, schema, &out, mode).await
+            } else {
+                #[cfg(feature = "lance")]
+                {
+                    let src = from_lance.expect("checked exactly one source is present");
+                    println!(
+                        "Converting Lance {} -> {} ({:?})",
+                        src.display(),
+                        out.display(),
+                        mode
+                    );
+                    native_write::write_from_lance(&src, &out, mode).await
+                }
+                #[cfg(not(feature = "lance"))]
+                unreachable!("checked exactly one source is present")
+            };
+
+            match result {
+                Ok(r) => {
+                    println!(
+                        "Wrote {} ({} rows, {} segments, table_id={}, now at version {}) in {:?}",
+                        out.display(),
+                        r.rows,
+                        r.segments,
+                        r.table_id,
+                        r.version,
+                        start.elapsed()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Commands::LoadNative { path, name, query } => {
+            use query_engine::storage::{native_manifest, native_write};
+            let start = Instant::now();
+            let manifest = match native_manifest::read_manifest(&path) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            println!("Native table: {}", path.display());
+            println!("  table_id: {}", manifest.table_id);
+            println!("  version:  {}", manifest.snapshot.version);
+            println!("  rows:     {}", manifest.snapshot.row_count);
+            println!("  segments: {}", manifest.segments.len());
+            let schema = manifest.arrow_schema();
+            println!("Schema: {} columns", schema.fields().len());
+            for field in schema.fields() {
+                println!("  - {}: {:?}", field.name(), field.data_type());
+            }
+            println!("Loaded manifest in {:?}", start.elapsed());
+
+            if let Some(sql) = query {
+                println!();
+                println!(
+                    "Running query (whole table materialized for this CLI command -- NOT the \
+                     production streaming read path): {}",
+                    sql
+                );
+                match native_write::read_back(&path) {
+                    Ok((schema, batches)) => {
+                        let mut ctx = ExecutionContext::new();
+                        ctx.register_table(name.clone(), schema, batches);
+                        match ctx.sql(&sql).await {
+                            Ok(result) => print_results(&result),
+                            Err(e) => {
+                                eprintln!("Error: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error reading back {}: {}", path.display(), e);
+                        std::process::exit(1);
+                    }
+                }
+            }
         }
 
         Commands::Repl {

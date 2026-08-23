@@ -37,5 +37,11 @@ pub mod metadata_cache;
 
 /// Native table manifest (identity/versioning/statistics format). Task 002
 /// of the native-tables-foundation epic; sibling to `native_write.rs` (003)
-/// and `native_table.rs` (004), neither of which exists yet.
+/// and `native_table.rs` (004).
 pub mod native_manifest;
+
+/// Native table write path (bulk-load from parquet/Iceberg/Lance/query
+/// results). Task 003 of the native-tables-foundation epic; calls into
+/// `native_manifest` (002) for the format. A module is otherwise never
+/// compiled, so this registration line is unavoidable.
+pub mod native_write;
