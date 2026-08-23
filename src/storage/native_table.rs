@@ -48,9 +48,68 @@
 //! acceptance criterion) is satisfied by real per-segment `Split`s with
 //! real byte/row counts feeding the existing `assign_lpt` LPT balancer
 //! unchanged, not by a stub returning `None`.
+//!
+//! # Memory safety: `scan()` is NOT spill-aware, so it is capacity-gated
+//! (task 006)
+//!
+//! `scan()` reads every active segment and returns one fully materialized
+//! `Vec<RecordBatch>` — the same "generic, non-parquet" provider contract
+//! `LanceTable::scan()` already has (see `native_write.rs`'s doc on
+//! `write_from_lance`), and the one this module's own doc has always named
+//! as NOT owning the write side's streaming discipline. Task 006 measured
+//! what that costs directly, not just by inspection: converting SF=10
+//! `lineitem` (60M rows) to a native table and running an ungrouped
+//! `SELECT COUNT(*), SUM(l_quantity), SUM(l_extendedprice)` against it
+//! through the REAL `TableProvider` path (`serve --tables`, not a
+//! synthetic microbenchmark) needed **~1.6GB peak RSS** (kernel `VmHWM`,
+//! not estimated) and was OOM-killed (SIGKILL, exit 137) under a bare 1GiB
+//! cgroup cap — while the IDENTICAL query over the IDENTICAL data as plain
+//! Parquet (which routes through `ParallelParquetSource`'s genuinely
+//! row-group-streaming path instead of this generic one) finished in
+//! 109ms and never came close to that cap. This is a real, measured,
+//! native-table-specific gap relative to Parquet, not a hypothetical or a
+//! general engine characteristic every provider already shares.
+//!
+//! A true fix (an incremental/streaming scan comparable to
+//! `ParallelParquetSource`) needs a per-provider morsel driver — out of
+//! this task's file scope (`src/physical/planner.rs` /
+//! `src/physical/operators/morsel_agg.rs`) and a materially larger lift
+//! than this epic's task 006 sizing. Per this task's own charter ("a hard,
+//! explicit size/row cap enforced at the right layer... pick one, don't
+//! ship neither"), `scan()` instead REFUSES cleanly, before touching a
+//! single segment, when its (conservative — see below) estimated memory
+//! need exceeds a configured budget:
+//!
+//! - The budget is `ExecutionConfig::memory_limit * spill_threshold` —
+//!   the EXACT formula `src/physical/operators/spillable.rs` already uses
+//!   at 7 call sites for the identical "how much may one thing in this
+//!   query legitimately hold" question; this is not a new concept or a
+//!   new opt-out, just this already-existing knob finally reaching a code
+//!   path it silently didn't before. `ExecutionContext::register_native_table`
+//!   computes it and calls [`NativeTable::with_memory_budget`]; a
+//!   `NativeTable` built directly (tests, and `native_write.rs`'s own
+//!   round-trip reader, which does not go through `ExecutionContext` at
+//!   all) gets `None` and is unaffected — exactly today's behavior.
+//! - The estimate is `self.statistics().total_byte_size` — the WHOLE
+//!   active segment set's on-disk size, deliberately ignoring any
+//!   requested projection: task 002's manifest has no per-column byte
+//!   breakdown to compute a narrower number from (adding one is
+//!   `native_manifest.rs` — task 002, closed — territory, not this
+//!   task's). This is conservative in the safe direction (may refuse a
+//!   narrow projection of a huge table that would actually have fit) and
+//!   never in the unsafe one (never proceeds when the whole table
+//!   plainly would not fit).
+//! - Large-scale native-table benchmarking (e.g. a future task 008 at
+//!   SF=10/SF=100) must size `--memory-limit` for the data, exactly like
+//!   `benchmark-parquet` already does (`(sf * 4.0).max(1.0)` GB, capped at
+//!   64GB, `src/main.rs`) — this is the SAME pre-existing convention, not
+//!   a new burden invented here; the engine-wide `ExecutionConfig::default()`
+//!   1GiB `memory_limit` was never meant to bound a real multi-GB scan (it
+//!   already never has for Parquet either — see `spillable.rs`'s own
+//!   `memory_limit * spill_threshold` budgets, sized the same way).
 
 use crate::distributed::{Split, SplitSet};
-use crate::error::Result;
+use crate::error::{QueryError, Result};
 use crate::physical::operators::{ColumnStatistics, TableProvider, TableStatistics};
 use crate::storage::ipc_cache;
 use crate::storage::native_manifest::{self, ColumnStats, NativeManifest, Segment};
@@ -85,13 +144,21 @@ pub struct NativeTable {
     /// freshly-opened, whole-table provider) means every segment in the
     /// manifest.
     only_segments: Option<HashSet<u32>>,
+    /// `scan()`'s admission-control budget in bytes, or `None` for no cap
+    /// (this provider's behavior before task 006, and still the behavior
+    /// for any `NativeTable` built directly rather than through
+    /// `ExecutionContext::register_native_table` — see the module doc's
+    /// "Memory safety" section and [`with_memory_budget`](Self::with_memory_budget).
+    memory_budget_bytes: Option<u64>,
 }
 
 impl NativeTable {
     /// Open a native table directory. Reads and fully validates
     /// `_manifest.json` (`native_manifest::read_manifest`): a missing or
     /// corrupt manifest is a clear `Err`, never a panic or a silently empty
-    /// table.
+    /// table. No `scan()` admission budget is set (see
+    /// [`with_memory_budget`](Self::with_memory_budget)) — `scan()` behaves
+    /// exactly as it did before task 006 unless a caller opts in.
     pub fn try_new(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         let manifest = native_manifest::read_manifest(&dir)?;
@@ -99,7 +166,63 @@ impl NativeTable {
             dir,
             manifest,
             only_segments: None,
+            memory_budget_bytes: None,
         })
+    }
+
+    /// Attach (or clear, with `None`) a `scan()` admission-control budget in
+    /// bytes — see the module doc's "Memory safety" section for the full
+    /// rationale and the measurement that motivated it.
+    /// `ExecutionContext::register_native_table` calls this with
+    /// `memory_limit * spill_threshold`, mirroring `spillable.rs`'s own
+    /// budget formula exactly. A `NativeTable` built directly (tests,
+    /// `native_write.rs`'s own round-trip reader) is unaffected unless it
+    /// opts in.
+    pub fn with_memory_budget(mut self, budget_bytes: Option<u64>) -> Self {
+        self.memory_budget_bytes = budget_bytes;
+        self
+    }
+
+    /// Admission control for `scan()`. This provider's scan is not
+    /// spill-aware (module doc) — it materializes every active segment into
+    /// one `Vec<RecordBatch>` before returning, so a conservative estimate
+    /// of its true memory need is this provider's own on-disk byte total
+    /// (ignoring any requested projection — task 002's manifest has no
+    /// per-column byte breakdown to compute a narrower number from). Refuses
+    /// cleanly, before touching a single segment, rather than silently
+    /// proceeding toward a possible OOM.
+    ///
+    /// `QE_DEBUG_SCAN_BUDGET=1` traces every call (dir + configured budget)
+    /// to stderr — matching this codebase's existing "cheap, env-gated,
+    /// zero cost when unset" diagnostic-switch convention (see CLAUDE.md's
+    /// "Diagnostic switches" table); used to confirm THIS check (rather
+    /// than some other code path) is what a given query actually goes
+    /// through while investigating task 006's own OOM reproduction.
+    fn check_scan_budget(&self) -> Result<()> {
+        if std::env::var("QE_DEBUG_SCAN_BUDGET").is_ok() {
+            eprintln!(
+                "[scan_budget] check_scan_budget: dir={} budget={:?}",
+                self.dir.display(),
+                self.memory_budget_bytes
+            );
+        }
+        let Some(budget) = self.memory_budget_bytes else {
+            return Ok(());
+        };
+        let estimated = self.statistics().map(|s| s.total_byte_size).unwrap_or(0);
+        if estimated > budget {
+            return Err(QueryError::Execution(format!(
+                "native table at {} needs an estimated {estimated} bytes to scan (its full \
+                 on-disk size — this provider's scan() is not yet spill-aware, see \
+                 .claude/plans/larger-than-memory-support.md), which exceeds the configured \
+                 memory safety budget of {budget} bytes (memory_limit * spill_threshold). \
+                 Raise --memory-limit / ExecutionConfig::memory_limit for this query (e.g. \
+                 sized for the data the way `benchmark-parquet` already does), or query a \
+                 narrower projection/predicate.",
+                self.dir.display()
+            )));
+        }
+        Ok(())
     }
 
     /// The manifest this provider was opened from — table_id, schema,
@@ -257,6 +380,7 @@ impl TableProvider for NativeTable {
     }
 
     fn scan(&self, projection: Option<&[usize]>) -> Result<Vec<RecordBatch>> {
+        self.check_scan_budget()?;
         let mut out = Vec::new();
         for seg in self.active_segments() {
             let batches = ipc_cache::read_row_group(&self.dir, seg.id as usize, projection, None)?;
@@ -336,6 +460,11 @@ impl TableProvider for NativeTable {
             dir: self.dir.clone(),
             manifest: self.manifest.clone(),
             only_segments: Some(ids),
+            // A shard covers a SUBSET of the whole table's segments, so
+            // inheriting the same absolute budget (rather than e.g.
+            // dropping it) stays conservative-safe and is never tighter
+            // than the whole-table check would have been.
+            memory_budget_bytes: self.memory_budget_bytes,
         })))
     }
 }
@@ -656,5 +785,94 @@ mod tests {
         std::fs::write(native_manifest::manifest_path(dir.path()), b"{ not json").unwrap();
         let err = NativeTable::try_new(dir.path()).unwrap_err();
         assert!(matches!(err, crate::error::QueryError::Storage(_)));
+    }
+
+    // ---------- scan() admission control (task 006) ----------
+
+    #[test]
+    fn no_budget_means_scan_is_unaffected() {
+        // The default from `try_new` alone (no `with_memory_budget` call) —
+        // every test above this one already relies on this implicitly;
+        // this test just makes the contract explicit.
+        let dir = tempfile::tempdir().unwrap();
+        write_test_table(dir.path());
+        let table = NativeTable::try_new(dir.path()).unwrap();
+        assert!(table.scan(None).is_ok());
+    }
+
+    #[test]
+    fn a_budget_comfortably_above_the_table_size_does_not_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_table(dir.path());
+        let table = NativeTable::try_new(dir.path())
+            .unwrap()
+            .with_memory_budget(Some(u64::MAX));
+        let scanned = table.scan(None).unwrap();
+        let total_rows: usize = scanned.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 5);
+    }
+
+    #[test]
+    fn a_budget_below_the_table_size_refuses_cleanly_before_reading_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_table(dir.path());
+        let table = NativeTable::try_new(dir.path()).unwrap();
+        let real_size = table.statistics().unwrap().total_byte_size;
+        assert!(real_size > 0, "the fixture must have a nonzero byte size");
+
+        let capped = table.with_memory_budget(Some(real_size - 1));
+        let err = capped.scan(None).unwrap_err();
+        assert!(
+            matches!(err, crate::error::QueryError::Execution(_)),
+            "{err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("memory safety budget"), "{msg}");
+        assert!(msg.contains("--memory-limit"), "{msg}");
+    }
+
+    #[test]
+    fn a_budget_exactly_at_the_table_size_does_not_refuse() {
+        // The check is a strict `>`, not `>=` -- a table that fits EXACTLY
+        // inside the declared budget must be allowed, not treated as an
+        // off-by-one violation.
+        let dir = tempfile::tempdir().unwrap();
+        write_test_table(dir.path());
+        let table = NativeTable::try_new(dir.path()).unwrap();
+        let real_size = table.statistics().unwrap().total_byte_size;
+
+        let exact = table.with_memory_budget(Some(real_size));
+        assert!(exact.scan(None).is_ok());
+    }
+
+    #[test]
+    fn shard_by_splits_propagates_the_budget_and_can_itself_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_table(dir.path());
+        let table = NativeTable::try_new(dir.path()).unwrap();
+        let real_size = table.statistics().unwrap().total_byte_size;
+        let capped = table.with_memory_budget(Some(real_size - 1));
+
+        let set = capped.distributed_splits("t", 2).unwrap().unwrap();
+        let seg0_only: Vec<Split> = set
+            .splits
+            .iter()
+            .filter(|s| s.row_group == 0)
+            .cloned()
+            .collect();
+        let shard = capped.shard_by_splits(&seg0_only).unwrap().unwrap();
+
+        // The shard's OWN (smaller) rollup is what gets checked -- a shard
+        // that individually fits under the whole table's budget must not be
+        // refused just because the WHOLE table would not have fit.
+        let shard_size = shard.statistics().unwrap().total_byte_size;
+        assert!(
+            shard_size < real_size,
+            "a one-segment shard must be smaller than the whole table"
+        );
+        assert!(
+            shard.scan(None).is_ok(),
+            "a shard that individually fits under the inherited budget must succeed"
+        );
     }
 }

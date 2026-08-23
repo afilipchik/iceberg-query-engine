@@ -355,7 +355,16 @@ impl ExecutionContext {
         name: impl Into<String>,
         path: impl AsRef<Path>,
     ) -> Result<()> {
-        let table = NativeTable::try_new(path)?;
+        // `NativeTable::scan()` is not spill-aware (task 006 measured this
+        // directly: a 60M-row native table's full-table scan needed ~1.6GB
+        // peak RSS and was OOM-killed under a bare 1GiB cgroup cap, while
+        // the identical query over the identical data as plain Parquet
+        // finished in 109ms — see `native_table.rs`'s module doc). Give it
+        // the SAME admission-control budget `spillable.rs` already computes
+        // at 7 call sites (`memory_limit * spill_threshold`) so a scan that
+        // plainly cannot fit refuses cleanly instead of risking OOM.
+        let budget = (self.config.memory_limit as f64 * self.config.spill_threshold) as u64;
+        let table = NativeTable::try_new(path)?.with_memory_budget(Some(budget));
         self.register_table_provider(name, Arc::new(table));
         Ok(())
     }
