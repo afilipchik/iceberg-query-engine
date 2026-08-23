@@ -1,8 +1,8 @@
 ---
 name: native-tables-foundation
-status: backlog
+status: in-progress
 created: 2026-08-23T07:42:14Z
-updated: 2026-08-23T07:42:14Z
+updated: 2026-08-23T18:35:37Z
 progress: 0%
 prd: .claude/prds/native-tables.md
 github: (will be set on sync)
@@ -196,3 +196,18 @@ the storage-format and TableProvider-integration tasks.
 - 008: S-M (1-2 days — both scales, both premises, CPU/GPU split, docs).
 - Total: 2-4 focused working sessions, the largest single-epic effort in
   this program so far.
+
+## Tasks Created
+- [ ] 001.md - Attribution spike — SQL DDL lift size + statistics/manifest format decision (parallel: false)
+- [ ] 002.md - Storage format + manifest — identity, versioning, zone-maps (parallel: false)
+- [ ] 003.md - Write path — bulk-load from parquet/Iceberg/Lance/query results (parallel: true)
+- [ ] 004.md - TableProvider integration — splits, statistics, registration (parallel: true)
+- [ ] 005.md - Dense-direct-address fast-path compatibility (parallel: false)
+- [ ] 006.md - Memory safety — cap or spill integration (parallel: false)
+- [ ] 007.md - GPU-offload identity/eligibility generalization (parallel: true)
+- [ ] 008.md - QA close-out — cell-exact SF=10+SF=100, Iceberg comparison, CPU/GPU split, docs, epic close (parallel: false)
+
+Total tasks: 8
+Parallel tasks: 3
+Sequential tasks: 5
+Estimated total effort: 72-144 hours (2-4 focused working sessions)
