@@ -355,10 +355,32 @@ impl PhysicalPlanner {
     /// a DENSE key space: NDV >= 1M and range <= 2x NDV. That is the regime
     /// where every worker's shared-channel partial state spans the whole key
     /// range and the merge pays workers-fold overlap (Q13's c_custkey,
-    /// NDV=range=15M: merge 4.3s shared vs 0.1ms disjoint at SF=100).
+    /// NDV=range=15M: merge 4.3s shared vs 0.1ms disjoint at SF=100 — an old
+    /// generic-merge measurement, kept for the shape it documents; the
+    /// CURRENT dense range-shard merge costs ~223ms at SF=10's 1.5M-range
+    /// c_custkey, `[raw-merge]` profiling, see task 002).
     /// Sparse keys (l_orderkey, range 4x NDV) measured a net LOSS under the
     /// scatter, and low-NDV keys pay scatter for a merge that was already
     /// trivial — both stay on the shared channel.
+    ///
+    /// Lower bound 1,000,000 (task 002, duckdb-parity-2 epic, 2026-08-22):
+    /// SF=10's c_custkey range is 1,500,000, under the floor this replaced
+    /// (2,000,000) — that floor was set from the SF=100 case alone with no
+    /// SF=10-scale measurement. `examples/disjoint_merge_bench.rs` isolates
+    /// the merge step at range/mult combinations bracketing 1.5M (mult =
+    /// TPC-H's fixed 10:1 orders:customer ratio) and found disjoint mode a
+    /// net win EVERYWHERE tested, 500K through 5M range and mult 3 through
+    /// 40, 1.55x-2.85x faster end to end (scatter cost included) with no
+    /// sign of a crossover approaching from below — at SF=10's exact shape
+    /// (range=1.5M, mult=10): ~1.9-2.0x. The bench's structural prediction
+    /// (8.59x worker-state duplication at range=15M, mult=10) matches this
+    /// function's own SF=100 doc citation (126M partial slots for 15M
+    /// groups) to within 2%, and its absolute SF=10 merge-step timing
+    /// (~150-200ms) matches the real measured 223ms `[raw-merge]` number
+    /// closely enough to trust its verdict at the untested 1.5M point.
+    /// 1,000,000 (not the lower bracket points also measured, e.g. 500K) was
+    /// chosen to stay inside the directly-tested range rather than
+    /// extrapolate below it.
     fn disjoint_group_hint(&self, group_by: &[Expr]) -> bool {
         if group_by.len() != 1 {
             return false;
@@ -378,10 +400,10 @@ impl PhysicalPlanner {
                         // scatter for a merge that was already cheap. The
                         // pathological shared-merge case is a dense DIRECT-
                         // ADDRESS key domain, and that is a RANGE property:
-                        // c_custkey (range 15M) qualifies, l_orderkey does
-                        // not.
+                        // c_custkey (range 15M at SF=100, 1.5M at SF=10)
+                        // qualifies, l_orderkey does not.
                         let range = max.saturating_sub(min).saturating_add(1).max(1) as u64;
-                        return (2_000_000..=64_000_000).contains(&range);
+                        return (1_000_000..=64_000_000).contains(&range);
                     }
                 }
             }
