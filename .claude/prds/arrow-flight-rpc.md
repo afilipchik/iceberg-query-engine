@@ -1,7 +1,7 @@
 ---
 name: arrow-flight-rpc
 description: Arrow Flight RPC endpoints for the query engine, serving single-node and distributed queries as gRPC Arrow streams
-status: backlog
+status: completed
 created: 2026-08-21T13:40:26Z
 ---
 

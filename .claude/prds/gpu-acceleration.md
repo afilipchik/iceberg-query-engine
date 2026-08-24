@@ -1,7 +1,7 @@
 ---
 name: gpu-acceleration
 description: Feature-gated CUDA offload for the aggregate shapes where a resident RTX 5090 provably beats the CPU - priced, validated, kept only on wins
-status: backlog
+status: completed
 created: 2026-08-22T06:16:43Z
 ---
 

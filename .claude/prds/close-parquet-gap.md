@@ -1,3 +1,12 @@
+> **Superseded (2026-08-23).** This PRD's own stated goal (≤55s at SF=100)
+> was not met by its epic, which closed with an honest partial result and
+> two documented negative findings rather than a numbered task
+> decomposition — see `.claude/epics/close-parquet-gap/epic.md`'s own
+> close-out. Its one concrete unresolved item, Q4 attribution, was picked
+> up and fully resolved by the `duckdb-parity` epic
+> (`.claude/epics/duckdb-parity/epic.md`: "Q4 3.50→1.74s"). No further
+> action needed against this PRD.
+
 # PRD: Close the parquet like-for-like gap vs DuckDB (SF=100)
 
 **Problem.** On IDENTICAL parquet files, warm, same machine: engine 87.1s,

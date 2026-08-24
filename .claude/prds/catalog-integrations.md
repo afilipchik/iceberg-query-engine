@@ -1,7 +1,7 @@
 ---
 name: catalog-integrations
 description: Extend Gravitino integration to relational catalogs and add Apache Pulsar topics-as-tables with schema-registry-driven discovery
-status: backlog
+status: completed
 created: 2026-08-22T15:25:08Z
 ---
 

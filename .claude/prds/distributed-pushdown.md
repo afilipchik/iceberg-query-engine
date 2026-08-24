@@ -1,7 +1,7 @@
 ---
 name: distributed-pushdown
 description: ClickHouse/Trino-style computation pushdown so distributed TPC-H stops shipping tables and starts shipping answers
-status: backlog
+status: completed
 created: 2026-08-22T05:07:38Z
 ---
 

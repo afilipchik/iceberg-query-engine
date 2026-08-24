@@ -1,7 +1,7 @@
 ---
 name: expression-compilation
 description: Closure-compiled fused expression evaluation - the form of query compilation that survives measurement in a vectorized engine
-status: backlog
+status: completed
 created: 2026-08-22T05:55:00Z
 ---
 

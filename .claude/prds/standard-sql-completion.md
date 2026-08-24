@@ -1,7 +1,7 @@
 ---
 name: standard-sql-completion
 description: Close the standard-SQL gaps found by probe - the full window function suite, grouping sets, and the missing expression forms
-status: backlog
+status: completed
 created: 2026-08-21T15:16:42Z
 ---
 
