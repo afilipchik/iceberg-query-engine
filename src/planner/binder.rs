@@ -137,6 +137,132 @@ pub fn create_table_target_name(stmt: &Statement) -> Option<String> {
     }
 }
 
+/// If `stmt` is an `INSERT` statement, its target table's name —
+/// regardless of whether the statement is otherwise a shape this binder's
+/// `bind()` will accept (mirrors [`create_table_target_name`]'s own
+/// "extraction is separate from validation" split, so a caller can learn
+/// the target before, or independent of, calling `bind()`). `None` for
+/// `TableObject::TableFunction` (ClickHouse `INSERT INTO TABLE
+/// FUNCTION(...)`), which has no plain table name —
+/// `require_supported_insert_shape` (called from `bind()`) refuses that
+/// shape by name too, so a caller that checks this first never reaches a
+/// validated bind for it.
+pub fn insert_target_name(stmt: &Statement) -> Option<String> {
+    match stmt {
+        Statement::Insert(insert) => match &insert.table {
+            ast::TableObject::TableName(name) => Some(name.table_name()),
+            // `TableFunction` (ClickHouse `INSERT INTO TABLE FUNCTION(...)`)
+            // and `TableQuery` (Oracle `INSERT INTO (subquery) VALUES ...`)
+            // have no plain table name -- `require_supported_insert_shape`
+            // (called from `bind()`) refuses both shapes by name too.
+            ast::TableObject::TableFunction(_) | ast::TableObject::TableQuery(_) => None,
+        },
+        _ => None,
+    }
+}
+
+/// Refuse, by name, every `INSERT` clause this epic (native-tables-
+/// mutation, task 002) does not implement. Mirrors
+/// `require_supported_create_table_shape`'s exact discipline, mechanically
+/// checked against sqlparser 0.62's real `ast::Insert` struct (~26 fields
+/// total; confirmed via `.scratch/mutation_sqlparser_spike/`, see task
+/// 001's Outcome, Decision 6). Only `table` (name only) and `source` are
+/// consumed (by `Binder::bind()`'s `Statement::Insert` arm); every other
+/// field must be at its "not specified" value or this returns a specific
+/// `QueryError::NotImplemented` naming the clause — never a silent
+/// downgrade to "ignore the clause and proceed." `insert_token`, `into`
+/// and `has_table_keyword` are pure syntax/span markers with no semantic
+/// effect (`INSERT INTO t ...` vs. dialect-specific `INSERT t ...`/
+/// `INSERT TABLE t ...` mean the same thing) and are deliberately not
+/// checked, mirroring `require_supported_create_table_shape`'s own
+/// treatment of `ct.hive_distribution`'s "NONE" default.
+fn require_supported_insert_shape(insert: &ast::Insert) -> Result<()> {
+    fn refuse(clause: &str) -> QueryError {
+        QueryError::NotImplemented(format!(
+            "INSERT: `{clause}` is not supported — this epic supports only \
+             `INSERT INTO <table> SELECT ...` / `INSERT INTO <table> VALUES (...)` against an \
+             existing native table (no upsert, no partial column lists, no full-table \
+             overwrite via INSERT)"
+        ))
+    }
+    if !matches!(insert.table, ast::TableObject::TableName(_)) {
+        return Err(refuse(
+            "an INSERT target that is not a plain table name (TABLE FUNCTION(...) or a \
+             sub-query target)",
+        ));
+    }
+    if !insert.optimizer_hints.is_empty() {
+        return Err(refuse("query optimizer hints"));
+    }
+    if insert.or.is_some() {
+        return Err(refuse("SQLite ON CONFLICT (INSERT OR ...)"));
+    }
+    if insert.ignore {
+        return Err(refuse("MySQL INSERT IGNORE"));
+    }
+    if insert.table_alias.is_some() {
+        return Err(refuse("a table alias on the INSERT target"));
+    }
+    if !insert.columns.is_empty() {
+        return Err(refuse(
+            "an explicit column list (INSERT INTO t (a, b) SELECT/VALUES ...)",
+        ));
+    }
+    if insert.overwrite {
+        return Err(refuse("Hive INSERT OVERWRITE TABLE"));
+    }
+    if !insert.assignments.is_empty() {
+        return Err(refuse("MySQL INSERT ... SET"));
+    }
+    if insert.partitioned.is_some() {
+        return Err(refuse("Hive PARTITION"));
+    }
+    if !insert.after_columns.is_empty() {
+        return Err(refuse("Hive columns defined after PARTITION"));
+    }
+    if insert.on.is_some() {
+        return Err(refuse("ON CONFLICT / ON DUPLICATE KEY UPDATE"));
+    }
+    if insert.returning.is_some() {
+        return Err(refuse("RETURNING"));
+    }
+    if insert.output.is_some() {
+        return Err(refuse("OUTPUT (MSSQL)"));
+    }
+    if insert.replace_into {
+        return Err(refuse("MySQL REPLACE INTO"));
+    }
+    if insert.priority.is_some() {
+        return Err(refuse(
+            "MySQL INSERT priority (LOW_PRIORITY/DELAYED/HIGH_PRIORITY)",
+        ));
+    }
+    if insert.insert_alias.is_some() {
+        return Err(refuse("MySQL INSERT ... AS alias"));
+    }
+    if insert.settings.is_some() {
+        return Err(refuse("ClickHouse SETTINGS"));
+    }
+    if insert.format_clause.is_some() {
+        return Err(refuse("ClickHouse FORMAT"));
+    }
+    if insert.multi_table_insert_type.is_some() {
+        return Err(refuse("Snowflake multi-table INSERT ALL/FIRST"));
+    }
+    if !insert.multi_table_into_clauses.is_empty() {
+        return Err(refuse(
+            "Snowflake multi-table INSERT additional INTO clauses",
+        ));
+    }
+    if !insert.multi_table_when_clauses.is_empty() {
+        return Err(refuse("Snowflake multi-table INSERT WHEN clauses"));
+    }
+    if insert.multi_table_else_clause.is_some() {
+        return Err(refuse("Snowflake multi-table INSERT ELSE clause"));
+    }
+    Ok(())
+}
+
 /// Refuse, by name, every `CREATE TABLE` clause this epic does not
 /// implement. Mirrors this binder's existing "match the supported shape,
 /// `NotImplemented` the rest" convention (used throughout for window
@@ -409,6 +535,37 @@ impl<'a> Binder<'a> {
                          populated later via INSERT) is not supported — this epic is \
                          full-table bulk-load/replace only. Use \
                          CREATE TABLE <name> AS SELECT ..."
+                            .to_string(),
+                    )
+                })?;
+                self.bind_query(query)
+            }
+            // `INSERT INTO <table> SELECT/VALUES ...` (native-tables-
+            // mutation epic, task 002). Mirrors the `CreateTable` arm's
+            // shape exactly: binds and returns ONLY the source query's
+            // LogicalPlan (no DML node — `LogicalPlan` gains none for the
+            // same reason `CreateTable` needed none), with the target
+            // table name recovered separately (`insert_target_name`) by
+            // whichever `ExecutionContext` entrypoint drives the write,
+            // since binding a query and deciding what to do with its
+            // result are different jobs. Every `Insert` struct field this
+            // epic does not support is refused BY NAME
+            // (`require_supported_insert_shape`), never silently ignored —
+            // see that function for the full list (explicit column lists,
+            // Hive INSERT OVERWRITE, ON CONFLICT/ON DUPLICATE KEY UPDATE,
+            // MySQL INSERT...SET, RETURNING/OUTPUT, multi-table INSERT
+            // ALL/FIRST, and more). `source` binds via the SAME
+            // `bind_query()` CreateTable already uses — covers both
+            // `INSERT ... SELECT` and `INSERT ... VALUES` (`SetExpr::
+            // Values` already has its own arm in `bind_set_expr`), so no
+            // extra binder work is needed for either shape.
+            Statement::Insert(insert) => {
+                require_supported_insert_shape(insert)?;
+                let query = insert.source.as_deref().ok_or_else(|| {
+                    QueryError::NotImplemented(
+                        "INSERT without a SELECT/VALUES source (e.g. DEFAULT VALUES) is not \
+                         supported — use INSERT INTO <table> SELECT ... or INSERT INTO \
+                         <table> VALUES (...)"
                             .to_string(),
                     )
                 })?;
@@ -4719,5 +4876,121 @@ mod tests {
 
         let result = binder.bind_sql("SELECT * FROM nonexistent");
         assert!(result.is_err());
+    }
+
+    // ---------- INSERT (native-tables-mutation epic, task 002) ----------
+
+    #[test]
+    fn insert_target_name_extracts_the_table_name_without_validating_shape() {
+        let stmt = parser::parse_sql("INSERT INTO orders SELECT * FROM orders").unwrap();
+        assert_eq!(insert_target_name(&stmt).as_deref(), Some("orders"));
+
+        // Extraction succeeds even for a shape `bind()` will later refuse
+        // (mirrors `create_table_target_name`'s own split).
+        let overwrite_stmt =
+            parser::parse_sql("INSERT OVERWRITE TABLE orders SELECT * FROM orders").unwrap();
+        assert_eq!(
+            insert_target_name(&overwrite_stmt).as_deref(),
+            Some("orders")
+        );
+
+        let select_stmt = parser::parse_sql("SELECT * FROM orders").unwrap();
+        assert_eq!(insert_target_name(&select_stmt), None);
+    }
+
+    #[test]
+    fn bind_insert_select_binds_only_the_source_query() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+
+        let stmt = parser::parse_sql("INSERT INTO orders SELECT o_orderkey FROM orders").unwrap();
+        let plan = binder.bind(&stmt).unwrap();
+        // Same shape a plain `SELECT o_orderkey FROM orders` produces --
+        // `LogicalPlan` has no DML node, exactly like `CreateTable`.
+        assert!(matches!(plan, LogicalPlan::Project(_)), "got {:?}", plan);
+    }
+
+    #[test]
+    fn bind_insert_values_binds_through_the_same_path_as_select() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+
+        // `INSERT ... VALUES` needs zero extra binder work per task 001's
+        // finding: `SetExpr::Values` already has its own arm.
+        let stmt =
+            parser::parse_sql("INSERT INTO orders VALUES (1, 100, 'O', 42.5, DATE '2024-01-01')")
+                .unwrap();
+        let plan = binder.bind(&stmt).unwrap();
+        assert!(matches!(plan, LogicalPlan::Values(_)), "got {:?}", plan);
+    }
+
+    #[test]
+    fn bind_insert_with_join_and_group_by_source_works() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+
+        let stmt = parser::parse_sql(
+            "INSERT INTO orders SELECT o.o_orderkey, COUNT(*) FROM orders o \
+             JOIN customer c ON o.o_custkey = c.c_custkey GROUP BY o.o_orderkey",
+        )
+        .unwrap();
+        // Must bind successfully -- the same `bind_query()` CTAS already
+        // relies on for arbitrary joins/aggregates.
+        binder.bind(&stmt).unwrap();
+    }
+
+    #[test]
+    fn bind_insert_refuses_an_explicit_column_list() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt =
+            parser::parse_sql("INSERT INTO orders (o_orderkey) SELECT o_orderkey FROM orders")
+                .unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("column list"), "{err}");
+    }
+
+    #[test]
+    fn bind_insert_refuses_hive_overwrite() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql("INSERT OVERWRITE TABLE orders SELECT o_orderkey FROM orders")
+            .unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("OVERWRITE"), "{err}");
+    }
+
+    #[test]
+    fn bind_insert_refuses_on_conflict() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql(
+            "INSERT INTO orders SELECT o_orderkey FROM orders ON CONFLICT DO NOTHING",
+        )
+        .unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("CONFLICT"), "{err}");
+    }
+
+    // Note: MySQL's `INSERT INTO t SET a = 1` shape (Insert.assignments)
+    // does NOT parse under GenericDialect at all ("Expected: SELECT,
+    // VALUES, or a subquery") -- confirmed the same way task 001's spike
+    // found MySQL's multi-table DELETE form doesn't parse either. The
+    // `assignments` check in `require_supported_insert_shape` stays as
+    // defensive code (in case a future dialect populates it) but is not
+    // independently testable through real, GenericDialect-parseable SQL
+    // text, matching that established precedent.
+
+    #[test]
+    fn bind_insert_without_a_source_is_refused() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql("INSERT INTO orders DEFAULT VALUES").unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("source"), "{err}");
     }
 }

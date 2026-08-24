@@ -76,6 +76,31 @@ pub struct CreateTableAsSelectResult {
     pub elapsed: Duration,
 }
 
+/// What `ExecutionContext::insert_into_native_table` produced
+/// (native-tables-mutation epic, task 002).
+#[derive(Debug, Clone)]
+pub struct InsertResult {
+    /// The table name the INSERT targeted (`insert.table` from the SQL).
+    pub table_name: String,
+    /// The native table's stable identity (UUID v4) — unchanged by an
+    /// INSERT.
+    pub table_id: String,
+    /// The snapshot version this INSERT committed. Equal to the
+    /// PRE-insert version when the source produced zero rows (a
+    /// legitimate no-op, not an error — see
+    /// `native_write::append_to_native_table`'s doc).
+    pub version: u64,
+    /// Rows ADDED by this INSERT (0 for an empty source).
+    pub rows_inserted: u64,
+    /// Segments ADDED by this INSERT (0 for an empty source).
+    pub segments_added: usize,
+    /// The table's TOTAL row count after this INSERT.
+    pub total_rows: u64,
+    /// Wall-clock time for the whole parse-bind-plan-execute-write
+    /// sequence.
+    pub elapsed: Duration,
+}
+
 /// Execution context - manages tables and executes queries
 pub struct ExecutionContext {
     catalog: InMemoryCatalog,
@@ -399,6 +424,29 @@ impl ExecutionContext {
             ));
         }
 
+        // Same reasoning, same fix shape, for `INSERT INTO ... SELECT/
+        // VALUES ...` (native-tables-mutation epic, task 002): now that
+        // `Binder::bind()` accepts `Statement::Insert` (binding ONLY the
+        // source query, exactly like CREATE TABLE), an unguarded INSERT
+        // reaching the ordinary bind/plan/execute path below would
+        // silently run just the SOURCE query and return ITS rows as a
+        // "successful" result — never writing a single row to the target
+        // native table. `insert_into_native_table` needs `&mut self` for
+        // the same reasons `create_table_as_select` does (re-registering
+        // the table so its new rows are visible in this session) and a
+        // genuinely streaming write, both incompatible with this method's
+        // `&self` signature.
+        if crate::planner::insert_target_name(&stmt).is_some() {
+            return Err(QueryError::InvalidArgument(
+                "INSERT INTO ... must run through \
+                 ExecutionContext::insert_into_native_table (the REPL calls this \
+                 automatically) — sql() cannot write to a native table (it takes &self) and \
+                 would otherwise silently execute only the source query without inserting \
+                 anything"
+                    .to_string(),
+            ));
+        }
+
         // Plan
         let plan_start = Instant::now();
         let mut binder = Binder::new(&self.catalog);
@@ -645,6 +693,145 @@ impl ExecutionContext {
             rows: write_result.rows,
             segments: write_result.segments,
             schema: write_schema,
+            elapsed: start.elapsed(),
+        })
+    }
+
+    /// Execute `INSERT INTO <table> SELECT ...` / `INSERT INTO <table>
+    /// VALUES (...)` end to end against an EXISTING native table
+    /// (native-tables-mutation epic, task 002): parse, bind the source
+    /// query via the ordinary `Binder::bind()` path (which also validates
+    /// the `INSERT`'s shape is one this epic supports — see
+    /// `planner::binder`'s `require_supported_insert_shape`), plan and
+    /// optimize it exactly like [`sql`](Self::sql)/
+    /// [`create_table_as_select`](Self::create_table_as_select), then
+    /// drive its `RecordBatchStream` DIRECTLY into
+    /// `native_write::append_to_native_table` — never collecting it into a
+    /// `Vec<RecordBatch>` first, matching `create_table_as_select`'s own
+    /// streaming discipline. Re-registers the table afterward so its new
+    /// rows are visible to a subsequent query in the SAME session.
+    ///
+    /// `&mut self`, unlike `sql()`'s `&self`: re-registering the table
+    /// mutates `self.tables`, and a genuinely streaming write needs the
+    /// plan's stream driven directly rather than via `sql()`'s collecting
+    /// wrapper.
+    ///
+    /// Unlike `create_table_as_select` (which always writes under
+    /// `native_table_root().join(name)`, creating that directory if
+    /// needed), INSERT never creates a table: the target MUST already be
+    /// REGISTERED in this session as a native table (`TableProvider::
+    /// as_any().downcast_ref::<NativeTable>()`) — a plain `QueryError::
+    /// TableNotFound`/`InvalidArgument` otherwise, the same "register
+    /// before you reference it" contract every other table access in this
+    /// engine already has (no special-cased auto-discovery under
+    /// `native_table_root()` — that would be a surprising, untested
+    /// deviation from that contract for this one statement only). An
+    /// empty source (zero matched rows) is a legitimate no-op — see
+    /// `native_write::append_to_native_table`'s doc — not an error.
+    ///
+    /// A schema mismatch between the source's output and the target's
+    /// declared schema is a clean, named `QueryError::Type` from
+    /// `native_write::write_append_segments`'s own validation, never
+    /// silent coercion.
+    pub async fn insert_into_native_table(&mut self, sql: &str) -> Result<InsertResult> {
+        let start = Instant::now();
+        let stmt = parser::parse_sql(sql)?;
+        let table_name = crate::planner::insert_target_name(&stmt).ok_or_else(|| {
+            QueryError::InvalidArgument(format!(
+                "insert_into_native_table expects an INSERT INTO <table> SELECT/VALUES ... \
+                 statement, got: {sql}"
+            ))
+        })?;
+
+        let provider = self.tables.get(&table_name).cloned().ok_or_else(|| {
+            QueryError::TableNotFound(format!(
+                "INSERT INTO {table_name}: no such table is registered in this session (a \
+                 native table must be registered, e.g. via register_native_table or a prior \
+                 CREATE TABLE ... AS SELECT, before INSERT can target it)"
+            ))
+        })?;
+        let native = provider
+            .as_any()
+            .downcast_ref::<NativeTable>()
+            .ok_or_else(|| {
+                QueryError::InvalidArgument(format!(
+                    "INSERT INTO {table_name}: this table is not a native table -- INSERT is \
+                     only supported against native tables"
+                ))
+            })?;
+        let table_dir = native.dir().to_path_buf();
+
+        let mut binder = Binder::new(&self.catalog);
+        // Validates the INSERT's shape (refusing every unsupported clause
+        // by name) AND binds the source query in one call: see
+        // `Binder::bind()`'s `Statement::Insert` arm.
+        let logical = binder.bind(&stmt)?;
+
+        let table_stats = self.collect_table_statistics();
+        let optimized = if table_stats.is_empty() {
+            self.optimizer.optimize(logical)?
+        } else {
+            let optimizer = Optimizer::new().with_table_statistics(table_stats);
+            optimizer.optimize(logical)?
+        };
+        if std::env::var("PLAN_DEBUG").is_ok() {
+            eprintln!("[plan]\n{}", optimized);
+        }
+
+        let mut planner =
+            PhysicalPlanner::with_config(self.memory_pool.clone(), self.config.clone());
+        for (name, provider) in &self.tables {
+            planner.register_table(name.clone(), provider.clone());
+        }
+        planner.enable_subquery_execution();
+        let physical = planner.create_physical_plan(&optimized)?;
+
+        // Drive every output partition's stream directly, then merge them
+        // into ONE stream -- `native_write::append_to_native_table` takes
+        // a single `RecordBatchStream`. Only strips INCIDENTAL
+        // Dictionary encoding here (small-build join gathers, or an
+        // IPC-sidecar-cached scan of the source) the same way
+        // `create_table_as_select` does — the REAL target-schema
+        // conformance (by POSITION, never trusting the source query's own
+        // field names, which can be table-qualified for a bare `SELECT *`
+        // wildcard source — the same trap CTAS already guards against)
+        // and dictionary re-application happen inside
+        // `native_write::write_append_segments` itself, against the
+        // target's ALREADY-DECLARED schema, which already exists for
+        // INSERT (unlike CTAS, which is defining a schema fresh).
+        let num_partitions = physical.output_partitions().max(1);
+        let mut streams: Vec<RecordBatchStream> = Vec::with_capacity(num_partitions);
+        for partition_id in 0..num_partitions {
+            let stream = physical.execute(partition_id).await.map_err(|e| {
+                QueryError::Execution(format!("Partition {partition_id} execution failed: {e}"))
+            })?;
+            let decoded: RecordBatchStream =
+                Box::pin(stream.and_then(|b| async move { decode_dictionary_batch(b) }));
+            streams.push(decoded);
+        }
+        let merged: RecordBatchStream = Box::pin(futures::stream::select_all(streams));
+
+        let append_result = native_write::append_to_native_table(
+            merged,
+            &table_dir,
+            native_write::NativeWriteOptions::default(),
+        )
+        .await
+        .map_err(|e| QueryError::Storage(format!("INSERT INTO {table_name}: {e}")))?;
+
+        // Re-open the table so a subsequent query in the SAME session
+        // sees the newly appended rows -- mirrors `create_table_as_select`'s
+        // own "make the write immediately queryable" step. Reuses the SAME
+        // memory budget `register_native_table` always computes.
+        self.register_native_table(&table_name, &table_dir)?;
+
+        Ok(InsertResult {
+            table_name,
+            table_id: append_result.table_id,
+            version: append_result.version,
+            rows_inserted: append_result.rows_appended,
+            segments_added: append_result.segments_appended,
+            total_rows: append_result.total_rows,
             elapsed: start.elapsed(),
         })
     }

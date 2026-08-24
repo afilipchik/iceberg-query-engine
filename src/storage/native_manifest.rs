@@ -24,7 +24,12 @@
 //!   `002.md`'s Technical Details).
 //! - Atomic publication of a whole table directory (manifest + segments
 //!   together), mirroring `ipc_cache.rs::build_sidecar`'s own
-//!   staging-dir-then-rename pattern.
+//!   staging-dir-then-rename pattern. Plus (native-tables-mutation epic,
+//!   task 002) atomic publication of a SINGLE manifest file
+//!   (`write_manifest_atomic`) for an INCREMENTAL mutation that must
+//!   leave a directory's existing segment files untouched — see that
+//!   function's doc for why `publish_table_dir`'s whole-directory replace
+//!   is not safe to reuse for that case.
 //!
 //! # What this module does NOT own
 //!
@@ -836,6 +841,54 @@ pub fn publish_table_dir(staging: &Path, final_dir: &Path) -> Result<()> {
     })
 }
 
+/// Atomically publish `manifest` as `dir`'s `_manifest.json`, replacing
+/// ONLY that one file — the sibling primitive [`publish_table_dir`] needs
+/// for INCREMENTAL mutations (native-tables-mutation epic, task 002's
+/// `Append`; a future DELETE/UPDATE). Load-bearing distinction, per task
+/// 001's design-spike Outcome (Decision 4): `publish_table_dir` does
+/// `remove_dir_all(final_dir)` then `rename(staging, final_dir)` — correct
+/// only when `staging` is a COMPLETE, self-sufficient replacement for the
+/// whole directory (true for `Create`/`Overwrite`). An incremental
+/// mutation instead writes new segment file(s) DIRECTLY into the already-
+/// live `dir` (see `native_write::write_append_segments`) and only the
+/// MANIFEST changes — calling `publish_table_dir` for that case would
+/// `remove_dir_all` away every segment file the new manifest didn't just
+/// write, corrupting the table. This function is the correct primitive
+/// instead: it touches nothing in `dir` except `_manifest.json` itself.
+///
+/// Mechanism: validates `manifest` (same as [`write_manifest`]), then
+/// writes it to a process-unique temporary file INSIDE `dir`
+/// (`_manifest.json.tmp-<pid>`) and `std::fs::rename`s that temp file onto
+/// [`manifest_path`]`(dir)` — ONE atomic file-level rename, the same POSIX
+/// guarantee `publish_table_dir`'s directory-level rename already relies
+/// on (same filesystem, same primitive, narrowed to a single file). A
+/// reader opening `_manifest.json` at any instant sees either the fully-
+/// old manifest or the fully-new one, never a torn/partial write, and a
+/// crash between this function and whatever wrote the new segment
+/// file(s) first leaves those segments as harmless, unreferenced orphans
+/// (the existing manifest is untouched until this call's rename lands).
+///
+/// Performs NO locking of its own — callers serializing concurrent
+/// writers (e.g. `native_write::lock_table_for_write`) must hold that
+/// lock across their ENTIRE read-modify-write span, not just this call;
+/// see that function's doc for why a per-call lock here would not be
+/// sufficient (a lost update between two independently-computed "next"
+/// manifests is possible even though each individual rename is atomic).
+pub fn write_manifest_atomic(dir: &Path, manifest: &NativeManifest) -> Result<()> {
+    manifest.validate()?;
+    let text = serde_json::to_string_pretty(manifest)
+        .map_err(|e| QueryError::Storage(format!("serialize native table manifest: {e}")))?;
+    let tmp_path = dir.join(format!("{MANIFEST_FILE_NAME}.tmp-{}", std::process::id()));
+    std::fs::write(&tmp_path, text)?;
+    std::fs::rename(&tmp_path, manifest_path(dir)).map_err(|e| {
+        QueryError::Storage(format!(
+            "publish native table manifest update {} -> {}: {e}",
+            tmp_path.display(),
+            manifest_path(dir).display()
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1330,6 +1383,95 @@ mod tests {
         assert_eq!(read_back.snapshot.version, 2);
         assert_eq!(read_back.snapshot.row_count, 7);
         assert_eq!(read_back.table_id, "same-id", "identity survives a replace");
+    }
+
+    // ---------- write_manifest_atomic: single-FILE publish, task 002 ----------
+
+    #[test]
+    fn write_manifest_atomic_replaces_only_the_manifest_file() {
+        let root = tempfile::tempdir().unwrap();
+        let final_dir = root.path().join("mytable");
+        let schema = sample_schema();
+
+        // Publish an initial table (whole-directory path) with one segment.
+        // `sample_segment` builds only the manifest-level `Segment` entry
+        // (no real Arrow IPC bytes), so write a stand-in segment file
+        // ourselves inside the staging dir to actually exercise "does an
+        // existing segment file survive" below.
+        let staging1 = staging_dir_for(&final_dir);
+        std::fs::create_dir_all(&staging1).unwrap();
+        std::fs::write(staging1.join("rg_00000.arrow"), b"segment-0-bytes").unwrap();
+        let m1 = NativeManifest::build(&schema, "same-id", 1, vec![sample_segment(0, 3, 1, 9)], 0)
+            .unwrap();
+        write_manifest(&staging1, &m1).unwrap();
+        publish_table_dir(&staging1, &final_dir).unwrap();
+        assert!(
+            final_dir.join("rg_00000.arrow").is_file(),
+            "sanity: the first publish's stand-in segment file must exist before we test \
+             that a manifest-only update leaves it alone"
+        );
+
+        // Simulate a segment file having been written DIRECTLY into the
+        // live directory by an Append (native_write::write_append_segments'
+        // job, not this module's) plus an unrelated sibling file that must
+        // never be touched.
+        std::fs::write(final_dir.join("rg_00001.arrow"), b"pretend-arrow-bytes").unwrap();
+        std::fs::write(final_dir.join("unrelated.txt"), b"must survive").unwrap();
+
+        // Now publish an updated manifest describing BOTH segments via the
+        // single-file primitive -- must NOT remove/rename the directory,
+        // must NOT touch the sibling file, must leave the segment files
+        // exactly as they were.
+        let mut segments = m1.segments.clone();
+        segments.push(sample_segment(1, 4, 2, 20));
+        let m2 = NativeManifest::build(&schema, "same-id", 2, segments, 1).unwrap();
+        write_manifest_atomic(&final_dir, &m2).unwrap();
+
+        assert!(
+            final_dir.join("unrelated.txt").is_file(),
+            "write_manifest_atomic must never touch sibling files"
+        );
+        assert_eq!(
+            std::fs::read(final_dir.join("rg_00001.arrow")).unwrap(),
+            b"pretend-arrow-bytes",
+            "an existing segment file must survive a manifest-only publish byte-for-byte"
+        );
+        assert_eq!(
+            std::fs::read(final_dir.join("rg_00000.arrow")).unwrap(),
+            b"segment-0-bytes",
+            "the FIRST publish's segment file must also still be present, byte-for-byte"
+        );
+        // No leftover temp file.
+        let tmp_leftover = std::fs::read_dir(&final_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp-"));
+        assert!(!tmp_leftover, "no temp manifest file must be left behind");
+
+        let read_back = read_manifest(&final_dir).unwrap();
+        assert_eq!(read_back.snapshot.version, 2);
+        assert_eq!(read_back.snapshot.row_count, 7);
+        assert_eq!(read_back.segments.len(), 2);
+        assert_eq!(read_back.table_id, "same-id");
+    }
+
+    #[test]
+    fn write_manifest_atomic_refuses_an_invalid_manifest_without_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = sample_schema();
+        let mut manifest =
+            NativeManifest::build(&schema, "t", 1, vec![sample_segment(0, 3, 1, 9)], 0).unwrap();
+        // Corrupt it post-construction the same way the existing
+        // `partial_manifest_inconsistent_row_count_is_a_clear_error` test
+        // does, so `validate()` inside `write_manifest_atomic` catches it.
+        manifest.snapshot.row_count = 999;
+
+        let err = write_manifest_atomic(dir.path(), &manifest).unwrap_err();
+        assert!(err.to_string().contains("row_count"), "{err}");
+        assert!(
+            !manifest_path(dir.path()).exists(),
+            "an invalid manifest must never be published"
+        );
     }
 
     // ---------- the load-bearing proof: ipc_cache::read_row_group reads a
