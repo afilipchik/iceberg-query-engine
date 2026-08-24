@@ -3,7 +3,7 @@ name: spill-join-correctness
 status: in-progress
 created: 2026-08-24T14:19:55Z
 updated: 2026-08-24T14:19:55Z
-progress: 0%
+progress: 25%
 prd: .claude/prds/spill-join-correctness.md
 github: (will be set on sync)
 ---
@@ -146,7 +146,7 @@ full focused session on its own, given the prior investigation's own
   uncertainty, not unwillingness to estimate.
 
 ## Tasks Created
-- [ ] 001.md - Reliable reproduction + instrumented root-cause investigation (parallel: false)
+- [x] 001.md - Reliable reproduction + instrumented root-cause investigation (parallel: false)
 - [ ] 002.md - Fix + immediate validation against the repro (parallel: false)
 - [ ] 003.md - Broad adversarial sweep + slowness verdict (parallel: false)
 - [ ] 004.md - QA close-out — full suite, cell-exact, docs, epic close (parallel: false)
