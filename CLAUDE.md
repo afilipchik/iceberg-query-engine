@@ -2269,13 +2269,131 @@ table's identity must never alias a worker's partial shard. Distributed/
 (`ExecutionConfig::gpu_offload` defaults `false`, forced `false` again in
 fragment contexts), independent of and unaffected by this change.
 
+### Mutation: INSERT (native-tables-mutation epic, phase 2, task 002, 2026-08-23)
+
+`INSERT INTO <native table> SELECT ...` / `INSERT INTO <native table>
+VALUES (...)` — the first mutation capability, extending a native table
+incrementally rather than only full-replacing it. Task 001's design spike
+(`.claude/epics/native-tables-mutation/001.md`'s Outcome) decided the
+mechanism ahead of implementation: reusing phase 1's `publish_table_dir`
+(whole-directory `remove_dir_all` + `rename`) unchanged would delete every
+pre-existing segment on an incremental write, so `Append` uses a
+DIFFERENT, single-FILE atomic-publish model instead.
+
+- **`NativeWriteMode::Append`** (new variant, `src/storage/
+  native_write.rs`) writes new segment(s) DIRECTLY into the LIVE table
+  directory (never a staging directory) under fresh, non-colliding
+  segment ids continuing from the existing maximum (never restarting at
+  0), casts every batch to the target's ALREADY-DECLARED schema and
+  dictionary encoding (inherited, never rediscovered from the new data's
+  own cardinality — a schema/type mismatch is a clean, named
+  `QueryError::Type`, never silent coercion), then publishes ONE new
+  manifest via `native_manifest::write_manifest_atomic`'s single-file
+  `rename()` (a NEW sibling primitive to `publish_table_dir`, additive,
+  zero changes to Create/Overwrite's own directory-level publish).
+  `NativeManifest::build` is reused COMPLETELY UNCHANGED to roll up
+  `row_count`/`table_stats` from the full (old + new) segment list — no
+  separate merge function needed. A zero-row source is a legitimate
+  no-op (no version bump, manifest untouched), unlike Create/Overwrite's
+  own zero-row refusal.
+- **Single-writer enforcement**: `std::fs::File::try_lock()` (stable std
+  since Rust 1.89, zero new dependency) on a sibling `<table>.lock` file,
+  held for the whole read-modify-write-publish span via an RAII guard
+  (`native_write::TableWriteLock`). A concurrent writer gets an
+  immediate, named `QueryError::Storage` — never blocks, never corrupts.
+- **Reusable, non-publishing building blocks** (task 001's Decision 2,
+  for task 003/004's DELETE/UPDATE to compose into their own single
+  atomic publish rather than two sequential self-publishing calls):
+  `native_write::write_append_segments` (writes segments, returns
+  `Vec<Segment>`, touches no manifest) and `native_write::
+  publish_manifest_update` (given a caller-assembled full `Vec<Segment>`,
+  builds + atomically publishes one manifest, does no locking itself).
+  `native_write::append_to_native_table` composes lock + both blocks into
+  the self-publishing entrypoint.
+- **SQL surface**: `Binder::bind()` gained a `Statement::Insert` arm
+  (`src/planner/binder.rs`, mirrors the `CreateTable` arm's shape exactly
+  — binds and returns only the source query's `LogicalPlan`, no new DML
+  node) plus `require_supported_insert_shape`, mechanically checked
+  against sqlparser 0.62's real 26-field `ast::Insert` struct (explicit
+  column lists, Hive `INSERT OVERWRITE`, `ON CONFLICT`/`ON DUPLICATE KEY
+  UPDATE`, MySQL `INSERT...SET`, multi-table `INSERT ALL/FIRST`, and more
+  are all refused by name). `INSERT ... VALUES` is SUPPORTED (not
+  refused) — task 001 confirmed it binds through the identical
+  `bind_query()` path with zero extra binder work.
+- **`ExecutionContext::insert_into_native_table`** (`&mut self`, mirrors
+  `create_table_as_select`'s shape): the target must already be a
+  REGISTERED native table (no auto-discovery — matches every other
+  table's "register before you reference it" contract); streams the
+  source query's `RecordBatchStream` directly into `append_to_native_table`
+  (never through `sql()`'s materializing path — `sql()` itself now
+  refuses a bare `INSERT` with a pointer to this method, mirroring its
+  pre-existing CREATE TABLE guard). Re-registers the table afterward so
+  its new rows are immediately queryable in the same session. Wired into
+  the REPL alongside `CREATE TABLE`'s existing dispatch.
+- **A real, pre-existing bug found and fixed while wiring `INSERT ...
+  VALUES` end to end**: `LogicalPlan::Values`'s physical planning
+  (`src/physical/planner.rs`) was an unimplemented stub that always
+  returned an EMPTY batch regardless of the actual literal rows — no
+  existing test anywhere in the suite exercised literal `VALUES` SQL
+  text, so this was silently dead code until this task's own integration
+  test caught it. Fixed by evaluating each row's expressions via the
+  existing `evaluate_expr` against a 1-row/0-column dummy batch — the
+  SAME trick `LogicalPlan::EmptyRelation` already uses one arm above for
+  a table-less `SELECT <literal>` — then concatenating per column. Fixes
+  `VALUES (...)` everywhere in the engine, not just for INSERT.
+- **Cell-exact validated** (`tests/native_insert_tests.rs`): inserting
+  into a table with existing CTAS data reassembles byte-identically to
+  an independently-computed reference (the same combined query against
+  the original, never-split parquet source); a `SELECT *`-wildcard
+  source (table-qualified field names) still lands positionally correct;
+  an empty result set is a no-op, not an error; a column-count schema
+  mismatch (two real, differently-shaped TPC-H fixtures) is a clean
+  error that leaves the table completely untouched; `statistics()`/
+  `distributed_splits()` correctly widen/add a split after an INSERT.
+- **Memory**: verified, not assumed, the same way phase 1 task 003 did —
+  measured two DIFFERENT things separately (`examples/
+  native_append_memory_check.rs`, `QE_MEM_CHECK_MODE=direct|sql`),
+  reported as separate premises per this doc's own standing convention:
+  - **`direct`** (apples-to-apples with task 003's own methodology:
+    `native_write::append_to_native_table` called directly, fed by the
+    SAME `StreamingParquetReader` construction `write_from_parquet`
+    uses, bypassing the SQL engine entirely) — appending SF=10
+    `lineitem` (60,000,000 rows, 2.8GB compressed) to an existing native
+    table peaked at **328MB** (`/usr/bin/time -v`, kernel `VmHWM`),
+    **better than** task 003's own 406MB CREATE-mode baseline for the
+    identical row count. This is the direct, load-bearing confirmation
+    of this task's own acceptance criterion: Append's write core is
+    genuinely bounded, not assumed to inherit Create/Overwrite's
+    discipline just because it reuses the same buffered-flush shape.
+  - **`sql`** (the full, realistic `INSERT INTO t SELECT * FROM
+    lineitem_src` statement via `ExecutionContext::
+    insert_into_native_table`) — peaked at **~5.3GB**, MUCH higher.
+    Root-caused, not just observed: `StreamingParquetScanExec::
+    output_partitions()` returns one partition per row-group work item
+    (tens of partitions for a 60M-row file), and `insert_into_native_table`
+    (like `create_table_as_select` before it — confirmed by reading both,
+    IDENTICAL structure) drives every partition's stream via
+    `physical.execute(partition_id)` and merges them ALL with
+    `futures::stream::select_all` before the single-threaded Append
+    writer drains them — so many partitions' worth of decoded parquet
+    data can be "in flight" concurrently with no backpressure. This is a
+    PRE-EXISTING, CTAS-shared characteristic (confirmed identical code
+    shape in `create_table_as_select`, not introduced by this task's own
+    Append write core) — named honestly as a residual risk for a future
+    task (bound concurrently-polled partitions, or give the merge real
+    backpressure), not fixed here: closing it would mean changing the
+    engine's generic multi-partition scan/stream-merge pattern, shared
+    by CTAS, well outside this task's own charter.
+
 ### Current limitations (explicit, matching this epic's own G5 boundary and the PRD's phase plan)
 
-- **No mutation.** `INSERT`/`UPDATE`/`DELETE` are not implemented —
-  `Statement::Insert` falls through the binder's catch-all
-  `NotImplemented` exactly as before this epic. A "load" is always a
-  full-table replace (`write-native --mode overwrite` / re-running
-  `CREATE TABLE ... AS SELECT`). Phase 2 of the PRD.
+- **DELETE/UPDATE still not implemented.** Only `INSERT` (native-tables-
+  mutation epic task 002, above) exists so far; `Statement::Delete`/
+  `Statement::Update` still fall through the binder's catch-all
+  `NotImplemented`. A deletion vector mechanism is designed (task 001's
+  Outcome, Decision 1) but not yet built (task 003). Full replace
+  (`write-native --mode overwrite` / re-running `CREATE TABLE ... AS
+  SELECT`) remains available alongside the new incremental `Append`.
 - **No filter/row-group pruning at scan level.** `NativeTable::
   scan_with_filter` has no predicate pushdown at all; every query reads
   every active segment in full and relies on a post-scan `FilterExec` for
