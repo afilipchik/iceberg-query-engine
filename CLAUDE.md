@@ -2826,43 +2826,350 @@ QE_MEM_CHECK_SOURCE=sf100 QE_MEM_CHECK_LIMIT_GB=60 /usr/bin/time -v
 path leg; `SAFE_BUILD_MEM=2G` prefix for the tight-cap legs;
 `QE_CRASH_MODE=concurrent` for the two-writer leg).
 
+### Mutation: QA close-out (native-tables-mutation epic, task 006, 2026-08-24)
+
+Final task of the epic. Full suite green in all four feature
+combinations, cell-exact validation of INSERT/DELETE/UPDATE composed
+together at REAL scale (SF=10 `orders`, not the ~1500-row fixtures
+tasks 002/003/004 individually used), M1/M2 distributed gates
+re-confirmed, never-mutated-table performance parity re-confirmed
+against phase 1's own recorded numbers, and a mutated table's read-
+performance cost measured and explained. Also found and FIXED three
+real, pre-existing bugs (none mutation-specific — all three reproduce
+on phase 1's own never-mutated fixtures) and found one more, deeper bug
+that was deliberately NOT fixed (see below). Full detail, including
+per-bug code pointers and every reproduction command:
+`.claude/epics/archived/native-tables-mutation/006.md`'s Outcome
+section.
+
+**Three real bugs found and fixed, one root cause, one fix pattern.**
+`SELECT ... FROM <table with a Dictionary-coerced string column>
+ORDER BY ...` (or a large-enough JOIN carrying one) failed outright —
+`Arrow error: Invalid argument error: column types must match schema
+types, expected Utf8 but found Dictionary(Int32, Utf8)` — whenever
+`ExternalSortExec`'s or `SpillableHashJoinExec`'s SPILL path engaged
+(the ALWAYS-used spillable operators, per this engine's memory-safety
+rule). Root cause: their declared output schema comes from
+`plan_schema_to_arrow`, which has no Dictionary representation (a
+string column is always reported as plain `Utf8`) — three OTHER call
+sites in this codebase already carry an established fix for exactly
+this "declared vs actual type" mismatch (`ProjectExec::project_batch`,
+`MemoryTableExec::execute`'s `rewrap`, `hash_join.rs`'s
+`batch_with_actual_types`), but the SPILL-specific code in
+`src/physical/operators/spillable.rs` had none of them — its in-memory
+counterpart was already safe (it delegates to the already-fixed
+operators). Never triggered before because no existing test/benchmark
+combined "large enough to spill" with "carries a Dictionary-coerced
+column" — this task's real-scale validation was the first time both
+conditions held at once, for BOTH the sort operator (a 15M-row `ORDER
+BY`) and the join operator (Q12's spilling INNER join, a pre-existing,
+already-documented characteristic — see Current limitations below).
+Fixed at all three call sites it was missing from
+(`ExternalSortExec::flush_run`, `ExternalSortExec::
+{build_merged_batch,build_merged_batch_final}`, `SpillableHashJoinExec`
+'s `create_joined_batch`) with a new local `batch_with_actual_types`
+helper (mirrors `hash_join.rs`'s function of the same name — this file
+follows the SAME local-duplication convention that function and
+`scan.rs`'s `rewrap` already established, rather than a new cross-
+module dependency for a three-line function). A SEPARATE, genuinely
+distinct bug in the same file was found and fixed alongside:
+`ExternalSortExec`'s k-way spill-merge held `(run_idx, row_idx)`
+references into a run's CURRENT in-memory Parquet batch that went
+stale — silently wrong data, or an out-of-bounds panic ("the len is N
+but the index is N") — the instant that batch was reloaded (any real
+spill run over `MERGE_BUFFER_ROWS` = 8192 rows, the ordinary case, not
+an edge case) before pending references were flushed; fixed by
+flushing `output_rows` before every buffer transition, not only the
+pre-existing periodic size-based flush. Four new regression tests pin
+all of this: `external_sort_spill_path_handles_dictionary_encoded_columns`,
+`k_way_merge_survives_a_run_needing_more_than_one_buffer_load`,
+`create_joined_batch_handles_dictionary_encoded_columns` (all in
+`spillable.rs`'s own test module).
+
+**A fourth, deeper bug found — NOT fixed, documented instead (a
+deliberate "stop and document" judgment call, not an oversight).** Once
+the crash above was fixed, TPC-H Q12 at SF=10 against a native table
+completes but returns a WRONG ANSWER (`high_line_count` exactly
+2x-inflated: engine 707644 vs an independent DuckDB oracle's 353822)
+and takes ~320 SECONDS (vs ~150-350ms for every other query). This
+SUPERSEDES this doc's own prior claim (native-tables-foundation task
+008) that a spilling native-table join is "always a safe, clean refusal
+or a slow-but-correct completion — never wrong data": that was only
+true because the schema-mismatch crash above always fired FIRST, before
+the join's own spill/partition/probe/merge sequence ever ran far enough
+to expose this SECOND, independent, more severe bug. Read
+`SpillableHashJoinExec::execute_spill_path`/`build_with_partitioning`/
+`probe_with_spilling`/`process_spilled_partition` end to end looking for
+a duplicate-counting mechanism (the clean ~2x ratio is diagnostic); the
+build/probe partition-vs-spill bookkeeping reads as mutually-exclusive-
+by-construction on inspection, and nothing in it is Dictionary-specific
+— meaning this is a genuinely SEPARATE, deeper bug in the partition/
+spill algorithm itself (or possibly its caller), not another instance of
+the same "declared vs actual type" class, and root-causing it safely
+would need materially more investigation than the three fixes above
+(each was a single missing schema-reconciliation call). Deliberately NOT
+attempted under time pressure — an unconfident fix risks leaving wrong
+answers that no longer even crash to reveal themselves, which is worse
+than the status quo. Also deliberately did NOT revert the three schema
+fixes to "restore" the crash as an accidental safety net: the
+duplication mechanism is not Dictionary-specific, so it is reachable by
+ANY sufficiently large spilling INNER join, native table or not —
+reverting would only narrow, not close, the exposure, while also
+regressing the (independently verified, cell-exact-correct) 15M-row
+`ORDER BY` case this task's own validation depends on. Recommendation
+for whoever picks this up: the native-tables-foundation epic's own
+"streaming rewrite of the join spill path" future-work item should be
+treated as a P0 correctness bug now, not merely a performance one.
+
+**Full suite, all four feature combinations**, final state (all fixes +
+all new tests included), through `scripts/claude-safe-build.sh`:
+
+| combo | passed | failed | ignored |
+|---|---|---|---|
+| default | 1188 | 0 | 1 |
+| lance | 1253 | 0 | 2 |
+| gpu | 1188 | 0 | 1 |
+| pulsar | 1191 | 0 | 1 |
+
+**Cell-exact validation at real scale** (`examples/
+native_mutation_cell_exact_check.rs` + `scripts/
+native_mutation_cell_exact_check.py`): CREATE (12,000,000 rows) →
+INSERT +3,000,000 (15,000,000) → DELETE −492,202 (14,507,798) → UPDATE
+2,071,620 rows recomputed in place (14,507,798, unchanged by design,
+matching UPDATE's own semantics) against real SF=10 `orders` (not the
+~1500-row fixtures individual tasks used) → final `SELECT * ... ORDER
+BY o_orderkey` (the exact shape that hit the schema-mismatch bug
+above). `scripts/native_mutation_cell_exact_check.py` independently
+recomputed the IDENTICAL 4-statement sequence as REAL DuckDB DML
+against the SAME source parquet (row counts agreed exactly at every
+step) and compared every cell via a DuckDB `EXCEPT` set difference in
+both directions: **PASS — 0 rows different either direction,
+14,507,798 rows × 9 columns, cell-exact.**
+
+**Never-mutated-table performance parity** (`data/tpch-10gb-native`,
+pristine, `scripts/native_bench_compare.py`, Q12 excluded — the fourth
+bug above, unrelated to mutation or this check): **21/21 cell-exact,
+5.667s total, 1.27x vs DuckDB-parquet** — matches phase 1's own recorded
+5.324s/1.23x within this program's established run-to-run noise band.
+Confirms the new deletion-vector-consultation code path costs nothing
+when a segment has nothing to filter (the empty-`deleted_rows` fast
+path holds).
+
+**Mutated-table (non-empty deletion vector) regression, reported
+honestly, not hidden.** Same 21 queries against a hardlink-mutated copy
+of the SAME warehouse (`examples/native_post_mutation_checks.rs`:
+`lineitem`'s deletion vector non-empty via `l_discount > 0.09`, ~10% /
+5,997,226 rows, spread near-uniformly across all 58 segments — DELETE
+never touches the other 7 tables' hardlinked copies): **15.017s total,
+3.35x vs DuckDB-parquet — a real 2.65x slowdown vs the SAME
+never-mutated warehouse.** Root-caused, not just measured: Q06's own
+filter (`l_discount BETWEEN 0.05 AND 0.07`) is DISJOINT from the delete
+predicate (`> 0.09`), so no deleted row could ever have mattered to
+Q06's ANSWER — yet its wall time still ~4.6x'd (111ms → 506ms),
+isolating the cost to the deletion-vector CONSULTATION itself (paid
+per-batch, on every scanned row, at the single choke point inside
+`scan()`/`scan_with_filter()`), not to any change in query selectivity.
+Because deletions are spread near-uniformly (not concentrated), the
+per-batch "no deleted position in this batch's range" fast-path skip
+almost never fires. Queries that barely touch `lineitem` (Q02, Q11,
+Q16, Q22) show flat-to-negligible regression, confirming the cost
+scales with rows actually scanned from the mutated table, not a fixed
+per-query tax — a REAL, BOUNDED, well-explained cost, exactly the
+honest-reporting bar this task set for itself.
+
+**Dense-direct-address and GPU offload, post-mutation** (`examples/
+native_post_mutation_checks.rs`, `examples/native_gpu_check.rs`): both
+still fire correctly. Dense-direct: native post-delete group count
+(14,594,694) exactly matches an independent parquet+equivalent-filter
+cross-check computed via the engine's generic/parquet code path (a
+materially different path from the native dense-direct one);
+`AGG_TIMING=1` confirms the `(native)` fast-path tag fires on both
+native legs (47.5ms / 303.5ms scan+accumulate). GPU offload: still
+engages (correct row counts, VRAM growth confirmed on the pristine
+leg — cold iter1 ~2.3s, warm iters ~5-7ms, exactly matching task 008's
+own documented numbers) but its warm speedup is FULLY MASKED by the
+same deletion-vector overhead once the table is mutated — a clean 2×2
+CPU/GPU × pristine/mutated matrix (Q6, warm, ms):
+
+| table | CPU | GPU | speedup |
+|---|---|---|---|
+| pristine (never-mutated) | ~106 | ~6 | **~18x**, matches task 008's own documented finding exactly |
+| mutated (10% deletion vector) | ~445 | ~415 | **~1.07x — effectively none** |
+
+A never-mutated table pays none of this (its dense-direct and GPU
+numbers match already-published pristine numbers exactly) — the cost is
+real but confined to tables that have actually been mutated, exactly as
+this epic's own design intends.
+
+**M1/M2 distributed gates**: both PASS (`scripts/cluster_local.sh
+verify` / `verify-m2`, re-confirmed with the FINAL default binary, all
+four fixes and all new tests included) — nothing this epic touched
+broke existing distributed behavior for parquet/Iceberg/Lance tables.
+
+**G1-G5 (this epic's own success criteria) — verdicts with evidence**:
+- **G1** (INSERT/DELETE/UPDATE work end-to-end through SQL, cell-exact
+  vs an independently computed reference) — **MET**. Real SF=10 scale
+  (14,507,798 rows), independently verified against DuckDB DML over the
+  same source parquet, 0 mismatches.
+- **G2** (no performance cliff for the still-dominant read-only query
+  shapes, for a table that has never been mutated) — **MET**. 1.27x
+  matches phase 1's own 1.23x within noise; dense-direct-address and GPU
+  offload both confirmed still firing at their pre-epic numbers.
+- **G3** (memory safety holds under adversarial testing) — **MET**
+  (task 005: two real findings quantified with concrete numbers —
+  deletion-vector JSON density at very large segment counts, O(N²)
+  cumulative manifest-rewrite cost across a long mutation sequence —
+  both named residual risks for a future compaction epic, not fixed
+  here by design; one real SQL-path OOM found AND fixed, 70-71% RSS
+  reduction).
+- **G4** (full suite green in all feature combinations; M1/M2 gates
+  unaffected) — **MET**. All 4 combinations green (table above, 0
+  failures anywhere); M1 + M2 PASS via real 3-process clusters.
+- **G5** (single-writer assumption enforced, not just documented; a
+  concurrent write fails cleanly and namedly) — **MET** (task 001/005:
+  `std::fs::File::try_lock()`, verified live with a real cross-process
+  test AND a real `kill -9` mid-mutation, 6/6 runs, zero flakes).
+
+Reproduce: `scripts/claude-safe-build.sh cargo build --release --example
+native_mutation_cell_exact_check --example native_post_mutation_checks`
+then run `native_mutation_cell_exact_check` + `.venv/bin/python
+scripts/native_mutation_cell_exact_check.py` (cell-exact validation);
+`native_post_mutation_checks` (builds the mutated warehouse the
+benchmark commands below need, and runs the dense-direct cross-check);
+`.venv/bin/python scripts/native_bench_compare.py --native-dir
+data/tpch-10gb-native --source-dir data/tpch-10gb --iceberg-dir
+data/tpch-10gb-iceberg --sf 10 --memory-limit 40G --iterations 2
+--queries 1,2,3,4,5,6,7,8,9,10,11,13,14,15,16,17,18,19,20,21,22`
+(never-mutated leg; Q12 excluded per the fourth-bug note above) and the
+same command pointed at the mutated warehouse directory with
+`--no-cell-exact --no-iceberg` (mutated leg — cell-exact is skipped
+there because the DuckDB oracle reads the ORIGINAL un-mutated parquet,
+so it would legitimately mismatch; correctness of mutation itself is
+what the cell-exact validation above already established).
+
 ### Current limitations (explicit, matching this epic's own G5 boundary and the PRD's phase plan)
 
 - **No filter/row-group pruning at scan level.** `NativeTable::
   scan_with_filter` has no predicate pushdown at all; every query reads
   every active segment in full and relies on a post-scan `FilterExec` for
-  correctness (always cell-exact — never a wrong answer). This has a
-  real, measured cost at scale, found by this epic's own QA close-out
-  (task 008): parquet's row-group statistics let it skip most of the
-  work for date-range-filtered queries before a join ever sees those
-  rows; native tables cannot, so their post-filter join inputs are
-  larger. For 3 of 22 TPC-H queries (Q4, Q12, Q13 — at scale-dependent
-  thresholds: only Q12 at SF=10, all three at SF=100) this pushes a
-  join's build side across the `SpillableHashJoinExec` spill threshold,
-  which (a pre-existing characteristic of that operator, not introduced
-  by this epic — see its own doc comment) fully materializes the build
-  side before deciding to spill, then spills as many small Parquet
-  files, and refuses outright rather than guessing when a non-INNER
-  join's build side is the one that's oversized. Root-caused with a live
-  `gdb` thread dump (caught a thread inside `parquet::column::writer`
+  correctness. This has a real, measured cost at scale, found by phase
+  1's own QA close-out (task 008): parquet's row-group statistics let it
+  skip most of the work for date-range-filtered queries before a join
+  ever sees those rows; native tables cannot, so their post-filter join
+  inputs are larger. For 3 of 22 TPC-H queries (Q4, Q12, Q13 — at
+  scale-dependent thresholds: only Q12 at SF=10, all three at SF=100)
+  this pushes a join's build side across the `SpillableHashJoinExec`
+  spill threshold, which (a pre-existing characteristic of that
+  operator, not introduced by either epic — see its own doc comment)
+  fully materializes the build side before deciding to spill, then
+  spills as many small Parquet files. Root-caused with a live `gdb`
+  thread dump (caught a thread inside `parquet::column::writer`
   mid-query — direct evidence, not inference) and filesystem evidence
   (`/tmp/query_engine_spill/join_*/build_*.parquet`, hundreds of files,
-  actively growing). Always a safe, clean refusal or a slow-but-correct
-  completion — never wrong data. Closing this for real means either
-  scan-level pruning for native tables or a streaming rewrite of the
-  join spill path — both real, separately-scoped future work, not a
-  same-task fix.
-- **No distributed participation yet.** A native table registers and
-  reads correctly on a single `serve` node (including via `--tables`
-  auto-detection), and `distributed_splits`/`shard_by_splits` are real,
-  non-`None` implementations (one `Split` per segment) — but multi-node
-  SCATTER/GATHER planning for native tables is explicitly out of scope
-  for this epic (its own G5 criterion only requires NOT breaking existing
-  parquet/Iceberg/Lance distributed behavior, confirmed by the M1/M2
-  gates) and has not been validated on a real cluster.
+  actively growing).
+  **CORRECTION (native-tables-mutation epic, task 006, 2026-08-24):
+  phase 1's own claim directly above this line — "always a safe, clean
+  refusal or a slow-but-correct completion — never wrong data" — is NOT
+  always true, and is superseded by this finding.** Task 006 found and
+  fixed a real, previously-masked crash in this exact spill path
+  (Dictionary-vs-declared-schema mismatch — see "Mutation: QA close-out"
+  above for the full story); once that crash was fixed, Q12 at SF=10
+  was revealed to complete but return a WRONG ANSWER (`high_line_count`
+  exactly 2x-inflated) after ~320 SECONDS — a SEPARATE, deeper,
+  NOT-YET-ROOT-CAUSED bug in `SpillableHashJoinExec`'s partition/spill
+  algorithm itself, found but deliberately NOT fixed (judged too large
+  for a same-task fix; see task 006's Outcome for the full investigation
+  and reasoning). Closing this for real now has three real levers, not
+  two: scan-level pruning for native tables, a streaming rewrite of the
+  join spill path (both already-named, separately-scoped future work),
+  or — now the more urgent one — root-causing and fixing the
+  duplicate-counting bug in the EXISTING partition/spill algorithm,
+  which affects ANY sufficiently large spilling INNER join
+  (Parquet/Iceberg/Lance too, not native-table-specific) and should be
+  treated as a P0 correctness bug by whichever of the three a future
+  epic picks up first.
+- **No compaction** (native-tables-mutation epic, confirmed OUT OF SCOPE
+  by design — task 001's Decision 3, not merely deferred incidentally). A
+  deletion vector is correctness-preserving indefinitely — reads always
+  apply the filter; they just do increasing filtering work as deletes
+  accumulate. Named, honest cost: segment count grows by at least one
+  per `Append`/`INSERT` statement forever (no merging of small
+  segments), and disk space from partially-deleted rows is never
+  physically reclaimed. One narrow, IN-SCOPE exception, not full
+  compaction: a segment tombstoned to 100%
+  (`deleted_rows.len() == row_count`) is dropped from the manifest
+  outright (task 003) — measured effective, not just designed for
+  (5/5 fully-tombstoned segments actually dropped in task 005's
+  adversarial run, ~9.1KB/segment saved vs. what would have persisted
+  without the exception). Task 005's adversarial testing found and
+  quantified two residual risks a future compaction epic should size
+  against — real, but neither urgent at this program's current scale
+  nor fixed in this epic:
+  - **Deletion-vector encoding density at very large segment counts.**
+    A broad, shallow DELETE (many segments, each lightly touched) costs
+    ~13.1-13.7 bytes per `deleted_rows` JSON entry (measured, stable
+    across a 313-segment and a 2573-segment run). Extrapolated — not
+    literally re-measured at this scale — to task 001's own original
+    "1000 segments x 1,000,000 rows x 1% deleted" worry: ~131MB, larger
+    than that design-time "tens of MB" guess. Every scale this program's
+    own fixtures/benchmarks actually reach today stays sub-2MB.
+  - **O(N²) cumulative manifest-rewrite cost across a long mutation
+    sequence.** Every single Append/Delete/Update unconditionally
+    re-reads AND re-writes the WHOLE `_manifest.json`, so per-mutation
+    latency grows roughly linearly with segment count — measured
+    ~0.44ms/op near-empty to ~8.8ms/op at 2500+ segments across a real
+    3000-operation mixed Append/Delete/Update sequence. Fine at the
+    scales exercised so far; a real ceiling for a table that
+    accumulates thousands of small mutations over its lifetime without
+    ever compacting.
+- **Single-writer only** (native-tables-mutation epic task 001's
+  Decision 5). No lock manager, no WAL, no MVCC — a mutation
+  (INSERT/DELETE/UPDATE) holds an exclusive `std::fs::File::try_lock()`
+  on a sibling `<table>.lock` file for its whole
+  read-identify-write-publish span. A concurrent writer gets an
+  immediate, clean, named `QueryError::Storage` — never blocks, never
+  corrupts (verified live: two real OS processes racing an Append,
+  exactly one succeeds, 3/3 runs). Process-crash-safe: the lock is a
+  kernel-managed `flock`, released automatically the instant a holder
+  dies for ANY reason including `SIGKILL` — verified with a real
+  external `kill -9` sent mid-mutation, 6/6 runs, zero flakes, manifest
+  byte-for-byte unchanged and the table immediately writable again
+  afterward. Explicit scope boundary, matching — not narrowing — phase
+  1's own: this is NOT `fsync`/power-loss durability beyond the OS's own
+  page-cache behavior (neither this epic's atomic single-file manifest
+  rename nor phase 1's own directory-level `publish_table_dir` ever call
+  `fsync`/`sync_all`). Readers never lock (writer-vs-writer only).
+  **Two distinct atomic-publish mechanisms, not one** — worth stating
+  plainly so a future reader doesn't assume a single mechanism covers
+  every write mode: `Create`/`Overwrite` still use phase 1's
+  whole-DIRECTORY `rename()` (`native_manifest::publish_table_dir`,
+  unchanged); `Append`/`DELETE`/`UPDATE` use this epic's single-FILE
+  `rename()` of a freshly-written manifest onto the live
+  `_manifest.json` (`native_write::publish_manifest_update` /
+  `write_manifest_atomic`) — chosen because a directory-level replace
+  would silently delete every pre-existing segment an incremental write
+  doesn't re-copy.
+- **No distributed participation yet — for reads OR mutation.** A
+  native table registers and reads correctly on a single `serve` node
+  (including via `--tables` auto-detection), and `distributed_splits`/
+  `shard_by_splits` are real, non-`None` implementations (one `Split`
+  per segment) — but multi-node SCATTER/GATHER planning for native
+  tables is explicitly out of scope for the foundation epic's own G5
+  criterion (only requires NOT breaking existing parquet/Iceberg/Lance
+  distributed behavior, confirmed by the M1/M2 gates) and has not been
+  validated on a real cluster. `INSERT`/`DELETE`/`UPDATE` (this epic)
+  inherit the identical boundary and go further: every mutation
+  entrypoint (`ExecutionContext::insert_into_native_table` etc.) is a
+  single-process, single-`ExecutionContext`-session operation with no
+  distributed-write story of any kind — not reachable from `serve`'s
+  HTTP/Flight surface at all, matching CREATE TABLE's own pre-existing
+  boundary from phase 1.
 - **GPU/RAM/disk tiering and materialized rollups are not built** —
   phases 3 and 4 of the PRD. This epic only kept the GPU-offload identity
-  hook open (above) so that work isn't blocked from zero.
+  hook open (above) so that work isn't blocked from zero; native-tables-
+  mutation task 006 confirmed offload still engages correctly (VRAM
+  growth + correct post-mutation values) against a table with a
+  non-empty deletion vector — see Benchmarks below.
 
 ### Benchmarks (2026-08-23, task 008 close-out)
 

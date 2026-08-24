@@ -1,9 +1,9 @@
 ---
 name: native-tables-mutation
-status: in-progress
+status: completed
 created: 2026-08-24T04:45:55Z
-updated: 2026-08-24T04:45:55Z
-progress: 83%
+updated: 2026-08-24T09:00:00Z
+progress: 100%
 prd: .claude/prds/native-tables.md
 github: (will be set on sync)
 ---
@@ -306,9 +306,271 @@ mechanism the way phase 1 substantially was.
 - [x] 003.md - Deletion vector mechanism + DELETE (parallel: false)
 - [x] 004.md - UPDATE (parallel: false)
 - [x] 005.md - Memory safety + concurrency/crash-safety adversarial verification (parallel: false)
-- [ ] 006.md - QA close-out — cell-exact, full suite, benchmarks, docs, epic close (parallel: false)
+- [x] 006.md - QA close-out — cell-exact, full suite, benchmarks, docs, epic close (parallel: false)
 
 Total tasks: 6
 Parallel tasks: 0
 Sequential tasks: 6
 Estimated total effort: 84-152 hours (3-5 focused working sessions)
+
+## Epic close-out (2026-08-24)
+
+All 6 tasks shipped and validated on branch `epic/native-tables-mutation`
+(commits `864a9d7`..`efe1fc4` for tasks 001-005, plus this task's own
+fix/docs/archive commits — see Commits below). Full suite green in
+**all four feature combinations** (default 1188/0/1, lance 1253/0/2,
+gpu 1188/0/1, pulsar 1191/0/1 — passed/failed/ignored, zero failures
+anywhere), `cargo fmt --all -- --check` clean, M1 + M2 distributed gates
+PASS via real 3-process clusters.
+
+### Headline: what this epic actually delivered
+
+`INSERT INTO`, `DELETE FROM ... WHERE`, and `UPDATE ... SET ... WHERE`
+against native tables — the first mutation capability this table format
+has ever had, turning phase 1's bulk-load/replace-only format
+(`native-tables-foundation`) into a genuinely incrementally-writable one.
+Deletion is merge-on-read (a per-segment sorted `deleted_rows: Vec<u32>`
+consulted at a single choke point inside `scan()`/`scan_with_filter()`);
+UPDATE is DELETE+INSERT composed into ONE atomically-published manifest
+edit, never two sequential publishes; a new single-FILE atomic-rename
+mechanism (`native_write::publish_manifest_update`) generalizes phase
+1's whole-directory rename for every incremental write mode
+(Append/DELETE/UPDATE); single-writer enforcement via
+`std::fs::File::try_lock()`, verified live under a real `kill -9`.
+Compaction is explicitly out of scope (task 001's Decision 3), with one
+narrow in-scope exception (a 100%-tombstoned segment is dropped from the
+manifest).
+
+| check | result |
+|---|---|
+| Cell-exact INSERT+DELETE+UPDATE, real SF=10 scale (14,507,798 rows, `orders`) | **PASS** — 0 cells different vs an independent DuckDB DML reference |
+| Never-mutated table vs phase 1's own recorded numbers | **1.27x vs DuckDB-parquet** (phase 1: 1.23x) — within noise |
+| Mutated table (10% deletion vector, spread broadly) | **2.65x slower** than the same never-mutated warehouse — real, bounded, root-caused (deletion-vector consultation overhead, not query selectivity) |
+| Dense-direct-address post-mutation | fires correctly, exact match vs an independent cross-check |
+| GPU offload post-mutation | still engages, still correct — but its ~18x warm speedup is FULLY MASKED by deletion-vector overhead once a table is mutated |
+| M1 / M2 distributed gates | **PASS** (mutation itself does not participate in distributed execution — matches phase 1's own scope boundary) |
+
+### Per-task attribution
+
+- **001** (design spike): decided all six open questions before any code
+  was written — deletion vector mechanism (sorted `Vec<u32>`, inline on
+  `Segment`, not roaring/copy-on-write/a sibling file), UPDATE semantics
+  (DELETE+INSERT via non-publishing building blocks composed into ONE
+  atomic publish — a load-bearing refinement the epic text itself did not
+  spell out), compaction (confirmed out of scope, with the narrow
+  100%-tombstone exception as the concrete floor), atomic-publish
+  mechanism (single-file rename, generalizing not reusing phase 1's
+  directory rename), single-writer enforcement (`File::try_lock()`,
+  verified live with a real SIGKILL test), and SQL grammar sizing
+  (confirmed a non-issue for all three statements via a fresh sqlparser
+  spike). Corrected the epic's own inaccurate claim that
+  `src/storage/iceberg.rs` was read-side precedent for deletion vectors
+  (it REFUSES delete files outright; this epic's read-side logic was new).
+- **002** (INSERT): `NativeWriteMode::Append`, SQL wiring, cell-exact at
+  real scale. **Found and fixed a real, pre-existing bug**:
+  `LogicalPlan::Values`'s physical planning was an unimplemented stub
+  that always returned an EMPTY batch — no test anywhere in the engine
+  had ever exercised literal `VALUES` SQL text before this task's own
+  `INSERT ... VALUES` integration test caught it. Fixed for the whole
+  engine, not just INSERT. Also flagged (not itself a fix): the
+  SQL-path `INSERT INTO ... SELECT` shared CTAS's own unbounded
+  concurrent-partition-merge pattern, measured at 5.3GB peak RSS for a
+  60M-row source — carried forward to task 005.
+- **003** (DELETE): the deletion-vector mechanism itself
+  (`native_delete.rs`) plus the SQL surface — genuinely new machinery,
+  not a thin wrapper (DELETE has no `LogicalPlan`/`PhysicalOperator`
+  pipeline to reuse; row-identification is a bespoke scan+evaluate loop).
+  Verified the dense-direct-address fast path needs ZERO code changes
+  (deletion filtering happens before it ever sees a batch) — re-confirmed
+  against the actual implementation, not just carried over from task
+  001's design-time analysis.
+- **004** (UPDATE): composed 002+003's non-publishing building blocks
+  into one atomic DELETE+INSERT per task 001's decision. **Found and
+  fixed a real correctness bug**: two overlapping UPDATEs (or an UPDATE
+  following a DELETE) could RESURRECT already-tombstoned rows, because
+  `identify_matching_rows` deliberately doesn't consult `deleted_rows`
+  (correct for DELETE's own idempotent-union semantics, wrong for
+  UPDATE's "read current value, write a new live row" semantics without
+  an extra filter). Fixed with `live_matched_rows`, caught by a
+  purpose-built adversarial test written FIRST, confirmed failing
+  without the fix. Also verified no-partial-state-visibility with a real
+  concurrent-reader test racing 60 UPDATEs against a genuine
+  multi-threaded read loop — every single poll (hundreds, 0 flakes) saw
+  either the fully-pre- or fully-post-update state, never a mix.
+- **005** (memory safety + crash-safety): six adversarial scenarios, each
+  given a real, evidenced verdict. Quantified (not just designed for) two
+  real residual risks for a future compaction epic — deletion-vector JSON
+  density at very large segment counts (~131MB extrapolated for task
+  001's own "1000 segments x 1M rows x 1% deleted" worry, larger than
+  its original "tens of MB" guess) and O(N²) cumulative manifest-rewrite
+  cost across a long mutation sequence (~0.44ms/op near-empty to
+  ~8.8ms/op at 2500+ segments). Verified the single-writer lock under a
+  REAL external `kill -9`, 6/6 runs, zero flakes. **Found and fixed a
+  real kernel-confirmed OOM** shared with the CTAS/INSERT SQL path
+  (task 002's own carried-forward finding): unconditionally concurrent
+  `futures::stream::select_all` over many partition streams, confirmed
+  via `journalctl -k` under a real cgroup cap; fixed with
+  `bounded_partition_merge` (concurrency-limited `flatten_unordered`),
+  **70-71% peak RSS reduction, wall time neutral-to-faster**.
+- **006** (this task, QA close-out): full suite re-verification in all 4
+  feature combinations, cell-exact SF=10 real-scale validation (INSERT+
+  DELETE+UPDATE composed, independently verified against DuckDB DML),
+  never-mutated and mutated benchmark comparisons, M1/M2 re-confirmation,
+  CLAUDE.md documentation, and this close-out. **Found and fixed THREE
+  real, pre-existing bugs** (one root cause, one fix pattern, all
+  reproduce on phase 1's own never-mutated fixtures — see "Mutation: QA
+  close-out" in CLAUDE.md for the full story): a Dictionary-vs-declared-
+  schema mismatch that crashed `ExternalSortExec`'s and
+  `SpillableHashJoinExec`'s SPILL paths outright whenever a large-enough
+  sort or join carried a Dictionary-coerced column (the ordinary case for
+  native tables' low-cardinality string columns), and a genuinely
+  separate k-way-merge staleness bug in the same file that could silently
+  misplace or panic on rows once fixed enough to run. **Found — but
+  deliberately did NOT fix — a FOURTH, deeper bug**: once the crash was
+  fixed, TPC-H Q12's spilling join at SF=10 was revealed to complete but
+  return a WRONG (2x-inflated) answer after ~320 seconds, a separate
+  duplicate-counting bug in the partition/spill algorithm this task
+  judged too large to root-cause and fix safely under time pressure —
+  documented in detail (including the reasoning for NOT reverting the
+  three schema fixes as a false safety net) rather than hidden or
+  scope-crept into.
+
+**Three real bugs found and fixed across this epic's SIX tasks — two
+genuine correctness bugs (task 002's `Values` stub, task 004's UPDATE
+resurrection) and one genuine memory-safety bug (task 005's kernel-
+confirmed OOM) — plus, in this final task, THREE MORE real bugs found
+and fixed (one root cause, three call sites: the Dictionary/schema
+spill-path crash) and one real bug found and knowingly left unfixed with
+full documentation** (the join-spill duplicate-counting bug). Every task
+in this epic that touched adversarial or real-scale validation found
+something real — a strong, repeated signal that this program's
+"implement → validate at real scale → benchmark" discipline keeps
+paying for itself, not a coincidence of any one task.
+
+### G1-G5 (this epic's own success criteria): ALL MET
+
+- **G1** (`INSERT INTO`, `DELETE FROM ... WHERE`, `UPDATE ... SET ...
+  WHERE` all work end-to-end through SQL, cell-exact vs an independently
+  computed reference) — **MET**. Validated at both the small scale each
+  task used during development AND, by this task, at real SF=10 scale
+  (14,507,798 rows, all three statements composed in one realistic
+  sequence) — independently verified against DuckDB DML over the same
+  source parquet, 0 cell mismatches.
+- **G2** (no performance cliff for the still-dominant read-only query
+  shapes — phase 1's benchmarks must not regress for a table that has
+  never been mutated) — **MET**. 1.27x vs DuckDB-parquet at SF=10,
+  matching phase 1's own recorded 1.23x within this program's
+  established noise band; dense-direct-address and GPU offload both
+  re-confirmed firing at their pre-epic numbers on a pristine table.
+- **G3** (memory safety holds under adversarial testing — large deletion
+  vectors, many sequential mutations) — **MET**. Task 005's six
+  scenarios each given a real, evidenced verdict; two residual risks
+  quantified with concrete numbers (not hidden), one real OOM found and
+  fixed with a measured 70-71% RSS reduction.
+- **G4** (full suite green in all feature combinations; M1/M2 gates
+  unaffected) — **MET**. All 4 combinations green (1188/1253/1188/1191
+  passed, 0 failed anywhere, final state including this task's own 4
+  fix commits and 4 new regression tests); M1 GATE PASS + M2 GATE PASS
+  via real 3-separate-process clusters, re-confirmed with the FINAL
+  default binary.
+- **G5** (the single-writer assumption is enforced, not just documented
+  — a concurrent-write attempt fails cleanly and namedly) — **MET**.
+  `std::fs::File::try_lock()`, verified live: a real cross-process
+  contention test (task 001) AND a real external `kill -9` mid-mutation,
+  6/6 runs, zero flakes, kernel auto-release confirmed (task 005).
+
+### Residues (named as one class, matching this program's convention)
+
+1. **The join-spill duplicate-counting bug (found, NOT fixed — the
+   single most important residue of this epic)** — see "Mutation: QA
+   close-out" in CLAUDE.md and this task's own `006.md` Outcome section
+   for the full investigation. Not native-table-specific: reachable by
+   ANY sufficiently large spilling INNER join, on any table type. Was
+   ALWAYS present (confirmed: reproduces on phase 1's own pristine,
+   never-mutated fixture) but was previously masked end-to-end by a
+   crash this task fixed as a side effect of unrelated real-scale
+   validation. Recommend treating this as a P0 correctness bug for
+   whichever future epic owns the join spill path, not merely folding it
+   into the pre-existing "streaming rewrite" performance framing.
+2. **Deletion-vector JSON density at very large segment counts** (task
+   005, quantified not just flagged) — ~131MB extrapolated for a
+   1000-segments x 1,000,000-rows x 1%-deleted table, larger than task
+   001's original design-time "tens of MB" guess. Not urgent at this
+   program's current real-scale fixtures (sub-2MB in every measured
+   case), but a real number for a future compaction epic to size
+   against. Task 001's own named forward-compatible escape hatch (a more
+   compact `deleted_rows` on-disk encoding) needs its own backward-
+   compatibility migration story, judged too large for a same-task fix.
+3. **O(N²) cumulative manifest-rewrite cost across a long mutation
+   sequence** (task 005) — every single Append/Delete/Update
+   unconditionally re-reads and re-writes the WHOLE `_manifest.json`;
+   measured ~0.44ms/op near-empty growing to ~8.8ms/op at 2500+
+   segments across a real 3000-operation mixed sequence. The direct,
+   expected mechanical consequence of this epic's own already-justified
+   "no compaction" design decision (task 001), not a bug — a real
+   ceiling for a table accumulating thousands of small mutations over
+   its lifetime without ever compacting.
+4. **INSERT's SQL-path memory ceiling is narrower than the read path's**
+   (task 002 found, task 005 fixed the common case) — even after task
+   005's `bounded_partition_merge` fix (5.3GB → 1.6GB), the write path
+   still has no formal pre-flight admission check consulting
+   `--memory-limit` the way `NativeTable::scan()`'s `check_scan_budget`
+   does; an extreme sub-1GB configuration can still OOM. Named, not
+   fixed — a reliable memory-need estimate for a write path is harder to
+   derive correctly than the read path's clean "total on-disk bytes"
+   proxy, and a wrong heuristic risks a new class of bug (false refusals
+   of legitimately-small operations).
+5. **Carried forward unchanged from phase 1**: no scan-level filter/
+   row-group pruning for native tables (`NativeTable::scan_with_filter`
+   has none at all); `NativeTable::scan()` is not incrementally streaming
+   (task 006 of phase 1's admission-control cap is a ceiling, not a true
+   streaming rewrite) — the same architectural gap `LanceTable::scan()`
+   already has. Neither is mutation-specific; both remain open,
+   unclaimed follow-up work this epic did not attempt to close.
+
+### Deferred to phase 3/4 (per the `native-tables` PRD — explicitly NOT
+attempted this epic, so the next epic starts from an accurate picture)
+
+- **Phase 3 — GPU/RAM/disk tiering.** Unbuilt, as planned. This epic's
+  own contribution here is confirming (not building) that GPU offload's
+  identity/cache-invalidation mechanism (phase 1 task 007) correctly
+  handles mutation: `identity()` = `table_id` + `version` bytes, and
+  every mutation bumps `version`, so a post-mutation query can never
+  silently serve stale pre-mutation GPU-cached columns — verified live,
+  not just argued from the code.
+- **Phase 4 — Materialized rollups.** Entirely unbuilt, as planned. No
+  query-rewrite/substitution mechanism of any kind exists anywhere in
+  this codebase (unchanged from phase 1's own finding).
+- **Compaction** (within mutation itself, not a PRD phase but explicitly
+  epic-out-of-scope per task 001's Decision 3) — a deletion vector is
+  correctness-preserving indefinitely; segment count grows forever and
+  disk space from partial deletes is never physically reclaimed (except
+  the narrow 100%-tombstone exception). Every building block a future
+  compaction task needs already exists or was built for other reasons
+  in this epic (deletion-aware `scan()`, the segment writer, the atomic
+  single-file publish + single-writer lock) — compositional reuse, not a
+  blocked-on-something-hard future task.
+- **Distributed participation for mutation.** Confirmed (M1/M2 gates)
+  that nothing this epic touched broke EXISTING distributed behavior for
+  other table types — but `INSERT`/`DELETE`/`UPDATE` themselves are
+  single-process, single-`ExecutionContext`-session operations only, not
+  reachable from `serve`'s HTTP/Flight surface at all, matching phase
+  1's own identical boundary for `CREATE TABLE ... AS SELECT`.
+
+### Commits
+
+`864a9d7` (001) → `bfc855f` (001 done) → `584c1a1` (002) → `38f032a`
+(002 done) → `c846da3` (002 done, 003 starting) → `67a63a1` (003) →
+`95a9f5c` (003 done, 004 starting) → `40bc074` (004) → `847d438`
+(004 done) → `be00057` (004 done, 005 starting) → `f15b02d` (005) →
+`efe1fc4` (005 done, 006/final QA starting) → this task's fix/docs/
+archive commits.
+
+### Archival
+
+Epic moved to `.claude/epics/archived/native-tables-mutation/` as this
+task's final step, mirroring `native-tables-foundation`/
+`duckdb-parity-2`/`dependency-modernization`'s archival pattern
+(`git mv`, this session). Not merged to `main` — that decision and
+action is left to the user/orchestrating session per this task's own
+instructions.
