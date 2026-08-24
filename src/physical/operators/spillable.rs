@@ -36,6 +36,21 @@ static SPILL_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Number of hash partitions for spilling
 const NUM_PARTITIONS: usize = 64;
 
+/// Monotonic call-sequence id for `QE_SPILL_DEBUG` join/aggregate spill-path
+/// tracing (task 001, spill-join-correctness epic). Diagnostic only — lets
+/// log lines from repeated or overlapping invocations of
+/// `execute_spill_path` / `execute_fused_streaming` (e.g. a fused-streaming
+/// aggregate that aborts and falls back, re-executing its input) be told
+/// apart in the log. Never read by any non-diagnostic code path.
+static SJ_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Next id for `QE_SPILL_DEBUG` tracing. `Ordering::Relaxed` is enough: this
+/// only needs distinct values for correlating log lines, never ordering
+/// guarantees against other memory operations.
+fn next_sj_trace_id() -> u64 {
+    SJ_TRACE_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Drain every input partition concurrently and return the collected batches
 /// together with their estimated in-memory size.
 ///
@@ -443,6 +458,29 @@ impl SpillableHashJoinExec {
             QueryError::Execution(format!("Failed to create spill directory: {}", e))
         })?;
 
+        // QE_SPILL_DEBUG tracing (task 001, spill-join-correctness epic):
+        // `execute_spill_path` recomputes its ENTIRE result from scratch on
+        // every call and has no cache of its own output (unlike
+        // `build_decision`, which IS memoized). If some caller ever invokes
+        // it more than once for what should be a single logical query
+        // execution (e.g. `SpillableHashAggregateExec`'s fused-streaming
+        // path aborting and falling back to
+        // `collect_input_partitions_concurrently`, which re-executes its
+        // input), this prints TWO START/DONE pairs for the SAME join
+        // instead of one — direct evidence, not inference. Zero cost when
+        // unset beyond one env lookup per call.
+        let sj_trace = std::env::var("QE_SPILL_DEBUG").is_ok();
+        let sj_t0 = std::time::Instant::now();
+        let build_rows_in: usize = build_batches.iter().map(|b| b.num_rows()).sum();
+        if sj_trace {
+            eprintln!(
+                "[sj-trace] execute_spill_path START spill_id={} build_batches={} build_rows={}",
+                spill_id,
+                build_batches.len(),
+                build_rows_in
+            );
+        }
+
         let (on_left, on_right): (Vec<_>, Vec<_>) = self.on.iter().cloned().unzip();
         let build_keys = if swapped { &on_right } else { &on_left };
         let probe_keys = if swapped { &on_left } else { &on_right };
@@ -468,6 +506,26 @@ impl SpillableHashJoinExec {
             }
         }
 
+        if sj_trace {
+            let in_mem_parts = in_memory_partitions.iter().filter(|p| p.is_some()).count();
+            let spilled_parts = spilled_partitions.iter().filter(|p| p.is_some()).count();
+            let in_mem_build_rows: usize = in_memory_partitions
+                .iter()
+                .flatten()
+                .flat_map(|p| p.batches.iter())
+                .map(|b| b.num_rows())
+                .sum();
+            let spilled_build_rows: usize = spilled_partitions
+                .iter()
+                .flatten()
+                .map(|sp| sp.build_rows)
+                .sum();
+            eprintln!(
+                "[sj-trace] execute_spill_path spill_id={} build partitioned: in_memory_partitions={} (rows={}) spilled_partitions={} (rows={})",
+                spill_id, in_mem_parts, in_mem_build_rows, spilled_parts, spilled_build_rows
+            );
+        }
+
         // Collect ALL probe-side partitions into a single stream
         let probe_partitions = probe_side.output_partitions().max(1);
         let mut probe_batches = Vec::new();
@@ -475,6 +533,13 @@ impl SpillableHashJoinExec {
             let probe_stream = probe_side.execute(p).await?;
             let batches: Vec<RecordBatch> = probe_stream.try_collect().await?;
             probe_batches.extend(batches);
+        }
+        let probe_rows_in: usize = probe_batches.iter().map(|b| b.num_rows()).sum();
+        if sj_trace {
+            eprintln!(
+                "[sj-trace] execute_spill_path spill_id={} probe collected: probe_partitions={} probe_rows={}",
+                spill_id, probe_partitions, probe_rows_in
+            );
         }
         let probe_stream: RecordBatchStream =
             Box::pin(stream::iter(probe_batches.into_iter().map(Ok)));
@@ -489,6 +554,7 @@ impl SpillableHashJoinExec {
                 swapped,
             )
             .await?;
+        let in_memory_matched_rows: usize = results.iter().map(|b| b.num_rows()).sum();
 
         // Attach each partition's probe spill file before processing: without
         // this, spilled build partitions are probed against an EMPTY probe side
@@ -502,17 +568,27 @@ impl SpillableHashJoinExec {
 
         // Process spilled partitions
         let mut all_results = results;
+        let mut spilled_matched_rows: usize = 0;
         for (idx, spilled) in spilled_partitions.iter().enumerate() {
             if let Some(sp) = spilled {
                 let spilled_results = self
                     .process_spilled_partition(sp, build_keys, probe_keys, swapped, idx)
                     .await?;
+                spilled_matched_rows += spilled_results.iter().map(|b| b.num_rows()).sum::<usize>();
                 all_results.extend(spilled_results);
             }
         }
 
         // Clean up spill directory
         let _ = std::fs::remove_dir_all(&spill_dir);
+
+        if sj_trace {
+            let total_matched: usize = all_results.iter().map(|b| b.num_rows()).sum();
+            eprintln!(
+                "[sj-trace] execute_spill_path DONE spill_id={} in_memory_matched={} spilled_matched={} total_matched={} elapsed={:?}",
+                spill_id, in_memory_matched_rows, spilled_matched_rows, total_matched, sj_t0.elapsed()
+            );
+        }
 
         Ok(Box::pin(stream::iter(all_results.into_iter().map(Ok))))
     }
@@ -792,6 +868,15 @@ impl SpillableHashAggregateExec {
         let agg_funcs: Vec<AggregateFunction> = self.aggregates.iter().map(|a| a.func).collect();
         let agg_inputs: Vec<Expr> = self.aggregates.iter().map(|a| a.input.clone()).collect();
         let timing = std::env::var("AGG_TIMING").is_ok();
+        // QE_SPILL_DEBUG tracing (task 001, spill-join-correctness epic): see
+        // the identical-purpose comment on `execute_spill_path`. This
+        // function's own doc comment already states it may fall back to
+        // `Ok(None)` and have its input RE-EXECUTED by the caller
+        // (`SpillableHashAggregateExec::execute`'s
+        // `collect_input_partitions_concurrently` path) — tracing here
+        // shows directly whether that fallback is actually taken, and why.
+        let sj_trace = std::env::var("QE_SPILL_DEBUG").is_ok();
+        let sj_call_id = next_sj_trace_id();
         let t_start = std::time::Instant::now();
         let busy_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
@@ -826,6 +911,13 @@ impl SpillableHashAggregateExec {
             rxs.push(r);
         }
         let abort = Arc::new(AtomicBool::new(false));
+        // QE_SPILL_DEBUG tracing (task 001, spill-join-correctness epic):
+        // `abort` alone doesn't say WHY — capture the first worker-side
+        // error's message so a caught abort is diagnosable, not just
+        // detected. `Mutex<Option<String>>` rather than a second atomic
+        // flag/enum: the interesting content is the error text itself.
+        let abort_reason: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
 
         // Aggregation workers: dedicated OS threads pulling from the channel.
         let mut workers = Vec::with_capacity(n_workers);
@@ -836,6 +928,7 @@ impl SpillableHashAggregateExec {
                 rxs[0].clone()
             };
             let abort = Arc::clone(&abort);
+            let abort_reason = Arc::clone(&abort_reason);
             let agg_funcs = agg_funcs.clone();
             let input_types = input_types.clone();
             let agg_inputs = agg_inputs.clone();
@@ -849,7 +942,16 @@ impl SpillableHashAggregateExec {
                         continue; // keep draining so senders never block forever
                     }
                     let t = std::time::Instant::now();
-                    if state.process_batch(&batch, &group_by, &agg_inputs).is_err() {
+                    if let Err(e) = state.process_batch(&batch, &group_by, &agg_inputs) {
+                        if sj_trace {
+                            let mut guard = abort_reason.lock().unwrap();
+                            if guard.is_none() {
+                                *guard = Some(format!(
+                                    "worker {} process_batch error after {} batches: {}",
+                                    w, batches_seen, e
+                                ));
+                            }
+                        }
                         abort.store(true, AtomicOrdering::Relaxed);
                         continue;
                     }
@@ -879,6 +981,12 @@ impl SpillableHashAggregateExec {
         // the scatter runs on the drain task, so it parallelizes across input
         // partitions.
         let input_partitions = self.input.output_partitions().max(1);
+        if sj_trace {
+            eprintln!(
+                "[sj-trace] execute_fused_streaming START call_id={} input_partitions={} disjoint={}",
+                sj_call_id, input_partitions, disjoint
+            );
+        }
         let mut drains = Vec::with_capacity(input_partitions);
         for p in 0..input_partitions {
             let input = self.input.clone();
@@ -971,23 +1079,73 @@ impl SpillableHashAggregateExec {
         drop(txs);
 
         let mut drain_failed = false;
-        for d in drains {
+        let mut first_drain_err: Option<String> = None;
+        for (p, d) in drains.into_iter().enumerate() {
             match d.await {
                 Ok(Ok(())) => {}
-                _ => drain_failed = true,
+                Ok(Err(e)) => {
+                    drain_failed = true;
+                    if sj_trace && first_drain_err.is_none() {
+                        first_drain_err = Some(format!("drain task p={} returned Err: {}", p, e));
+                    }
+                }
+                Err(join_err) => {
+                    drain_failed = true;
+                    if sj_trace && first_drain_err.is_none() {
+                        first_drain_err = Some(format!(
+                            "drain task p={} join error (panic?): {}",
+                            p, join_err
+                        ));
+                    }
+                }
             }
         }
         let t_drained = t_start.elapsed();
 
         let mut states = Vec::with_capacity(workers.len());
-        for w in workers {
-            match w.join() {
+        let mut first_worker_join_err: Option<String> = None;
+        for (w, worker) in workers.into_iter().enumerate() {
+            match worker.join() {
                 Ok(state) => states.push(state),
-                Err(_) => drain_failed = true,
+                Err(e) => {
+                    drain_failed = true;
+                    if sj_trace && first_worker_join_err.is_none() {
+                        let msg = e
+                            .downcast_ref::<&str>()
+                            .map(|s| s.to_string())
+                            .or_else(|| e.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                        first_worker_join_err = Some(format!("worker w={} panicked: {}", w, msg));
+                    }
+                }
             }
         }
 
-        if drain_failed || abort.load(AtomicOrdering::Relaxed) {
+        let aborted = abort.load(AtomicOrdering::Relaxed);
+        if drain_failed || aborted {
+            if sj_trace {
+                let group_limit_exceeded = states.iter().any(|s| s.group_count() > group_limit);
+                let total_groups_so_far: usize = states.iter().map(|s| s.group_count()).sum();
+                let process_batch_reason = abort_reason.lock().unwrap().clone();
+                eprintln!(
+                    "[sj-trace] execute_fused_streaming ABORTED call_id={} drain_failed={} abort_flag={} \
+                     group_limit_exceeded={} group_limit={} states_collected={} total_groups_so_far={} \
+                     elapsed={:?} first_drain_err={:?} first_worker_join_err={:?} process_batch_reason={:?} \
+                     -> falling back to Ok(None); CALLER WILL RE-EXECUTE THE INPUT \
+                     (collect_input_partitions_concurrently) FROM SCRATCH",
+                    sj_call_id,
+                    drain_failed,
+                    aborted,
+                    group_limit_exceeded,
+                    group_limit,
+                    states.len(),
+                    total_groups_so_far,
+                    t_start.elapsed(),
+                    first_drain_err,
+                    first_worker_join_err,
+                    process_batch_reason
+                );
+            }
             return Ok(None);
         }
 
@@ -1026,6 +1184,16 @@ impl SpillableHashAggregateExec {
                 total_groups,
                 t_merged - t_workers,
                 busy_ns.load(AtomicOrdering::Relaxed) as f64 / 1e6,
+                t_start.elapsed()
+            );
+        }
+        if sj_trace {
+            let out_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            eprintln!(
+                "[sj-trace] execute_fused_streaming OK call_id={} total_groups={} out_rows={} elapsed={:?}",
+                sj_call_id,
+                total_groups,
+                out_rows,
                 t_start.elapsed()
             );
         }
@@ -1079,10 +1247,32 @@ impl PhysicalOperator for SpillableHashAggregateExec {
         // production. Bounded channel + group-count budget keep memory safe;
         // ineligible shapes or a tripped budget fall through to the
         // collect-then-decide path below.
-        if self.fused_streaming_eligible() {
+        let fused_eligible = self.fused_streaming_eligible();
+        if fused_eligible {
             if let Some(result) = self.execute_fused_streaming().await? {
                 return Ok(result);
             }
+        }
+
+        // QE_SPILL_DEBUG tracing (task 001, spill-join-correctness epic):
+        // reaching here after `fused_eligible` was true means
+        // `execute_fused_streaming` returned `Ok(None)` (see its own DONE/
+        // ABORTED trace lines) and its input is about to be driven a SECOND
+        // time by `collect_input_partitions_concurrently` below — for a
+        // child like `SpillableHashJoinExec`'s spill path, which has no
+        // cache of its own output, this reruns the ENTIRE join computation
+        // from scratch. Not proof of duplication by itself (this second run
+        // is the one whose results are actually returned), but a query
+        // whose log shows this line is a query where the join's expensive
+        // work happened twice, and a wrong answer that also shows two
+        // `execute_spill_path` DONE lines is direct evidence they share a
+        // cause.
+        if std::env::var("QE_SPILL_DEBUG").is_ok() {
+            eprintln!(
+                "[sj-trace] agg fallback: fused_eligible={} -> (re-)executing input via \
+                 collect_input_partitions_concurrently",
+                fused_eligible
+            );
         }
 
         // Drain all input partitions concurrently so a parallel scan/join beneath this
