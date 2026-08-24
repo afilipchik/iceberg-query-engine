@@ -433,7 +433,13 @@ manifest).
   judged too large to root-cause and fix safely under time pressure —
   documented in detail (including the reasoning for NOT reverting the
   three schema fixes as a false safety net) rather than hidden or
-  scope-crept into.
+  scope-crept into. **Independently re-verified by the orchestrating
+  session before this merge**: the extreme slowness reproduced twice
+  from scratch (~150s both times); the 2x-inflated wrong answer did NOT
+  reproduce in either attempt (fresh table, and the same table after a
+  real DELETE) — narrows but does not clear the risk; full reproduction
+  matrix and reasoning in CLAUDE.md's own note on this finding. Treated
+  as a live P0 for follow-up, not stood down.
 
 **Three real bugs found and fixed across this epic's SIX tasks — two
 genuine correctness bugs (task 002's `Values` stub, task 004's UPDATE

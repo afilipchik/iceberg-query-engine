@@ -2921,6 +2921,37 @@ for whoever picks this up: the native-tables-foundation epic's own
 "streaming rewrite of the join spill path" future-work item should be
 treated as a P0 correctness bug now, not merely a performance one.
 
+**Independent re-verification (2026-08-24, orchestrating session, before
+merge to main).** Reproduced this exact query twice from scratch against
+freshly-built native tables (`CREATE TABLE ... AS SELECT` from
+`data/tpch-10gb` orders/lineitem via `serve --tables --memory-limit 40G`,
+bypassing the small REPL default budget): once against a never-mutated
+table, once against the same table after a real `DELETE FROM lineitem_v
+WHERE l_orderkey % 1000 = 0` (60,266 rows removed, no segments dropped).
+**The extreme slowness reproduced identically both times** (150.0s and
+150.5s — same order of magnitude as the original ~320s, vs. 150-350ms for
+every other query; this part of the finding is solid). **The 2x-inflated
+wrong answer did NOT reproduce either time** — both runs returned
+`high_line_count` 353822/352224, cell-exact against a freshly-computed
+DuckDB oracle (the mutated run's `low_line_count` shifted by exactly the
+expected amount for the rows actually deleted — itself a small additional
+correctness confirmation of the DELETE mechanism under this exact join
+shape). This does **not** disprove the wrong-answer finding — the
+reported ratio was a suspiciously exact 2.0000x, which reads as a real,
+systematic duplication mechanism under SOME condition, not measurement
+noise — but it narrows where to look: a plain post-CREATE `DELETE` was
+not sufficient to trigger it in two independent attempts, so the trigger
+(if the original run's exact condition wasn't itself a fluke of that run's
+specific partition-count/memory-pressure state) more likely depends on
+the full `CREATE→INSERT→DELETE→UPDATE` segment/deletion-vector shape the
+original finding's own cell-exact validation used (not yet re-attempted),
+or on non-deterministic partition-count selection under spill pressure.
+**Verdict: treat both halves as a live, P0, open risk** — the slowness is
+confirmed-severe on its own regardless of the correctness question, and
+the wrong-answer risk is unconfirmed-but-uncleared, not stood down.
+Whoever picks up the P0 follow-up should start from exactly this
+narrowed reproduction matrix rather than re-deriving it.
+
 **Full suite, all four feature combinations**, final state (all fixes +
 all new tests included), through `scripts/claude-safe-build.sh`:
 
