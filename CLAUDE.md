@@ -2952,6 +2952,39 @@ the wrong-answer risk is unconfirmed-but-uncleared, not stood down.
 Whoever picks up the P0 follow-up should start from exactly this
 narrowed reproduction matrix rather than re-deriving it.
 
+**CORRECTION + resolution of the trigger question (`spill-join-
+correctness` epic, task 001, 2026-08-24).** The paragraph immediately
+above is WRONG about the trigger: re-reading the *raw* original
+investigation log (not just this doc's own summary of it) shows the
+original finding came from a plain benchmark run against the **pristine,
+never-mutated** warehouse — the `CREATE→INSERT→DELETE→UPDATE` sequence
+mentioned above never touched `lineitem` and never ran Q12. Mutation
+history is not part of the trigger; this doc's own prior speculation
+sent the wrong signal. The real picture, now precisely quantified: **21
+repro runs against the pristine warehouse, 1 wrong (4.8%) — a real,
+non-deterministic, intermittent bug**, not a deterministic one gated by
+data shape. All 21 runs showed the extreme slowness (140-291s). The one
+wrong run's ratio was ~1.9925-1.9927x, not an exact 2.0000x — consistent
+with a racy partial overlap rather than a clean "every row counted
+twice" mechanism. Real, adversarial root-cause work was done: the
+code's own comment names the leading suspect (`execute_fused_streaming`
+aborting and re-executing its non-idempotent join child); a controlled
+test FORCED exactly that path after a correct first computation and got
+the CORRECT final answer back (283s, matching the real wrong run's 291s
+almost exactly) — this **disproves** the leading hypothesis for
+wrongness while fully confirming it explains the slowness. Sort
+re-executing the aggregate, per-process hash-seed randomization, and
+build/probe double-collection were also ruled out with direct evidence,
+not assumption. Root cause for the wrongness specifically: **still not
+confirmed** — best remaining hypothesis is a genuine mid-computation
+failure (not a clean post-completion discard) inside the spill path.
+Separately found, not the root cause but real and actionable: a likely
+O(n²) read-rewrite-rename-per-append pattern in the spill path's
+Parquet-file handling that plausibly explains most of the deterministic
+slowness on its own. Full details, the reusable repro script, and the
+complete chronological investigation: `.claude/epics/archived/
+spill-join-correctness/001.md` and its `updates/001/stream-A.md`.
+
 **Full suite, all four feature combinations**, final state (all fixes +
 all new tests included), through `scripts/claude-safe-build.sh`:
 
