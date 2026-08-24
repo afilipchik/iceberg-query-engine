@@ -2549,18 +2549,179 @@ bespoke loop.
   correctly in a session that has already performed a DELETE (no
   regression).
 
+### Mutation: UPDATE (native-tables-mutation epic, phase 2, task 004, 2026-08-24)
+
+`UPDATE <native table> SET <col> = <expr>, ... [WHERE ...]` — per task
+001's Decision 2 (DELETE + INSERT, composed as ONE atomically-published
+operation, never two sequential self-publishing calls). Genuinely NEW
+mechanism (not just a thin wrapper): reads matched rows' CURRENT column
+values, evaluates every SET assignment against them, and publishes the
+tombstoned-old + recomputed-new segments in a SINGLE manifest rename.
+
+- **`src/storage/native_update.rs`** (new sibling module to
+  `native_write.rs`/`native_delete.rs`/`native_manifest.rs`): owns the
+  whole composition. `pub async fn update_native_table(table_dir,
+  predicate: Option<&Expr>, assignments: &[(String, Expr)]) ->
+  Result<NativeUpdateResult>` — the ONLY entrypoint, sequence: (1)
+  `native_write::lock_table_for_write` ONCE, held for the WHOLE span; (2)
+  `native_manifest::read_manifest` ONCE; (3)
+  `native_delete::identify_matching_rows(dir, &existing, predicate,
+  materialize_rows: true)` ONCE — reused completely UNCHANGED from task
+  003, called with `materialize_rows: true` (task 003's own Outcome names
+  this exact call shape as task 004's need) to get BOTH tombstone-candidate
+  positions AND matched rows' current values in one pass; (4) evaluate
+  every assignment's bound value expression against each matched row's
+  PRE-update values (`assemble_updated_batch` — evaluates ALL assignments
+  first against the untouched input batch, THEN overwrites columns, so
+  `SET x = x + 1` and multi-assignment SET lists never read a
+  partially-updated value, regardless of assignment order); (5)
+  `native_delete::apply_deletions` (task 003's function, reused
+  UNCHANGED) for the tombstoning half; (6)
+  `native_write::write_append_segments` (task 002's function, reused
+  UNCHANGED — schema/dictionary inheritance and by-position type
+  validation come for free) for the recomputed-rows half, against the
+  SAME already-read manifest; (7) fold both segment lists into ONE
+  `Vec<Segment>`; (8) `native_write::publish_manifest_update` (task 002's
+  single-file atomic-rename primitive) EXACTLY ONCE; (9) release the lock
+  (guard `Drop`). This is the concrete mechanism — not just a design
+  argument — behind "no partial-state visibility": exactly one
+  `rename(2)` publishes the whole statement, so a reader can only ever
+  observe the fully-pre-update or fully-post-update manifest.
+- **A real correctness gap found and fixed, beyond task 001/003's own
+  analysis**: `identify_matching_rows` deliberately does NOT consult
+  `Segment::deleted_rows` (harmless for DELETE — re-matching an
+  already-deleted position is a no-op union). UPDATE is different: a
+  match means "read this row's CURRENT value and write a BRAND-NEW live
+  row from it," so a match that is ALREADY tombstoned (e.g. a second
+  UPDATE, or an UPDATE after a DELETE, whose predicate still covers an
+  already-removed row) must NOT be resurrected. `live_matched_rows`
+  filters each segment's materialized matches down to only the positions
+  NOT already in that segment's OWN `deleted_rows` BEFORE any SET
+  expression ever sees them — without this filter, two overlapping
+  UPDATEs (or an UPDATE following a DELETE) touching the same rows would
+  silently DUPLICATE them. Caught by this task's own required "a second
+  UPDATE that overlaps a first" adversarial test, which fails loudly
+  (wrong row count / duplicate ids) without the fix and passes with it —
+  confirmed by writing the test first, seeing it fail against a
+  naive (unfiltered) composition, then adding the fix.
+  `NativeUpdateResult::rows_updated` is therefore the NET count of
+  actually-live matched rows recomputed, never the gross predicate-match
+  count (mirrors `NativeDeleteResult::rows_deleted`'s own NET-vs-gross
+  discipline) — a predicate matching only already-dead rows is a TRUE
+  no-op (no version bump, manifest untouched), exactly like DELETE's own
+  fully-redundant-repeat case.
+- **Dictionary round-trip**: a matched row's NEW value for a
+  dictionary-coerced column (e.g. `SET category = 'new-value'`) evaluates
+  to a plain `Utf8` array (`evaluate_expr`'s literal/arithmetic/string
+  paths never re-encode dictionaries); an UNTOUCHED dictionary column
+  passes through unchanged (still `Dictionary(Int32, Utf8)`, since
+  `assemble_updated_batch` only overwrites assigned column positions).
+  Both land correctly because `write_append_segments`'s own by-position
+  `cast_batch_to_target` (task 002, reused completely UNCHANGED) already
+  handles exactly these two shapes: an exact type match passes through
+  as-is, and a plain-`Utf8`-into-declared-`Dictionary` mismatch is the
+  ONE sanctioned coercion. The manifest's declared schema for the column
+  is NEVER re-derived from the new data — `publish_manifest_update` is
+  always called with the SAME `target_schema` read at the start of the
+  operation — so a regression back to plain `Utf8` is structurally
+  impossible, not just tested against. Verified end to end (not just by
+  this argument) via a real dictionary-encoded TPC-H `o_orderstatus`
+  column, cell-exact.
+- **SQL surface**: `update_target_name(stmt) -> Option<String>`
+  (extraction, mirrors `delete_target_name`) plus a `Statement::Update`
+  arm in `Binder::bind()` that validates shape
+  (`require_supported_update_shape`, mechanically checked against
+  sqlparser 0.62's real 11-field `ast::Update` struct —
+  `src/ast/dml.rs` — plus `TableFactor::Table`'s 10 fields, identical
+  check to `require_supported_delete_shape`'s own: JOINs, `FROM`
+  [Postgres/Snowflake/MySQL `UPDATE ... FROM`, a materially different
+  join-shaped feature this epic's "recompute against the row's OWN
+  current values only" model does not support], `AssignmentTarget::Tuple`
+  [`SET (a,b) = (1,2)`], `RETURNING`/`OUTPUT`, SQLite `OR` conflict
+  resolution, `ORDER BY`/`LIMIT` all refused by name) and then ALWAYS
+  returns `Err` pointing at the real entrypoint — UPDATE has no
+  `LogicalPlan` to give back, same reason DELETE doesn't. The real
+  binding work is `pub fn bind_update(&mut self, stmt: &ast::Update) ->
+  Result<(String, Vec<(String, Expr)>, Option<Expr>)>`: validates shape,
+  binds EVERY SET assignment's value expression (`assignment_target_
+  column_name` extracts the target column's unqualified name — the LAST
+  identifier of its `ObjectName`, so both `col` and `alias.col` resolve
+  the same way — and its existence is validated against the table's
+  schema at BIND TIME, a clean `ColumnNotFound` rather than a confusing
+  failure deep in the storage layer) plus the WHERE predicate (if any),
+  all via the SAME `bind_expr` method `bind_delete` uses, against the
+  target's schema (aliased if the UPDATE names one). A subquery ANYWHERE
+  — in the WHERE clause OR a SET value (task 001's spike confirmed even a
+  correlated scalar subquery as a SET value parses to a plain `Expr`) —
+  BINDS successfully but is refused right after, by name: this epic's
+  subquery-free evaluator (`physical::operators::evaluate_expr`, no
+  `SubqueryExecutor`) cannot execute it, mirroring `bind_delete`'s own
+  "refuse cleanly and early" discipline exactly.
+- **`ExecutionContext::update_native_table`** (`&mut self`, mirrors
+  `delete_from_native_table`'s shape): target must already be a
+  REGISTERED native table; calls `Binder::bind_update` directly (NOT
+  `bind()` + a physical plan — no `LogicalPlan`/`PhysicalOperator`
+  pipeline involved at all) then drives `native_update::
+  update_native_table`. Re-registers the table afterward so the update is
+  visible to a subsequent query in the same session. `sql()` gained the
+  same UPDATE-refusal guard it already has for CREATE TABLE/INSERT/
+  DELETE. Wired into the REPL alongside the other three's existing
+  dispatch.
+- **Verified — not just designed for — no partial-state visibility**
+  (this task's own highest-priority acceptance criterion): a real
+  concurrent-reader test (`tests/native_update_tests.rs`) races 60
+  back-to-back UPDATEs (alternating a marker column between two values,
+  matching every one of a 1500-row table's rows each time) against a
+  tight polling loop using the REAL `TableProvider::scan` read path (task
+  003's own deletion-aware `NativeTable::scan`, not the non-production
+  `native_write::read_back` dump) on a genuine multi-threaded tokio
+  runtime (`flavor = "multi_thread"`, needed because neither side's I/O
+  is truly async — both are blocking `std::fs` work wrapped in async
+  fns, so a default single-threaded runtime would let the reader's tight
+  loop starve the writer task entirely; confirmed empirically — the test
+  hung indefinitely under the default flavor before this fix). Every
+  single poll (many hundreds across 5 repeated runs, 0 flakes) observed
+  EITHER exactly 1500 rows of the pre-update marker OR exactly 1500 of
+  the post-update one — never a row-count dip, never a mix. A second,
+  independent, non-timing-dependent angle on the same property: each
+  UPDATE call is asserted to bump `snapshot.version` by EXACTLY 1 — a
+  regression to two sequential self-publishing calls (the exact
+  anti-pattern task 001's design spike forbids) would deterministically
+  show as a jump of 2 for one statement, caught with zero timing
+  dependence at all.
+- **Cell-exact validated** (`tests/native_update_tests.rs`): a
+  self-referential `SET total = total * 1.1` matches an independently-
+  computed CASE-expression reference over the ORIGINAL source, including
+  for rows the SET did NOT touch; a zero-match UPDATE is a byte-for-byte
+  no-op; an all-rows UPDATE (no WHERE) via a real dictionary-encoded
+  TPC-H column round-trips correctly (manifest type unregressed); two
+  overlapping sequential UPDATEs compose exactly as if run in order (no
+  duplicate/lost rows — the `live_matched_rows` fix above, exercised for
+  real); a cross-segment UPDATE (CTAS + INSERT-built two-segment table)
+  applies to the correct segments only; `sql()`'s refusal guard;
+  unregistered-table and non-native-table error paths; INSERT, DELETE and
+  a fresh CTAS all still work correctly in a session that has already
+  performed an UPDATE (no regression).
+
+A live example (real result, captured 2026-08-24, `repl --tpch
+data/tpch-1mb`, 1500-row `orders` table):
+```
+Created table 'orders_native' (1500 rows, 1 segment(s), now at version 1) in 5.140ms
+SELECT o_orderkey, o_totalprice FROM orders_native WHERE o_orderkey <= 3 ORDER BY o_orderkey;
+-- 1 | 360828.2497833599
+-- 2 | 362430.2868490354
+-- 3 | 350094.35363558686
+UPDATE orders_native SET o_totalprice = o_totalprice * 1.1 WHERE o_orderkey <= 500;
+-- Updated 500 row(s) in 'orders_native' (0 segment(s) dropped, 1 segment(s) added, now 1500 row(s) total, version 2) in 0.974ms
+SELECT o_orderkey, o_totalprice FROM orders_native WHERE o_orderkey <= 3 ORDER BY o_orderkey;
+-- 1 | 396911.07476169587   (== 360828.2497833599 * 1.1)
+-- 2 | 398673.315533939
+-- 3 | 385103.78899914556
+SELECT COUNT(*) FROM orders_native;  -- 1500 (unchanged)
+```
+
 ### Current limitations (explicit, matching this epic's own G5 boundary and the PRD's phase plan)
 
-- **UPDATE still not implemented.** `INSERT` (task 002) and `DELETE`
-  (task 003, above) both exist now; `Statement::Update` still falls
-  through the binder's catch-all `NotImplemented`. Task 001's Decision 2
-  designed UPDATE as DELETE + INSERT composed under ONE atomic publish
-  (reusing `native_delete`'s row-identification core — with
-  `materialize_rows: true` — for matched rows' current values, and
-  `native_write::write_append_segments` for the recomputed rows) but this
-  is not yet built (task 004). Full replace (`write-native --mode
-  overwrite` / re-running `CREATE TABLE ... AS SELECT`) remains available
-  alongside the incremental `Append`/`DELETE`.
 - **No filter/row-group pruning at scan level.** `NativeTable::
   scan_with_filter` has no predicate pushdown at all; every query reads
   every active segment in full and relies on a post-scan `FilterExec` for
