@@ -29,44 +29,91 @@ codebase to extend.
 
 ## Architecture Decisions
 
-**Deferred to task 001's design spike, not decided here** — matching
-phase 1's own discipline (its task 001 decided SQL DDL scope and manifest
-format before anything else proceeded; this epic's design stakes are
-higher, so the same discipline applies with more force):
+**Decided by task 001's design spike** (`.claude/epics/
+native-tables-mutation/001.md`'s Outcome section has the full evidence
+behind every decision below — read it before implementing 002-006;
+this section states the conclusions only) — matching phase 1's own
+discipline (its task 001 decided SQL DDL scope and manifest format
+before anything else proceeded; this epic's design stakes are higher,
+so the same discipline applied with more force):
 
-- **Deletion mechanism**: a per-table or per-segment deletion vector
-  (bitmap or sorted row-id list) consulted at read time — the
-  industry-standard "merge-on-read" pattern every modern lakehouse format
-  (Iceberg, Delta Lake, Hudi) uses, and one this codebase already has
-  read-side precedent for via `src/storage/iceberg.rs` — versus rewriting
-  affected segments in place on every delete. Leaning toward deletion
-  vectors (bounded read-time cost, no write amplification on every
-  delete), but task 001 must weigh this against this engine's specific
-  segment format and decide with evidence, not by default.
-- **UPDATE semantics**: modeled as DELETE + INSERT (the standard
-  simplification essentially every mutable lakehouse format uses,
-  reusing both mechanisms rather than inventing a third), unless task
-  001 finds a concrete reason this engine's shape makes true in-place
-  update meaningfully better.
-- **Compaction**: whether reclaiming space from accumulated deletes is
-  in scope for this epic or explicitly deferred to a later one. A
-  deletion vector alone is CORRECT indefinitely (reads stay right; they
-  just do increasing amounts of filtering work as deletes accumulate) —
-  compaction is a performance concern, not a correctness one, so
-  deferring it is a legitimate, smaller-first-slice option task 001
-  should weigh explicitly rather than assume either way.
-- **Atomic publish for incremental changes**: phase 1's full-replace
-  writes are publish-atomic by construction (a new complete snapshot
-  either exists or doesn't — read the manifest field names/staging
-  pattern in the archived `native-tables-foundation/002.md` and `003.md`
-  Outcome sections before assuming how this worked). An `Append`/delete/
-  update must preserve that property for the pieces it touches — a
-  reader must never observe a manifest that references a segment that
-  isn't fully written, or a deletion vector that's been partially
-  updated. Task 001 must state the concrete mechanism (e.g., write new
-  segment(s) + write updated manifest to a staging path, then atomic
-  rename over the published manifest — mirroring the existing pattern)
-  before task 002 implements anything.
+- **Deletion mechanism — DECIDED: a per-segment sorted deletion vector**
+  (`Vec<u32>` of local row positions, a new field inline on the existing
+  `Segment` struct in `_manifest.json`), consulted inside
+  `NativeTable::scan()`/`scan_with_filter()` as a single choke point —
+  merge-on-read, not copy-on-write. **Correction to this section's own
+  prior claim**: `src/storage/iceberg.rs` is NOT existing read-side
+  precedent for deletion-vector consultation — read in full, it
+  REFUSES any Iceberg table containing delete files outright
+  (`data_files_of`: `content != 0` is a hard `NotImplemented`, "row-level
+  deletes are not supported — compact the table first"), never consults
+  them. This epic's deletion-vector read-side logic is new, with no
+  prior in-repo implementation to reuse. Representation is a plain
+  `Vec<u32>`, not the `roaring` crate — segments are capped at
+  ~1,000,000 rows by construction, below the scale where `roaring`'s
+  compression wins over a flat structure, and a wholly-tombstoned
+  segment is dropped from the manifest outright (see Compaction below),
+  bounding the pathological case a plain list handles worst. No new
+  Cargo dependency. Full reasoning, including composition with phase
+  1's dense-direct-address fast path (verified needs ZERO changes) and
+  the memory-budget mechanism (verified needs ZERO changes, with one
+  named residual risk for task 005 to adversarially test): task 001's
+  Outcome, Decision 1.
+- **UPDATE semantics — DECIDED: DELETE + INSERT, confirmed**, no
+  evidenced reason found for true in-place update to be better on this
+  engine's immutable-segment shape. One load-bearing refinement beyond
+  the "standard simplification" framing: task 004 must NOT implement
+  this as two sequential calls to task 002/003's own public,
+  self-publishing entrypoints (each would independently publish,
+  leaving a real half-done window) — task 002 and task 003 must each
+  expose a lower-level, non-publishing building block (write segments
+  without publishing; identify+tombstone matched rows without
+  publishing) that task 004 composes into ONE manifest edit and ONE
+  atomic publish. Full reasoning: task 001's Outcome, Decision 2.
+- **Compaction — DECIDED: explicitly deferred to a future epic**, not
+  built here. A deletion vector alone is CORRECT indefinitely (reads
+  stay right; they just do increasing amounts of filtering work as
+  deletes accumulate) — confirmed, not just asserted. Honest, named
+  downside: segment count grows by at least one per Append/INSERT
+  forever (no merging of small segments), and disk space from deleted
+  rows is never physically reclaimed — except one narrow, in-scope
+  exception: a segment tombstoned to 100% (`deleted_rows.len() ==
+  row_count`) is dropped from the manifest outright by task 003, which
+  is not full compaction but does bound the deletion vector's own
+  worst case. A future compaction task needs nothing this epic doesn't
+  already build: candidate selection is its own new logic, but reading
+  survivors (the existing deletion-aware `scan()`), writing them as
+  fresh segments (the existing segment-writer), and publishing
+  (the existing atomic single-file manifest rename + single-writer
+  lock) are all direct reuse. Full reasoning: task 001's Outcome,
+  Decision 3.
+- **Atomic publish for incremental changes — DECIDED: single-FILE
+  atomic rename of a freshly-written manifest**, generalizing (not
+  reusing unchanged) phase 1's single-DIRECTORY rename
+  (`native_manifest::publish_table_dir`). Confirmed by reading the
+  actual implementation: phase 1's mechanism does
+  `remove_dir_all(final_dir)` then `rename(staging, final_dir)` — safe
+  only when the staging directory is a complete, self-sufficient copy
+  of the whole new table state (true for Create/Overwrite, NOT true for
+  Append/DELETE/UPDATE, which must preserve most of an existing
+  directory's segment files unchanged). Confirms this section's own
+  hint: "phase 1's atomicity only worked because full-replace writes
+  have no partial-update window to protect against" — true, evidenced.
+  The new mechanism: write new segment file(s) directly into the LIVE
+  table directory under fresh non-colliding ids (harmless orphans if a
+  crash happens before publish — no manifest references them yet),
+  construct one new `Vec<Segment>` in memory, call the EXISTING
+  `NativeManifest::build()` unchanged (it already derives
+  `row_count`/`table_stats` fresh from whatever segments it's given —
+  no new merge function needed), write the new manifest to a temp file
+  in the same directory, then `rename()` it over the live
+  `_manifest.json` — one atomic file-level rename, the same POSIX
+  guarantee already trusted for directory-level renames elsewhere in
+  this exact codebase. Explicit scope boundary: this provides
+  read-atomicity and process-crash-safety, not `fsync`/power-loss
+  durability beyond the OS's own page-cache behavior — matching, not
+  narrowing, phase 1's own established scope (its own publish path
+  doesn't `fsync` either). Full reasoning: task 001's Outcome, Decision 4.
 
 **Not deferred — fixed by this epic's own non-negotiables:**
 
@@ -78,42 +125,73 @@ higher, so the same discipline applies with more force):
   though a dedicated verification task still exists here precisely
   because "by design" claims in this program have been wrong before and
   were only caught by adversarial testing, never by inspection alone.
-- **Single-writer assumption stays explicit, not implicit.** This engine
-  has no lock manager, no WAL, no MVCC. This epic does not build any of
-  those. If concurrent writers to the same native table need to be
-  prevented, task 001 must name the mechanism (even a simple advisory
-  lock file) rather than leave it as an unstated assumption a future bug
-  report discovers.
+- **Single-writer assumption stays explicit, not implicit — DECIDED:
+  `std::fs::File::try_lock()`.** This engine has no lock manager, no
+  WAL, no MVCC, and this epic does not build any of those. Task 001
+  decided the concrete mechanism: `std::fs::File::{try_lock, unlock}` —
+  STABLE standard-library methods (confirmed against this toolchain's
+  shipped std source; this repo pins `rustc 1.93.0`, well past the
+  1.89.0 stabilization), wrapping `flock(2)` on a sibling lock file per
+  table directory, held for a mutation's full read-identify-write-publish
+  span. Zero new Cargo dependency. Verified with a real, live
+  cross-process test (not just documentation trust): a second process
+  gets `TryLockError::WouldBlock` while the first holds the lock, and —
+  critically for crash-safety — can immediately acquire it after the
+  first is `SIGKILL`'d, with zero manual cleanup, because the kernel
+  releases a `flock` the instant the holding process dies for any
+  reason. This is why `File::try_lock()` was chosen over a simpler
+  `create_new`-marker-file lock, which would NOT self-release after a
+  crash. Readers never lock (writer-vs-writer only). Full reasoning and
+  the live test transcript: task 001's Outcome, Decision 5.
 
 ## Technical Approach
 
 ### SQL surface
 `INSERT INTO <table> SELECT ...` (source is a `Box<Query>`, same shape
-CTAS already binds via the existing `bind_query()` — task 001 should
-confirm this holds for `Insert` the same way phase 1's own spike
-confirmed it for `CreateTable`, not assume it transfers). `DELETE FROM
-<table> WHERE <predicate>`. `UPDATE <table> SET <assignments> WHERE
-<predicate>`. All three need new `Binder::bind()` match arms (currently
-absent — everything but `Statement::Query` and `Statement::CreateTable`
-hits `NotImplemented`) and new `ExecutionContext` entrypoints following
+CTAS already binds via the existing `bind_query()` — task 001 confirmed
+this holds for `Insert` via a fresh spike, not assumed to transfer from
+CreateTable's; `INSERT ... VALUES (...)` binds through the identical
+path too, for free, since `Binder::bind_set_expr` already has a
+`SetExpr::Values` arm). `DELETE FROM <table> WHERE <predicate>`.
+`UPDATE <table> SET <assignments> WHERE <predicate>`. All three need new
+`Binder::bind()` match arms (currently absent — everything but
+`Statement::Query` and `Statement::CreateTable` hits `NotImplemented`)
+and new `ExecutionContext` entrypoints following
 `create_table_as_select`'s established shape (`&mut self`, streaming,
-not `sql()`'s materializing path).
+not `sql()`'s materializing path). DELETE/UPDATE's `WHERE`/`SET`
+expressions bind via the existing `Binder::bind_expr` (the same
+predicate-binding `bind_select`'s WHERE clause already uses) but are
+NOT executed via the generic `LogicalPlan`/`PhysicalOperator` pipeline
+CTAS/INSERT use for their source query — that pipeline has no way to
+carry a matched row's (segment, local position) back out, which DELETE
+and UPDATE both need. They use a bespoke per-segment scan+evaluate loop
+instead (task 001's Outcome, Decision 1 and Decision 2).
 
 ### Storage
-`NativeWriteMode::Append` (new) writes additional segments and merges
-their stats into the manifest's `table_stats` rollup (the existing
-`NativeManifest::rollup`/stats-merge functions from phase 1 are the
-direct template — read their exact names in the archived task 002/003
-Outcome sections before reinventing). Deletion vector mechanism per task
-001's decision, most likely a new manifest-adjacent artifact (its own
-small file or a `NativeManifest` field) versioned alongside
-`snapshot.version`.
+`NativeWriteMode::Append` (new) writes additional segments directly into
+the live table directory (fresh, non-colliding segment ids continuing
+from the existing max, not restarting at 0) and constructs one new
+`Vec<Segment>` (existing + new) that the EXISTING `NativeManifest::build`
+rolls up unchanged — no new merge function needed, confirmed by reading
+`build`'s existing implementation (task 001's Outcome, Decision 4).
+Append must inherit the target table's ALREADY-DECIDED dictionary
+encoding and validate the source's schema (name+type, not just column
+count — `SegmentWriter::accept` today checks only count) against the
+target's existing manifest schema, not rediscover either from the new
+data (task 001's Outcome, Decision 6). The deletion vector is a new
+`deleted_rows: Vec<u32>` field inline on the EXISTING `Segment` struct
+in `_manifest.json` — NOT a separate file or artifact (task 001's
+Outcome, Decision 1 — corrects this section's own earlier "most likely
+a new manifest-adjacent artifact" framing).
 
 ### Read path
 `NativeTable::scan()`/`scan_with_filter()` gain a deletion-vector
-consultation step if that's task 001's chosen mechanism — every row a
-segment yields gets filtered against pending deletes before reaching the
-rest of the query. This must compose correctly with task 005's
+consultation step (task 001's Outcome, Decision 1) — every row a
+segment yields gets filtered against `deleted_rows` before reaching the
+rest of the query, as a single choke point inside `scan()` itself, so
+every existing caller (generic path, dense-direct-address, a future
+distributed shard) composes correctly with zero changes at the call
+site. Verified (not assumed) to compose correctly with task 005's
 dense-direct-address fast path from phase 1 (which reads segment/table
 stats directly) and with distributed splits (`shard_by_splits`) — a
 deletion vector scoped to the wrong granularity could silently
