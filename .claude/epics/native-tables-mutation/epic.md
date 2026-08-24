@@ -3,7 +3,7 @@ name: native-tables-mutation
 status: in-progress
 created: 2026-08-24T04:45:55Z
 updated: 2026-08-24T04:45:55Z
-progress: 0%
+progress: 17%
 prd: .claude/prds/native-tables.md
 github: (will be set on sync)
 ---
@@ -301,7 +301,7 @@ mechanism the way phase 1 substantially was.
   program so far.
 
 ## Tasks Created
-- [ ] 001.md - Design spike — deletion mechanism, UPDATE semantics, compaction scope, atomic-publish model (parallel: false)
+- [x] 001.md - Design spike — deletion mechanism, UPDATE semantics, compaction scope, atomic-publish model (parallel: false)
 - [ ] 002.md - INSERT — Append write mode + SQL wiring (parallel: false)
 - [ ] 003.md - Deletion vector mechanism + DELETE (parallel: false)
 - [ ] 004.md - UPDATE (parallel: false)

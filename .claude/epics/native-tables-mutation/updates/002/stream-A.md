@@ -1,0 +1,10 @@
+---
+issue: 002
+stream: main
+started: 2026-08-24T05:10:00Z
+status: in_progress
+---
+## Scope
+See .claude/epics/native-tables-mutation/002.md
+## Progress
+- Starting implementation
