@@ -9,6 +9,7 @@ use crate::physical::{PhysicalOperator, PhysicalPlanner, RecordBatchStream};
 use crate::planner::{Binder, InMemoryCatalog, LogicalPlan, PlanSchema, SchemaField};
 use crate::storage::native_delete;
 use crate::storage::native_manifest;
+use crate::storage::native_update;
 use crate::storage::native_write::{self, NativeWriteMode};
 use crate::storage::{NativeTable, ParquetTable};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -125,6 +126,38 @@ pub struct DeleteResult {
     /// this DELETE.
     pub total_rows: u64,
     /// Wall-clock time for the whole parse-bind-identify-publish sequence.
+    pub elapsed: Duration,
+}
+
+/// What `ExecutionContext::update_native_table` produced
+/// (native-tables-mutation epic, task 004).
+#[derive(Debug, Clone)]
+pub struct UpdateResult {
+    /// The table name the UPDATE targeted (`update.table` from the SQL).
+    pub table_name: String,
+    /// The native table's stable identity (UUID v4) — unchanged by an
+    /// UPDATE.
+    pub table_id: String,
+    /// The snapshot version this UPDATE committed. Equal to the PRE-update
+    /// version when the predicate matched zero LIVE rows (a legitimate
+    /// no-op, not an error — see `native_update::update_native_table`'s
+    /// doc).
+    pub version: u64,
+    /// Rows actually recomputed and rewritten — the NET count of LIVE
+    /// matched rows (0 for a no-op match, or a match that only covers
+    /// rows already tombstoned by a prior DELETE/UPDATE).
+    pub rows_updated: u64,
+    /// Old segments dropped entirely because every one of their rows
+    /// became tombstoned by this UPDATE.
+    pub segments_dropped: usize,
+    /// New segments written to hold the recomputed rows.
+    pub segments_added: usize,
+    /// The table's TOTAL LOGICAL (post-update, visible) row count — always
+    /// equal to the pre-update logical row count for a real update (an
+    /// UPDATE never changes how many rows are live, only their values).
+    pub total_rows: u64,
+    /// Wall-clock time for the whole parse-bind-identify-evaluate-write-
+    /// publish sequence.
     pub elapsed: Duration,
 }
 
@@ -492,6 +525,26 @@ impl ExecutionContext {
                  automatically) — sql() cannot delete from a native table (it takes &self, \
                  and DELETE needs a bespoke row-identification loop no LogicalPlan can \
                  express)"
+                    .to_string(),
+            ));
+        }
+
+        // Same reasoning again for `UPDATE <table> SET ... [WHERE ...]`
+        // (native-tables-mutation epic, task 004): `Binder::bind()`'s
+        // `Statement::Update` arm only validates shape and always returns
+        // `Err` (UPDATE has no `LogicalPlan` to give back, same reason
+        // DELETE doesn't), so an unguarded UPDATE reaching the ordinary
+        // bind/plan/execute path below would just surface that
+        // NotImplemented error anyway. This guard exists for the same
+        // reason the CREATE TABLE/INSERT/DELETE ones do: fail with a
+        // message that names the correct entrypoint BEFORE constructing a
+        // `Binder` at all.
+        if crate::planner::update_target_name(&stmt).is_some() {
+            return Err(QueryError::InvalidArgument(
+                "UPDATE ... SET ... must run through \
+                 ExecutionContext::update_native_table (the REPL calls this automatically) — \
+                 sql() cannot update a native table (it takes &self, and UPDATE needs a \
+                 bespoke row-identification + SET-evaluation loop no LogicalPlan can express)"
                     .to_string(),
             ));
         }
@@ -961,6 +1014,91 @@ impl ExecutionContext {
             rows_deleted: delete_result.rows_deleted,
             segments_dropped: delete_result.segments_dropped,
             total_rows: delete_result.total_rows,
+            elapsed: start.elapsed(),
+        })
+    }
+
+    /// Execute `UPDATE <table> SET <col> = <expr>, ... [WHERE ...]` end to
+    /// end against an EXISTING native table (native-tables-mutation epic,
+    /// task 004): parse, recover the target name
+    /// (`planner::update_target_name`), look it up as a REGISTERED native
+    /// table (same "register before you reference it" contract as INSERT/
+    /// DELETE — no auto-discovery), bind the SET assignments and WHERE
+    /// predicate via `Binder::bind_update` (which ALSO validates the
+    /// statement's shape — every clause this epic does not support refused
+    /// by name), then drive `native_update::update_native_table`'s bespoke
+    /// row-identification + SET-evaluation + combined-segment-list +
+    /// single-file atomic-publish sequence DIRECTLY — unlike CTAS/INSERT,
+    /// there is no `LogicalPlan`/`PhysicalOperator` pipeline involved at
+    /// all (see `native_update.rs`'s module doc for why, and for exactly
+    /// why this is composed as ONE atomic operation rather than a DELETE
+    /// followed by an INSERT). Re-registers the table afterward so the
+    /// update is visible to a subsequent query in the SAME session.
+    ///
+    /// `&mut self`, unlike `sql()`'s `&self`: re-registering the table
+    /// mutates `self.tables`.
+    ///
+    /// `selection: None` (`UPDATE t SET ...` with no WHERE) updates every
+    /// LIVE row. A predicate matching zero rows, or matching only rows
+    /// already tombstoned by a prior DELETE/UPDATE, is a clean no-op (no
+    /// version bump, manifest untouched) — see `native_update::
+    /// update_native_table`'s doc.
+    pub async fn update_native_table(&mut self, sql: &str) -> Result<UpdateResult> {
+        let start = Instant::now();
+        let stmt = parser::parse_sql(sql)?;
+        let table_name = crate::planner::update_target_name(&stmt).ok_or_else(|| {
+            QueryError::InvalidArgument(format!(
+                "update_native_table expects an UPDATE <table> SET ... [WHERE ...] statement, \
+                 got: {sql}"
+            ))
+        })?;
+
+        let provider = self.tables.get(&table_name).cloned().ok_or_else(|| {
+            QueryError::TableNotFound(format!(
+                "UPDATE {table_name}: no such table is registered in this session (a native \
+                 table must be registered, e.g. via register_native_table or a prior CREATE \
+                 TABLE ... AS SELECT, before UPDATE can target it)"
+            ))
+        })?;
+        let native = provider
+            .as_any()
+            .downcast_ref::<NativeTable>()
+            .ok_or_else(|| {
+                QueryError::InvalidArgument(format!(
+                    "UPDATE {table_name}: this table is not a native table -- UPDATE is only \
+                     supported against native tables"
+                ))
+            })?;
+        let table_dir = native.dir().to_path_buf();
+
+        let sqlparser::ast::Statement::Update(update) = &stmt else {
+            unreachable!("update_target_name only returns Some for a Statement::Update")
+        };
+        let mut binder = Binder::new(&self.catalog);
+        // Validates the UPDATE's shape (refusing every unsupported clause
+        // by name) AND binds every SET assignment's value expression plus
+        // the WHERE predicate (if any) in one call — see
+        // `Binder::bind_update`.
+        let (_, assignments, predicate) = binder.bind_update(update)?;
+
+        let update_result =
+            native_update::update_native_table(&table_dir, predicate.as_ref(), &assignments)
+                .await
+                .map_err(|e| QueryError::Storage(format!("UPDATE {table_name}: {e}")))?;
+
+        // Re-open the table so a subsequent query in the SAME session sees
+        // the update -- mirrors `delete_from_native_table`'s own "make the
+        // write immediately visible" step.
+        self.register_native_table(&table_name, &table_dir)?;
+
+        Ok(UpdateResult {
+            table_name,
+            table_id: update_result.table_id,
+            version: update_result.version,
+            rows_updated: update_result.rows_updated,
+            segments_dropped: update_result.segments_dropped,
+            segments_added: update_result.segments_added,
+            total_rows: update_result.total_rows,
             elapsed: start.elapsed(),
         })
     }

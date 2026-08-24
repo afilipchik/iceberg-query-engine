@@ -62,3 +62,10 @@ pub use native_table::NativeTable;
 /// so this registration line is unavoidable — same reasoning as
 /// `native_manifest`'s own line above.
 pub mod native_delete;
+
+/// Native table UPDATE (composes `native_write`'s Append core with
+/// `native_delete`'s row-identification/deletion-vector core into ONE
+/// atomically-published operation). Task 004 of the native-tables-mutation
+/// epic. A module is otherwise never compiled, so this registration line
+/// is unavoidable — same reasoning as `native_manifest`'s own line above.
+pub mod native_update;

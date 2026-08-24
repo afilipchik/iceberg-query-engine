@@ -1828,12 +1828,13 @@ async fn run_repl(
                 }
 
                 // Execute SQL query. `CREATE TABLE ... AS SELECT`,
-                // `INSERT INTO ... SELECT/VALUES ...` and
-                // `DELETE FROM ... [WHERE ...]` are all DDL/DML that need
+                // `INSERT INTO ... SELECT/VALUES ...`,
+                // `DELETE FROM ... [WHERE ...]` and
+                // `UPDATE ... SET ... [WHERE ...]` are all DDL/DML that need
                 // `&mut ctx` (registering/re-registering the affected
                 // native table), so each is routed to its own
                 // `ExecutionContext` entrypoint rather than `sql()` (which
-                // now refuses all three outright — see `ExecutionContext::
+                // now refuses all four outright — see `ExecutionContext::
                 // sql`'s doc comment for why). Parsed once up front purely
                 // to make this routing decision; on a parse failure this
                 // falls through to `sql()`, which re-parses and reports
@@ -1889,6 +1890,29 @@ async fn run_repl(
                                     r.rows_deleted,
                                     r.table_name,
                                     r.segments_dropped,
+                                    r.total_rows,
+                                    r.version,
+                                    start.elapsed().as_secs_f64() * 1000.0
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("Error: {}\n", e);
+                            }
+                        }
+                    }
+                    // `UPDATE <native table> SET ... [WHERE ...]` (native-
+                    // tables-mutation epic, task 004) -- same "needs
+                    // &mut ctx, not sql()'s materializing &self path"
+                    // reasoning as CREATE TABLE/INSERT/DELETE above.
+                    Ok(stmt) if query_engine::planner::update_target_name(&stmt).is_some() => {
+                        match ctx.update_native_table(line).await {
+                            Ok(r) => {
+                                println!(
+                                    "Updated {} row(s) in '{}' ({} segment(s) dropped, {} segment(s) added, now {} row(s) total, version {}) in {:.3}ms\n",
+                                    r.rows_updated,
+                                    r.table_name,
+                                    r.segments_dropped,
+                                    r.segments_added,
                                     r.total_rows,
                                     r.version,
                                     start.elapsed().as_secs_f64() * 1000.0
