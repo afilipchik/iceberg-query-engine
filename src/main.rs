@@ -1827,15 +1827,18 @@ async fn run_repl(
                     continue;
                 }
 
-                // Execute SQL query. `CREATE TABLE ... AS SELECT` is DDL: it
-                // needs `&mut ctx` to register the written table, so it is
-                // routed to `create_table_as_select` rather than `sql()`
-                // (which now refuses it outright — see
-                // `ExecutionContext::sql`'s doc comment for why). Parsed
-                // once up front purely to make that routing decision; on a
-                // parse failure this falls through to `sql()`, which
-                // re-parses and reports the same error the user would
-                // otherwise see.
+                // Execute SQL query. `CREATE TABLE ... AS SELECT`,
+                // `INSERT INTO ... SELECT/VALUES ...`,
+                // `DELETE FROM ... [WHERE ...]` and
+                // `UPDATE ... SET ... [WHERE ...]` are all DDL/DML that need
+                // `&mut ctx` (registering/re-registering the affected
+                // native table), so each is routed to its own
+                // `ExecutionContext` entrypoint rather than `sql()` (which
+                // now refuses all four outright — see `ExecutionContext::
+                // sql`'s doc comment for why). Parsed once up front purely
+                // to make this routing decision; on a parse failure this
+                // falls through to `sql()`, which re-parses and reports
+                // the same error the user would otherwise see.
                 let start = Instant::now();
                 match query_engine::parser::parse_sql(line) {
                     Ok(stmt)
@@ -1848,6 +1851,69 @@ async fn run_repl(
                                     r.table_name,
                                     r.rows,
                                     r.segments,
+                                    r.version,
+                                    start.elapsed().as_secs_f64() * 1000.0
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("Error: {}\n", e);
+                            }
+                        }
+                    }
+                    Ok(stmt) if query_engine::planner::insert_target_name(&stmt).is_some() => {
+                        match ctx.insert_into_native_table(line).await {
+                            Ok(r) => {
+                                println!(
+                                    "Inserted {} row(s) into '{}' ({} segment(s) added, now {} row(s) total, version {}) in {:.3}ms\n",
+                                    r.rows_inserted,
+                                    r.table_name,
+                                    r.segments_added,
+                                    r.total_rows,
+                                    r.version,
+                                    start.elapsed().as_secs_f64() * 1000.0
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("Error: {}\n", e);
+                            }
+                        }
+                    }
+                    // `DELETE FROM <native table> [WHERE ...]` (native-
+                    // tables-mutation epic, task 003) -- same "needs
+                    // &mut ctx, not sql()'s materializing &self path"
+                    // reasoning as CREATE TABLE/INSERT above.
+                    Ok(stmt) if query_engine::planner::delete_target_name(&stmt).is_some() => {
+                        match ctx.delete_from_native_table(line).await {
+                            Ok(r) => {
+                                println!(
+                                    "Deleted {} row(s) from '{}' ({} segment(s) dropped, now {} row(s) total, version {}) in {:.3}ms\n",
+                                    r.rows_deleted,
+                                    r.table_name,
+                                    r.segments_dropped,
+                                    r.total_rows,
+                                    r.version,
+                                    start.elapsed().as_secs_f64() * 1000.0
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("Error: {}\n", e);
+                            }
+                        }
+                    }
+                    // `UPDATE <native table> SET ... [WHERE ...]` (native-
+                    // tables-mutation epic, task 004) -- same "needs
+                    // &mut ctx, not sql()'s materializing &self path"
+                    // reasoning as CREATE TABLE/INSERT/DELETE above.
+                    Ok(stmt) if query_engine::planner::update_target_name(&stmt).is_some() => {
+                        match ctx.update_native_table(line).await {
+                            Ok(r) => {
+                                println!(
+                                    "Updated {} row(s) in '{}' ({} segment(s) dropped, {} segment(s) added, now {} row(s) total, version {}) in {:.3}ms\n",
+                                    r.rows_updated,
+                                    r.table_name,
+                                    r.segments_dropped,
+                                    r.segments_added,
+                                    r.total_rows,
                                     r.version,
                                     start.elapsed().as_secs_f64() * 1000.0
                                 );

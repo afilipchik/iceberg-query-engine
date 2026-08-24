@@ -3,10 +3,10 @@
 use crate::error::{QueryError, Result};
 use crate::execution::{ExecutionConfig, SharedMemoryPool};
 use crate::physical::operators::{
-    run_subquery_plan, AggregateExpr, ExternalSortExec, FilterExec, HashAggregateExec,
-    HashJoinExec, LimitExec, MemoryTableExec, MorselAggregateExec, ProjectExec, SortExec,
-    SpillableHashAggregateExec, SpillableHashJoinExec, SubqueryExecutor, TableProvider, UnionExec,
-    VectorSearchExec,
+    evaluate_expr, run_subquery_plan, AggregateExpr, ExternalSortExec, FilterExec,
+    HashAggregateExec, HashJoinExec, LimitExec, MemoryTableExec, MorselAggregateExec, ProjectExec,
+    SortExec, SpillableHashAggregateExec, SpillableHashJoinExec, SubqueryExecutor, TableProvider,
+    UnionExec, VectorSearchExec,
 };
 use crate::physical::PhysicalOperator;
 use crate::planner::{BinaryOp, Expr, JoinType, LogicalPlan, PlanSchema};
@@ -1959,10 +1959,67 @@ impl PhysicalPlanner {
             }
 
             LogicalPlan::Values(node) => {
-                // Evaluate constant expressions and create a batch
+                // Evaluate each row's constant expressions into a real
+                // RecordBatch — this used to be a stub returning an always-
+                // empty batch ("proper implementation needs expression
+                // evaluation"), silently making every `VALUES (...)` a
+                // no-op no matter where it was reached from (a bare
+                // `VALUES` query, and — the case that surfaced this,
+                // native-tables-mutation epic task 002 — `INSERT INTO
+                // <table> VALUES (...)`, which task 001's design spike
+                // confirmed BINDS via the pre-existing `SetExpr::Values`
+                // arm but never actually got this far correctly before).
+                //
+                // Reuses the SAME "1-row, 0-column dummy batch +
+                // evaluate_expr" trick `LogicalPlan::EmptyRelation` above
+                // already uses for a table-less `SELECT <literal-expr>`:
+                // each `Expr` in a VALUES row is, per the SQL grammar, a
+                // constant expression with no column references, so
+                // evaluating it against a schema-less 1-row batch is
+                // sufficient and needs no new evaluator machinery.
                 let schema = plan_schema_to_arrow(&node.schema);
-                // For now, return empty - proper implementation needs expression evaluation
-                let exec = MemoryTableExec::new("values", schema, vec![], None);
+                let batches = if node.values.is_empty() {
+                    vec![]
+                } else {
+                    let dummy_options =
+                        arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(1usize));
+                    let dummy_row = arrow::record_batch::RecordBatch::try_new_with_options(
+                        Arc::new(Schema::empty()),
+                        vec![],
+                        &dummy_options,
+                    )?;
+
+                    let num_cols = schema.fields().len();
+                    let mut per_column: Vec<Vec<arrow::array::ArrayRef>> = (0..num_cols)
+                        .map(|_| Vec::with_capacity(node.values.len()))
+                        .collect();
+                    for row in &node.values {
+                        if row.len() != num_cols {
+                            return Err(QueryError::Plan(format!(
+                                "VALUES row has {} expression(s) but the inferred schema has \
+                                 {} column(s)",
+                                row.len(),
+                                num_cols
+                            )));
+                        }
+                        for (i, expr) in row.iter().enumerate() {
+                            per_column[i].push(evaluate_expr(&dummy_row, expr)?);
+                        }
+                    }
+                    let columns: Vec<arrow::array::ArrayRef> = per_column
+                        .into_iter()
+                        .map(|parts| {
+                            let refs: Vec<&dyn arrow::array::Array> =
+                                parts.iter().map(|a| a.as_ref()).collect();
+                            arrow::compute::concat(&refs).map_err(QueryError::from)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    vec![arrow::record_batch::RecordBatch::try_new(
+                        schema.clone(),
+                        columns,
+                    )?]
+                };
+                let exec = MemoryTableExec::new("values", schema, batches, None);
                 Ok(Arc::new(exec))
             }
 

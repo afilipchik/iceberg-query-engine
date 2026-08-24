@@ -2269,48 +2269,938 @@ table's identity must never alias a worker's partial shard. Distributed/
 (`ExecutionConfig::gpu_offload` defaults `false`, forced `false` again in
 fragment contexts), independent of and unaffected by this change.
 
+### Mutation: INSERT (native-tables-mutation epic, phase 2, task 002, 2026-08-23)
+
+`INSERT INTO <native table> SELECT ...` / `INSERT INTO <native table>
+VALUES (...)` — the first mutation capability, extending a native table
+incrementally rather than only full-replacing it. Task 001's design spike
+(`.claude/epics/native-tables-mutation/001.md`'s Outcome) decided the
+mechanism ahead of implementation: reusing phase 1's `publish_table_dir`
+(whole-directory `remove_dir_all` + `rename`) unchanged would delete every
+pre-existing segment on an incremental write, so `Append` uses a
+DIFFERENT, single-FILE atomic-publish model instead.
+
+- **`NativeWriteMode::Append`** (new variant, `src/storage/
+  native_write.rs`) writes new segment(s) DIRECTLY into the LIVE table
+  directory (never a staging directory) under fresh, non-colliding
+  segment ids continuing from the existing maximum (never restarting at
+  0), casts every batch to the target's ALREADY-DECLARED schema and
+  dictionary encoding (inherited, never rediscovered from the new data's
+  own cardinality — a schema/type mismatch is a clean, named
+  `QueryError::Type`, never silent coercion), then publishes ONE new
+  manifest via `native_manifest::write_manifest_atomic`'s single-file
+  `rename()` (a NEW sibling primitive to `publish_table_dir`, additive,
+  zero changes to Create/Overwrite's own directory-level publish).
+  `NativeManifest::build` is reused COMPLETELY UNCHANGED to roll up
+  `row_count`/`table_stats` from the full (old + new) segment list — no
+  separate merge function needed. A zero-row source is a legitimate
+  no-op (no version bump, manifest untouched), unlike Create/Overwrite's
+  own zero-row refusal.
+- **Single-writer enforcement**: `std::fs::File::try_lock()` (stable std
+  since Rust 1.89, zero new dependency) on a sibling `<table>.lock` file,
+  held for the whole read-modify-write-publish span via an RAII guard
+  (`native_write::TableWriteLock`). A concurrent writer gets an
+  immediate, named `QueryError::Storage` — never blocks, never corrupts.
+- **Reusable, non-publishing building blocks** (task 001's Decision 2,
+  for task 003/004's DELETE/UPDATE to compose into their own single
+  atomic publish rather than two sequential self-publishing calls):
+  `native_write::write_append_segments` (writes segments, returns
+  `Vec<Segment>`, touches no manifest) and `native_write::
+  publish_manifest_update` (given a caller-assembled full `Vec<Segment>`,
+  builds + atomically publishes one manifest, does no locking itself).
+  `native_write::append_to_native_table` composes lock + both blocks into
+  the self-publishing entrypoint.
+- **SQL surface**: `Binder::bind()` gained a `Statement::Insert` arm
+  (`src/planner/binder.rs`, mirrors the `CreateTable` arm's shape exactly
+  — binds and returns only the source query's `LogicalPlan`, no new DML
+  node) plus `require_supported_insert_shape`, mechanically checked
+  against sqlparser 0.62's real 26-field `ast::Insert` struct (explicit
+  column lists, Hive `INSERT OVERWRITE`, `ON CONFLICT`/`ON DUPLICATE KEY
+  UPDATE`, MySQL `INSERT...SET`, multi-table `INSERT ALL/FIRST`, and more
+  are all refused by name). `INSERT ... VALUES` is SUPPORTED (not
+  refused) — task 001 confirmed it binds through the identical
+  `bind_query()` path with zero extra binder work.
+- **`ExecutionContext::insert_into_native_table`** (`&mut self`, mirrors
+  `create_table_as_select`'s shape): the target must already be a
+  REGISTERED native table (no auto-discovery — matches every other
+  table's "register before you reference it" contract); streams the
+  source query's `RecordBatchStream` directly into `append_to_native_table`
+  (never through `sql()`'s materializing path — `sql()` itself now
+  refuses a bare `INSERT` with a pointer to this method, mirroring its
+  pre-existing CREATE TABLE guard). Re-registers the table afterward so
+  its new rows are immediately queryable in the same session. Wired into
+  the REPL alongside `CREATE TABLE`'s existing dispatch.
+- **A real, pre-existing bug found and fixed while wiring `INSERT ...
+  VALUES` end to end**: `LogicalPlan::Values`'s physical planning
+  (`src/physical/planner.rs`) was an unimplemented stub that always
+  returned an EMPTY batch regardless of the actual literal rows — no
+  existing test anywhere in the suite exercised literal `VALUES` SQL
+  text, so this was silently dead code until this task's own integration
+  test caught it. Fixed by evaluating each row's expressions via the
+  existing `evaluate_expr` against a 1-row/0-column dummy batch — the
+  SAME trick `LogicalPlan::EmptyRelation` already uses one arm above for
+  a table-less `SELECT <literal>` — then concatenating per column. Fixes
+  `VALUES (...)` everywhere in the engine, not just for INSERT.
+- **Cell-exact validated** (`tests/native_insert_tests.rs`): inserting
+  into a table with existing CTAS data reassembles byte-identically to
+  an independently-computed reference (the same combined query against
+  the original, never-split parquet source); a `SELECT *`-wildcard
+  source (table-qualified field names) still lands positionally correct;
+  an empty result set is a no-op, not an error; a column-count schema
+  mismatch (two real, differently-shaped TPC-H fixtures) is a clean
+  error that leaves the table completely untouched; `statistics()`/
+  `distributed_splits()` correctly widen/add a split after an INSERT.
+- **Memory**: verified, not assumed, the same way phase 1 task 003 did —
+  measured two DIFFERENT things separately (`examples/
+  native_append_memory_check.rs`, `QE_MEM_CHECK_MODE=direct|sql`),
+  reported as separate premises per this doc's own standing convention:
+  - **`direct`** (apples-to-apples with task 003's own methodology:
+    `native_write::append_to_native_table` called directly, fed by the
+    SAME `StreamingParquetReader` construction `write_from_parquet`
+    uses, bypassing the SQL engine entirely) — appending SF=10
+    `lineitem` (60,000,000 rows, 2.8GB compressed) to an existing native
+    table peaked at **328MB** (`/usr/bin/time -v`, kernel `VmHWM`),
+    **better than** task 003's own 406MB CREATE-mode baseline for the
+    identical row count. This is the direct, load-bearing confirmation
+    of this task's own acceptance criterion: Append's write core is
+    genuinely bounded, not assumed to inherit Create/Overwrite's
+    discipline just because it reuses the same buffered-flush shape.
+  - **`sql`** (the full, realistic `INSERT INTO t SELECT * FROM
+    lineitem_src` statement via `ExecutionContext::
+    insert_into_native_table`) — peaked at **~5.3GB**, MUCH higher.
+    Root-caused, not just observed: `StreamingParquetScanExec::
+    output_partitions()` returns one partition per row-group work item
+    (tens of partitions for a 60M-row file), and `insert_into_native_table`
+    (like `create_table_as_select` before it — confirmed by reading both,
+    IDENTICAL structure) drives every partition's stream via
+    `physical.execute(partition_id)` and merges them ALL with
+    `futures::stream::select_all` before the single-threaded Append
+    writer drains them — so many partitions' worth of decoded parquet
+    data can be "in flight" concurrently with no backpressure. This is a
+    PRE-EXISTING, CTAS-shared characteristic (confirmed identical code
+    shape in `create_table_as_select`, not introduced by this task's own
+    Append write core) — named honestly as a residual risk for a future
+    task (bound concurrently-polled partitions, or give the merge real
+    backpressure), not fixed here: closing it would mean changing the
+    engine's generic multi-partition scan/stream-merge pattern, shared
+    by CTAS, well outside this task's own charter.
+
+### Mutation: DELETE (native-tables-mutation epic, phase 2, task 003, 2026-08-23)
+
+`DELETE FROM <native table> [WHERE ...]` — the deletion-vector mechanism
+task 001's design spike decided (Outcome, Decision 1) plus the SQL surface
+that exercises it. Unlike CTAS/INSERT, this is NOT a thin wrapper around
+`bind_query()`/the generic `LogicalPlan`/`PhysicalOperator` pipeline —
+that pipeline has no way to carry a matched row's (segment id, local
+position) back out (`TableProvider::scan()` returns only
+`Vec<RecordBatch>`), so DELETE's row-identification is a genuinely new,
+bespoke loop.
+
+- **`Segment::deleted_rows: Vec<u32>`** (new field, `src/storage/
+  native_manifest.rs`, `#[serde(default)]`): sorted, deduplicated LOCAL
+  row positions within that segment's own on-disk row order that a
+  DELETE has tombstoned. Every manifest phase 1 or task 002 ever wrote
+  deserializes with an empty `Vec` here — zero behavior or performance
+  change for a never-deleted-from table. `Segment.row_count`/
+  `Snapshot.row_count` are DELIBERATELY unaffected by `deleted_rows` —
+  they keep meaning the PHYSICAL (write-time) count, so
+  `NativeManifest::validate`'s existing `row_count == sum(segments[].
+  row_count)` invariant holds with zero changes and `NativeManifest::
+  build` stays callable completely unchanged after a DELETE. A NEW method,
+  `Segment::live_row_count()` (`row_count - deleted_rows.len()`), is the
+  LOGICAL (post-delete, visible) count; `NativeManifest::validate` also
+  now bounds-checks `deleted_rows` (sorted, strictly increasing, every
+  entry `< row_count`).
+- **`src/storage/native_delete.rs`** (new sibling module to
+  `native_write.rs`/`native_manifest.rs`/`native_table.rs`): owns
+  row-identification and deletion-vector editing. Two reusable,
+  non-publishing building blocks (task 001's Decision 2, for task 004's
+  UPDATE to compose into ONE atomic publish rather than two sequential
+  self-publishing calls):
+  - `identify_matching_rows(dir, target, predicate: Option<&Expr>,
+    materialize_rows: bool) -> Result<MatchedRows>` — opens the target's
+    CURRENT manifest's segments directly (in id order), reads each via
+    `ipc_cache::read_row_group` (the SAME mmap-backed reader `NativeTable
+    ::scan` uses), evaluates the predicate batch-by-batch via
+    `physical::operators::evaluate_expr` (the SAME function `FilterExec`
+    itself uses), and tracks a running local-row offset across a
+    segment's (possibly many) batches to convert matches into
+    segment-relative positions. `predicate: None` matches every row
+    (`DELETE FROM t` with no WHERE) without ever building an all-true
+    mask. `materialize_rows` controls whether matched rows' ACTUAL COLUMN
+    DATA is also gathered (`MatchedRows::per_segment[].rows: Option<
+    RecordBatch>`) — DELETE itself always passes `false` (it only needs
+    WHICH rows, never their values, so a broad `DELETE FROM t` doesn't
+    pay to materialize row data it will never use); task 004 (UPDATE) is
+    expected to pass `true` to get matched rows' CURRENT values for
+    evaluating its SET expressions against, reusing this exact function
+    rather than re-deriving an equivalent scan.
+  - `apply_deletions(target, matches) -> Vec<Segment>` — unions each
+    segment's newly matched positions into its EXISTING `deleted_rows` via
+    a `BTreeSet` (insert + re-serialize sorted) — idempotent BY
+    CONSTRUCTION, so re-matching an already-deleted row via a second,
+    overlapping DELETE is naturally a no-op with no special-casing. Drops
+    a `Segment` entirely once `deleted_rows.len() >= row_count` (every row
+    tombstoned) — task 001's Decision 3's narrow, in-scope compaction
+    exception; NOT full compaction (deferred to a future epic).
+  - `delete_from_native_table(table_dir, predicate) ->
+    Result<NativeDeleteResult>` — the self-publishing entrypoint:
+    `native_write::lock_table_for_write` (held for the whole span) →
+    `native_manifest::read_manifest` → `identify_matching_rows` →
+    `apply_deletions` → `native_write::publish_manifest_update` (task
+    002's single-file atomic-rename primitive, reused completely
+    UNCHANGED — DELETE never writes new segment `.arrow` files, only an
+    edited manifest, so no second publish path was needed). **Two
+    distinct no-op cases**, both leave the manifest byte-for-byte
+    untouched and never bump the version: the predicate matches zero
+    physical rows, OR it matches rows but EVERY one was already
+    tombstoned by a prior DELETE (detected via the LOGICAL row-count
+    delta, `rows_deleted == 0`, not a segment-by-segment equality check)
+    — `NativeDeleteResult::rows_deleted` is the NET newly-tombstoned
+    count, never the gross predicate-match count, so a fully-redundant
+    repeat DELETE reports `0` rather than the same nonzero number every
+    time it runs.
+- **Read-path consultation — the single choke point**: `NativeTable::scan`
+  (`src/storage/native_table.rs`) gained a deletion-filtering step: for
+  each segment with a non-empty `deleted_rows`, a new free function
+  (`filter_deleted_rows`) tracks a running local-row offset across the
+  segment's (possibly many) batches and applies `arrow::compute::filter`
+  — with a per-batch fast path that skips the mask/filter call entirely
+  when NO deleted position falls in that batch's range (the common case
+  for a segment with only a few scattered deletions). A segment with an
+  EMPTY `deleted_rows` (every table phase 1/task 002 ever wrote, and any
+  untouched segment of a mutated table) takes a zero-allocation fast path
+  straight through — confirmed zero behavior/performance change, not just
+  designed for it. Because `TableProvider::scan_with_filter`'s DEFAULT
+  implementation is `self.scan(projection)` and `NativeTable` does not
+  override it, EVERY read path funnels through this one fix with zero
+  further changes — confirmed by reading every call site, not assumed:
+  `morsel_agg.rs`'s dense-direct-address fast path
+  (`try_execute_dense_direct` calls `provider.scan_with_filter(...)`),
+  `physical/planner.rs`'s generic `MemoryTableExec` path, and its 400MB
+  prescan cache all reach the same `scan()`. Dense-direct-address needed
+  literally ZERO code changes: it only emits a group whose `presence` bit
+  was actually set during accumulation, and deleted rows now simply never
+  reach the accumulator (the same sparse-key mechanism that already
+  handles ordinary gapped key ranges) — task 001's prior analysis is
+  reconfirmed against the ACTUAL implementation, not just carried over
+  unchanged from the design doc.
+- **`NativeTable::statistics()` row count**: extended to sum
+  `segment.live_row_count()` (the NEW logical count) instead of raw
+  `segment.row_count`, for BOTH the whole-table and sharded-provider
+  branches — a one-line change to an already-existing "compute row_count
+  from active_segments()" pattern. `total_byte_size` and the column-stats
+  rollup (min/max/NDV) are DELIBERATELY left untouched (task 001: deletion
+  vectors never shrink a segment's physical bytes, and a wider stats
+  bound is always safe) — this is also why `check_scan_budget`'s existing
+  `memory_limit * spill_threshold` formula (phase 1 task 006) needed ZERO
+  changes: it estimates `total_byte_size`, which DELETE never changes,
+  and `scan()` still must decode a segment's full physical content before
+  the new per-batch filter can drop rows.
+- **SQL surface**: `delete_target_name(stmt) -> Option<String>`
+  (extraction, mirrors `insert_target_name`) plus a `Statement::Delete`
+  arm in `Binder::bind()` that validates shape
+  (`require_supported_delete_shape`, mechanically checked against
+  sqlparser 0.62's real 10-field `ast::Delete` struct plus
+  `TableFactor::Table`'s 10 fields — multi-table FROM lists, JOINs,
+  `USING`, `RETURNING`/`OUTPUT`, `ORDER BY`/`LIMIT` all refused by name)
+  and then ALWAYS returns `Err` pointing at the real entrypoint — DELETE
+  has no `LogicalPlan` to give back, so unlike the Insert/CreateTable
+  arms this one is not a small wrapper around `bind_query()`. The real
+  binding work is `pub fn bind_delete(&mut self, stmt: &ast::Delete) ->
+  Result<(String, Option<Expr>)>`: validates shape, then binds the WHERE
+  predicate (if any) via the SAME `bind_expr` method `bind_select`'s own
+  WHERE-clause binding uses, against the target table's own schema
+  (aliased if the DELETE names one, mirroring `bind_table_factor`'s
+  convention). `selection: None` binds to predicate `None` (match every
+  row), not a trivial `TRUE` literal or an error. A subquery in the WHERE
+  clause (`DELETE FROM t WHERE id IN (SELECT ...)`) BINDS successfully
+  (confirmed by task 001's spike — the identical `bind_expr` path
+  `bind_select` uses) but is refused right after, by name, at bind time:
+  evaluating it needs a `SubqueryExecutor`, which the bespoke
+  `identify_matching_rows` loop (deliberately not the generic
+  `PhysicalOperator` pipeline `SubqueryExecutor` is normally wired
+  through) does not have — refusing here, rather than letting
+  `physical::operators::evaluate_expr` fail deep inside the
+  identification loop with a less specific error, matches this codebase's
+  "refuse cleanly and early" discipline.
+- **`ExecutionContext::delete_from_native_table`** (`&mut self`, mirrors
+  `insert_into_native_table`'s shape): target must already be a
+  REGISTERED native table; calls `Binder::bind_delete` directly (NOT
+  `bind()` + a physical plan — there is no `LogicalPlan`/
+  `PhysicalOperator` pipeline involved at all for DELETE) then drives
+  `native_delete::delete_from_native_table`. Re-registers the table
+  afterward so the deletion is visible to a subsequent query in the same
+  session. `sql()` gained the same DELETE-refusal guard it already has
+  for CREATE TABLE/INSERT. Wired into the REPL alongside CREATE
+  TABLE/INSERT's existing dispatch.
+- **Cell-exact validated** (`tests/native_delete_tests.rs`): a subset
+  DELETE matches the independently-computed complement of the original
+  source cell-exact; deleting ALL rows leaves the table existing but
+  logically empty (subsequent queries return zero rows cleanly, not an
+  error); deleting ZERO rows is a clean no-op (manifest byte-for-byte
+  unchanged); a DELETE spanning a segment boundary in a real two-segment
+  table (CTAS + INSERT) applies to the correct segments only; repeated
+  overlapping DELETEs (fully AND partially redundant) never corrupt or
+  double-count, with the NET-vs-gross `rows_deleted` distinction
+  explicitly asserted; `statistics()` reflects the post-delete logical row
+  count; `sql()`'s refusal guard; unregistered-table and
+  non-native-table error paths; INSERT and a fresh CTAS both still work
+  correctly in a session that has already performed a DELETE (no
+  regression).
+
+### Mutation: UPDATE (native-tables-mutation epic, phase 2, task 004, 2026-08-24)
+
+`UPDATE <native table> SET <col> = <expr>, ... [WHERE ...]` — per task
+001's Decision 2 (DELETE + INSERT, composed as ONE atomically-published
+operation, never two sequential self-publishing calls). Genuinely NEW
+mechanism (not just a thin wrapper): reads matched rows' CURRENT column
+values, evaluates every SET assignment against them, and publishes the
+tombstoned-old + recomputed-new segments in a SINGLE manifest rename.
+
+- **`src/storage/native_update.rs`** (new sibling module to
+  `native_write.rs`/`native_delete.rs`/`native_manifest.rs`): owns the
+  whole composition. `pub async fn update_native_table(table_dir,
+  predicate: Option<&Expr>, assignments: &[(String, Expr)]) ->
+  Result<NativeUpdateResult>` — the ONLY entrypoint, sequence: (1)
+  `native_write::lock_table_for_write` ONCE, held for the WHOLE span; (2)
+  `native_manifest::read_manifest` ONCE; (3)
+  `native_delete::identify_matching_rows(dir, &existing, predicate,
+  materialize_rows: true)` ONCE — reused completely UNCHANGED from task
+  003, called with `materialize_rows: true` (task 003's own Outcome names
+  this exact call shape as task 004's need) to get BOTH tombstone-candidate
+  positions AND matched rows' current values in one pass; (4) evaluate
+  every assignment's bound value expression against each matched row's
+  PRE-update values (`assemble_updated_batch` — evaluates ALL assignments
+  first against the untouched input batch, THEN overwrites columns, so
+  `SET x = x + 1` and multi-assignment SET lists never read a
+  partially-updated value, regardless of assignment order); (5)
+  `native_delete::apply_deletions` (task 003's function, reused
+  UNCHANGED) for the tombstoning half; (6)
+  `native_write::write_append_segments` (task 002's function, reused
+  UNCHANGED — schema/dictionary inheritance and by-position type
+  validation come for free) for the recomputed-rows half, against the
+  SAME already-read manifest; (7) fold both segment lists into ONE
+  `Vec<Segment>`; (8) `native_write::publish_manifest_update` (task 002's
+  single-file atomic-rename primitive) EXACTLY ONCE; (9) release the lock
+  (guard `Drop`). This is the concrete mechanism — not just a design
+  argument — behind "no partial-state visibility": exactly one
+  `rename(2)` publishes the whole statement, so a reader can only ever
+  observe the fully-pre-update or fully-post-update manifest.
+- **A real correctness gap found and fixed, beyond task 001/003's own
+  analysis**: `identify_matching_rows` deliberately does NOT consult
+  `Segment::deleted_rows` (harmless for DELETE — re-matching an
+  already-deleted position is a no-op union). UPDATE is different: a
+  match means "read this row's CURRENT value and write a BRAND-NEW live
+  row from it," so a match that is ALREADY tombstoned (e.g. a second
+  UPDATE, or an UPDATE after a DELETE, whose predicate still covers an
+  already-removed row) must NOT be resurrected. `live_matched_rows`
+  filters each segment's materialized matches down to only the positions
+  NOT already in that segment's OWN `deleted_rows` BEFORE any SET
+  expression ever sees them — without this filter, two overlapping
+  UPDATEs (or an UPDATE following a DELETE) touching the same rows would
+  silently DUPLICATE them. Caught by this task's own required "a second
+  UPDATE that overlaps a first" adversarial test, which fails loudly
+  (wrong row count / duplicate ids) without the fix and passes with it —
+  confirmed by writing the test first, seeing it fail against a
+  naive (unfiltered) composition, then adding the fix.
+  `NativeUpdateResult::rows_updated` is therefore the NET count of
+  actually-live matched rows recomputed, never the gross predicate-match
+  count (mirrors `NativeDeleteResult::rows_deleted`'s own NET-vs-gross
+  discipline) — a predicate matching only already-dead rows is a TRUE
+  no-op (no version bump, manifest untouched), exactly like DELETE's own
+  fully-redundant-repeat case.
+- **Dictionary round-trip**: a matched row's NEW value for a
+  dictionary-coerced column (e.g. `SET category = 'new-value'`) evaluates
+  to a plain `Utf8` array (`evaluate_expr`'s literal/arithmetic/string
+  paths never re-encode dictionaries); an UNTOUCHED dictionary column
+  passes through unchanged (still `Dictionary(Int32, Utf8)`, since
+  `assemble_updated_batch` only overwrites assigned column positions).
+  Both land correctly because `write_append_segments`'s own by-position
+  `cast_batch_to_target` (task 002, reused completely UNCHANGED) already
+  handles exactly these two shapes: an exact type match passes through
+  as-is, and a plain-`Utf8`-into-declared-`Dictionary` mismatch is the
+  ONE sanctioned coercion. The manifest's declared schema for the column
+  is NEVER re-derived from the new data — `publish_manifest_update` is
+  always called with the SAME `target_schema` read at the start of the
+  operation — so a regression back to plain `Utf8` is structurally
+  impossible, not just tested against. Verified end to end (not just by
+  this argument) via a real dictionary-encoded TPC-H `o_orderstatus`
+  column, cell-exact.
+- **SQL surface**: `update_target_name(stmt) -> Option<String>`
+  (extraction, mirrors `delete_target_name`) plus a `Statement::Update`
+  arm in `Binder::bind()` that validates shape
+  (`require_supported_update_shape`, mechanically checked against
+  sqlparser 0.62's real 11-field `ast::Update` struct —
+  `src/ast/dml.rs` — plus `TableFactor::Table`'s 10 fields, identical
+  check to `require_supported_delete_shape`'s own: JOINs, `FROM`
+  [Postgres/Snowflake/MySQL `UPDATE ... FROM`, a materially different
+  join-shaped feature this epic's "recompute against the row's OWN
+  current values only" model does not support], `AssignmentTarget::Tuple`
+  [`SET (a,b) = (1,2)`], `RETURNING`/`OUTPUT`, SQLite `OR` conflict
+  resolution, `ORDER BY`/`LIMIT` all refused by name) and then ALWAYS
+  returns `Err` pointing at the real entrypoint — UPDATE has no
+  `LogicalPlan` to give back, same reason DELETE doesn't. The real
+  binding work is `pub fn bind_update(&mut self, stmt: &ast::Update) ->
+  Result<(String, Vec<(String, Expr)>, Option<Expr>)>`: validates shape,
+  binds EVERY SET assignment's value expression (`assignment_target_
+  column_name` extracts the target column's unqualified name — the LAST
+  identifier of its `ObjectName`, so both `col` and `alias.col` resolve
+  the same way — and its existence is validated against the table's
+  schema at BIND TIME, a clean `ColumnNotFound` rather than a confusing
+  failure deep in the storage layer) plus the WHERE predicate (if any),
+  all via the SAME `bind_expr` method `bind_delete` uses, against the
+  target's schema (aliased if the UPDATE names one). A subquery ANYWHERE
+  — in the WHERE clause OR a SET value (task 001's spike confirmed even a
+  correlated scalar subquery as a SET value parses to a plain `Expr`) —
+  BINDS successfully but is refused right after, by name: this epic's
+  subquery-free evaluator (`physical::operators::evaluate_expr`, no
+  `SubqueryExecutor`) cannot execute it, mirroring `bind_delete`'s own
+  "refuse cleanly and early" discipline exactly.
+- **`ExecutionContext::update_native_table`** (`&mut self`, mirrors
+  `delete_from_native_table`'s shape): target must already be a
+  REGISTERED native table; calls `Binder::bind_update` directly (NOT
+  `bind()` + a physical plan — no `LogicalPlan`/`PhysicalOperator`
+  pipeline involved at all) then drives `native_update::
+  update_native_table`. Re-registers the table afterward so the update is
+  visible to a subsequent query in the same session. `sql()` gained the
+  same UPDATE-refusal guard it already has for CREATE TABLE/INSERT/
+  DELETE. Wired into the REPL alongside the other three's existing
+  dispatch.
+- **Verified — not just designed for — no partial-state visibility**
+  (this task's own highest-priority acceptance criterion): a real
+  concurrent-reader test (`tests/native_update_tests.rs`) races 60
+  back-to-back UPDATEs (alternating a marker column between two values,
+  matching every one of a 1500-row table's rows each time) against a
+  tight polling loop using the REAL `TableProvider::scan` read path (task
+  003's own deletion-aware `NativeTable::scan`, not the non-production
+  `native_write::read_back` dump) on a genuine multi-threaded tokio
+  runtime (`flavor = "multi_thread"`, needed because neither side's I/O
+  is truly async — both are blocking `std::fs` work wrapped in async
+  fns, so a default single-threaded runtime would let the reader's tight
+  loop starve the writer task entirely; confirmed empirically — the test
+  hung indefinitely under the default flavor before this fix). Every
+  single poll (many hundreds across 5 repeated runs, 0 flakes) observed
+  EITHER exactly 1500 rows of the pre-update marker OR exactly 1500 of
+  the post-update one — never a row-count dip, never a mix. A second,
+  independent, non-timing-dependent angle on the same property: each
+  UPDATE call is asserted to bump `snapshot.version` by EXACTLY 1 — a
+  regression to two sequential self-publishing calls (the exact
+  anti-pattern task 001's design spike forbids) would deterministically
+  show as a jump of 2 for one statement, caught with zero timing
+  dependence at all.
+- **Cell-exact validated** (`tests/native_update_tests.rs`): a
+  self-referential `SET total = total * 1.1` matches an independently-
+  computed CASE-expression reference over the ORIGINAL source, including
+  for rows the SET did NOT touch; a zero-match UPDATE is a byte-for-byte
+  no-op; an all-rows UPDATE (no WHERE) via a real dictionary-encoded
+  TPC-H column round-trips correctly (manifest type unregressed); two
+  overlapping sequential UPDATEs compose exactly as if run in order (no
+  duplicate/lost rows — the `live_matched_rows` fix above, exercised for
+  real); a cross-segment UPDATE (CTAS + INSERT-built two-segment table)
+  applies to the correct segments only; `sql()`'s refusal guard;
+  unregistered-table and non-native-table error paths; INSERT, DELETE and
+  a fresh CTAS all still work correctly in a session that has already
+  performed an UPDATE (no regression).
+
+A live example (real result, captured 2026-08-24, `repl --tpch
+data/tpch-1mb`, 1500-row `orders` table):
+```
+Created table 'orders_native' (1500 rows, 1 segment(s), now at version 1) in 5.140ms
+SELECT o_orderkey, o_totalprice FROM orders_native WHERE o_orderkey <= 3 ORDER BY o_orderkey;
+-- 1 | 360828.2497833599
+-- 2 | 362430.2868490354
+-- 3 | 350094.35363558686
+UPDATE orders_native SET o_totalprice = o_totalprice * 1.1 WHERE o_orderkey <= 500;
+-- Updated 500 row(s) in 'orders_native' (0 segment(s) dropped, 1 segment(s) added, now 1500 row(s) total, version 2) in 0.974ms
+SELECT o_orderkey, o_totalprice FROM orders_native WHERE o_orderkey <= 3 ORDER BY o_orderkey;
+-- 1 | 396911.07476169587   (== 360828.2497833599 * 1.1)
+-- 2 | 398673.315533939
+-- 3 | 385103.78899914556
+SELECT COUNT(*) FROM orders_native;  -- 1500 (unchanged)
+```
+
+### Mutation: memory safety + concurrency/crash-safety adversarial verification (native-tables-mutation epic, task 005, 2026-08-24)
+
+Six adversarial scenarios, each given a REAL, evidenced verdict (not design
+review) per `.claude/epics/native-tables-mutation/005.md`'s Outcome section
+— full numbers, methodology, and code pointers there; summary here.
+
+- **Deletion vector growth**: a single large DELETE stays cheap (bounded by
+  the per-segment `Vec<u32>` + the empty-segment-drop exception). The
+  named "many segments, each lightly touched" shape (task 001's own
+  residual-risk worry) was built for real (2573 segments via 3000
+  separate Append/Delete/Update calls) and hit with one broad ~1% DELETE:
+  **~13.1-13.7 bytes per `deleted_rows` JSON entry, stable across a
+  313-segment and a 2573-segment run** — extrapolated (not re-measured at
+  literal scale) to task 001's own "1000 segments x 1,000,000 rows x 1%
+  deleted" scenario: **~131MB**, larger than task 001's "tens of MB"
+  guess. Judged a real-but-not-urgent, well-quantified residual risk
+  (current realistic scales stay in the sub-2MB range) rather than fixed
+  in this task — task 001's own named forward-compatible escape hatch
+  (compact `deleted_rows` on-disk encoding) needs a backward-compat
+  migration story big enough to warrant its own task, not a same-task fix.
+- **Sequential-mutation growth**: a REAL mixed sequence (Append/Delete/
+  Update interleaved, not just repeated inserts) up to 2573 segments/4.6M
+  rows stays fully correct throughout (`scan()` and `statistics()` agree
+  exactly at every checkpoint) and manifest size grows perfectly linearly
+  (~413 bytes/segment, no super-linear blowup). `scan()`/`statistics()`
+  wall time stay roughly linear in segment count (no cliff) — **but the
+  cumulative cost of a LONG mutation SEQUENCE is O(N²)**, a genuine new
+  finding beyond the letter of the acceptance criteria: per-mutation cost
+  grew from ~0.44ms/op near-empty to ~8.8ms/op at 2500+ segments (every
+  mutation re-reads + re-writes the WHOLE `_manifest.json`), because
+  compaction is out of this epic's scope by design (task 001 Decision 3).
+  Named as a residual risk with concrete numbers for a future compaction
+  task, not fixed here (fixing it for real means building compaction).
+  Open file descriptors stayed flat (10) for the entire 3000-op run —
+  confirmed no handle leak.
+- **Empty-segment-drop exception effectiveness**: measured for real, not
+  assumed — 5 fully-tombstoned segments were confirmed dropped from the
+  manifest, and the counterfactual "what it would have cost had the
+  exception not fired" was computed by literally serializing the
+  actual retained-shape `Segment` value: **~9,114 bytes/segment that
+  would have persisted, vs. 0 actual** (~45.6KB saved across the 5
+  segments tested).
+- **Single-writer lock under a REAL `kill -9`**: a genuine two-process
+  test (`examples/native_crash_kill_check.rs`) drives the REAL
+  `native_write::write_append_segments`/`publish_manifest_update`
+  building blocks (not a lock-only synthetic harness): a child writes new
+  segment file(s), signals readiness, and gets a real external `kill -9
+  <pid>` subprocess sent at it (confirmed reaped with `signal=Some(9)`).
+  **PASS, 6/6 repeated runs, zero flakes**: the lock is immediately
+  re-acquirable (kernel auto-release), `_manifest.json` is byte-for-byte
+  untouched, the new segment file is a harmless unreferenced orphan, the
+  table reads back as EXACTLY its pre-crash state via the real
+  `TableProvider::scan()`/`statistics()` path, and the table is still
+  normally writable afterward. A separate `QE_CRASH_MODE=concurrent` run
+  (two real child processes racing a real Append against the same table)
+  confirms exactly one succeeds and the other gets a clean, named
+  `QueryError::Storage` ("another writer already holds the lock...") —
+  never silent data loss, never corruption — also 3/3 clean runs.
+- **Crash safety mid-mutation**: the SAME `kill -9` test above IS this
+  verdict — a writer killed strictly between writing new segment files
+  and the final manifest rename leaves the table in EXACTLY its
+  pre-mutation state, never a partial one.
+- **Carried-forward 5.3GB SQL-path finding (from task 002)** — given a
+  real verdict, not left silent: (a) **CONFIRMED BOUNDED, not unbounded
+  in source size** — SF=10 (60M rows) measured 5.38GB peak RSS, SF=100
+  (600M rows, 10x) measured 5.86GB (+9% for 10x data): the partition
+  COUNT (capped at `rayon::current_num_threads()`), not row count, drives
+  it, since `StreamingParquetScanExec`'s row-group size is ~constant
+  (~1,048,576 rows) regardless of scale. (b) **CONFIRMED it does NOT fail
+  safely before this task's fix**: a configured `--memory-limit` had
+  ZERO effect on actual usage (proved by setting it to 1GB while the
+  query still used 5.4GB), and under a real tight cgroup cap the process
+  was OOM-killed by the KERNEL (`journalctl -k`: "Memory cgroup out of
+  memory: Killed process ... (native_append_m)") — the identical failure
+  class phase 1 task 006 found and fixed for `NativeTable::scan()`. (c)
+  **FIXED with a small, scoped, root-cause mitigation**: `ExecutionContext
+  ::create_table_as_select`/`insert_into_native_table` (`src/execution/
+  context.rs`) now merge their per-partition streams via
+  `bounded_partition_merge` (`futures::stream::iter(streams).
+  flatten_unordered(Some(limit))`, `limit` from `QE_INSERT_MERGE_
+  CONCURRENCY`, default 8) instead of unconditionally-concurrent
+  `futures::stream::select_all` — bounding how many partition readers'
+  decoded-row-group working sets can be resident at once. **Measured
+  effect: SF=10 5.38GB -> 1.63GB (-70%), SF=100 5.86GB -> 1.67GB (-71%,
+  and now even MORE tightly scale-invariant), wall time NEUTRAL TO
+  FASTER (SF=10 6.54s -> 6.29s; SF=100 100.3s -> 77.8s, -22%)** — a real
+  win, not a slow-but-safe tradeoff. Zero correctness regression (all 21
+  pre-existing INSERT/CTAS integration tests unchanged and green, plus 3
+  new unit tests for the merge helper itself). A 2GB and even a 1GB cgroup
+  cap now complete successfully (were both OOM-kills before); a 512MB cap
+  still gets SIGKILL'd — a real but much narrower residual gap (this path
+  still has no formal pre-flight admission check consulting
+  `--memory-limit`, unlike `NativeTable::scan()`'s `check_scan_budget` —
+  named as a follow-up, not attempted here: a reliable estimate for THIS
+  path's true need is harder to derive than the read-path's clean
+  "total on-disk bytes" proxy, and a wrong heuristic risks false
+  refusals, a new kind of bug).
+
+Reproduce: `scripts/claude-safe-build.sh cargo build --release --example
+native_mutation_growth_check --example native_crash_kill_check --example
+native_append_memory_check`, then run each (`QE_MEM_CHECK_MODE=sql
+QE_MEM_CHECK_SOURCE=sf100 QE_MEM_CHECK_LIMIT_GB=60 /usr/bin/time -v
+./target/release/examples/native_append_memory_check` for the SF=100 SQL
+path leg; `SAFE_BUILD_MEM=2G` prefix for the tight-cap legs;
+`QE_CRASH_MODE=concurrent` for the two-writer leg).
+
+### Mutation: QA close-out (native-tables-mutation epic, task 006, 2026-08-24)
+
+Final task of the epic. Full suite green in all four feature
+combinations, cell-exact validation of INSERT/DELETE/UPDATE composed
+together at REAL scale (SF=10 `orders`, not the ~1500-row fixtures
+tasks 002/003/004 individually used), M1/M2 distributed gates
+re-confirmed, never-mutated-table performance parity re-confirmed
+against phase 1's own recorded numbers, and a mutated table's read-
+performance cost measured and explained. Also found and FIXED three
+real, pre-existing bugs (none mutation-specific — all three reproduce
+on phase 1's own never-mutated fixtures) and found one more, deeper bug
+that was deliberately NOT fixed (see below). Full detail, including
+per-bug code pointers and every reproduction command:
+`.claude/epics/archived/native-tables-mutation/006.md`'s Outcome
+section.
+
+**Three real bugs found and fixed, one root cause, one fix pattern.**
+`SELECT ... FROM <table with a Dictionary-coerced string column>
+ORDER BY ...` (or a large-enough JOIN carrying one) failed outright —
+`Arrow error: Invalid argument error: column types must match schema
+types, expected Utf8 but found Dictionary(Int32, Utf8)` — whenever
+`ExternalSortExec`'s or `SpillableHashJoinExec`'s SPILL path engaged
+(the ALWAYS-used spillable operators, per this engine's memory-safety
+rule). Root cause: their declared output schema comes from
+`plan_schema_to_arrow`, which has no Dictionary representation (a
+string column is always reported as plain `Utf8`) — three OTHER call
+sites in this codebase already carry an established fix for exactly
+this "declared vs actual type" mismatch (`ProjectExec::project_batch`,
+`MemoryTableExec::execute`'s `rewrap`, `hash_join.rs`'s
+`batch_with_actual_types`), but the SPILL-specific code in
+`src/physical/operators/spillable.rs` had none of them — its in-memory
+counterpart was already safe (it delegates to the already-fixed
+operators). Never triggered before because no existing test/benchmark
+combined "large enough to spill" with "carries a Dictionary-coerced
+column" — this task's real-scale validation was the first time both
+conditions held at once, for BOTH the sort operator (a 15M-row `ORDER
+BY`) and the join operator (Q12's spilling INNER join, a pre-existing,
+already-documented characteristic — see Current limitations below).
+Fixed at all three call sites it was missing from
+(`ExternalSortExec::flush_run`, `ExternalSortExec::
+{build_merged_batch,build_merged_batch_final}`, `SpillableHashJoinExec`
+'s `create_joined_batch`) with a new local `batch_with_actual_types`
+helper (mirrors `hash_join.rs`'s function of the same name — this file
+follows the SAME local-duplication convention that function and
+`scan.rs`'s `rewrap` already established, rather than a new cross-
+module dependency for a three-line function). A SEPARATE, genuinely
+distinct bug in the same file was found and fixed alongside:
+`ExternalSortExec`'s k-way spill-merge held `(run_idx, row_idx)`
+references into a run's CURRENT in-memory Parquet batch that went
+stale — silently wrong data, or an out-of-bounds panic ("the len is N
+but the index is N") — the instant that batch was reloaded (any real
+spill run over `MERGE_BUFFER_ROWS` = 8192 rows, the ordinary case, not
+an edge case) before pending references were flushed; fixed by
+flushing `output_rows` before every buffer transition, not only the
+pre-existing periodic size-based flush. Four new regression tests pin
+all of this: `external_sort_spill_path_handles_dictionary_encoded_columns`,
+`k_way_merge_survives_a_run_needing_more_than_one_buffer_load`,
+`create_joined_batch_handles_dictionary_encoded_columns` (all in
+`spillable.rs`'s own test module).
+
+**A fourth, deeper bug found — NOT fixed, documented instead (a
+deliberate "stop and document" judgment call, not an oversight).** Once
+the crash above was fixed, TPC-H Q12 at SF=10 against a native table
+completes but returns a WRONG ANSWER (`high_line_count` exactly
+2x-inflated: engine 707644 vs an independent DuckDB oracle's 353822)
+and takes ~320 SECONDS (vs ~150-350ms for every other query). This
+SUPERSEDES this doc's own prior claim (native-tables-foundation task
+008) that a spilling native-table join is "always a safe, clean refusal
+or a slow-but-correct completion — never wrong data": that was only
+true because the schema-mismatch crash above always fired FIRST, before
+the join's own spill/partition/probe/merge sequence ever ran far enough
+to expose this SECOND, independent, more severe bug. Read
+`SpillableHashJoinExec::execute_spill_path`/`build_with_partitioning`/
+`probe_with_spilling`/`process_spilled_partition` end to end looking for
+a duplicate-counting mechanism (the clean ~2x ratio is diagnostic); the
+build/probe partition-vs-spill bookkeeping reads as mutually-exclusive-
+by-construction on inspection, and nothing in it is Dictionary-specific
+— meaning this is a genuinely SEPARATE, deeper bug in the partition/
+spill algorithm itself (or possibly its caller), not another instance of
+the same "declared vs actual type" class, and root-causing it safely
+would need materially more investigation than the three fixes above
+(each was a single missing schema-reconciliation call). Deliberately NOT
+attempted under time pressure — an unconfident fix risks leaving wrong
+answers that no longer even crash to reveal themselves, which is worse
+than the status quo. Also deliberately did NOT revert the three schema
+fixes to "restore" the crash as an accidental safety net: the
+duplication mechanism is not Dictionary-specific, so it is reachable by
+ANY sufficiently large spilling INNER join, native table or not —
+reverting would only narrow, not close, the exposure, while also
+regressing the (independently verified, cell-exact-correct) 15M-row
+`ORDER BY` case this task's own validation depends on. Recommendation
+for whoever picks this up: the native-tables-foundation epic's own
+"streaming rewrite of the join spill path" future-work item should be
+treated as a P0 correctness bug now, not merely a performance one.
+
+**Independent re-verification (2026-08-24, orchestrating session, before
+merge to main).** Reproduced this exact query twice from scratch against
+freshly-built native tables (`CREATE TABLE ... AS SELECT` from
+`data/tpch-10gb` orders/lineitem via `serve --tables --memory-limit 40G`,
+bypassing the small REPL default budget): once against a never-mutated
+table, once against the same table after a real `DELETE FROM lineitem_v
+WHERE l_orderkey % 1000 = 0` (60,266 rows removed, no segments dropped).
+**The extreme slowness reproduced identically both times** (150.0s and
+150.5s — same order of magnitude as the original ~320s, vs. 150-350ms for
+every other query; this part of the finding is solid). **The 2x-inflated
+wrong answer did NOT reproduce either time** — both runs returned
+`high_line_count` 353822/352224, cell-exact against a freshly-computed
+DuckDB oracle (the mutated run's `low_line_count` shifted by exactly the
+expected amount for the rows actually deleted — itself a small additional
+correctness confirmation of the DELETE mechanism under this exact join
+shape). This does **not** disprove the wrong-answer finding — the
+reported ratio was a suspiciously exact 2.0000x, which reads as a real,
+systematic duplication mechanism under SOME condition, not measurement
+noise — but it narrows where to look: a plain post-CREATE `DELETE` was
+not sufficient to trigger it in two independent attempts, so the trigger
+(if the original run's exact condition wasn't itself a fluke of that run's
+specific partition-count/memory-pressure state) more likely depends on
+the full `CREATE→INSERT→DELETE→UPDATE` segment/deletion-vector shape the
+original finding's own cell-exact validation used (not yet re-attempted),
+or on non-deterministic partition-count selection under spill pressure.
+**Verdict: treat both halves as a live, P0, open risk** — the slowness is
+confirmed-severe on its own regardless of the correctness question, and
+the wrong-answer risk is unconfirmed-but-uncleared, not stood down.
+Whoever picks up the P0 follow-up should start from exactly this
+narrowed reproduction matrix rather than re-deriving it.
+
+**Full suite, all four feature combinations**, final state (all fixes +
+all new tests included), through `scripts/claude-safe-build.sh`:
+
+| combo | passed | failed | ignored |
+|---|---|---|---|
+| default | 1188 | 0 | 1 |
+| lance | 1253 | 0 | 2 |
+| gpu | 1188 | 0 | 1 |
+| pulsar | 1191 | 0 | 1 |
+
+**Cell-exact validation at real scale** (`examples/
+native_mutation_cell_exact_check.rs` + `scripts/
+native_mutation_cell_exact_check.py`): CREATE (12,000,000 rows) →
+INSERT +3,000,000 (15,000,000) → DELETE −492,202 (14,507,798) → UPDATE
+2,071,620 rows recomputed in place (14,507,798, unchanged by design,
+matching UPDATE's own semantics) against real SF=10 `orders` (not the
+~1500-row fixtures individual tasks used) → final `SELECT * ... ORDER
+BY o_orderkey` (the exact shape that hit the schema-mismatch bug
+above). `scripts/native_mutation_cell_exact_check.py` independently
+recomputed the IDENTICAL 4-statement sequence as REAL DuckDB DML
+against the SAME source parquet (row counts agreed exactly at every
+step) and compared every cell via a DuckDB `EXCEPT` set difference in
+both directions: **PASS — 0 rows different either direction,
+14,507,798 rows × 9 columns, cell-exact.**
+
+**Never-mutated-table performance parity** (`data/tpch-10gb-native`,
+pristine, `scripts/native_bench_compare.py`, Q12 excluded — the fourth
+bug above, unrelated to mutation or this check): **21/21 cell-exact,
+5.667s total, 1.27x vs DuckDB-parquet** — matches phase 1's own recorded
+5.324s/1.23x within this program's established run-to-run noise band.
+Confirms the new deletion-vector-consultation code path costs nothing
+when a segment has nothing to filter (the empty-`deleted_rows` fast
+path holds).
+
+**Mutated-table (non-empty deletion vector) regression, reported
+honestly, not hidden.** Same 21 queries against a hardlink-mutated copy
+of the SAME warehouse (`examples/native_post_mutation_checks.rs`:
+`lineitem`'s deletion vector non-empty via `l_discount > 0.09`, ~10% /
+5,997,226 rows, spread near-uniformly across all 58 segments — DELETE
+never touches the other 7 tables' hardlinked copies): **15.017s total,
+3.35x vs DuckDB-parquet — a real 2.65x slowdown vs the SAME
+never-mutated warehouse.** Root-caused, not just measured: Q06's own
+filter (`l_discount BETWEEN 0.05 AND 0.07`) is DISJOINT from the delete
+predicate (`> 0.09`), so no deleted row could ever have mattered to
+Q06's ANSWER — yet its wall time still ~4.6x'd (111ms → 506ms),
+isolating the cost to the deletion-vector CONSULTATION itself (paid
+per-batch, on every scanned row, at the single choke point inside
+`scan()`/`scan_with_filter()`), not to any change in query selectivity.
+Because deletions are spread near-uniformly (not concentrated), the
+per-batch "no deleted position in this batch's range" fast-path skip
+almost never fires. Queries that barely touch `lineitem` (Q02, Q11,
+Q16, Q22) show flat-to-negligible regression, confirming the cost
+scales with rows actually scanned from the mutated table, not a fixed
+per-query tax — a REAL, BOUNDED, well-explained cost, exactly the
+honest-reporting bar this task set for itself.
+
+**Dense-direct-address and GPU offload, post-mutation** (`examples/
+native_post_mutation_checks.rs`, `examples/native_gpu_check.rs`): both
+still fire correctly. Dense-direct: native post-delete group count
+(14,594,694) exactly matches an independent parquet+equivalent-filter
+cross-check computed via the engine's generic/parquet code path (a
+materially different path from the native dense-direct one);
+`AGG_TIMING=1` confirms the `(native)` fast-path tag fires on both
+native legs (47.5ms / 303.5ms scan+accumulate). GPU offload: still
+engages (correct row counts, VRAM growth confirmed on the pristine
+leg — cold iter1 ~2.3s, warm iters ~5-7ms, exactly matching task 008's
+own documented numbers) but its warm speedup is FULLY MASKED by the
+same deletion-vector overhead once the table is mutated — a clean 2×2
+CPU/GPU × pristine/mutated matrix (Q6, warm, ms):
+
+| table | CPU | GPU | speedup |
+|---|---|---|---|
+| pristine (never-mutated) | ~106 | ~6 | **~18x**, matches task 008's own documented finding exactly |
+| mutated (10% deletion vector) | ~445 | ~415 | **~1.07x — effectively none** |
+
+A never-mutated table pays none of this (its dense-direct and GPU
+numbers match already-published pristine numbers exactly) — the cost is
+real but confined to tables that have actually been mutated, exactly as
+this epic's own design intends.
+
+**M1/M2 distributed gates**: both PASS (`scripts/cluster_local.sh
+verify` / `verify-m2`, re-confirmed with the FINAL default binary, all
+four fixes and all new tests included) — nothing this epic touched
+broke existing distributed behavior for parquet/Iceberg/Lance tables.
+
+**G1-G5 (this epic's own success criteria) — verdicts with evidence**:
+- **G1** (INSERT/DELETE/UPDATE work end-to-end through SQL, cell-exact
+  vs an independently computed reference) — **MET**. Real SF=10 scale
+  (14,507,798 rows), independently verified against DuckDB DML over the
+  same source parquet, 0 mismatches.
+- **G2** (no performance cliff for the still-dominant read-only query
+  shapes, for a table that has never been mutated) — **MET**. 1.27x
+  matches phase 1's own 1.23x within noise; dense-direct-address and GPU
+  offload both confirmed still firing at their pre-epic numbers.
+- **G3** (memory safety holds under adversarial testing) — **MET**
+  (task 005: two real findings quantified with concrete numbers —
+  deletion-vector JSON density at very large segment counts, O(N²)
+  cumulative manifest-rewrite cost across a long mutation sequence —
+  both named residual risks for a future compaction epic, not fixed
+  here by design; one real SQL-path OOM found AND fixed, 70-71% RSS
+  reduction).
+- **G4** (full suite green in all feature combinations; M1/M2 gates
+  unaffected) — **MET**. All 4 combinations green (table above, 0
+  failures anywhere); M1 + M2 PASS via real 3-process clusters.
+- **G5** (single-writer assumption enforced, not just documented; a
+  concurrent write fails cleanly and namedly) — **MET** (task 001/005:
+  `std::fs::File::try_lock()`, verified live with a real cross-process
+  test AND a real `kill -9` mid-mutation, 6/6 runs, zero flakes).
+
+Reproduce: `scripts/claude-safe-build.sh cargo build --release --example
+native_mutation_cell_exact_check --example native_post_mutation_checks`
+then run `native_mutation_cell_exact_check` + `.venv/bin/python
+scripts/native_mutation_cell_exact_check.py` (cell-exact validation);
+`native_post_mutation_checks` (builds the mutated warehouse the
+benchmark commands below need, and runs the dense-direct cross-check);
+`.venv/bin/python scripts/native_bench_compare.py --native-dir
+data/tpch-10gb-native --source-dir data/tpch-10gb --iceberg-dir
+data/tpch-10gb-iceberg --sf 10 --memory-limit 40G --iterations 2
+--queries 1,2,3,4,5,6,7,8,9,10,11,13,14,15,16,17,18,19,20,21,22`
+(never-mutated leg; Q12 excluded per the fourth-bug note above) and the
+same command pointed at the mutated warehouse directory with
+`--no-cell-exact --no-iceberg` (mutated leg — cell-exact is skipped
+there because the DuckDB oracle reads the ORIGINAL un-mutated parquet,
+so it would legitimately mismatch; correctness of mutation itself is
+what the cell-exact validation above already established).
+
 ### Current limitations (explicit, matching this epic's own G5 boundary and the PRD's phase plan)
 
-- **No mutation.** `INSERT`/`UPDATE`/`DELETE` are not implemented —
-  `Statement::Insert` falls through the binder's catch-all
-  `NotImplemented` exactly as before this epic. A "load" is always a
-  full-table replace (`write-native --mode overwrite` / re-running
-  `CREATE TABLE ... AS SELECT`). Phase 2 of the PRD.
 - **No filter/row-group pruning at scan level.** `NativeTable::
   scan_with_filter` has no predicate pushdown at all; every query reads
   every active segment in full and relies on a post-scan `FilterExec` for
-  correctness (always cell-exact — never a wrong answer). This has a
-  real, measured cost at scale, found by this epic's own QA close-out
-  (task 008): parquet's row-group statistics let it skip most of the
-  work for date-range-filtered queries before a join ever sees those
-  rows; native tables cannot, so their post-filter join inputs are
-  larger. For 3 of 22 TPC-H queries (Q4, Q12, Q13 — at scale-dependent
-  thresholds: only Q12 at SF=10, all three at SF=100) this pushes a
-  join's build side across the `SpillableHashJoinExec` spill threshold,
-  which (a pre-existing characteristic of that operator, not introduced
-  by this epic — see its own doc comment) fully materializes the build
-  side before deciding to spill, then spills as many small Parquet
-  files, and refuses outright rather than guessing when a non-INNER
-  join's build side is the one that's oversized. Root-caused with a live
-  `gdb` thread dump (caught a thread inside `parquet::column::writer`
+  correctness. This has a real, measured cost at scale, found by phase
+  1's own QA close-out (task 008): parquet's row-group statistics let it
+  skip most of the work for date-range-filtered queries before a join
+  ever sees those rows; native tables cannot, so their post-filter join
+  inputs are larger. For 3 of 22 TPC-H queries (Q4, Q12, Q13 — at
+  scale-dependent thresholds: only Q12 at SF=10, all three at SF=100)
+  this pushes a join's build side across the `SpillableHashJoinExec`
+  spill threshold, which (a pre-existing characteristic of that
+  operator, not introduced by either epic — see its own doc comment)
+  fully materializes the build side before deciding to spill, then
+  spills as many small Parquet files. Root-caused with a live `gdb`
+  thread dump (caught a thread inside `parquet::column::writer`
   mid-query — direct evidence, not inference) and filesystem evidence
   (`/tmp/query_engine_spill/join_*/build_*.parquet`, hundreds of files,
-  actively growing). Always a safe, clean refusal or a slow-but-correct
-  completion — never wrong data. Closing this for real means either
-  scan-level pruning for native tables or a streaming rewrite of the
-  join spill path — both real, separately-scoped future work, not a
-  same-task fix.
-- **No distributed participation yet.** A native table registers and
-  reads correctly on a single `serve` node (including via `--tables`
-  auto-detection), and `distributed_splits`/`shard_by_splits` are real,
-  non-`None` implementations (one `Split` per segment) — but multi-node
-  SCATTER/GATHER planning for native tables is explicitly out of scope
-  for this epic (its own G5 criterion only requires NOT breaking existing
-  parquet/Iceberg/Lance distributed behavior, confirmed by the M1/M2
-  gates) and has not been validated on a real cluster.
+  actively growing).
+  **CORRECTION (native-tables-mutation epic, task 006, 2026-08-24):
+  phase 1's own claim directly above this line — "always a safe, clean
+  refusal or a slow-but-correct completion — never wrong data" — is NOT
+  always true, and is superseded by this finding.** Task 006 found and
+  fixed a real, previously-masked crash in this exact spill path
+  (Dictionary-vs-declared-schema mismatch — see "Mutation: QA close-out"
+  above for the full story); once that crash was fixed, Q12 at SF=10
+  was revealed to complete but return a WRONG ANSWER (`high_line_count`
+  exactly 2x-inflated) after ~320 SECONDS — a SEPARATE, deeper,
+  NOT-YET-ROOT-CAUSED bug in `SpillableHashJoinExec`'s partition/spill
+  algorithm itself, found but deliberately NOT fixed (judged too large
+  for a same-task fix; see task 006's Outcome for the full investigation
+  and reasoning). Closing this for real now has three real levers, not
+  two: scan-level pruning for native tables, a streaming rewrite of the
+  join spill path (both already-named, separately-scoped future work),
+  or — now the more urgent one — root-causing and fixing the
+  duplicate-counting bug in the EXISTING partition/spill algorithm,
+  which affects ANY sufficiently large spilling INNER join
+  (Parquet/Iceberg/Lance too, not native-table-specific) and should be
+  treated as a P0 correctness bug by whichever of the three a future
+  epic picks up first.
+- **No compaction** (native-tables-mutation epic, confirmed OUT OF SCOPE
+  by design — task 001's Decision 3, not merely deferred incidentally). A
+  deletion vector is correctness-preserving indefinitely — reads always
+  apply the filter; they just do increasing filtering work as deletes
+  accumulate. Named, honest cost: segment count grows by at least one
+  per `Append`/`INSERT` statement forever (no merging of small
+  segments), and disk space from partially-deleted rows is never
+  physically reclaimed. One narrow, IN-SCOPE exception, not full
+  compaction: a segment tombstoned to 100%
+  (`deleted_rows.len() == row_count`) is dropped from the manifest
+  outright (task 003) — measured effective, not just designed for
+  (5/5 fully-tombstoned segments actually dropped in task 005's
+  adversarial run, ~9.1KB/segment saved vs. what would have persisted
+  without the exception). Task 005's adversarial testing found and
+  quantified two residual risks a future compaction epic should size
+  against — real, but neither urgent at this program's current scale
+  nor fixed in this epic:
+  - **Deletion-vector encoding density at very large segment counts.**
+    A broad, shallow DELETE (many segments, each lightly touched) costs
+    ~13.1-13.7 bytes per `deleted_rows` JSON entry (measured, stable
+    across a 313-segment and a 2573-segment run). Extrapolated — not
+    literally re-measured at this scale — to task 001's own original
+    "1000 segments x 1,000,000 rows x 1% deleted" worry: ~131MB, larger
+    than that design-time "tens of MB" guess. Every scale this program's
+    own fixtures/benchmarks actually reach today stays sub-2MB.
+  - **O(N²) cumulative manifest-rewrite cost across a long mutation
+    sequence.** Every single Append/Delete/Update unconditionally
+    re-reads AND re-writes the WHOLE `_manifest.json`, so per-mutation
+    latency grows roughly linearly with segment count — measured
+    ~0.44ms/op near-empty to ~8.8ms/op at 2500+ segments across a real
+    3000-operation mixed Append/Delete/Update sequence. Fine at the
+    scales exercised so far; a real ceiling for a table that
+    accumulates thousands of small mutations over its lifetime without
+    ever compacting.
+- **Single-writer only** (native-tables-mutation epic task 001's
+  Decision 5). No lock manager, no WAL, no MVCC — a mutation
+  (INSERT/DELETE/UPDATE) holds an exclusive `std::fs::File::try_lock()`
+  on a sibling `<table>.lock` file for its whole
+  read-identify-write-publish span. A concurrent writer gets an
+  immediate, clean, named `QueryError::Storage` — never blocks, never
+  corrupts (verified live: two real OS processes racing an Append,
+  exactly one succeeds, 3/3 runs). Process-crash-safe: the lock is a
+  kernel-managed `flock`, released automatically the instant a holder
+  dies for ANY reason including `SIGKILL` — verified with a real
+  external `kill -9` sent mid-mutation, 6/6 runs, zero flakes, manifest
+  byte-for-byte unchanged and the table immediately writable again
+  afterward. Explicit scope boundary, matching — not narrowing — phase
+  1's own: this is NOT `fsync`/power-loss durability beyond the OS's own
+  page-cache behavior (neither this epic's atomic single-file manifest
+  rename nor phase 1's own directory-level `publish_table_dir` ever call
+  `fsync`/`sync_all`). Readers never lock (writer-vs-writer only).
+  **Two distinct atomic-publish mechanisms, not one** — worth stating
+  plainly so a future reader doesn't assume a single mechanism covers
+  every write mode: `Create`/`Overwrite` still use phase 1's
+  whole-DIRECTORY `rename()` (`native_manifest::publish_table_dir`,
+  unchanged); `Append`/`DELETE`/`UPDATE` use this epic's single-FILE
+  `rename()` of a freshly-written manifest onto the live
+  `_manifest.json` (`native_write::publish_manifest_update` /
+  `write_manifest_atomic`) — chosen because a directory-level replace
+  would silently delete every pre-existing segment an incremental write
+  doesn't re-copy.
+- **No distributed participation yet — for reads OR mutation.** A
+  native table registers and reads correctly on a single `serve` node
+  (including via `--tables` auto-detection), and `distributed_splits`/
+  `shard_by_splits` are real, non-`None` implementations (one `Split`
+  per segment) — but multi-node SCATTER/GATHER planning for native
+  tables is explicitly out of scope for the foundation epic's own G5
+  criterion (only requires NOT breaking existing parquet/Iceberg/Lance
+  distributed behavior, confirmed by the M1/M2 gates) and has not been
+  validated on a real cluster. `INSERT`/`DELETE`/`UPDATE` (this epic)
+  inherit the identical boundary and go further: every mutation
+  entrypoint (`ExecutionContext::insert_into_native_table` etc.) is a
+  single-process, single-`ExecutionContext`-session operation with no
+  distributed-write story of any kind — not reachable from `serve`'s
+  HTTP/Flight surface at all, matching CREATE TABLE's own pre-existing
+  boundary from phase 1.
 - **GPU/RAM/disk tiering and materialized rollups are not built** —
   phases 3 and 4 of the PRD. This epic only kept the GPU-offload identity
-  hook open (above) so that work isn't blocked from zero.
+  hook open (above) so that work isn't blocked from zero; native-tables-
+  mutation task 006 confirmed offload still engages correctly (VRAM
+  growth + correct post-mutation values) against a table with a
+  non-empty deletion vector — see Benchmarks below.
 
 ### Benchmarks (2026-08-23, task 008 close-out)
 

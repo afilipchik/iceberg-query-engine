@@ -70,6 +70,82 @@
 //! read_row_group` task 004's provider will also call, but has none of a
 //! real provider's projection/filter/statistics/streaming machinery. Do not
 //! grow it into one; that is task 004's job.
+//!
+//! # Append: a DIFFERENT atomic-publish model from Create/Overwrite
+//! (native-tables-mutation epic, task 002)
+//!
+//! Everything above this section describes `Create`/`Overwrite`: stage a
+//! COMPLETE new table in a fresh staging directory, then atomically
+//! replace the whole destination directory
+//! (`native_manifest::publish_table_dir` — `remove_dir_all` + `rename`).
+//! Task 001's design spike (`.claude/epics/native-tables-mutation/001.md`'s
+//! Outcome, Decision 4) found this is **not** safely reusable unchanged for
+//! an INCREMENTAL write: `Append` must preserve every pre-existing segment
+//! file, and staging a fresh directory containing only the NEW segments
+//! would make `publish_table_dir` delete every OLD one out from under the
+//! table. `Append` therefore uses a materially different mechanism, built
+//! from three pieces with clean, independently-reusable boundaries — named
+//! here precisely because task 003 (DELETE) and task 004 (UPDATE) are
+//! expected to reuse them directly rather than re-derive this shape:
+//!
+//! 1. [`lock_table_for_write`] — acquires the single-writer advisory lock
+//!    (`std::fs::File::try_lock()`, task 001's Decision 5) on a sibling
+//!    `<table>.lock` file. Non-blocking: a concurrent writer gets a named
+//!    `QueryError::Storage` immediately, never blocks. Must be held for the
+//!    ENTIRE read-modify-write-publish span of a mutation, not just one
+//!    step — the returned [`TableWriteLock`] is an RAII guard (`Drop`
+//!    unlocks; the kernel also releases it automatically if the holding
+//!    process dies for any reason, verified in task 001's SIGKILL test).
+//! 2. [`write_append_segments`] — the NON-PUBLISHING write core: streams
+//!    `stream`'s batches into new segment file(s) written DIRECTLY into the
+//!    LIVE table directory (never a staging directory) under fresh,
+//!    non-colliding segment ids continuing from the existing maximum
+//!    (`existing.segments.iter().map(|s| s.id).max().unwrap_or(0) + 1..` —
+//!    NOT restarting at 0, which `SegmentWriter::new`'s `next_id: 0` would
+//!    silently do if reused as-is). Casts every batch to conform to the
+//!    TARGET's already-declared schema AND dictionary encoding (read from
+//!    the existing manifest, never rediscovered — task 001's Decision 6);
+//!    a real mismatch is a clean, named `QueryError::Type`, never silent
+//!    coercion. Returns ONLY the new `Segment` entries — does not read,
+//!    build, or publish any manifest. A crash (or a schema-mismatch error
+//!    partway through a multi-segment stream) leaves any already-flushed
+//!    segment(s) as harmless, manifest-unreferenced orphans, exactly like
+//!    an abandoned Create/Overwrite staging directory is already inert
+//!    today.
+//! 3. [`publish_manifest_update`] — the NON-LOCKING publish core: given a
+//!    caller-assembled COMPLETE `Vec<Segment>` (existing segments, possibly
+//!    edited, plus any new ones), calls the EXISTING `NativeManifest::
+//!    build` UNCHANGED (it already derives `row_count`/`table_stats` fresh
+//!    from whatever `Vec<Segment>` it's given — no new merge function
+//!    needed) and publishes via `native_manifest::write_manifest_atomic`'s
+//!    single-FILE atomic rename (task 001's Decision 4) — never
+//!    `publish_table_dir`.
+//!
+//! [`append_to_native_table`] composes all three into ONE self-publishing
+//! entrypoint (lock → read existing manifest → write segments → publish →
+//! unlock) and is what [`write_batches_with_options`]`(..., NativeWriteMode
+//! ::Append, ...)` and `ExecutionContext::insert_into_native_table` both
+//! call. A zero-row source (an empty stream, or a stream of only empty
+//! batches) is a legitimate NO-OP — `write_append_segments` returns
+//! `Ok(vec![])`, and `append_to_native_table` skips the publish step
+//! entirely (no version bump, no manifest write) and reports the table's
+//! unchanged current state. This deliberately differs from Create/
+//! Overwrite's `write_staged`, which REFUSES a zero-row source — an INSERT
+//! that happens to match no source rows is not an error the way creating
+//! an empty table from nothing is.
+//!
+//! Task 004 (UPDATE)'s own composition, per task 001's Decision 2: it must
+//! NOT call `append_to_native_table` and task 003's own
+//! `native_delete::delete_from_native_table` (self-publishing entrypoint)
+//! sequentially (two independent publishes leave a real half-done window).
+//! Instead it should call [`write_append_segments`] directly (for the
+//! recomputed rows) and task 003's own non-publishing building blocks —
+//! `native_delete::identify_matching_rows` (with `materialize_rows: true`
+//! to get matched rows' CURRENT values for evaluating SET expressions
+//! against, not just their positions) and `native_delete::apply_deletions`
+//! — fold BOTH results into one `Vec<Segment>`, and call
+//! [`publish_manifest_update`] exactly ONCE — all under a SINGLE
+//! [`lock_table_for_write`] guard held for the whole sequence.
 
 use crate::error::{QueryError, Result};
 use crate::physical::operators::TableProvider;
@@ -83,10 +159,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// How a write relates to whatever already exists at the destination
-/// directory. Mirrors `LanceWriteMode` minus `Append`: this epic's write
-/// path is full-table-replace only ("a load always produces one complete
-/// new snapshot; no partial append/update in this epic" — task 003's own
-/// Description).
+/// directory. Phase 1 (native-tables-foundation) shipped `Create`/
+/// `Overwrite` only, full-table-replace: "a load always produces one
+/// complete new snapshot; no partial append/update in this epic" — task
+/// 003's own Description. `Append` (native-tables-mutation epic, task 002)
+/// adds the first INCREMENTAL write mode: it does NOT go through this
+/// enum's other two variants' staging-directory + whole-directory-rename
+/// flow at all (see [`write_batches_with_options`]'s doc and
+/// [`append_to_native_table`] for why that flow is unsafe to reuse for an
+/// incremental change — it would delete every pre-existing segment file
+/// not part of a fresh staging set).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeWriteMode {
     /// Fail if a native table already exists at the destination.
@@ -97,6 +179,19 @@ pub enum NativeWriteMode {
     /// that exists, is non-empty, and is NOT already a native table — see
     /// the module-level safety note on [`write_batches_with_options`].
     Overwrite,
+    /// Add new rows to an EXISTING native table (task 002,
+    /// native-tables-mutation epic): writes new segment(s) directly into
+    /// the live table directory (fresh, non-colliding segment ids
+    /// continuing from the existing maximum) and publishes ONE new
+    /// manifest via a single-FILE atomic rename
+    /// (`native_manifest::write_manifest_atomic`), never touching or
+    /// removing any pre-existing segment file. Requires the destination to
+    /// ALREADY be a native table (`native_manifest::read_manifest` is a
+    /// clean `Err` otherwise — unlike `Create`/`Overwrite`, `Append` never
+    /// creates a table from nothing). See [`append_to_native_table`] for
+    /// the full mechanism and its lower-level, non-publishing building
+    /// blocks ([`write_append_segments`], [`publish_manifest_update`]).
+    Append,
 }
 
 impl std::str::FromStr for NativeWriteMode {
@@ -105,8 +200,9 @@ impl std::str::FromStr for NativeWriteMode {
         match s.to_ascii_lowercase().as_str() {
             "create" => Ok(Self::Create),
             "overwrite" => Ok(Self::Overwrite),
+            "append" => Ok(Self::Append),
             other => Err(QueryError::NotImplemented(format!(
-                "unknown native table write mode `{other}` (expected create or overwrite)"
+                "unknown native table write mode `{other}` (expected create, overwrite, or append)"
             ))),
         }
     }
@@ -143,11 +239,20 @@ impl Default for NativeWriteOptions {
     }
 }
 
-/// What a write produced.
+/// What a write produced. For `Create`/`Overwrite` this describes the
+/// WHOLE table (every row/segment now present, since both modes fully
+/// replace it). `NativeWriteMode::Append` reuses this same struct when
+/// reached via [`write_batches`]/[`write_batches_with_options`] (for CLI
+/// parity across all three modes), with the SAME "whole table" meaning —
+/// `rows`/`segments` are the table's TOTALS after the append, not just the
+/// delta this call added. Callers that need the delta (e.g.
+/// `ExecutionContext::insert_into_native_table`) should call
+/// [`append_to_native_table`] directly instead, which returns
+/// [`NativeAppendResult`] (both the delta AND the totals).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeWriteResult {
     /// Stable table identity (UUID v4 on first create, preserved across an
-    /// `Overwrite`).
+    /// `Overwrite`/`Append`).
     pub table_id: String,
     /// The snapshot version this write committed (1 for a fresh table).
     pub version: u64,
@@ -155,6 +260,30 @@ pub struct NativeWriteResult {
     pub rows: u64,
     /// Segments written.
     pub segments: usize,
+}
+
+/// What [`append_to_native_table`] produced — the richer, delta-aware
+/// sibling of [`NativeWriteResult`] (see that struct's doc for why
+/// `Append` needs its own shape rather than overloading "written" to mean
+/// two different things across modes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeAppendResult {
+    /// Stable table identity (UUID v4) — unchanged by an Append.
+    pub table_id: String,
+    /// The snapshot version this append committed. Equal to the PRE-append
+    /// version when the source produced zero rows (a no-op, not an error —
+    /// see the module doc's "Append" section).
+    pub version: u64,
+    /// Rows ADDED by this operation (0 for an empty source).
+    pub rows_appended: u64,
+    /// Segments ADDED by this operation (0 for an empty source).
+    pub segments_appended: usize,
+    /// The table's TOTAL row count after this append (== the new
+    /// manifest's `snapshot.row_count`; unchanged from before if this was
+    /// a no-op).
+    pub total_rows: u64,
+    /// The table's TOTAL segment count after this append.
+    pub total_segments: usize,
 }
 
 fn dictionary_data_type() -> DataType {
@@ -203,15 +332,30 @@ pub async fn write_batches(
 ///   caller pointed `--out` at the wrong directory". An empty existing
 ///   directory is adopted silently (the natural "fresh destination"
 ///   case — same spirit as `Create`, since there is nothing to lose).
+/// * `Append`: delegates ENTIRELY to [`append_to_native_table`] — a
+///   completely different mechanism (see the module doc's "Append"
+///   section), not the staging-directory flow below. `out_dir` MUST
+///   already be a native table (a clean `Err` otherwise, never "create
+///   it"). `schema` is IGNORED for this mode: the target schema always
+///   comes from the EXISTING manifest (task 001's Decision 6 — inherit,
+///   never rediscover), never from this parameter, which exists only to
+///   define a FRESH table's schema for `Create`/`Overwrite`. Returns
+///   [`NativeWriteResult`] with `rows`/`segments` as the table's TOTALS
+///   after the append (see that struct's doc); call
+///   [`append_to_native_table`] directly for delta-aware
+///   [`NativeAppendResult`].
 ///
 /// # On error
 ///
-/// The destination directory (`out_dir`) is left completely untouched: a
-/// staging directory is written to first and only atomically published
-/// (`native_manifest::publish_table_dir`) after everything else succeeds.
-/// The staging directory itself is best-effort cleaned up on any error path
-/// (not load-bearing for correctness — a leftover `.<pid>.building` staging
-/// dir next to `out_dir` is inert, never read by anything).
+/// For `Create`/`Overwrite`: the destination directory (`out_dir`) is left
+/// completely untouched — a staging directory is written to first and only
+/// atomically published (`native_manifest::publish_table_dir`) after
+/// everything else succeeds. The staging directory itself is best-effort
+/// cleaned up on any error path (not load-bearing for correctness — a
+/// leftover `.<pid>.building` staging dir next to `out_dir` is inert, never
+/// read by anything). For `Append`: see [`append_to_native_table`]'s own
+/// error-path documentation (new segment files may already be written as
+/// harmless orphans; the existing manifest is always left intact).
 pub async fn write_batches_with_options(
     stream: RecordBatchStream,
     schema: SchemaRef,
@@ -220,6 +364,17 @@ pub async fn write_batches_with_options(
     options: NativeWriteOptions,
 ) -> Result<NativeWriteResult> {
     let final_dir = out_dir.as_ref().to_path_buf();
+
+    if mode == NativeWriteMode::Append {
+        let _ = &schema; // ignored for Append -- see this function's own doc.
+        let result = append_to_native_table(stream, &final_dir, options).await?;
+        return Ok(NativeWriteResult {
+            table_id: result.table_id,
+            version: result.version,
+            rows: result.total_rows,
+            segments: result.total_segments,
+        });
+    }
 
     if mode == NativeWriteMode::Create && final_dir.exists() {
         return Err(QueryError::Storage(format!(
@@ -303,7 +458,12 @@ async fn write_staged(
     })
 }
 
-fn now_ms() -> i64 {
+/// `pub(crate)` (not just `fn`) so `native_delete.rs` (task 003) can reuse
+/// this exact wall-clock helper for its own manifest publishes rather than
+/// duplicating it — both modules need the identical "now, in millis since
+/// the epoch, 0 on a clock error" behavior for `NativeManifest::build`'s
+/// `created_at_ms` argument.
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -465,6 +625,9 @@ impl SegmentWriter {
             row_count,
             byte_size,
             column_stats,
+            // A freshly-written segment (Create/Overwrite/Append) has
+            // never been touched by a DELETE -- always starts empty.
+            deleted_rows: Vec::new(),
         });
         Ok(())
     }
@@ -509,6 +672,421 @@ fn write_ipc_file(path: &Path, schema: &SchemaRef, batches: &[RecordBatch]) -> R
     }
     writer.finish()?;
     Ok(())
+}
+
+// ============================================================================
+// Single-writer lock (task 001's Decision 5) — a sibling advisory lock file
+// per table directory, held for the WHOLE span of an Append (or any future
+// DELETE/UPDATE) mutation, from before the existing manifest is read
+// through the final publish. `std::fs::File::{try_lock, unlock}` are
+// STABLE std methods (since Rust 1.89.0; this repo pins 1.93.0) wrapping
+// `flock(2)` on Unix — confirmed, with a live cross-process SIGKILL test,
+// to release automatically the instant a holding process dies for ANY
+// reason (task 001's Outcome, Decision 5). Zero new Cargo dependency.
+// ============================================================================
+
+/// The sibling lock-file path for `final_dir` — mirrors
+/// `native_manifest::staging_dir_for`'s own sibling-path convention.
+/// Computed once per TABLE (not per attempt/pid): the whole point is one
+/// stable identity every writer contends on, not a fresh one each time.
+pub fn lock_path_for(final_dir: &Path) -> PathBuf {
+    let mut name = final_dir.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    final_dir.with_file_name(name)
+}
+
+/// RAII guard for a native table's single-writer advisory lock. Holds an
+/// exclusive `std::fs::File::try_lock()` for as long as this guard lives;
+/// `Drop` calls `unlock()` so an early `?`-propagated error or a panic
+/// still releases it deterministically. The kernel is the backstop for a
+/// hard crash (SIGKILL): it releases a `flock` the instant the holding
+/// process dies, for any reason, with zero manual cleanup — verified live
+/// in task 001's design spike.
+#[derive(Debug)]
+pub struct TableWriteLock {
+    file: std::fs::File,
+}
+
+impl Drop for TableWriteLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+/// Acquire the single-writer advisory lock for the native table directory
+/// `final_dir` (its sibling lock file, per [`lock_path_for`] — created if
+/// absent). Non-blocking: returns a `QueryError::Storage` naming
+/// `final_dir` IMMEDIATELY if another writer already holds it
+/// (`TryLockError::WouldBlock`), never blocks waiting.
+///
+/// Callers performing a multi-step read-modify-write-publish mutation
+/// (Append here; a future DELETE/UPDATE) must acquire this ONCE, BEFORE
+/// reading the existing manifest, and hold the returned guard for the
+/// mutation's ENTIRE span through the final atomic publish — this is what
+/// prevents a LOST UPDATE between two concurrent writers each computing
+/// their own "next" manifest version from the same starting point (a risk
+/// each individual atomic rename, on its own, cannot close — see
+/// `native_manifest::write_manifest_atomic`'s own doc). Readers never call
+/// this (writer-vs-writer only).
+pub fn lock_table_for_write(final_dir: &Path) -> Result<TableWriteLock> {
+    let lock_path = lock_path_for(final_dir);
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)?;
+    file.try_lock().map_err(|e| {
+        QueryError::Storage(format!(
+            "another writer already holds the lock on native table {} ({}): {e}",
+            final_dir.display(),
+            lock_path.display()
+        ))
+    })?;
+    Ok(TableWriteLock { file })
+}
+
+// ============================================================================
+// Append: non-publishing write core (task 002's reusable building block)
+// ============================================================================
+
+/// Write `stream`'s batches as new segment(s) DIRECTLY into the LIVE
+/// native table directory `table_dir`, conforming to (and validating
+/// against) `target`'s ALREADY-DECLARED schema and dictionary encoding —
+/// never rediscovering either (task 001's Decision 6). Segment ids
+/// continue from `target.segments`'s existing maximum, never restarting
+/// at 0. Returns ONLY the newly written segments' `Segment` entries — does
+/// NOT read, construct, or publish any manifest; the caller (this
+/// module's [`append_to_native_table`], or a future task 003/004 DELETE/
+/// UPDATE composing its own atomic publish) is responsible for folding
+/// these into a full `Vec<Segment>` and calling
+/// [`publish_manifest_update`].
+///
+/// # Schema conformance
+///
+/// Every incoming batch is checked, BEFORE it is written, against
+/// `target.arrow_schema()` BY POSITION — never by the source's own field
+/// names (the same wildcard-qualification trap CTAS already guards
+/// against: `SELECT * FROM src` produces table-qualified field names like
+/// `"src.col"`, and is even more direct to avoid here since the target
+/// schema already exists). For each column position: an EXACT data-type
+/// match is used as-is; a target column declared `Dictionary(Int32,
+/// Utf8)` whose incoming column is plain `Utf8` (the target's own decoded
+/// value type) is cast to match (the ONE sanctioned coercion — the
+/// dictionary decision is inherited, never re-derived from the new
+/// data's cardinality); anything else is a clean, named `QueryError::Type`
+/// naming the column and both types, checked before any write — never
+/// silent coercion, never a generic Arrow error. Callers should
+/// pre-normalize any INCIDENTALLY dictionary-encoded source columns (e.g.
+/// from small-build join gathers or an IPC-sidecar-cached scan) to plain
+/// arrays first — mirrors `create_table_as_select`'s own
+/// `decode_dictionary_batch` step — since "source already
+/// dictionary-encoded but target is plain" is not one of the two accepted
+/// shapes above.
+///
+/// A schema mismatch found on a batch after the first still leaves any
+/// EARLIER batches' segment file(s) written on disk — harmless,
+/// manifest-unreferenced orphans, identical in kind to a crash between
+/// this function and the eventual publish (see the module doc's "Append"
+/// section).
+///
+/// A zero-row source (an empty stream, or a stream of only empty batches)
+/// returns `Ok(vec![])` — never an error (unlike `write_batches`'s
+/// Create/Overwrite path, which refuses zero rows — see the module doc
+/// for why the two modes differ here).
+pub async fn write_append_segments(
+    mut stream: RecordBatchStream,
+    target: &NativeManifest,
+    table_dir: &Path,
+    options: NativeWriteOptions,
+) -> Result<Vec<Segment>> {
+    use futures::TryStreamExt;
+
+    let target_schema = target.arrow_schema();
+    let next_id = target
+        .segments
+        .iter()
+        .map(|s| s.id)
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(0);
+    let mut writer =
+        AppendSegmentWriter::new(target_schema, table_dir.to_path_buf(), next_id, options);
+    while let Some(batch) = stream.try_next().await? {
+        writer.accept(batch)?;
+    }
+    writer.finish()
+}
+
+/// Accumulates incoming (already schema-conformed) batches up to
+/// `options.target_rows_per_segment`, then flushes them as one segment
+/// written directly into the LIVE table directory — the `Append` analogue
+/// of [`SegmentWriter`], with two deliberate differences: the target
+/// schema/dictionary decision is FIXED (from the caller, never derived
+/// from the data) and segment ids start from a caller-supplied `next_id`
+/// rather than always 0. Not `pub`: an internal implementation detail,
+/// like `SegmentWriter`.
+struct AppendSegmentWriter {
+    target_schema: SchemaRef,
+    table_dir: PathBuf,
+    options: NativeWriteOptions,
+    pending: Vec<RecordBatch>,
+    pending_rows: usize,
+    next_id: u32,
+    segments: Vec<Segment>,
+}
+
+impl AppendSegmentWriter {
+    fn new(
+        target_schema: SchemaRef,
+        table_dir: PathBuf,
+        next_id: u32,
+        options: NativeWriteOptions,
+    ) -> Self {
+        Self {
+            target_schema,
+            table_dir,
+            options,
+            pending: Vec::new(),
+            pending_rows: 0,
+            next_id,
+            segments: Vec::new(),
+        }
+    }
+
+    fn accept(&mut self, batch: RecordBatch) -> Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let conformed = cast_batch_to_target(&batch, &self.target_schema)?;
+        self.pending_rows += conformed.num_rows();
+        self.pending.push(conformed);
+        if self.pending_rows >= self.options.target_rows_per_segment {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Flush whatever is currently buffered as one segment. A no-op if
+    /// nothing is buffered (safe to call unconditionally from `finish`).
+    fn flush(&mut self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        // Every pending batch was already cast to `target_schema` exactly
+        // in `accept`, so concatenation against that schema can never trip
+        // on a mismatch here.
+        let concatenated =
+            arrow::compute::concat_batches(&self.target_schema, self.pending.iter())?;
+        self.pending.clear();
+        self.pending_rows = 0;
+
+        let row_count = concatenated.num_rows() as u64;
+        let column_stats = native_manifest::compute_batch_stats(&concatenated);
+
+        let id = self.next_id;
+        self.next_id += 1;
+        let path = native_manifest::segment_full_path(&self.table_dir, id);
+        let slices = ipc_cache::reslice_large(
+            vec![concatenated],
+            self.options.slice_rows,
+            self.options.slice_rows,
+        );
+        write_ipc_file(&path, &self.target_schema, &slices)?;
+        let byte_size = std::fs::metadata(&path)?.len();
+
+        self.segments.push(Segment {
+            id,
+            path: Segment::expected_file_name(id),
+            row_count,
+            byte_size,
+            column_stats,
+            // A freshly-written segment (Create/Overwrite/Append) has
+            // never been touched by a DELETE -- always starts empty.
+            deleted_rows: Vec::new(),
+        });
+        Ok(())
+    }
+
+    /// Flush any remaining buffered rows and return every segment written.
+    fn finish(mut self) -> Result<Vec<Segment>> {
+        if self.pending_rows > 0 {
+            self.flush()?;
+        }
+        Ok(self.segments)
+    }
+}
+
+/// Validate `batch`'s columns against `target_schema` BY POSITION and
+/// return a new batch conforming to it exactly (same schema object, cast
+/// columns where needed) — see [`write_append_segments`]'s doc for the
+/// exact rules. Never called with an empty batch (guarded by the one
+/// caller, `AppendSegmentWriter::accept`).
+fn cast_batch_to_target(batch: &RecordBatch, target_schema: &SchemaRef) -> Result<RecordBatch> {
+    if batch.num_columns() != target_schema.fields().len() {
+        return Err(QueryError::Type(format!(
+            "INSERT/Append: source produced {} column(s) but the target table has {}",
+            batch.num_columns(),
+            target_schema.fields().len()
+        )));
+    }
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (i, target_field) in target_schema.fields().iter().enumerate() {
+        let src_col = batch.column(i);
+        let src_type = src_col.data_type();
+        let target_type = target_field.data_type();
+        if src_type == target_type {
+            columns.push(src_col.clone());
+            continue;
+        }
+        // The one sanctioned coercion: the target column is already
+        // dictionary-encoded (a decision made when the table's FIRST
+        // segment was ever written, task 001's Decision 6) and the
+        // source produced that dictionary's own plain value type — apply
+        // the table's existing encoding, never re-derive it.
+        if let DataType::Dictionary(_, value_ty) = target_type {
+            if src_type == value_ty.as_ref() {
+                let cast_col = arrow::compute::cast(src_col, target_type).map_err(|e| {
+                    QueryError::Type(format!(
+                        "INSERT/Append: column `{}` (position {i}): failed to apply the \
+                         target table's existing dictionary encoding: {e}",
+                        target_field.name()
+                    ))
+                })?;
+                columns.push(cast_col);
+                continue;
+            }
+        }
+        return Err(QueryError::Type(format!(
+            "INSERT/Append: column `{}` (position {i}): source produced {src_type:?} but the \
+             target table declares {target_type:?} -- schema mismatch is not supported (no \
+             implicit coercion; cast explicitly in the SELECT if this is intentional)",
+            target_field.name()
+        )));
+    }
+    Ok(RecordBatch::try_new(target_schema.clone(), columns)?)
+}
+
+// ============================================================================
+// Append: non-locking publish core (task 002's reusable building block)
+// ============================================================================
+
+/// Publish an updated segment list for an EXISTING native table: build a
+/// fresh manifest via the EXISTING `NativeManifest::build` (re-derives
+/// `row_count`/`table_stats` from `segments` — no separate merge function
+/// needed) and publish it via `native_manifest::write_manifest_atomic`'s
+/// single-FILE atomic rename (task 001's Decision 4) — NEVER
+/// `native_manifest::publish_table_dir`, which would `remove_dir_all` the
+/// whole directory and delete every segment file not part of a fresh
+/// staging set.
+///
+/// `table_id` is carried through unchanged (identity survives every
+/// mutation). `version` and `segments` are the CALLER's responsibility to
+/// compute correctly (e.g. `existing.snapshot.version + 1`,
+/// `existing.segments` extended with new/tombstoned entries) — this
+/// function performs no merge logic of its own beyond what
+/// `NativeManifest::build` already does.
+///
+/// Does NOT acquire the single-writer lock — the caller must already hold
+/// it (via [`lock_table_for_write`]) for the ENTIRE read-modify-write span
+/// this publish concludes, not just for this call. Calling this without
+/// holding that lock risks a lost update (see [`lock_table_for_write`]'s
+/// own doc) — nothing here enforces that at the type level.
+pub fn publish_manifest_update(
+    table_dir: &Path,
+    schema: &Schema,
+    table_id: impl Into<String>,
+    version: u64,
+    segments: Vec<Segment>,
+    created_at_ms: i64,
+) -> Result<NativeManifest> {
+    let manifest = NativeManifest::build(schema, table_id, version, segments, created_at_ms)?;
+    native_manifest::write_manifest_atomic(table_dir, &manifest)?;
+    Ok(manifest)
+}
+
+// ============================================================================
+// Append: the self-publishing entrypoint
+// ============================================================================
+
+/// Append `stream`'s batches to an EXISTING native table at `table_dir` —
+/// the full self-publishing entrypoint composing all three of this
+/// module's Append building blocks in sequence: acquires the
+/// single-writer lock ([`lock_table_for_write`], held for this whole
+/// call), reads the existing manifest, streams new segment(s) directly
+/// into the live directory ([`write_append_segments`]), and publishes ONE
+/// atomically-renamed manifest ([`publish_manifest_update`]) — or, if the
+/// source produced zero rows, publishes NOTHING and returns the table's
+/// unchanged current state (see the module doc's "Append" section).
+///
+/// This is the entrypoint `ExecutionContext::insert_into_native_table`
+/// calls, and the one [`write_batches_with_options`]`(...,
+/// NativeWriteMode::Append, ...)` delegates to for CLI/`write-native
+/// --mode append` parity with Create/Overwrite.
+///
+/// `table_dir` MUST already be a native table directory
+/// (`native_manifest::is_native_table_dir`) — unlike Create/Overwrite,
+/// Append never creates a table from nothing; a missing/non-native
+/// destination is a clean `QueryError::Storage` (from
+/// `native_manifest::read_manifest`), not silently treated as "create".
+///
+/// # On error
+///
+/// A lock-contention failure or a missing/corrupt manifest leaves
+/// `table_dir` completely untouched (nothing was written yet). A schema-
+/// mismatch error from the source may leave already-flushed segment
+/// file(s) as harmless orphans (see [`write_append_segments`]'s doc) —
+/// the existing manifest is NEVER modified unless this function reaches
+/// and completes its final [`publish_manifest_update`] call.
+pub async fn append_to_native_table(
+    stream: RecordBatchStream,
+    table_dir: impl AsRef<Path>,
+    options: NativeWriteOptions,
+) -> Result<NativeAppendResult> {
+    let table_dir = table_dir.as_ref().to_path_buf();
+    let _lock = lock_table_for_write(&table_dir)?;
+    let existing = native_manifest::read_manifest(&table_dir)?;
+
+    let new_segments = write_append_segments(stream, &existing, &table_dir, options).await?;
+    if new_segments.is_empty() {
+        // A legitimate no-op (see the module doc's "Append" section) --
+        // never touch the manifest, never bump the version.
+        return Ok(NativeAppendResult {
+            table_id: existing.table_id,
+            version: existing.snapshot.version,
+            rows_appended: 0,
+            segments_appended: 0,
+            total_rows: existing.snapshot.row_count,
+            total_segments: existing.segments.len(),
+        });
+    }
+
+    let rows_appended: u64 = new_segments.iter().map(|s| s.row_count).sum();
+    let segments_appended = new_segments.len();
+
+    let mut all_segments = existing.segments.clone();
+    all_segments.extend(new_segments);
+
+    let schema = existing.arrow_schema();
+    let manifest = publish_manifest_update(
+        &table_dir,
+        schema.as_ref(),
+        existing.table_id.clone(),
+        existing.snapshot.version + 1,
+        all_segments,
+        now_ms(),
+    )?;
+
+    Ok(NativeAppendResult {
+        table_id: manifest.table_id.clone(),
+        version: manifest.snapshot.version,
+        rows_appended,
+        segments_appended,
+        total_rows: manifest.snapshot.row_count,
+        total_segments: manifest.segments.len(),
+    })
 }
 
 // ============================================================================
@@ -1349,6 +1927,593 @@ mod tests {
             "OVERWRITE".parse::<NativeWriteMode>().unwrap(),
             NativeWriteMode::Overwrite
         );
-        assert!("append".parse::<NativeWriteMode>().is_err());
+        assert_eq!(
+            "Append".parse::<NativeWriteMode>().unwrap(),
+            NativeWriteMode::Append
+        );
+        assert!("bogus".parse::<NativeWriteMode>().is_err());
+    }
+
+    // ========================================================================
+    // Append (native-tables-mutation epic, task 002)
+    // ========================================================================
+
+    /// Build a real, on-disk native table via `write_batches(..., Create)`
+    /// with `n` rows of `small_schema()`-shaped data, sent as `n` SEPARATE
+    /// one-row batches so `target_rows_per_segment` actually controls
+    /// segmentation (a single incoming batch is never split mid-way — see
+    /// `append_continues_segment_ids_from_the_existing_maximum_never_
+    /// restarting_at_0`'s own comment).
+    async fn create_base_table(
+        dir: &Path,
+        n: i64,
+        categories: &[&str],
+        target_rows_per_segment: usize,
+    ) -> NativeWriteResult {
+        let schema = small_schema();
+        let batches: Vec<RecordBatch> = (0..n)
+            .map(|i| small_batch(&schema, i, 1, categories))
+            .collect();
+        let options = NativeWriteOptions {
+            target_rows_per_segment,
+            ..NativeWriteOptions::default()
+        };
+        write_batches_with_options(
+            boxed_stream(batches),
+            schema,
+            dir,
+            NativeWriteMode::Create,
+            options,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn append_adds_rows_to_a_table_created_via_create_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("t");
+        let first = create_base_table(&out, 50, &["a", "b", "c"], 1_000_000).await;
+        assert_eq!(first.version, 1);
+        assert_eq!(first.segments, 1);
+
+        let schema = small_schema();
+        let more = small_batch(&schema, 50, 30, &["a", "b", "c"]);
+        let expected_total_id_sum =
+            sum_i64_col(&[small_batch(&schema, 0, 80, &["a", "b", "c"])], 0);
+
+        let result = append_to_native_table(
+            boxed_stream(vec![more]),
+            &out,
+            NativeWriteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.table_id, first.table_id,
+            "identity survives an Append"
+        );
+        assert_eq!(result.version, 2, "version bumps by exactly one");
+        assert_eq!(result.rows_appended, 30);
+        assert_eq!(result.segments_appended, 1);
+        assert_eq!(result.total_rows, 80);
+        assert_eq!(result.total_segments, 2);
+
+        // Both the OLD (from Create) and NEW (from Append) rows must be
+        // present — read back the whole table and check.
+        let (_, batches) = read_back(&out).unwrap();
+        assert_eq!(row_count(&batches), 80);
+        assert_eq!(sum_i64_col(&batches, 0), expected_total_id_sum);
+
+        let manifest = native_manifest::read_manifest(&out).unwrap();
+        assert_eq!(manifest.snapshot.version, 2);
+        assert_eq!(manifest.snapshot.row_count, 80);
+        assert_eq!(manifest.segments.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn append_continues_segment_ids_from_the_existing_maximum_never_restarting_at_0() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("t");
+        // 25 rows, 10/segment -> segments 0, 1, 2 (10, 10, 5).
+        let first = create_base_table(&out, 25, &["x", "y"], 10).await;
+        assert_eq!(first.segments, 3);
+        let existing_ids: Vec<u32> = native_manifest::read_manifest(&out)
+            .unwrap()
+            .segments
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(existing_ids, vec![0, 1, 2]);
+
+        // Append 25 more rows, 10/segment -> three NEW segments (10, 10,
+        // 5). Sent as 25 SEPARATE one-row batches (matching
+        // `segments_split_at_target_row_count_with_correct_stats`'s own
+        // convention above): a single big incoming batch is never split
+        // mid-way (matches `SegmentWriter`'s own documented behavior), so
+        // this is what actually exercises the flush-between-batches path.
+        // A bug that restarted `next_id` at 0 would collide with segment
+        // 0's existing file and/or its manifest entry —
+        // `NativeManifest::build`'s own `validate()` (duplicate segment
+        // id) would catch a collision, but we assert the actual ids
+        // directly for a load-bearing, specific check.
+        let schema = small_schema();
+        let more: Vec<RecordBatch> = (25..50)
+            .map(|i| small_batch(&schema, i, 1, &["x", "y"]))
+            .collect();
+        let options = NativeWriteOptions {
+            target_rows_per_segment: 10,
+            ..NativeWriteOptions::default()
+        };
+        let result = append_to_native_table(boxed_stream(more), &out, options)
+            .await
+            .unwrap();
+        assert_eq!(result.segments_appended, 3);
+        assert_eq!(result.total_segments, 6);
+
+        let manifest = native_manifest::read_manifest(&out).unwrap();
+        let mut ids: Vec<u32> = manifest.segments.iter().map(|s| s.id).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![0, 1, 2, 3, 4, 5],
+            "new segment ids must continue from the existing maximum, never restart at 0"
+        );
+        assert_eq!(manifest.snapshot.row_count, 50);
+        // Every segment file physically exists under its own id.
+        for id in &ids {
+            assert!(native_manifest::segment_full_path(&out, *id).is_file());
+        }
+    }
+
+    #[tokio::test]
+    async fn append_inherits_dictionary_encoding_from_the_target_not_the_new_datas_cardinality() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("t");
+        // Low-cardinality base table -> `category` is dictionary-encoded.
+        let first = create_base_table(&out, 100, &["red", "green", "blue"], 1_000_000).await;
+        assert_eq!(first.segments, 1);
+        let manifest_before = native_manifest::read_manifest(&out).unwrap();
+        let category_before = manifest_before
+            .schema
+            .iter()
+            .find(|f| f.name == "category")
+            .unwrap();
+        assert!(matches!(
+            category_before.data_type,
+            native_manifest::ManifestDataType::Dictionary { .. }
+        ));
+
+        // Append a batch with HIGH cardinality for `category` -- if this
+        // writer re-derived the dictionary decision from the NEW data's
+        // own cardinality (the bug task 001 flagged), it would either
+        // reject this batch or, worse, silently write a schema-violating
+        // plain Utf8 segment. It must instead cast to the TABLE's existing
+        // Dictionary(Int32, Utf8) encoding unconditionally.
+        let wide_categories: Vec<String> = (0..600).map(|i| format!("wide-{i}")).collect();
+        let wide_refs: Vec<&str> = wide_categories.iter().map(|s| s.as_str()).collect();
+        let schema = small_schema();
+        let wide_batch = small_batch(&schema, 100, 600, &wide_refs);
+
+        let result = append_to_native_table(
+            boxed_stream(vec![wide_batch]),
+            &out,
+            NativeWriteOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.rows_appended, 600);
+
+        let manifest_after = native_manifest::read_manifest(&out).unwrap();
+        let category_after = manifest_after
+            .schema
+            .iter()
+            .find(|f| f.name == "category")
+            .unwrap();
+        assert!(
+            matches!(
+                category_after.data_type,
+                native_manifest::ManifestDataType::Dictionary { .. }
+            ),
+            "the declared schema's dictionary decision must not change on Append"
+        );
+
+        // The NEW segment's actual array must ALSO physically be
+        // Dictionary-typed, not just the manifest's declared schema.
+        let (_, batches) = read_back(&out).unwrap();
+        assert_eq!(batches.len(), 2, "one batch per segment");
+        for b in &batches {
+            assert!(
+                matches!(b.column(1).data_type(), DT::Dictionary(_, _)),
+                "every segment, old and newly appended, must be Dictionary-encoded to match \
+                 the table's inherited decision"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn append_of_zero_rows_is_a_no_op_and_does_not_touch_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("t");
+        let first = create_base_table(&out, 10, &["a"], 1_000_000).await;
+        let manifest_before = native_manifest::read_manifest(&out).unwrap();
+
+        // An entirely empty stream.
+        let result =
+            append_to_native_table(boxed_stream(vec![]), &out, NativeWriteOptions::default())
+                .await
+                .unwrap();
+        assert_eq!(result.rows_appended, 0);
+        assert_eq!(result.segments_appended, 0);
+        assert_eq!(result.version, first.version, "no version bump for a no-op");
+        assert_eq!(result.total_rows, 10);
+        assert_eq!(result.table_id, first.table_id);
+
+        // A stream with a batch that has zero rows (not zero batches).
+        let schema = small_schema();
+        let empty_batch = RecordBatch::new_empty(schema);
+        let result2 = append_to_native_table(
+            boxed_stream(vec![empty_batch]),
+            &out,
+            NativeWriteOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result2.rows_appended, 0);
+        assert_eq!(result2.version, first.version);
+
+        // The manifest on disk must be BYTE-FOR-BYTE the same object as
+        // before -- not just "logically equal", genuinely untouched.
+        let manifest_after = native_manifest::read_manifest(&out).unwrap();
+        assert_eq!(manifest_before, manifest_after);
+    }
+
+    #[tokio::test]
+    async fn append_refuses_a_column_count_mismatch_cleanly_and_leaves_the_manifest_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("t");
+        let first = create_base_table(&out, 10, &["a"], 1_000_000).await;
+        let manifest_before = native_manifest::read_manifest(&out).unwrap();
+
+        // Only 2 columns instead of small_schema()'s 3.
+        let bad_schema: SchemaRef = Arc::new(Schema::new(vec![
+            ArrowField::new("id", DT::Int64, false),
+            ArrowField::new("category", DT::Utf8, true),
+        ]));
+        let bad_batch = RecordBatch::try_new(
+            bad_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+
+        let err = append_to_native_table(
+            boxed_stream(vec![bad_batch]),
+            &out,
+            NativeWriteOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, QueryError::Type(_)), "{err:?}");
+        assert!(err.to_string().contains("2 column"), "{err}");
+        assert!(err.to_string().contains('3'), "{err}");
+
+        let manifest_after = native_manifest::read_manifest(&out).unwrap();
+        assert_eq!(
+            manifest_before, manifest_after,
+            "a rejected Append must leave the existing manifest completely intact"
+        );
+        assert_eq!(first.rows, manifest_after.snapshot.row_count);
+    }
+
+    #[tokio::test]
+    async fn append_refuses_a_column_type_mismatch_cleanly_and_leaves_the_manifest_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("t");
+        create_base_table(&out, 10, &["a"], 1_000_000).await;
+        let manifest_before = native_manifest::read_manifest(&out).unwrap();
+
+        // `price` (position 2) is Float64 in the target; supply Utf8
+        // instead -- not the sanctioned dictionary coercion, so this must
+        // be a clean, named error, never a silent cast/corruption.
+        let bad_schema: SchemaRef = Arc::new(Schema::new(vec![
+            ArrowField::new("id", DT::Int64, false),
+            ArrowField::new("category", DT::Utf8, true),
+            ArrowField::new("price", DT::Utf8, true),
+        ]));
+        let bad_batch = RecordBatch::try_new(
+            bad_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["a"])),
+                Arc::new(StringArray::from(vec!["not-a-number"])),
+            ],
+        )
+        .unwrap();
+
+        let err = append_to_native_table(
+            boxed_stream(vec![bad_batch]),
+            &out,
+            NativeWriteOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, QueryError::Type(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("price"), "{msg}");
+        assert!(msg.to_lowercase().contains("utf8"), "{msg}");
+
+        let manifest_after = native_manifest::read_manifest(&out).unwrap();
+        assert_eq!(
+            manifest_before, manifest_after,
+            "a rejected Append must leave the existing manifest completely intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_refuses_a_missing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("does_not_exist");
+        let schema = small_schema();
+        let batch = small_batch(&schema, 0, 5, &["a"]);
+        let err = append_to_native_table(
+            boxed_stream(vec![batch]),
+            &out,
+            NativeWriteOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, QueryError::Storage(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn append_refuses_a_non_native_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("t");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("not_a_manifest.txt"), b"hello").unwrap();
+
+        let schema = small_schema();
+        let batch = small_batch(&schema, 0, 5, &["a"]);
+        let err = append_to_native_table(
+            boxed_stream(vec![batch]),
+            &out,
+            NativeWriteOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, QueryError::Storage(_)), "{err:?}");
+        assert!(
+            out.join("not_a_manifest.txt").exists(),
+            "a refused Append must not touch the existing directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_splits_new_rows_into_multiple_segments_per_target_rows_per_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("t");
+        create_base_table(&out, 5, &["a"], 1_000_000).await;
+
+        let schema = small_schema();
+        // 25 SEPARATE one-row batches -- a single big batch is never split
+        // mid-way (see the sibling `append_continues_segment_ids...` test's
+        // comment for why).
+        let more: Vec<RecordBatch> = (5..30)
+            .map(|i| small_batch(&schema, i, 1, &["a", "b"]))
+            .collect();
+        let options = NativeWriteOptions {
+            target_rows_per_segment: 10,
+            ..NativeWriteOptions::default()
+        };
+        let result = append_to_native_table(boxed_stream(more), &out, options)
+            .await
+            .unwrap();
+        // 25 new rows / 10 per segment -> 3 new segments (10, 10, 5).
+        assert_eq!(result.segments_appended, 3);
+        assert_eq!(result.rows_appended, 25);
+        assert_eq!(result.total_segments, 4, "1 original + 3 new");
+        assert_eq!(result.total_rows, 30);
+    }
+
+    // ---------- the reusable, non-publishing building blocks, called
+    // DIRECTLY (proving task 003/004 can compose them without going
+    // through the self-publishing `append_to_native_table` wrapper) ----------
+
+    #[tokio::test]
+    async fn write_append_segments_does_not_touch_or_publish_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("t");
+        create_base_table(&out, 10, &["a"], 1_000_000).await;
+        let manifest_before = native_manifest::read_manifest(&out).unwrap();
+
+        let schema = small_schema();
+        let more = small_batch(&schema, 10, 5, &["a"]);
+        let new_segments = write_append_segments(
+            boxed_stream(vec![more]),
+            &manifest_before,
+            &out,
+            NativeWriteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(new_segments.len(), 1);
+        assert_eq!(new_segments[0].id, 1, "continues from segment 0");
+        assert_eq!(new_segments[0].row_count, 5);
+        // The segment FILE was written directly into the live directory...
+        assert!(native_manifest::segment_full_path(&out, 1).is_file());
+        // ...but the MANIFEST must be completely untouched -- this
+        // function is explicitly non-publishing.
+        let manifest_after = native_manifest::read_manifest(&out).unwrap();
+        assert_eq!(manifest_before, manifest_after);
+        assert_eq!(
+            manifest_after.segments.len(),
+            1,
+            "still just the original segment"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_manifest_update_composes_directly_with_write_append_segments_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("t");
+        create_base_table(&out, 10, &["a"], 1_000_000).await;
+        let existing = native_manifest::read_manifest(&out).unwrap();
+
+        let schema = small_schema();
+        let more = small_batch(&schema, 10, 7, &["a"]);
+        let new_segments = write_append_segments(
+            boxed_stream(vec![more]),
+            &existing,
+            &out,
+            NativeWriteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // A caller (this test, standing in for a future task 004 UPDATE)
+        // assembles its OWN full segment list -- here, simply the existing
+        // ones plus the new ones, exactly what `append_to_native_table`
+        // itself does internally, but invoked directly to prove the two
+        // building blocks compose without the self-publishing wrapper.
+        let mut all_segments = existing.segments.clone();
+        all_segments.extend(new_segments);
+        let published = publish_manifest_update(
+            &out,
+            existing.arrow_schema().as_ref(),
+            existing.table_id.clone(),
+            existing.snapshot.version + 1,
+            all_segments,
+            123,
+        )
+        .unwrap();
+
+        assert_eq!(published.snapshot.version, 2);
+        assert_eq!(published.snapshot.row_count, 17);
+        assert_eq!(published.segments.len(), 2);
+        assert_eq!(published.table_id, existing.table_id);
+
+        let read_back_manifest = native_manifest::read_manifest(&out).unwrap();
+        assert_eq!(read_back_manifest, published);
+    }
+
+    // ---------- single-writer lock ----------
+
+    #[test]
+    fn lock_table_for_write_blocks_a_second_concurrent_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("t");
+        std::fs::create_dir_all(&table_dir).unwrap();
+
+        let _first = lock_table_for_write(&table_dir).expect("first lock succeeds");
+        let err = lock_table_for_write(&table_dir).expect_err(
+            "a second, independent lock attempt on the SAME table directory must fail while \
+             the first is held -- flock is per OPEN FILE DESCRIPTION, so two independent \
+             std::fs::File::open calls in the SAME process still contend correctly",
+        );
+        assert!(matches!(err, QueryError::Storage(_)), "{err:?}");
+        assert!(
+            err.to_string().contains(&table_dir.display().to_string()),
+            "the error must name the table directory: {err}"
+        );
+    }
+
+    #[test]
+    fn lock_is_released_deterministically_when_the_guard_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("t");
+        std::fs::create_dir_all(&table_dir).unwrap();
+
+        {
+            let _guard = lock_table_for_write(&table_dir).expect("first lock succeeds");
+            assert!(
+                lock_table_for_write(&table_dir).is_err(),
+                "contended while the guard is alive"
+            );
+        } // guard dropped here -> Drop::drop calls unlock()
+
+        let second = lock_table_for_write(&table_dir);
+        assert!(
+            second.is_ok(),
+            "must succeed immediately after the first guard is dropped, with no manual cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_to_native_table_fails_cleanly_when_another_writer_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("t");
+        create_base_table(&out, 10, &["a"], 1_000_000).await;
+        let manifest_before = native_manifest::read_manifest(&out).unwrap();
+
+        // Hold the lock externally, simulating a concurrent writer already
+        // mid-mutation.
+        let _held = lock_table_for_write(&out).expect("acquire the lock externally");
+
+        let schema = small_schema();
+        let more = small_batch(&schema, 10, 5, &["a"]);
+        let err = append_to_native_table(
+            boxed_stream(vec![more]),
+            &out,
+            NativeWriteOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, QueryError::Storage(_)), "{err:?}");
+        assert!(
+            err.to_string().contains(&out.display().to_string()),
+            "{err}"
+        );
+
+        // Nothing must have been written -- no new segment files, no
+        // manifest change.
+        let manifest_after = native_manifest::read_manifest(&out).unwrap();
+        assert_eq!(manifest_before, manifest_after);
+        assert!(!native_manifest::segment_full_path(&out, 1).exists());
+    }
+
+    #[test]
+    fn lock_path_for_is_a_stable_sibling_of_the_table_directory() {
+        let table_dir = Path::new("/some/root/mytable");
+        let lock1 = lock_path_for(table_dir);
+        let lock2 = lock_path_for(table_dir);
+        assert_eq!(lock1, lock2, "computed once per TABLE, not per attempt");
+        assert_eq!(lock1, Path::new("/some/root/mytable.lock"));
+    }
+
+    // ---------- write_batches_with_options' Append dispatch (CLI parity) ----------
+
+    #[tokio::test]
+    async fn write_batches_with_options_append_mode_matches_append_to_native_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("t");
+        create_base_table(&out, 10, &["a"], 1_000_000).await;
+
+        let schema = small_schema();
+        let more = small_batch(&schema, 10, 5, &["a"]);
+        // `schema` here is deliberately a DIFFERENT (but structurally
+        // compatible) SchemaRef instance than the target's own -- proves
+        // it is genuinely ignored for Append (the target's schema from
+        // the existing manifest is what actually governs), not merely
+        // unused by coincidence.
+        let result = write_batches_with_options(
+            boxed_stream(vec![more]),
+            schema,
+            &out,
+            NativeWriteMode::Append,
+            NativeWriteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // write_batches_with_options reports TOTALS (NativeWriteResult's
+        // existing "whole table" meaning), not the delta.
+        assert_eq!(result.rows, 15);
+        assert_eq!(result.segments, 2);
+        assert_eq!(result.version, 2);
     }
 }

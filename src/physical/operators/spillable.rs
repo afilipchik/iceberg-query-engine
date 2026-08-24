@@ -1542,8 +1542,47 @@ impl ExternalSortExec {
             return Ok(());
         }
 
-        // Concatenate batches
-        let combined = compute::concat_batches(&self.schema, batches)?;
+        // Concatenate under the batches' OWN actual schema, not the
+        // declared/logical one (`self.schema`, derived from `PlanSchema` via
+        // `plan_schema_to_arrow`, which has no Dictionary representation and
+        // so always reports a string column as plain `Utf8`). A sort large
+        // enough to spill over a Dictionary-encoded source (native tables;
+        // also small-build join gathers, per the identical reasoning already
+        // applied to the in-memory path) previously failed outright here
+        // with "column types must match schema types, expected Utf8 but
+        // found Dictionary(...)" — found by native-tables-mutation task
+        // 006's real-scale (SF=10, 15M-row `orders`) cell-exact validation;
+        // reproduces on an UNMUTATED native table too, so this is a
+        // pre-existing gap in the spill path specifically, not something
+        // mutation introduced. Mirrors the exact "if every batch agrees, use
+        // their actual schema; otherwise cast Dictionary columns down to
+        // their plain value type against the declared schema" pattern
+        // `SortExec::execute()` (sort.rs) and `MemoryTableExec::execute()`
+        // (scan.rs) already establish for the in-memory sort path.
+        let first_schema = batches[0].schema();
+        let all_agree = batches.iter().all(|b| b.schema() == first_schema);
+
+        let combined = if all_agree {
+            compute::concat_batches(&first_schema, batches)?
+        } else {
+            let normalized: Result<Vec<RecordBatch>> = batches
+                .iter()
+                .map(|b| {
+                    let cols: std::result::Result<Vec<ArrayRef>, arrow::error::ArrowError> = b
+                        .columns()
+                        .iter()
+                        .map(|c| match c.data_type() {
+                            arrow::datatypes::DataType::Dictionary(_, v) => {
+                                compute::cast(c.as_ref(), v)
+                            }
+                            _ => Ok(c.clone()),
+                        })
+                        .collect();
+                    RecordBatch::try_new(self.schema.clone(), cols?).map_err(Into::into)
+                })
+                .collect();
+            compute::concat_batches(&self.schema, &normalized?)?
+        };
 
         // Sort
         let sorted = sort_batch(&combined, &self.order_by)?;
@@ -1730,6 +1769,40 @@ impl ExternalSortExec {
                     // Check if current buffer is exhausted
                     if let Some(ref batch) = run_buffers[run_idx] {
                         if run_indices[run_idx] >= batch.num_rows() {
+                            // `output_rows` holds (run_idx, row_idx) pairs
+                            // where row_idx indexes into `run_buffers
+                            // [run_idx]`'s CURRENT in-memory batch — a
+                            // reference that goes stale (silently wrong, or
+                            // out-of-bounds and panicking) the instant that
+                            // slot is overwritten below. A run whose
+                            // Parquet file needs more than one
+                            // `buffer_rows`-sized read (any spill run
+                            // larger than `MERGE_BUFFER_ROWS` = 8192 rows —
+                            // the common case for a real spill, not an edge
+                            // case) reloads mid-merge, and any row pushed
+                            // from an EARLIER load of this exact slot that
+                            // had not yet been flushed becomes a dangling
+                            // reference: `build_merged_batch` would gather
+                            // it from the NEW batch at the OLD row_idx —
+                            // silently wrong data if the new batch happens
+                            // to be at least that long, or an out-of-bounds
+                            // panic ("the len is N but the index is N")
+                            // otherwise. Found by native-tables-mutation
+                            // task 006's real-scale (SF=10, 15M-row
+                            // `orders`) `ORDER BY` validation — a spill
+                            // large enough to need >1 run AND any run
+                            // >8192 rows reaches this every time; TPC-H's
+                            // own suite apparently never spills a sort this
+                            // large. Flushing HERE, before the slot is
+                            // overwritten, guarantees every row in
+                            // `output_rows` always indexes into whichever
+                            // batch is CURRENTLY loaded for its run — the
+                            // invariant `build_merged_batch` requires.
+                            if !output_rows.is_empty() {
+                                let batch = self.build_merged_batch(&run_buffers, &output_rows)?;
+                                result_batches.push(batch);
+                                output_rows.clear();
+                            }
                             // Try to load next batch from this run
                             if let Some(next_batch) = run_iterators[run_idx].next() {
                                 run_buffers[run_idx] = Some(next_batch?);
@@ -1750,7 +1823,13 @@ impl ExternalSortExec {
             }
         }
 
-        // Flush remaining output
+        // Flush remaining output. With the flush-before-buffer-transition
+        // fix above, every run's exhaustion (buffer -> None) flushes
+        // `output_rows` first, and the loop only exits once every run has
+        // exhausted — so in practice `output_rows` is always already empty
+        // here. Kept as a defensive fallback (not proven unreachable by an
+        // exhaustive proof, just by construction of the loop above) rather
+        // than deleted outright.
         if !output_rows.is_empty() {
             // For the final batch, we need to reload any exhausted buffers
             // that are referenced in output_rows
@@ -1817,7 +1896,7 @@ impl ExternalSortExec {
             }
         }
 
-        RecordBatch::try_new(self.schema.clone(), final_columns).map_err(Into::into)
+        batch_with_actual_types(&self.schema, final_columns)
     }
 
     /// Build final merged batch, reloading data from files if needed
@@ -1883,8 +1962,54 @@ impl ExternalSortExec {
             }
         }
 
-        RecordBatch::try_new(self.schema.clone(), final_columns).map_err(Into::into)
+        batch_with_actual_types(&self.schema, final_columns)
     }
+}
+
+/// Build a `RecordBatch` from columns whose ACTUAL data types may not match
+/// `declared`'s (a `plan_schema_to_arrow`-derived schema, which has no
+/// Dictionary representation and so always claims a string column is plain
+/// `Utf8` even when the real data — native table segments, small-build join
+/// gathers, or either round-tripped through this operator's own Parquet
+/// spill files, which faithfully preserve Dictionary via the embedded
+/// `ARROW:schema` metadata `ArrowWriter`/`ParquetRecordBatchReaderBuilder`
+/// already use — is `Dictionary(Int32, Utf8)`). Widens the declared field
+/// type to the actual column's type wherever they disagree, mirroring the
+/// identical fix already established for the in-memory sort path
+/// (`SortExec::execute()` in sort.rs, `MemoryTableExec::execute()`'s
+/// `rewrap` in scan.rs) and for joins (`hash_join.rs`'s own
+/// `batch_with_actual_types`, not reused directly across the module
+/// boundary — this file follows the same local-duplication convention
+/// those two other sites already established rather than introducing a
+/// new cross-module dependency for a three-line function). Found by
+/// native-tables-mutation task 006's real-scale (SF=10, 15M-row `orders`)
+/// cell-exact `ORDER BY` validation — reproduces on an unmutated native
+/// table too, so this is a pre-existing gap in the external-sort spill
+/// path specifically, not something mutation introduced.
+fn batch_with_actual_types(declared: &SchemaRef, columns: Vec<ArrayRef>) -> Result<RecordBatch> {
+    let types_match = columns
+        .iter()
+        .zip(declared.fields())
+        .all(|(c, f)| c.data_type() == f.data_type());
+    let schema = if types_match {
+        declared.clone()
+    } else {
+        Arc::new(Schema::new(
+            declared
+                .fields()
+                .iter()
+                .zip(&columns)
+                .map(|(f, c)| {
+                    if f.data_type() == c.data_type() {
+                        f.as_ref().clone()
+                    } else {
+                        arrow::datatypes::Field::new(f.name(), c.data_type().clone(), true)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ))
+    };
+    RecordBatch::try_new(schema, columns).map_err(Into::into)
 }
 
 impl fmt::Display for ExternalSortExec {
@@ -2492,7 +2617,15 @@ fn create_joined_batch(
         _ => columns,
     };
 
-    RecordBatch::try_new(output_schema.clone(), columns).map_err(Into::into)
+    // Same "declared Utf8 vs actual Dictionary" class as
+    // `ExternalSortExec`'s spill path above (`output_schema` is a
+    // `plan_schema_to_arrow`-derived declared schema; `columns` are
+    // GATHERED via `compute::take`, which preserves whatever the build/
+    // probe batches' actual encoding is). Found the same way: a real
+    // SF=10 query (Q12, whose join output must carry the low-cardinality,
+    // Dictionary-coerced `l_shipmode`) spilling this hash join over a
+    // native table crashed here with the identical error before this fix.
+    batch_with_actual_types(output_schema, columns)
 }
 
 fn gather_column(
@@ -2814,6 +2947,258 @@ mod tests {
                 (60, 3, None),
             ],
             "Left join + force-kept filter column + pruned join keys/unused columns"
+        );
+    }
+
+    /// A `Dictionary(Int32, Utf8)`-encoded column reaching `ExternalSortExec`'s
+    /// SPILL path (not its in-memory `SortExec` delegate, already exercised
+    /// elsewhere) previously failed outright: "column types must match
+    /// schema types, expected Utf8 but found Dictionary(Int32, Utf8)".
+    /// `flush_run`/`build_merged_batch`/`build_merged_batch_final` all
+    /// constructed their output `RecordBatch` against `self.schema` (a
+    /// `plan_schema_to_arrow`-derived DECLARED schema, which has no
+    /// Dictionary representation and so always reports a string column as
+    /// plain `Utf8`) instead of the batches' own ACTUAL type. Found by
+    /// native-tables-mutation task 006's real-scale `ORDER BY` validation
+    /// over a native table (whose low-cardinality string columns are always
+    /// Dictionary-encoded) large enough to spill; reproduces on an
+    /// unmutated native table too, so this is a pre-existing external-sort
+    /// gap, not something mutation introduced.
+    #[tokio::test]
+    async fn external_sort_spill_path_handles_dictionary_encoded_columns() {
+        use arrow::array::DictionaryArray;
+        use arrow::datatypes::{DataType, Field, Int32Type, Schema};
+
+        // DECLARED schema: plain Utf8 for the string column, mirroring
+        // `plan_schema_to_arrow`'s own logical->physical mapping (it has no
+        // Dictionary variant, so a string column is always declared Utf8
+        // regardless of a provider's actual physical encoding).
+        let declared_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Utf8, false),
+        ]));
+        // ACTUAL schema of the batches themselves -- what a native table's
+        // segments genuinely are on disk. `MemoryTableExec` stores batches
+        // and its own declared `schema` independently (reconciling only
+        // inside `execute()`), so constructing a batch here must use its
+        // OWN real type, exactly like a real provider's scan output would.
+        let actual_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new(
+                "v",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                false,
+            ),
+        ]));
+
+        // Several batches whose ACTUAL data is Dictionary-encoded (as a
+        // native table's low-cardinality string columns always are), keys
+        // in descending order so a correct sort must reverse them.
+        let mut batches = Vec::new();
+        for chunk in 0..4i64 {
+            let start = chunk * 4;
+            let keys: Vec<i64> = (start..start + 4).rev().collect();
+            let dict: DictionaryArray<Int32Type> = keys
+                .iter()
+                .map(|k| Some(if k % 2 == 0 { "alpha" } else { "beta" }))
+                .collect();
+            batches.push(
+                RecordBatch::try_new(
+                    actual_schema.clone(),
+                    vec![Arc::new(Int64Array::from(keys)), Arc::new(dict)],
+                )
+                .unwrap(),
+            );
+        }
+
+        let input: Arc<dyn PhysicalOperator> = Arc::new(
+            crate::physical::operators::MemoryTableExec::new("t", declared_schema, batches, None),
+        );
+
+        // A tiny memory budget forces the SPILL branch (not the in-memory
+        // SortExec delegate) even for this handful of rows.
+        let pool = crate::execution::create_memory_pool(1024);
+        let mut config = ExecutionConfig::default();
+        config.memory_limit = 1024;
+        config.spill_threshold = 0.1;
+        config.spill_path =
+            std::env::temp_dir().join(format!("qe_sort_dict_spill_test_{}", std::process::id()));
+
+        let sort = ExternalSortExec::new(
+            input,
+            vec![crate::planner::SortExpr::new(Expr::column("k"))],
+            pool,
+            config,
+        );
+
+        let mut stream = sort.execute(0).await.expect("spilled sort must not error");
+        let mut keys = Vec::new();
+        while let Some(batch) = stream.try_next().await.expect("collecting sorted output") {
+            let k = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            keys.extend(k.values().iter().copied());
+            assert!(
+                matches!(batch.column(1).data_type(), DataType::Dictionary(_, _)),
+                "sorted output column 1 should still be Dictionary-encoded, got {:?}",
+                batch.column(1).data_type()
+            );
+        }
+        assert_eq!(keys.len(), 16);
+        assert!(
+            keys.windows(2).all(|w| w[0] <= w[1]),
+            "output must be sorted ascending by k: {keys:?}"
+        );
+    }
+
+    /// The k-way merge's `output_rows` buffer held `(run_idx, row_idx)`
+    /// pairs indexing into `run_buffers[run_idx]`'s CURRENT in-memory
+    /// batch — a reference that went stale (silently wrong, or an
+    /// out-of-bounds panic) the instant that slot was reloaded before the
+    /// pending rows were flushed. Any run whose Parquet file needs more
+    /// than one `buffer_rows`-sized read during merge (the common case for
+    /// a real spill: any run over `MERGE_BUFFER_ROWS` = 8192 rows) hit
+    /// this. Found by native-tables-mutation task 006's real-scale
+    /// `ORDER BY` validation: a real 15M-row sort's spilled-run merge
+    /// panicked with "index out of bounds: the len is 5329 but the index
+    /// is 5329". This test reproduces the same shape at unit-test scale by
+    /// calling `streaming_k_way_merge` directly with a tiny `buffer_rows`
+    /// so a 10-row run needs multiple reloads to merge.
+    #[tokio::test]
+    async fn k_way_merge_survives_a_run_needing_more_than_one_buffer_load() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let dir = std::env::temp_dir().join(format!("qe_kway_merge_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Run A: 10 rows, sorted -- bigger than the buffer_rows=4 this
+        // test uses below, so merging it needs MULTIPLE `next()` reads
+        // (the reload this bug loses track of).
+        let run_a_vals: Vec<i64> = (0..10).map(|i| i * 2).collect(); // 0,2,4,...,18
+        let run_a_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(run_a_vals.clone()))],
+        )
+        .unwrap();
+        let run_a_path = dir.join("run_a.parquet");
+        write_batches_to_parquet(&run_a_path, &[run_a_batch]).unwrap();
+
+        // Run B: 5 rows, interleaved with (a prefix of) A's values.
+        let run_b_vals: Vec<i64> = (0..5).map(|i| i * 2 + 1).collect(); // 1,3,5,7,9
+        let run_b_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(run_b_vals.clone()))],
+        )
+        .unwrap();
+        let run_b_path = dir.join("run_b.parquet");
+        write_batches_to_parquet(&run_b_path, &[run_b_batch]).unwrap();
+
+        let pool = crate::execution::create_memory_pool(64 * 1024 * 1024);
+        let config = ExecutionConfig::default();
+        let sort = ExternalSortExec::new(
+            Arc::new(crate::physical::operators::MemoryTableExec::new(
+                "t",
+                schema,
+                vec![],
+                None,
+            )),
+            vec![crate::planner::SortExpr::new(Expr::column("k"))],
+            pool,
+            config,
+        );
+
+        // buffer_rows=4: run A (10 rows) needs 3 reloads to merge fully.
+        let merged = sort
+            .streaming_k_way_merge(&[run_a_path, run_b_path], 4)
+            .expect("k-way merge must not crash or lose/misplace rows");
+
+        let mut all_vals: Vec<i64> = Vec::new();
+        for batch in &merged {
+            let arr = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            all_vals.extend(arr.values().iter().copied());
+        }
+        let mut expected: Vec<i64> = run_a_vals.into_iter().chain(run_b_vals).collect();
+        expected.sort_unstable();
+        assert_eq!(
+            all_vals, expected,
+            "k-way merge must produce every value from both runs, in order, exactly once"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same "declared Utf8 vs actual Dictionary" bug class as
+    /// `ExternalSortExec`'s spill path, in `SpillableHashJoinExec`'s own
+    /// spill-path join-output constructor (`create_joined_batch`). Found
+    /// by native-tables-mutation task 006's real-scale SF=10 benchmark:
+    /// Q12 (whose join output carries the Dictionary-coerced `l_shipmode`)
+    /// crashed identically once its join spilled over a native table.
+    #[test]
+    fn create_joined_batch_handles_dictionary_encoded_columns() {
+        use arrow::array::DictionaryArray;
+        use arrow::datatypes::{DataType, Field, Int32Type, Schema};
+
+        // DECLARED (plan_schema_to_arrow-shaped) output schema: plain
+        // Utf8 for the string column.
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("tag", DataType::Utf8, false),
+        ]));
+
+        // ACTUAL build-side batch: Dictionary-encoded `tag`, as a native
+        // table's low-cardinality string columns always are.
+        let build_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "tag",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                false,
+            ),
+        ]));
+        let dict: DictionaryArray<Int32Type> = vec![Some("alpha"), Some("beta"), Some("alpha")]
+            .into_iter()
+            .collect();
+        let build_batch = RecordBatch::try_new(
+            build_schema,
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3])), Arc::new(dict)],
+        )
+        .unwrap();
+
+        // An empty-schema probe side keeps this test focused on the
+        // build-side gather (`compute::take`), which is where the actual
+        // Dictionary encoding survives into the joined output.
+        let probe_schema = Arc::new(Schema::new(Vec::<Field>::new()));
+        let probe_batch = RecordBatch::try_new_with_options(
+            probe_schema,
+            vec![],
+            &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(3)),
+        )
+        .unwrap();
+
+        let result = create_joined_batch(
+            &[build_batch],
+            &probe_batch,
+            &[(0, 0), (0, 1), (0, 2)],
+            &[0, 1, 2],
+            false,
+            &output_schema,
+            None,
+        )
+        .expect("must not error on a Dictionary-encoded build column");
+
+        assert_eq!(result.num_rows(), 3);
+        assert!(
+            matches!(result.column(1).data_type(), DataType::Dictionary(_, _)),
+            "joined output column 1 should still be Dictionary-encoded, got {:?}",
+            result.column(1).data_type()
         );
     }
 }

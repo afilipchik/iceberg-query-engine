@@ -24,7 +24,20 @@
 //!   `002.md`'s Technical Details).
 //! - Atomic publication of a whole table directory (manifest + segments
 //!   together), mirroring `ipc_cache.rs::build_sidecar`'s own
-//!   staging-dir-then-rename pattern.
+//!   staging-dir-then-rename pattern. Plus (native-tables-mutation epic,
+//!   task 002) atomic publication of a SINGLE manifest file
+//!   (`write_manifest_atomic`) for an INCREMENTAL mutation that must
+//!   leave a directory's existing segment files untouched — see that
+//!   function's doc for why `publish_table_dir`'s whole-directory replace
+//!   is not safe to reuse for that case.
+//! - (native-tables-mutation epic, task 003) `Segment::deleted_rows`: a
+//!   sorted, deduplicated `Vec<u32>` of tombstoned LOCAL row positions,
+//!   `#[serde(default)]` so every manifest phase 1/task 002 ever wrote
+//!   still reads back unchanged (empty = no deletions). This module owns
+//!   only the FIELD, its serialization, and `validate()`'s bounds/sort
+//!   checks; consultation at read time lives in `native_table.rs::scan`
+//!   and editing lives in `native_delete.rs` (both task 003, neither
+//!   touches this file beyond what's described here).
 //!
 //! # What this module does NOT own
 //!
@@ -510,12 +523,44 @@ pub struct Segment {
     /// `Segment::expected_file_name(id)` — `NativeManifest::validate`
     /// enforces this.
     pub path: String,
+    /// The PHYSICAL row count actually written to this segment's `.arrow`
+    /// file. Deliberately UNAFFECTED by `deleted_rows` (native-tables-
+    /// mutation epic, task 001's Decision 1, task 003's Outcome): this
+    /// keeps `NativeManifest::validate`'s existing
+    /// `snapshot.row_count == sum(segments[].row_count)` invariant true
+    /// with zero changes, and keeps `NativeManifest::build` callable
+    /// unchanged after a DELETE. Use [`Segment::live_row_count`] for the
+    /// LOGICAL (post-delete, visible) count.
     pub row_count: u64,
     pub byte_size: u64,
     /// Per-column stats for JUST this segment's rows. Keyed the same way
     /// as `compute_batch_stats`'s output (unqualified, lowercase).
+    /// Deliberately NOT recomputed on DELETE (task 003's Outcome) — always
+    /// safe (a wider bound never causes a wrong answer), never chased to
+    /// an exact post-delete bound.
     #[serde(default)]
     pub column_stats: BTreeMap<String, ColumnStats>,
+    /// Sorted, deduplicated LOCAL row positions (within this segment's own
+    /// on-disk row order, i.e. the same 0-based indexing `ipc_cache::
+    /// read_row_group`'s returned batches use, concatenated in on-disk
+    /// block order) that a `DELETE`/`UPDATE` has tombstoned (native-
+    /// tables-mutation epic, task 003, task 001's Decision 1). Read/
+    /// consulted at scan time by `NativeTable::scan` (`native_table.rs`),
+    /// EDITED (unioned via a `BTreeSet`, so re-deleting an
+    /// already-deleted position is a structural no-op) by
+    /// `native_delete::apply_deletions`. `#[serde(default)]` means every
+    /// manifest phase 1 or task 002 (INSERT) ever wrote deserializes with
+    /// an empty `Vec` here — no behavior change for a never-deleted-from
+    /// table, and no manifest-format migration needed. A plain `Vec<u32>`,
+    /// not `roaring` or a sibling file — see task 001's Outcome for the
+    /// full tradeoff analysis (segments are capped at ~1,000,000 rows by
+    /// construction, an order of magnitude below where a compressed
+    /// bitmap format starts winning, and this format's own established
+    /// "one inline, human-inspectable JSON file" discipline). NEVER
+    /// contains a value `>= row_count` and is always sorted/deduplicated —
+    /// `NativeManifest::validate` enforces both.
+    #[serde(default)]
+    pub deleted_rows: Vec<u32>,
 }
 
 impl Segment {
@@ -525,6 +570,21 @@ impl Segment {
     /// module doc's "Load-bearing finding" section.
     pub fn expected_file_name(id: u32) -> String {
         format!("rg_{id:05}.arrow")
+    }
+
+    /// The LOGICAL (post-delete, visible) row count: physical `row_count`
+    /// minus however many local positions `deleted_rows` currently
+    /// tombstones. `0` for a fully-tombstoned segment (which, per task
+    /// 001's Decision 3, `native_delete::apply_deletions` drops from the
+    /// manifest entirely rather than ever persisting one — so `0` from
+    /// this method is reachable only transiently, mid-computation, never
+    /// in a published manifest). Used by `NativeTable::statistics()` (a
+    /// NEW, separate computation from the physical `row_count` above —
+    /// see that field's own doc) and by `native_delete`'s own result
+    /// reporting.
+    pub fn live_row_count(&self) -> u64 {
+        self.row_count
+            .saturating_sub(self.deleted_rows.len() as u64)
     }
 }
 
@@ -684,6 +744,32 @@ impl NativeManifest {
                     )));
                 }
             }
+            // `deleted_rows` (native-tables-mutation epic, task 003) must be
+            // sorted, strictly increasing (implies deduplicated — the
+            // invariant `native_delete::apply_deletions`' `BTreeSet` union
+            // always produces) and every position must name an actual row
+            // of this segment (`< row_count`) — catches corruption/a
+            // hand-edited manifest at load time rather than an
+            // out-of-bounds panic or a silently wrong scan later.
+            for pair in seg.deleted_rows.windows(2) {
+                if pair[0] >= pair[1] {
+                    return Err(QueryError::Storage(format!(
+                        "native table manifest segment {} has an unsorted or duplicate \
+                         deleted_rows entry ({} then {}) — deleted_rows must be sorted and \
+                         strictly increasing",
+                        seg.id, pair[0], pair[1]
+                    )));
+                }
+            }
+            if let Some(&max_deleted) = seg.deleted_rows.last() {
+                if max_deleted as u64 >= seg.row_count {
+                    return Err(QueryError::Storage(format!(
+                        "native table manifest segment {} has a deleted_rows entry ({}) \
+                         that is out of range for its row_count ({})",
+                        seg.id, max_deleted, seg.row_count
+                    )));
+                }
+            }
             computed_row_count = computed_row_count.saturating_add(seg.row_count);
         }
         if computed_row_count != self.snapshot.row_count {
@@ -836,6 +922,54 @@ pub fn publish_table_dir(staging: &Path, final_dir: &Path) -> Result<()> {
     })
 }
 
+/// Atomically publish `manifest` as `dir`'s `_manifest.json`, replacing
+/// ONLY that one file — the sibling primitive [`publish_table_dir`] needs
+/// for INCREMENTAL mutations (native-tables-mutation epic, task 002's
+/// `Append`; a future DELETE/UPDATE). Load-bearing distinction, per task
+/// 001's design-spike Outcome (Decision 4): `publish_table_dir` does
+/// `remove_dir_all(final_dir)` then `rename(staging, final_dir)` — correct
+/// only when `staging` is a COMPLETE, self-sufficient replacement for the
+/// whole directory (true for `Create`/`Overwrite`). An incremental
+/// mutation instead writes new segment file(s) DIRECTLY into the already-
+/// live `dir` (see `native_write::write_append_segments`) and only the
+/// MANIFEST changes — calling `publish_table_dir` for that case would
+/// `remove_dir_all` away every segment file the new manifest didn't just
+/// write, corrupting the table. This function is the correct primitive
+/// instead: it touches nothing in `dir` except `_manifest.json` itself.
+///
+/// Mechanism: validates `manifest` (same as [`write_manifest`]), then
+/// writes it to a process-unique temporary file INSIDE `dir`
+/// (`_manifest.json.tmp-<pid>`) and `std::fs::rename`s that temp file onto
+/// [`manifest_path`]`(dir)` — ONE atomic file-level rename, the same POSIX
+/// guarantee `publish_table_dir`'s directory-level rename already relies
+/// on (same filesystem, same primitive, narrowed to a single file). A
+/// reader opening `_manifest.json` at any instant sees either the fully-
+/// old manifest or the fully-new one, never a torn/partial write, and a
+/// crash between this function and whatever wrote the new segment
+/// file(s) first leaves those segments as harmless, unreferenced orphans
+/// (the existing manifest is untouched until this call's rename lands).
+///
+/// Performs NO locking of its own — callers serializing concurrent
+/// writers (e.g. `native_write::lock_table_for_write`) must hold that
+/// lock across their ENTIRE read-modify-write span, not just this call;
+/// see that function's doc for why a per-call lock here would not be
+/// sufficient (a lost update between two independently-computed "next"
+/// manifests is possible even though each individual rename is atomic).
+pub fn write_manifest_atomic(dir: &Path, manifest: &NativeManifest) -> Result<()> {
+    manifest.validate()?;
+    let text = serde_json::to_string_pretty(manifest)
+        .map_err(|e| QueryError::Storage(format!("serialize native table manifest: {e}")))?;
+    let tmp_path = dir.join(format!("{MANIFEST_FILE_NAME}.tmp-{}", std::process::id()));
+    std::fs::write(&tmp_path, text)?;
+    std::fs::rename(&tmp_path, manifest_path(dir)).map_err(|e| {
+        QueryError::Storage(format!(
+            "publish native table manifest update {} -> {}: {e}",
+            tmp_path.display(),
+            manifest_path(dir).display()
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -867,6 +1001,7 @@ mod tests {
             row_count,
             byte_size: 1024,
             column_stats: stats,
+            deleted_rows: Vec::new(),
         }
     }
 
@@ -1038,6 +1173,7 @@ mod tests {
             row_count: 3,
             byte_size: 8,
             column_stats: with_stats,
+            deleted_rows: Vec::new(),
         };
         // Segment B has no entry for "x" at all (e.g. an all-null batch, or
         // a writer that only tracks columns with a real value).
@@ -1047,6 +1183,7 @@ mod tests {
             row_count: 1,
             byte_size: 8,
             column_stats: BTreeMap::new(),
+            deleted_rows: Vec::new(),
         };
         let rollup = NativeManifest::rollup(&[seg_a, seg_b]);
         let x = rollup.get("x").unwrap();
@@ -1077,6 +1214,7 @@ mod tests {
             row_count: 1,
             byte_size: 8,
             column_stats: stats,
+            deleted_rows: Vec::new(),
         }];
         let manifest =
             NativeManifest::build(&schema, "tid", 1, segments, 0).expect("NaN stats must validate");
@@ -1195,6 +1333,92 @@ mod tests {
         manifest.snapshot.row_count = 999;
         let err = manifest.validate().unwrap_err();
         assert!(err.to_string().contains("row_count"), "{err}");
+    }
+
+    // ---------- deleted_rows (native-tables-mutation epic, task 003) ----------
+
+    #[test]
+    fn deleted_rows_defaults_to_empty_and_manifests_without_it_round_trip_unchanged() {
+        // Every manifest phase 1 or task 002 (INSERT) ever wrote has no
+        // `deleted_rows` key at all in its JSON -- `#[serde(default)]` must
+        // deserialize that as an empty Vec, not an error, and a segment
+        // built via `sample_segment` (this test file's own helper, used
+        // throughout tasks 001/002) must already carry an empty one.
+        let seg = sample_segment(0, 3, 1, 9);
+        assert!(seg.deleted_rows.is_empty());
+        assert_eq!(
+            seg.live_row_count(),
+            3,
+            "no deletions -- physical == logical"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let schema = sample_schema();
+        let doc = serde_json::json!({
+            "format_version": FORMAT_VERSION,
+            "table_id": "pre-task-003",
+            "schema": schema_to_manifest_fields(&schema).unwrap(),
+            "snapshot": {"version": 1, "row_count": 3, "created_at_ms": 0},
+            "segments": [{
+                "id": 0,
+                "path": "rg_00000.arrow",
+                "row_count": 3,
+                "byte_size": 8,
+                "column_stats": {},
+            }],
+            "table_stats": {},
+        });
+        std::fs::write(manifest_path(dir.path()), doc.to_string()).unwrap();
+        let read_back = read_manifest(dir.path()).expect("a pre-task-003 manifest must still read");
+        assert_eq!(read_back.segments[0].deleted_rows, Vec::<u32>::new());
+        assert_eq!(read_back.segments[0].live_row_count(), 3);
+    }
+
+    #[test]
+    fn live_row_count_subtracts_deleted_rows() {
+        let mut seg = sample_segment(0, 10, 1, 9);
+        seg.deleted_rows = vec![2, 5, 7];
+        assert_eq!(seg.live_row_count(), 7);
+    }
+
+    #[test]
+    fn deleted_rows_out_of_range_is_a_clear_validation_error() {
+        let schema = sample_schema();
+        let mut seg = sample_segment(0, 3, 1, 9);
+        seg.deleted_rows = vec![0, 3]; // row_count is 3 -- valid positions are 0,1,2
+        let err = NativeManifest::build(&schema, "t", 1, vec![seg], 0).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("out of range"), "{msg}");
+        assert!(msg.contains('3'), "{msg}");
+    }
+
+    #[test]
+    fn deleted_rows_unsorted_or_duplicated_is_a_clear_validation_error() {
+        let schema = sample_schema();
+
+        let mut unsorted = sample_segment(0, 5, 1, 9);
+        unsorted.deleted_rows = vec![2, 1];
+        let err = NativeManifest::build(&schema, "t", 1, vec![unsorted], 0).unwrap_err();
+        assert!(err.to_string().contains("unsorted"), "{err}");
+
+        let mut duplicated = sample_segment(0, 5, 1, 9);
+        duplicated.deleted_rows = vec![1, 1];
+        let err = NativeManifest::build(&schema, "t", 1, vec![duplicated], 0).unwrap_err();
+        assert!(err.to_string().contains("unsorted or duplicate"), "{err}");
+    }
+
+    #[test]
+    fn deleted_rows_do_not_affect_row_count_consistency_validation() {
+        // Decision 1: Segment.row_count / Snapshot.row_count stay PHYSICAL,
+        // unaffected by deleted_rows -- a partially-tombstoned segment must
+        // still validate cleanly with its ORIGINAL physical row_count.
+        let schema = sample_schema();
+        let mut seg = sample_segment(0, 5, 1, 9);
+        seg.deleted_rows = vec![0, 4];
+        let manifest = NativeManifest::build(&schema, "t", 1, vec![seg], 0)
+            .expect("a partially-tombstoned segment must still validate");
+        assert_eq!(manifest.snapshot.row_count, 5, "physical count unaffected");
+        assert_eq!(manifest.segments[0].live_row_count(), 3);
     }
 
     #[test]
@@ -1332,6 +1556,95 @@ mod tests {
         assert_eq!(read_back.table_id, "same-id", "identity survives a replace");
     }
 
+    // ---------- write_manifest_atomic: single-FILE publish, task 002 ----------
+
+    #[test]
+    fn write_manifest_atomic_replaces_only_the_manifest_file() {
+        let root = tempfile::tempdir().unwrap();
+        let final_dir = root.path().join("mytable");
+        let schema = sample_schema();
+
+        // Publish an initial table (whole-directory path) with one segment.
+        // `sample_segment` builds only the manifest-level `Segment` entry
+        // (no real Arrow IPC bytes), so write a stand-in segment file
+        // ourselves inside the staging dir to actually exercise "does an
+        // existing segment file survive" below.
+        let staging1 = staging_dir_for(&final_dir);
+        std::fs::create_dir_all(&staging1).unwrap();
+        std::fs::write(staging1.join("rg_00000.arrow"), b"segment-0-bytes").unwrap();
+        let m1 = NativeManifest::build(&schema, "same-id", 1, vec![sample_segment(0, 3, 1, 9)], 0)
+            .unwrap();
+        write_manifest(&staging1, &m1).unwrap();
+        publish_table_dir(&staging1, &final_dir).unwrap();
+        assert!(
+            final_dir.join("rg_00000.arrow").is_file(),
+            "sanity: the first publish's stand-in segment file must exist before we test \
+             that a manifest-only update leaves it alone"
+        );
+
+        // Simulate a segment file having been written DIRECTLY into the
+        // live directory by an Append (native_write::write_append_segments'
+        // job, not this module's) plus an unrelated sibling file that must
+        // never be touched.
+        std::fs::write(final_dir.join("rg_00001.arrow"), b"pretend-arrow-bytes").unwrap();
+        std::fs::write(final_dir.join("unrelated.txt"), b"must survive").unwrap();
+
+        // Now publish an updated manifest describing BOTH segments via the
+        // single-file primitive -- must NOT remove/rename the directory,
+        // must NOT touch the sibling file, must leave the segment files
+        // exactly as they were.
+        let mut segments = m1.segments.clone();
+        segments.push(sample_segment(1, 4, 2, 20));
+        let m2 = NativeManifest::build(&schema, "same-id", 2, segments, 1).unwrap();
+        write_manifest_atomic(&final_dir, &m2).unwrap();
+
+        assert!(
+            final_dir.join("unrelated.txt").is_file(),
+            "write_manifest_atomic must never touch sibling files"
+        );
+        assert_eq!(
+            std::fs::read(final_dir.join("rg_00001.arrow")).unwrap(),
+            b"pretend-arrow-bytes",
+            "an existing segment file must survive a manifest-only publish byte-for-byte"
+        );
+        assert_eq!(
+            std::fs::read(final_dir.join("rg_00000.arrow")).unwrap(),
+            b"segment-0-bytes",
+            "the FIRST publish's segment file must also still be present, byte-for-byte"
+        );
+        // No leftover temp file.
+        let tmp_leftover = std::fs::read_dir(&final_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp-"));
+        assert!(!tmp_leftover, "no temp manifest file must be left behind");
+
+        let read_back = read_manifest(&final_dir).unwrap();
+        assert_eq!(read_back.snapshot.version, 2);
+        assert_eq!(read_back.snapshot.row_count, 7);
+        assert_eq!(read_back.segments.len(), 2);
+        assert_eq!(read_back.table_id, "same-id");
+    }
+
+    #[test]
+    fn write_manifest_atomic_refuses_an_invalid_manifest_without_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = sample_schema();
+        let mut manifest =
+            NativeManifest::build(&schema, "t", 1, vec![sample_segment(0, 3, 1, 9)], 0).unwrap();
+        // Corrupt it post-construction the same way the existing
+        // `partial_manifest_inconsistent_row_count_is_a_clear_error` test
+        // does, so `validate()` inside `write_manifest_atomic` catches it.
+        manifest.snapshot.row_count = 999;
+
+        let err = write_manifest_atomic(dir.path(), &manifest).unwrap_err();
+        assert!(err.to_string().contains("row_count"), "{err}");
+        assert!(
+            !manifest_path(dir.path()).exists(),
+            "an invalid manifest must never be published"
+        );
+    }
+
     // ---------- the load-bearing proof: ipc_cache::read_row_group reads a
     // manifest-described segment UNCHANGED, with zero refactor ----------
 
@@ -1369,6 +1682,7 @@ mod tests {
             row_count: 3,
             byte_size,
             column_stats: compute_batch_stats(&batch),
+            deleted_rows: Vec::new(),
         };
         let manifest = NativeManifest::build(&schema, "seg-test", 1, vec![segment], 0).unwrap();
         write_manifest(dir.path(), &manifest).unwrap();
@@ -1418,6 +1732,7 @@ mod tests {
             row_count: 3,
             byte_size,
             column_stats: compute_batch_stats(&batch),
+            deleted_rows: Vec::new(),
         };
         let manifest = NativeManifest::build(&schema, "dict-test", 1, vec![segment], 0).unwrap();
         write_manifest(dir.path(), &manifest).unwrap();

@@ -7,7 +7,9 @@ use crate::parser;
 use crate::physical::operators::{MemoryTable, TableProvider};
 use crate::physical::{PhysicalOperator, PhysicalPlanner, RecordBatchStream};
 use crate::planner::{Binder, InMemoryCatalog, LogicalPlan, PlanSchema, SchemaField};
+use crate::storage::native_delete;
 use crate::storage::native_manifest;
+use crate::storage::native_update;
 use crate::storage::native_write::{self, NativeWriteMode};
 use crate::storage::{NativeTable, ParquetTable};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -76,6 +78,89 @@ pub struct CreateTableAsSelectResult {
     pub elapsed: Duration,
 }
 
+/// What `ExecutionContext::insert_into_native_table` produced
+/// (native-tables-mutation epic, task 002).
+#[derive(Debug, Clone)]
+pub struct InsertResult {
+    /// The table name the INSERT targeted (`insert.table` from the SQL).
+    pub table_name: String,
+    /// The native table's stable identity (UUID v4) — unchanged by an
+    /// INSERT.
+    pub table_id: String,
+    /// The snapshot version this INSERT committed. Equal to the
+    /// PRE-insert version when the source produced zero rows (a
+    /// legitimate no-op, not an error — see
+    /// `native_write::append_to_native_table`'s doc).
+    pub version: u64,
+    /// Rows ADDED by this INSERT (0 for an empty source).
+    pub rows_inserted: u64,
+    /// Segments ADDED by this INSERT (0 for an empty source).
+    pub segments_added: usize,
+    /// The table's TOTAL row count after this INSERT.
+    pub total_rows: u64,
+    /// Wall-clock time for the whole parse-bind-plan-execute-write
+    /// sequence.
+    pub elapsed: Duration,
+}
+
+/// What `ExecutionContext::delete_from_native_table` produced
+/// (native-tables-mutation epic, task 003).
+#[derive(Debug, Clone)]
+pub struct DeleteResult {
+    /// The table name the DELETE targeted (`delete.from` from the SQL).
+    pub table_name: String,
+    /// The native table's stable identity (UUID v4) — unchanged by a
+    /// DELETE.
+    pub table_id: String,
+    /// The snapshot version this DELETE committed. Equal to the PRE-delete
+    /// version when the predicate matched zero rows (a legitimate no-op,
+    /// not an error — see `native_delete::delete_from_native_table`'s
+    /// doc).
+    pub version: u64,
+    /// Rows tombstoned by this DELETE (0 for a no-op match).
+    pub rows_deleted: u64,
+    /// Segments dropped entirely because every one of their rows became
+    /// tombstoned by this DELETE (task 001's Decision 3).
+    pub segments_dropped: usize,
+    /// The table's TOTAL LOGICAL (post-delete, visible) row count after
+    /// this DELETE.
+    pub total_rows: u64,
+    /// Wall-clock time for the whole parse-bind-identify-publish sequence.
+    pub elapsed: Duration,
+}
+
+/// What `ExecutionContext::update_native_table` produced
+/// (native-tables-mutation epic, task 004).
+#[derive(Debug, Clone)]
+pub struct UpdateResult {
+    /// The table name the UPDATE targeted (`update.table` from the SQL).
+    pub table_name: String,
+    /// The native table's stable identity (UUID v4) — unchanged by an
+    /// UPDATE.
+    pub table_id: String,
+    /// The snapshot version this UPDATE committed. Equal to the PRE-update
+    /// version when the predicate matched zero LIVE rows (a legitimate
+    /// no-op, not an error — see `native_update::update_native_table`'s
+    /// doc).
+    pub version: u64,
+    /// Rows actually recomputed and rewritten — the NET count of LIVE
+    /// matched rows (0 for a no-op match, or a match that only covers
+    /// rows already tombstoned by a prior DELETE/UPDATE).
+    pub rows_updated: u64,
+    /// Old segments dropped entirely because every one of their rows
+    /// became tombstoned by this UPDATE.
+    pub segments_dropped: usize,
+    /// New segments written to hold the recomputed rows.
+    pub segments_added: usize,
+    /// The table's TOTAL LOGICAL (post-update, visible) row count — always
+    /// equal to the pre-update logical row count for a real update (an
+    /// UPDATE never changes how many rows are live, only their values).
+    pub total_rows: u64,
+    /// Wall-clock time for the whole parse-bind-identify-evaluate-write-
+    /// publish sequence.
+    pub elapsed: Duration,
+}
+
 /// Execution context - manages tables and executes queries
 pub struct ExecutionContext {
     catalog: InMemoryCatalog,
@@ -101,6 +186,21 @@ impl Default for ExecutionContext {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Pure parsing logic for `QE_INSERT_MERGE_CONCURRENCY`
+/// (native-tables-mutation epic, task 005) — factored out of
+/// `ExecutionContext::insert_merge_concurrency` so it is unit-testable
+/// without mutating the real process environment (this crate's test
+/// binaries run many `#[tokio::test]`s concurrently in one process; a test
+/// that called `std::env::set_var` here would race every other test
+/// reading the same key). Any absent, unparseable, or zero value falls
+/// back to the default (8) — never a panic, never a zero-concurrency
+/// merge (which would deadlock `flatten_unordered`'s `Some(0)` semantics).
+fn parse_merge_concurrency(raw: Option<&str>) -> usize {
+    raw.and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(8)
 }
 
 impl ExecutionContext {
@@ -399,6 +499,71 @@ impl ExecutionContext {
             ));
         }
 
+        // Same reasoning, same fix shape, for `INSERT INTO ... SELECT/
+        // VALUES ...` (native-tables-mutation epic, task 002): now that
+        // `Binder::bind()` accepts `Statement::Insert` (binding ONLY the
+        // source query, exactly like CREATE TABLE), an unguarded INSERT
+        // reaching the ordinary bind/plan/execute path below would
+        // silently run just the SOURCE query and return ITS rows as a
+        // "successful" result — never writing a single row to the target
+        // native table. `insert_into_native_table` needs `&mut self` for
+        // the same reasons `create_table_as_select` does (re-registering
+        // the table so its new rows are visible in this session) and a
+        // genuinely streaming write, both incompatible with this method's
+        // `&self` signature.
+        if crate::planner::insert_target_name(&stmt).is_some() {
+            return Err(QueryError::InvalidArgument(
+                "INSERT INTO ... must run through \
+                 ExecutionContext::insert_into_native_table (the REPL calls this \
+                 automatically) — sql() cannot write to a native table (it takes &self) and \
+                 would otherwise silently execute only the source query without inserting \
+                 anything"
+                    .to_string(),
+            ));
+        }
+
+        // Same reasoning again for `DELETE FROM ... [WHERE ...]`
+        // (native-tables-mutation epic, task 003): `Binder::bind()`'s
+        // `Statement::Delete` arm only validates shape and always returns
+        // `Err` (DELETE has no `LogicalPlan` to give back — see that arm's
+        // own comment), so an unguarded DELETE reaching the ordinary
+        // bind/plan/execute path below would just surface that
+        // NotImplemented error anyway. This guard exists for the same
+        // reason the CREATE TABLE/INSERT ones do: fail with a message that
+        // names the correct entrypoint BEFORE constructing a `Binder` at
+        // all, matching this method's own established pattern rather than
+        // relying on `bind()`'s incidental refusal.
+        if crate::planner::delete_target_name(&stmt).is_some() {
+            return Err(QueryError::InvalidArgument(
+                "DELETE FROM ... must run through \
+                 ExecutionContext::delete_from_native_table (the REPL calls this \
+                 automatically) — sql() cannot delete from a native table (it takes &self, \
+                 and DELETE needs a bespoke row-identification loop no LogicalPlan can \
+                 express)"
+                    .to_string(),
+            ));
+        }
+
+        // Same reasoning again for `UPDATE <table> SET ... [WHERE ...]`
+        // (native-tables-mutation epic, task 004): `Binder::bind()`'s
+        // `Statement::Update` arm only validates shape and always returns
+        // `Err` (UPDATE has no `LogicalPlan` to give back, same reason
+        // DELETE doesn't), so an unguarded UPDATE reaching the ordinary
+        // bind/plan/execute path below would just surface that
+        // NotImplemented error anyway. This guard exists for the same
+        // reason the CREATE TABLE/INSERT/DELETE ones do: fail with a
+        // message that names the correct entrypoint BEFORE constructing a
+        // `Binder` at all.
+        if crate::planner::update_target_name(&stmt).is_some() {
+            return Err(QueryError::InvalidArgument(
+                "UPDATE ... SET ... must run through \
+                 ExecutionContext::update_native_table (the REPL calls this automatically) — \
+                 sql() cannot update a native table (it takes &self, and UPDATE needs a \
+                 bespoke row-identification + SET-evaluation loop no LogicalPlan can express)"
+                    .to_string(),
+            ));
+        }
+
         // Plan
         let plan_start = Instant::now();
         let mut binder = Binder::new(&self.catalog);
@@ -502,6 +667,52 @@ impl ExecutionContext {
             row_count,
             metrics,
         })
+    }
+
+    /// Merge many per-partition streams into ONE, bounding how many are
+    /// concurrently polled/decoded at once (native-tables-mutation epic,
+    /// task 005). Plain `futures::stream::select_all` (the mechanism this
+    /// replaces at both call sites below) keeps EVERY member stream alive
+    /// and interleaves polls across ALL of them for the operation's whole
+    /// duration — for a wide multi-partition source (a
+    /// `StreamingParquetScanExec` partition per up to `rayon::
+    /// current_num_threads()`, each effectively a currently-open parquet
+    /// row-group reader with its own decoded-column-chunk working set
+    /// resident once its turn comes), that lets up to `num_partitions`
+    /// readers' working sets sit resident simultaneously with no cap. Task
+    /// 002 root-caused this as (most of) the SQL-path INSERT's measured
+    /// ~5.3GB-vs-328MB gap over the direct write core; task 005 confirmed
+    /// (a) it stays BOUNDED rather than growing with source row count
+    /// (60M vs 600M rows measured ~5.4GB vs ~6.0GB peak RSS — the
+    /// partition count, not the row count, drives it) but (b) is not
+    /// admission-controlled at all today (a configured `--memory-limit`
+    /// has zero effect on this path) and (c) a genuinely tight memory cap
+    /// gets the process a real kernel cgroup OOM-kill, not a clean
+    /// refusal — see `.claude/epics/native-tables-mutation/005.md`'s
+    /// Outcome for the full measurement. `flatten_unordered(Some(limit))`
+    /// polls at most `limit` inner streams at once: same eventual output
+    /// (every row, order-independent — matching `select_all`'s own
+    /// pre-existing "unordered merge is fine, only every row exactly once
+    /// matters" contract both callers already documented), bounded
+    /// concurrent memory instead of unbounded. A single-threaded Append
+    /// writer downstream drains one batch at a time regardless, so wide
+    /// concurrency here was never buying write throughput — only, at
+    /// best, some read-ahead.
+    fn bounded_partition_merge(streams: Vec<RecordBatchStream>, limit: usize) -> RecordBatchStream {
+        use futures::StreamExt;
+        Box::pin(futures::stream::iter(streams).flatten_unordered(Some(limit.max(1))))
+    }
+
+    /// Concurrency cap for [`Self::bounded_partition_merge`]. Overridable
+    /// via `QE_INSERT_MERGE_CONCURRENCY`, matching this codebase's
+    /// established env-gated tuning-switch convention (`QE_MORSEL`,
+    /// `QE_IPC_CACHE`, ...). 8 is a deliberately modest, hardware-count-
+    /// independent default — task 005 measured it cuts the SQL-path
+    /// INSERT/CTAS peak RSS materially with no correctness change (every
+    /// row still emitted exactly once) and no measurable wall-time
+    /// regression on the shapes it tested.
+    fn insert_merge_concurrency() -> usize {
+        parse_merge_concurrency(std::env::var("QE_INSERT_MERGE_CONCURRENCY").ok().as_deref())
     }
 
     /// Execute `CREATE TABLE <name> AS SELECT ...` end to end: parse, bind
@@ -611,7 +822,8 @@ impl ExecutionContext {
             }));
             streams.push(decoded);
         }
-        let merged: RecordBatchStream = Box::pin(futures::stream::select_all(streams));
+        let merged: RecordBatchStream =
+            Self::bounded_partition_merge(streams, Self::insert_merge_concurrency());
 
         // Create for a genuinely fresh destination, Overwrite when a native
         // table already lives there (bumps snapshot.version, preserves
@@ -645,6 +857,311 @@ impl ExecutionContext {
             rows: write_result.rows,
             segments: write_result.segments,
             schema: write_schema,
+            elapsed: start.elapsed(),
+        })
+    }
+
+    /// Execute `INSERT INTO <table> SELECT ...` / `INSERT INTO <table>
+    /// VALUES (...)` end to end against an EXISTING native table
+    /// (native-tables-mutation epic, task 002): parse, bind the source
+    /// query via the ordinary `Binder::bind()` path (which also validates
+    /// the `INSERT`'s shape is one this epic supports — see
+    /// `planner::binder`'s `require_supported_insert_shape`), plan and
+    /// optimize it exactly like [`sql`](Self::sql)/
+    /// [`create_table_as_select`](Self::create_table_as_select), then
+    /// drive its `RecordBatchStream` DIRECTLY into
+    /// `native_write::append_to_native_table` — never collecting it into a
+    /// `Vec<RecordBatch>` first, matching `create_table_as_select`'s own
+    /// streaming discipline. Re-registers the table afterward so its new
+    /// rows are visible to a subsequent query in the SAME session.
+    ///
+    /// `&mut self`, unlike `sql()`'s `&self`: re-registering the table
+    /// mutates `self.tables`, and a genuinely streaming write needs the
+    /// plan's stream driven directly rather than via `sql()`'s collecting
+    /// wrapper.
+    ///
+    /// Unlike `create_table_as_select` (which always writes under
+    /// `native_table_root().join(name)`, creating that directory if
+    /// needed), INSERT never creates a table: the target MUST already be
+    /// REGISTERED in this session as a native table (`TableProvider::
+    /// as_any().downcast_ref::<NativeTable>()`) — a plain `QueryError::
+    /// TableNotFound`/`InvalidArgument` otherwise, the same "register
+    /// before you reference it" contract every other table access in this
+    /// engine already has (no special-cased auto-discovery under
+    /// `native_table_root()` — that would be a surprising, untested
+    /// deviation from that contract for this one statement only). An
+    /// empty source (zero matched rows) is a legitimate no-op — see
+    /// `native_write::append_to_native_table`'s doc — not an error.
+    ///
+    /// A schema mismatch between the source's output and the target's
+    /// declared schema is a clean, named `QueryError::Type` from
+    /// `native_write::write_append_segments`'s own validation, never
+    /// silent coercion.
+    pub async fn insert_into_native_table(&mut self, sql: &str) -> Result<InsertResult> {
+        let start = Instant::now();
+        let stmt = parser::parse_sql(sql)?;
+        let table_name = crate::planner::insert_target_name(&stmt).ok_or_else(|| {
+            QueryError::InvalidArgument(format!(
+                "insert_into_native_table expects an INSERT INTO <table> SELECT/VALUES ... \
+                 statement, got: {sql}"
+            ))
+        })?;
+
+        let provider = self.tables.get(&table_name).cloned().ok_or_else(|| {
+            QueryError::TableNotFound(format!(
+                "INSERT INTO {table_name}: no such table is registered in this session (a \
+                 native table must be registered, e.g. via register_native_table or a prior \
+                 CREATE TABLE ... AS SELECT, before INSERT can target it)"
+            ))
+        })?;
+        let native = provider
+            .as_any()
+            .downcast_ref::<NativeTable>()
+            .ok_or_else(|| {
+                QueryError::InvalidArgument(format!(
+                    "INSERT INTO {table_name}: this table is not a native table -- INSERT is \
+                     only supported against native tables"
+                ))
+            })?;
+        let table_dir = native.dir().to_path_buf();
+
+        let mut binder = Binder::new(&self.catalog);
+        // Validates the INSERT's shape (refusing every unsupported clause
+        // by name) AND binds the source query in one call: see
+        // `Binder::bind()`'s `Statement::Insert` arm.
+        let logical = binder.bind(&stmt)?;
+
+        let table_stats = self.collect_table_statistics();
+        let optimized = if table_stats.is_empty() {
+            self.optimizer.optimize(logical)?
+        } else {
+            let optimizer = Optimizer::new().with_table_statistics(table_stats);
+            optimizer.optimize(logical)?
+        };
+        if std::env::var("PLAN_DEBUG").is_ok() {
+            eprintln!("[plan]\n{}", optimized);
+        }
+
+        let mut planner =
+            PhysicalPlanner::with_config(self.memory_pool.clone(), self.config.clone());
+        for (name, provider) in &self.tables {
+            planner.register_table(name.clone(), provider.clone());
+        }
+        planner.enable_subquery_execution();
+        let physical = planner.create_physical_plan(&optimized)?;
+
+        // Drive every output partition's stream directly, then merge them
+        // into ONE stream -- `native_write::append_to_native_table` takes
+        // a single `RecordBatchStream`. Only strips INCIDENTAL
+        // Dictionary encoding here (small-build join gathers, or an
+        // IPC-sidecar-cached scan of the source) the same way
+        // `create_table_as_select` does — the REAL target-schema
+        // conformance (by POSITION, never trusting the source query's own
+        // field names, which can be table-qualified for a bare `SELECT *`
+        // wildcard source — the same trap CTAS already guards against)
+        // and dictionary re-application happen inside
+        // `native_write::write_append_segments` itself, against the
+        // target's ALREADY-DECLARED schema, which already exists for
+        // INSERT (unlike CTAS, which is defining a schema fresh).
+        let num_partitions = physical.output_partitions().max(1);
+        let mut streams: Vec<RecordBatchStream> = Vec::with_capacity(num_partitions);
+        for partition_id in 0..num_partitions {
+            let stream = physical.execute(partition_id).await.map_err(|e| {
+                QueryError::Execution(format!("Partition {partition_id} execution failed: {e}"))
+            })?;
+            let decoded: RecordBatchStream =
+                Box::pin(stream.and_then(|b| async move { decode_dictionary_batch(b) }));
+            streams.push(decoded);
+        }
+        let merged: RecordBatchStream =
+            Self::bounded_partition_merge(streams, Self::insert_merge_concurrency());
+
+        let append_result = native_write::append_to_native_table(
+            merged,
+            &table_dir,
+            native_write::NativeWriteOptions::default(),
+        )
+        .await
+        .map_err(|e| QueryError::Storage(format!("INSERT INTO {table_name}: {e}")))?;
+
+        // Re-open the table so a subsequent query in the SAME session
+        // sees the newly appended rows -- mirrors `create_table_as_select`'s
+        // own "make the write immediately queryable" step. Reuses the SAME
+        // memory budget `register_native_table` always computes.
+        self.register_native_table(&table_name, &table_dir)?;
+
+        Ok(InsertResult {
+            table_name,
+            table_id: append_result.table_id,
+            version: append_result.version,
+            rows_inserted: append_result.rows_appended,
+            segments_added: append_result.segments_appended,
+            total_rows: append_result.total_rows,
+            elapsed: start.elapsed(),
+        })
+    }
+
+    /// Execute `DELETE FROM <table> [WHERE ...]` end to end against an
+    /// EXISTING native table (native-tables-mutation epic, task 003):
+    /// parse, recover the target name (`planner::delete_target_name`),
+    /// look it up as a REGISTERED native table (same "register before you
+    /// reference it" contract as INSERT — no auto-discovery), bind the
+    /// WHERE predicate via `Binder::bind_delete` (which ALSO validates the
+    /// statement's shape — every clause this epic does not support
+    /// refused by name), then drive `native_delete::
+    /// delete_from_native_table`'s bespoke row-identification +
+    /// deletion-vector-editing + single-file atomic-publish sequence
+    /// DIRECTLY — unlike CTAS/INSERT, there is no `LogicalPlan`/
+    /// `PhysicalOperator` pipeline involved at all (see `native_delete.rs`'s
+    /// module doc for why). Re-registers the table afterward so the
+    /// deletion is visible to a subsequent query in the SAME session.
+    ///
+    /// `&mut self`, unlike `sql()`'s `&self`: re-registering the table
+    /// mutates `self.tables`.
+    ///
+    /// `selection: None` (`DELETE FROM t` with no WHERE) deletes every
+    /// row — the table keeps existing, now logically empty, not an error.
+    /// A predicate matching zero rows is a clean no-op (no version bump,
+    /// manifest untouched) — see `native_delete::delete_from_native_table`'s
+    /// doc.
+    pub async fn delete_from_native_table(&mut self, sql: &str) -> Result<DeleteResult> {
+        let start = Instant::now();
+        let stmt = parser::parse_sql(sql)?;
+        let table_name = crate::planner::delete_target_name(&stmt).ok_or_else(|| {
+            QueryError::InvalidArgument(format!(
+                "delete_from_native_table expects a DELETE FROM <table> [WHERE ...] \
+                 statement, got: {sql}"
+            ))
+        })?;
+
+        let provider = self.tables.get(&table_name).cloned().ok_or_else(|| {
+            QueryError::TableNotFound(format!(
+                "DELETE FROM {table_name}: no such table is registered in this session (a \
+                 native table must be registered, e.g. via register_native_table or a prior \
+                 CREATE TABLE ... AS SELECT, before DELETE can target it)"
+            ))
+        })?;
+        let native = provider
+            .as_any()
+            .downcast_ref::<NativeTable>()
+            .ok_or_else(|| {
+                QueryError::InvalidArgument(format!(
+                    "DELETE FROM {table_name}: this table is not a native table -- DELETE is \
+                     only supported against native tables"
+                ))
+            })?;
+        let table_dir = native.dir().to_path_buf();
+
+        let sqlparser::ast::Statement::Delete(delete) = &stmt else {
+            unreachable!("delete_target_name only returns Some for a Statement::Delete")
+        };
+        let mut binder = Binder::new(&self.catalog);
+        // Validates the DELETE's shape (refusing every unsupported clause
+        // by name) AND binds the WHERE predicate (if any) in one call —
+        // see `Binder::bind_delete`.
+        let (_, predicate) = binder.bind_delete(delete)?;
+
+        let delete_result = native_delete::delete_from_native_table(&table_dir, predicate.as_ref())
+            .await
+            .map_err(|e| QueryError::Storage(format!("DELETE FROM {table_name}: {e}")))?;
+
+        // Re-open the table so a subsequent query in the SAME session
+        // sees the deletion -- mirrors `insert_into_native_table`'s own
+        // "make the write immediately visible" step.
+        self.register_native_table(&table_name, &table_dir)?;
+
+        Ok(DeleteResult {
+            table_name,
+            table_id: delete_result.table_id,
+            version: delete_result.version,
+            rows_deleted: delete_result.rows_deleted,
+            segments_dropped: delete_result.segments_dropped,
+            total_rows: delete_result.total_rows,
+            elapsed: start.elapsed(),
+        })
+    }
+
+    /// Execute `UPDATE <table> SET <col> = <expr>, ... [WHERE ...]` end to
+    /// end against an EXISTING native table (native-tables-mutation epic,
+    /// task 004): parse, recover the target name
+    /// (`planner::update_target_name`), look it up as a REGISTERED native
+    /// table (same "register before you reference it" contract as INSERT/
+    /// DELETE — no auto-discovery), bind the SET assignments and WHERE
+    /// predicate via `Binder::bind_update` (which ALSO validates the
+    /// statement's shape — every clause this epic does not support refused
+    /// by name), then drive `native_update::update_native_table`'s bespoke
+    /// row-identification + SET-evaluation + combined-segment-list +
+    /// single-file atomic-publish sequence DIRECTLY — unlike CTAS/INSERT,
+    /// there is no `LogicalPlan`/`PhysicalOperator` pipeline involved at
+    /// all (see `native_update.rs`'s module doc for why, and for exactly
+    /// why this is composed as ONE atomic operation rather than a DELETE
+    /// followed by an INSERT). Re-registers the table afterward so the
+    /// update is visible to a subsequent query in the SAME session.
+    ///
+    /// `&mut self`, unlike `sql()`'s `&self`: re-registering the table
+    /// mutates `self.tables`.
+    ///
+    /// `selection: None` (`UPDATE t SET ...` with no WHERE) updates every
+    /// LIVE row. A predicate matching zero rows, or matching only rows
+    /// already tombstoned by a prior DELETE/UPDATE, is a clean no-op (no
+    /// version bump, manifest untouched) — see `native_update::
+    /// update_native_table`'s doc.
+    pub async fn update_native_table(&mut self, sql: &str) -> Result<UpdateResult> {
+        let start = Instant::now();
+        let stmt = parser::parse_sql(sql)?;
+        let table_name = crate::planner::update_target_name(&stmt).ok_or_else(|| {
+            QueryError::InvalidArgument(format!(
+                "update_native_table expects an UPDATE <table> SET ... [WHERE ...] statement, \
+                 got: {sql}"
+            ))
+        })?;
+
+        let provider = self.tables.get(&table_name).cloned().ok_or_else(|| {
+            QueryError::TableNotFound(format!(
+                "UPDATE {table_name}: no such table is registered in this session (a native \
+                 table must be registered, e.g. via register_native_table or a prior CREATE \
+                 TABLE ... AS SELECT, before UPDATE can target it)"
+            ))
+        })?;
+        let native = provider
+            .as_any()
+            .downcast_ref::<NativeTable>()
+            .ok_or_else(|| {
+                QueryError::InvalidArgument(format!(
+                    "UPDATE {table_name}: this table is not a native table -- UPDATE is only \
+                     supported against native tables"
+                ))
+            })?;
+        let table_dir = native.dir().to_path_buf();
+
+        let sqlparser::ast::Statement::Update(update) = &stmt else {
+            unreachable!("update_target_name only returns Some for a Statement::Update")
+        };
+        let mut binder = Binder::new(&self.catalog);
+        // Validates the UPDATE's shape (refusing every unsupported clause
+        // by name) AND binds every SET assignment's value expression plus
+        // the WHERE predicate (if any) in one call — see
+        // `Binder::bind_update`.
+        let (_, assignments, predicate) = binder.bind_update(update)?;
+
+        let update_result =
+            native_update::update_native_table(&table_dir, predicate.as_ref(), &assignments)
+                .await
+                .map_err(|e| QueryError::Storage(format!("UPDATE {table_name}: {e}")))?;
+
+        // Re-open the table so a subsequent query in the SAME session sees
+        // the update -- mirrors `delete_from_native_table`'s own "make the
+        // write immediately visible" step.
+        self.register_native_table(&table_name, &table_dir)?;
+
+        Ok(UpdateResult {
+            table_name,
+            table_id: update_result.table_id,
+            version: update_result.version,
+            rows_updated: update_result.rows_updated,
+            segments_dropped: update_result.segments_dropped,
+            segments_added: update_result.segments_added,
+            total_rows: update_result.total_rows,
             elapsed: start.elapsed(),
         })
     }
@@ -990,6 +1507,93 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field};
+
+    // ------------------------------------------------------------------
+    // native-tables-mutation epic, task 005: bounded partition-merge
+    // concurrency (the SQL-path INSERT/CTAS memory fix -- see this
+    // module's `bounded_partition_merge`/`insert_merge_concurrency` doc
+    // comments and `.claude/epics/native-tables-mutation/005.md`'s
+    // Outcome for the full before/after measurement).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_merge_concurrency_defaults_and_validates() {
+        assert_eq!(parse_merge_concurrency(None), 8);
+        assert_eq!(parse_merge_concurrency(Some("")), 8);
+        assert_eq!(parse_merge_concurrency(Some("not a number")), 8);
+        assert_eq!(
+            parse_merge_concurrency(Some("0")),
+            8,
+            "zero would deadlock flatten_unordered's Some(0) -- must fall back"
+        );
+        assert_eq!(
+            parse_merge_concurrency(Some("-1")),
+            8,
+            "negative is not a valid usize -- must fall back"
+        );
+        assert_eq!(parse_merge_concurrency(Some("1")), 1);
+        assert_eq!(parse_merge_concurrency(Some("32")), 32);
+    }
+
+    fn int_batch(schema: &SchemaRef, vals: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vals))]).unwrap()
+    }
+
+    /// `bounded_partition_merge` must emit every row from every input
+    /// stream exactly once, regardless of the concurrency limit -- tested
+    /// at the extremes (1, the most different from unbounded `select_all`
+    /// and therefore the most likely to reveal an off-by-one/deadlock;
+    /// and a generous limit) plus the real default.
+    #[tokio::test]
+    async fn bounded_partition_merge_preserves_every_row_at_every_concurrency_limit() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        for limit in [1usize, 2, ExecutionContext::insert_merge_concurrency(), 100] {
+            let streams: Vec<RecordBatchStream> = (0..5)
+                .map(|p| {
+                    let base = p * 10;
+                    let batches = vec![
+                        int_batch(&schema, vec![base, base + 1]),
+                        int_batch(&schema, vec![base + 2]),
+                    ];
+                    Box::pin(futures::stream::iter(batches.into_iter().map(Ok)))
+                        as RecordBatchStream
+                })
+                .collect();
+            let merged = ExecutionContext::bounded_partition_merge(streams, limit);
+            let collected: Vec<RecordBatch> =
+                merged.try_collect().await.expect("merge must not error");
+            let mut values: Vec<i64> = collected
+                .iter()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            values.sort_unstable();
+            let expected: Vec<i64> = (0..5)
+                .flat_map(|p| [p * 10, p * 10 + 1, p * 10 + 2])
+                .collect();
+            assert_eq!(
+                values, expected,
+                "limit={limit}: every row must appear exactly once"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_partition_merge_handles_zero_streams() {
+        let merged = ExecutionContext::bounded_partition_merge(Vec::new(), 8);
+        let collected: Vec<RecordBatch> = merged
+            .try_collect()
+            .await
+            .expect("empty merge must not error");
+        assert!(collected.is_empty());
+    }
 
     fn create_test_context() -> ExecutionContext {
         let mut ctx = ExecutionContext::new();

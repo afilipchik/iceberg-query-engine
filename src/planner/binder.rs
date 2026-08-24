@@ -137,6 +137,413 @@ pub fn create_table_target_name(stmt: &Statement) -> Option<String> {
     }
 }
 
+/// If `stmt` is an `INSERT` statement, its target table's name —
+/// regardless of whether the statement is otherwise a shape this binder's
+/// `bind()` will accept (mirrors [`create_table_target_name`]'s own
+/// "extraction is separate from validation" split, so a caller can learn
+/// the target before, or independent of, calling `bind()`). `None` for
+/// `TableObject::TableFunction` (ClickHouse `INSERT INTO TABLE
+/// FUNCTION(...)`), which has no plain table name —
+/// `require_supported_insert_shape` (called from `bind()`) refuses that
+/// shape by name too, so a caller that checks this first never reaches a
+/// validated bind for it.
+pub fn insert_target_name(stmt: &Statement) -> Option<String> {
+    match stmt {
+        Statement::Insert(insert) => match &insert.table {
+            ast::TableObject::TableName(name) => Some(name.table_name()),
+            // `TableFunction` (ClickHouse `INSERT INTO TABLE FUNCTION(...)`)
+            // and `TableQuery` (Oracle `INSERT INTO (subquery) VALUES ...`)
+            // have no plain table name -- `require_supported_insert_shape`
+            // (called from `bind()`) refuses both shapes by name too.
+            ast::TableObject::TableFunction(_) | ast::TableObject::TableQuery(_) => None,
+        },
+        _ => None,
+    }
+}
+
+/// Refuse, by name, every `INSERT` clause this epic (native-tables-
+/// mutation, task 002) does not implement. Mirrors
+/// `require_supported_create_table_shape`'s exact discipline, mechanically
+/// checked against sqlparser 0.62's real `ast::Insert` struct (~26 fields
+/// total; confirmed via `.scratch/mutation_sqlparser_spike/`, see task
+/// 001's Outcome, Decision 6). Only `table` (name only) and `source` are
+/// consumed (by `Binder::bind()`'s `Statement::Insert` arm); every other
+/// field must be at its "not specified" value or this returns a specific
+/// `QueryError::NotImplemented` naming the clause — never a silent
+/// downgrade to "ignore the clause and proceed." `insert_token`, `into`
+/// and `has_table_keyword` are pure syntax/span markers with no semantic
+/// effect (`INSERT INTO t ...` vs. dialect-specific `INSERT t ...`/
+/// `INSERT TABLE t ...` mean the same thing) and are deliberately not
+/// checked, mirroring `require_supported_create_table_shape`'s own
+/// treatment of `ct.hive_distribution`'s "NONE" default.
+fn require_supported_insert_shape(insert: &ast::Insert) -> Result<()> {
+    fn refuse(clause: &str) -> QueryError {
+        QueryError::NotImplemented(format!(
+            "INSERT: `{clause}` is not supported — this epic supports only \
+             `INSERT INTO <table> SELECT ...` / `INSERT INTO <table> VALUES (...)` against an \
+             existing native table (no upsert, no partial column lists, no full-table \
+             overwrite via INSERT)"
+        ))
+    }
+    if !matches!(insert.table, ast::TableObject::TableName(_)) {
+        return Err(refuse(
+            "an INSERT target that is not a plain table name (TABLE FUNCTION(...) or a \
+             sub-query target)",
+        ));
+    }
+    if !insert.optimizer_hints.is_empty() {
+        return Err(refuse("query optimizer hints"));
+    }
+    if insert.or.is_some() {
+        return Err(refuse("SQLite ON CONFLICT (INSERT OR ...)"));
+    }
+    if insert.ignore {
+        return Err(refuse("MySQL INSERT IGNORE"));
+    }
+    if insert.table_alias.is_some() {
+        return Err(refuse("a table alias on the INSERT target"));
+    }
+    if !insert.columns.is_empty() {
+        return Err(refuse(
+            "an explicit column list (INSERT INTO t (a, b) SELECT/VALUES ...)",
+        ));
+    }
+    if insert.overwrite {
+        return Err(refuse("Hive INSERT OVERWRITE TABLE"));
+    }
+    if !insert.assignments.is_empty() {
+        return Err(refuse("MySQL INSERT ... SET"));
+    }
+    if insert.partitioned.is_some() {
+        return Err(refuse("Hive PARTITION"));
+    }
+    if !insert.after_columns.is_empty() {
+        return Err(refuse("Hive columns defined after PARTITION"));
+    }
+    if insert.on.is_some() {
+        return Err(refuse("ON CONFLICT / ON DUPLICATE KEY UPDATE"));
+    }
+    if insert.returning.is_some() {
+        return Err(refuse("RETURNING"));
+    }
+    if insert.output.is_some() {
+        return Err(refuse("OUTPUT (MSSQL)"));
+    }
+    if insert.replace_into {
+        return Err(refuse("MySQL REPLACE INTO"));
+    }
+    if insert.priority.is_some() {
+        return Err(refuse(
+            "MySQL INSERT priority (LOW_PRIORITY/DELAYED/HIGH_PRIORITY)",
+        ));
+    }
+    if insert.insert_alias.is_some() {
+        return Err(refuse("MySQL INSERT ... AS alias"));
+    }
+    if insert.settings.is_some() {
+        return Err(refuse("ClickHouse SETTINGS"));
+    }
+    if insert.format_clause.is_some() {
+        return Err(refuse("ClickHouse FORMAT"));
+    }
+    if insert.multi_table_insert_type.is_some() {
+        return Err(refuse("Snowflake multi-table INSERT ALL/FIRST"));
+    }
+    if !insert.multi_table_into_clauses.is_empty() {
+        return Err(refuse(
+            "Snowflake multi-table INSERT additional INTO clauses",
+        ));
+    }
+    if !insert.multi_table_when_clauses.is_empty() {
+        return Err(refuse("Snowflake multi-table INSERT WHEN clauses"));
+    }
+    if insert.multi_table_else_clause.is_some() {
+        return Err(refuse("Snowflake multi-table INSERT ELSE clause"));
+    }
+    Ok(())
+}
+
+/// The single `TableFactor` a `DELETE`'s `FROM` clause names — the FIRST
+/// entry of `delete.from`'s table list, regardless of whether the
+/// statement is otherwise a shape this binder accepts (mirrors
+/// [`create_table_target_name`]/[`insert_target_name`]'s own "extraction is
+/// separate from validation" split: a multi-table or joined DELETE still
+/// has an extractable first target, and [`require_supported_delete_shape`]
+/// — not this function — is what refuses those shapes with a specific,
+/// actionable error). `None` only when there is no FROM table at all to
+/// extract (structurally impossible for a real parse, but handled rather
+/// than panicking) or its `TableFactor` variant carries no plain name
+/// (e.g. a derived/function table factor — also refused by name inside
+/// `require_supported_delete_shape`).
+fn delete_from_table_factor(delete: &ast::Delete) -> Option<&ast::TableFactor> {
+    let tables = match &delete.from {
+        ast::FromTable::WithFromKeyword(t) | ast::FromTable::WithoutKeyword(t) => t,
+    };
+    Some(&tables.first()?.relation)
+}
+
+/// If `stmt` is a `DELETE` statement, its target table's name — see
+/// [`delete_from_table_factor`]'s doc for the exact extraction rule this
+/// delegates to. Used by `main.rs`'s REPL routing and
+/// `ExecutionContext::delete_from_native_table` (both call this BEFORE any
+/// validation, exactly like [`insert_target_name`]).
+pub fn delete_target_name(stmt: &Statement) -> Option<String> {
+    match stmt {
+        Statement::Delete(delete) => match delete_from_table_factor(delete)? {
+            ast::TableFactor::Table { name, .. } => Some(name.table_name()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Refuse, by name, every `DELETE` clause this epic does not implement.
+/// Mirrors [`require_supported_insert_shape`]'s exact discipline,
+/// mechanically checked against sqlparser 0.62's real 10-field
+/// `ast::Delete` struct (confirmed via `.scratch/mutation_sqlparser_spike/`,
+/// see task 001's Outcome, Decision 6) plus the real `TableFactor::Table`
+/// variant's 10 fields. Only `from`'s single target table name/alias and
+/// `selection` are consumed (by [`Binder::bind_delete`]); every other
+/// field must be at its "not specified" value or this returns a specific
+/// `QueryError::NotImplemented` naming the clause.
+fn require_supported_delete_shape(delete: &ast::Delete) -> Result<()> {
+    fn refuse(clause: &str) -> QueryError {
+        QueryError::NotImplemented(format!(
+            "DELETE: `{clause}` is not supported — this epic supports only `DELETE FROM \
+             <table> [WHERE ...]` against a single existing native table (no multi-table \
+             delete, no USING, no ORDER BY/LIMIT, no RETURNING/OUTPUT)"
+        ))
+    }
+    if !delete.optimizer_hints.is_empty() {
+        return Err(refuse("query optimizer hints"));
+    }
+    if !delete.tables.is_empty() {
+        return Err(refuse(
+            "a MySQL multi-table DELETE (comma-separated target list)",
+        ));
+    }
+    let tables = match &delete.from {
+        ast::FromTable::WithFromKeyword(t) | ast::FromTable::WithoutKeyword(t) => t,
+    };
+    if tables.len() != 1 {
+        return Err(refuse("a DELETE naming more than one FROM table"));
+    }
+    if !tables[0].joins.is_empty() {
+        return Err(refuse("a JOIN in the DELETE target"));
+    }
+    match &tables[0].relation {
+        ast::TableFactor::Table {
+            name: _,
+            alias: _,
+            args,
+            with_hints,
+            version,
+            with_ordinality,
+            partitions,
+            json_path,
+            sample,
+            index_hints,
+        } => {
+            if args.is_some() {
+                return Err(refuse("a table-valued function as the DELETE target"));
+            }
+            if !with_hints.is_empty() {
+                return Err(refuse("MSSQL table hints (WITH (...))"));
+            }
+            if version.is_some() {
+                return Err(refuse("a table time-travel version qualifier"));
+            }
+            if *with_ordinality {
+                return Err(refuse("WITH ORDINALITY"));
+            }
+            if !partitions.is_empty() {
+                return Err(refuse("MySQL PARTITION selection"));
+            }
+            if json_path.is_some() {
+                return Err(refuse("a PartiQL JSON path"));
+            }
+            if sample.is_some() {
+                return Err(refuse("a TABLESAMPLE clause"));
+            }
+            if !index_hints.is_empty() {
+                return Err(refuse("MySQL index hints"));
+            }
+        }
+        _ => return Err(refuse("a DELETE target that is not a plain table name")),
+    }
+    if delete.using.is_some() {
+        return Err(refuse(
+            "USING (Postgres/Snowflake/MySQL join-shaped delete)",
+        ));
+    }
+    if delete.returning.is_some() {
+        return Err(refuse("RETURNING"));
+    }
+    if delete.output.is_some() {
+        return Err(refuse("OUTPUT (MSSQL)"));
+    }
+    if !delete.order_by.is_empty() {
+        return Err(refuse("MySQL ORDER BY on DELETE"));
+    }
+    if delete.limit.is_some() {
+        return Err(refuse("MySQL LIMIT on DELETE"));
+    }
+    Ok(())
+}
+
+/// If `stmt` is an `UPDATE` statement, its target table's name — see
+/// [`delete_target_name`]'s doc for the exact extraction rule this mirrors
+/// (extraction is deliberately separate from validation — used by
+/// `main.rs`'s REPL routing and `ExecutionContext::update_native_table`,
+/// both call this BEFORE any validation, exactly like [`delete_target_name`]/
+/// [`insert_target_name`]). `None` only when the target's `TableFactor`
+/// carries no plain name (a derived/function table factor — also refused
+/// by name inside [`require_supported_update_shape`]).
+pub fn update_target_name(stmt: &Statement) -> Option<String> {
+    match stmt {
+        Statement::Update(update) => match &update.table.relation {
+            ast::TableFactor::Table { name, .. } => Some(name.table_name()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The column name a `SET` assignment targets — the LAST identifier of its
+/// `AssignmentTarget::ColumnName`'s `ObjectName` (so both a bare `col` and
+/// a qualified `alias.col` resolve to the same unqualified name, mirroring
+/// `find_column_index`'s own "qualification is optional" convention).
+/// [`require_supported_update_shape`] has already refused
+/// `AssignmentTarget::Tuple` by the time this is called from
+/// [`Binder::bind_update`], so the `Tuple` arm here is unreachable in
+/// practice — handled explicitly (an `Err`, never a panic) rather than
+/// assumed, since this function does not itself depend on that refusal
+/// having run first.
+fn assignment_target_column_name(target: &ast::AssignmentTarget) -> Result<String> {
+    match target {
+        ast::AssignmentTarget::ColumnName(name) => name
+            .0
+            .last()
+            .map(|part| match part {
+                ast::ObjectNamePart::Identifier(i) => i.value.clone(),
+                other => other.to_string(),
+            })
+            .ok_or_else(|| QueryError::Bind("UPDATE: empty SET target column name".to_string())),
+        ast::AssignmentTarget::Tuple(_) => Err(QueryError::NotImplemented(
+            "UPDATE: a multi-column tuple SET target (SET (a,b) = (1,2)) is not supported"
+                .to_string(),
+        )),
+    }
+}
+
+/// Refuse, by name, every `UPDATE` clause this epic does not implement.
+/// Mirrors [`require_supported_delete_shape`]'s exact discipline,
+/// mechanically checked against sqlparser 0.62's real 11-field
+/// `ast::Update` struct (`src/ast/dml.rs`) plus the real
+/// `TableFactor::Table` variant's 10 fields (identical check to
+/// `require_supported_delete_shape`'s own). Only `table` (a single,
+/// unjoined plain table name), `assignments` (each a single-column
+/// `ColumnName` target — `Tuple` refused) and `selection` are consumed (by
+/// [`Binder::bind_update`]); every other field must be at its "not
+/// specified" value or this returns a specific `QueryError::NotImplemented`
+/// naming the clause — never a silent downgrade to "ignore the clause and
+/// proceed."
+fn require_supported_update_shape(update: &ast::Update) -> Result<()> {
+    fn refuse(clause: &str) -> QueryError {
+        QueryError::NotImplemented(format!(
+            "UPDATE: `{clause}` is not supported — this epic supports only `UPDATE <table> SET \
+             <col> = <expr>, ... [WHERE ...]` against a single existing native table (no FROM, \
+             no joins, no multi-column tuple targets, no RETURNING/OUTPUT)"
+        ))
+    }
+    if !update.optimizer_hints.is_empty() {
+        return Err(refuse("query optimizer hints"));
+    }
+    if !update.table.joins.is_empty() {
+        return Err(refuse("a JOIN in the UPDATE target"));
+    }
+    match &update.table.relation {
+        ast::TableFactor::Table {
+            name: _,
+            alias: _,
+            args,
+            with_hints,
+            version,
+            with_ordinality,
+            partitions,
+            json_path,
+            sample,
+            index_hints,
+        } => {
+            if args.is_some() {
+                return Err(refuse("a table-valued function as the UPDATE target"));
+            }
+            if !with_hints.is_empty() {
+                return Err(refuse("MSSQL table hints (WITH (...))"));
+            }
+            if version.is_some() {
+                return Err(refuse("a table time-travel version qualifier"));
+            }
+            if *with_ordinality {
+                return Err(refuse("WITH ORDINALITY"));
+            }
+            if !partitions.is_empty() {
+                return Err(refuse("MySQL PARTITION selection"));
+            }
+            if json_path.is_some() {
+                return Err(refuse("a PartiQL JSON path"));
+            }
+            if sample.is_some() {
+                return Err(refuse("a TABLESAMPLE clause"));
+            }
+            if !index_hints.is_empty() {
+                return Err(refuse("MySQL index hints"));
+            }
+        }
+        _ => return Err(refuse("an UPDATE target that is not a plain table name")),
+    }
+    if update.assignments.is_empty() {
+        return Err(refuse("UPDATE with an empty SET list"));
+    }
+    for a in &update.assignments {
+        if matches!(a.target, ast::AssignmentTarget::Tuple(_)) {
+            return Err(refuse(
+                "a multi-column tuple SET target (SET (a,b) = (1,2))",
+            ));
+        }
+    }
+    // Postgres/Snowflake/MySQL `UPDATE ... FROM <table>` -- confirmed
+    // parses (task 001's spike, `.scratch/mutation_sqlparser_spike/`) both
+    // before AND after the SET list (`UpdateTableFromKind::BeforeSet`/
+    // `AfterSet`). A materially different feature (joining another
+    // table's columns into the SET computation) this epic's "recompute
+    // each matched row's SET expressions against that row's OWN current
+    // column values only" model does not support -- refuse explicitly,
+    // never silently ignore the clause.
+    if update.from.is_some() {
+        return Err(refuse(
+            "FROM (Postgres/Snowflake/MySQL UPDATE ... FROM — joining another table's columns \
+             into the SET computation is not supported by this epic's UPDATE)",
+        ));
+    }
+    if update.returning.is_some() {
+        return Err(refuse("RETURNING"));
+    }
+    if update.output.is_some() {
+        return Err(refuse("OUTPUT (MSSQL)"));
+    }
+    if update.or.is_some() {
+        return Err(refuse("SQLite ON CONFLICT resolution (UPDATE OR ...)"));
+    }
+    if !update.order_by.is_empty() {
+        return Err(refuse("MySQL ORDER BY on UPDATE"));
+    }
+    if update.limit.is_some() {
+        return Err(refuse("MySQL LIMIT on UPDATE"));
+    }
+    Ok(())
+}
+
 /// Refuse, by name, every `CREATE TABLE` clause this epic does not
 /// implement. Mirrors this binder's existing "match the supported shape,
 /// `NotImplemented` the rest" convention (used throughout for window
@@ -414,6 +821,97 @@ impl<'a> Binder<'a> {
                 })?;
                 self.bind_query(query)
             }
+            // `INSERT INTO <table> SELECT/VALUES ...` (native-tables-
+            // mutation epic, task 002). Mirrors the `CreateTable` arm's
+            // shape exactly: binds and returns ONLY the source query's
+            // LogicalPlan (no DML node — `LogicalPlan` gains none for the
+            // same reason `CreateTable` needed none), with the target
+            // table name recovered separately (`insert_target_name`) by
+            // whichever `ExecutionContext` entrypoint drives the write,
+            // since binding a query and deciding what to do with its
+            // result are different jobs. Every `Insert` struct field this
+            // epic does not support is refused BY NAME
+            // (`require_supported_insert_shape`), never silently ignored —
+            // see that function for the full list (explicit column lists,
+            // Hive INSERT OVERWRITE, ON CONFLICT/ON DUPLICATE KEY UPDATE,
+            // MySQL INSERT...SET, RETURNING/OUTPUT, multi-table INSERT
+            // ALL/FIRST, and more). `source` binds via the SAME
+            // `bind_query()` CreateTable already uses — covers both
+            // `INSERT ... SELECT` and `INSERT ... VALUES` (`SetExpr::
+            // Values` already has its own arm in `bind_set_expr`), so no
+            // extra binder work is needed for either shape.
+            Statement::Insert(insert) => {
+                require_supported_insert_shape(insert)?;
+                let query = insert.source.as_deref().ok_or_else(|| {
+                    QueryError::NotImplemented(
+                        "INSERT without a SELECT/VALUES source (e.g. DEFAULT VALUES) is not \
+                         supported — use INSERT INTO <table> SELECT ... or INSERT INTO \
+                         <table> VALUES (...)"
+                            .to_string(),
+                    )
+                })?;
+                self.bind_query(query)
+            }
+            // `DELETE FROM <table> [WHERE ...]` (native-tables-mutation
+            // epic, task 003). Unlike `CreateTable`/`Insert` above, this
+            // arm is NOT a small wrapper around `bind_query` — DELETE has
+            // no source query to bind, and `LogicalPlan`'s
+            // scan/filter/project pipeline has no way to carry a matched
+            // row's (segment, local position) back out (see
+            // `native_delete.rs`'s module doc for exactly why). This arm
+            // therefore only VALIDATES the statement's shape
+            // (`require_supported_delete_shape` — every clause this epic
+            // does not support refused by name, mirroring the Insert/
+            // CreateTable arms above) and then points at the real
+            // entrypoint: `Binder::bind_delete` (which returns the target
+            // table name + bound predicate, not a `LogicalPlan`) is what
+            // `ExecutionContext::delete_from_native_table` actually calls
+            // to drive the bespoke row-identification loop. Reachable
+            // here only via `logical_plan()`/other direct `bind()` callers
+            // — `ExecutionContext::sql()` refuses a DELETE by name before
+            // ever calling `bind()`, exactly like its CreateTable/Insert
+            // guards.
+            Statement::Delete(delete) => {
+                require_supported_delete_shape(delete)?;
+                Err(QueryError::NotImplemented(
+                    "DELETE FROM ... must run through \
+                     ExecutionContext::delete_from_native_table (the REPL calls this \
+                     automatically) — Binder::bind() only validates a DELETE statement's \
+                     shape; identifying and removing matched rows needs a bespoke \
+                     row-identification loop over the target table's actual current data, not \
+                     a LogicalPlan (see Binder::bind_delete)."
+                        .to_string(),
+                ))
+            }
+            // `UPDATE <table> SET <col> = <expr>, ... [WHERE ...]`
+            // (native-tables-mutation epic, task 004). Same shape as the
+            // `Delete` arm immediately above, for the same reason: UPDATE
+            // has no source query to bind, and identifying matched rows +
+            // evaluating SET expressions against their CURRENT values
+            // needs the same bespoke, non-`LogicalPlan` loop DELETE's own
+            // row-identification does (reused directly — see
+            // `native_update.rs`'s module doc). This arm therefore only
+            // VALIDATES the statement's shape (`require_supported_update_
+            // shape`) and then points at the real entrypoint:
+            // `Binder::bind_update` (which returns the target table name,
+            // bound SET assignments, and bound predicate — not a
+            // `LogicalPlan`) is what `ExecutionContext::update_native_table`
+            // actually calls. Reachable here only via `logical_plan()`/
+            // other direct `bind()` callers — `ExecutionContext::sql()`
+            // refuses an UPDATE by name before ever calling `bind()`,
+            // exactly like its CreateTable/Insert/Delete guards.
+            Statement::Update(update) => {
+                require_supported_update_shape(update)?;
+                Err(QueryError::NotImplemented(
+                    "UPDATE ... SET ... [WHERE ...] must run through \
+                     ExecutionContext::update_native_table (the REPL calls this \
+                     automatically) — Binder::bind() only validates an UPDATE statement's \
+                     shape; identifying matched rows and evaluating SET expressions against \
+                     their current values needs a bespoke loop over the target table's actual \
+                     current data, not a LogicalPlan (see Binder::bind_update)."
+                        .to_string(),
+                ))
+            }
             _ => Err(QueryError::NotImplemented(format!(
                 "Statement type not supported: {:?}",
                 stmt
@@ -425,6 +923,194 @@ impl<'a> Binder<'a> {
     pub fn bind_sql(&mut self, sql: &str) -> Result<LogicalPlan> {
         let stmt = parser::parse_sql(sql)?;
         self.bind(&stmt)
+    }
+
+    /// Bind a `DELETE FROM <table> WHERE <predicate>` statement
+    /// (native-tables-mutation epic, task 003): validates the statement's
+    /// shape (`require_supported_delete_shape`), then binds the WHERE
+    /// predicate (if any) via the SAME `bind_expr` method `bind_select`'s
+    /// own WHERE-clause binding uses (`selection: None` binds to `None` —
+    /// "match every row," a real supported case, not an error), against
+    /// the target table's OWN schema (no join, no other table in scope;
+    /// aliased via the DELETE's own alias if present, mirroring
+    /// `bind_table_factor`'s convention, so `WHERE alias.col = ...` binds
+    /// exactly like `WHERE col = ...` does). Returns the target table name
+    /// and the bound predicate — the caller
+    /// (`ExecutionContext::delete_from_native_table`) evaluates this
+    /// predicate directly via `physical::operators::evaluate_expr` inside
+    /// `native_delete::identify_matching_rows`, NOT through the generic
+    /// `LogicalPlan`/`PhysicalOperator` pipeline.
+    pub fn bind_delete(&mut self, stmt: &ast::Delete) -> Result<(String, Option<Expr>)> {
+        require_supported_delete_shape(stmt)?;
+        let tables = match &stmt.from {
+            ast::FromTable::WithFromKeyword(t) | ast::FromTable::WithoutKeyword(t) => t,
+        };
+        // `require_supported_delete_shape` already guarantees exactly one
+        // entry whose relation is `TableFactor::Table`.
+        let (table_name, alias) = match &tables[0].relation {
+            TableFactor::Table { name, alias, .. } => (
+                name.table_name(),
+                alias.as_ref().map(|a| a.name.value.clone()),
+            ),
+            other => {
+                return Err(QueryError::Bind(format!(
+                    "DELETE: expected a plain table name, got {other:?}"
+                )))
+            }
+        };
+
+        let schema = self
+            .catalog
+            .get_table_schema(&table_name)
+            .ok_or_else(|| QueryError::TableNotFound(table_name.clone()))?;
+        let alias_name = alias.unwrap_or_else(|| table_name.clone());
+        let aliased_schema = PlanSchema::new(
+            schema
+                .fields()
+                .iter()
+                .map(|f| f.clone().with_relation(alias_name.clone()))
+                .collect(),
+        );
+
+        let predicate = match &stmt.selection {
+            Some(expr) => Some(self.bind_expr(expr, &aliased_schema)?),
+            None => None,
+        };
+
+        // A subquery in the WHERE clause (`DELETE FROM t WHERE id IN
+        // (SELECT ...)`) BINDS successfully -- `bind_expr` is the same
+        // method `bind_select`'s own WHERE binding uses, and task 001's
+        // spike confirmed sqlparser parses this shape cleanly -- but
+        // EVALUATING it needs a `SubqueryExecutor`, which this epic's
+        // bespoke row-identification loop (`native_delete::
+        // identify_matching_rows`, deliberately NOT the generic
+        // LogicalPlan/PhysicalOperator pipeline `SubqueryExecutor` is
+        // normally wired through) does not have and is out of this
+        // task's scope to add. Refuse HERE, by name, at bind time --
+        // matching this codebase's own "refuse cleanly and early" ethos
+        // (mirrors `require_supported_delete_shape`'s discipline) --
+        // rather than let it reach `physical::operators::evaluate_expr`
+        // deep inside the identification loop and fail with a less
+        // specific "no executor available" error.
+        if predicate.as_ref().is_some_and(|p| p.contains_subquery()) {
+            return Err(QueryError::NotImplemented(
+                "DELETE: a subquery in the WHERE clause is not supported -- this epic's \
+                 row-identification loop evaluates the predicate directly (via \
+                 physical::operators::evaluate_expr), which has no subquery executor; \
+                 rewrite the predicate without a subquery (e.g. a plain column comparison)"
+                    .to_string(),
+            ));
+        }
+
+        Ok((table_name, predicate))
+    }
+
+    /// Bind an `UPDATE <table> SET <col> = <expr>, ... [WHERE <predicate>]`
+    /// statement (native-tables-mutation epic, task 004): validates the
+    /// statement's shape (`require_supported_update_shape`), then binds
+    /// EVERY `SET` assignment's value expression AND the WHERE predicate
+    /// (if any) via the SAME `bind_expr` method [`bind_delete`] uses,
+    /// against the target table's OWN schema (aliased via the UPDATE's own
+    /// alias if present, mirroring `bind_delete`'s identical convention —
+    /// `SET x = alias.x + 1 WHERE alias.y > ...` binds exactly like the
+    /// unqualified form). Returns the target table name, the bound
+    /// assignments as `(unqualified column name, bound value expression)`
+    /// pairs (in the SAME order the SQL listed them — self-referential
+    /// assignments like `SET x = x + 1` need no special binder handling;
+    /// the storage layer evaluates every assignment against a matched
+    /// row's PRE-update values before assembling the new row, exactly like
+    /// an ordinary projection evaluates several output expressions against
+    /// one input row — see `native_update.rs`), and the bound predicate.
+    /// `selection: None` binds to predicate `None` ("match every row," a
+    /// real supported case, not an error) — identical convention to
+    /// `bind_delete`.
+    ///
+    /// The caller (`ExecutionContext::update_native_table`) evaluates the
+    /// assignments and predicate directly via
+    /// `physical::operators::evaluate_expr` inside `native_update::
+    /// update_native_table`, NOT through the generic `LogicalPlan`/
+    /// `PhysicalOperator` pipeline — same reasoning as `bind_delete`.
+    pub fn bind_update(
+        &mut self,
+        stmt: &ast::Update,
+    ) -> Result<(String, Vec<(String, Expr)>, Option<Expr>)> {
+        require_supported_update_shape(stmt)?;
+        let (table_name, alias) = match &stmt.table.relation {
+            TableFactor::Table { name, alias, .. } => (
+                name.table_name(),
+                alias.as_ref().map(|a| a.name.value.clone()),
+            ),
+            other => {
+                return Err(QueryError::Bind(format!(
+                    "UPDATE: expected a plain table name, got {other:?}"
+                )))
+            }
+        };
+
+        let schema = self
+            .catalog
+            .get_table_schema(&table_name)
+            .ok_or_else(|| QueryError::TableNotFound(table_name.clone()))?;
+        let alias_name = alias.unwrap_or_else(|| table_name.clone());
+        let aliased_schema = PlanSchema::new(
+            schema
+                .fields()
+                .iter()
+                .map(|f| f.clone().with_relation(alias_name.clone()))
+                .collect(),
+        );
+
+        let mut assignments = Vec::with_capacity(stmt.assignments.len());
+        for a in &stmt.assignments {
+            let col_name = assignment_target_column_name(&a.target)?;
+            // Fail clean and early (this codebase's own discipline) if the
+            // SET target names a column the table doesn't have, rather
+            // than letting it surface later as a confusing error deep
+            // inside the storage layer's own column-index resolution.
+            if schema.index_of(&col_name).is_none() {
+                return Err(QueryError::ColumnNotFound(format!(
+                    "UPDATE {table_name} SET {col_name}: no such column"
+                )));
+            }
+            let value = self.bind_expr(&a.value, &aliased_schema)?;
+            assignments.push((col_name, value));
+        }
+
+        let predicate = match &stmt.selection {
+            Some(expr) => Some(self.bind_expr(expr, &aliased_schema)?),
+            None => None,
+        };
+
+        // Same reasoning as `bind_delete`'s own subquery refusal: this
+        // epic's bespoke row-identification/SET-evaluation loop
+        // (`native_delete::identify_matching_rows` +
+        // `native_update::update_native_table`) evaluates expressions
+        // directly via `physical::operators::evaluate_expr` (no
+        // `SubqueryExecutor`), so a subquery anywhere in the WHERE clause
+        // OR a SET value would parse and bind cleanly (confirmed by task
+        // 001's spike, even for a correlated scalar subquery as a SET
+        // value) but fail deep inside evaluation with a generic "no
+        // executor available" error. Refuse here, by name, at bind time
+        // instead — matching this codebase's "refuse cleanly and early"
+        // discipline.
+        if predicate.as_ref().is_some_and(|p| p.contains_subquery()) {
+            return Err(QueryError::NotImplemented(
+                "UPDATE: a subquery in the WHERE clause is not supported -- this epic's \
+                 row-identification loop evaluates the predicate directly (via \
+                 physical::operators::evaluate_expr), which has no subquery executor; rewrite \
+                 the predicate without a subquery (e.g. a plain column comparison)"
+                    .to_string(),
+            ));
+        }
+        if let Some((col, _)) = assignments.iter().find(|(_, e)| e.contains_subquery()) {
+            return Err(QueryError::NotImplemented(format!(
+                "UPDATE: a subquery in the SET expression for `{col}` is not supported -- this \
+                 epic's SET-expression evaluation uses the same subquery-free evaluator as the \
+                 WHERE clause; rewrite the expression without a subquery"
+            )));
+        }
+
+        Ok((table_name, assignments, predicate))
     }
 
     fn bind_query(&mut self, query: &ast::Query) -> Result<LogicalPlan> {
@@ -4719,5 +5405,538 @@ mod tests {
 
         let result = binder.bind_sql("SELECT * FROM nonexistent");
         assert!(result.is_err());
+    }
+
+    // ---------- INSERT (native-tables-mutation epic, task 002) ----------
+
+    #[test]
+    fn insert_target_name_extracts_the_table_name_without_validating_shape() {
+        let stmt = parser::parse_sql("INSERT INTO orders SELECT * FROM orders").unwrap();
+        assert_eq!(insert_target_name(&stmt).as_deref(), Some("orders"));
+
+        // Extraction succeeds even for a shape `bind()` will later refuse
+        // (mirrors `create_table_target_name`'s own split).
+        let overwrite_stmt =
+            parser::parse_sql("INSERT OVERWRITE TABLE orders SELECT * FROM orders").unwrap();
+        assert_eq!(
+            insert_target_name(&overwrite_stmt).as_deref(),
+            Some("orders")
+        );
+
+        let select_stmt = parser::parse_sql("SELECT * FROM orders").unwrap();
+        assert_eq!(insert_target_name(&select_stmt), None);
+    }
+
+    #[test]
+    fn bind_insert_select_binds_only_the_source_query() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+
+        let stmt = parser::parse_sql("INSERT INTO orders SELECT o_orderkey FROM orders").unwrap();
+        let plan = binder.bind(&stmt).unwrap();
+        // Same shape a plain `SELECT o_orderkey FROM orders` produces --
+        // `LogicalPlan` has no DML node, exactly like `CreateTable`.
+        assert!(matches!(plan, LogicalPlan::Project(_)), "got {:?}", plan);
+    }
+
+    #[test]
+    fn bind_insert_values_binds_through_the_same_path_as_select() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+
+        // `INSERT ... VALUES` needs zero extra binder work per task 001's
+        // finding: `SetExpr::Values` already has its own arm.
+        let stmt =
+            parser::parse_sql("INSERT INTO orders VALUES (1, 100, 'O', 42.5, DATE '2024-01-01')")
+                .unwrap();
+        let plan = binder.bind(&stmt).unwrap();
+        assert!(matches!(plan, LogicalPlan::Values(_)), "got {:?}", plan);
+    }
+
+    #[test]
+    fn bind_insert_with_join_and_group_by_source_works() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+
+        let stmt = parser::parse_sql(
+            "INSERT INTO orders SELECT o.o_orderkey, COUNT(*) FROM orders o \
+             JOIN customer c ON o.o_custkey = c.c_custkey GROUP BY o.o_orderkey",
+        )
+        .unwrap();
+        // Must bind successfully -- the same `bind_query()` CTAS already
+        // relies on for arbitrary joins/aggregates.
+        binder.bind(&stmt).unwrap();
+    }
+
+    #[test]
+    fn bind_insert_refuses_an_explicit_column_list() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt =
+            parser::parse_sql("INSERT INTO orders (o_orderkey) SELECT o_orderkey FROM orders")
+                .unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("column list"), "{err}");
+    }
+
+    #[test]
+    fn bind_insert_refuses_hive_overwrite() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql("INSERT OVERWRITE TABLE orders SELECT o_orderkey FROM orders")
+            .unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("OVERWRITE"), "{err}");
+    }
+
+    #[test]
+    fn bind_insert_refuses_on_conflict() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql(
+            "INSERT INTO orders SELECT o_orderkey FROM orders ON CONFLICT DO NOTHING",
+        )
+        .unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("CONFLICT"), "{err}");
+    }
+
+    // Note: MySQL's `INSERT INTO t SET a = 1` shape (Insert.assignments)
+    // does NOT parse under GenericDialect at all ("Expected: SELECT,
+    // VALUES, or a subquery") -- confirmed the same way task 001's spike
+    // found MySQL's multi-table DELETE form doesn't parse either. The
+    // `assignments` check in `require_supported_insert_shape` stays as
+    // defensive code (in case a future dialect populates it) but is not
+    // independently testable through real, GenericDialect-parseable SQL
+    // text, matching that established precedent.
+
+    #[test]
+    fn bind_insert_without_a_source_is_refused() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql("INSERT INTO orders DEFAULT VALUES").unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("source"), "{err}");
+    }
+
+    // ---------- DELETE (native-tables-mutation epic, task 003) ----------
+
+    #[test]
+    fn delete_target_name_extracts_the_table_name_without_validating_shape() {
+        let stmt = parser::parse_sql("DELETE FROM orders WHERE o_orderkey = 1").unwrap();
+        assert_eq!(delete_target_name(&stmt).as_deref(), Some("orders"));
+
+        let no_where = parser::parse_sql("DELETE FROM orders").unwrap();
+        assert_eq!(delete_target_name(&no_where).as_deref(), Some("orders"));
+
+        // Extraction succeeds even for a shape `bind()` will later refuse
+        // (mirrors `insert_target_name`'s own split).
+        let joined = parser::parse_sql(
+            "DELETE FROM orders JOIN customer ON orders.o_custkey = customer.c_custkey",
+        )
+        .unwrap();
+        assert_eq!(delete_target_name(&joined).as_deref(), Some("orders"));
+
+        let select_stmt = parser::parse_sql("SELECT * FROM orders").unwrap();
+        assert_eq!(delete_target_name(&select_stmt), None);
+    }
+
+    #[test]
+    fn bind_delete_with_where_binds_the_predicate() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql("DELETE FROM orders WHERE o_orderkey = 1").unwrap();
+        let Statement::Delete(delete) = &stmt else {
+            panic!("expected a Delete statement");
+        };
+        let (table_name, predicate) = binder.bind_delete(delete).unwrap();
+        assert_eq!(table_name, "orders");
+        assert!(
+            matches!(predicate, Some(Expr::BinaryExpr { .. })),
+            "{predicate:?}"
+        );
+    }
+
+    #[test]
+    fn bind_delete_without_where_binds_no_predicate_meaning_delete_all_rows() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql("DELETE FROM orders").unwrap();
+        let Statement::Delete(delete) = &stmt else {
+            panic!("expected a Delete statement");
+        };
+        let (table_name, predicate) = binder.bind_delete(delete).unwrap();
+        assert_eq!(table_name, "orders");
+        assert!(
+            predicate.is_none(),
+            "no WHERE clause must bind to None (match every row), not an error or a trivial \
+             TRUE literal"
+        );
+    }
+
+    #[test]
+    fn bind_delete_with_a_table_alias_binds_a_qualified_where_column() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql("DELETE FROM orders o WHERE o.o_orderkey = 1").unwrap();
+        let Statement::Delete(delete) = &stmt else {
+            panic!("expected a Delete statement");
+        };
+        let (table_name, predicate) = binder.bind_delete(delete).unwrap();
+        assert_eq!(table_name, "orders");
+        assert!(predicate.is_some());
+    }
+
+    #[test]
+    fn bind_delete_against_an_unregistered_table_is_table_not_found() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql("DELETE FROM nope WHERE x = 1").unwrap();
+        let Statement::Delete(delete) = &stmt else {
+            panic!("expected a Delete statement");
+        };
+        let err = binder.bind_delete(delete).unwrap_err();
+        assert!(matches!(err, QueryError::TableNotFound(_)), "{err:?}");
+    }
+
+    #[test]
+    fn bind_delete_statement_arm_points_at_the_real_entrypoint() {
+        // `Binder::bind()` itself cannot express "identify and remove
+        // matched rows" as a `LogicalPlan` -- it validates shape then
+        // refuses, naming the real entrypoint.
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql("DELETE FROM orders WHERE o_orderkey = 1").unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("delete_from_native_table"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn bind_delete_refuses_a_multi_table_from_list() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql("DELETE FROM orders, customer WHERE o_orderkey = 1").unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("more than one"), "{err}");
+    }
+
+    #[test]
+    fn bind_delete_refuses_a_join_in_the_target() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql(
+            "DELETE FROM orders JOIN customer ON orders.o_custkey = customer.c_custkey",
+        )
+        .unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("JOIN"), "{err}");
+    }
+
+    #[test]
+    fn bind_delete_refuses_using() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql(
+            "DELETE FROM orders USING customer WHERE orders.o_custkey = customer.c_custkey",
+        )
+        .unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("USING"), "{err}");
+    }
+
+    #[test]
+    fn bind_delete_refuses_returning() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt =
+            parser::parse_sql("DELETE FROM orders WHERE o_orderkey = 1 RETURNING o_orderkey")
+                .unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("RETURNING"), "{err}");
+    }
+
+    #[test]
+    fn bind_delete_refuses_order_by_and_limit() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql("DELETE FROM orders ORDER BY o_orderkey LIMIT 5").unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        // Whichever check fires first (ORDER BY is checked before LIMIT).
+        assert!(err.to_string().contains("ORDER BY"), "{err}");
+    }
+
+    #[test]
+    fn bind_delete_refuses_a_subquery_in_where_even_though_it_parses_and_binds() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql(
+            "DELETE FROM orders WHERE o_custkey IN (SELECT c_custkey FROM customer)",
+        )
+        .unwrap();
+        let Statement::Delete(delete) = &stmt else {
+            panic!("expected a Delete statement");
+        };
+        let err = binder.bind_delete(delete).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("subquery"), "{err}");
+    }
+
+    // Note: MySQL's `DELETE t1, t2 FROM t1, t2 WHERE ...` multi-table form
+    // (`Delete.tables`, the field BEFORE `FROM`) does NOT parse under
+    // GenericDialect at all -- confirmed directly from sqlparser 0.62's
+    // `Parser::parse_delete` source: the `tables` list is only ever
+    // populated for `BigQueryDialect`/`OracleDialect`/`GenericDialect`
+    // when NO leading table list is present, i.e. `tables` is
+    // UNCONDITIONALLY `vec![]` for this engine's dialect. The
+    // `!delete.tables.is_empty()` check in `require_supported_delete_shape`
+    // stays as defensive code (in case a future dialect populates it) but
+    // is not independently testable through real, GenericDialect-parseable
+    // SQL text -- the identical situation `insert.assignments` is already
+    // documented as, above.
+
+    // ---------- UPDATE (native-tables-mutation epic, task 004) ----------
+
+    #[test]
+    fn update_target_name_extracts_the_table_name_without_validating_shape() {
+        let stmt =
+            parser::parse_sql("UPDATE orders SET o_totalprice = 1 WHERE o_orderkey = 1").unwrap();
+        assert_eq!(update_target_name(&stmt).as_deref(), Some("orders"));
+
+        let no_where = parser::parse_sql("UPDATE orders SET o_totalprice = 1").unwrap();
+        assert_eq!(update_target_name(&no_where).as_deref(), Some("orders"));
+
+        // Extraction succeeds even for a shape `bind()` will later refuse
+        // (mirrors `delete_target_name`/`insert_target_name`'s own split).
+        let with_from = parser::parse_sql(
+            "UPDATE orders SET o_totalprice = 1 FROM customer WHERE orders.o_custkey = \
+             customer.c_custkey",
+        )
+        .unwrap();
+        assert_eq!(update_target_name(&with_from).as_deref(), Some("orders"));
+
+        let select_stmt = parser::parse_sql("SELECT * FROM orders").unwrap();
+        assert_eq!(update_target_name(&select_stmt), None);
+    }
+
+    #[test]
+    fn bind_update_with_where_binds_assignments_and_predicate() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql(
+            "UPDATE orders SET o_totalprice = o_totalprice * 1.1, o_orderstatus = 'X' WHERE \
+             o_orderkey = 1",
+        )
+        .unwrap();
+        let Statement::Update(update) = &stmt else {
+            panic!("expected an Update statement");
+        };
+        let (table_name, assignments, predicate) = binder.bind_update(update).unwrap();
+        assert_eq!(table_name, "orders");
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(assignments[0].0, "o_totalprice");
+        assert!(
+            matches!(assignments[0].1, Expr::BinaryExpr { .. }),
+            "self-referential SET value must bind to a real expression, not a stub: {:?}",
+            assignments[0].1
+        );
+        assert_eq!(assignments[1].0, "o_orderstatus");
+        assert!(matches!(assignments[1].1, Expr::Literal(_)));
+        assert!(
+            matches!(predicate, Some(Expr::BinaryExpr { .. })),
+            "{predicate:?}"
+        );
+    }
+
+    #[test]
+    fn bind_update_without_where_binds_no_predicate_meaning_update_all_rows() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql("UPDATE orders SET o_totalprice = 0").unwrap();
+        let Statement::Update(update) = &stmt else {
+            panic!("expected an Update statement");
+        };
+        let (table_name, assignments, predicate) = binder.bind_update(update).unwrap();
+        assert_eq!(table_name, "orders");
+        assert_eq!(assignments.len(), 1);
+        assert!(
+            predicate.is_none(),
+            "no WHERE clause must bind to None (match every row), not an error or a trivial \
+             TRUE literal"
+        );
+    }
+
+    #[test]
+    fn bind_update_with_a_table_alias_binds_qualified_set_and_where() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql(
+            "UPDATE orders o SET o.o_totalprice = o.o_totalprice + 1 WHERE o.o_orderkey = 1",
+        )
+        .unwrap();
+        let Statement::Update(update) = &stmt else {
+            panic!("expected an Update statement");
+        };
+        let (table_name, assignments, predicate) = binder.bind_update(update).unwrap();
+        assert_eq!(table_name, "orders");
+        assert_eq!(
+            assignments[0].0, "o_totalprice",
+            "a qualified assignment target (alias.col) must resolve to the unqualified column \
+             name"
+        );
+        assert!(predicate.is_some());
+    }
+
+    #[test]
+    fn bind_update_against_an_unregistered_table_is_table_not_found() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql("UPDATE nope SET x = 1 WHERE x = 1").unwrap();
+        let Statement::Update(update) = &stmt else {
+            panic!("expected an Update statement");
+        };
+        let err = binder.bind_update(update).unwrap_err();
+        assert!(matches!(err, QueryError::TableNotFound(_)), "{err:?}");
+    }
+
+    #[test]
+    fn bind_update_naming_an_unknown_set_target_column_is_column_not_found() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql("UPDATE orders SET does_not_exist = 1").unwrap();
+        let Statement::Update(update) = &stmt else {
+            panic!("expected an Update statement");
+        };
+        let err = binder.bind_update(update).unwrap_err();
+        assert!(matches!(err, QueryError::ColumnNotFound(_)), "{err:?}");
+    }
+
+    #[test]
+    fn bind_update_statement_arm_points_at_the_real_entrypoint() {
+        // `Binder::bind()` itself cannot express "identify matched rows,
+        // recompute their SET expressions" as a `LogicalPlan` -- it
+        // validates shape then refuses, naming the real entrypoint.
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt =
+            parser::parse_sql("UPDATE orders SET o_totalprice = 1 WHERE o_orderkey = 1").unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("update_native_table"), "{err}");
+    }
+
+    #[test]
+    fn bind_update_refuses_a_join_in_the_target() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql(
+            "UPDATE orders JOIN customer ON orders.o_custkey = customer.c_custkey SET \
+             o_totalprice = 1",
+        )
+        .unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("JOIN"), "{err}");
+    }
+
+    #[test]
+    fn bind_update_refuses_from() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql(
+            "UPDATE orders SET o_totalprice = 1 FROM customer WHERE orders.o_custkey = \
+             customer.c_custkey",
+        )
+        .unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("FROM"), "{err}");
+    }
+
+    #[test]
+    fn bind_update_refuses_a_multi_column_tuple_target() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql("UPDATE orders SET (o_orderkey, o_custkey) = (1, 2)").unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("tuple"), "{err}");
+    }
+
+    #[test]
+    fn bind_update_refuses_returning() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql(
+            "UPDATE orders SET o_totalprice = 1 WHERE o_orderkey = 1 RETURNING o_orderkey",
+        )
+        .unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("RETURNING"), "{err}");
+    }
+
+    #[test]
+    fn bind_update_refuses_order_by_and_limit() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt =
+            parser::parse_sql("UPDATE orders SET o_totalprice = 1 ORDER BY o_orderkey LIMIT 5")
+                .unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        // Whichever check fires first (ORDER BY is checked before LIMIT).
+        assert!(err.to_string().contains("ORDER BY"), "{err}");
+    }
+
+    #[test]
+    fn bind_update_refuses_a_subquery_in_where_even_though_it_parses_and_binds() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql(
+            "UPDATE orders SET o_totalprice = 1 WHERE o_custkey IN (SELECT c_custkey FROM \
+             customer)",
+        )
+        .unwrap();
+        let Statement::Update(update) = &stmt else {
+            panic!("expected an Update statement");
+        };
+        let err = binder.bind_update(update).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("subquery"), "{err}");
+    }
+
+    #[test]
+    fn bind_update_refuses_a_subquery_in_a_set_expression_even_though_it_parses_and_binds() {
+        // Task 001's spike confirmed a correlated scalar subquery as a SET
+        // value parses to a plain `Expr` (the identical shape `evaluate_expr`
+        // already handles for other expressions) -- but this epic's
+        // subquery-free evaluator still cannot execute it, so it must be
+        // refused here, not left to fail deep inside evaluation.
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql(
+            "UPDATE orders SET o_totalprice = (SELECT MAX(c_custkey) FROM customer) WHERE \
+             o_orderkey = 1",
+        )
+        .unwrap();
+        let Statement::Update(update) = &stmt else {
+            panic!("expected an Update statement");
+        };
+        let err = binder.bind_update(update).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("subquery"), "{err}");
     }
 }
