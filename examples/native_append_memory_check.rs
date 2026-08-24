@@ -48,14 +48,31 @@ use query_engine::storage::{ParquetTable, StreamingParquetReader};
 use query_engine::{ExecutionConfig, ExecutionContext};
 
 const SMALL_SEED: &str = "data/tpch-1mb/lineitem.parquet";
-const LARGE_SOURCE: &str = "data/tpch-10gb/lineitem.parquet";
+const LARGE_SOURCE_SF10: &str = "data/tpch-10gb/lineitem.parquet";
+const LARGE_SOURCE_SF100: &str = "data/tpch-100gb/lineitem.parquet";
+
+/// Task 005 (native-tables-mutation epic) addition: which large source to
+/// use. `sf10` (default) reproduces task 002's own original ~5.3GB `sql`
+/// finding unchanged; `sf100` (600,000,000 rows, 28GB compressed, 10x
+/// SF=10's row count) is task 005's own adversarial re-test at a size
+/// where an unbounded-in-source-size relationship would become genuinely
+/// dangerous -- see `.claude/epics/native-tables-mutation/005.md`'s
+/// carried-forward acceptance criterion.
+fn large_source() -> &'static str {
+    match std::env::var("QE_MEM_CHECK_SOURCE").as_deref() {
+        Ok("sf100") => LARGE_SOURCE_SF100,
+        _ => LARGE_SOURCE_SF10,
+    }
+}
 
 #[tokio::main]
 async fn main() -> query_engine::Result<()> {
-    if !std::path::Path::new(LARGE_SOURCE).exists() {
+    let large_source = large_source();
+    if !std::path::Path::new(large_source).exists() {
         eprintln!(
-            "skipping: {LARGE_SOURCE} not found (generate SF=10 parquet first, e.g. \
-             `query_engine generate-parquet --sf 10 --output data/tpch-10gb`)"
+            "skipping: {large_source} not found (generate the source parquet first, e.g. \
+             `query_engine generate-parquet --sf 10 --output data/tpch-10gb`, or --sf 100 for \
+             QE_MEM_CHECK_SOURCE=sf100)"
         );
         return Ok(());
     }
@@ -108,14 +125,12 @@ async fn run_direct() -> query_engine::Result<()> {
     let scratch = seed_native_table().await;
     let out_dir = scratch.path().join("t");
 
-    let table = ParquetTable::try_new(LARGE_SOURCE).expect("open large lineitem source");
+    let large_source = large_source();
+    let table = ParquetTable::try_new(large_source).expect("open large lineitem source");
     let reader = StreamingParquetReader::from_table(&table, None, 65_536);
     let stream: query_engine::physical::RecordBatchStream = reader.into_stream();
 
-    println!(
-        "[direct] append_to_native_table(StreamingParquetReader over {LARGE_SOURCE}, 60M rows, \
-         2.8GB compressed) ..."
-    );
+    println!("[direct] append_to_native_table(StreamingParquetReader over {large_source}) ...");
     let t0 = std::time::Instant::now();
     let result =
         native_write::append_to_native_table(stream, &out_dir, NativeWriteOptions::default())
@@ -136,11 +151,22 @@ async fn run_direct() -> query_engine::Result<()> {
 /// statement via `ExecutionContext::insert_into_native_table`.
 async fn run_sql() -> query_engine::Result<()> {
     let scratch = tempfile::tempdir().expect("tempdir for the native table root");
-    // 6GB: far above what a bounded, streaming Append should ever need on
-    // its own -- but this cap is not what proves anything; /usr/bin/time
-    // -v's measured RSS is the actual evidence, for whichever mechanism
-    // this run measures.
-    let config = ExecutionConfig::default().with_memory_limit(6 * 1024 * 1024 * 1024);
+    // Task 005 addition: `QE_MEM_CHECK_LIMIT_GB` (default 6, task 002's
+    // original value -- "far above what a bounded, streaming Append
+    // should ever need on its own") lets the fail-safe half of task 005's
+    // own adversarial re-test set a DELIBERATELY TIGHT limit, so a query
+    // that truly needs multiple GB either refuses cleanly (a `--memory-
+    // limit`-style admission check exists on this path) or is left to
+    // OOM/SIGKILL under `scripts/claude-safe-build.sh`'s own cgroup cap --
+    // the same bar phase 1 task 006 held for `NativeTable::scan()`. This
+    // cap is not itself what proves anything; `/usr/bin/time -v`'s
+    // measured RSS (unbounded run) or the process's actual exit behavior
+    // (tight-cap run) is the real evidence either way.
+    let limit_gb: usize = std::env::var("QE_MEM_CHECK_LIMIT_GB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6);
+    let config = ExecutionConfig::default().with_memory_limit(limit_gb * 1024 * 1024 * 1024);
     let mut ctx =
         ExecutionContext::with_config(config).with_native_table_root(scratch.path().to_path_buf());
 
@@ -155,10 +181,14 @@ async fn run_sql() -> query_engine::Result<()> {
         created.rows, created.segments, created.version
     );
 
-    ctx.register_parquet("lineitem_src", LARGE_SOURCE)
+    let large_source = large_source();
+    ctx.register_parquet("lineitem_src", large_source)
         .expect("register large lineitem source");
 
-    println!("[sql] INSERT INTO t SELECT * FROM lineitem_src (60M rows, 2.8GB compressed) ...");
+    println!(
+        "[sql] INSERT INTO t SELECT * FROM lineitem_src (source={large_source}, \
+         memory_limit={limit_gb}GB) ..."
+    );
     let t0 = std::time::Instant::now();
     let result = ctx
         .insert_into_native_table("INSERT INTO t SELECT * FROM lineitem_src")

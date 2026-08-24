@@ -2720,6 +2720,112 @@ SELECT o_orderkey, o_totalprice FROM orders_native WHERE o_orderkey <= 3 ORDER B
 SELECT COUNT(*) FROM orders_native;  -- 1500 (unchanged)
 ```
 
+### Mutation: memory safety + concurrency/crash-safety adversarial verification (native-tables-mutation epic, task 005, 2026-08-24)
+
+Six adversarial scenarios, each given a REAL, evidenced verdict (not design
+review) per `.claude/epics/native-tables-mutation/005.md`'s Outcome section
+— full numbers, methodology, and code pointers there; summary here.
+
+- **Deletion vector growth**: a single large DELETE stays cheap (bounded by
+  the per-segment `Vec<u32>` + the empty-segment-drop exception). The
+  named "many segments, each lightly touched" shape (task 001's own
+  residual-risk worry) was built for real (2573 segments via 3000
+  separate Append/Delete/Update calls) and hit with one broad ~1% DELETE:
+  **~13.1-13.7 bytes per `deleted_rows` JSON entry, stable across a
+  313-segment and a 2573-segment run** — extrapolated (not re-measured at
+  literal scale) to task 001's own "1000 segments x 1,000,000 rows x 1%
+  deleted" scenario: **~131MB**, larger than task 001's "tens of MB"
+  guess. Judged a real-but-not-urgent, well-quantified residual risk
+  (current realistic scales stay in the sub-2MB range) rather than fixed
+  in this task — task 001's own named forward-compatible escape hatch
+  (compact `deleted_rows` on-disk encoding) needs a backward-compat
+  migration story big enough to warrant its own task, not a same-task fix.
+- **Sequential-mutation growth**: a REAL mixed sequence (Append/Delete/
+  Update interleaved, not just repeated inserts) up to 2573 segments/4.6M
+  rows stays fully correct throughout (`scan()` and `statistics()` agree
+  exactly at every checkpoint) and manifest size grows perfectly linearly
+  (~413 bytes/segment, no super-linear blowup). `scan()`/`statistics()`
+  wall time stay roughly linear in segment count (no cliff) — **but the
+  cumulative cost of a LONG mutation SEQUENCE is O(N²)**, a genuine new
+  finding beyond the letter of the acceptance criteria: per-mutation cost
+  grew from ~0.44ms/op near-empty to ~8.8ms/op at 2500+ segments (every
+  mutation re-reads + re-writes the WHOLE `_manifest.json`), because
+  compaction is out of this epic's scope by design (task 001 Decision 3).
+  Named as a residual risk with concrete numbers for a future compaction
+  task, not fixed here (fixing it for real means building compaction).
+  Open file descriptors stayed flat (10) for the entire 3000-op run —
+  confirmed no handle leak.
+- **Empty-segment-drop exception effectiveness**: measured for real, not
+  assumed — 5 fully-tombstoned segments were confirmed dropped from the
+  manifest, and the counterfactual "what it would have cost had the
+  exception not fired" was computed by literally serializing the
+  actual retained-shape `Segment` value: **~9,114 bytes/segment that
+  would have persisted, vs. 0 actual** (~45.6KB saved across the 5
+  segments tested).
+- **Single-writer lock under a REAL `kill -9`**: a genuine two-process
+  test (`examples/native_crash_kill_check.rs`) drives the REAL
+  `native_write::write_append_segments`/`publish_manifest_update`
+  building blocks (not a lock-only synthetic harness): a child writes new
+  segment file(s), signals readiness, and gets a real external `kill -9
+  <pid>` subprocess sent at it (confirmed reaped with `signal=Some(9)`).
+  **PASS, 6/6 repeated runs, zero flakes**: the lock is immediately
+  re-acquirable (kernel auto-release), `_manifest.json` is byte-for-byte
+  untouched, the new segment file is a harmless unreferenced orphan, the
+  table reads back as EXACTLY its pre-crash state via the real
+  `TableProvider::scan()`/`statistics()` path, and the table is still
+  normally writable afterward. A separate `QE_CRASH_MODE=concurrent` run
+  (two real child processes racing a real Append against the same table)
+  confirms exactly one succeeds and the other gets a clean, named
+  `QueryError::Storage` ("another writer already holds the lock...") —
+  never silent data loss, never corruption — also 3/3 clean runs.
+- **Crash safety mid-mutation**: the SAME `kill -9` test above IS this
+  verdict — a writer killed strictly between writing new segment files
+  and the final manifest rename leaves the table in EXACTLY its
+  pre-mutation state, never a partial one.
+- **Carried-forward 5.3GB SQL-path finding (from task 002)** — given a
+  real verdict, not left silent: (a) **CONFIRMED BOUNDED, not unbounded
+  in source size** — SF=10 (60M rows) measured 5.38GB peak RSS, SF=100
+  (600M rows, 10x) measured 5.86GB (+9% for 10x data): the partition
+  COUNT (capped at `rayon::current_num_threads()`), not row count, drives
+  it, since `StreamingParquetScanExec`'s row-group size is ~constant
+  (~1,048,576 rows) regardless of scale. (b) **CONFIRMED it does NOT fail
+  safely before this task's fix**: a configured `--memory-limit` had
+  ZERO effect on actual usage (proved by setting it to 1GB while the
+  query still used 5.4GB), and under a real tight cgroup cap the process
+  was OOM-killed by the KERNEL (`journalctl -k`: "Memory cgroup out of
+  memory: Killed process ... (native_append_m)") — the identical failure
+  class phase 1 task 006 found and fixed for `NativeTable::scan()`. (c)
+  **FIXED with a small, scoped, root-cause mitigation**: `ExecutionContext
+  ::create_table_as_select`/`insert_into_native_table` (`src/execution/
+  context.rs`) now merge their per-partition streams via
+  `bounded_partition_merge` (`futures::stream::iter(streams).
+  flatten_unordered(Some(limit))`, `limit` from `QE_INSERT_MERGE_
+  CONCURRENCY`, default 8) instead of unconditionally-concurrent
+  `futures::stream::select_all` — bounding how many partition readers'
+  decoded-row-group working sets can be resident at once. **Measured
+  effect: SF=10 5.38GB -> 1.63GB (-70%), SF=100 5.86GB -> 1.67GB (-71%,
+  and now even MORE tightly scale-invariant), wall time NEUTRAL TO
+  FASTER (SF=10 6.54s -> 6.29s; SF=100 100.3s -> 77.8s, -22%)** — a real
+  win, not a slow-but-safe tradeoff. Zero correctness regression (all 21
+  pre-existing INSERT/CTAS integration tests unchanged and green, plus 3
+  new unit tests for the merge helper itself). A 2GB and even a 1GB cgroup
+  cap now complete successfully (were both OOM-kills before); a 512MB cap
+  still gets SIGKILL'd — a real but much narrower residual gap (this path
+  still has no formal pre-flight admission check consulting
+  `--memory-limit`, unlike `NativeTable::scan()`'s `check_scan_budget` —
+  named as a follow-up, not attempted here: a reliable estimate for THIS
+  path's true need is harder to derive than the read-path's clean
+  "total on-disk bytes" proxy, and a wrong heuristic risks false
+  refusals, a new kind of bug).
+
+Reproduce: `scripts/claude-safe-build.sh cargo build --release --example
+native_mutation_growth_check --example native_crash_kill_check --example
+native_append_memory_check`, then run each (`QE_MEM_CHECK_MODE=sql
+QE_MEM_CHECK_SOURCE=sf100 QE_MEM_CHECK_LIMIT_GB=60 /usr/bin/time -v
+./target/release/examples/native_append_memory_check` for the SF=100 SQL
+path leg; `SAFE_BUILD_MEM=2G` prefix for the tight-cap legs;
+`QE_CRASH_MODE=concurrent` for the two-writer leg).
+
 ### Current limitations (explicit, matching this epic's own G5 boundary and the PRD's phase plan)
 
 - **No filter/row-group pruning at scan level.** `NativeTable::

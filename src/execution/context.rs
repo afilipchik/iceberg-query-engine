@@ -188,6 +188,21 @@ impl Default for ExecutionContext {
     }
 }
 
+/// Pure parsing logic for `QE_INSERT_MERGE_CONCURRENCY`
+/// (native-tables-mutation epic, task 005) — factored out of
+/// `ExecutionContext::insert_merge_concurrency` so it is unit-testable
+/// without mutating the real process environment (this crate's test
+/// binaries run many `#[tokio::test]`s concurrently in one process; a test
+/// that called `std::env::set_var` here would race every other test
+/// reading the same key). Any absent, unparseable, or zero value falls
+/// back to the default (8) — never a panic, never a zero-concurrency
+/// merge (which would deadlock `flatten_unordered`'s `Some(0)` semantics).
+fn parse_merge_concurrency(raw: Option<&str>) -> usize {
+    raw.and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(8)
+}
+
 impl ExecutionContext {
     pub fn new() -> Self {
         let config = ExecutionConfig::default();
@@ -654,6 +669,52 @@ impl ExecutionContext {
         })
     }
 
+    /// Merge many per-partition streams into ONE, bounding how many are
+    /// concurrently polled/decoded at once (native-tables-mutation epic,
+    /// task 005). Plain `futures::stream::select_all` (the mechanism this
+    /// replaces at both call sites below) keeps EVERY member stream alive
+    /// and interleaves polls across ALL of them for the operation's whole
+    /// duration — for a wide multi-partition source (a
+    /// `StreamingParquetScanExec` partition per up to `rayon::
+    /// current_num_threads()`, each effectively a currently-open parquet
+    /// row-group reader with its own decoded-column-chunk working set
+    /// resident once its turn comes), that lets up to `num_partitions`
+    /// readers' working sets sit resident simultaneously with no cap. Task
+    /// 002 root-caused this as (most of) the SQL-path INSERT's measured
+    /// ~5.3GB-vs-328MB gap over the direct write core; task 005 confirmed
+    /// (a) it stays BOUNDED rather than growing with source row count
+    /// (60M vs 600M rows measured ~5.4GB vs ~6.0GB peak RSS — the
+    /// partition count, not the row count, drives it) but (b) is not
+    /// admission-controlled at all today (a configured `--memory-limit`
+    /// has zero effect on this path) and (c) a genuinely tight memory cap
+    /// gets the process a real kernel cgroup OOM-kill, not a clean
+    /// refusal — see `.claude/epics/native-tables-mutation/005.md`'s
+    /// Outcome for the full measurement. `flatten_unordered(Some(limit))`
+    /// polls at most `limit` inner streams at once: same eventual output
+    /// (every row, order-independent — matching `select_all`'s own
+    /// pre-existing "unordered merge is fine, only every row exactly once
+    /// matters" contract both callers already documented), bounded
+    /// concurrent memory instead of unbounded. A single-threaded Append
+    /// writer downstream drains one batch at a time regardless, so wide
+    /// concurrency here was never buying write throughput — only, at
+    /// best, some read-ahead.
+    fn bounded_partition_merge(streams: Vec<RecordBatchStream>, limit: usize) -> RecordBatchStream {
+        use futures::StreamExt;
+        Box::pin(futures::stream::iter(streams).flatten_unordered(Some(limit.max(1))))
+    }
+
+    /// Concurrency cap for [`Self::bounded_partition_merge`]. Overridable
+    /// via `QE_INSERT_MERGE_CONCURRENCY`, matching this codebase's
+    /// established env-gated tuning-switch convention (`QE_MORSEL`,
+    /// `QE_IPC_CACHE`, ...). 8 is a deliberately modest, hardware-count-
+    /// independent default — task 005 measured it cuts the SQL-path
+    /// INSERT/CTAS peak RSS materially with no correctness change (every
+    /// row still emitted exactly once) and no measurable wall-time
+    /// regression on the shapes it tested.
+    fn insert_merge_concurrency() -> usize {
+        parse_merge_concurrency(std::env::var("QE_INSERT_MERGE_CONCURRENCY").ok().as_deref())
+    }
+
     /// Execute `CREATE TABLE <name> AS SELECT ...` end to end: parse, bind
     /// the inner `SELECT` via the ordinary `Binder::bind()` path (which also
     /// validates the `CREATE TABLE` clause is a shape this epic supports —
@@ -761,7 +822,8 @@ impl ExecutionContext {
             }));
             streams.push(decoded);
         }
-        let merged: RecordBatchStream = Box::pin(futures::stream::select_all(streams));
+        let merged: RecordBatchStream =
+            Self::bounded_partition_merge(streams, Self::insert_merge_concurrency());
 
         // Create for a genuinely fresh destination, Overwrite when a native
         // table already lives there (bumps snapshot.version, preserves
@@ -911,7 +973,8 @@ impl ExecutionContext {
                 Box::pin(stream.and_then(|b| async move { decode_dictionary_batch(b) }));
             streams.push(decoded);
         }
-        let merged: RecordBatchStream = Box::pin(futures::stream::select_all(streams));
+        let merged: RecordBatchStream =
+            Self::bounded_partition_merge(streams, Self::insert_merge_concurrency());
 
         let append_result = native_write::append_to_native_table(
             merged,
@@ -1444,6 +1507,93 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field};
+
+    // ------------------------------------------------------------------
+    // native-tables-mutation epic, task 005: bounded partition-merge
+    // concurrency (the SQL-path INSERT/CTAS memory fix -- see this
+    // module's `bounded_partition_merge`/`insert_merge_concurrency` doc
+    // comments and `.claude/epics/native-tables-mutation/005.md`'s
+    // Outcome for the full before/after measurement).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_merge_concurrency_defaults_and_validates() {
+        assert_eq!(parse_merge_concurrency(None), 8);
+        assert_eq!(parse_merge_concurrency(Some("")), 8);
+        assert_eq!(parse_merge_concurrency(Some("not a number")), 8);
+        assert_eq!(
+            parse_merge_concurrency(Some("0")),
+            8,
+            "zero would deadlock flatten_unordered's Some(0) -- must fall back"
+        );
+        assert_eq!(
+            parse_merge_concurrency(Some("-1")),
+            8,
+            "negative is not a valid usize -- must fall back"
+        );
+        assert_eq!(parse_merge_concurrency(Some("1")), 1);
+        assert_eq!(parse_merge_concurrency(Some("32")), 32);
+    }
+
+    fn int_batch(schema: &SchemaRef, vals: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vals))]).unwrap()
+    }
+
+    /// `bounded_partition_merge` must emit every row from every input
+    /// stream exactly once, regardless of the concurrency limit -- tested
+    /// at the extremes (1, the most different from unbounded `select_all`
+    /// and therefore the most likely to reveal an off-by-one/deadlock;
+    /// and a generous limit) plus the real default.
+    #[tokio::test]
+    async fn bounded_partition_merge_preserves_every_row_at_every_concurrency_limit() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        for limit in [1usize, 2, ExecutionContext::insert_merge_concurrency(), 100] {
+            let streams: Vec<RecordBatchStream> = (0..5)
+                .map(|p| {
+                    let base = p * 10;
+                    let batches = vec![
+                        int_batch(&schema, vec![base, base + 1]),
+                        int_batch(&schema, vec![base + 2]),
+                    ];
+                    Box::pin(futures::stream::iter(batches.into_iter().map(Ok)))
+                        as RecordBatchStream
+                })
+                .collect();
+            let merged = ExecutionContext::bounded_partition_merge(streams, limit);
+            let collected: Vec<RecordBatch> =
+                merged.try_collect().await.expect("merge must not error");
+            let mut values: Vec<i64> = collected
+                .iter()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            values.sort_unstable();
+            let expected: Vec<i64> = (0..5)
+                .flat_map(|p| [p * 10, p * 10 + 1, p * 10 + 2])
+                .collect();
+            assert_eq!(
+                values, expected,
+                "limit={limit}: every row must appear exactly once"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_partition_merge_handles_zero_streams() {
+        let merged = ExecutionContext::bounded_partition_merge(Vec::new(), 8);
+        let collected: Vec<RecordBatch> = merged
+            .try_collect()
+            .await
+            .expect("empty merge must not error");
+        assert!(collected.is_empty());
+    }
 
     fn create_test_context() -> ExecutionContext {
         let mut ctx = ExecutionContext::new();
