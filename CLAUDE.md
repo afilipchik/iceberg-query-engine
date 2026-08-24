@@ -2385,15 +2385,182 @@ DIFFERENT, single-FILE atomic-publish model instead.
     engine's generic multi-partition scan/stream-merge pattern, shared
     by CTAS, well outside this task's own charter.
 
+### Mutation: DELETE (native-tables-mutation epic, phase 2, task 003, 2026-08-23)
+
+`DELETE FROM <native table> [WHERE ...]` — the deletion-vector mechanism
+task 001's design spike decided (Outcome, Decision 1) plus the SQL surface
+that exercises it. Unlike CTAS/INSERT, this is NOT a thin wrapper around
+`bind_query()`/the generic `LogicalPlan`/`PhysicalOperator` pipeline —
+that pipeline has no way to carry a matched row's (segment id, local
+position) back out (`TableProvider::scan()` returns only
+`Vec<RecordBatch>`), so DELETE's row-identification is a genuinely new,
+bespoke loop.
+
+- **`Segment::deleted_rows: Vec<u32>`** (new field, `src/storage/
+  native_manifest.rs`, `#[serde(default)]`): sorted, deduplicated LOCAL
+  row positions within that segment's own on-disk row order that a
+  DELETE has tombstoned. Every manifest phase 1 or task 002 ever wrote
+  deserializes with an empty `Vec` here — zero behavior or performance
+  change for a never-deleted-from table. `Segment.row_count`/
+  `Snapshot.row_count` are DELIBERATELY unaffected by `deleted_rows` —
+  they keep meaning the PHYSICAL (write-time) count, so
+  `NativeManifest::validate`'s existing `row_count == sum(segments[].
+  row_count)` invariant holds with zero changes and `NativeManifest::
+  build` stays callable completely unchanged after a DELETE. A NEW method,
+  `Segment::live_row_count()` (`row_count - deleted_rows.len()`), is the
+  LOGICAL (post-delete, visible) count; `NativeManifest::validate` also
+  now bounds-checks `deleted_rows` (sorted, strictly increasing, every
+  entry `< row_count`).
+- **`src/storage/native_delete.rs`** (new sibling module to
+  `native_write.rs`/`native_manifest.rs`/`native_table.rs`): owns
+  row-identification and deletion-vector editing. Two reusable,
+  non-publishing building blocks (task 001's Decision 2, for task 004's
+  UPDATE to compose into ONE atomic publish rather than two sequential
+  self-publishing calls):
+  - `identify_matching_rows(dir, target, predicate: Option<&Expr>,
+    materialize_rows: bool) -> Result<MatchedRows>` — opens the target's
+    CURRENT manifest's segments directly (in id order), reads each via
+    `ipc_cache::read_row_group` (the SAME mmap-backed reader `NativeTable
+    ::scan` uses), evaluates the predicate batch-by-batch via
+    `physical::operators::evaluate_expr` (the SAME function `FilterExec`
+    itself uses), and tracks a running local-row offset across a
+    segment's (possibly many) batches to convert matches into
+    segment-relative positions. `predicate: None` matches every row
+    (`DELETE FROM t` with no WHERE) without ever building an all-true
+    mask. `materialize_rows` controls whether matched rows' ACTUAL COLUMN
+    DATA is also gathered (`MatchedRows::per_segment[].rows: Option<
+    RecordBatch>`) — DELETE itself always passes `false` (it only needs
+    WHICH rows, never their values, so a broad `DELETE FROM t` doesn't
+    pay to materialize row data it will never use); task 004 (UPDATE) is
+    expected to pass `true` to get matched rows' CURRENT values for
+    evaluating its SET expressions against, reusing this exact function
+    rather than re-deriving an equivalent scan.
+  - `apply_deletions(target, matches) -> Vec<Segment>` — unions each
+    segment's newly matched positions into its EXISTING `deleted_rows` via
+    a `BTreeSet` (insert + re-serialize sorted) — idempotent BY
+    CONSTRUCTION, so re-matching an already-deleted row via a second,
+    overlapping DELETE is naturally a no-op with no special-casing. Drops
+    a `Segment` entirely once `deleted_rows.len() >= row_count` (every row
+    tombstoned) — task 001's Decision 3's narrow, in-scope compaction
+    exception; NOT full compaction (deferred to a future epic).
+  - `delete_from_native_table(table_dir, predicate) ->
+    Result<NativeDeleteResult>` — the self-publishing entrypoint:
+    `native_write::lock_table_for_write` (held for the whole span) →
+    `native_manifest::read_manifest` → `identify_matching_rows` →
+    `apply_deletions` → `native_write::publish_manifest_update` (task
+    002's single-file atomic-rename primitive, reused completely
+    UNCHANGED — DELETE never writes new segment `.arrow` files, only an
+    edited manifest, so no second publish path was needed). **Two
+    distinct no-op cases**, both leave the manifest byte-for-byte
+    untouched and never bump the version: the predicate matches zero
+    physical rows, OR it matches rows but EVERY one was already
+    tombstoned by a prior DELETE (detected via the LOGICAL row-count
+    delta, `rows_deleted == 0`, not a segment-by-segment equality check)
+    — `NativeDeleteResult::rows_deleted` is the NET newly-tombstoned
+    count, never the gross predicate-match count, so a fully-redundant
+    repeat DELETE reports `0` rather than the same nonzero number every
+    time it runs.
+- **Read-path consultation — the single choke point**: `NativeTable::scan`
+  (`src/storage/native_table.rs`) gained a deletion-filtering step: for
+  each segment with a non-empty `deleted_rows`, a new free function
+  (`filter_deleted_rows`) tracks a running local-row offset across the
+  segment's (possibly many) batches and applies `arrow::compute::filter`
+  — with a per-batch fast path that skips the mask/filter call entirely
+  when NO deleted position falls in that batch's range (the common case
+  for a segment with only a few scattered deletions). A segment with an
+  EMPTY `deleted_rows` (every table phase 1/task 002 ever wrote, and any
+  untouched segment of a mutated table) takes a zero-allocation fast path
+  straight through — confirmed zero behavior/performance change, not just
+  designed for it. Because `TableProvider::scan_with_filter`'s DEFAULT
+  implementation is `self.scan(projection)` and `NativeTable` does not
+  override it, EVERY read path funnels through this one fix with zero
+  further changes — confirmed by reading every call site, not assumed:
+  `morsel_agg.rs`'s dense-direct-address fast path
+  (`try_execute_dense_direct` calls `provider.scan_with_filter(...)`),
+  `physical/planner.rs`'s generic `MemoryTableExec` path, and its 400MB
+  prescan cache all reach the same `scan()`. Dense-direct-address needed
+  literally ZERO code changes: it only emits a group whose `presence` bit
+  was actually set during accumulation, and deleted rows now simply never
+  reach the accumulator (the same sparse-key mechanism that already
+  handles ordinary gapped key ranges) — task 001's prior analysis is
+  reconfirmed against the ACTUAL implementation, not just carried over
+  unchanged from the design doc.
+- **`NativeTable::statistics()` row count**: extended to sum
+  `segment.live_row_count()` (the NEW logical count) instead of raw
+  `segment.row_count`, for BOTH the whole-table and sharded-provider
+  branches — a one-line change to an already-existing "compute row_count
+  from active_segments()" pattern. `total_byte_size` and the column-stats
+  rollup (min/max/NDV) are DELIBERATELY left untouched (task 001: deletion
+  vectors never shrink a segment's physical bytes, and a wider stats
+  bound is always safe) — this is also why `check_scan_budget`'s existing
+  `memory_limit * spill_threshold` formula (phase 1 task 006) needed ZERO
+  changes: it estimates `total_byte_size`, which DELETE never changes,
+  and `scan()` still must decode a segment's full physical content before
+  the new per-batch filter can drop rows.
+- **SQL surface**: `delete_target_name(stmt) -> Option<String>`
+  (extraction, mirrors `insert_target_name`) plus a `Statement::Delete`
+  arm in `Binder::bind()` that validates shape
+  (`require_supported_delete_shape`, mechanically checked against
+  sqlparser 0.62's real 10-field `ast::Delete` struct plus
+  `TableFactor::Table`'s 10 fields — multi-table FROM lists, JOINs,
+  `USING`, `RETURNING`/`OUTPUT`, `ORDER BY`/`LIMIT` all refused by name)
+  and then ALWAYS returns `Err` pointing at the real entrypoint — DELETE
+  has no `LogicalPlan` to give back, so unlike the Insert/CreateTable
+  arms this one is not a small wrapper around `bind_query()`. The real
+  binding work is `pub fn bind_delete(&mut self, stmt: &ast::Delete) ->
+  Result<(String, Option<Expr>)>`: validates shape, then binds the WHERE
+  predicate (if any) via the SAME `bind_expr` method `bind_select`'s own
+  WHERE-clause binding uses, against the target table's own schema
+  (aliased if the DELETE names one, mirroring `bind_table_factor`'s
+  convention). `selection: None` binds to predicate `None` (match every
+  row), not a trivial `TRUE` literal or an error. A subquery in the WHERE
+  clause (`DELETE FROM t WHERE id IN (SELECT ...)`) BINDS successfully
+  (confirmed by task 001's spike — the identical `bind_expr` path
+  `bind_select` uses) but is refused right after, by name, at bind time:
+  evaluating it needs a `SubqueryExecutor`, which the bespoke
+  `identify_matching_rows` loop (deliberately not the generic
+  `PhysicalOperator` pipeline `SubqueryExecutor` is normally wired
+  through) does not have — refusing here, rather than letting
+  `physical::operators::evaluate_expr` fail deep inside the
+  identification loop with a less specific error, matches this codebase's
+  "refuse cleanly and early" discipline.
+- **`ExecutionContext::delete_from_native_table`** (`&mut self`, mirrors
+  `insert_into_native_table`'s shape): target must already be a
+  REGISTERED native table; calls `Binder::bind_delete` directly (NOT
+  `bind()` + a physical plan — there is no `LogicalPlan`/
+  `PhysicalOperator` pipeline involved at all for DELETE) then drives
+  `native_delete::delete_from_native_table`. Re-registers the table
+  afterward so the deletion is visible to a subsequent query in the same
+  session. `sql()` gained the same DELETE-refusal guard it already has
+  for CREATE TABLE/INSERT. Wired into the REPL alongside CREATE
+  TABLE/INSERT's existing dispatch.
+- **Cell-exact validated** (`tests/native_delete_tests.rs`): a subset
+  DELETE matches the independently-computed complement of the original
+  source cell-exact; deleting ALL rows leaves the table existing but
+  logically empty (subsequent queries return zero rows cleanly, not an
+  error); deleting ZERO rows is a clean no-op (manifest byte-for-byte
+  unchanged); a DELETE spanning a segment boundary in a real two-segment
+  table (CTAS + INSERT) applies to the correct segments only; repeated
+  overlapping DELETEs (fully AND partially redundant) never corrupt or
+  double-count, with the NET-vs-gross `rows_deleted` distinction
+  explicitly asserted; `statistics()` reflects the post-delete logical row
+  count; `sql()`'s refusal guard; unregistered-table and
+  non-native-table error paths; INSERT and a fresh CTAS both still work
+  correctly in a session that has already performed a DELETE (no
+  regression).
+
 ### Current limitations (explicit, matching this epic's own G5 boundary and the PRD's phase plan)
 
-- **DELETE/UPDATE still not implemented.** Only `INSERT` (native-tables-
-  mutation epic task 002, above) exists so far; `Statement::Delete`/
-  `Statement::Update` still fall through the binder's catch-all
-  `NotImplemented`. A deletion vector mechanism is designed (task 001's
-  Outcome, Decision 1) but not yet built (task 003). Full replace
-  (`write-native --mode overwrite` / re-running `CREATE TABLE ... AS
-  SELECT`) remains available alongside the new incremental `Append`.
+- **UPDATE still not implemented.** `INSERT` (task 002) and `DELETE`
+  (task 003, above) both exist now; `Statement::Update` still falls
+  through the binder's catch-all `NotImplemented`. Task 001's Decision 2
+  designed UPDATE as DELETE + INSERT composed under ONE atomic publish
+  (reusing `native_delete`'s row-identification core — with
+  `materialize_rows: true` — for matched rows' current values, and
+  `native_write::write_append_segments` for the recomputed rows) but this
+  is not yet built (task 004). Full replace (`write-native --mode
+  overwrite` / re-running `CREATE TABLE ... AS SELECT`) remains available
+  alongside the incremental `Append`/`DELETE`.
 - **No filter/row-group pruning at scan level.** `NativeTable::
   scan_with_filter` has no predicate pushdown at all; every query reads
   every active segment in full and relies on a post-scan `FilterExec` for

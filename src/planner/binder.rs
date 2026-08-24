@@ -263,6 +263,134 @@ fn require_supported_insert_shape(insert: &ast::Insert) -> Result<()> {
     Ok(())
 }
 
+/// The single `TableFactor` a `DELETE`'s `FROM` clause names — the FIRST
+/// entry of `delete.from`'s table list, regardless of whether the
+/// statement is otherwise a shape this binder accepts (mirrors
+/// [`create_table_target_name`]/[`insert_target_name`]'s own "extraction is
+/// separate from validation" split: a multi-table or joined DELETE still
+/// has an extractable first target, and [`require_supported_delete_shape`]
+/// — not this function — is what refuses those shapes with a specific,
+/// actionable error). `None` only when there is no FROM table at all to
+/// extract (structurally impossible for a real parse, but handled rather
+/// than panicking) or its `TableFactor` variant carries no plain name
+/// (e.g. a derived/function table factor — also refused by name inside
+/// `require_supported_delete_shape`).
+fn delete_from_table_factor(delete: &ast::Delete) -> Option<&ast::TableFactor> {
+    let tables = match &delete.from {
+        ast::FromTable::WithFromKeyword(t) | ast::FromTable::WithoutKeyword(t) => t,
+    };
+    Some(&tables.first()?.relation)
+}
+
+/// If `stmt` is a `DELETE` statement, its target table's name — see
+/// [`delete_from_table_factor`]'s doc for the exact extraction rule this
+/// delegates to. Used by `main.rs`'s REPL routing and
+/// `ExecutionContext::delete_from_native_table` (both call this BEFORE any
+/// validation, exactly like [`insert_target_name`]).
+pub fn delete_target_name(stmt: &Statement) -> Option<String> {
+    match stmt {
+        Statement::Delete(delete) => match delete_from_table_factor(delete)? {
+            ast::TableFactor::Table { name, .. } => Some(name.table_name()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Refuse, by name, every `DELETE` clause this epic does not implement.
+/// Mirrors [`require_supported_insert_shape`]'s exact discipline,
+/// mechanically checked against sqlparser 0.62's real 10-field
+/// `ast::Delete` struct (confirmed via `.scratch/mutation_sqlparser_spike/`,
+/// see task 001's Outcome, Decision 6) plus the real `TableFactor::Table`
+/// variant's 10 fields. Only `from`'s single target table name/alias and
+/// `selection` are consumed (by [`Binder::bind_delete`]); every other
+/// field must be at its "not specified" value or this returns a specific
+/// `QueryError::NotImplemented` naming the clause.
+fn require_supported_delete_shape(delete: &ast::Delete) -> Result<()> {
+    fn refuse(clause: &str) -> QueryError {
+        QueryError::NotImplemented(format!(
+            "DELETE: `{clause}` is not supported — this epic supports only `DELETE FROM \
+             <table> [WHERE ...]` against a single existing native table (no multi-table \
+             delete, no USING, no ORDER BY/LIMIT, no RETURNING/OUTPUT)"
+        ))
+    }
+    if !delete.optimizer_hints.is_empty() {
+        return Err(refuse("query optimizer hints"));
+    }
+    if !delete.tables.is_empty() {
+        return Err(refuse(
+            "a MySQL multi-table DELETE (comma-separated target list)",
+        ));
+    }
+    let tables = match &delete.from {
+        ast::FromTable::WithFromKeyword(t) | ast::FromTable::WithoutKeyword(t) => t,
+    };
+    if tables.len() != 1 {
+        return Err(refuse("a DELETE naming more than one FROM table"));
+    }
+    if !tables[0].joins.is_empty() {
+        return Err(refuse("a JOIN in the DELETE target"));
+    }
+    match &tables[0].relation {
+        ast::TableFactor::Table {
+            name: _,
+            alias: _,
+            args,
+            with_hints,
+            version,
+            with_ordinality,
+            partitions,
+            json_path,
+            sample,
+            index_hints,
+        } => {
+            if args.is_some() {
+                return Err(refuse("a table-valued function as the DELETE target"));
+            }
+            if !with_hints.is_empty() {
+                return Err(refuse("MSSQL table hints (WITH (...))"));
+            }
+            if version.is_some() {
+                return Err(refuse("a table time-travel version qualifier"));
+            }
+            if *with_ordinality {
+                return Err(refuse("WITH ORDINALITY"));
+            }
+            if !partitions.is_empty() {
+                return Err(refuse("MySQL PARTITION selection"));
+            }
+            if json_path.is_some() {
+                return Err(refuse("a PartiQL JSON path"));
+            }
+            if sample.is_some() {
+                return Err(refuse("a TABLESAMPLE clause"));
+            }
+            if !index_hints.is_empty() {
+                return Err(refuse("MySQL index hints"));
+            }
+        }
+        _ => return Err(refuse("a DELETE target that is not a plain table name")),
+    }
+    if delete.using.is_some() {
+        return Err(refuse(
+            "USING (Postgres/Snowflake/MySQL join-shaped delete)",
+        ));
+    }
+    if delete.returning.is_some() {
+        return Err(refuse("RETURNING"));
+    }
+    if delete.output.is_some() {
+        return Err(refuse("OUTPUT (MSSQL)"));
+    }
+    if !delete.order_by.is_empty() {
+        return Err(refuse("MySQL ORDER BY on DELETE"));
+    }
+    if delete.limit.is_some() {
+        return Err(refuse("MySQL LIMIT on DELETE"));
+    }
+    Ok(())
+}
+
 /// Refuse, by name, every `CREATE TABLE` clause this epic does not
 /// implement. Mirrors this binder's existing "match the supported shape,
 /// `NotImplemented` the rest" convention (used throughout for window
@@ -571,6 +699,37 @@ impl<'a> Binder<'a> {
                 })?;
                 self.bind_query(query)
             }
+            // `DELETE FROM <table> [WHERE ...]` (native-tables-mutation
+            // epic, task 003). Unlike `CreateTable`/`Insert` above, this
+            // arm is NOT a small wrapper around `bind_query` — DELETE has
+            // no source query to bind, and `LogicalPlan`'s
+            // scan/filter/project pipeline has no way to carry a matched
+            // row's (segment, local position) back out (see
+            // `native_delete.rs`'s module doc for exactly why). This arm
+            // therefore only VALIDATES the statement's shape
+            // (`require_supported_delete_shape` — every clause this epic
+            // does not support refused by name, mirroring the Insert/
+            // CreateTable arms above) and then points at the real
+            // entrypoint: `Binder::bind_delete` (which returns the target
+            // table name + bound predicate, not a `LogicalPlan`) is what
+            // `ExecutionContext::delete_from_native_table` actually calls
+            // to drive the bespoke row-identification loop. Reachable
+            // here only via `logical_plan()`/other direct `bind()` callers
+            // — `ExecutionContext::sql()` refuses a DELETE by name before
+            // ever calling `bind()`, exactly like its CreateTable/Insert
+            // guards.
+            Statement::Delete(delete) => {
+                require_supported_delete_shape(delete)?;
+                Err(QueryError::NotImplemented(
+                    "DELETE FROM ... must run through \
+                     ExecutionContext::delete_from_native_table (the REPL calls this \
+                     automatically) — Binder::bind() only validates a DELETE statement's \
+                     shape; identifying and removing matched rows needs a bespoke \
+                     row-identification loop over the target table's actual current data, not \
+                     a LogicalPlan (see Binder::bind_delete)."
+                        .to_string(),
+                ))
+            }
             _ => Err(QueryError::NotImplemented(format!(
                 "Statement type not supported: {:?}",
                 stmt
@@ -582,6 +741,86 @@ impl<'a> Binder<'a> {
     pub fn bind_sql(&mut self, sql: &str) -> Result<LogicalPlan> {
         let stmt = parser::parse_sql(sql)?;
         self.bind(&stmt)
+    }
+
+    /// Bind a `DELETE FROM <table> WHERE <predicate>` statement
+    /// (native-tables-mutation epic, task 003): validates the statement's
+    /// shape (`require_supported_delete_shape`), then binds the WHERE
+    /// predicate (if any) via the SAME `bind_expr` method `bind_select`'s
+    /// own WHERE-clause binding uses (`selection: None` binds to `None` —
+    /// "match every row," a real supported case, not an error), against
+    /// the target table's OWN schema (no join, no other table in scope;
+    /// aliased via the DELETE's own alias if present, mirroring
+    /// `bind_table_factor`'s convention, so `WHERE alias.col = ...` binds
+    /// exactly like `WHERE col = ...` does). Returns the target table name
+    /// and the bound predicate — the caller
+    /// (`ExecutionContext::delete_from_native_table`) evaluates this
+    /// predicate directly via `physical::operators::evaluate_expr` inside
+    /// `native_delete::identify_matching_rows`, NOT through the generic
+    /// `LogicalPlan`/`PhysicalOperator` pipeline.
+    pub fn bind_delete(&mut self, stmt: &ast::Delete) -> Result<(String, Option<Expr>)> {
+        require_supported_delete_shape(stmt)?;
+        let tables = match &stmt.from {
+            ast::FromTable::WithFromKeyword(t) | ast::FromTable::WithoutKeyword(t) => t,
+        };
+        // `require_supported_delete_shape` already guarantees exactly one
+        // entry whose relation is `TableFactor::Table`.
+        let (table_name, alias) = match &tables[0].relation {
+            TableFactor::Table { name, alias, .. } => (
+                name.table_name(),
+                alias.as_ref().map(|a| a.name.value.clone()),
+            ),
+            other => {
+                return Err(QueryError::Bind(format!(
+                    "DELETE: expected a plain table name, got {other:?}"
+                )))
+            }
+        };
+
+        let schema = self
+            .catalog
+            .get_table_schema(&table_name)
+            .ok_or_else(|| QueryError::TableNotFound(table_name.clone()))?;
+        let alias_name = alias.unwrap_or_else(|| table_name.clone());
+        let aliased_schema = PlanSchema::new(
+            schema
+                .fields()
+                .iter()
+                .map(|f| f.clone().with_relation(alias_name.clone()))
+                .collect(),
+        );
+
+        let predicate = match &stmt.selection {
+            Some(expr) => Some(self.bind_expr(expr, &aliased_schema)?),
+            None => None,
+        };
+
+        // A subquery in the WHERE clause (`DELETE FROM t WHERE id IN
+        // (SELECT ...)`) BINDS successfully -- `bind_expr` is the same
+        // method `bind_select`'s own WHERE binding uses, and task 001's
+        // spike confirmed sqlparser parses this shape cleanly -- but
+        // EVALUATING it needs a `SubqueryExecutor`, which this epic's
+        // bespoke row-identification loop (`native_delete::
+        // identify_matching_rows`, deliberately NOT the generic
+        // LogicalPlan/PhysicalOperator pipeline `SubqueryExecutor` is
+        // normally wired through) does not have and is out of this
+        // task's scope to add. Refuse HERE, by name, at bind time --
+        // matching this codebase's own "refuse cleanly and early" ethos
+        // (mirrors `require_supported_delete_shape`'s discipline) --
+        // rather than let it reach `physical::operators::evaluate_expr`
+        // deep inside the identification loop and fail with a less
+        // specific "no executor available" error.
+        if predicate.as_ref().is_some_and(|p| p.contains_subquery()) {
+            return Err(QueryError::NotImplemented(
+                "DELETE: a subquery in the WHERE clause is not supported -- this epic's \
+                 row-identification loop evaluates the predicate directly (via \
+                 physical::operators::evaluate_expr), which has no subquery executor; \
+                 rewrite the predicate without a subquery (e.g. a plain column comparison)"
+                    .to_string(),
+            ));
+        }
+
+        Ok((table_name, predicate))
     }
 
     fn bind_query(&mut self, query: &ast::Query) -> Result<LogicalPlan> {
@@ -4993,4 +5232,188 @@ mod tests {
         assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
         assert!(err.to_string().contains("source"), "{err}");
     }
+
+    // ---------- DELETE (native-tables-mutation epic, task 003) ----------
+
+    #[test]
+    fn delete_target_name_extracts_the_table_name_without_validating_shape() {
+        let stmt = parser::parse_sql("DELETE FROM orders WHERE o_orderkey = 1").unwrap();
+        assert_eq!(delete_target_name(&stmt).as_deref(), Some("orders"));
+
+        let no_where = parser::parse_sql("DELETE FROM orders").unwrap();
+        assert_eq!(delete_target_name(&no_where).as_deref(), Some("orders"));
+
+        // Extraction succeeds even for a shape `bind()` will later refuse
+        // (mirrors `insert_target_name`'s own split).
+        let joined = parser::parse_sql(
+            "DELETE FROM orders JOIN customer ON orders.o_custkey = customer.c_custkey",
+        )
+        .unwrap();
+        assert_eq!(delete_target_name(&joined).as_deref(), Some("orders"));
+
+        let select_stmt = parser::parse_sql("SELECT * FROM orders").unwrap();
+        assert_eq!(delete_target_name(&select_stmt), None);
+    }
+
+    #[test]
+    fn bind_delete_with_where_binds_the_predicate() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql("DELETE FROM orders WHERE o_orderkey = 1").unwrap();
+        let Statement::Delete(delete) = &stmt else {
+            panic!("expected a Delete statement");
+        };
+        let (table_name, predicate) = binder.bind_delete(delete).unwrap();
+        assert_eq!(table_name, "orders");
+        assert!(
+            matches!(predicate, Some(Expr::BinaryExpr { .. })),
+            "{predicate:?}"
+        );
+    }
+
+    #[test]
+    fn bind_delete_without_where_binds_no_predicate_meaning_delete_all_rows() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql("DELETE FROM orders").unwrap();
+        let Statement::Delete(delete) = &stmt else {
+            panic!("expected a Delete statement");
+        };
+        let (table_name, predicate) = binder.bind_delete(delete).unwrap();
+        assert_eq!(table_name, "orders");
+        assert!(
+            predicate.is_none(),
+            "no WHERE clause must bind to None (match every row), not an error or a trivial \
+             TRUE literal"
+        );
+    }
+
+    #[test]
+    fn bind_delete_with_a_table_alias_binds_a_qualified_where_column() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql("DELETE FROM orders o WHERE o.o_orderkey = 1").unwrap();
+        let Statement::Delete(delete) = &stmt else {
+            panic!("expected a Delete statement");
+        };
+        let (table_name, predicate) = binder.bind_delete(delete).unwrap();
+        assert_eq!(table_name, "orders");
+        assert!(predicate.is_some());
+    }
+
+    #[test]
+    fn bind_delete_against_an_unregistered_table_is_table_not_found() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql("DELETE FROM nope WHERE x = 1").unwrap();
+        let Statement::Delete(delete) = &stmt else {
+            panic!("expected a Delete statement");
+        };
+        let err = binder.bind_delete(delete).unwrap_err();
+        assert!(matches!(err, QueryError::TableNotFound(_)), "{err:?}");
+    }
+
+    #[test]
+    fn bind_delete_statement_arm_points_at_the_real_entrypoint() {
+        // `Binder::bind()` itself cannot express "identify and remove
+        // matched rows" as a `LogicalPlan` -- it validates shape then
+        // refuses, naming the real entrypoint.
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql("DELETE FROM orders WHERE o_orderkey = 1").unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("delete_from_native_table"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn bind_delete_refuses_a_multi_table_from_list() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql("DELETE FROM orders, customer WHERE o_orderkey = 1").unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("more than one"), "{err}");
+    }
+
+    #[test]
+    fn bind_delete_refuses_a_join_in_the_target() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql(
+            "DELETE FROM orders JOIN customer ON orders.o_custkey = customer.c_custkey",
+        )
+        .unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("JOIN"), "{err}");
+    }
+
+    #[test]
+    fn bind_delete_refuses_using() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql(
+            "DELETE FROM orders USING customer WHERE orders.o_custkey = customer.c_custkey",
+        )
+        .unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("USING"), "{err}");
+    }
+
+    #[test]
+    fn bind_delete_refuses_returning() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt =
+            parser::parse_sql("DELETE FROM orders WHERE o_orderkey = 1 RETURNING o_orderkey")
+                .unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("RETURNING"), "{err}");
+    }
+
+    #[test]
+    fn bind_delete_refuses_order_by_and_limit() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql("DELETE FROM orders ORDER BY o_orderkey LIMIT 5").unwrap();
+        let err = binder.bind(&stmt).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        // Whichever check fires first (ORDER BY is checked before LIMIT).
+        assert!(err.to_string().contains("ORDER BY"), "{err}");
+    }
+
+    #[test]
+    fn bind_delete_refuses_a_subquery_in_where_even_though_it_parses_and_binds() {
+        let catalog = create_test_catalog();
+        let mut binder = Binder::new(&catalog);
+        let stmt = parser::parse_sql(
+            "DELETE FROM orders WHERE o_custkey IN (SELECT c_custkey FROM customer)",
+        )
+        .unwrap();
+        let Statement::Delete(delete) = &stmt else {
+            panic!("expected a Delete statement");
+        };
+        let err = binder.bind_delete(delete).unwrap_err();
+        assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
+        assert!(err.to_string().contains("subquery"), "{err}");
+    }
+
+    // Note: MySQL's `DELETE t1, t2 FROM t1, t2 WHERE ...` multi-table form
+    // (`Delete.tables`, the field BEFORE `FROM`) does NOT parse under
+    // GenericDialect at all -- confirmed directly from sqlparser 0.62's
+    // `Parser::parse_delete` source: the `tables` list is only ever
+    // populated for `BigQueryDialect`/`OracleDialect`/`GenericDialect`
+    // when NO leading table list is present, i.e. `tables` is
+    // UNCONDITIONALLY `vec![]` for this engine's dialect. The
+    // `!delete.tables.is_empty()` check in `require_supported_delete_shape`
+    // stays as defensive code (in case a future dialect populates it) but
+    // is not independently testable through real, GenericDialect-parseable
+    // SQL text -- the identical situation `insert.assignments` is already
+    // documented as, above.
 }

@@ -135,14 +135,17 @@
 //! an empty table from nothing is.
 //!
 //! Task 004 (UPDATE)'s own composition, per task 001's Decision 2: it must
-//! NOT call `append_to_native_table` and a future DELETE's own
-//! self-publishing entrypoint sequentially (two independent publishes
-//! leave a real half-done window). Instead it should call
-//! [`write_append_segments`] directly (for the recomputed rows) and DELETE
-//! task 003's own non-publishing identification building block, fold BOTH
-//! results into one `Vec<Segment>`, and call [`publish_manifest_update`]
-//! exactly ONCE — all under a SINGLE [`lock_table_for_write`] guard held
-//! for the whole sequence.
+//! NOT call `append_to_native_table` and task 003's own
+//! `native_delete::delete_from_native_table` (self-publishing entrypoint)
+//! sequentially (two independent publishes leave a real half-done window).
+//! Instead it should call [`write_append_segments`] directly (for the
+//! recomputed rows) and task 003's own non-publishing building blocks —
+//! `native_delete::identify_matching_rows` (with `materialize_rows: true`
+//! to get matched rows' CURRENT values for evaluating SET expressions
+//! against, not just their positions) and `native_delete::apply_deletions`
+//! — fold BOTH results into one `Vec<Segment>`, and call
+//! [`publish_manifest_update`] exactly ONCE — all under a SINGLE
+//! [`lock_table_for_write`] guard held for the whole sequence.
 
 use crate::error::{QueryError, Result};
 use crate::physical::operators::TableProvider;
@@ -455,7 +458,12 @@ async fn write_staged(
     })
 }
 
-fn now_ms() -> i64 {
+/// `pub(crate)` (not just `fn`) so `native_delete.rs` (task 003) can reuse
+/// this exact wall-clock helper for its own manifest publishes rather than
+/// duplicating it — both modules need the identical "now, in millis since
+/// the epoch, 0 on a clock error" behavior for `NativeManifest::build`'s
+/// `created_at_ms` argument.
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -617,6 +625,9 @@ impl SegmentWriter {
             row_count,
             byte_size,
             column_stats,
+            // A freshly-written segment (Create/Overwrite/Append) has
+            // never been touched by a DELETE -- always starts empty.
+            deleted_rows: Vec::new(),
         });
         Ok(())
     }
@@ -892,6 +903,9 @@ impl AppendSegmentWriter {
             row_count,
             byte_size,
             column_stats,
+            // A freshly-written segment (Create/Overwrite/Append) has
+            // never been touched by a DELETE -- always starts empty.
+            deleted_rows: Vec::new(),
         });
         Ok(())
     }

@@ -7,6 +7,7 @@ use crate::parser;
 use crate::physical::operators::{MemoryTable, TableProvider};
 use crate::physical::{PhysicalOperator, PhysicalPlanner, RecordBatchStream};
 use crate::planner::{Binder, InMemoryCatalog, LogicalPlan, PlanSchema, SchemaField};
+use crate::storage::native_delete;
 use crate::storage::native_manifest;
 use crate::storage::native_write::{self, NativeWriteMode};
 use crate::storage::{NativeTable, ParquetTable};
@@ -98,6 +99,32 @@ pub struct InsertResult {
     pub total_rows: u64,
     /// Wall-clock time for the whole parse-bind-plan-execute-write
     /// sequence.
+    pub elapsed: Duration,
+}
+
+/// What `ExecutionContext::delete_from_native_table` produced
+/// (native-tables-mutation epic, task 003).
+#[derive(Debug, Clone)]
+pub struct DeleteResult {
+    /// The table name the DELETE targeted (`delete.from` from the SQL).
+    pub table_name: String,
+    /// The native table's stable identity (UUID v4) — unchanged by a
+    /// DELETE.
+    pub table_id: String,
+    /// The snapshot version this DELETE committed. Equal to the PRE-delete
+    /// version when the predicate matched zero rows (a legitimate no-op,
+    /// not an error — see `native_delete::delete_from_native_table`'s
+    /// doc).
+    pub version: u64,
+    /// Rows tombstoned by this DELETE (0 for a no-op match).
+    pub rows_deleted: u64,
+    /// Segments dropped entirely because every one of their rows became
+    /// tombstoned by this DELETE (task 001's Decision 3).
+    pub segments_dropped: usize,
+    /// The table's TOTAL LOGICAL (post-delete, visible) row count after
+    /// this DELETE.
+    pub total_rows: u64,
+    /// Wall-clock time for the whole parse-bind-identify-publish sequence.
     pub elapsed: Duration,
 }
 
@@ -443,6 +470,28 @@ impl ExecutionContext {
                  automatically) — sql() cannot write to a native table (it takes &self) and \
                  would otherwise silently execute only the source query without inserting \
                  anything"
+                    .to_string(),
+            ));
+        }
+
+        // Same reasoning again for `DELETE FROM ... [WHERE ...]`
+        // (native-tables-mutation epic, task 003): `Binder::bind()`'s
+        // `Statement::Delete` arm only validates shape and always returns
+        // `Err` (DELETE has no `LogicalPlan` to give back — see that arm's
+        // own comment), so an unguarded DELETE reaching the ordinary
+        // bind/plan/execute path below would just surface that
+        // NotImplemented error anyway. This guard exists for the same
+        // reason the CREATE TABLE/INSERT ones do: fail with a message that
+        // names the correct entrypoint BEFORE constructing a `Binder` at
+        // all, matching this method's own established pattern rather than
+        // relying on `bind()`'s incidental refusal.
+        if crate::planner::delete_target_name(&stmt).is_some() {
+            return Err(QueryError::InvalidArgument(
+                "DELETE FROM ... must run through \
+                 ExecutionContext::delete_from_native_table (the REPL calls this \
+                 automatically) — sql() cannot delete from a native table (it takes &self, \
+                 and DELETE needs a bespoke row-identification loop no LogicalPlan can \
+                 express)"
                     .to_string(),
             ));
         }
@@ -832,6 +881,86 @@ impl ExecutionContext {
             rows_inserted: append_result.rows_appended,
             segments_added: append_result.segments_appended,
             total_rows: append_result.total_rows,
+            elapsed: start.elapsed(),
+        })
+    }
+
+    /// Execute `DELETE FROM <table> [WHERE ...]` end to end against an
+    /// EXISTING native table (native-tables-mutation epic, task 003):
+    /// parse, recover the target name (`planner::delete_target_name`),
+    /// look it up as a REGISTERED native table (same "register before you
+    /// reference it" contract as INSERT — no auto-discovery), bind the
+    /// WHERE predicate via `Binder::bind_delete` (which ALSO validates the
+    /// statement's shape — every clause this epic does not support
+    /// refused by name), then drive `native_delete::
+    /// delete_from_native_table`'s bespoke row-identification +
+    /// deletion-vector-editing + single-file atomic-publish sequence
+    /// DIRECTLY — unlike CTAS/INSERT, there is no `LogicalPlan`/
+    /// `PhysicalOperator` pipeline involved at all (see `native_delete.rs`'s
+    /// module doc for why). Re-registers the table afterward so the
+    /// deletion is visible to a subsequent query in the SAME session.
+    ///
+    /// `&mut self`, unlike `sql()`'s `&self`: re-registering the table
+    /// mutates `self.tables`.
+    ///
+    /// `selection: None` (`DELETE FROM t` with no WHERE) deletes every
+    /// row — the table keeps existing, now logically empty, not an error.
+    /// A predicate matching zero rows is a clean no-op (no version bump,
+    /// manifest untouched) — see `native_delete::delete_from_native_table`'s
+    /// doc.
+    pub async fn delete_from_native_table(&mut self, sql: &str) -> Result<DeleteResult> {
+        let start = Instant::now();
+        let stmt = parser::parse_sql(sql)?;
+        let table_name = crate::planner::delete_target_name(&stmt).ok_or_else(|| {
+            QueryError::InvalidArgument(format!(
+                "delete_from_native_table expects a DELETE FROM <table> [WHERE ...] \
+                 statement, got: {sql}"
+            ))
+        })?;
+
+        let provider = self.tables.get(&table_name).cloned().ok_or_else(|| {
+            QueryError::TableNotFound(format!(
+                "DELETE FROM {table_name}: no such table is registered in this session (a \
+                 native table must be registered, e.g. via register_native_table or a prior \
+                 CREATE TABLE ... AS SELECT, before DELETE can target it)"
+            ))
+        })?;
+        let native = provider
+            .as_any()
+            .downcast_ref::<NativeTable>()
+            .ok_or_else(|| {
+                QueryError::InvalidArgument(format!(
+                    "DELETE FROM {table_name}: this table is not a native table -- DELETE is \
+                     only supported against native tables"
+                ))
+            })?;
+        let table_dir = native.dir().to_path_buf();
+
+        let sqlparser::ast::Statement::Delete(delete) = &stmt else {
+            unreachable!("delete_target_name only returns Some for a Statement::Delete")
+        };
+        let mut binder = Binder::new(&self.catalog);
+        // Validates the DELETE's shape (refusing every unsupported clause
+        // by name) AND binds the WHERE predicate (if any) in one call —
+        // see `Binder::bind_delete`.
+        let (_, predicate) = binder.bind_delete(delete)?;
+
+        let delete_result = native_delete::delete_from_native_table(&table_dir, predicate.as_ref())
+            .await
+            .map_err(|e| QueryError::Storage(format!("DELETE FROM {table_name}: {e}")))?;
+
+        // Re-open the table so a subsequent query in the SAME session
+        // sees the deletion -- mirrors `insert_into_native_table`'s own
+        // "make the write immediately visible" step.
+        self.register_native_table(&table_name, &table_dir)?;
+
+        Ok(DeleteResult {
+            table_name,
+            table_id: delete_result.table_id,
+            version: delete_result.version,
+            rows_deleted: delete_result.rows_deleted,
+            segments_dropped: delete_result.segments_dropped,
+            total_rows: delete_result.total_rows,
             elapsed: start.elapsed(),
         })
     }

@@ -113,6 +113,7 @@ use crate::error::{QueryError, Result};
 use crate::physical::operators::{ColumnStatistics, TableProvider, TableStatistics};
 use crate::storage::ipc_cache;
 use crate::storage::native_manifest::{self, ColumnStats, NativeManifest, Segment};
+use arrow::array::{ArrayRef, BooleanArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -345,6 +346,62 @@ fn table_statistics_from(
     }
 }
 
+/// Filter tombstoned rows out of one segment's already-read `batches`
+/// (native-tables-mutation epic, task 003). `deleted_rows` names LOCAL
+/// positions in the segment's own combined on-disk row order — the same
+/// order `ipc_cache::read_row_group`'s returned batches are already in
+/// (stable on-disk block order, never reordered; `native_write.rs` already
+/// calls `ipc_cache::reslice_large` before writing, so multiple
+/// ~65,536-row batches per segment is the NORMAL case, not an edge case) —
+/// so a running local-row offset across `batches` correctly maps each
+/// batch's row indices back to the positions `deleted_rows` names. Only
+/// called when `deleted_rows` is non-empty (the caller, `scan`, already
+/// fast-paths the common empty case before reaching here).
+///
+/// `deleted_rows` is sorted and deduplicated (`NativeManifest::validate`
+/// enforces this), so a single monotonic cursor into it — never
+/// rewinding, since batches are processed in increasing offset order —
+/// finds each batch's slice in amortized O(1) rather than re-scanning the
+/// whole `Vec` per batch. A batch with NO deleted row in its range is
+/// passed through completely unchanged (zero-copy, no `compute::filter`
+/// call at all) — the common case for a lightly-deleted segment spread
+/// across many batches.
+fn filter_deleted_rows(
+    batches: Vec<RecordBatch>,
+    deleted_rows: &[u32],
+) -> Result<Vec<RecordBatch>> {
+    let mut out = Vec::with_capacity(batches.len());
+    let mut local_offset: u32 = 0;
+    let mut cursor = 0usize;
+    for batch in batches {
+        let n = batch.num_rows() as u32;
+        let end = local_offset + n;
+        while cursor < deleted_rows.len() && deleted_rows[cursor] < local_offset {
+            cursor += 1;
+        }
+        if cursor >= deleted_rows.len() || deleted_rows[cursor] >= end {
+            // No deleted row falls inside this batch's range.
+            out.push(batch);
+            local_offset = end;
+            continue;
+        }
+        let mut keep = vec![true; n as usize];
+        while cursor < deleted_rows.len() && deleted_rows[cursor] < end {
+            keep[(deleted_rows[cursor] - local_offset) as usize] = false;
+            cursor += 1;
+        }
+        let mask = BooleanArray::from(keep);
+        let cols: Result<Vec<ArrayRef>> = batch
+            .columns()
+            .iter()
+            .map(|c| arrow::compute::filter(c.as_ref(), &mask).map_err(Into::into))
+            .collect();
+        out.push(RecordBatch::try_new(batch.schema(), cols?)?);
+        local_offset = end;
+    }
+    Ok(out)
+}
+
 impl TableProvider for NativeTable {
     fn schema(&self) -> SchemaRef {
         self.logical_schema()
@@ -379,12 +436,27 @@ impl TableProvider for NativeTable {
         )
     }
 
+    /// Reads every active segment, then filters out whatever
+    /// `Segment::deleted_rows` (native-tables-mutation epic, task 003)
+    /// tombstones — the SINGLE choke point every read path (this generic
+    /// scan, the dense-direct-address fast path via `scan_with_filter`'s
+    /// default delegation below, a distributed shard's own scan) shares,
+    /// so a deleted row can never reach any consumer no matter how it got
+    /// there. A segment with an empty `deleted_rows` (every table phase 1
+    /// or task 002 ever wrote, and the common case even for a mutated
+    /// table's untouched segments) takes a fast, allocation-free path
+    /// straight through — zero behavior or performance change from before
+    /// this task.
     fn scan(&self, projection: Option<&[usize]>) -> Result<Vec<RecordBatch>> {
         self.check_scan_budget()?;
         let mut out = Vec::new();
         for seg in self.active_segments() {
             let batches = ipc_cache::read_row_group(&self.dir, seg.id as usize, projection, None)?;
-            out.extend(batches);
+            if seg.deleted_rows.is_empty() {
+                out.extend(batches);
+                continue;
+            }
+            out.extend(filter_deleted_rows(batches, &seg.deleted_rows)?);
         }
         Ok(out)
     }
@@ -394,10 +466,26 @@ impl TableProvider for NativeTable {
     // (e.g. LanceTable's unfiltered path) relies on the physical planner's
     // own FilterExec above the scan for correctness, and that applies here
     // unchanged; a future task can add pushdown without touching callers.
+    // This default delegation is exactly why deletion filtering living
+    // ONLY inside `scan` (above) is sufficient: `try_execute_dense_direct`
+    // (`morsel_agg.rs`) and every other caller that goes through
+    // `scan_with_filter` gets deletion-filtered batches for free, with
+    // zero changes anywhere else (confirmed by reading every call site —
+    // `morsel_agg.rs`, `physical/planner.rs`'s generic `MemoryTableExec`
+    // path, and the prescan cache — all reach this same function).
 
     fn statistics(&self) -> Option<TableStatistics> {
         let segs = self.active_segments();
-        let row_count: u64 = segs.iter().map(|s| s.row_count).sum();
+        // LOGICAL (post-delete, visible) row count — a NEW, separate
+        // computation from `total_byte_size`/the column-stats rollup below,
+        // both of which intentionally keep reflecting PHYSICAL/write-time
+        // content (task 001/003's Decision 1: deletion vectors never
+        // shrink a segment's on-disk bytes, and re-deriving exact
+        // post-delete min/max/NDV bounds is not worth chasing — a wider
+        // bound is always safe). For a table with no deletions anywhere
+        // this is byte-for-byte the same number the pre-task-003 code
+        // computed (`live_row_count()` is a no-op subtraction of 0).
+        let row_count: u64 = segs.iter().map(|s| s.live_row_count()).sum();
         let total_byte_size: u64 = segs.iter().map(|s| s.byte_size).sum();
         let rollup = match &self.only_segments {
             // Whole table: the manifest's own precomputed rollup (task 002,
@@ -474,7 +562,10 @@ mod tests {
     use super::*;
     use arrow::array::{Float64Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
-    use native_manifest::{publish_table_dir, segment_full_path, staging_dir_for, write_manifest};
+    use native_manifest::{
+        publish_table_dir, read_manifest, segment_full_path, staging_dir_for, write_manifest,
+        write_manifest_atomic,
+    };
 
     /// Build a real, on-disk, two-segment native table directly against
     /// task 002's manifest API and this crate's own `ipc_cache`-compatible
@@ -524,6 +615,7 @@ mod tests {
                 row_count: batch.num_rows() as u64,
                 byte_size,
                 column_stats: native_manifest::compute_batch_stats(batch),
+                deleted_rows: Vec::new(),
             });
         }
 
@@ -619,6 +711,7 @@ mod tests {
             row_count: 3,
             byte_size,
             column_stats: native_manifest::compute_batch_stats(&batch),
+            deleted_rows: Vec::new(),
         };
         let manifest =
             NativeManifest::build(&dict_schema, "dict-schema-test", 1, vec![segment], 0).unwrap();
@@ -874,5 +967,156 @@ mod tests {
             shard.scan(None).is_ok(),
             "a shard that individually fits under the inherited budget must succeed"
         );
+    }
+
+    // ---------- deletion-vector consultation at scan time (task 003) ----------
+    //
+    // These tests exercise `NativeTable::scan`/`statistics` in ISOLATION
+    // from `native_delete.rs`'s own editing logic — a manifest is built by
+    // `write_test_table` (task 002's proven fixture, unmodified) and then
+    // its `deleted_rows` edited directly, mirroring the exact separation
+    // task 001's design established: the READ side (this file) must be
+    // correct independent of whatever EDITS the vector (`native_delete.rs`,
+    // its own test module).
+
+    fn set_deleted_rows(dir: &Path, segment_id: u32, deleted_rows: Vec<u32>) {
+        let mut manifest = read_manifest(dir).unwrap();
+        for seg in manifest.segments.iter_mut() {
+            if seg.id == segment_id {
+                seg.deleted_rows = deleted_rows.clone();
+            }
+        }
+        write_manifest_atomic(dir, &manifest).unwrap();
+    }
+
+    fn scanned_ids(table: &NativeTable) -> Vec<i64> {
+        table
+            .scan(None)
+            .unwrap()
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scan_with_no_deletions_is_byte_for_byte_the_pre_task_003_behavior() {
+        // Every table phase 1/task 002 ever wrote has empty `deleted_rows`
+        // on every segment -- this is the "zero behavior change" contract.
+        let dir = tempfile::tempdir().unwrap();
+        write_test_table(dir.path());
+        let table = NativeTable::try_new(dir.path()).unwrap();
+        assert_eq!(scanned_ids(&table), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn scan_filters_out_a_deleted_row_within_a_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_table(dir.path()); // segment 0: ids [1,2,3] at local [0,1,2]
+        set_deleted_rows(dir.path(), 0, vec![1]); // local position 1 -> id 2
+
+        let table = NativeTable::try_new(dir.path()).unwrap();
+        assert_eq!(
+            scanned_ids(&table),
+            vec![1, 3, 4, 5],
+            "id 2 (segment 0, local position 1) must be excluded, everything else present"
+        );
+    }
+
+    #[test]
+    fn scan_applies_deletions_to_the_correct_segment_only() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_table(dir.path()); // segment 0: ids [1,2,3]; segment 1: ids [4,5]
+        set_deleted_rows(dir.path(), 0, vec![0, 2]); // ids 1 and 3 gone from segment 0
+        set_deleted_rows(dir.path(), 1, vec![1]); // id 5 gone from segment 1
+
+        let table = NativeTable::try_new(dir.path()).unwrap();
+        assert_eq!(
+            scanned_ids(&table),
+            vec![2, 4],
+            "a segment's deletions must never leak onto -- or be silently applied to all of --
+             the other segment"
+        );
+    }
+
+    #[test]
+    fn scan_deleting_every_row_of_one_segment_still_returns_the_other_segments_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_table(dir.path());
+        set_deleted_rows(dir.path(), 0, vec![0, 1, 2]); // every row of segment 0
+
+        let table = NativeTable::try_new(dir.path()).unwrap();
+        assert_eq!(
+            scanned_ids(&table),
+            vec![4, 5],
+            "a wholly-tombstoned segment (still present in the manifest here -- \
+             native_delete.rs is what actually drops it) must scan as zero rows, not error"
+        );
+    }
+
+    #[test]
+    fn statistics_row_count_reflects_deletions_but_byte_size_and_column_stats_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_table(dir.path());
+        let before = NativeTable::try_new(dir.path())
+            .unwrap()
+            .statistics()
+            .unwrap();
+
+        set_deleted_rows(dir.path(), 0, vec![0]); // delete id=1
+
+        let after = NativeTable::try_new(dir.path())
+            .unwrap()
+            .statistics()
+            .unwrap();
+        assert_eq!(
+            after.row_count,
+            before.row_count - 1,
+            "logical row count must drop by exactly the number of deleted rows"
+        );
+        assert_eq!(
+            after.total_byte_size, before.total_byte_size,
+            "physical byte size must NOT shrink -- check_scan_budget's memory-safety formula \
+             relies on this staying the whole active segment set's true on-disk size"
+        );
+        let id_before = before.column_stats.get("id").unwrap();
+        let id_after = after.column_stats.get("id").unwrap();
+        assert_eq!(
+            id_after.min_i64, id_before.min_i64,
+            "column-stats rollup is deliberately NOT recomputed on delete (task 001's decision) \
+             -- a wider bound is always safe"
+        );
+    }
+
+    #[test]
+    fn shard_by_splits_scan_and_statistics_respect_the_shards_own_segment_deletions() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_table(dir.path());
+        set_deleted_rows(dir.path(), 0, vec![0]); // delete id=1 from segment 0
+
+        let table = NativeTable::try_new(dir.path()).unwrap();
+        let set = table.distributed_splits("t", 2).unwrap().unwrap();
+        let seg0_only: Vec<Split> = set
+            .splits
+            .iter()
+            .filter(|s| s.row_group == 0)
+            .cloned()
+            .collect();
+        let shard = table.shard_by_splits(&seg0_only).unwrap().unwrap();
+
+        let scanned = shard.scan(None).unwrap();
+        let total_rows: usize = scanned.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 2,
+            "a distributed shard's own scan must apply its own segment's deletions, not just \
+             the whole-table view"
+        );
+        assert_eq!(shard.statistics().unwrap().row_count, 2);
     }
 }

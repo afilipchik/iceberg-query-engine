@@ -1827,16 +1827,17 @@ async fn run_repl(
                     continue;
                 }
 
-                // Execute SQL query. `CREATE TABLE ... AS SELECT` and
-                // `INSERT INTO ... SELECT/VALUES ...` are both DDL/DML that
-                // need `&mut ctx` (registering/re-registering the affected
+                // Execute SQL query. `CREATE TABLE ... AS SELECT`,
+                // `INSERT INTO ... SELECT/VALUES ...` and
+                // `DELETE FROM ... [WHERE ...]` are all DDL/DML that need
+                // `&mut ctx` (registering/re-registering the affected
                 // native table), so each is routed to its own
                 // `ExecutionContext` entrypoint rather than `sql()` (which
-                // now refuses both outright — see `ExecutionContext::sql`'s
-                // doc comment for why). Parsed once up front purely to make
-                // this routing decision; on a parse failure this falls
-                // through to `sql()`, which re-parses and reports the same
-                // error the user would otherwise see.
+                // now refuses all three outright — see `ExecutionContext::
+                // sql`'s doc comment for why). Parsed once up front purely
+                // to make this routing decision; on a parse failure this
+                // falls through to `sql()`, which re-parses and reports
+                // the same error the user would otherwise see.
                 let start = Instant::now();
                 match query_engine::parser::parse_sql(line) {
                     Ok(stmt)
@@ -1866,6 +1867,28 @@ async fn run_repl(
                                     r.rows_inserted,
                                     r.table_name,
                                     r.segments_added,
+                                    r.total_rows,
+                                    r.version,
+                                    start.elapsed().as_secs_f64() * 1000.0
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("Error: {}\n", e);
+                            }
+                        }
+                    }
+                    // `DELETE FROM <native table> [WHERE ...]` (native-
+                    // tables-mutation epic, task 003) -- same "needs
+                    // &mut ctx, not sql()'s materializing &self path"
+                    // reasoning as CREATE TABLE/INSERT above.
+                    Ok(stmt) if query_engine::planner::delete_target_name(&stmt).is_some() => {
+                        match ctx.delete_from_native_table(line).await {
+                            Ok(r) => {
+                                println!(
+                                    "Deleted {} row(s) from '{}' ({} segment(s) dropped, now {} row(s) total, version {}) in {:.3}ms\n",
+                                    r.rows_deleted,
+                                    r.table_name,
+                                    r.segments_dropped,
                                     r.total_rows,
                                     r.version,
                                     start.elapsed().as_secs_f64() * 1000.0
