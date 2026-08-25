@@ -2,8 +2,8 @@
 name: spill-join-correctness
 status: in-progress
 created: 2026-08-24T14:19:55Z
-updated: 2026-08-25T00:00:00Z
-progress: 50%
+updated: 2026-08-25T02:00:00Z
+progress: 75%
 prd: .claude/prds/spill-join-correctness.md
 github: (will be set on sync)
 ---
@@ -143,7 +143,18 @@ along this line rather than block everything on the harder problem.
   wrong-answer root cause)
 - 003 (re-scoped): Blast-radius characterization of the (still
   unfixed) wrong-answer bug — parquet vs. native, which queries;
-  explicitly not a fix attempt (parallel: false, depends on 002)
+  explicitly not a fix attempt (parallel: false, depends on 002) —
+  CLOSED. Headline: parquet, forced into the identical spill code path,
+  is statistically indistinguishable from native (0/80 wrong each, this
+  task); only Q12 spills at any realistic SF=10/SF=100 memory-limit;
+  spilling joins DO occur in distributed (scatter) execution, 0/40 wrong,
+  but a distinct spill-directory-collision bug was found there (reported,
+  not fixed); epic-wide cumulative 1/290 wrong (0.34%, 95% CI
+  [0.01%,1.91%]) — tighter and lower than task 001's own standalone
+  4.76% point estimate, NOT evidence of a fix. See 003.md's Outcome for
+  full detail, including two more distinct bugs found (LIMIT not
+  enforced under spill; a sort-spill run-file crash), both unrelated to
+  this bug and both reported, not fixed.
 - 004: QA close-out — full suite, cell-exact, docs, epic close
   (parallel: false, depends on everything)
 
@@ -178,10 +189,18 @@ full focused session on its own, given the prior investigation's own
   NOT explained by the same mechanism in its simplest form. See 001's
   Outcome.
 - G4: broad sweep confirms no sibling instance survives, or names what
-  it found. RE-SCOPED — task 003 characterizes the wrong-answer bug's
-  blast radius (parquet vs. native, which queries) since no fix exists
-  yet to sweep for sibling survivors of; reports what it finds either
-  way.
+  it found. RE-SCOPED and MET — task 003 characterized the wrong-answer
+  bug's blast radius instead of sweeping for survivors of a fix (none
+  exists yet). Result: only Q12 spills at any realistic SF=10/SF=100
+  memory-limit (both sources); parquet, forced into the identical spill
+  code path, is statistically indistinguishable from native (0/80 wrong
+  each) — no evidence the bug is native-specific; spilling joins DO occur
+  in distributed (scatter) execution, 0/40 wrong there too; epic-wide
+  cumulative 1/290 (0.34%). Three NEW, unrelated bugs found and reported
+  (not fixed, per the gate): a spill-directory collision across
+  concurrent same-host `serve` processes, a LIMIT-not-enforced-under-spill
+  bug, and a sort-spill run-file crash. See 003.md's Outcome for full
+  detail.
 - G5: full suite green; native-tables-mutation's documentation updated.
 - G6 (added at re-scope): the confirmed O(n²) `append_to_parquet`
   slowness is fixed, with before/after wall-clock evidence on task
@@ -208,7 +227,7 @@ full focused session on its own, given the prior investigation's own
 ## Tasks Created
 - [x] 001.md - Reliable reproduction + instrumented root-cause investigation (parallel: false)
 - [x] 002.md - (re-scoped) Fix confirmed O(n²) `append_to_parquet` spill slowness (parallel: false)
-- [ ] 003.md - (re-scoped) Blast-radius characterization of the wrong-answer bug (parallel: false)
+- [x] 003.md - (re-scoped) Blast-radius characterization of the wrong-answer bug (parallel: false)
 - [ ] 004.md - QA close-out — full suite, cell-exact, docs, epic close (parallel: false)
 
 Total tasks: 4
