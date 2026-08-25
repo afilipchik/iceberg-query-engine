@@ -474,7 +474,8 @@ than the prose that is right above it.
 trigger-condition correction) -> `722a13f` (001 done) -> `b3116f8`
 (re-scope 002/003 after task 001) -> `21ed410` (002 done: O(n²) fix)
 -> `4d75410` (003 done: blast-radius characterization) -> `10e46d1`
-(004 spec) -> this task's own docs/close-out/archive commit(s).
+(004 spec) -> `524b494` (004 done: close-out + docs) -> `5dd1597`
+(archive move, this task's final step).
 
 ### Archival
 
