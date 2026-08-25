@@ -2,8 +2,8 @@
 name: spill-join-correctness
 status: in-progress
 created: 2026-08-24T14:19:55Z
-updated: 2026-08-24T14:19:55Z
-progress: 25%
+updated: 2026-08-25T00:00:00Z
+progress: 50%
 prd: .claude/prds/spill-join-correctness.md
 github: (will be set on sync)
 ---
@@ -186,6 +186,13 @@ full focused session on its own, given the prior investigation's own
 - G6 (added at re-scope): the confirmed O(n²) `append_to_parquet`
   slowness is fixed, with before/after wall-clock evidence on task
   001's repro and no correctness regression (cell-exact, full suite).
+  MET — task 002: 140-291s (task 001's 21-run baseline) -> 3-5s per
+  run (this task's own 40-trial validation, 30 fresh + 10 warm), a
+  ~40-90x speedup; 40/40 cell-exact vs the DuckDB oracle; full suite
+  green in all four feature combinations, each exactly +2 over the
+  native-tables-mutation task 006 baseline (the two new tests this
+  task added, zero regressions): default 1190/0/1, lance 1255/0/2,
+  gpu 1190/0/1, pulsar 1193/0/1. See 002's Outcome for full detail.
 
 ## Estimated Effort
 
@@ -200,7 +207,7 @@ full focused session on its own, given the prior investigation's own
 
 ## Tasks Created
 - [x] 001.md - Reliable reproduction + instrumented root-cause investigation (parallel: false)
-- [ ] 002.md - (re-scoped) Fix confirmed O(n²) `append_to_parquet` spill slowness (parallel: false)
+- [x] 002.md - (re-scoped) Fix confirmed O(n²) `append_to_parquet` spill slowness (parallel: false)
 - [ ] 003.md - (re-scoped) Blast-radius characterization of the wrong-answer bug (parallel: false)
 - [ ] 004.md - QA close-out — full suite, cell-exact, docs, epic close (parallel: false)
 
