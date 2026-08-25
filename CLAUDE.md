@@ -3078,8 +3078,8 @@ no-guess-fixes gate) — tracked here as known, open issues:
 
 None of the three was investigated further or fixed — each needs its
 own root-cause + fix task. Full evidence, exact trial counts, and every
-reproduction command: `.claude/epics/spill-join-correctness/003.md`'s
-Outcome section and `updates/003/stream-A.md`.
+reproduction command: `.claude/epics/archived/spill-join-correctness/
+003.md`'s Outcome section and `updates/003/stream-A.md`.
 
 **Bottom line, stated plainly per this epic's own honesty
 requirement**: the wrong-answer bug described in this section is real,
