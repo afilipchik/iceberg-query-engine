@@ -2985,15 +2985,125 @@ slowness on its own. Full details, the reusable repro script, and the
 complete chronological investigation: `.claude/epics/archived/
 spill-join-correctness/001.md` and its `updates/001/stream-A.md`.
 
+**Epic close-out (`spill-join-correctness` epic, tasks 002-004, closed
+2026-08-25).** This is NOT a "bug fixed" epic — say so plainly, since
+the paragraphs above could otherwise read that way in isolation. Two
+real, separate things landed. **The O(n²) `append_to_parquet`
+spill-write slowness named just above IS FIXED** (task 002 — replaced
+the read-rewrite-rename-per-append pattern with a single `ArrowWriter`
+kept open per partition for the whole build/probe phase, appending
+each batch as one more row group instead of re-reading and rewriting
+everything already spilled): **140-291s -> 3-6s on this exact Q12
+repro, a ~40-90x speedup**, 40/40 trials cell-exact, zero regression,
+full suite green in all four feature combinations. This was always a
+mechanism SEPARATE from the wrongness (task 001's own chaos-test
+experiment had already shown a forced ~2x-retry-and-discard does not
+reproduce the wrong answer even though it fully explains the
+slowness), so fixing it neither touched nor was expected to touch the
+duplicate-counting bug. **The wrong-answer bug itself remains OPEN —
+root cause still UNCONFIRMED.** Real, adversarial root-cause work was
+attempted (task 001: runtime instrumentation plus a controlled
+chaos/fault-injection test) and reached a genuine, evidenced negative
+result — the leading hypothesis (non-idempotent join-child
+re-execution) was directly disproven for the wrongness specifically —
+but no mechanism was ever caught in the act. Per this epic's own
+"no-guess-fixes" gate, no fix was attempted. Rate estimate, reported as
+a range because two real estimates exist at different sample sizes and
+the larger one does not supersede the smaller one's validity, it just
+bounds it more tightly: task 001's own standalone 21-trial estimate is
+**4.8% (1/21, 95% CI [0.12%, 23.82%])**; pooling every trial run
+across the whole epic (tasks 001+002+003, 290 trials total, still only
+ever the same one wrong observation) tightens this to **0.34% (1/290,
+95% CI [0.01%, 1.91%])**. The lower pooled number is explicitly NOT
+evidence of an accidental fix — nothing in tasks 002 or 003 touched the
+duplicate-counting mechanism — it is a tighter bound on what was
+always a real, low, still-live rate, from a larger sample. **Not
+native-table-specific — no evidence found either way that it's
+confined there**: task 003 forced plain parquet into the IDENTICAL
+spill code path (`--memory-limit 1M`, matched to native's own natural
+spill shape — same `build_batches=916 build_rows=1765881` once both
+spill) and got 0/80 wrong, statistically indistinguishable from
+native's own 0/80 at equal trial counts. **Confirmed also reachable via
+distributed execution**: Q12's shape qualifies for the SCATTER
+`two_phase` election, so each of 3 nodes independently runs the
+identical `execute_spill_path` over its own shard of `lineitem`
+(confirmed directly, not inferred — per-node `build_rows` summed
+exactly to the single-process total); 40/40 distributed trials came
+back correct, so this is a confirmed EXPOSURE, not a confirmed-safe
+path — the absence of a wrong distributed trial in 40 tries is
+consistent with, not proof against, the same low rate applying there
+too.
+
+Task 003 also found **three new, distinct residue bugs** while
+characterizing blast radius, none fixed (per the epic's own
+no-guess-fixes gate) — tracked here as known, open issues:
+
+1. **Concurrent same-host `serve` processes collide on the default
+   spill directory.** `spill_path`'s default (`$TMPDIR/
+   query_engine_spill`) disambiguates only via a PER-PROCESS-LOCAL
+   `SPILL_COUNTER` starting at 0 in every process, so multiple `serve`
+   processes sharing one host's `$TMPDIR` (this repo's own local
+   multi-process cluster test harness included) can compute the
+   identical `spill_id` and write to the same directory concurrently.
+   Trigger condition, stated precisely: a REALISTIC single-node
+   memory-limit (40G — native Q12's own natural spill) was enough to
+   surface this; the adversarial ingredient is co-located `serve`
+   processes sharing a temp filesystem, NOT an extreme memory-limit —
+   a real, practical risk for any multi-node-per-host deployment, not
+   just a synthetic stress condition. Severity: fails LOUDLY (`Parquet
+   error: Required field schema is missing`, HTTP 400) — confirmed
+   never silently wrong (giving each node its own `TMPDIR` fixed it,
+   cell-exact) — but a real availability risk. Not fixed; needs
+   per-process disambiguation added to the spill-path default (e.g.
+   include the PID).
+2. **`LIMIT` not enforced under spill for `ORDER BY ... LIMIT`
+   queries** (Q2/Q3-shaped). Trigger condition: a deliberately
+   adversarial, unrealistic `--memory-limit 1M` sweep that forced 13
+   queries' joins into the spill path at once — NONE of these 13 were
+   ever observed spilling at any realistic memory-limit anywhere in
+   this epic. Symptom: row count blew up (2085 vs 100; 755880 vs 10)
+   while every compared row's VALUES were byte-for-byte correct
+   against DuckDB's own LIMIT-ed oracle — a "correct top-K prefix,
+   LIMIT never applied to truncate it" bug, likely in
+   `ExternalSortExec`'s spill path or the top-k fusion rule losing
+   track of the LIMIT under a spilled input. Severity: wrong ROW COUNT
+   under an adversarial, non-default setting only — a different
+   symptom shape than the target bug (which inflates VALUES, not row
+   count) and not reproduced at any realistic setting.
+3. **Sort-spill run-file-not-found crash** (Q10-shaped): `Failed to
+   open run file ".../sort_0_27/merged_pass0_48.parquet": No such file
+   or directory`. Same artificial `--memory-limit 1M` sweep as #2.
+   Severity: crashes loudly, never silently wrong; not reproduced at
+   any realistic setting.
+
+None of the three was investigated further or fixed — each needs its
+own root-cause + fix task. Full evidence, exact trial counts, and every
+reproduction command: `.claude/epics/archived/spill-join-correctness/
+003.md`'s Outcome section and `updates/003/stream-A.md`.
+
+**Bottom line, stated plainly per this epic's own honesty
+requirement**: the wrong-answer bug described in this section is real,
+reliably reproducible (at a real, if low, rate), and STILL UNFIXED,
+with its root cause still UNCONFIRMED — this is the epic's own honest
+headline, not a footnote. A real, separate performance win landed (the
+O(n²) fix, ~40-90x). A real, valuable characterization landed
+(native/parquet parity, confirmed distributed exposure, three
+newly-found bugs). Full epic close-out, including G1-G6 verdicts and
+every commit: `.claude/epics/archived/spill-join-correctness/epic.md`.
+
 **Full suite, all four feature combinations**, final state (all fixes +
 all new tests included), through `scripts/claude-safe-build.sh`:
 
 | combo | passed | failed | ignored |
 |---|---|---|---|
-| default | 1188 | 0 | 1 |
-| lance | 1253 | 0 | 2 |
-| gpu | 1188 | 0 | 1 |
-| pulsar | 1191 | 0 | 1 |
+| default | 1190 | 0 | 1 |
+| lance | 1255 | 0 | 2 |
+| gpu | 1190 | 0 | 1 |
+| pulsar | 1193 | 0 | 1 |
+
+(Updated post-`spill-join-correctness` epic: +2 over the prior baseline
+in every combination, the two tests task 002 added for the O(n²)
+spill-append fix; zero regressions, re-confirmed at merge time.)
 
 **Cell-exact validation at real scale** (`examples/
 native_mutation_cell_exact_check.rs` + `scripts/
@@ -3152,6 +3262,26 @@ what the cell-exact validation above already established).
   (Parquet/Iceberg/Lance too, not native-table-specific) and should be
   treated as a P0 correctness bug by whichever of the three a future
   epic picks up first.
+  **Further update (`spill-join-correctness` epic, closed 2026-08-25):**
+  the O(n²) read-rewrite-rename-per-append pattern that was the
+  dominant cost of "spills as many small Parquet files" above is now
+  **FIXED** — see "Mutation: QA close-out"'s own epic-close-out
+  paragraph above for the full number (**~40-90x** on the Q12 repro).
+  This was always a separate mechanism from the wrong answer, confirmed
+  not assumed, and fixing it left the duplicate-counting bug untouched.
+  That bug remains **OPEN, root cause still unconfirmed**, now with a
+  tighter rate estimate (0.34%, 1/290 trials epic-wide, vs. this
+  section's own earlier 4.8%/1/21 standalone estimate — see "Mutation:
+  QA close-out" for the full range and why both numbers are reported)
+  and **empirically confirmed NOT to be native-table-specific** (plain
+  parquet forced into the identical spill path: 0/80 wrong,
+  statistically indistinguishable from native's own 0/80) and
+  **confirmed also reachable via distributed (scatter) execution**. Of
+  the three levers named just above, native-table scan-level pruning
+  would therefore NOT close this bug even if built — only the
+  join-spill streaming rewrite or directly root-causing the
+  duplicate-counting mechanism can. Full detail: `.claude/epics/
+  archived/spill-join-correctness/epic.md`.
 - **No compaction** (native-tables-mutation epic, confirmed OUT OF SCOPE
   by design — task 001's Decision 3, not merely deferred incidentally). A
   deletion vector is correctness-preserving indefinitely — reads always

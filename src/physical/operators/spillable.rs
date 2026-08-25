@@ -36,6 +36,21 @@ static SPILL_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Number of hash partitions for spilling
 const NUM_PARTITIONS: usize = 64;
 
+/// Monotonic call-sequence id for `QE_SPILL_DEBUG` join/aggregate spill-path
+/// tracing (task 001, spill-join-correctness epic). Diagnostic only — lets
+/// log lines from repeated or overlapping invocations of
+/// `execute_spill_path` / `execute_fused_streaming` (e.g. a fused-streaming
+/// aggregate that aborts and falls back, re-executing its input) be told
+/// apart in the log. Never read by any non-diagnostic code path.
+static SJ_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Next id for `QE_SPILL_DEBUG` tracing. `Ordering::Relaxed` is enough: this
+/// only needs distinct values for correlating log lines, never ordering
+/// guarantees against other memory operations.
+fn next_sj_trace_id() -> u64 {
+    SJ_TRACE_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Drain every input partition concurrently and return the collected batches
 /// together with their estimated in-memory size.
 ///
@@ -443,6 +458,29 @@ impl SpillableHashJoinExec {
             QueryError::Execution(format!("Failed to create spill directory: {}", e))
         })?;
 
+        // QE_SPILL_DEBUG tracing (task 001, spill-join-correctness epic):
+        // `execute_spill_path` recomputes its ENTIRE result from scratch on
+        // every call and has no cache of its own output (unlike
+        // `build_decision`, which IS memoized). If some caller ever invokes
+        // it more than once for what should be a single logical query
+        // execution (e.g. `SpillableHashAggregateExec`'s fused-streaming
+        // path aborting and falling back to
+        // `collect_input_partitions_concurrently`, which re-executes its
+        // input), this prints TWO START/DONE pairs for the SAME join
+        // instead of one — direct evidence, not inference. Zero cost when
+        // unset beyond one env lookup per call.
+        let sj_trace = std::env::var("QE_SPILL_DEBUG").is_ok();
+        let sj_t0 = std::time::Instant::now();
+        let build_rows_in: usize = build_batches.iter().map(|b| b.num_rows()).sum();
+        if sj_trace {
+            eprintln!(
+                "[sj-trace] execute_spill_path START spill_id={} build_batches={} build_rows={}",
+                spill_id,
+                build_batches.len(),
+                build_rows_in
+            );
+        }
+
         let (on_left, on_right): (Vec<_>, Vec<_>) = self.on.iter().cloned().unzip();
         let build_keys = if swapped { &on_right } else { &on_left };
         let probe_keys = if swapped { &on_left } else { &on_right };
@@ -468,6 +506,26 @@ impl SpillableHashJoinExec {
             }
         }
 
+        if sj_trace {
+            let in_mem_parts = in_memory_partitions.iter().filter(|p| p.is_some()).count();
+            let spilled_parts = spilled_partitions.iter().filter(|p| p.is_some()).count();
+            let in_mem_build_rows: usize = in_memory_partitions
+                .iter()
+                .flatten()
+                .flat_map(|p| p.batches.iter())
+                .map(|b| b.num_rows())
+                .sum();
+            let spilled_build_rows: usize = spilled_partitions
+                .iter()
+                .flatten()
+                .map(|sp| sp.build_rows)
+                .sum();
+            eprintln!(
+                "[sj-trace] execute_spill_path spill_id={} build partitioned: in_memory_partitions={} (rows={}) spilled_partitions={} (rows={})",
+                spill_id, in_mem_parts, in_mem_build_rows, spilled_parts, spilled_build_rows
+            );
+        }
+
         // Collect ALL probe-side partitions into a single stream
         let probe_partitions = probe_side.output_partitions().max(1);
         let mut probe_batches = Vec::new();
@@ -475,6 +533,13 @@ impl SpillableHashJoinExec {
             let probe_stream = probe_side.execute(p).await?;
             let batches: Vec<RecordBatch> = probe_stream.try_collect().await?;
             probe_batches.extend(batches);
+        }
+        let probe_rows_in: usize = probe_batches.iter().map(|b| b.num_rows()).sum();
+        if sj_trace {
+            eprintln!(
+                "[sj-trace] execute_spill_path spill_id={} probe collected: probe_partitions={} probe_rows={}",
+                spill_id, probe_partitions, probe_rows_in
+            );
         }
         let probe_stream: RecordBatchStream =
             Box::pin(stream::iter(probe_batches.into_iter().map(Ok)));
@@ -489,6 +554,7 @@ impl SpillableHashJoinExec {
                 swapped,
             )
             .await?;
+        let in_memory_matched_rows: usize = results.iter().map(|b| b.num_rows()).sum();
 
         // Attach each partition's probe spill file before processing: without
         // this, spilled build partitions are probed against an EMPTY probe side
@@ -502,17 +568,27 @@ impl SpillableHashJoinExec {
 
         // Process spilled partitions
         let mut all_results = results;
+        let mut spilled_matched_rows: usize = 0;
         for (idx, spilled) in spilled_partitions.iter().enumerate() {
             if let Some(sp) = spilled {
                 let spilled_results = self
                     .process_spilled_partition(sp, build_keys, probe_keys, swapped, idx)
                     .await?;
+                spilled_matched_rows += spilled_results.iter().map(|b| b.num_rows()).sum::<usize>();
                 all_results.extend(spilled_results);
             }
         }
 
         // Clean up spill directory
         let _ = std::fs::remove_dir_all(&spill_dir);
+
+        if sj_trace {
+            let total_matched: usize = all_results.iter().map(|b| b.num_rows()).sum();
+            eprintln!(
+                "[sj-trace] execute_spill_path DONE spill_id={} in_memory_matched={} spilled_matched={} total_matched={} elapsed={:?}",
+                spill_id, in_memory_matched_rows, spilled_matched_rows, total_matched, sj_t0.elapsed()
+            );
+        }
 
         Ok(Box::pin(stream::iter(all_results.into_iter().map(Ok))))
     }
@@ -528,6 +604,14 @@ impl SpillableHashJoinExec {
             .collect();
         let mut spilled: Vec<Option<SpilledPartition>> =
             (0..NUM_PARTITIONS).map(|_| None).collect();
+        // One incrementally-written Parquet file per spilled partition, kept
+        // OPEN for the whole build phase and closed exactly once at the end.
+        // This replaces the old per-append read-entire-file+rewrite+rename
+        // (`append_to_parquet`), whose cost grew with the total data already
+        // spilled for that partition — see `append_batch_streaming`'s doc
+        // comment (spill-join-correctness epic, task 002).
+        let mut spill_writers: Vec<Option<ArrowWriter<File>>> =
+            (0..NUM_PARTITIONS).map(|_| None).collect();
         let mut total_memory: usize = 0;
         let memory_threshold =
             (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
@@ -541,7 +625,9 @@ impl SpillableHashJoinExec {
                 if let Some(idx) = find_largest_partition(&partitions) {
                     let part = partitions[idx].take().unwrap();
                     let path = spill_dir.join(format!("build_{}.parquet", idx));
-                    write_batches_to_parquet(&path, &part.batches)?;
+                    for b in &part.batches {
+                        append_batch_streaming(&mut spill_writers[idx], &path, b)?;
+                    }
 
                     self.memory_pool.record_spill(part.memory_bytes);
                     total_memory -= part.memory_bytes;
@@ -565,13 +651,16 @@ impl SpillableHashJoinExec {
                         part.add_batch(pb);
                         total_memory += pb_size;
                     } else if let Some(ref sp) = spilled[idx] {
-                        // Append to spilled partition
-                        append_to_parquet(&sp.build_file, &pb)?;
+                        // Append to spilled partition as one more row group
+                        // in the already-open writer — O(batch), never
+                        // re-reads or rewrites this partition's prior data.
+                        append_batch_streaming(&mut spill_writers[idx], &sp.build_file, &pb)?;
                     }
                 }
             }
         }
 
+        close_spill_writers(spill_writers)?;
         Ok((partitions, spilled))
     }
 
@@ -587,6 +676,11 @@ impl SpillableHashJoinExec {
     ) -> Result<(Vec<RecordBatch>, Vec<Option<PathBuf>>)> {
         let mut results = Vec::new();
         let mut probe_spill_files: Vec<Option<PathBuf>> =
+            (0..NUM_PARTITIONS).map(|_| None).collect();
+        // Same fix as `build_with_partitioning`: one writer per partition,
+        // kept open for the whole probe phase, instead of a read-rewrite
+        // per appended batch.
+        let mut spill_writers: Vec<Option<ArrowWriter<File>>> =
             (0..NUM_PARTITIONS).map(|_| None).collect();
 
         while let Some(batch) = probe_stream.try_next().await? {
@@ -616,12 +710,13 @@ impl SpillableHashJoinExec {
                         let probe_path = probe_spill_files[idx].get_or_insert_with(|| {
                             spill_dir.join(format!("probe_{}.parquet", idx))
                         });
-                        append_to_parquet(probe_path, &pb)?;
+                        append_batch_streaming(&mut spill_writers[idx], probe_path, &pb)?;
                     }
                 }
             }
         }
 
+        close_spill_writers(spill_writers)?;
         Ok((results, probe_spill_files))
     }
 
@@ -792,6 +887,15 @@ impl SpillableHashAggregateExec {
         let agg_funcs: Vec<AggregateFunction> = self.aggregates.iter().map(|a| a.func).collect();
         let agg_inputs: Vec<Expr> = self.aggregates.iter().map(|a| a.input.clone()).collect();
         let timing = std::env::var("AGG_TIMING").is_ok();
+        // QE_SPILL_DEBUG tracing (task 001, spill-join-correctness epic): see
+        // the identical-purpose comment on `execute_spill_path`. This
+        // function's own doc comment already states it may fall back to
+        // `Ok(None)` and have its input RE-EXECUTED by the caller
+        // (`SpillableHashAggregateExec::execute`'s
+        // `collect_input_partitions_concurrently` path) — tracing here
+        // shows directly whether that fallback is actually taken, and why.
+        let sj_trace = std::env::var("QE_SPILL_DEBUG").is_ok();
+        let sj_call_id = next_sj_trace_id();
         let t_start = std::time::Instant::now();
         let busy_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
@@ -826,6 +930,13 @@ impl SpillableHashAggregateExec {
             rxs.push(r);
         }
         let abort = Arc::new(AtomicBool::new(false));
+        // QE_SPILL_DEBUG tracing (task 001, spill-join-correctness epic):
+        // `abort` alone doesn't say WHY — capture the first worker-side
+        // error's message so a caught abort is diagnosable, not just
+        // detected. `Mutex<Option<String>>` rather than a second atomic
+        // flag/enum: the interesting content is the error text itself.
+        let abort_reason: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
 
         // Aggregation workers: dedicated OS threads pulling from the channel.
         let mut workers = Vec::with_capacity(n_workers);
@@ -836,6 +947,7 @@ impl SpillableHashAggregateExec {
                 rxs[0].clone()
             };
             let abort = Arc::clone(&abort);
+            let abort_reason = Arc::clone(&abort_reason);
             let agg_funcs = agg_funcs.clone();
             let input_types = input_types.clone();
             let agg_inputs = agg_inputs.clone();
@@ -849,7 +961,16 @@ impl SpillableHashAggregateExec {
                         continue; // keep draining so senders never block forever
                     }
                     let t = std::time::Instant::now();
-                    if state.process_batch(&batch, &group_by, &agg_inputs).is_err() {
+                    if let Err(e) = state.process_batch(&batch, &group_by, &agg_inputs) {
+                        if sj_trace {
+                            let mut guard = abort_reason.lock().unwrap();
+                            if guard.is_none() {
+                                *guard = Some(format!(
+                                    "worker {} process_batch error after {} batches: {}",
+                                    w, batches_seen, e
+                                ));
+                            }
+                        }
                         abort.store(true, AtomicOrdering::Relaxed);
                         continue;
                     }
@@ -879,6 +1000,12 @@ impl SpillableHashAggregateExec {
         // the scatter runs on the drain task, so it parallelizes across input
         // partitions.
         let input_partitions = self.input.output_partitions().max(1);
+        if sj_trace {
+            eprintln!(
+                "[sj-trace] execute_fused_streaming START call_id={} input_partitions={} disjoint={}",
+                sj_call_id, input_partitions, disjoint
+            );
+        }
         let mut drains = Vec::with_capacity(input_partitions);
         for p in 0..input_partitions {
             let input = self.input.clone();
@@ -971,23 +1098,73 @@ impl SpillableHashAggregateExec {
         drop(txs);
 
         let mut drain_failed = false;
-        for d in drains {
+        let mut first_drain_err: Option<String> = None;
+        for (p, d) in drains.into_iter().enumerate() {
             match d.await {
                 Ok(Ok(())) => {}
-                _ => drain_failed = true,
+                Ok(Err(e)) => {
+                    drain_failed = true;
+                    if sj_trace && first_drain_err.is_none() {
+                        first_drain_err = Some(format!("drain task p={} returned Err: {}", p, e));
+                    }
+                }
+                Err(join_err) => {
+                    drain_failed = true;
+                    if sj_trace && first_drain_err.is_none() {
+                        first_drain_err = Some(format!(
+                            "drain task p={} join error (panic?): {}",
+                            p, join_err
+                        ));
+                    }
+                }
             }
         }
         let t_drained = t_start.elapsed();
 
         let mut states = Vec::with_capacity(workers.len());
-        for w in workers {
-            match w.join() {
+        let mut first_worker_join_err: Option<String> = None;
+        for (w, worker) in workers.into_iter().enumerate() {
+            match worker.join() {
                 Ok(state) => states.push(state),
-                Err(_) => drain_failed = true,
+                Err(e) => {
+                    drain_failed = true;
+                    if sj_trace && first_worker_join_err.is_none() {
+                        let msg = e
+                            .downcast_ref::<&str>()
+                            .map(|s| s.to_string())
+                            .or_else(|| e.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                        first_worker_join_err = Some(format!("worker w={} panicked: {}", w, msg));
+                    }
+                }
             }
         }
 
-        if drain_failed || abort.load(AtomicOrdering::Relaxed) {
+        let aborted = abort.load(AtomicOrdering::Relaxed);
+        if drain_failed || aborted {
+            if sj_trace {
+                let group_limit_exceeded = states.iter().any(|s| s.group_count() > group_limit);
+                let total_groups_so_far: usize = states.iter().map(|s| s.group_count()).sum();
+                let process_batch_reason = abort_reason.lock().unwrap().clone();
+                eprintln!(
+                    "[sj-trace] execute_fused_streaming ABORTED call_id={} drain_failed={} abort_flag={} \
+                     group_limit_exceeded={} group_limit={} states_collected={} total_groups_so_far={} \
+                     elapsed={:?} first_drain_err={:?} first_worker_join_err={:?} process_batch_reason={:?} \
+                     -> falling back to Ok(None); CALLER WILL RE-EXECUTE THE INPUT \
+                     (collect_input_partitions_concurrently) FROM SCRATCH",
+                    sj_call_id,
+                    drain_failed,
+                    aborted,
+                    group_limit_exceeded,
+                    group_limit,
+                    states.len(),
+                    total_groups_so_far,
+                    t_start.elapsed(),
+                    first_drain_err,
+                    first_worker_join_err,
+                    process_batch_reason
+                );
+            }
             return Ok(None);
         }
 
@@ -1026,6 +1203,16 @@ impl SpillableHashAggregateExec {
                 total_groups,
                 t_merged - t_workers,
                 busy_ns.load(AtomicOrdering::Relaxed) as f64 / 1e6,
+                t_start.elapsed()
+            );
+        }
+        if sj_trace {
+            let out_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            eprintln!(
+                "[sj-trace] execute_fused_streaming OK call_id={} total_groups={} out_rows={} elapsed={:?}",
+                sj_call_id,
+                total_groups,
+                out_rows,
                 t_start.elapsed()
             );
         }
@@ -1079,10 +1266,32 @@ impl PhysicalOperator for SpillableHashAggregateExec {
         // production. Bounded channel + group-count budget keep memory safe;
         // ineligible shapes or a tripped budget fall through to the
         // collect-then-decide path below.
-        if self.fused_streaming_eligible() {
+        let fused_eligible = self.fused_streaming_eligible();
+        if fused_eligible {
             if let Some(result) = self.execute_fused_streaming().await? {
                 return Ok(result);
             }
+        }
+
+        // QE_SPILL_DEBUG tracing (task 001, spill-join-correctness epic):
+        // reaching here after `fused_eligible` was true means
+        // `execute_fused_streaming` returned `Ok(None)` (see its own DONE/
+        // ABORTED trace lines) and its input is about to be driven a SECOND
+        // time by `collect_input_partitions_concurrently` below — for a
+        // child like `SpillableHashJoinExec`'s spill path, which has no
+        // cache of its own output, this reruns the ENTIRE join computation
+        // from scratch. Not proof of duplication by itself (this second run
+        // is the one whose results are actually returned), but a query
+        // whose log shows this line is a query where the join's expensive
+        // work happened twice, and a wrong answer that also shows two
+        // `execute_spill_path` DONE lines is direct evidence they share a
+        // cause.
+        if std::env::var("QE_SPILL_DEBUG").is_ok() {
+            eprintln!(
+                "[sj-trace] agg fallback: fused_eligible={} -> (re-)executing input via \
+                 collect_input_partitions_concurrently",
+                fused_eligible
+            );
         }
 
         // Drain all input partitions concurrently so a parallel scan/join beneath this
@@ -2286,55 +2495,60 @@ fn write_batches_to_parquet(path: &PathBuf, batches: &[RecordBatch]) -> Result<(
     Ok(())
 }
 
-/// Append a batch to an existing Parquet file (or create new) using streaming
-fn append_to_parquet(path: &PathBuf, batch: &RecordBatch) -> Result<()> {
-    if !path.exists() {
-        // No existing file, just write the batch
-        return write_batches_to_parquet(path, &[batch.clone()]);
+/// Append one batch to a spilled partition's Parquet file as a new row
+/// group, via an ALREADY-OPEN streaming writer kept alive across many calls
+/// (one per spilled partition, for the whole build or probe phase — see
+/// `build_with_partitioning`/`probe_with_spilling`).
+///
+/// Replaces the previous `append_to_parquet`, which reopened the file on
+/// EVERY call: read the schema back off disk, streamed the ENTIRE existing
+/// file into a fresh temp file, wrote the one new batch, then renamed the
+/// temp file over the original. With `NUM_PARTITIONS` = 64 partitions
+/// spilling almost immediately and hundreds of build batches (plus the full
+/// probe side) appended progressively, that made each append cost
+/// O(current file size) — i.e. the whole build/probe phase cost O(n^2) in
+/// bytes read+written for a partition that accumulates n batches.
+/// Confirmed (spill-join-correctness epic, task 001) to be a strong,
+/// evidenced candidate for why even a CORRECT run of a large spilling join
+/// took 140+ seconds, on top of the still-open, unrelated wrong-answer bug
+/// investigated by that same epic. `writer_slot` is created lazily on the
+/// first call for a given partition (mirrors the old function's "no
+/// existing file yet" branch — nothing is written, and no file appears on
+/// disk, for a partition that never receives a batch) and reused for every
+/// subsequent one, so the cost of any single append no longer grows with
+/// how much has already been spilled for that partition. The on-disk
+/// SHAPE is unchanged (still exactly one Parquet file per partition, still
+/// one row group per appended batch) — `read_parquet`/
+/// `process_spilled_partition` need no changes.
+fn append_batch_streaming(
+    writer_slot: &mut Option<ArrowWriter<File>>,
+    path: &PathBuf,
+    batch: &RecordBatch,
+) -> Result<()> {
+    if writer_slot.is_none() {
+        let file = File::create(path).map_err(|e| {
+            QueryError::Execution(format!("Failed to create spill file {:?}: {}", path, e))
+        })?;
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        *writer_slot = Some(ArrowWriter::try_new(file, batch.schema(), Some(props))?);
     }
+    writer_slot
+        .as_mut()
+        .expect("just created above if it was None")
+        .write(batch)?;
+    Ok(())
+}
 
-    // Streaming append: create temp file, stream existing + new batch, then rename
-    let temp_path = path.with_extension("parquet.tmp");
-
-    // Get schema from existing file
-    let schema = {
-        let file = File::open(path)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-        builder.schema().clone()
-    };
-
-    // Create output writer
-    let output_file = File::create(&temp_path).map_err(|e| {
-        QueryError::Execution(format!("Failed to create temp file {:?}: {}", temp_path, e))
-    })?;
-
-    let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .build();
-
-    let mut writer = ArrowWriter::try_new(output_file, schema, Some(props))?;
-
-    // Stream existing batches (one at a time to limit memory)
-    {
-        let existing_file = File::open(path)?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(existing_file)?
-            .with_batch_size(8192)
-            .build()?;
-
-        for batch_result in reader {
-            let existing_batch = batch_result?;
-            writer.write(&existing_batch)?;
-        }
+/// Close every open spill writer exactly once, flushing the final row group
+/// and Parquet footer so the file is valid and readable. Must run after a
+/// build/probe phase's loop finishes — every `SpilledPartition` file has to
+/// be complete before `process_spilled_partition` opens it.
+fn close_spill_writers(writers: Vec<Option<ArrowWriter<File>>>) -> Result<()> {
+    for writer in writers.into_iter().flatten() {
+        writer.close()?;
     }
-
-    // Write the new batch
-    writer.write(batch)?;
-    writer.close()?;
-
-    // Atomically replace old file with new
-    std::fs::rename(&temp_path, path)
-        .map_err(|e| QueryError::Execution(format!("Failed to rename temp file: {}", e)))?;
-
     Ok(())
 }
 
@@ -2697,6 +2911,139 @@ mod tests {
 
         let size = estimate_batch_size(&batch);
         assert!(size > 0);
+    }
+
+    /// `append_batch_streaming` is the task 002 fix for `append_to_parquet`'s
+    /// O(n^2) read-entire-file+rewrite-rename-per-append pattern (see its
+    /// own doc comment for the full story). This appends many small batches
+    /// to the SAME spill file — the exact call pattern
+    /// `build_with_partitioning`/`probe_with_spilling` use — through one
+    /// shared writer slot, then confirms every row survives the round trip
+    /// exactly, in the order written (Parquet preserves row-group write
+    /// order and `read_parquet` reads row groups in file order).
+    #[test]
+    fn append_batch_streaming_preserves_all_rows_across_many_appends() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let dir = std::env::temp_dir().join(format!(
+            "qe_append_streaming_correctness_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("build_0.parquet");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let mut writer: Option<ArrowWriter<File>> = None;
+        let n_batches = 50;
+        let batch_len = 37; // deliberately not a round number
+        let mut expected: Vec<i64> = Vec::new();
+
+        for i in 0..n_batches {
+            let start = (i * batch_len) as i64;
+            let vals: Vec<i64> = (start..start + batch_len as i64).collect();
+            expected.extend_from_slice(&vals);
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vals))])
+                    .unwrap();
+            append_batch_streaming(&mut writer, &path, &batch)
+                .expect("streaming append must not fail");
+        }
+        close_spill_writers(vec![writer]).expect("closing the writer must not fail");
+
+        let read_back = read_parquet(&path).expect("spill file must be readable after close");
+        let mut actual: Vec<i64> = Vec::new();
+        for batch in &read_back {
+            let arr = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            actual.extend(arr.values().iter().copied());
+        }
+        assert_eq!(
+            actual, expected,
+            "every appended batch's rows must survive, in write order"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Direct evidence for task 002's own acceptance criterion: "cost per
+    /// append does not grow with the total data already spilled for that
+    /// partition." Times one append early (right after the file already has
+    /// one batch in it) and one late (after ~300 more appends), through the
+    /// SAME writer slot/file `build_with_partitioning` would use, and
+    /// asserts the late append is not dramatically more expensive than the
+    /// early one. A generous multiplier avoids flaking on scheduler jitter
+    /// while still clearly failing if the old O(n)-per-append cost (which
+    /// would make append #301 roughly 150x the cost of append #2, since the
+    /// file being fully re-read+rewritten on every call would have grown
+    /// ~150x between the two measurements) ever regresses back in.
+    #[test]
+    fn append_batch_streaming_cost_does_not_grow_with_prior_data() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::time::{Duration, Instant};
+
+        let dir =
+            std::env::temp_dir().join(format!("qe_append_streaming_cost_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("build_0.parquet");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Float64, false),
+        ]));
+        let make_batch = || {
+            let n = 500usize;
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+                    Arc::new(Float64Array::from(vec![1.5f64; n])),
+                ],
+            )
+            .unwrap()
+        };
+
+        let mut writer: Option<ArrowWriter<File>> = None;
+
+        // Prime the file with one batch, then time append #2.
+        append_batch_streaming(&mut writer, &path, &make_batch()).unwrap();
+        let t0 = Instant::now();
+        append_batch_streaming(&mut writer, &path, &make_batch()).unwrap();
+        let early = t0.elapsed();
+
+        // 300 more appends — under the OLD read-rewrite-rename
+        // implementation, the file being re-read+rewritten on every call
+        // here would have grown ~150x between the early and late
+        // measurement below.
+        for _ in 0..300 {
+            append_batch_streaming(&mut writer, &path, &make_batch()).unwrap();
+        }
+
+        let t1 = Instant::now();
+        append_batch_streaming(&mut writer, &path, &make_batch()).unwrap();
+        let late = t1.elapsed();
+
+        close_spill_writers(vec![writer]).unwrap();
+        let total_rows: usize = read_parquet(&path)
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(total_rows, 500 * (2 + 300 + 1));
+
+        assert!(
+            late < early * 20 + Duration::from_millis(25),
+            "append cost grew with prior data (early={:?}, late={:?}) — \
+             the O(n^2) read-rewrite-rename pattern may have regressed",
+            early,
+            late
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Disjoint fused aggregation must produce EXACTLY what the plain
