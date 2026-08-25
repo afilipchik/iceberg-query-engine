@@ -498,6 +498,37 @@ paying for itself, not a coincidence of any one task.
    validation. Recommend treating this as a P0 correctness bug for
    whichever future epic owns the join spill path, not merely folding it
    into the pre-existing "streaming rewrite" performance framing.
+
+   **Update (`spill-join-correctness` epic, closed 2026-08-25):** a
+   dedicated follow-up epic investigated this bug directly. It remains
+   **OPEN** — root cause still not confirmed, despite real
+   instrumentation and a controlled chaos-test experiment that directly
+   DISPROVED the leading hypothesis (non-idempotent join-child
+   re-execution) for the wrongness specifically (it fully explains the
+   bug's severe slowness, which is a separate, now-FIXED issue — see
+   below). This entry's own "not native-table-specific" claim above is
+   now EMPIRICALLY confirmed, not just inferred from reading the code:
+   plain parquet forced into the identical spill code path was
+   statistically indistinguishable from native (0/80 wrong each,
+   matched trial counts). Also newly confirmed: reachable via
+   distributed (scatter) execution, where each node independently runs
+   the identical join-spill code over its own shard (40/40 distributed
+   trials came back correct, but the spill path DOES engage there — a
+   confirmed exposure, not a confirmed-safe path). Rate estimate
+   refined by pooling every trial run across that epic's own
+   investigation (290 total, still only the one original wrong
+   observation): 0.34% (95% CI [0.01%, 1.91%]), tighter than and not in
+   conflict with this epic's own standalone 4.8% (1/21) — NOT evidence
+   of a fix, just a tighter bound on the same low, real rate.
+   Separately, that epic DID fix a confirmed, independent O(n²)
+   `append_to_parquet` spill-write slowness that had been inflating
+   this bug's own slow runs too (140-291s -> 3-6s, ~40-90x, on the
+   identical repro) — that mechanism is now closed; the wrong-answer
+   mechanism is not. Three further new, distinct bugs were found (a
+   concurrent-`serve`-process spill-directory collision, a
+   LIMIT-not-enforced-under-spill bug, a sort-spill run-file crash),
+   none fixed. Full detail: `.claude/epics/archived/
+   spill-join-correctness/epic.md`.
 2. **Deletion-vector JSON density at very large segment counts** (task
    005, quantified not just flagged) — ~131MB extrapolated for a
    1000-segments x 1,000,000-rows x 1%-deleted table, larger than task
