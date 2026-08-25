@@ -95,15 +95,55 @@ currently frame this as a live P0 open risk — update both once resolved
 3. Broad adversarial sweep for sibling instances + the slowness verdict.
 4. QA close-out: full suite, cell-exact, docs, epic close.
 
+## Re-scope after task 001 (2026-08-24)
+
+Task 001 closed with the wrong-answer root cause genuinely not found
+(see its Outcome), so per this epic's own "no guess-fixes" gate, task
+002 as originally scoped (fix the wrong-answer bug) correctly does not
+proceed. Task 001 also, however, landed a SEPARATE finding with its own
+confirmed root cause: `append_to_parquet` in `spillable.rs` does a full
+read-entire-file + rewrite-to-temp + atomic-rename on every spill
+append, an O(n²)-ish disk I/O pattern that plausibly explains most of
+the 140-291s runtime even on the 20/21 CORRECT runs. That's a real,
+independently fixable, low-risk problem discovered as a side effect of
+hunting the correctness bug — sitting on it until the wrong-answer
+mystery resolves (uncertain timeline, possibly never, given task 001's
+own effort/result ratio) wastes a known win. Orchestrating-session
+decision, with the user's explicit sign-off: split the remaining work
+along this line rather than block everything on the harder problem.
+
+- **Task 002 (re-scoped)**: fix the O(n²) `append_to_parquet` pattern.
+  Confirmed root cause, does NOT require the wrong-answer mechanism to
+  be understood. Validated by wall-clock time on task 001's repro
+  (140-291s → target well under that) plus cell-exact correctness
+  (unchanged) on both the repro and the full suite.
+- **Task 003 (re-scoped)**: blast-radius CHARACTERIZATION of the
+  wrong-answer bug specifically — not a fix attempt (none is possible
+  without a confirmed mechanism; the gate still applies to this half).
+  Determine whether it's native-table-specific or reachable via plain
+  Parquet sources too, and which other spilling TPC-H queries are
+  exposed. Sequenced after 002 (not logically dependent on it, but
+  002's fix should make the many large spilling-join trials this sweep
+  needs to run far cheaper in wall-clock time).
+- **Wrong-answer root cause**: remains open, undiscovered, and
+  explicitly NOT re-attempted by either 002 or 003. It stays documented
+  as a live, tracked, low-frequency (~4.8% observed) correctness risk
+  in `CLAUDE.md` until someone picks the investigation back up — most
+  likely via task 001's own named next step (a downsized synthetic
+  repro to make iteration cheap enough for hundreds of trials).
+
 ## Task Breakdown Preview
 
 - 001: Reliable reproduction + instrumented root-cause investigation
   (parallel: false, gates everything; may end the epic if root cause
-  isn't confidently found)
-- 002: Fix + immediate validation against the repro (parallel: false,
-  depends on 001 reaching a confident root cause)
-- 003: Broad adversarial sweep (other shapes/sources) + slowness verdict
-  (parallel: false, depends on 002)
+  isn't confidently found) — CLOSED, root cause not found, see re-scope
+  note above.
+- 002 (re-scoped): Fix the confirmed O(n²) `append_to_parquet` spill
+  slowness (parallel: false, depends on 001; does NOT depend on the
+  wrong-answer root cause)
+- 003 (re-scoped): Blast-radius characterization of the (still
+  unfixed) wrong-answer bug — parquet vs. native, which queries;
+  explicitly not a fix attempt (parallel: false, depends on 002)
 - 004: QA close-out — full suite, cell-exact, docs, epic close
   (parallel: false, depends on everything)
 
@@ -125,14 +165,27 @@ full focused session on its own, given the prior investigation's own
 ## Success Criteria (Technical)
 
 - G1: reliable repro established (or an honest, evidenced "could not
-  reliably reproduce" conclusion with a real explanation).
+  reliably reproduce" conclusion with a real explanation). MET — 21
+  runs, 4.8% wrong, see 001's Outcome.
 - G2: if reproduced, root cause identified with runtime evidence and
-  fixed, with a regression test that fails without the fix.
+  fixed, with a regression test that fails without the fix. NOT MET for
+  the wrong-answer mechanism specifically (root cause not found; see
+  re-scope note) — this is an accepted, documented partial outcome per
+  the epic's own gate, not a failure to try.
 - G3: explicit verdict on whether the slowness shares the duplication's
-  root cause.
+  root cause. MET (partial, evidenced verdict) — slowness fully
+  explained by "computation ran ~2x" via the chaos test; wrongness is
+  NOT explained by the same mechanism in its simplest form. See 001's
+  Outcome.
 - G4: broad sweep confirms no sibling instance survives, or names what
-  it found.
+  it found. RE-SCOPED — task 003 characterizes the wrong-answer bug's
+  blast radius (parquet vs. native, which queries) since no fix exists
+  yet to sweep for sibling survivors of; reports what it finds either
+  way.
 - G5: full suite green; native-tables-mutation's documentation updated.
+- G6 (added at re-scope): the confirmed O(n²) `append_to_parquet`
+  slowness is fixed, with before/after wall-clock evidence on task
+  001's repro and no correctness regression (cell-exact, full suite).
 
 ## Estimated Effort
 
@@ -147,8 +200,8 @@ full focused session on its own, given the prior investigation's own
 
 ## Tasks Created
 - [x] 001.md - Reliable reproduction + instrumented root-cause investigation (parallel: false)
-- [ ] 002.md - Fix + immediate validation against the repro (parallel: false)
-- [ ] 003.md - Broad adversarial sweep + slowness verdict (parallel: false)
+- [ ] 002.md - (re-scoped) Fix confirmed O(n²) `append_to_parquet` spill slowness (parallel: false)
+- [ ] 003.md - (re-scoped) Blast-radius characterization of the wrong-answer bug (parallel: false)
 - [ ] 004.md - QA close-out — full suite, cell-exact, docs, epic close (parallel: false)
 
 Total tasks: 4
