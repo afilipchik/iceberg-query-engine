@@ -1,46 +1,54 @@
 ---
 name: native-tables
 description: A first-class, writable, tiered (GPU/RAM/disk) native table format for blazingly fast analytical and data-viz queries
-status: active
+status: completed
 created: 2026-08-23T07:42:14Z
-updated: 2026-08-26T00:00:00Z
+updated: 2026-08-26T19:30:00Z
 ---
 
-> **Status note (2026-08-26).** 3 of 4 phases shipped and archived:
-> `native-tables-foundation` (CREATE/read), `native-tables-mutation`
-> (INSERT/DELETE/UPDATE), and now `native-tables-rollups` (materialized
-> rollups) — all three cell-exact validated at real scale, against both
-> direct base-table computation and an independent DuckDB oracle. The
-> rollup phase is a real, working capability, not a partial or
-> honest-negative-result phase: `CREATE MATERIALIZED VIEW <name> AS
-> SELECT ...` registers an exact-match rollup; a query that structurally
-> matches (same base table, same GROUP BY set, same aggregate set —
-> order/alias-independent) is transparently answered from it with
-> provenance always visible (`QueryMetrics::rollup_answered`); a
-> non-matching query or a stale/failed-refresh rollup always falls back
-> correctly; INSERT/DELETE/UPDATE against a rollup's base table eagerly,
-> automatically refresh every dependent rollup (measured cost: 3-5.6x
-> mutation latency at SF=1 per attached rollup, tens of ms absolute — a
-> real, named, full-base-table-rescan-per-rollup cost, not an incremental
-> merge). Scope is deliberately narrow, matching this program's own
-> "narrow slice first" discipline: single native base table only, exact
-> GROUP BY/aggregate SET match only (no subsumption/coarser-grouping
-> reasoning), no distributed rollups, no `ALTER`/`DROP`/`REFRESH
-> MATERIALIZED VIEW` SQL, no new background scheduler — see the archived
-> epic's own close-out for the complete boundary and every commit. A QA
-> broader-validation sweep during this phase's close-out also found and
-> fixed one real, pre-existing, general SQL binder bug (`ORDER BY <a
-> GROUP BY column's original name>` when the SELECT list only exposes
-> that column under a different alias) — unrelated to rollups or native
-> tables specifically, but surfaced by this phase's own testing; see
-> CLAUDE.md's "Materialized rollups: QA close-out" section for the full
-> story. Phase 3 (GPU/RAM/disk tiering) is the only phase remaining and
-> is not started. A correctness bug in the mutation epic's own QA
+> **Status note (2026-08-26, updated).** **ALL FOUR PHASES SHIPPED AND
+> ARCHIVED — this PRD is complete.** `native-tables-foundation`
+> (CREATE/read), `native-tables-mutation` (INSERT/DELETE/UPDATE),
+> `native-tables-rollups` (materialized rollups), and now
+> `native-tables-tiering` (GPU/RAM/disk tiering) — all four cell-exact
+> validated at real scale, on real hardware where applicable (an RTX
+> 5090). The tiering phase closes out this PRD's last remaining gap: a
+> dedicated research pass found the PRD's own "3-tier hierarchy" framing
+> overstated the actual work (RAM and disk tiers already existed as the
+> native-table format itself and its default on-disk persistence — see
+> the archived epic's own Overview for the full research trail); the
+> real, concrete, bounded gap was GPU-cache hardening — a genuine,
+> empirically-confirmed VRAM leak on mutation (task 001: measured +224
+> MiB over 15 mutations pre-fix, flat post-fix, closed as a direct
+> consequence of a general byte-accounted LRU-eviction mechanism with no
+> native-table-specific code), a real, enforced `QE_GPU_CACHE_MB` budget
+> (task 001, default 24576 MiB), and per-column failure isolation
+> replacing a single process-wide poison flag that used to permanently
+> disable GPU offload after any one upload failure (task 002, validated
+> with a real induced CUDA VRAM-exhaustion failure on actual hardware).
+> Task 003's own broader validation (150 mutation ops across 10
+> concurrently-live native tables competing for an undersized shared
+> budget — more of both axes than either task 001 or 002 individually
+> tested) confirmed VRAM stays bounded and 170/170 correctness checks
+> stayed cell-exact; an independent no-regression re-measurement with
+> BOTH tasks' changes combined found (after investigating, not glossing
+> over, an initial anomalous reading) `gpu-acceleration`'s original
+> ~18-20x Q6-shape win reproduces cleanly at ~19.1x. Full suite green in
+> all four feature combinations throughout every phase. See each
+> archived epic's own close-out for full detail, every commit, and each
+> phase's complete, honestly-named residual scope boundary — none of the
+> four phases' own named residues (no subsumption/coarser-grouping
+> rollup matching, no compaction, single-writer-only mutation, no
+> distributed native-table participation, type-coverage widening left
+> out of the tiering phase, etc.) block this PRD from being considered
+> complete; each was a deliberate, documented scope decision, not an
+> abandoned requirement. A correctness bug in the mutation epic's own QA
 > close-out (`SpillableHashJoinExec`'s spill path, unrelated to native
-> tables or rollups specifically) remains open per `spill-join-
-> correctness`'s own close-out (root cause unconfirmed, a real but low
-> — 0.34% pooled — reproduction rate) and continues to not block this
-> PRD's remaining phase.
+> tables specifically) remains open per `spill-join-correctness`'s own
+> close-out (root cause unconfirmed, a real but low — 0.34% pooled —
+> reproduction rate, confirmed NOT native-table-specific and confirmed
+> distributed-reachable) — tracked there, not blocking, and untouched by
+> any of the four native-tables phases.
 
 # PRD: native-tables
 
