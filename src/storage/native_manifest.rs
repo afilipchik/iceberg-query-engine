@@ -616,6 +616,14 @@ pub struct NativeManifest {
     /// 004) is meant to read this directly: an O(1) lookup, no recompute.
     #[serde(default)]
     pub table_stats: BTreeMap<String, ColumnStats>,
+    /// Present only when this native table IS a materialized rollup of
+    /// another, already-registered native table (native-tables-rollups
+    /// epic, task 001). `#[serde(default)]` so every manifest the
+    /// foundation and mutation epics ever wrote deserializes with `None`
+    /// here, unchanged behavior — mirrors `Segment::deleted_rows`'s own
+    /// additive-field precedent exactly. See [`RollupMeta`].
+    #[serde(default)]
+    pub rollup: Option<RollupMeta>,
 }
 
 impl NativeManifest {
@@ -662,9 +670,27 @@ impl NativeManifest {
             },
             segments,
             table_stats,
+            rollup: None,
         };
         manifest.validate()?;
         Ok(manifest)
+    }
+
+    /// Attach rollup metadata to an already-built manifest (native-tables-
+    /// rollups epic, task 001). `ExecutionContext::register_rollup` calls
+    /// this AFTER the rollup's row data has already been written and
+    /// published as an ordinary native table (via `native_write::
+    /// write_batches`, completely UNCHANGED — a rollup's row data IS a
+    /// native table), then re-publishes just the manifest via
+    /// [`write_manifest_atomic`]'s single-file atomic rename — the SAME
+    /// "manifest-only patch" primitive the mutation epic's Append/DELETE/
+    /// UPDATE paths already established (`native_write::
+    /// publish_manifest_update`), reused here rather than inventing a new
+    /// write mechanism. Does not itself validate — the caller's
+    /// subsequent `write_manifest`/`write_manifest_atomic` call does that.
+    pub fn with_rollup(mut self, rollup: RollupMeta) -> Self {
+        self.rollup = Some(rollup);
+        self
     }
 
     /// The manifest's declared schema as an Arrow `SchemaRef`.
@@ -800,7 +826,170 @@ impl NativeManifest {
             ));
         }
 
+        // Rollup metadata (native-tables-rollups epic, task 001): a
+        // structurally-parseable-but-wrong `RollupMeta` — an empty
+        // `columns` list, a `physical_name` that names no real column of
+        // THIS table's own schema, or a duplicate `canonical_key` — is
+        // refused here at load time, matching this function's own
+        // "catch corruption/tampering/a future bug, don't guess" ethos
+        // applied everywhere else in this manifest.
+        if let Some(rollup) = &self.rollup {
+            if rollup.base_table.trim().is_empty() {
+                return Err(QueryError::Storage(
+                    "native table manifest has rollup metadata with an empty base_table".into(),
+                ));
+            }
+            if rollup.columns.is_empty() {
+                return Err(QueryError::Storage(
+                    "native table manifest has rollup metadata with zero columns — a rollup \
+                     must record at least one GROUP BY or aggregate column"
+                        .into(),
+                ));
+            }
+            let mut seen_keys = HashSet::new();
+            for col in &rollup.columns {
+                if !seen_keys.insert(col.canonical_key.clone()) {
+                    return Err(QueryError::Storage(format!(
+                        "native table manifest rollup metadata has a duplicate canonical_key \
+                         `{}`",
+                        col.canonical_key
+                    )));
+                }
+                if !known_columns.contains(&col.physical_name.to_lowercase()) {
+                    return Err(QueryError::Storage(format!(
+                        "native table manifest rollup metadata's column `{}` names physical \
+                         column `{}`, which is not a column of this table's own schema",
+                        col.canonical_key, col.physical_name
+                    )));
+                }
+            }
+        }
+
         Ok(())
+    }
+}
+
+// ============================================================================
+// Rollup metadata (native-tables-rollups epic, task 001)
+//
+// Present only when this native table IS a materialized rollup of
+// another, already-registered NATIVE table (the "base table"). Pure
+// data: no dependency on `crate::planner::Expr`/`LogicalPlan` here — this
+// module stays planner-independent, per its own module doc's layering.
+// The STRUCTURAL matching logic that PRODUCES/CONSUMES these canonical
+// keys (turning an `Expr` into the `canonical_key` strings stored below,
+// recognizing a query's shape, substituting a scan) lives in the sibling
+// `crate::storage::native_rollup` module — mirrors how task 003 of the
+// mutation epic added the `Segment::deleted_rows` FIELD here while its
+// EDITING logic lived entirely in `native_delete.rs`.
+// ============================================================================
+
+/// One GROUP BY or aggregate column of a rollup's defining query: its
+/// order-independent structural "shape" key (see
+/// `native_rollup::canonical_expr_key` for the exact normalization rules
+/// this module does not itself compute) paired with the PHYSICAL column
+/// name this rollup's own native table actually stores it under.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RollupColumn {
+    /// Canonical, alias-blind, table-qualification-blind shape key.
+    pub canonical_key: String,
+    /// This rollup's own native-table column name holding that value.
+    pub physical_name: String,
+    /// `true` if `canonical_key` names a GROUP BY expression, `false` if
+    /// it names an aggregate. Informational for a human reading a
+    /// manifest; matching itself only ever needs `canonical_key` ->
+    /// `physical_name`, split by this flag into the two SETS the
+    /// matching mechanism compares (see [`RollupMeta::group_by_key_set`]/
+    /// [`RollupMeta::aggregate_key_set`]).
+    pub is_group_by: bool,
+}
+
+/// Rollup identity + staleness bookkeeping, attached to a native table's
+/// manifest when (and only when) that table is a materialized rollup of
+/// another, already-registered native table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RollupMeta {
+    /// The base table's REGISTERED name at the moment this rollup was
+    /// created (`ExecutionContext::register_rollup`'s `base_table`
+    /// argument, verbatim). Matching (`native_rollup.rs`) looks up the
+    /// CURRENT provider under this name both to confirm an incoming
+    /// query's own `Scan` targets the same base table and to check
+    /// staleness below.
+    pub base_table: String,
+    /// The raw defining SQL, kept verbatim for provenance/debugging and
+    /// as the natural input for a future SQL DDL surface (task 002) —
+    /// NOT used for matching itself, which compares the STRUCTURAL shape
+    /// in `columns` below (immune to whitespace/alias/column-order
+    /// differences a naive string compare would wrongly treat as a
+    /// mismatch).
+    pub defining_sql: String,
+    /// The base table's `table_id` at the moment this rollup was last
+    /// (re)computed. Staleness bookkeeping, half A: identity should
+    /// survive a base-table `Overwrite` unchanged (only `version`
+    /// bumps), so in practice `base_table_version` below is the field
+    /// that actually changes on every real base-table mutation — but a
+    /// `table_id` mismatch is checked too, defensively, in case the base
+    /// table was ever replaced by an entirely different table under the
+    /// same registered name.
+    pub base_table_id: String,
+    /// The base table's `snapshot.version` at the moment this rollup was
+    /// last (re)computed. Staleness bookkeeping, half B: a rollup is
+    /// STALE whenever the base table's CURRENT `(table_id, version)`
+    /// differs from this recorded pair. Task 001 only needs staleness to
+    /// EXIST and be CHECKED (a stale rollup is excluded from matching —
+    /// see `native_rollup::rollup_candidates`) — the refresh/recompute
+    /// model itself (keeping this field current automatically on every
+    /// base-table INSERT/DELETE/UPDATE) is task 003's job, named not
+    /// attempted here.
+    pub base_table_version: u64,
+    /// Every GROUP BY and aggregate column of the defining query, in the
+    /// PHYSICAL (written-table) column order — see [`RollupColumn`].
+    pub columns: Vec<RollupColumn>,
+}
+
+impl RollupMeta {
+    /// The sorted set of GROUP BY canonical keys. Order-independence,
+    /// decided explicitly (native-tables-rollups epic, task 001): `GROUP
+    /// BY a, b` and `GROUP BY b, a` both produce this SAME sorted list,
+    /// so a query written either way matches this rollup identically.
+    /// Sorting (rather than a true `HashSet`) also makes this a
+    /// sorted-MULTISET comparison, not a set one: a pathological `GROUP
+    /// BY a, a` would need a rollup ALSO defined with `a` listed twice to
+    /// match — never silently collapsed to a smaller set.
+    pub fn group_by_key_set(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .columns
+            .iter()
+            .filter(|c| c.is_group_by)
+            .map(|c| c.canonical_key.clone())
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// The sorted set of aggregate canonical keys — same order-
+    /// independence/sorted-multiset reasoning as [`Self::group_by_key_set`],
+    /// applied to the requested aggregate SET (e.g. `SELECT SUM(x),
+    /// COUNT(*)` matches `SELECT COUNT(*), SUM(x)`).
+    pub fn aggregate_key_set(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .columns
+            .iter()
+            .filter(|c| !c.is_group_by)
+            .map(|c| c.canonical_key.clone())
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// This rollup's own physical column name for a given canonical key,
+    /// if it has one. Used to reshape a matched query's output — see
+    /// `native_rollup::substitute`.
+    pub fn physical_name_for(&self, canonical_key: &str) -> Option<&str> {
+        self.columns
+            .iter()
+            .find(|c| c.canonical_key == canonical_key)
+            .map(|c| c.physical_name.as_str())
     }
 }
 

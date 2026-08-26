@@ -409,6 +409,27 @@ pub fn update_target_name(stmt: &Statement) -> Option<String> {
     }
 }
 
+/// If `stmt` is a `CREATE MATERIALIZED VIEW` statement, its target (rollup)
+/// name — regardless of whether the statement is otherwise a shape this
+/// binder's `bind()` will accept (mirrors [`create_table_target_name`]'s own
+/// "extraction is separate from validation" split). Deliberately returns
+/// `None` for a PLAIN (non-materialized) `CREATE VIEW` — mirroring
+/// [`insert_target_name`]'s own treatment of `TableObject::TableFunction`
+/// (a shape with no dedicated entrypoint to redirect to): a plain
+/// `CREATE VIEW` has no `ExecutionContext` entrypoint of its own to route
+/// callers toward, so it deliberately falls through to `Binder::bind()`'s
+/// own "CREATE VIEW (non-materialized) is not supported" refusal instead of
+/// this function's callers redirecting it somewhere that would just refuse
+/// it a second time. Used by `ExecutionContext::sql()`'s DDL/DML redirect
+/// guard and by `ExecutionContext::create_materialized_view`
+/// (native-tables-rollups epic, task 002).
+pub fn create_materialized_view_target_name(stmt: &Statement) -> Option<String> {
+    match stmt {
+        Statement::CreateView(cv) if cv.materialized => Some(cv.name.table_name()),
+        _ => None,
+    }
+}
+
 /// The column name a `SET` assignment targets — the LAST identifier of its
 /// `AssignmentTarget::ColumnName`'s `ObjectName` (so both a bare `col` and
 /// a qualified `alias.col` resolve to the same unqualified name, mirroring
@@ -744,6 +765,94 @@ fn require_supported_create_table_shape(ct: &ast::CreateTable) -> Result<()> {
     Ok(())
 }
 
+/// Refuse, by name, every `CREATE VIEW`/`CREATE MATERIALIZED VIEW` clause
+/// this epic (native-tables-rollups, task 002) does not implement. Mirrors
+/// [`require_supported_create_table_shape`]'s exact discipline, mechanically
+/// checked against sqlparser 0.62's real 17-field `CreateView` struct
+/// (`src/ast/ddl.rs`, reread directly from the vendored source for this
+/// task rather than trusted from a paraphrase). Only `name` and `query` are
+/// consumed (by [`Binder::bind()`]'s `Statement::CreateView` arm); every
+/// other field must be at its "not specified" value or this returns a
+/// specific `QueryError::NotImplemented` naming the clause — never a silent
+/// downgrade to "ignore the clause and proceed."
+///
+/// `materialized` is checked separately, by the `bind()` arm itself, not
+/// here — its required value is the OPPOSITE sense of every other field
+/// checked below (all of which must be OFF/unset; `materialized` must be
+/// ON), and a non-materialized `CREATE VIEW` gets its own, differently-
+/// worded refusal message (it is out of scope entirely, not "a clause this
+/// engine doesn't support yet" the way e.g. `SECURE` is).
+///
+/// `name_before_not_exists` is a pure syntax/span marker (which side of the
+/// view name `IF NOT EXISTS` appeared on — a SQLite dialect quirk) with no
+/// semantic effect once `if_not_exists` itself is refused below — mirrors
+/// `require_supported_insert_shape`'s own treatment of `insert_token`/
+/// `into`/`has_table_keyword` — and is deliberately not checked.
+fn require_supported_create_view_shape(cv: &ast::CreateView) -> Result<()> {
+    fn refuse(clause: &str) -> QueryError {
+        QueryError::NotImplemented(format!(
+            "CREATE MATERIALIZED VIEW ... AS SELECT: `{clause}` is not supported — this epic \
+             supports only `CREATE MATERIALIZED VIEW <name> AS SELECT ...` defining an \
+             exact-match rollup over a single existing native table (no OR REPLACE/OR ALTER, \
+             no SECURE, no explicit view column list, no CLUSTER BY, no ALGORITHM/DEFINER/\
+             security params, and more — see require_supported_create_view_shape for the full \
+             list)"
+        ))
+    }
+    if cv.or_alter {
+        return Err(refuse("OR ALTER"));
+    }
+    if cv.or_replace {
+        return Err(refuse("OR REPLACE"));
+    }
+    if cv.secure {
+        return Err(refuse("SECURE"));
+    }
+    if !cv.columns.is_empty() {
+        return Err(refuse(
+            "an explicit view column list (CREATE MATERIALIZED VIEW v (a, b) AS SELECT ...)",
+        ));
+    }
+    if cv.options != ast::CreateTableOptions::None {
+        return Err(refuse("view options (WITH/OPTIONS)"));
+    }
+    if !cv.cluster_by.is_empty() {
+        return Err(refuse("CLUSTER BY"));
+    }
+    if cv.comment.is_some() {
+        return Err(refuse("COMMENT"));
+    }
+    if cv.with_no_schema_binding {
+        return Err(refuse("WITH NO SCHEMA BINDING"));
+    }
+    if cv.if_not_exists {
+        // Same reasoning as `require_supported_create_table_shape`'s own
+        // `ct.if_not_exists` refusal, and task 002's own required, explicit
+        // decision (not left unhandled): honoring the real semantics (skip
+        // silently if a rollup of this name already exists) would require
+        // detecting an existing rollup and NOT replacing it, but
+        // `register_rollup` always recomputes/replaces wholesale --
+        // accepting this flag and ignoring it would silently change what
+        // the statement means rather than doing what it says.
+        return Err(refuse("IF NOT EXISTS"));
+    }
+    if cv.temporary {
+        return Err(refuse("TEMPORARY"));
+    }
+    if cv.copy_grants {
+        return Err(refuse("COPY GRANTS"));
+    }
+    if cv.to.is_some() {
+        return Err(refuse("TO (ClickHouse target-table clause)"));
+    }
+    if cv.params.is_some() {
+        return Err(refuse(
+            "MySQL view ALGORITHM/DEFINER/SQL SECURITY parameters",
+        ));
+    }
+    Ok(())
+}
+
 impl<'a> Binder<'a> {
     pub fn new(catalog: &'a dyn Catalog) -> Self {
         Self {
@@ -820,6 +929,40 @@ impl<'a> Binder<'a> {
                     )
                 })?;
                 self.bind_query(query)
+            }
+            // `CREATE MATERIALIZED VIEW <name> AS SELECT ...`
+            // (native-tables-rollups epic, task 002). Mirrors the
+            // `CreateTable` arm's shape exactly: binds and returns ONLY the
+            // inner SELECT's `LogicalPlan` (no new DDL node -- `LogicalPlan`
+            // gains none, same reasoning as `CreateTable`), with the target
+            // rollup name recovered separately
+            // (`create_materialized_view_target_name`) by whichever
+            // `ExecutionContext` entrypoint drives registration, since
+            // binding a query and deciding what to do with its result are
+            // different jobs. Every `CreateView` struct field this epic
+            // does not support is refused BY NAME
+            // (`require_supported_create_view_shape`), never silently
+            // ignored. A non-materialized `CREATE VIEW` is refused
+            // explicitly too -- genuinely out of scope, never silently
+            // treated as a rollup. Unlike `CreateTable.query`
+            // (`Option<Box<Query>>`), `CreateView.query` is a plain,
+            // always-present `Box<Query>` -- sqlparser's own grammar
+            // requires `AS <query>` for every `CREATE [MATERIALIZED] VIEW`,
+            // so there is no "missing query" case to check here (confirmed
+            // by reading the vendored struct directly, not assumed).
+            Statement::CreateView(cv) => {
+                require_supported_create_view_shape(cv)?;
+                if !cv.materialized {
+                    return Err(QueryError::NotImplemented(
+                        "CREATE VIEW (non-materialized) is not supported — only `CREATE \
+                         MATERIALIZED VIEW <name> AS SELECT ...` is (native-tables-rollups \
+                         epic); a plain CREATE VIEW has no native concept of a stored, \
+                         queryable relation in this engine and is genuinely out of scope, not \
+                         silently treated as a rollup"
+                            .to_string(),
+                    ));
+                }
+                self.bind_query(&cv.query)
             }
             // `INSERT INTO <table> SELECT/VALUES ...` (native-tables-
             // mutation epic, task 002). Mirrors the `CreateTable` arm's
@@ -5108,10 +5251,37 @@ fn extend_projection_for_sort(
     let LogicalPlan::Project(project) = plan else {
         return Ok((plan, None));
     };
-    if matches!(project.input.as_ref(), LogicalPlan::Aggregate(_)) {
-        return Ok((LogicalPlan::Project(project), None));
-    }
 
+    // NOTE: this used to unconditionally bail out here whenever
+    // `project.input` was an `Aggregate` (added 2026-08-09 alongside this
+    // function itself, ac8d4be, as a conservative "not proven out yet"
+    // scope limit for the vector-search feature -- never revisited since).
+    // That blanket bailout is REMOVED (native-tables-rollups epic, task
+    // 004 QA close-out, 2026-08-26): it left a real, reproducible crash for
+    // `SELECT <aggregates...>, <group-by-col> AS <alias> FROM t GROUP BY
+    // <group-by-col> ORDER BY <group-by-col>` (the ORIGINAL, un-aliased
+    // name, referenced anywhere the SELECT list doesn't ALSO expose it
+    // verbatim) -- `bind_order_by` never validates a bare identifier
+    // against the schema (it just emits `Expr::Column` unconditionally),
+    // so with no rescue the Sort node's input silently lacks its own sort
+    // key and physical execution fails with a confusing "Column not
+    // found" instead of a clean bind-time error or a correct answer.
+    // Found via `native-tables-rollups` task 004's own broader validation
+    // sweep, but confirmed general and pre-existing -- reproduces on plain
+    // in-memory TPC-H data with zero rollup involved
+    // (`query_engine sql "SELECT COUNT(*) AS cnt, ..., l_shipmode AS mode
+    // FROM lineitem GROUP BY l_shipmode ORDER BY l_shipmode"`).
+    //
+    // Removing the bailout is safe because the resolve-based check just
+    // below (`input_schema.resolve_column(col)`) already gates every
+    // widened column, Aggregate or not, and for an Aggregate `project.input`,
+    // `input_schema` is `AggregateNode::schema()` -- which contains ONLY
+    // the GROUP BY key output fields and the aggregate-expression output
+    // fields, nothing else. A column can therefore only be "rescued" here
+    // if it already names a legitimate per-group scalar (a group key or an
+    // already-computed aggregate result) that the Aggregate node itself
+    // produces -- never a raw, pre-aggregation row column, so this can
+    // never smuggle in an ungrouped column and break GROUP BY semantics.
     let input_schema = project.input.schema();
     let mut extra_exprs = Vec::new();
     let mut extra_fields = Vec::new();

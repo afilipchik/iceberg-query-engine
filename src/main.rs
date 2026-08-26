@@ -1741,6 +1741,39 @@ fn load_tpch_dir(
     println!();
 }
 
+/// Print a one-line-per-rollup summary of an INSERT/DELETE/UPDATE's
+/// eager rollup-refresh outcomes (native-tables-rollups epic, task 003) —
+/// a no-op (prints nothing) when `outcomes` is empty (the table has no
+/// dependent rollups, or the mutation was itself a no-op), matching this
+/// codebase's own "provenance always visible, never silently different
+/// from a plain mutation" convention. A FAILED refresh is reported to
+/// stderr, not silently folded into the success line -- see
+/// `ExecutionContext::refresh_dependent_rollups`'s own doc for why a
+/// failed refresh never fails the mutation itself (the rollup is simply
+/// left correctly stale, excluded from matching until a future refresh
+/// succeeds).
+fn print_rollup_refresh_summary(outcomes: &[query_engine::execution::RollupRefreshOutcome]) {
+    if outcomes.is_empty() {
+        return;
+    }
+    let ok: Vec<&str> = outcomes
+        .iter()
+        .filter(|o| o.error.is_none())
+        .map(|o| o.rollup_name.as_str())
+        .collect();
+    if !ok.is_empty() {
+        println!("  refreshed rollup(s): {}", ok.join(", "));
+    }
+    for o in outcomes.iter().filter(|o| o.error.is_some()) {
+        eprintln!(
+            "  WARNING: failed to refresh rollup '{}' ({}) -- it remains stale and will be \
+             excluded from matching until a future refresh succeeds",
+            o.rollup_name,
+            o.error.as_deref().unwrap_or("unknown error")
+        );
+    }
+}
+
 /// Run the interactive SQL REPL
 async fn run_repl(
     tpch_path: Option<PathBuf>,
@@ -1872,6 +1905,7 @@ async fn run_repl(
                                     r.version,
                                     start.elapsed().as_secs_f64() * 1000.0
                                 );
+                                print_rollup_refresh_summary(&r.rollups_refreshed);
                             }
                             Err(e) => {
                                 eprintln!("Error: {}\n", e);
@@ -1894,6 +1928,7 @@ async fn run_repl(
                                     r.version,
                                     start.elapsed().as_secs_f64() * 1000.0
                                 );
+                                print_rollup_refresh_summary(&r.rollups_refreshed);
                             }
                             Err(e) => {
                                 eprintln!("Error: {}\n", e);
@@ -1914,6 +1949,37 @@ async fn run_repl(
                                     r.segments_dropped,
                                     r.segments_added,
                                     r.total_rows,
+                                    r.version,
+                                    start.elapsed().as_secs_f64() * 1000.0
+                                );
+                                print_rollup_refresh_summary(&r.rollups_refreshed);
+                            }
+                            Err(e) => {
+                                eprintln!("Error: {}\n", e);
+                            }
+                        }
+                    }
+                    // `CREATE MATERIALIZED VIEW <name> AS SELECT ...`
+                    // (native-tables-rollups epic, task 002) -- same "needs
+                    // &mut ctx, not sql()'s materializing &self path"
+                    // reasoning as CREATE TABLE/INSERT/DELETE/UPDATE above.
+                    // A plain (non-materialized) `CREATE VIEW` does NOT
+                    // match this arm (`create_materialized_view_target_name`
+                    // returns `None` for it) and falls through to the
+                    // catch-all `sql()` arm below, which reports
+                    // `Binder::bind()`'s own "not supported" refusal.
+                    Ok(stmt)
+                        if query_engine::planner::create_materialized_view_target_name(&stmt)
+                            .is_some() =>
+                    {
+                        match ctx.create_materialized_view(line).await {
+                            Ok(r) => {
+                                println!(
+                                    "Created materialized view '{}' as a rollup of '{}' ({} rows, {} segment(s), now at version {}) in {:.3}ms\n",
+                                    r.rollup_name,
+                                    r.base_table,
+                                    r.rows,
+                                    r.segments,
                                     r.version,
                                     start.elapsed().as_secs_f64() * 1000.0
                                 );

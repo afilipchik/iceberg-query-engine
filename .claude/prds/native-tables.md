@@ -3,17 +3,44 @@ name: native-tables
 description: A first-class, writable, tiered (GPU/RAM/disk) native table format for blazingly fast analytical and data-viz queries
 status: active
 created: 2026-08-23T07:42:14Z
-updated: 2026-08-25T00:00:00Z
+updated: 2026-08-26T00:00:00Z
 ---
 
-> **Status note (2026-08-25).** 2 of 4 phases shipped and archived:
-> `native-tables-foundation` (CREATE/read) and `native-tables-mutation`
-> (INSERT/DELETE/UPDATE), both cell-exact validated at real SF=10 scale.
-> Phase 3 (GPU/RAM/disk tiering) and phase 4 (materialized rollups) are
-> not started. A correctness bug in the mutation epic's own QA close-out
-> (`SpillableHashJoinExec`'s spill path, unrelated to native tables
-> specifically — see `spill-join-correctness`) is tracked separately and
-> does not block this PRD's own remaining phases.
+> **Status note (2026-08-26).** 3 of 4 phases shipped and archived:
+> `native-tables-foundation` (CREATE/read), `native-tables-mutation`
+> (INSERT/DELETE/UPDATE), and now `native-tables-rollups` (materialized
+> rollups) — all three cell-exact validated at real scale, against both
+> direct base-table computation and an independent DuckDB oracle. The
+> rollup phase is a real, working capability, not a partial or
+> honest-negative-result phase: `CREATE MATERIALIZED VIEW <name> AS
+> SELECT ...` registers an exact-match rollup; a query that structurally
+> matches (same base table, same GROUP BY set, same aggregate set —
+> order/alias-independent) is transparently answered from it with
+> provenance always visible (`QueryMetrics::rollup_answered`); a
+> non-matching query or a stale/failed-refresh rollup always falls back
+> correctly; INSERT/DELETE/UPDATE against a rollup's base table eagerly,
+> automatically refresh every dependent rollup (measured cost: 3-5.6x
+> mutation latency at SF=1 per attached rollup, tens of ms absolute — a
+> real, named, full-base-table-rescan-per-rollup cost, not an incremental
+> merge). Scope is deliberately narrow, matching this program's own
+> "narrow slice first" discipline: single native base table only, exact
+> GROUP BY/aggregate SET match only (no subsumption/coarser-grouping
+> reasoning), no distributed rollups, no `ALTER`/`DROP`/`REFRESH
+> MATERIALIZED VIEW` SQL, no new background scheduler — see the archived
+> epic's own close-out for the complete boundary and every commit. A QA
+> broader-validation sweep during this phase's close-out also found and
+> fixed one real, pre-existing, general SQL binder bug (`ORDER BY <a
+> GROUP BY column's original name>` when the SELECT list only exposes
+> that column under a different alias) — unrelated to rollups or native
+> tables specifically, but surfaced by this phase's own testing; see
+> CLAUDE.md's "Materialized rollups: QA close-out" section for the full
+> story. Phase 3 (GPU/RAM/disk tiering) is the only phase remaining and
+> is not started. A correctness bug in the mutation epic's own QA
+> close-out (`SpillableHashJoinExec`'s spill path, unrelated to native
+> tables or rollups specifically) remains open per `spill-join-
+> correctness`'s own close-out (root cause unconfirmed, a real but low
+> — 0.34% pooled — reproduction rate) and continues to not block this
+> PRD's remaining phase.
 
 # PRD: native-tables
 

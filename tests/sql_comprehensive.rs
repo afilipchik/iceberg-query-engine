@@ -753,6 +753,50 @@ mod group_by {
         let result = ctx.sql(sql).await.unwrap();
         assert_eq!(result.row_count, 3); // A, B, C
     }
+
+    /// Regression test (found via the native-tables-rollups epic's task
+    /// 004 QA close-out broader validation sweep, but general and
+    /// pre-existing -- has nothing to do with rollups/native tables).
+    /// `ORDER BY <group-by column's ORIGINAL name>` used to crash at
+    /// EXECUTION time with "Column not found" whenever the SELECT list
+    /// exposed that same column only under a DIFFERENT alias and placed
+    /// it after other aggregate columns -- `extend_projection_for_sort`
+    /// (`src/planner/binder.rs`) had a blanket bailout for any `Project`
+    /// whose child is an `Aggregate`, so the missing sort-key column was
+    /// never rescued into the widened projection the way the equivalent
+    /// non-aggregate shape (`SELECT id FROM t ORDER BY price`) already
+    /// was. Fixed by removing that blanket bailout -- the function's own
+    /// resolve-based check already safely gates what can be widened.
+    #[tokio::test]
+    async fn test_order_by_group_key_under_its_original_name_when_aliased_in_select() {
+        let ctx = create_test_context();
+        let sql = "SELECT COUNT(*) AS cnt, status AS s FROM orders GROUP BY status ORDER BY \
+                    status";
+        let result = ctx.sql(sql).await.unwrap();
+        assert_eq!(result.row_count, 3); // cancelled, completed, pending
+
+        let batch = &result.batches[0];
+        let statuses = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let counts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        // ASC order (default), and the fix must produce the CORRECT sort,
+        // not just avoid crashing.
+        assert_eq!(
+            (0..3).map(|i| statuses.value(i)).collect::<Vec<_>>(),
+            vec!["cancelled", "completed", "pending"]
+        );
+        assert_eq!(
+            (0..3).map(|i| counts.value(i)).collect::<Vec<_>>(),
+            vec![1, 4, 1]
+        );
+    }
 }
 
 // ============================================================================

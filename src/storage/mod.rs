@@ -69,3 +69,11 @@ pub mod native_delete;
 /// epic. A module is otherwise never compiled, so this registration line
 /// is unavoidable — same reasoning as `native_manifest`'s own line above.
 pub mod native_update;
+
+/// Rollup matching/substitution mechanism (canonicalization, shape
+/// recognition, registry-snapshot matching, plan rewriting). Task 001 of
+/// the native-tables-rollups epic; calls into `native_manifest` for the
+/// `RollupMeta`/`RollupColumn` fields it reads and builds. A module is
+/// otherwise never compiled, so this registration line is unavoidable —
+/// same reasoning as `native_manifest`'s own line above.
+pub mod native_rollup;
