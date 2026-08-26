@@ -1940,8 +1940,11 @@ Load-bearing decisions (each forced by a real failure):
   runtime; **libnvrtc comes from the repo .venv's nvidia pip wheel** — gpu
   builds need `LD_LIBRARY_PATH=$PWD/.venv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib`.
 - `QE_GPU=0` kills routing at plan time even in a gpu build.
-- Not done (documented): eviction/QE_GPU_CACHE_MB cap, GPU joins, GPU
-  parquet decode, Lance/Iceberg providers, distributed-worker GPU.
+- **VRAM budget/eviction (`QE_GPU_CACHE_MB`) implemented 2026-08-26** —
+  see "VRAM budget + LRU eviction" below; superseded the "not done" note
+  this bullet used to carry.
+- Not done (documented): GPU joins, GPU parquet decode, Lance/Iceberg
+  providers, distributed-worker GPU.
 
 **CPU vs GPU split, full SF=10 TPC-H (2026-08-23, `duckdb-parity-2`
 close-out).** Ran the SF=10 sweep both with and without GPU routing, as
@@ -2024,6 +2027,64 @@ bottleneck is something other than scan/decode or the reduction kernel
 lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib NATIVE_DIR=data/
 tpch-10gb-native/lineitem cargo run --release --features gpu --example
 native_gpu_check` (add `QE_GPU=0` for the CPU leg).
+
+### VRAM budget + LRU eviction + the mutation-driven leak, FIXED (native-tables-tiering epic, task 001, 2026-08-26)
+
+The gap named above ("Not done: eviction/QE_GPU_CACHE_MB cap") is
+closed. `GpuEngine`'s resident-column cache (`src/physical/gpu.rs`) was
+insert-only with zero VRAM byte accounting — and because a native
+table's `identity()` is `table_id ++ version` (`native_table.rs`),
+every INSERT/DELETE/UPDATE against a GPU-queried native table produced
+a new cache key, permanently leaking the old version's columns. Both
+are now fixed by ONE mechanism, entirely inside the worker thread's
+existing single-consumer loop (no new concurrency surface): every
+resident column/group-codes buffer is byte-accounted (`GpuCache`,
+`ColumnEntry`/`CodesEntry`) and tagged with an LRU tick; before each
+upload, `GpuCache::reserve` evicts the globally least-recently-used
+entries until the upload fits under **`QE_GPU_CACHE_MB`** (now actually
+implemented — default 24576 MiB, re-read from the environment on every
+check rather than cached at startup). No native-table-specific code
+exists in the fix: a superseded version's columns are never touched
+again by any future query, so under plain LRU they are always the
+coldest entries and are evicted first — the mutation leak closes as a
+direct consequence of the general eviction policy, not a special case.
+
+**Leak confirmed empirically first** (`examples/
+gpu_cache_tiering_check.rs`, 2,000,000-row native table, 15 mutation
+cycles, real `nvidia-smi` sampling): pre-fix, VRAM grew **1864 → 2088
+MiB (+224 MiB)** while the table's own row count oscillated within
+0.05% of constant. **Post-fix, same repro with `QE_GPU_CACHE_MB=24`**:
+VRAM stayed **perfectly flat at 1767 MiB across all 16 table
+versions**, with the query's answer independently verified cell-exact
+every single cycle (correctness and the leak fix demonstrated
+together, in the same run). A dedicated hardware-backed test
+(`tests/gpu_cache_tests.rs`) confirms real eviction under an 8 MiB
+budget (`eviction_count=13`, `resident_bytes` bounded at ~7.03 MiB vs.
+~16 MB unbounded) and that a column evicted then re-requested
+transparently re-uploads and answers cell-exact — the exact same
+"not yet resident" path a never-uploaded column already took, no new
+re-upload logic. A necessary related fix: the pre-existing `queued`
+upload-dedup `HashSet` was never cleared, which — once eviction
+existed — would have silently and permanently blocked re-upload of any
+evicted column forever; fixed alongside (`GpuEngine::unmark_queued`).
+
+**No regression to the Q6-shape win, measured same-session before/after**
+(`git stash` isolated this task's own diff, rebuilt, ran
+`native_gpu_check` on both sides of the SAME session against SF=10
+`lineitem`): Q6 warm 5.405ms → 5.479ms (+1.4%), Q1 warm 482.5ms →
+501.8ms (+4.0%) — both within this program's normal run-to-run noise
+band, confirming the budget/eviction bookkeeping adds no measurable
+cost to the already-resident (no-eviction-pressure) warm path. A fresh
+CPU baseline taken in the same session (~87ms Q6) puts today's
+GPU-vs-CPU ratio at ~16x — below the "~18-20x" figure recorded above,
+but that shift traces to the CPU baseline itself moving (140ms → 87ms
+across sessions, on this shared, multi-agent development machine, in a
+code path this task's diff never touches), not to anything this task
+changed; the before/after-fix GPU numbers agree with each other far
+more tightly than either does with the older session's CPU number.
+
+Full task detail, every command, and the complete Outcome section:
+`.claude/epics/native-tables-tiering/001.md`.
 
 ## Expression Compilation — researched, priced, narrowly adopted (2026-08-22)
 
