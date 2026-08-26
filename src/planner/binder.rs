@@ -5251,10 +5251,37 @@ fn extend_projection_for_sort(
     let LogicalPlan::Project(project) = plan else {
         return Ok((plan, None));
     };
-    if matches!(project.input.as_ref(), LogicalPlan::Aggregate(_)) {
-        return Ok((LogicalPlan::Project(project), None));
-    }
 
+    // NOTE: this used to unconditionally bail out here whenever
+    // `project.input` was an `Aggregate` (added 2026-08-09 alongside this
+    // function itself, ac8d4be, as a conservative "not proven out yet"
+    // scope limit for the vector-search feature -- never revisited since).
+    // That blanket bailout is REMOVED (native-tables-rollups epic, task
+    // 004 QA close-out, 2026-08-26): it left a real, reproducible crash for
+    // `SELECT <aggregates...>, <group-by-col> AS <alias> FROM t GROUP BY
+    // <group-by-col> ORDER BY <group-by-col>` (the ORIGINAL, un-aliased
+    // name, referenced anywhere the SELECT list doesn't ALSO expose it
+    // verbatim) -- `bind_order_by` never validates a bare identifier
+    // against the schema (it just emits `Expr::Column` unconditionally),
+    // so with no rescue the Sort node's input silently lacks its own sort
+    // key and physical execution fails with a confusing "Column not
+    // found" instead of a clean bind-time error or a correct answer.
+    // Found via `native-tables-rollups` task 004's own broader validation
+    // sweep, but confirmed general and pre-existing -- reproduces on plain
+    // in-memory TPC-H data with zero rollup involved
+    // (`query_engine sql "SELECT COUNT(*) AS cnt, ..., l_shipmode AS mode
+    // FROM lineitem GROUP BY l_shipmode ORDER BY l_shipmode"`).
+    //
+    // Removing the bailout is safe because the resolve-based check just
+    // below (`input_schema.resolve_column(col)`) already gates every
+    // widened column, Aggregate or not, and for an Aggregate `project.input`,
+    // `input_schema` is `AggregateNode::schema()` -- which contains ONLY
+    // the GROUP BY key output fields and the aggregate-expression output
+    // fields, nothing else. A column can therefore only be "rescued" here
+    // if it already names a legitimate per-group scalar (a group key or an
+    // already-computed aggregate result) that the Aggregate node itself
+    // produces -- never a raw, pre-aggregation row column, so this can
+    // never smuggle in an ungrouped column and break GROUP BY semantics.
     let input_schema = project.input.schema();
     let mut extra_exprs = Vec::new();
     let mut extra_fields = Vec::new();
