@@ -3221,6 +3221,159 @@ there because the DuckDB oracle reads the ORIGINAL un-mutated parquet,
 so it would legitimately mismatch; correctness of mutation itself is
 what the cell-exact validation above already established).
 
+### Materialized rollups: matching/substitution mechanism (native-tables-rollups epic, task 001, 2026-08-26)
+
+Phase 4 of the native-tables PRD, task 1 of 4. Proves the epic's own
+real risk — can a query be matched against a registered rollup
+definition and transparently, correctly answered from it — against a
+PROGRAMMATIC registration API (`ExecutionContext::register_rollup`, not
+SQL DDL yet; that is task 002's job). Genuinely new-algorithm-class
+work: a dedicated research pass confirmed nothing in this codebase
+previously reasoned about equivalence between two independently-planned
+queries.
+
+**Data model.** `NativeManifest` (`src/storage/native_manifest.rs`)
+gains an additive, `#[serde(default)]` `rollup: Option<RollupMeta>`
+field — every manifest the foundation/mutation epics ever wrote
+deserializes with `None`, unchanged behavior (mirrors `Segment::
+deleted_rows`'s own precedent exactly). `RollupMeta` records:
+`base_table` (the registered name), `defining_sql` (verbatim, for
+provenance/a future DDL surface, NOT used for matching), `base_table_id`/
+`base_table_version` (staleness bookkeeping — see below), and
+`columns: Vec<RollupColumn>` (each GROUP BY/aggregate's canonical shape
+key paired with its physical column name in the rollup's own native
+table).
+
+**The matching mechanism** (`src/storage/native_rollup.rs`, new sibling
+module to `native_write.rs`/`native_delete.rs`/`native_update.rs`):
+`canonical_expr_key` renders an `Expr` into an alias-blind, table-
+qualification-blind string key (strips every `Expr::Alias` wrapper and
+every `Column.relation` before falling back to a Debug-based rendering
+of each node's own deterministic "tag" — this task's own answer to a
+question the codebase's two existing plan-comparison precedents
+(`optimizer/mod.rs`'s fixpoint-loop Debug-string hash, `subquery.rs`'s
+`plan_hash`) leave open: both compare for EXACT identity, never semantic
+equivalence). `recognize()` matches the `Project(Aggregate(Scan))` shape
+— exactly what `Binder::bind_select` produces, unmodified, for a plain
+single-table GROUP BY query — straight off the RAW BOUND plan, BEFORE
+the ordinary optimizer pipeline runs (a deliberate choice: several rules
+rewrite an `AggregateNode`'s own fields or push work into the `Scan`,
+which would make an incoming query's OPTIMIZED shape diverge from a
+rollup's recorded shape for reasons having nothing to do with whether
+the two queries are equivalent).
+
+**Matching semantics, decided explicitly (not left implicit, per the
+task's own gotcha warning)**:
+- GROUP BY and aggregate SETs are compared order-independently (`GROUP
+  BY a, b` matches `GROUP BY b, a`) via SORTED-MULTISET equality (element
+  COUNT still matters — nothing is silently collapsed the way a true set
+  would).
+- Column aliasing never affects matching (`SUM(x) AS a` and `SUM(x) AS
+  b` canonicalize identically); the substituted plan's OUTPUT columns
+  always reflect the INCOMING query's own aliases, never the rollup's.
+- Table qualification is stripped (`l_returnflag`/`lineitem.l_returnflag`/
+  `l.l_returnflag` all canonicalize the same) — safe only because this
+  task's scope is single-base-table, no-JOIN rollups (structurally
+  guaranteed by `recognize`).
+- The requested aggregate SET must match EXACTLY, not be a subset in
+  either direction — coarser/subsumption matching is explicitly out of
+  scope (the epic's own "narrow slice first" decision).
+- A query's SELECT list may reorder/alias/omit trailing columns freely
+  (e.g. `SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY
+  l_returnflag, l_linestatus`, omitting `l_linestatus` from the output
+  while still grouping by it) — matching is against the `Aggregate`
+  node's OWN `group_by`/`aggregates` fields, independent of what the
+  outer `Project` exposes — but every SELECT list item itself must be a
+  bare (optionally aliased) column reference, never a computed
+  expression.
+- A WHERE clause anywhere (rollup definition OR incoming query) always
+  misses the shape and falls back correctly — this epic ships
+  unfiltered, exact-match rollups only.
+
+**Where this plugs in — NOT an `OptimizerRule`, per the epic's own
+architecture decision**: `OptimizerRule::optimize(&self, plan) ->
+Result<LogicalPlan>` has no catalog/registry parameter by design, so
+`ExecutionContext` (`src/execution/context.rs`) itself owns
+`rollup_candidates()` (builds a `&[RollupCandidate]` snapshot from
+`self.tables`, EXCLUDING any rollup whose recorded base-table identity
+no longer matches the base table's CURRENT `(table_id, version)` — this
+IS task 001's staleness enforcement) and `substitute_rollups()` (calls
+`native_rollup::substitute`, a `VectorSearchPushdown`-style recursive
+plan rewrite), wired into `sql()` and `optimized_plan()` BEFORE
+`Optimizer::optimize()` runs. Zero-cost when no rollup is registered:
+`rollup_candidates()` returns empty and substitution short-circuits
+before walking the plan tree at all — a rollup is additive, confirmed by
+the full pre-existing suite staying green with zero regression.
+
+**Registration** (`ExecutionContext::register_rollup(name, base_table,
+defining_sql)`, `&mut self`, async): the base table must already be a
+REGISTERED NATIVE table (staleness bookkeeping needs a real (table_id,
+version) pair, which only a native table's manifest provides — a
+rollup over plain parquet/Iceberg/Lance is out of scope). Binds the
+defining SQL, validates its shape via the SAME `recognize()` an
+incoming query is later matched against, then reuses `create_table_as_
+select`'s own plan/optimize/execute/stream pipeline UNCHANGED to write
+the rollup as an ordinary native table via `native_write::write_batches`
+(a rollup's row data IS a native table) — then attaches `RollupMeta` to
+the just-published manifest via a SECOND, small, manifest-only atomic
+patch (`native_manifest::write_manifest_atomic`, the SAME single-file
+atomic-rename primitive the mutation epic's Append/DELETE/UPDATE paths
+already established for exactly this "patch just the manifest" shape).
+
+**Provenance** (G3/PRD G5): `QueryMetrics::rollup_answered: Vec<String>`
+— empty when no rollup was involved, else the name(s) of every rollup
+that answered some subtree, checked directly by every integration test
+(never left implicit). `QE_DEBUG_ROLLUP=1` traces every match/no-match/
+staleness decision to stderr, matching this codebase's established
+diagnostic-switch convention.
+
+**Cell-exact validated**: `tests/native_rollup_tests.rs` (15 tests, real
+SQL-level path, `data/tpch-1mb`) — the PRD's own worked example
+(`lineitem` grouped by `l_returnflag`/`l_linestatus`, SUM/COUNT)
+cell-exact vs. direct base-table computation; order-independence;
+alias-blindness; subset-projection; THREE explicit non-matching-shape
+fallback tests (different GROUP BY set, added filter, different
+aggregate) each asserting the FALLBACK ANSWER stays cell-exact, not just
+"doesn't crash"; staleness after a real base-table DELETE, fallback
+answer verified cell-exact vs. an independently-mutated reference
+context; 5 `register_rollup` validation/error-path tests.
+`examples/native_rollup_cell_exact_check.rs` + `scripts/
+native_rollup_cell_exact_check.py`: real SF=1 scale (`data/tpch-1gb`'s
+`lineitem`, 6,000,000 rows), a query that deliberately differs from the
+defining query in GROUP BY order, aliases AND SELECT-list order,
+independently verified against a fresh DuckDB computation over the same
+source parquet — PASS, 6/6 groups, within this repo's own PRE-EXISTING
+float-SUM tolerance (`scripts/native_bench_compare.py`'s `cell_compare`:
+`tol = max(0.02, |v|*1e-9)`; a first pass using flat 6-decimal rounding
+reported spurious ~1e-15-relative mismatches, exactly the
+float64-summation-order noise class that tolerance already exists to
+absorb — not a rollup-specific issue).
+
+**Full suite green, all four feature combinations** (default/lance/gpu/
+pulsar), zero regression: 1224/1289/1224/1227 passed respectively (each
+exactly the prior baseline + this task's 34 new tests), 0 failed
+anywhere.
+
+**What's explicitly NOT done, per the epic's own task breakdown** (not
+silently narrowed — named here): SQL DDL (`CREATE MATERIALIZED VIEW`,
+task 002); the refresh-on-write model that keeps `RollupMeta` current
+automatically on base-table INSERT/DELETE/UPDATE (task 003 — today, a
+mutated base table's rollup simply goes stale and is excluded from
+matching until manually re-registered); subsumption/coarser-grouping
+matching (explicitly out of scope for this epic, named by the epic
+itself as "a genuinely new algorithm class"); rollups over a non-native
+base table; a subquery-embedded aggregate opportunity
+(`LogicalPlan::children()` does not expose plans inside
+`Expr::ScalarSubquery`/`Exists`/`InSubquery`, so `substitute`'s
+recursive walk never visits them); distributed rollups.
+
+Reproduce: `scripts/claude-safe-build.sh cargo test native_rollup` (35
+unit+integration tests); `scripts/claude-safe-build.sh cargo build
+--release --example native_rollup_cell_exact_check && scripts/
+claude-safe-build.sh ./target/release/examples/
+native_rollup_cell_exact_check && .venv/bin/python scripts/
+native_rollup_cell_exact_check.py` (DuckDB oracle, real SF=1 scale).
+
 ### Current limitations (explicit, matching this epic's own G5 boundary and the PRD's phase plan)
 
 - **No filter/row-group pruning at scan level.** `NativeTable::
@@ -3358,12 +3511,21 @@ what the cell-exact validation above already established).
   distributed-write story of any kind — not reachable from `serve`'s
   HTTP/Flight surface at all, matching CREATE TABLE's own pre-existing
   boundary from phase 1.
-- **GPU/RAM/disk tiering and materialized rollups are not built** —
-  phases 3 and 4 of the PRD. This epic only kept the GPU-offload identity
-  hook open (above) so that work isn't blocked from zero; native-tables-
-  mutation task 006 confirmed offload still engages correctly (VRAM
-  growth + correct post-mutation values) against a table with a
-  non-empty deletion vector — see Benchmarks below.
+- **GPU/RAM/disk tiering is not built** — phase 3 of the PRD. This epic
+  only kept the GPU-offload identity hook open (above) so that work
+  isn't blocked from zero; native-tables-mutation task 006 confirmed
+  offload still engages correctly (VRAM growth + correct post-mutation
+  values) against a table with a non-empty deletion vector — see
+  Benchmarks below.
+- **Materialized rollups (phase 4 of the PRD) have their core matching/
+  substitution mechanism built and cell-exact validated** (native-
+  tables-rollups epic, task 001, see above) — but only the programmatic
+  registration API, single-base-table/unfiltered/exact-match shapes, and
+  manual (not automatic) staleness: no SQL DDL yet (task 002), no
+  refresh-on-write (task 003 — a mutated base table's rollup goes stale
+  and stays excluded from matching until manually re-registered), and no
+  subsumption/coarser-grouping matching (explicitly out of scope for the
+  whole epic).
 
 ### Benchmarks (2026-08-23, task 008 close-out)
 
