@@ -70,9 +70,21 @@ async fn main() -> query_engine::Result<()> {
     ctx.register_native_table("lineitem", &native_dir)?;
     println!("registered native lineitem from {native_dir}");
 
+    // native-tables-tiering task 003: default stays 6 (unchanged from every
+    // prior recorded measurement of this example) -- QE_GPU_CHECK_ITERS
+    // exists only so a slower-than-usual upload warm-up window (this
+    // program's own established shared-machine-contention caveat, see
+    // CLAUDE.md's "GPU Aggregate Offload" section) can still be given
+    // enough iterations to reach a genuinely fully-resident warm state
+    // before reporting a "warm" number, without changing the default
+    // behavior anything else measuring this example relies on.
+    let iters: usize = std::env::var("QE_GPU_CHECK_ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6);
     for (label, sql) in [("Q1", Q1), ("Q6", Q6)] {
         println!("\n=== {label} ===");
-        for iter in 1..=6 {
+        for iter in 1..=iters {
             let t0 = Instant::now();
             let result = ctx.sql(sql).await?;
             println!(
