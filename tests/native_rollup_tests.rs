@@ -339,13 +339,43 @@ async fn provenance_distinguishes_rollup_answered_from_base_table_answered() {
 }
 
 // ============================================================================
-// Staleness: a base-table mutation after registration makes the rollup
-// stop matching, and the fallback answer reflects the NEW base-table
-// state correctly.
+// Staleness: task 001's own bookkeeping mechanism (a base-table mutation
+// makes a rollup's recorded (table_id, version) stop matching the base
+// table's CURRENT one, so it is excluded from matching and the fallback
+// answer reflects the NEW base-table state correctly). Task 003
+// (native-tables-rollups epic) wires an EAGER refresh into
+// `ExecutionContext::insert_into_native_table`/`delete_from_native_table`/
+// `update_native_table` specifically, so a mutation that goes through
+// THOSE entrypoints no longer leaves a dependent rollup stale at all --
+// see `native_rollup_refresh_tests.rs` for task 003's own dedicated
+// coverage (eager refresh through all three mutation types, the
+// multi-rollup case, and the refresh-fails-so-correctly-falls-back case).
+// The two tests below still exist to prove the STALENESS BOOKKEEPING
+// ITSELF (task 001's own mechanism, independent of whatever triggers a
+// mutation) continues to work correctly and is not somehow disabled or
+// weakened by task 003's addition.
 // ============================================================================
 
 #[tokio::test]
-async fn a_stale_rollup_after_a_base_table_mutation_falls_back_and_stays_correct() {
+async fn a_base_table_mutation_through_execution_context_now_eagerly_refreshes_the_rollup() {
+    // Renamed/re-asserted for task 003 (native-tables-rollups epic): this
+    // test used to be named `..._falls_back_and_stays_correct` and
+    // asserted the query stopped matching after the DELETE below. That
+    // assertion described a real but explicitly TEMPORARY gap named by
+    // task 001's own Outcome ("today, a mutated base table's rollup
+    // simply goes stale ... and stays that way until register_rollup is
+    // called again manually ... task 003's job"). Task 003 closes exactly
+    // that gap for THIS entrypoint (`ExecutionContext::
+    // delete_from_native_table`, called below) by eagerly refreshing every
+    // dependent rollup before the DELETE call returns -- so the correct,
+    // intended behavior through this entrypoint is now "the SAME query is
+    // STILL answered by the rollup, with fresh, post-delete data," not
+    // "falls back." The staleness BOOKKEEPING mechanism itself (excluding
+    // a rollup whose recorded version doesn't match) is unchanged and
+    // still directly tested by
+    // `staleness_bookkeeping_still_correctly_excludes_a_rollup_mutated_outside_execution_context`
+    // immediately below, which mutates the base table WITHOUT going
+    // through this refresh-wired entrypoint.
     let (mut ctx, _tmp) = build_with_rollup().await;
     let query = "SELECT l_returnflag, l_linestatus, SUM(l_quantity) AS sum_qty, \
                  SUM(l_extendedprice) AS sum_base_price, COUNT(*) AS count_order \
@@ -359,9 +389,9 @@ async fn a_stale_rollup_after_a_base_table_mutation_falls_back_and_stays_correct
         vec!["lineitem_rollup".to_string()]
     );
 
-    // Mutate the BASE table (not the rollup) -- bumps lineitem_native's
-    // own snapshot.version, which the rollup's recorded base_table_version
-    // no longer matches.
+    // Mutate the BASE table through the real ExecutionContext entrypoint
+    // -- bumps lineitem_native's own snapshot.version AND (task 003)
+    // eagerly refreshes lineitem_rollup before this call returns.
     let deleted = ctx
         .delete_from_native_table("DELETE FROM lineitem_native WHERE l_orderkey = 1")
         .await
@@ -370,15 +400,29 @@ async fn a_stale_rollup_after_a_base_table_mutation_falls_back_and_stays_correct
         deleted.rows_deleted > 0,
         "the delete must actually remove real rows"
     );
+    assert_eq!(
+        deleted.rollups_refreshed.len(),
+        1,
+        "exactly one dependent rollup must have been refreshed"
+    );
+    assert_eq!(deleted.rollups_refreshed[0].rollup_name, "lineitem_rollup");
+    assert!(
+        deleted.rollups_refreshed[0].error.is_none(),
+        "the refresh must have succeeded: {:?}",
+        deleted.rollups_refreshed[0].error
+    );
 
     let after = ctx
         .sql(query)
         .await
         .expect("query must still succeed after the base mutates");
-    assert!(
-        after.metrics.rollup_answered.is_empty(),
-        "a rollup whose recorded base-table version no longer matches the base table's \
-         CURRENT version must be excluded from matching -- never silently stale"
+    assert_eq!(
+        after.metrics.rollup_answered,
+        vec!["lineitem_rollup".to_string()],
+        "task 003: the rollup was eagerly refreshed as part of the DELETE call itself, so the \
+         SAME query must STILL be answered by it -- now reflecting the post-delete data, never \
+         falling back to the base table for a table this codebase's own refresh wiring keeps \
+         current automatically"
     );
 
     // Independent ground truth: a SEPARATE context, loads the SAME source,
@@ -393,13 +437,97 @@ async fn a_stale_rollup_after_a_base_table_mutation_falls_back_and_stays_correct
     assert_eq!(
         render(&after.batches),
         render(&reference.batches),
-        "the post-mutation fallback answer must be cell-exact vs. an independently \
-         recomputed reference over the identically-mutated base table"
+        "the refreshed rollup's answer must be cell-exact vs. an independently recomputed \
+         reference over the identically-mutated base table"
     );
     // And, for good measure, the post-mutation answer must differ from the
-    // pre-mutation (stale) one -- otherwise this test would not actually
-    // be exercising a real data change.
+    // pre-mutation one -- otherwise this test would not actually be
+    // exercising a real data change.
     assert_ne!(render(&before.batches), render(&after.batches));
+}
+
+#[tokio::test]
+async fn staleness_bookkeeping_still_correctly_excludes_a_rollup_mutated_outside_execution_context()
+{
+    // Task 001's own staleness bookkeeping (`ExecutionContext::
+    // rollup_candidates`) is a property of the MANIFEST comparison, not
+    // of which code path triggered a mutation -- this test proves it
+    // still holds when the base table's underlying storage is mutated
+    // via the lower-level `storage::native_delete::delete_from_native_table`
+    // function DIRECTLY, bypassing `ExecutionContext::
+    // delete_from_native_table` entirely (and therefore bypassing task
+    // 003's eager-refresh wiring, which lives ONLY in the
+    // `ExecutionContext` entrypoint, not in the storage layer itself).
+    // This is exactly the ORIGINAL scenario/coverage of this file's own
+    // pre-task-003 staleness test, preserved here at the layer where it
+    // is still literally true, rather than silently dropped.
+    use query_engine::planner::{BinaryOp, Column, Expr, ScalarValue};
+    use query_engine::storage::native_delete;
+
+    fn orderkey_eq_one() -> Expr {
+        Expr::BinaryExpr {
+            left: Box::new(Expr::Column(Column::new("l_orderkey"))),
+            op: BinaryOp::Eq,
+            right: Box::new(Expr::Literal(ScalarValue::Int64(1))),
+        }
+    }
+
+    let (mut ctx, tmp) = build_with_rollup().await;
+    let query = "SELECT l_returnflag, l_linestatus, SUM(l_quantity) AS sum_qty, \
+                 SUM(l_extendedprice) AS sum_base_price, COUNT(*) AS count_order \
+                 FROM lineitem_native GROUP BY l_returnflag, l_linestatus \
+                 ORDER BY l_returnflag, l_linestatus";
+
+    let before = ctx.sql(query).await.unwrap();
+    assert_eq!(
+        before.metrics.rollup_answered,
+        vec!["lineitem_rollup".to_string()]
+    );
+
+    // Mutate lineitem_native's on-disk storage directly -- no
+    // ExecutionContext involved, so no refresh is ever attempted.
+    let table_dir = tmp.path().join("lineitem_native");
+    let deleted =
+        native_delete::delete_from_native_table(&table_dir, Some(&orderkey_eq_one())).await;
+    let deleted = deleted.expect("direct low-level delete must succeed");
+    assert!(
+        deleted.rows_deleted > 0,
+        "the delete must actually remove real rows"
+    );
+
+    // Re-register the (now-mutated) base table so `ctx.sql` sees its NEW
+    // version -- mirrors what `ExecutionContext::delete_from_native_table`
+    // itself does, minus the refresh step this test deliberately skips.
+    ctx.register_native_table("lineitem_native", &table_dir)
+        .expect("re-register the mutated base table");
+
+    let after = ctx
+        .sql(query)
+        .await
+        .expect("query must still succeed after the base mutates");
+    assert!(
+        after.metrics.rollup_answered.is_empty(),
+        "a rollup whose recorded base-table version no longer matches the base table's \
+         CURRENT version must be excluded from matching when nothing ever refreshed it -- \
+         task 001's staleness bookkeeping must still hold independent of task 003's refresh \
+         wiring"
+    );
+
+    // The fallback answer must still be correct (cell-exact vs. an
+    // independent reference), never silently wrong or silently stale.
+    let (mut ref_ctx, _tmp3) = build_lineitem_native().await;
+    ref_ctx
+        .delete_from_native_table("DELETE FROM lineitem_native WHERE l_orderkey = 1")
+        .await
+        .expect("reference delete must succeed");
+    let reference = ref_ctx.sql(query).await.unwrap();
+    assert_eq!(render(&after.batches), render(&reference.batches));
+    assert_ne!(
+        render(&before.batches),
+        render(&after.batches),
+        "the fallback answer must actually reflect the real data change, not coincidentally \
+         match the pre-mutation rollup answer"
+    );
 }
 
 // ============================================================================
