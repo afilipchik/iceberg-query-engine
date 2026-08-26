@@ -1923,6 +1923,36 @@ async fn run_repl(
                             }
                         }
                     }
+                    // `CREATE MATERIALIZED VIEW <name> AS SELECT ...`
+                    // (native-tables-rollups epic, task 002) -- same "needs
+                    // &mut ctx, not sql()'s materializing &self path"
+                    // reasoning as CREATE TABLE/INSERT/DELETE/UPDATE above.
+                    // A plain (non-materialized) `CREATE VIEW` does NOT
+                    // match this arm (`create_materialized_view_target_name`
+                    // returns `None` for it) and falls through to the
+                    // catch-all `sql()` arm below, which reports
+                    // `Binder::bind()`'s own "not supported" refusal.
+                    Ok(stmt)
+                        if query_engine::planner::create_materialized_view_target_name(&stmt)
+                            .is_some() =>
+                    {
+                        match ctx.create_materialized_view(line).await {
+                            Ok(r) => {
+                                println!(
+                                    "Created materialized view '{}' as a rollup of '{}' ({} rows, {} segment(s), now at version {}) in {:.3}ms\n",
+                                    r.rollup_name,
+                                    r.base_table,
+                                    r.rows,
+                                    r.segments,
+                                    r.version,
+                                    start.elapsed().as_secs_f64() * 1000.0
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("Error: {}\n", e);
+                            }
+                        }
+                    }
                     _ => match ctx.sql(line).await {
                         Ok(result) => {
                             // Use the configured output format

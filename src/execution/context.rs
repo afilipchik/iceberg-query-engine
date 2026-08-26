@@ -773,6 +773,82 @@ impl ExecutionContext {
         })
     }
 
+    /// Execute `CREATE MATERIALIZED VIEW <name> AS SELECT ...` end to end
+    /// (native-tables-rollups epic, task 002): parse, validate + bind the
+    /// statement via the ordinary `Binder::bind()` path (refuses every
+    /// unsupported `CreateView` clause by name and requires `materialized
+    /// == true` -- see `planner::binder`'s
+    /// `require_supported_create_view_shape`), recover the defining
+    /// query's own base table from that SAME bound plan via
+    /// `native_rollup::recognize` (task 001's own recognition function,
+    /// reused completely UNCHANGED -- guarantees this layer and
+    /// `register_rollup`'s own internal re-derivation can never disagree
+    /// about which table a rollup is defined against), then hands
+    /// `(rollup_name, base_table, defining_sql)` to task 001's
+    /// `register_rollup`, which does all the real work (re-parses/
+    /// re-binds/plans/optimizes/executes/writes/registers). This method is
+    /// purely a DDL front end onto that mechanism, per this task's own
+    /// scope -- it never itself touches the plan/execute/write pipeline.
+    ///
+    /// `&mut self`, unlike `sql()`'s `&self`: `register_rollup` mutates
+    /// `self.tables`/`self.catalog`, exactly like `create_table_as_select`.
+    ///
+    /// `IF NOT EXISTS` is refused by name
+    /// (`require_supported_create_view_shape`), not silently accepted and
+    /// ignored -- see that function's own doc for why (mirrors `CREATE
+    /// TABLE`'s identical `ct.if_not_exists` precedent exactly). A rollup
+    /// registered under a name that already holds a rollup (or any native
+    /// table) is replaced wholesale, matching `register_rollup`'s/
+    /// `create_table_as_select`'s own re-registration semantics -- this is
+    /// deliberately NOT what `IF NOT EXISTS` asks for (skip silently if it
+    /// already exists), which is exactly why this epic refuses the clause
+    /// outright rather than mapping it onto that different behavior.
+    pub async fn create_materialized_view(&mut self, sql: &str) -> Result<RegisterRollupResult> {
+        let stmt = parser::parse_sql(sql)?;
+        let rollup_name =
+            crate::planner::create_materialized_view_target_name(&stmt).ok_or_else(|| {
+                QueryError::InvalidArgument(format!(
+                    "create_materialized_view expects a CREATE MATERIALIZED VIEW <name> AS \
+                     SELECT ... statement, got: {sql}"
+                ))
+            })?;
+
+        let sqlparser::ast::Statement::CreateView(cv) = &stmt else {
+            unreachable!(
+                "create_materialized_view_target_name only returns Some for a \
+                 Statement::CreateView"
+            )
+        };
+
+        let mut binder = Binder::new(&self.catalog);
+        // Validates the CREATE VIEW's shape (refusing every unsupported
+        // clause by name, requiring `materialized`) AND binds the inner
+        // SELECT in one call: see `Binder::bind()`'s `Statement::CreateView`
+        // arm. The resulting `LogicalPlan` is used ONLY to recover the base
+        // table name below -- `register_rollup` independently re-parses and
+        // re-binds `defining_sql` itself (deliberately not refactored into
+        // a shared helper under this task's time budget, mirroring task
+        // 001's own established precedent for this exact tradeoff -- see
+        // that method's own doc).
+        let logical = binder.bind(&stmt)?;
+
+        let recognized = native_rollup::recognize(&logical).ok_or_else(|| {
+            QueryError::NotImplemented(format!(
+                "CREATE MATERIALIZED VIEW {rollup_name}: the defining query must bind to \
+                 exactly `SELECT <GROUP BY column(s) and/or aggregate(s), any order, any \
+                 aliases> FROM <table> GROUP BY <...>` — no WHERE/JOIN/HAVING/ORDER BY/LIMIT/\
+                 DISTINCT, every SELECT item a bare (optionally aliased) column reference, and \
+                 the FROM table itself must be unaliased (native-tables-rollups epic's \
+                 deliberate exact-match-only scope — see \
+                 native_rollup::require_rollup_defining_shape)"
+            ))
+        })?;
+
+        let defining_sql = cv.query.to_string();
+        self.register_rollup(rollup_name, recognized.table_name, &defining_sql)
+            .await
+    }
+
     /// Execute a SQL query and return results
     pub async fn sql(&self, query: &str) -> Result<QueryResult> {
         let start = Instant::now();
@@ -864,6 +940,37 @@ impl ExecutionContext {
                  ExecutionContext::update_native_table (the REPL calls this automatically) — \
                  sql() cannot update a native table (it takes &self, and UPDATE needs a \
                  bespoke row-identification + SET-evaluation loop no LogicalPlan can express)"
+                    .to_string(),
+            ));
+        }
+
+        // Same reasoning again for `CREATE MATERIALIZED VIEW <name> AS
+        // SELECT ...` (native-tables-rollups epic, task 002):
+        // `create_materialized_view` needs `&mut self` (registering the
+        // rollup's own native table mutates `self.tables`/`self.catalog`,
+        // exactly like `create_table_as_select`) and drives task 001's
+        // `register_rollup` directly, incompatible with this method's
+        // `&self`, fully-materializing signature. An unguarded CREATE
+        // MATERIALIZED VIEW reaching the ordinary bind/plan/execute path
+        // below would (now that `Binder::bind()` accepts
+        // `Statement::CreateView`) bind and execute the DEFINING query
+        // itself and return ITS rows as a "successful" result -- never
+        // registering a rollup at all. A PLAIN (non-materialized) `CREATE
+        // VIEW` is deliberately NOT caught by this guard
+        // (`create_materialized_view_target_name` returns `None` for it) --
+        // it falls through to the ordinary path below and is refused
+        // there, directly, by `Binder::bind()` itself ("CREATE VIEW
+        // (non-materialized) is not supported"), matching
+        // `Statement::Delete`/`Statement::Update`'s own "let `bind()`'s own
+        // unconditional refusal fire" precedent for shapes with no
+        // alternate entrypoint to redirect to.
+        if crate::planner::create_materialized_view_target_name(&stmt).is_some() {
+            return Err(QueryError::InvalidArgument(
+                "CREATE MATERIALIZED VIEW ... AS SELECT must run through \
+                 ExecutionContext::create_materialized_view (the REPL calls this \
+                 automatically) — sql() cannot register the result (it takes &self) and would \
+                 otherwise silently execute only the defining query without registering a \
+                 rollup"
                     .to_string(),
             ));
         }
