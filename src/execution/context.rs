@@ -9,6 +9,7 @@ use crate::physical::{PhysicalOperator, PhysicalPlanner, RecordBatchStream};
 use crate::planner::{Binder, InMemoryCatalog, LogicalPlan, PlanSchema, SchemaField};
 use crate::storage::native_delete;
 use crate::storage::native_manifest;
+use crate::storage::native_rollup;
 use crate::storage::native_update;
 use crate::storage::native_write::{self, NativeWriteMode};
 use crate::storage::{NativeTable, ParquetTable};
@@ -54,6 +55,17 @@ pub struct QueryMetrics {
     pub files_pruned_by_stats: usize,
     /// Number of files pruned by partition filter
     pub files_pruned_by_partition: usize,
+    /// Names of every registered rollup that answered some part of this
+    /// query (native-tables-rollups epic, task 001) — empty when no
+    /// rollup was involved (including when none is registered at all).
+    /// This is this task's structured PROVENANCE record: per the epic's
+    /// G3 / the PRD's G5, whenever a rollup answers a query that fact
+    /// must be observable, never silently indistinguishable from "the
+    /// engine got faster at the real query." `QE_DEBUG_ROLLUP=1` also
+    /// traces every match/no-match/staleness decision to stderr, matching
+    /// this codebase's established diagnostic-switch convention (see
+    /// `storage::native_rollup`).
+    pub rollup_answered: Vec<String>,
 }
 
 /// What `ExecutionContext::create_table_as_select` produced.
@@ -158,6 +170,32 @@ pub struct UpdateResult {
     pub total_rows: u64,
     /// Wall-clock time for the whole parse-bind-identify-evaluate-write-
     /// publish sequence.
+    pub elapsed: Duration,
+}
+
+/// What `ExecutionContext::register_rollup` produced (native-tables-
+/// rollups epic, task 001).
+#[derive(Debug, Clone)]
+pub struct RegisterRollupResult {
+    /// The name the rollup was registered under.
+    pub rollup_name: String,
+    /// The base table this rollup is defined against (must already be a
+    /// registered native table — see `register_rollup`'s doc).
+    pub base_table: String,
+    /// The rollup's own native table's stable identity (UUID v4).
+    pub table_id: String,
+    /// The snapshot version the rollup's write committed.
+    pub version: u64,
+    /// Rows in the materialized rollup (one per distinct GROUP BY key
+    /// combination the defining query computed).
+    pub rows: u64,
+    /// Number of Arrow IPC segment files the rollup now has.
+    pub segments: usize,
+    /// The written rollup table's schema (== the defining query's own
+    /// output schema).
+    pub schema: SchemaRef,
+    /// Wall-clock time for the whole parse-bind-plan-execute-write-tag-
+    /// register sequence.
     pub elapsed: Duration,
 }
 
@@ -469,6 +507,272 @@ impl ExecutionContext {
         Ok(())
     }
 
+    /// Build a snapshot of every registered, NON-STALE rollup — the real
+    /// registry access `storage::native_rollup`'s pure matching functions
+    /// cannot have themselves (see that module's doc for why this can't
+    /// live inside an `OptimizerRule`). A rollup is excluded here
+    /// (exactly as if it had never been registered) whenever:
+    /// - it is not (or is no longer) a native table with `manifest().
+    ///   rollup` populated,
+    /// - its recorded base table is not currently registered, or is
+    ///   registered but is not (or is no longer) a native table, or
+    /// - the base table's CURRENT `(table_id, snapshot.version)` differs
+    ///   from what this rollup recorded — this IS task 001's staleness
+    ///   enforcement; the model that keeps `RollupMeta` current
+    ///   automatically on every base-table mutation is task 003's job.
+    ///
+    /// `QE_DEBUG_ROLLUP=1` traces every exclusion to stderr, matching
+    /// this codebase's established diagnostic-switch convention.
+    fn rollup_candidates(&self) -> Vec<native_rollup::RollupCandidate> {
+        let debug = std::env::var("QE_DEBUG_ROLLUP").is_ok();
+        let mut out = Vec::new();
+        for (name, provider) in &self.tables {
+            let Some(native) = provider.as_any().downcast_ref::<NativeTable>() else {
+                continue;
+            };
+            let Some(meta) = native.manifest().rollup.clone() else {
+                continue;
+            };
+            let Some(base_provider) = self.tables.get(&meta.base_table) else {
+                if debug {
+                    eprintln!(
+                        "[rollup] `{name}`: base table `{}` is not registered in this \
+                         session -- excluded (stale)",
+                        meta.base_table
+                    );
+                }
+                continue;
+            };
+            let Some(base_native) = base_provider.as_any().downcast_ref::<NativeTable>() else {
+                if debug {
+                    eprintln!(
+                        "[rollup] `{name}`: base table `{}` is not a native table -- excluded \
+                         (stale)",
+                        meta.base_table
+                    );
+                }
+                continue;
+            };
+            let base_manifest = base_native.manifest();
+            if base_manifest.table_id != meta.base_table_id
+                || base_manifest.snapshot.version != meta.base_table_version
+            {
+                if debug {
+                    eprintln!(
+                        "[rollup] `{name}`: STALE -- base table `{}` is now at (table_id={}, \
+                         version={}), rollup recorded (table_id={}, version={})",
+                        meta.base_table,
+                        base_manifest.table_id,
+                        base_manifest.snapshot.version,
+                        meta.base_table_id,
+                        meta.base_table_version
+                    );
+                }
+                continue;
+            }
+            out.push(native_rollup::RollupCandidate {
+                registered_name: name.clone(),
+                meta,
+                schema: arrow_schema_to_plan_schema(&native.schema()),
+            });
+        }
+        out
+    }
+
+    /// Apply rollup substitution to a freshly-bound logical plan, given
+    /// the real registry access [`Self::rollup_candidates`] has — see
+    /// `storage::native_rollup`'s module doc for why this cannot be an
+    /// `OptimizerRule` and must instead run here, in `ExecutionContext`'s
+    /// own flow, positioned BEFORE `Optimizer::optimize()` (not after or
+    /// inside it — matching against the RAW bound plan, before any
+    /// optimizer rewrite, is a deliberate design decision documented in
+    /// full in that module). Structurally a no-op, with zero plan-tree
+    /// walk at all, when no rollup is registered: `rollup_candidates`
+    /// returns empty and this short-circuits before calling
+    /// `native_rollup::substitute` — a rollup is additive, so native
+    /// tables/mutation must (and do) behave identically whether or not
+    /// any rollup is registered against them.
+    fn substitute_rollups(&self, plan: LogicalPlan) -> Result<(LogicalPlan, Vec<String>)> {
+        let candidates = self.rollup_candidates();
+        if candidates.is_empty() {
+            return Ok((plan, Vec::new()));
+        }
+        let mut matched = Vec::new();
+        let rewritten = native_rollup::substitute(&plan, &candidates, &mut matched)?;
+        Ok((rewritten, matched))
+    }
+
+    /// Register a materialized rollup of an existing, already-registered
+    /// NATIVE base table (native-tables-rollups epic, task 001's
+    /// programmatic registration API — SQL DDL is task 002's job, not
+    /// attempted here). `defining_sql` must bind to exactly `SELECT
+    /// <GROUP BY column(s) and/or aggregate(s), any order, any aliases>
+    /// FROM <base_table> GROUP BY <...>` — no WHERE/JOIN/HAVING/ORDER
+    /// BY/LIMIT/DISTINCT, and every SELECT item must be a bare
+    /// (optionally aliased) reference to one of the GROUP BY columns or
+    /// aggregates, never a computed expression over them (see
+    /// `storage::native_rollup::require_rollup_defining_shape` for the
+    /// exact, enforced rule and its rationale).
+    ///
+    /// Sequence: (1) confirm `base_table` is already a registered native
+    /// table (needed for staleness bookkeeping — a rollup over a plain
+    /// parquet/Iceberg/Lance table has no version concept to compare
+    /// against, so this epic requires a native base table); (2) parse +
+    /// bind the defining query and validate/recognize its shape against
+    /// the RAW bound plan (the exact same recognition an incoming query
+    /// is later matched against — see `storage::native_rollup`'s module
+    /// doc for why); (3) plan, optimize and execute it exactly like
+    /// [`Self::create_table_as_select`] (a rollup's row data IS a native
+    /// table — this reuses `native_write::write_batches` completely
+    /// UNCHANGED); (4) attach the resulting `RollupMeta` (base table
+    /// identity + canonical GROUP BY/aggregate keys + physical column
+    /// mapping) to the just-published manifest via a SECOND, small,
+    /// manifest-only atomic patch (`native_manifest::write_manifest_atomic`
+    /// — the SAME single-file atomic-rename primitive the mutation
+    /// epic's Append/DELETE/UPDATE paths already established for exactly
+    /// this "patch just the manifest" shape); (5) register the rollup
+    /// normally, so it is immediately queryable AND a substitution
+    /// candidate for the rest of this session.
+    ///
+    /// `&mut self`, unlike `sql()`'s `&self`: registering the new rollup
+    /// mutates `self.tables`/`self.catalog`, and a genuinely streaming
+    /// write needs the defining query's stream driven directly rather
+    /// than via `sql()`'s collecting wrapper — mirrors
+    /// `create_table_as_select`'s own reasoning exactly.
+    ///
+    /// An existing native table at the target directory is replaced
+    /// wholesale (`NativeWriteMode::Overwrite`), matching
+    /// `create_table_as_select`'s own re-registration/replace semantics —
+    /// re-registering a rollup under a name that already holds a rollup
+    /// (or any native table) recomputes it from scratch.
+    pub async fn register_rollup(
+        &mut self,
+        name: impl Into<String>,
+        base_table: impl Into<String>,
+        defining_sql: &str,
+    ) -> Result<RegisterRollupResult> {
+        let name = name.into();
+        let base_table = base_table.into();
+        let start = Instant::now();
+
+        let base_provider = self.tables.get(&base_table).cloned().ok_or_else(|| {
+            QueryError::TableNotFound(format!(
+                "register_rollup: base table `{base_table}` is not registered in this session"
+            ))
+        })?;
+        let base_native = base_provider
+            .as_any()
+            .downcast_ref::<NativeTable>()
+            .ok_or_else(|| {
+                QueryError::InvalidArgument(format!(
+                    "register_rollup: base table `{base_table}` is not a native table -- a \
+                     rollup's staleness bookkeeping needs a real (table_id, version) pair to \
+                     compare against, which only a native table's manifest provides"
+                ))
+            })?;
+        let base_table_id = base_native.manifest().table_id.clone();
+        let base_table_version = base_native.manifest().snapshot.version;
+
+        let stmt = parser::parse_sql(defining_sql)?;
+        let mut binder = Binder::new(&self.catalog);
+        // The RAW bound plan -- exactly what an incoming query is later
+        // matched against (see storage::native_rollup's module doc).
+        let logical = binder.bind(&stmt)?;
+        let recognized = native_rollup::require_rollup_defining_shape(&logical, &base_table)?;
+
+        let table_stats = self.collect_table_statistics();
+        let optimized = if table_stats.is_empty() {
+            self.optimizer.optimize(logical)?
+        } else {
+            let optimizer = Optimizer::new().with_table_statistics(table_stats);
+            optimizer.optimize(logical)?
+        };
+        if std::env::var("PLAN_DEBUG").is_ok() {
+            eprintln!("[plan]\n{}", optimized);
+        }
+
+        let mut planner =
+            PhysicalPlanner::with_config(self.memory_pool.clone(), self.config.clone());
+        for (tname, provider) in &self.tables {
+            planner.register_table(tname.clone(), provider.clone());
+        }
+        planner.enable_subquery_execution();
+        let physical = planner.create_physical_plan(&optimized)?;
+        // Same qualification-stripping/dictionary-normalizing schema
+        // create_table_as_select computes, for the identical reason (a
+        // persisted table's column names must be plain, not internally
+        // qualified) -- see that function's own call-site comment.
+        let write_schema = output_schema_for_native_write(&physical.schema())?;
+
+        let num_partitions = physical.output_partitions().max(1);
+        let mut streams: Vec<RecordBatchStream> = Vec::with_capacity(num_partitions);
+        for partition_id in 0..num_partitions {
+            let stream = physical.execute(partition_id).await.map_err(|e| {
+                QueryError::Execution(format!("Partition {partition_id} execution failed: {e}"))
+            })?;
+            let out_schema = write_schema.clone();
+            let decoded: RecordBatchStream = Box::pin(stream.and_then(move |b| {
+                let out_schema = out_schema.clone();
+                async move {
+                    let b = decode_dictionary_batch(b)?;
+                    RecordBatch::try_new(out_schema, b.columns().to_vec())
+                        .map_err(|e| QueryError::Execution(e.to_string()))
+                }
+            }));
+            streams.push(decoded);
+        }
+        let merged: RecordBatchStream =
+            Self::bounded_partition_merge(streams, Self::insert_merge_concurrency());
+
+        let out_dir = self.native_table_root.join(&name);
+        let mode = if native_manifest::is_native_table_dir(&out_dir) {
+            NativeWriteMode::Overwrite
+        } else {
+            NativeWriteMode::Create
+        };
+        // `write_batches`'s own return value (table_id/version/rows/
+        // segments) is superseded by the manifest read back below, which
+        // carries the identical data PLUS the `rollup` field this
+        // function still needs to attach -- no reason to bind it here.
+        native_write::write_batches(merged, write_schema.clone(), &out_dir, mode)
+            .await
+            .map_err(|e| QueryError::Storage(format!("register_rollup {name}: {e}")))?;
+
+        // Attach rollup metadata: the just-written table's columns are
+        // already in the SAME order `recognized.proj_slots` recorded
+        // (writing never reorders/drops columns), so this is a plain
+        // positional zip -- see `build_rollup_columns`'s own doc.
+        let columns = native_rollup::build_rollup_columns(&recognized, &write_schema)?;
+        let meta = native_manifest::RollupMeta {
+            base_table: base_table.clone(),
+            defining_sql: defining_sql.to_string(),
+            base_table_id,
+            base_table_version,
+            columns,
+        };
+        let manifest = native_manifest::read_manifest(&out_dir)
+            .map_err(|e| QueryError::Storage(format!("register_rollup {name}: {e}")))?
+            .with_rollup(meta);
+        native_manifest::write_manifest_atomic(&out_dir, &manifest)
+            .map_err(|e| QueryError::Storage(format!("register_rollup {name}: {e}")))?;
+
+        // Make the freshly written, now rollup-tagged table immediately
+        // queryable AND a substitution candidate for the rest of this
+        // session.
+        self.register_native_table(&name, &out_dir)?;
+
+        Ok(RegisterRollupResult {
+            rollup_name: name,
+            base_table,
+            table_id: manifest.table_id.clone(),
+            version: manifest.snapshot.version,
+            rows: manifest.snapshot.row_count,
+            segments: manifest.segments.len(),
+            schema: write_schema,
+            elapsed: start.elapsed(),
+        })
+    }
+
     /// Execute a SQL query and return results
     pub async fn sql(&self, query: &str) -> Result<QueryResult> {
         let start = Instant::now();
@@ -569,6 +873,18 @@ impl ExecutionContext {
         let mut binder = Binder::new(&self.catalog);
         let logical = binder.bind(&stmt)?;
         metrics.plan_time = plan_start.elapsed();
+
+        // Rollup substitution (native-tables-rollups epic, task 001):
+        // given real registry access this method has and a plain
+        // `OptimizerRule` cannot (see `storage::native_rollup`'s module
+        // doc), check whether a registered, non-stale rollup exactly
+        // answers this query and, if so, rewrite the plan to scan it
+        // instead of the base table — BEFORE the ordinary optimizer
+        // pipeline runs, matching against the plan straight out of the
+        // binder. `rollup_answered` is this task's structured provenance
+        // record (see `QueryMetrics::rollup_answered`'s own doc).
+        let (logical, rollup_answered) = self.substitute_rollups(logical)?;
+        metrics.rollup_answered = rollup_answered;
 
         // Optimize (with table statistics for better join planning)
         let optimize_start = Instant::now();
@@ -1176,6 +1492,10 @@ impl ExecutionContext {
     /// Get the optimized logical plan for a query (for debugging)
     pub fn optimized_plan(&self, query: &str) -> Result<LogicalPlan> {
         let logical = self.logical_plan(query)?;
+        // Same rollup substitution step sql() applies (see that method's
+        // own comment) — otherwise this debug view would show a
+        // different plan than what actually executes.
+        let (logical, _) = self.substitute_rollups(logical)?;
         // Use the same statistics-aware optimizer as sql(), otherwise the
         // debug view shows a different (stats-blind) plan than execution uses.
         let table_stats = self.collect_table_statistics();
