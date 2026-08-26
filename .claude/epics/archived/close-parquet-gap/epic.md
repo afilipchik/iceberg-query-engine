@@ -1,3 +1,24 @@
+---
+name: close-parquet-gap
+status: completed
+created: 2026-08-17T00:00:00Z
+updated: 2026-08-25T00:00:00Z
+progress: 100%
+prd: .claude/prds/close-parquet-gap.md
+github: (will be set on sync)
+---
+
+> **Bookkeeping note (2026-08-25).** This epic predates the frontmatter
+> and numbered-task-file conventions later epics use — the fields above
+> were added retroactively (dates from this file's own recorded
+> close-out and the later "bug found post-close" note) so tracking
+> scripts stop misreporting this as an open 0-task Planning-stage epic.
+> No content below was changed. `progress: 100%` reflects the epic
+> itself closing (2026-08-17), not its own ≤55s goal being met — task
+> 005 (Q4 fix) never completed inside this epic; see the close-out below
+> for the honest reasoning and `duckdb-parity` for where Q4 actually got
+> fixed.
+
 # Epic: close-parquet-gap
 
 Tasks (dependencies noted; measurement runs are SERIALIZED):

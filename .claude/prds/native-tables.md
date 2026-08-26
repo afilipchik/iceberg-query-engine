@@ -1,9 +1,19 @@
 ---
 name: native-tables
 description: A first-class, writable, tiered (GPU/RAM/disk) native table format for blazingly fast analytical and data-viz queries
-status: backlog
+status: active
 created: 2026-08-23T07:42:14Z
+updated: 2026-08-25T00:00:00Z
 ---
+
+> **Status note (2026-08-25).** 2 of 4 phases shipped and archived:
+> `native-tables-foundation` (CREATE/read) and `native-tables-mutation`
+> (INSERT/DELETE/UPDATE), both cell-exact validated at real SF=10 scale.
+> Phase 3 (GPU/RAM/disk tiering) and phase 4 (materialized rollups) are
+> not started. A correctness bug in the mutation epic's own QA close-out
+> (`SpillableHashJoinExec`'s spill path, unrelated to native tables
+> specifically — see `spill-join-correctness`) is tracked separately and
+> does not block this PRD's own remaining phases.
 
 # PRD: native-tables
 

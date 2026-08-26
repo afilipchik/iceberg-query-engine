@@ -1,9 +1,23 @@
 ---
 name: spill-join-correctness
 description: Root-cause and fix a silent wrong-answer bug in SpillableHashJoinExec's spill path, discovered via native-tables-mutation but general-purpose and pre-existing
-status: backlog
+status: completed
 created: 2026-08-24T14:19:55Z
+updated: 2026-08-25T00:00:00Z
 ---
+
+> **Status note (2026-08-25).** `completed` reflects the epic running its
+> full course and closing (all 4 tasks closed, merged to `main`), NOT
+> that this PRD's own headline goal was reached. **The wrong-answer bug
+> itself remains OPEN and unfixed — root cause never confirmed.** What
+> the epic actually delivered: a reliable repro (4.8%→0.34% rate
+> estimate as trials accumulated), a disproven leading hypothesis, a
+> real ~40-90x fix for a separate O(n²) slowness issue found along the
+> way, and a blast-radius characterization (not native-table-specific,
+> confirmed distributed-exposed, three new unrelated bugs found and
+> reported unfixed). See `.claude/epics/archived/spill-join-correctness/
+> epic.md`'s close-out and `CLAUDE.md`'s "Mutation: QA close-out"
+> section for the full picture before picking this back up.
 
 # PRD: spill-join-correctness
 

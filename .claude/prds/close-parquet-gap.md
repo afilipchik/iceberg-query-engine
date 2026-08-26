@@ -1,3 +1,19 @@
+---
+name: close-parquet-gap
+description: Close the like-for-like parquet gap to DuckDB at SF=100 (87.1s vs 39.4s, 2.21x)
+status: completed
+created: 2026-08-17T00:00:00Z
+updated: 2026-08-25T00:00:00Z
+---
+
+> **Bookkeeping note (2026-08-25).** This PRD predates the frontmatter
+> convention adopted by later epics — the fields above were added
+> retroactively from the epic's own recorded close-out date (2026-08-17)
+> and status, not re-derived. `status: completed` reflects the epic
+> running its course and closing, not that the ≤55s goal below was
+> met — see the superseded-note and epic close-out immediately below for
+> the honest, already-recorded outcome.
+
 > **Superseded (2026-08-23).** This PRD's own stated goal (≤55s at SF=100)
 > was not met by its epic, which closed with an honest partial result and
 > two documented negative findings rather than a numbered task
