@@ -2086,6 +2086,73 @@ more tightly than either does with the older session's CPU number.
 Full task detail, every command, and the complete Outcome section:
 `.claude/epics/native-tables-tiering/001.md`.
 
+### Per-column failure isolation + observability (native-tables-tiering epic, task 002, 2026-08-26)
+
+The other pre-existing gap named above ("one failed upload permanently
+disables GPU offload for the rest of the process") is closed.
+`GpuEngine::mark_unhealthy()` — a single process-wide `healthy:
+AtomicBool`, set `false` on any upload failure and never reset, gating
+BOTH `request()` (stopped queuing new uploads at all) and `ready()`
+(stopped serving even already-resident columns from the GPU) — is
+DELETED, not replaced with a new global mechanism. Per-column isolation
+was already structurally present in task 001's `resident`/`codes`/
+`queued` maps (all keyed per `(pid, column)`/`codes_key`); `healthy` was
+the only thing overriding it. **Design decision: a failed upload is
+RETRIED on a later query, never permanently blacklisted** — matches the
+pre-existing "not cacheable" (`Ok(None)`) handling exactly (never
+blacklisted either, `unmark_queued` from task 001 already clears the
+dedup key unconditionally), and avoids fighting task 001's own eviction
+mechanism (a permanent blacklist would keep a column CPU-only forever
+even after eviction frees the exact room a transient VRAM-pressure
+failure needed).
+
+**Validated with two independent real-hardware failure constructions**
+(`tests/gpu_failure_isolation_tests.rs`, one hardware-backed
+`#[tokio::test]`): (1) a deterministic Int64-column-out-of-2^52-range
+"not cacheable" refusal — zero risk to the shared GPU, confirms
+per-column isolation; (2) a GENUINELY INDUCED real VRAM-exhaustion
+failure — a second handle onto the SAME primary CUDA context (`cudarc::
+driver::CudaContext::new` retains the device's primary context) ate
+real VRAM from 31.6GB down to 271MB free (confirmed via `mem_get_info()`
+before/after, not assumed), forcing a genuine `stream.memcpy_stod`
+failure for a 480MB victim column upload — the EXACT call site
+`mark_unhealthy()` used to gate on. That query correctly fell back to
+CPU with a numerically correct answer; critically, a DIFFERENT,
+unrelated table's column immediately uploaded and became GPU-resident
+right after (the key proof the process isn't poisoned), and the
+ORIGINAL victim column also eventually became resident once retried
+after VRAM pressure cleared (real evidence for the retry design, not
+just isolation). Honest finding along the way: `mem_get_info()` read
+IDENTICALLY before and after releasing the ~31GB eater buffer,
+consistent with CUDA's stream-ordered memory-pool allocator retaining
+freed pages rather than returning them to the driver-global free count
+immediately — this did not prevent the pool from correctly servicing
+later real allocations, confirming the test's pass/fail signal correctly
+rests on real allocation attempts through `GpuEngine`, not a raw
+post-release byte count. Task 001's own hardware-backed eviction test
+(`tests/gpu_cache_tests.rs`) re-confirmed passing, unmodified.
+
+**Observability**: two new `AtomicU64` counters — `upload_failures`
+(every upload/build-codes attempt that did not result in a resident
+entry, for any reason) and `run_fallbacks` (a fully-`ready()` plan whose
+device `run()` itself still failed) — plus `GpuEngine::snapshot() ->
+GpuCacheSnapshot` (bundles resident columns, VRAM used, budget, eviction
+count, both new counters into one `Display`-able struct) and a new
+**`QE_GPU_DEBUG`** env var (confirmed absent from the codebase before
+adding it — checked, not assumed), matching `QE_SPILL_DEBUG`'s exact
+established convention (checked fresh via `std::env::var(...).is_ok()`
+on every relevant call, no `OnceLock` caching): traces every upload/
+build-codes/run outcome plus a live snapshot to stderr, prefixed
+`[gpu-trace]`. Confirmed working on real hardware via `examples/
+gpu_cache_tiering_check.rs`.
+
+Full suite green, all four feature combinations (default 1252, lance
+1317, gpu 1261 = task 001's 1259 baseline + 2 new tests, pulsar 1255,
+zero failures anywhere); `cargo fmt --all -- --check` clean. Sole file
+changed: `src/physical/gpu.rs` (373 insertions, 24 deletions) plus one
+new test file. Full task detail and the complete Outcome section:
+`.claude/epics/native-tables-tiering/002.md`.
+
 ## Expression Compilation — researched, priced, narrowly adopted (2026-08-22)
 
 The "modern engines compile queries" question, answered with measurements

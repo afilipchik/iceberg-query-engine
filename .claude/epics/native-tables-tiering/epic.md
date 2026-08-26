@@ -2,8 +2,8 @@
 name: native-tables-tiering
 status: in-progress
 created: 2026-08-26T16:23:07Z
-updated: 2026-08-26T17:45:00Z
-progress: 33%
+updated: 2026-08-26T18:30:00Z
+progress: 67%
 prd: .claude/prds/native-tables.md
 github: (will be set on sync)
 ---
@@ -215,7 +215,7 @@ characterization), not a new algorithm class.
 
 ## Tasks Created
 - [x] 001.md - VRAM budget + LRU eviction + confirm/fix the mutation leak (parallel: false) — CLOSED 2026-08-26
-- [ ] 002.md - Per-column failure isolation + observability (parallel: false)
+- [x] 002.md - Per-column failure isolation + observability (parallel: false) — CLOSED 2026-08-26
 - [ ] 003.md - QA close-out — validation, no-regression check, full suite, docs, epic close (parallel: false)
 
 Total tasks: 3

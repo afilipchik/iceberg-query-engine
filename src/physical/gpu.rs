@@ -75,9 +75,95 @@
 //! never-uploaded column already took before this task — no new
 //! re-upload logic, just returning a column to a state the engine already
 //! handled correctly.
+//!
+//! ## Failure isolation + observability (native-tables-tiering task 002)
+//!
+//! Before this task, ANY upload failure — for ANY column, ANY table, for
+//! ANY reason — called `mark_unhealthy()`, which set a single
+//! process-wide `healthy: AtomicBool` to `false`. Both `request()` and
+//! `ready()` checked it and short-circuited ("do nothing" / "never
+//! ready") once set, permanently, for the rest of the process's
+//! lifetime, with no reset path anywhere in the file. One column on one
+//! table failing to upload (a transient VRAM pressure spike, a driver
+//! hiccup) silently disabled GPU offload for every OTHER column, every
+//! OTHER table, every future query, forever — the opposite of graceful
+//! degradation, and never exercised by any pre-existing test.
+//!
+//! **Fix: delete the global gate, don't replace it with a new one.**
+//! Task 001 already gives every upload attempt a `(pid, column)`- or
+//! `codes_key`-scoped identity in `resident`/`codes`/`queued` — a failed
+//! upload for column X was ALREADY incapable of touching column Y's own
+//! entries in those maps. The only thing standing in the way of correct
+//! per-column isolation was the single global `healthy` flag layered on
+//! top, gating BOTH `request()` (so a poisoned engine stopped even
+//! TRYING new uploads) and `ready()` (so a poisoned engine stopped
+//! serving ALREADY-uploaded, perfectly resident columns from the GPU,
+//! too). Removing `healthy` entirely — the field, its two gate checks,
+//! `mark_unhealthy()`, and its one call site — is therefore the complete
+//! fix: per-column isolation was already structurally present, just
+//! overridden by a coarser, unconditional gate.
+//!
+//! **Decision: a failed upload is RETRIED on a later query, never
+//! permanently blacklisted — for that column, or the process.** Chosen
+//! over a per-`(pid, column)` blacklist for three concrete reasons:
+//!
+//! 1. **Symmetry with existing behavior.** `load_column_f64` returning
+//!    `Ok(None)` (nulls, an unsupported type, an Int64 value outside
+//!    2^52) was ALREADY handled this way before this task — no
+//!    blacklist; `unmark_queued` clears the dedup key unconditionally, so
+//!    the exact same doomed upload is retried on the very next query that
+//!    needs it, and that has never been a problem. Treating a hard
+//!    upload ERROR (a CUDA/driver failure) any differently would mean
+//!    maintaining two different failure-handling mechanisms for what is,
+//!    from a caller's perspective, the identical outcome: "this column
+//!    isn't resident yet."
+//! 2. **A blacklist would fight task 001's own eviction mechanism.** The
+//!    named example failure modes ("a momentary VRAM pressure spike, a
+//!    driver hiccup") are transient by construction — task 001 built LRU
+//!    eviction specifically so VRAM pressure resolves itself over time.
+//!    A permanent per-key blacklist would keep a column stuck on the CPU
+//!    path forever even after eviction frees the exact room its upload
+//!    needed — actively working against the mechanism task 001 just
+//!    built. Retry lets a later, successful attempt (once room exists
+//!    again) simply happen, with zero new code: `unmark_queued` already
+//!    clears the dedup key after every job, success or failure.
+//! 3. **Minimal, surgical diff.** No new state is needed at all — the fix
+//!    is SUBTRACTIVE (delete `healthy` and its call sites), not additive
+//!    (a new `HashSet` of blacklisted keys, with its own insert/check/
+//!    never-cleared-on-mutation lifecycle to get right). Smaller surface,
+//!    less to get wrong, zero risk of regressing task 001's own
+//!    eviction/budget logic (confirmed untouched by this task).
+//!
+//! **Accepted cost, named plainly**: a column whose upload fails for a
+//! genuinely PERMANENT reason (e.g. a value outside `load_column_f64`'s
+//! accepted range, which cannot change without a new table version/pid)
+//! is retried on every single future query that needs it, forever costing
+//! one column scan + one failed device call per query — never incorrect
+//! (always falls back to a correct CPU answer), just not free. Matches
+//! this program's own "always correct, even if that means not fast"
+//! standing culture. A future task could add a short backoff/cooldown
+//! between retry attempts for a specific key if this cost is ever
+//! measured to matter in practice; not attempted here — out of scope, and
+//! not asked for by this task's own acceptance criteria, which name only
+//! "retry" or "permanent blacklist" as the two options.
+//!
+//! **Observability**: `GpuEngine` gained two new counters alongside task
+//! 001's `eviction_count` — `upload_failures` (every upload/build-codes
+//! attempt that did NOT result in a resident entry: a hard error, a
+//! provider scan error, "not cacheable," or a row-count mismatch — see
+//! each field's own doc for the exact breakdown) and `run_fallbacks` (a
+//! fully-`ready()` plan whose device `run()` itself still failed, forcing
+//! `GpuAggExec` to fall back to the CPU operator for that one query).
+//! `GpuEngine::snapshot()` bundles every observable metric (resident
+//! columns, VRAM used, budget, evictions, upload failures, run
+//! fallbacks) into one `GpuCacheSnapshot`; `QE_GPU_DEBUG` (unset by
+//! default, matching `QE_SPILL_DEBUG`'s established convention exactly —
+//! checked fresh via `std::env::var(...).is_ok()` on every relevant call,
+//! never cached in a `OnceLock`) traces every upload/build-codes/run
+//! outcome plus a cache snapshot to stderr, prefixed `[gpu-trace]`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, StringArray};
@@ -555,17 +641,39 @@ pub struct GpuEngine {
     codes: Mutex<HashMap<String, usize>>,
     /// Upload requests already queued (dedup).
     queued: Mutex<HashSet<String>>,
-    healthy: AtomicBool,
     /// Mirrors the worker thread's `GpuCache::total_bytes` (task 001's real
     /// byte accounting) for cheap, lock-free external reads — tests,
-    /// diagnostics, and task 002's future observability work. The worker
-    /// thread's own accounting is the source of truth used for actual
-    /// eviction decisions; this is a same-step mirror, not a second
-    /// independent count.
+    /// diagnostics, and task 002's observability work. The worker thread's
+    /// own accounting is the source of truth used for actual eviction
+    /// decisions; this is a same-step mirror, not a second independent
+    /// count.
     resident_bytes: AtomicUsize,
     /// Total evictions performed since process start (task 001's LRU
     /// policy). Monotonically increasing; never reset.
     eviction_count: AtomicU64,
+    /// Total upload/build-codes attempts that did NOT result in a resident
+    /// entry, since process start (task 002; never reset). Counts every
+    /// non-success outcome uniformly: a hard CUDA/driver error (e.g. VRAM
+    /// exhaustion), a provider scan error, "not cacheable" (nulls, an
+    /// unsupported type, an Int64 value outside 2^52), or a row-count
+    /// mismatch against a pid's other resident columns — see the module
+    /// doc's "Failure isolation" section for why these are NOT
+    /// distinguished by a separate blacklist. Deliberately does NOT count
+    /// the ordinary "not yet uploaded" cold-start path (`GpuAggExec::
+    /// execute` finding `ready() == false` simply because a column hasn't
+    /// been requested yet) — that is expected warm-up, not a failure, and
+    /// counting it would drown the signal this metric exists to surface.
+    /// Incrementing this NEVER prevents any other column's upload from
+    /// being attempted or succeeding — isolated per-column by construction
+    /// (see `resident`/`codes`/`queued`, all keyed per column/codes-key).
+    upload_failures: AtomicU64,
+    /// Total times `GpuAggExec::execute` found its plan fully `ready()`
+    /// (every needed column/codes buffer already resident) but the actual
+    /// device `run()` call itself returned an error, forcing a fallback to
+    /// the CPU operator for that one query (task 002; never reset).
+    /// Distinct from `upload_failures`: the data WAS successfully
+    /// resident: only the kernel launch/execution itself failed.
+    run_fallbacks: AtomicU64,
 }
 
 impl GpuEngine {
@@ -586,9 +694,10 @@ impl GpuEngine {
                         resident: Mutex::new(HashSet::new()),
                         codes: Mutex::new(HashMap::new()),
                         queued: Mutex::new(HashSet::new()),
-                        healthy: AtomicBool::new(true),
                         resident_bytes: AtomicUsize::new(0),
                         eviction_count: AtomicU64::new(0),
+                        upload_failures: AtomicU64::new(0),
+                        run_fallbacks: AtomicU64::new(0),
                     }),
                     _ => {
                         tracing::info!("gpu: no usable CUDA device/nvrtc; offload disabled");
@@ -610,11 +719,12 @@ impl GpuEngine {
         self.codes.lock().unwrap().get(key).copied()
     }
 
-    /// Queue whatever this plan needs that is not yet resident.
+    /// Queue whatever this plan needs that is not yet resident. No
+    /// process-wide health gate (task 002): a column/codes buffer that
+    /// previously failed to upload is always eligible to be retried here —
+    /// see the module doc's "Failure isolation" section for why retry,
+    /// not a permanent blacklist, is this task's chosen design.
     pub fn request(&self, plan: &GpuAggPlan) {
-        if !self.healthy.load(Ordering::Relaxed) {
-            return;
-        }
         let mut queued = self.queued.lock().unwrap();
         let pid = plan.pid();
         for col in plan.needed_columns() {
@@ -639,11 +749,13 @@ impl GpuEngine {
         }
     }
 
-    /// Is everything resident so a run would succeed right now?
+    /// Is everything resident so a run would succeed right now? No
+    /// process-wide health gate (task 002) — see `request`'s doc and the
+    /// module doc's "Failure isolation" section. A column that failed to
+    /// upload simply stays (or returns to) not-resident, so this correctly
+    /// reports `false` for THAT plan without affecting any other plan's
+    /// columns, which live under independent `resident`/`codes` keys.
     pub fn ready(&self, plan: &GpuAggPlan) -> bool {
-        if !self.healthy.load(Ordering::Relaxed) {
-            return false;
-        }
         let pid = plan.pid();
         let cols_ok = plan
             .needed_columns()
@@ -728,9 +840,26 @@ impl GpuEngine {
         }
     }
 
-    fn mark_unhealthy() {
+    /// Task 002: record that an upload/build-codes attempt did NOT result
+    /// in a resident entry — see the `upload_failures` field doc for
+    /// exactly what counts. Deliberately per-metric only, never per-key:
+    /// this NEVER touches `resident`, `codes`, or `queued`, so it cannot
+    /// affect any OTHER column's ability to be requested/uploaded/served —
+    /// the failing column simply stays not-resident and is retried the
+    /// next time a query needs it (see the module doc's "Failure
+    /// isolation" section for why retry, not a blacklist, was chosen).
+    fn mark_upload_failed() {
         if let Some(e) = GpuEngine::get() {
-            e.healthy.store(false, Ordering::Relaxed);
+            e.upload_failures.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Task 002: record a `Job::Run` whose plan was fully resident/ready
+    /// but whose actual device execution failed, forcing `GpuAggExec::
+    /// execute` to fall back to the CPU operator for that one query.
+    fn mark_run_fallback() {
+        if let Some(e) = GpuEngine::get() {
+            e.run_fallbacks.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -758,6 +887,79 @@ impl GpuEngine {
     pub fn budget_bytes() -> usize {
         cache_budget_bytes()
     }
+
+    /// Total upload/build-codes attempts that did NOT result in a resident
+    /// entry, since process start. See the `upload_failures` field doc for
+    /// exactly what counts (task 002).
+    pub fn upload_failures(&self) -> u64 {
+        self.upload_failures.load(Ordering::Relaxed)
+    }
+
+    /// Total times a fully-`ready()` GPU plan's device `run()` itself
+    /// failed, forcing a fallback to the CPU operator for that one query.
+    /// See the `run_fallbacks` field doc (task 002).
+    pub fn run_fallbacks(&self) -> u64 {
+        self.run_fallbacks.load(Ordering::Relaxed)
+    }
+
+    /// A point-in-time snapshot of every cache-state metric this task
+    /// (native-tables-tiering task 002) exposes — resident columns, VRAM
+    /// used, budget, eviction count, upload failures, run fallbacks. The
+    /// single source both `QE_GPU_DEBUG`'s trace lines and any external
+    /// caller (tests, a future admin surface) should read, so the two can
+    /// never silently disagree. Every field is a cheap, lock-free atomic
+    /// read except `resident_columns` (a `Mutex<HashSet>` length, the same
+    /// pre-existing cost `resident_column_count` already has).
+    pub fn snapshot(&self) -> GpuCacheSnapshot {
+        GpuCacheSnapshot {
+            resident_columns: self.resident_column_count(),
+            resident_bytes: self.resident_bytes(),
+            budget_bytes: Self::budget_bytes(),
+            eviction_count: self.eviction_count(),
+            upload_failures: self.upload_failures(),
+            run_fallbacks: self.run_fallbacks(),
+        }
+    }
+}
+
+/// See `GpuEngine::snapshot`. Plain data, cheap to copy, `Display`-able so
+/// `QE_GPU_DEBUG` tracing and any caller share one rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuCacheSnapshot {
+    pub resident_columns: usize,
+    pub resident_bytes: usize,
+    pub budget_bytes: usize,
+    pub eviction_count: u64,
+    pub upload_failures: u64,
+    pub run_fallbacks: u64,
+}
+
+impl std::fmt::Display for GpuCacheSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "resident_columns={} resident_bytes={} budget_bytes={} eviction_count={} \
+             upload_failures={} run_fallbacks={}",
+            self.resident_columns,
+            self.resident_bytes,
+            self.budget_bytes,
+            self.eviction_count,
+            self.upload_failures,
+            self.run_fallbacks
+        )
+    }
+}
+
+/// `QE_GPU_DEBUG`: this module's cache-state/failure-isolation trace,
+/// matching `QE_SPILL_DEBUG`'s established convention exactly (checked
+/// fresh via `std::env::var(...).is_ok()` on every call, never cached in a
+/// `OnceLock` — see `cache_budget_bytes`'s own doc for why that is the
+/// right call for a diagnostic switch a long-lived process or test might
+/// toggle; call frequency here is at most once per upload/build-codes/run
+/// job and once per query's GPU-routing decision, never per-row, so the
+/// cost is negligible). Zero cost when unset beyond one env lookup.
+fn gpu_debug_enabled() -> bool {
+    std::env::var("QE_GPU_DEBUG").is_ok()
 }
 
 /// SUM/MIN/MAX/COUNT take one slot; AVG takes two (sum + count).
@@ -1076,11 +1278,19 @@ fn worker(rx: std::sync::mpsc::Receiver<Job>, ready: std::sync::mpsc::Sender<boo
     while let Ok(job) = rx.recv() {
         match job {
             Job::Upload { pid, col, provider } => {
+                let trace = gpu_debug_enabled();
                 match load_column_f64(&provider, &col) {
                     Ok(Some(values)) => {
                         let expect = cache.rows.entry(pid).or_insert(values.len());
                         if *expect != values.len() {
                             tracing::warn!("gpu: {col} row count mismatch; skipped");
+                            GpuEngine::mark_upload_failed();
+                            if trace {
+                                eprintln!(
+                                    "[gpu-trace] upload SKIP (row count mismatch) pid={pid:x} col={col} snapshot=[{}]",
+                                    GpuEngine::get().map(|e| e.snapshot().to_string()).unwrap_or_default()
+                                );
+                            }
                         } else {
                             let bytes = values.len() * std::mem::size_of::<f64>();
                             cache.reserve(bytes);
@@ -1089,18 +1299,55 @@ fn worker(rx: std::sync::mpsc::Receiver<Job>, ready: std::sync::mpsc::Sender<boo
                                     cache.insert_column(pid, col.clone(), buf, bytes);
                                     GpuEngine::mark_resident(pid, &col, bytes);
                                     tracing::info!("gpu: cached {col} ({} MB)", bytes / 1_000_000);
+                                    if trace {
+                                        eprintln!(
+                                            "[gpu-trace] upload OK pid={pid:x} col={col} bytes={bytes} snapshot=[{}]",
+                                            GpuEngine::get().map(|e| e.snapshot().to_string()).unwrap_or_default()
+                                        );
+                                    }
                                 }
                                 Err(e) => {
+                                    // A genuine device-level failure (e.g. real
+                                    // VRAM exhaustion, a driver hiccup) — task
+                                    // 002: isolated to THIS column only (see
+                                    // module doc's "Failure isolation"
+                                    // section). No process-wide state is
+                                    // touched; `unmark_queued` below makes this
+                                    // column eligible for retry on the very
+                                    // next query that needs it.
                                     tracing::warn!("gpu: upload {col} failed: {e}");
-                                    GpuEngine::mark_unhealthy();
+                                    GpuEngine::mark_upload_failed();
+                                    if trace {
+                                        eprintln!(
+                                            "[gpu-trace] upload FAILED pid={pid:x} col={col} err={e} \
+                                             -- isolated to this column, other columns unaffected snapshot=[{}]",
+                                            GpuEngine::get().map(|e| e.snapshot().to_string()).unwrap_or_default()
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
                     Ok(None) => {
-                        tracing::info!("gpu: {col} not cacheable (nulls/type); skipped")
+                        tracing::info!("gpu: {col} not cacheable (nulls/type); skipped");
+                        GpuEngine::mark_upload_failed();
+                        if trace {
+                            eprintln!(
+                                "[gpu-trace] upload SKIP (not cacheable: null/type/range) pid={pid:x} col={col} snapshot=[{}]",
+                                GpuEngine::get().map(|e| e.snapshot().to_string()).unwrap_or_default()
+                            );
+                        }
                     }
-                    Err(e) => tracing::warn!("gpu: scan {col} failed: {e}"),
+                    Err(e) => {
+                        tracing::warn!("gpu: scan {col} failed: {e}");
+                        GpuEngine::mark_upload_failed();
+                        if trace {
+                            eprintln!(
+                                "[gpu-trace] upload FAILED (provider scan error) pid={pid:x} col={col} err={e} snapshot=[{}]",
+                                GpuEngine::get().map(|e| e.snapshot().to_string()).unwrap_or_default()
+                            );
+                        }
+                    }
                 }
                 // Always clear the dedup key, whatever happened above — see
                 // `GpuEngine::unmark_queued`'s doc for why this must not be
@@ -1113,11 +1360,19 @@ fn worker(rx: std::sync::mpsc::Receiver<Job>, ready: std::sync::mpsc::Sender<boo
                 cols,
                 provider,
             } => {
+                let trace = gpu_debug_enabled();
                 match build_codes(&provider, &cols) {
                     Ok(Some((codes, labels))) => {
                         let expect = cache.rows.entry(pid).or_insert(codes.len());
                         if *expect != codes.len() {
                             tracing::warn!("gpu: group codes row mismatch; skipped");
+                            GpuEngine::mark_upload_failed();
+                            if trace {
+                                eprintln!(
+                                    "[gpu-trace] codes SKIP (row count mismatch) key={key} snapshot=[{}]",
+                                    GpuEngine::get().map(|e| e.snapshot().to_string()).unwrap_or_default()
+                                );
+                            }
                         } else {
                             let n = labels.len();
                             let bytes = codes.len(); // u8 codes: 1 byte/row
@@ -1127,13 +1382,50 @@ fn worker(rx: std::sync::mpsc::Receiver<Job>, ready: std::sync::mpsc::Sender<boo
                                     cache.insert_codes(key.clone(), buf, labels, n, bytes);
                                     GpuEngine::mark_codes(&key, n, bytes);
                                     tracing::info!("gpu: cached group codes {key} ({n} groups)");
+                                    if trace {
+                                        eprintln!(
+                                            "[gpu-trace] codes OK key={key} groups={n} bytes={bytes} snapshot=[{}]",
+                                            GpuEngine::get().map(|e| e.snapshot().to_string()).unwrap_or_default()
+                                        );
+                                    }
                                 }
-                                Err(e) => tracing::warn!("gpu: codes upload failed: {e}"),
+                                Err(e) => {
+                                    // Task 002: isolated to this codes key
+                                    // only, same reasoning as the column
+                                    // upload failure above.
+                                    tracing::warn!("gpu: codes upload failed: {e}");
+                                    GpuEngine::mark_upload_failed();
+                                    if trace {
+                                        eprintln!(
+                                            "[gpu-trace] codes FAILED key={key} err={e} \
+                                             -- isolated to this key, other columns/codes unaffected snapshot=[{}]",
+                                            GpuEngine::get().map(|e| e.snapshot().to_string()).unwrap_or_default()
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
-                    Ok(None) => tracing::info!("gpu: group of {cols:?} not codeable; skipped"),
-                    Err(e) => tracing::warn!("gpu: group scan failed: {e}"),
+                    Ok(None) => {
+                        tracing::info!("gpu: group of {cols:?} not codeable; skipped");
+                        GpuEngine::mark_upload_failed();
+                        if trace {
+                            eprintln!(
+                                "[gpu-trace] codes SKIP (not codeable) key={key} cols={cols:?} snapshot=[{}]",
+                                GpuEngine::get().map(|e| e.snapshot().to_string()).unwrap_or_default()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("gpu: group scan failed: {e}");
+                        GpuEngine::mark_upload_failed();
+                        if trace {
+                            eprintln!(
+                                "[gpu-trace] codes FAILED (provider scan error) key={key} err={e} snapshot=[{}]",
+                                GpuEngine::get().map(|e| e.snapshot().to_string()).unwrap_or_default()
+                            );
+                        }
+                    }
                 }
                 GpuEngine::unmark_queued(&key);
             }
@@ -1601,11 +1893,21 @@ impl PhysicalOperator for GpuAggExec {
     }
 
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
+        let trace = gpu_debug_enabled();
         let use_gpu = *self.decision.get_or_init(|| match GpuEngine::get() {
             Some(engine) => {
                 let ready = engine.ready(&self.plan);
                 if !ready {
                     engine.request(&self.plan);
+                    if trace {
+                        eprintln!(
+                            "[gpu-trace] not ready table={} pid={:x} -- requesting upload(s), \
+                             this query runs on CPU snapshot=[{}]",
+                            self.plan.table,
+                            self.plan.pid(),
+                            engine.snapshot()
+                        );
+                    }
                 }
                 ready
             }
@@ -1613,13 +1915,37 @@ impl PhysicalOperator for GpuAggExec {
         });
         if use_gpu {
             if partition == 0 {
-                match GpuEngine::get().expect("decided").run(&self.plan).await {
+                let engine = GpuEngine::get().expect("decided");
+                match engine.run(&self.plan).await {
                     Ok(batch) => {
                         tracing::debug!("gpu: served {} on device", self.plan.table);
+                        if trace {
+                            eprintln!(
+                                "[gpu-trace] run OK table={} pid={:x} snapshot=[{}]",
+                                self.plan.table,
+                                self.plan.pid(),
+                                engine.snapshot()
+                            );
+                        }
                         return Ok(Box::pin(futures::stream::iter(vec![Ok(batch)])));
                     }
                     Err(e) => {
+                        // The plan WAS fully resident/ready (unlike an
+                        // upload failure, this is an execution-time
+                        // failure) -- task 002: falls back to the CPU
+                        // operator for THIS query only, isolated exactly
+                        // like an upload failure (see module doc).
                         tracing::warn!("gpu: run failed, falling back: {e}");
+                        GpuEngine::mark_run_fallback();
+                        if trace {
+                            eprintln!(
+                                "[gpu-trace] run FAILED table={} pid={:x} err={e} \
+                                 -- falling back to CPU for this query only snapshot=[{}]",
+                                self.plan.table,
+                                self.plan.pid(),
+                                engine.snapshot()
+                            );
+                        }
                         return self.inner.execute(partition).await;
                     }
                 }
@@ -1704,5 +2030,28 @@ mod tests {
         assert!(cache.columns.is_empty());
         assert!(cache.code_bufs.is_empty());
         assert!(cache.rows.is_empty());
+    }
+
+    // Task 002: `GpuCacheSnapshot`/its `Display` impl are plain data with no
+    // CUDA/env dependency, so — unlike the failure-isolation mechanism
+    // itself, which needs real hardware (`tests/gpu_failure_isolation_tests
+    // .rs`) — they can be unit-tested hermetically right here.
+    #[test]
+    fn snapshot_display_includes_every_field() {
+        let snap = GpuCacheSnapshot {
+            resident_columns: 3,
+            resident_bytes: 1024,
+            budget_bytes: 2048,
+            eviction_count: 5,
+            upload_failures: 7,
+            run_fallbacks: 2,
+        };
+        let s = snap.to_string();
+        assert!(s.contains("resident_columns=3"));
+        assert!(s.contains("resident_bytes=1024"));
+        assert!(s.contains("budget_bytes=2048"));
+        assert!(s.contains("eviction_count=5"));
+        assert!(s.contains("upload_failures=7"));
+        assert!(s.contains("run_fallbacks=2"));
     }
 }
