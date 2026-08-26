@@ -2,8 +2,8 @@
 name: native-tables-rollups
 status: in-progress
 created: 2026-08-26T06:43:51Z
-updated: 2026-08-26T12:00:00Z
-progress: 25%
+updated: 2026-08-26T13:00:00Z
+progress: 50%
 prd: .claude/prds/native-tables.md
 github: (will be set on sync)
 ---
@@ -218,7 +218,20 @@ task 001 used.
       feature combinations (+34 tests, zero regression). Recommendation:
       task 002 should proceed. Full detail: `001.md`'s own Outcome
       section.
-- [ ] 002.md - SQL DDL surface — CREATE MATERIALIZED VIEW (parallel: false)
+- [x] 002.md - SQL DDL surface — CREATE MATERIALIZED VIEW (parallel: false)
+      — CLOSED 2026-08-26. `CREATE MATERIALIZED VIEW <name> AS SELECT
+      ...` wired to task 001's `register_rollup`, zero sqlparser grammar
+      work, zero changes to task 001's own matching/substitution
+      mechanism (confirmed by empty diff on `native_rollup.rs`). All 17
+      `CreateView` struct fields refused by name where unsupported;
+      `IF NOT EXISTS` decided explicitly (error, mirrors `CREATE TABLE`'s
+      own precedent); `sql()`'s DDL/DML redirect pattern extended to a
+      fifth case; REPL wired; checked and documented that registration is
+      NOT reachable via HTTP `/sql`/Flight (mirrors CTAS's own
+      pre-existing boundary) while subsequent MATCHING is, since it
+      shares the real `sql()` path. 11 new end-to-end tests, full suite
+      green in all four feature combinations (+11 each, 0 regressions).
+      Full detail: `002.md`'s own Outcome section.
 - [ ] 003.md - Staleness/refresh-on-write model (parallel: false)
 - [ ] 004.md - QA close-out — cell-exact validation, full suite, docs, epic close (parallel: false)
 
@@ -226,4 +239,5 @@ Total tasks: 4
 Parallel tasks: 0
 Sequential tasks: 4
 Estimated total effort: genuinely uncertain, dominated by task 001 (now
-closed — see its own Outcome for what remains: tasks 002-004)
+closed — see its own Outcome for what remains: tasks 002-004). Task 002
+(now also closed) was S-M as estimated, no surprises versus the plan.

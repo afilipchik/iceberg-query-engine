@@ -2112,7 +2112,10 @@ semantics tests). Both must stay green.
 A first-class, writable, independently-persistent table format — phase 1
 ("foundation") of the four-phase `native-tables` PRD
 (`.claude/prds/native-tables.md`; phases 2-4 are mutation, GPU/RAM/disk
-tiering, and materialized rollups, none built yet). Generalizes the
+tiering, and materialized rollups — as of this writing, phase 2
+(mutation) is fully shipped and phase 4 (rollups) has its core matching/
+substitution mechanism and SQL DDL surface shipped, see "Materialized
+rollups" below; phase 3 (tiering) is not built). Generalizes the
 engine's existing Arrow-IPC sidecar cache (`src/storage/ipc_cache.rs`,
 already measured faster than DuckDB's own native storage at SF=100) from
 an opportunistic read-through cache tied to shadowing a specific parquet
@@ -3226,8 +3229,10 @@ what the cell-exact validation above already established).
 Phase 4 of the native-tables PRD, task 1 of 4. Proves the epic's own
 real risk — can a query be matched against a registered rollup
 definition and transparently, correctly answered from it — against a
-PROGRAMMATIC registration API (`ExecutionContext::register_rollup`, not
-SQL DDL yet; that is task 002's job). Genuinely new-algorithm-class
+PROGRAMMATIC registration API (`ExecutionContext::register_rollup`,
+proven before any SQL DDL was built on top of it; task 002, immediately
+below, wires `CREATE MATERIALIZED VIEW` onto this same API unchanged).
+Genuinely new-algorithm-class
 work: a dedicated research pass confirmed nothing in this codebase
 previously reasoned about equivalence between two independently-planned
 queries.
@@ -3355,17 +3360,17 @@ exactly the prior baseline + this task's 34 new tests), 0 failed
 anywhere.
 
 **What's explicitly NOT done, per the epic's own task breakdown** (not
-silently narrowed — named here): SQL DDL (`CREATE MATERIALIZED VIEW`,
-task 002); the refresh-on-write model that keeps `RollupMeta` current
-automatically on base-table INSERT/DELETE/UPDATE (task 003 — today, a
-mutated base table's rollup simply goes stale and is excluded from
-matching until manually re-registered); subsumption/coarser-grouping
-matching (explicitly out of scope for this epic, named by the epic
-itself as "a genuinely new algorithm class"); rollups over a non-native
-base table; a subquery-embedded aggregate opportunity
-(`LogicalPlan::children()` does not expose plans inside
-`Expr::ScalarSubquery`/`Exists`/`InSubquery`, so `substitute`'s
-recursive walk never visits them); distributed rollups.
+silently narrowed — named here): SQL DDL was task 002's job (now shipped
+— see the next section); the refresh-on-write model that keeps
+`RollupMeta` current automatically on base-table INSERT/DELETE/UPDATE
+(task 003 — today, a mutated base table's rollup simply goes stale and
+is excluded from matching until manually re-registered/re-`CREATE
+MATERIALIZED VIEW`-ed); subsumption/coarser-grouping matching
+(explicitly out of scope for this epic, named by the epic itself as "a
+genuinely new algorithm class"); rollups over a non-native base table; a
+subquery-embedded aggregate opportunity (`LogicalPlan::children()` does
+not expose plans inside `Expr::ScalarSubquery`/`Exists`/`InSubquery`, so
+`substitute`'s recursive walk never visits them); distributed rollups.
 
 Reproduce: `scripts/claude-safe-build.sh cargo test native_rollup` (35
 unit+integration tests); `scripts/claude-safe-build.sh cargo build
@@ -3373,6 +3378,93 @@ unit+integration tests); `scripts/claude-safe-build.sh cargo build
 claude-safe-build.sh ./target/release/examples/
 native_rollup_cell_exact_check && .venv/bin/python scripts/
 native_rollup_cell_exact_check.py` (DuckDB oracle, real SF=1 scale).
+
+### Materialized rollups: SQL DDL surface (native-tables-rollups epic, task 002, 2026-08-26)
+
+`CREATE MATERIALIZED VIEW <name> AS SELECT ...` wired onto task 001's
+`register_rollup`, with ZERO sqlparser grammar work (confirmed by the
+research: `Statement::CreateView { materialized: true, query, .. }`
+already parsed this shape natively at the pinned sqlparser 0.62) and
+ZERO changes to task 001's own matching/substitution mechanism
+(`native_rollup.rs` — confirmed by an empty diff against task 001's
+head, not just "we didn't mean to touch it"). Example:
+
+```sql
+CREATE MATERIALIZED VIEW lineitem_rollup AS
+  SELECT l_returnflag, l_linestatus,
+         SUM(l_quantity) AS sum_qty, SUM(l_extendedprice) AS sum_base_price,
+         COUNT(*) AS count_order
+  FROM lineitem_native GROUP BY l_returnflag, l_linestatus;
+```
+
+**`Binder::bind()` gains a `Statement::CreateView` arm**
+(`src/planner/binder.rs`), mirroring `Statement::CreateTable`'s existing
+shape exactly (validate, then bind the inner query).
+`require_supported_create_view_shape` refuses, BY NAME, every one of
+sqlparser 0.62's real 17 `CreateView` struct fields this epic does not
+implement (re-read directly from the vendored `ast/ddl.rs`, not a
+paraphrase) — `or_alter`, `or_replace`, `secure`, an explicit view
+column list, `options`, `cluster_by`, `comment`,
+`with_no_schema_binding`, `if_not_exists`, `temporary`, `copy_grants`,
+`to`, `params`. `materialized` is required `true` — a plain `CREATE
+VIEW` is refused explicitly (out of scope entirely, never silently
+treated as a rollup), checked separately from the shape validator since
+its required sense (must be ON) is the opposite of every other field
+(must be OFF).
+
+**`IF NOT EXISTS` — decided explicitly: ERROR**, matching `CREATE
+TABLE`'s own `ct.if_not_exists` precedent exactly: `register_rollup`
+always recomputes/replaces wholesale, so silently accepting and ignoring
+the flag would change what the statement means rather than doing what
+it says.
+
+**`ExecutionContext::create_materialized_view(&mut self, sql: &str)`**
+(new, placed beside `register_rollup`): extracts the target name,
+`Binder::bind()`s the whole statement (validates shape, binds the inner
+query), recovers the defining query's base table from that SAME bound
+plan via `native_rollup::recognize` — task 001's OWN recognition
+function, reused unchanged from a new call site, so this layer and
+`register_rollup`'s own internal re-derivation of the same query can
+never disagree about which table a rollup is defined against — then
+calls `register_rollup(name, base_table, defining_sql)`, which does all
+the real work. This method never itself touches the plan/execute/write
+pipeline: purely a DDL front end, per the task's own scope. `sql()`
+gained a fifth DDL/DML redirect case (mirrors CREATE TABLE/INSERT/
+DELETE/UPDATE's identical pattern); a plain `CREATE VIEW` is
+deliberately NOT caught by that guard (no entrypoint to redirect it to)
+and instead falls through to `Binder::bind()`'s own direct refusal,
+mirroring `Statement::Delete`/`Update`'s precedent. REPL wiring mirrors
+the other four DDL/DML statements' existing dispatch exactly.
+
+**Checked, per the task's own instruction, whether REPL/CLI share the
+`sql()` path — finding**: `src/distributed/server.rs`'s
+`execute_statement` (used by both HTTP `/sql` and Arrow Flight) calls
+`ctx.sql(&statement)` directly, so CREATE MATERIALIZED VIEW's
+REGISTRATION step is **NOT reachable via HTTP `/sql` or Flight**,
+exactly mirroring CTAS's own already-documented boundary above — only
+the SUBSEQUENT matching/answering step (an ordinary query) runs through
+the real, shared `sql()` path. The REPL has its own dedicated dispatch
+for registration, matching CREATE TABLE/INSERT/DELETE/UPDATE's identical
+pattern; no other CLI subcommand runs arbitrary DDL text.
+
+**Validated end to end** (`tests/native_materialized_view_tests.rs`, 11
+new tests): `CREATE MATERIALIZED VIEW` populates a rollup and a
+subsequent `ctx.sql()` query — the exact method HTTP `/sql`/the REPL's
+catch-all call — is transparently answered from it, provenance-confirmed
+and cell-exact vs. an independent reference context; `sql()`'s redirect
+and the plain-`CREATE VIEW`/`IF NOT EXISTS`/`OR REPLACE`/view-column-list
+refusals; the defining query's own shape requirements (no WHERE, no
+computed projection, no JOIN, native base table only) are not loosened
+by the DDL layer, reaching `register_rollup`'s own already-tested
+validation correctly through the new glue code.
+
+**Full suite, all four feature combinations, zero regression**: default
+1235 (+11), lance 1300 (+11), gpu 1235 (+11), pulsar 1238 (+11) — each
+exactly task 001's own baseline plus this task's 11 new tests, 0 failed
+anywhere. `cargo fmt --all -- --check` clean.
+
+Reproduce: `scripts/claude-safe-build.sh cargo test --test
+native_materialized_view_tests`.
 
 ### Current limitations (explicit, matching this epic's own G5 boundary and the PRD's phase plan)
 
@@ -3518,14 +3610,18 @@ native_rollup_cell_exact_check.py` (DuckDB oracle, real SF=1 scale).
   values) against a table with a non-empty deletion vector — see
   Benchmarks below.
 - **Materialized rollups (phase 4 of the PRD) have their core matching/
-  substitution mechanism built and cell-exact validated** (native-
-  tables-rollups epic, task 001, see above) — but only the programmatic
-  registration API, single-base-table/unfiltered/exact-match shapes, and
-  manual (not automatic) staleness: no SQL DDL yet (task 002), no
-  refresh-on-write (task 003 — a mutated base table's rollup goes stale
-  and stays excluded from matching until manually re-registered), and no
-  subsumption/coarser-grouping matching (explicitly out of scope for the
-  whole epic).
+  substitution mechanism built and cell-exact validated, and a SQL DDL
+  surface on top of it** (native-tables-rollups epic, tasks 001-002, see
+  above) — but still only single-base-table/unfiltered/exact-match
+  shapes, and manual (not automatic) staleness: no refresh-on-write yet
+  (task 003 — a mutated base table's rollup goes stale and stays
+  excluded from matching until manually re-registered/re-`CREATE
+  MATERIALIZED VIEW`-ed), no `ALTER`/`DROP`/`REFRESH MATERIALIZED VIEW`
+  (re-running `CREATE MATERIALIZED VIEW` under the same name is the only
+  "refresh" available today), registration is not reachable via HTTP
+  `/sql`/Flight (mirrors CTAS's own identical boundary — only the
+  subsequent matching/answering step is), and no subsumption/coarser-
+  grouping matching (explicitly out of scope for the whole epic).
 
 ### Benchmarks (2026-08-23, task 008 close-out)
 
