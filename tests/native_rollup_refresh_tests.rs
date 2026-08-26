@@ -30,6 +30,71 @@ fn render(batches: &[arrow::record_batch::RecordBatch]) -> String {
         .unwrap_or_default()
 }
 
+/// Cell-exact comparison for two independently-computed aggregation
+/// results, tolerant of float64 summation-order noise -- the SAME
+/// `1e-6` relative / `1e-9` absolute convention already established for
+/// exactly this class of comparison elsewhere in this codebase
+/// (`tests/distributed_cluster.rs`, `src/distributed/coordinator.rs`:
+/// "1e-6 relative for floating point" reduction-order sensitivity).
+///
+/// This matters here specifically because `after` (rollup-refreshed) and
+/// `reference` (recomputed from scratch in a completely separate
+/// `ExecutionContext`) are two independently-scheduled parallel
+/// aggregations over the identical logical data -- non-associative f64
+/// SUM means their exact bit patterns can legitimately differ in the
+/// last few significant digits depending on thread-scheduling-dependent
+/// partial-sum combination order (confirmed non-reproducing across 10/10
+/// isolated re-runs; only surfaced once, under full-workspace-suite CPU
+/// contention). An exact string/Display comparison is fragile to this by
+/// construction; a real wrong-answer bug would show a difference far
+/// larger than float noise, which this still catches.
+fn assert_cell_exact_with_tolerance(after: &str, reference: &str, context: &str) {
+    let cells = |s: &str| -> Vec<Vec<String>> {
+        s.lines()
+            .filter(|l| l.contains('|'))
+            .map(|l| {
+                l.split('|')
+                    .map(|c| c.trim().to_string())
+                    .filter(|c| !c.is_empty())
+                    .collect()
+            })
+            .collect()
+    };
+    let a_rows = cells(after);
+    let r_rows = cells(reference);
+    assert_eq!(
+        a_rows.len(),
+        r_rows.len(),
+        "{context}\nrow count differs -- after:\n{after}\nreference:\n{reference}"
+    );
+    for (row_idx, (a_row, r_row)) in a_rows.iter().zip(r_rows.iter()).enumerate() {
+        assert_eq!(
+            a_row.len(),
+            r_row.len(),
+            "{context}\nrow {row_idx} column count differs -- after:\n{after}\nreference:\n{reference}"
+        );
+        for (col_idx, (a_cell, r_cell)) in a_row.iter().zip(r_row.iter()).enumerate() {
+            if a_cell == r_cell {
+                continue;
+            }
+            match (a_cell.parse::<f64>(), r_cell.parse::<f64>()) {
+                (Ok(a_f), Ok(r_f)) => {
+                    let tol = (1e-6 * a_f.abs().max(r_f.abs())).max(1e-9);
+                    assert!(
+                        (a_f - r_f).abs() <= tol,
+                        "{context}\nrow {row_idx} col {col_idx} differs beyond float tolerance \
+                         ({a_cell} vs {r_cell}, tol {tol}) -- after:\n{after}\nreference:\n{reference}"
+                    );
+                }
+                _ => panic!(
+                    "{context}\nrow {row_idx} col {col_idx} differs and is not float-comparable \
+                     ({a_cell:?} vs {r_cell:?}) -- after:\n{after}\nreference:\n{reference}"
+                ),
+            }
+        }
+    }
+}
+
 /// A fresh context with `lineitem_src` registered from the real fixture,
 /// plus a native table `lineitem_native` containing every row, written
 /// via the real CTAS SQL surface into a private tempdir. No rollup is
@@ -150,11 +215,11 @@ async fn insert_eagerly_refreshes_the_dependent_rollup_and_stays_cell_exact() {
         .await
         .expect("reference insert must succeed");
     let reference = ref_ctx.sql(WORKED_EXAMPLE_QUERY).await.unwrap();
-    assert_eq!(
-        render(&after.batches),
-        render(&reference.batches),
+    assert_cell_exact_with_tolerance(
+        &render(&after.batches),
+        &render(&reference.batches),
         "the refreshed rollup's answer must be cell-exact vs. an independently recomputed \
-         reference over the identically-mutated base table"
+         reference over the identically-mutated base table",
     );
 }
 
@@ -190,7 +255,11 @@ async fn delete_eagerly_refreshes_the_dependent_rollup_and_stays_cell_exact() {
         .await
         .expect("reference delete must succeed");
     let reference = ref_ctx.sql(WORKED_EXAMPLE_QUERY).await.unwrap();
-    assert_eq!(render(&after.batches), render(&reference.batches));
+    assert_cell_exact_with_tolerance(
+        &render(&after.batches),
+        &render(&reference.batches),
+        "DELETE refresh must be cell-exact vs. an independently recomputed reference",
+    );
 }
 
 #[tokio::test]
@@ -232,7 +301,11 @@ async fn update_eagerly_refreshes_the_dependent_rollup_and_stays_cell_exact() {
         .await
         .expect("reference update must succeed");
     let reference = ref_ctx.sql(WORKED_EXAMPLE_QUERY).await.unwrap();
-    assert_eq!(render(&after.batches), render(&reference.batches));
+    assert_cell_exact_with_tolerance(
+        &render(&after.batches),
+        &render(&reference.batches),
+        "UPDATE refresh must be cell-exact vs. an independently recomputed reference",
+    );
 }
 
 // ============================================================================
@@ -475,11 +548,11 @@ async fn a_failed_refresh_leaves_the_rollup_stale_and_matching_queries_fall_back
         .await
         .expect("reference delete must succeed");
     let reference = ref_ctx.sql(WORKED_EXAMPLE_QUERY).await.unwrap();
-    assert_eq!(
-        render(&after.batches),
-        render(&reference.batches),
+    assert_cell_exact_with_tolerance(
+        &render(&after.batches),
+        &render(&reference.batches),
         "the fallback answer (after a failed refresh) must be cell-exact vs. an independently \
-         recomputed reference over the identically-mutated base table -- not stale, not wrong"
+         recomputed reference over the identically-mutated base table -- not stale, not wrong",
     );
     assert_ne!(
         render(&before.batches),
