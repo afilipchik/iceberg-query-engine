@@ -2,8 +2,8 @@
 name: native-tables-rollups
 status: in-progress
 created: 2026-08-26T06:43:51Z
-updated: 2026-08-26T13:00:00Z
-progress: 50%
+updated: 2026-08-26T14:00:00Z
+progress: 75%
 prd: .claude/prds/native-tables.md
 github: (will be set on sync)
 ---
@@ -232,7 +232,32 @@ task 001 used.
       shares the real `sql()` path. 11 new end-to-end tests, full suite
       green in all four feature combinations (+11 each, 0 regressions).
       Full detail: `002.md`'s own Outcome section.
-- [ ] 003.md - Staleness/refresh-on-write model (parallel: false)
+- [x] 003.md - Staleness/refresh-on-write model (parallel: false)
+      — CLOSED 2026-08-26. EAGER refresh chosen and documented explicitly
+      (LAZY has no viable call site: the only place a rollup is matched,
+      `sql()`/`optimized_plan()`, is `&self`, and the only refresh
+      mechanism, `register_rollup`, is `&mut self` — making LAZY work
+      would need either an invasive `sql()` signature change or new
+      interior-mutability infrastructure, both outside this task's
+      scope). Wired into all three of `ExecutionContext::
+      insert_into_native_table`/`delete_from_native_table`/
+      `update_native_table` (a deliberate layering choice explained in
+      full in the task's own Outcome — NOT literally inside
+      `native_write.rs`/`native_delete.rs`/`native_update.rs`, which have
+      no SQL/registry awareness by design, mirroring task 001's own
+      "why not an OptimizerRule" reasoning). Multi-rollup case verified
+      (one mutation refreshes ALL dependents). A failed refresh never
+      fails the base table's own mutation and leaves the rollup
+      correctly stale, verified with a REAL induced I/O failure (not
+      simulated) via a permission-denial test, with the fallback answer
+      confirmed cell-exact. Performance measured, not assumed: 3-5.6x
+      mutation latency at SF=1 with 1-3 rollups registered, root-caused
+      to a full base-table rescan per rollup (the honest cost of EAGER
+      full-recompute refresh vs. a much harder, out-of-scope incremental
+      merge). Full suite green in all four feature combinations (+8 tests
+      each, 0 regressions); zero changes to `native_write.rs`/
+      `native_delete.rs`/`native_update.rs`/`native_rollup.rs` (confirmed
+      by `git diff`). Full detail: `003.md`'s own Outcome section.
 - [ ] 004.md - QA close-out — cell-exact validation, full suite, docs, epic close (parallel: false)
 
 Total tasks: 4
@@ -241,3 +266,5 @@ Sequential tasks: 4
 Estimated total effort: genuinely uncertain, dominated by task 001 (now
 closed — see its own Outcome for what remains: tasks 002-004). Task 002
 (now also closed) was S-M as estimated, no surprises versus the plan.
+Task 003 (now also closed) was S-M as estimated, no surprises versus the
+plan.
