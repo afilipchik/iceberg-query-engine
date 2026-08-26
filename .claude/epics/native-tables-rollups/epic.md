@@ -2,8 +2,8 @@
 name: native-tables-rollups
 status: in-progress
 created: 2026-08-26T06:43:51Z
-updated: 2026-08-26T06:43:51Z
-progress: 0%
+updated: 2026-08-26T12:00:00Z
+progress: 25%
 prd: .claude/prds/native-tables.md
 github: (will be set on sync)
 ---
@@ -207,7 +207,17 @@ task 001 used.
 - 004: S-M.
 
 ## Tasks Created
-- [ ] 001.md - Rollup data model + matching/substitution mechanism (parallel: false)
+- [x] 001.md - Rollup data model + matching/substitution mechanism (parallel: false)
+      — CLOSED 2026-08-26. Confidence gate MET: a real, evidenced,
+      working substitution mechanism, cell-exact validated (direct
+      computation + independent DuckDB oracle at real SF=1 scale),
+      order-independence/aliasing decided and tested explicitly, three
+      non-matching-shape fallback cases plus staleness-after-mutation
+      all verified cell-exact (not just "doesn't crash"), provenance via
+      `QueryMetrics::rollup_answered`, full suite green in all four
+      feature combinations (+34 tests, zero regression). Recommendation:
+      task 002 should proceed. Full detail: `001.md`'s own Outcome
+      section.
 - [ ] 002.md - SQL DDL surface — CREATE MATERIALIZED VIEW (parallel: false)
 - [ ] 003.md - Staleness/refresh-on-write model (parallel: false)
 - [ ] 004.md - QA close-out — cell-exact validation, full suite, docs, epic close (parallel: false)
@@ -215,4 +225,5 @@ task 001 used.
 Total tasks: 4
 Parallel tasks: 0
 Sequential tasks: 4
-Estimated total effort: genuinely uncertain, dominated by task 001
+Estimated total effort: genuinely uncertain, dominated by task 001 (now
+closed — see its own Outcome for what remains: tasks 002-004)
