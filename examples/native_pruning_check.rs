@@ -64,8 +64,11 @@ async fn main() -> query_engine::Result<()> {
     // (whose min_i64 = 1048577) is PROVABLY unsatisfiable for `<= 1000` and
     // must be skipped. Set QE_DEBUG_NATIVE_PRUNING=1 to see the trace.
     println!("\n--- range predicate: o_orderkey <= 1000 (should skip segment 1) ---");
-    let range_count =
-        scalar_count(&ctx, "SELECT COUNT(*) FROM orders_native WHERE o_orderkey <= 1000").await;
+    let range_count = scalar_count(
+        &ctx,
+        "SELECT COUNT(*) FROM orders_native WHERE o_orderkey <= 1000",
+    )
+    .await;
     println!("filtered COUNT(*): {range_count}");
 
     // Equality predicate entirely inside segment 1's key range -- segment 0
@@ -88,7 +91,8 @@ async fn main() -> query_engine::Result<()> {
     // diverge.
     use arrow::array::Int64Array;
     use arrow::compute::kernels::cmp::{eq, lt_eq};
-    let provider = query_engine::storage::NativeTable::try_new(NATIVE_DIR).expect("open native table");
+    let provider =
+        query_engine::storage::NativeTable::try_new(NATIVE_DIR).expect("open native table");
     let full = query_engine::physical::operators::TableProvider::scan(&provider, None)
         .expect("unfiltered scan");
     let idx = full[0]
@@ -190,13 +194,20 @@ async fn main() -> query_engine::Result<()> {
         }
     }
     println!("\n--- lineitem cell-exact cross-check ---");
-    println!("manual AND count: {manual_and} (engine AND: {and_count}, engine BETWEEN: {between_count})");
-    assert_eq!(manual_and as i64, and_count, "AND-pruned result must match the unpruned baseline");
+    println!(
+        "manual AND count: {manual_and} (engine AND: {and_count}, engine BETWEEN: {between_count})"
+    );
+    assert_eq!(
+        manual_and as i64, and_count,
+        "AND-pruned result must match the unpruned baseline"
+    );
     assert_eq!(
         manual_and as i64, between_count,
         "BETWEEN-pruned result must equal the equivalent AND-pruned result exactly"
     );
 
-    println!("\nPASS: lineitem AND/BETWEEN pruning is cell-exact vs. a pruning-independent baseline.");
+    println!(
+        "\nPASS: lineitem AND/BETWEEN pruning is cell-exact vs. a pruning-independent baseline."
+    );
     Ok(())
 }

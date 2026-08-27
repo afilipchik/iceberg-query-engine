@@ -430,9 +430,7 @@ fn filter_deleted_rows(
 fn segment_might_match(predicate: &Expr, stats: &BTreeMap<String, ColumnStats>) -> bool {
     match predicate {
         Expr::BinaryExpr { left, op, right } => match op {
-            BinaryOp::And => {
-                segment_might_match(left, stats) && segment_might_match(right, stats)
-            }
+            BinaryOp::And => segment_might_match(left, stats) && segment_might_match(right, stats),
             BinaryOp::Or => segment_might_match(left, stats) || segment_might_match(right, stats),
             _ => check_comparison(left, op, right, stats),
         },
@@ -1560,7 +1558,11 @@ mod tests {
         // skipped: `ColumnStats` has no zone-map for it.
         let stats: BTreeMap<String, ColumnStats> = BTreeMap::new();
         assert!(segment_might_match(
-            &cmp(col("name"), BinaryOp::Eq, Expr::Literal(ScalarValue::Utf8("z".into()))),
+            &cmp(
+                col("name"),
+                BinaryOp::Eq,
+                Expr::Literal(ScalarValue::Utf8("z".into()))
+            ),
             &stats
         ));
     }
@@ -1670,6 +1672,10 @@ mod tests {
                     .to_vec()
             })
             .collect();
-        assert_eq!(ids, vec![1, 3], "id=2 must still be excluded by the deletion vector");
+        assert_eq!(
+            ids,
+            vec![1, 3],
+            "id=2 must still be excluded by the deletion vector"
+        );
     }
 }
