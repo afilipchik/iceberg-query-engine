@@ -2,8 +2,8 @@
 name: native-table-pruning
 status: in-progress
 created: 2026-08-27T07:44:44Z
-updated: 2026-08-27T07:44:44Z
-progress: 0%
+updated: 2026-08-27T09:30:00Z
+progress: 50%
 prd: .claude/prds/native-table-pruning.md
 github: (will be set on sync)
 ---
@@ -92,10 +92,45 @@ computes," not new infrastructure.
 - 002: S.
 
 ## Tasks Created
-- [ ] 001.md - Implement segment-level scan pruning (parallel: false)
+- [x] 001.md - Implement segment-level scan pruning (parallel: false) — CLOSED 2026-08-27
 - [ ] 002.md - Validation, before/after measurement, QA close-out (parallel: false)
 
 Total tasks: 2
 Parallel tasks: 0
 Sequential tasks: 2
 Estimated total effort: S-M
+
+## Task 001 close-out summary (2026-08-27)
+
+`NativeTable::scan_with_filter` (`src/storage/native_table.rs`) now really
+prunes: for each active segment, `segment_might_match` evaluates the pushed
+predicate (AND/OR/NOT/BETWEEN/InList, mirroring `row_group_pruning.rs`'s
+own recursive shape and reusing its `flip_op`/`eval_range`/`eval_range_f64`
+helpers verbatim, made `pub(crate)`) against that segment's `ColumnStats`;
+a segment PROVABLY unable to match is never passed to
+`ipc_cache::read_row_group` at all. The caller-side wiring
+(`PhysicalPlanner`'s Scan arm calling `provider.scan_with_filter(...)`
+unconditionally for any non-streaming-Parquet provider) was confirmed
+ALREADY provider-agnostic by reading `src/physical/planner.rs` in full —
+zero changes needed there. Deletion vectors remain fully respected
+(pruned-out segments are simply never read; segments that ARE read still
+go through the unchanged `filter_deleted_rows` step). Tracing via
+`QE_DEBUG_NATIVE_PRUNING=1`, matching this codebase's established
+env-gated diagnostic convention.
+
+Real, traced confirmation: `examples/native_pruning_check.rs` against
+real on-disk multi-segment native tables (`data/tpch-1gb-native/orders`,
+2 segments; `.../lineitem`, 6 segments) shows real segment skips for
+range/equality/AND/BETWEEN predicates (e.g. an AND-of-two-comparisons on
+`lineitem.l_orderkey` skips 5 of 6 segments), cell-exact both against an
+independent in-process unpruned baseline and against a fresh DuckDB
+oracle over the same source parquet. 12 new hermetic unit tests (10
+`segment_might_match` cases + 2 end-to-end `scan_with_filter` cases,
+one of which composes pruning with a real deletion vector) all pass.
+Full suite green in all four feature combinations, each exactly the
+prior baseline + these 12 new tests, zero regressions; `cargo fmt --all
+-- --check` clean. Full detail, every command, and the complete Outcome
+section: `001.md`.
+
+Not attempted by this task (explicitly task 002's job per the task
+breakdown above): the Q4/Q12/Q13 before/after re-measurement (G3).
