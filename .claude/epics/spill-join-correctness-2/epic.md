@@ -2,8 +2,8 @@
 name: spill-join-correctness-2
 status: in-progress
 created: 2026-08-27T07:44:44Z
-updated: 2026-08-27T07:44:44Z
-progress: 0%
+updated: 2026-08-27T09:30:00Z
+progress: 20%
 prd: .claude/prds/spill-join-correctness-2.md
 github: (will be set on sync)
 ---
@@ -131,13 +131,53 @@ better-bounded.
 - 005: S-M.
 
 ## Tasks Created
-- [ ] 001.md - Hash/derived-state-consistency investigation (parallel: false)
+- [x] 001.md - Hash/derived-state-consistency investigation (parallel: false)
+      — CLOSED. Confidence gate MET WITH DIRECT EVIDENCE: the new
+      `KeyChecksum` write-vs-read instrumentation caught a real
+      spill-directory collision (two concurrent `query_engine` processes
+      sharing the same PID-less default `spill_path`) producing silent
+      wrong answers, not just the "loud crash only" `spill-join-
+      correctness` task 003 previously characterized. Fixed
+      (PID-disambiguated default spill path, `src/execution/memory.rs`),
+      validated via a regression test (fails-without/passes-with), a
+      deliberate controlled 2-process collision reproduction (3/3
+      collided pre-fix, 0/8 collided post-fix across native+parquet), and
+      615 clean single-process trials post-instrumentation. Full suite
+      green, 4/4 feature combinations. **NOTE for task 004**: this fix
+      already resolves task 004's own "spill-directory collision" sibling
+      bug target — task 004 should verify and cross-reference rather than
+      re-fix the same field. See `001.md`'s Outcome for full detail.
 - [ ] 002.md - Fix the collect-fully-then-decide OOM hole (parallel: false)
 - [ ] 003.md - Fault-injection/differential testing harness (parallel: false)
-- [ ] 004.md - Fix the three known sibling bugs (parallel: false)
+- [ ] 004.md - Fix the three known sibling bugs (parallel: false) — NOTE:
+      one of its three targets (spill-directory collision) is already
+      fixed by task 001; task 004 should verify/cross-reference, not
+      duplicate.
 - [ ] 005.md - QA close-out (parallel: false)
 
 Total tasks: 5
 Parallel tasks: 0
 Sequential tasks: 5
 Estimated total effort: genuinely uncertain, dominated by task 001
+
+## Task 001 close-out (2026-08-27)
+
+Closed with a landed fix — NOT the "reliably reproduced, not yet
+root-caused" outcome the epic's own Architecture Decisions anticipated as
+equally valid. The hash/derived-state-consistency hypothesis, in its
+literal Trino PR #25892 form (two different hash-VALUE-generator
+implementations disagreeing on the same logical key), was not what was
+found. What WAS found, via the exact "instrument, don't just re-read"
+discipline the epic's Architecture Decisions require: a structurally
+adjacent mismatch — the join-key data ITSELF, not just its hash, differed
+between what a spilling execution wrote and what an unrelated, CONCURRENT
+execution's own writes/deletes caused a later read to see, because both
+processes shared one PID-less default spill directory. Caught directly
+(a `HASH-MISMATCH` trace line showing ~10x row inflation, correlated with
+a wrong final query answer in the same trial), root-caused, fixed with a
+one-line change, and validated from three independent angles (a
+deterministic unit test, a deliberate self-contained collision
+reproduction, and a 615-trial clean sweep). Full detail, including the
+mid-investigation worktree-isolation incident (an almost poetic parallel
+to the bug itself — two unrelated concurrent agents colliding on one
+shared resource), in `001.md`'s Outcome section.

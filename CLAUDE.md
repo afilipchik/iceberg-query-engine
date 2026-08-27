@@ -3190,6 +3190,38 @@ no-guess-fixes gate) — tracked here as known, open issues:
    cell-exact) — but a real availability risk. Not fixed; needs
    per-process disambiguation added to the spill-path default (e.g.
    include the PID).
+
+   **Update (`spill-join-correctness-2` epic, task 001, 2026-08-27):
+   FIXED, and the "never silently wrong" claim above was INCOMPLETE.**
+   Direct, instrumented evidence (a new per-partition join-key checksum
+   comparing what a spilling execution WROTE against what it later READ
+   BACK, `QE_SPILL_DEBUG`-gated `KeyChecksum` in `spillable.rs`) caught
+   this exact collision producing a SILENTLY WRONG final query answer —
+   `read_rows` ~9.9-10x `write_rows` across all 64 build partitions in
+   the affected trial, matching a concurrent, unrelated SF=100 process's
+   own join-spill data bleeding into this trial's SF=10 read via the
+   shared default path. A second trial in the same sweep showed the
+   identical mismatch pattern but happened to still land on the correct
+   final answer; a third manifested as the loud crash this entry
+   originally described. All three are the SAME underlying collision —
+   whether it fails loud or silently wrong depends on exact timing, not
+   on a different mechanism. **Fixed**: `ExecutionConfig::default()`'s
+   `spill_path` now embeds `std::process::id()`
+   (`src/execution/memory.rs`), making a default-path collision between
+   two different processes structurally impossible. Validated: a
+   regression test that fails without the fix and passes with it; a
+   deliberate, controlled, self-contained 2-concurrent-process
+   collision reproduction (3/3 trials collided pre-fix — native; 0/8
+   collided post-fix — native and parquet); 615 clean single-process
+   trials post-fix (0 wrong, 0 checksum mismatches). This mechanism is
+   PLAUSIBLE but NOT PROVEN to be the cause of this section's own
+   headline ~0.34%-rate historical wrong-answer bug (below) — no
+   concurrent process was ever identified at the time of that bug's
+   original occurrences — but it is the same operator class, the same
+   file, and the same "silently wrong, not crashed" symptom shape, and
+   it is now a confirmed, real, fixed mechanism rather than a
+   hypothesis. Full evidence: `.claude/epics/spill-join-correctness-2/
+   001.md`'s Outcome section.
 2. **`LIMIT` not enforced under spill for `ORDER BY ... LIMIT`
    queries** (Q2/Q3-shaped). Trigger condition: a deliberately
    adversarial, unrealistic `--memory-limit 1M` sweep that forced 13
@@ -3224,6 +3256,19 @@ O(n²) fix, ~40-90x). A real, valuable characterization landed
 (native/parquet parity, confirmed distributed exposure, three
 newly-found bugs). Full epic close-out, including G1-G6 verdicts and
 every commit: `.claude/epics/archived/spill-join-correctness/epic.md`.
+
+**Update (`spill-join-correctness-2` epic, task 001, 2026-08-27):** this
+paragraph's "still unfixed, root cause still unconfirmed" verdict
+STANDS for the specific ~0.34%-rate bug this section describes — task
+001 did NOT confirm that mechanism. What it DID find, fix, and validate
+is a real, DIFFERENT-but-adjacent mechanism (residue item 1 above,
+concurrent same-host processes colliding on the spill-directory
+default) that is now proven capable of the identical symptom (silently
+wrong, same operator, same file) rather than only the loud crash
+previously recorded — plausible, not proven, as an explanation for this
+section's own historical bug. See item 1's own "Update" note above and
+`.claude/epics/spill-join-correctness-2/001.md`'s Outcome for the full
+evidence.
 
 **Full suite, all four feature combinations**, final state (all fixes +
 all new tests included), through `scripts/claude-safe-build.sh`:
