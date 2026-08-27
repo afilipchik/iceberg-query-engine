@@ -254,8 +254,12 @@ fn check_comparison(
     }
 }
 
-/// Flip a comparison operator (for when literal is on the left side)
-fn flip_op(op: &BinaryOp) -> BinaryOp {
+/// Flip a comparison operator (for when literal is on the left side).
+/// `pub(crate)`: reused as-is by `native_table.rs`'s segment-stats pruning
+/// (native-table-pruning epic) — the operator-flip semantics don't depend on
+/// which statistics representation (parquet footer vs. `ColumnStats`) is
+/// being checked, so this is shared rather than duplicated.
+pub(crate) fn flip_op(op: &BinaryOp) -> BinaryOp {
     match op {
         BinaryOp::Lt => BinaryOp::Gt,
         BinaryOp::LtEq => BinaryOp::GtEq,
@@ -358,8 +362,12 @@ fn check_utf8_stats(stats: &ParquetStatistics, op: BinaryOp, val: &str) -> bool 
     }
 }
 
-/// Evaluate whether a value might exist in the range [min, max] for the given operator
-fn eval_range(op: BinaryOp, val: i64, min: i64, max: i64) -> bool {
+/// Evaluate whether a value might exist in the range [min, max] for the given
+/// operator. `pub(crate)`: reused as-is by `native_table.rs`'s segment-stats
+/// pruning (native-table-pruning epic) for its `min_i64`/`max_i64` zone-map —
+/// see [`flip_op`]'s doc for why sharing rather than duplicating is correct
+/// here.
+pub(crate) fn eval_range(op: BinaryOp, val: i64, min: i64, max: i64) -> bool {
     match op {
         BinaryOp::Eq => min <= val && val <= max,
         BinaryOp::NotEq => !(min == val && max == val),
@@ -383,7 +391,10 @@ fn eval_range_i32(op: BinaryOp, val: i32, min: i32, max: i32) -> bool {
     }
 }
 
-fn eval_range_f64(op: BinaryOp, val: f64, min: f64, max: f64) -> bool {
+/// `pub(crate)`: reused as-is by `native_table.rs`'s segment-stats pruning
+/// (native-table-pruning epic) for its `min_f64`/`max_f64` zone-map — see
+/// [`flip_op`]'s doc.
+pub(crate) fn eval_range_f64(op: BinaryOp, val: f64, min: f64, max: f64) -> bool {
     match op {
         BinaryOp::Eq => min <= val && val <= max,
         BinaryOp::NotEq => !(min == val && max == val),

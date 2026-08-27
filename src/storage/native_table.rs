@@ -111,8 +111,10 @@
 use crate::distributed::{Split, SplitSet};
 use crate::error::{QueryError, Result};
 use crate::physical::operators::{ColumnStatistics, TableProvider, TableStatistics};
+use crate::planner::{BinaryOp, Expr, ScalarValue, UnaryOp};
 use crate::storage::ipc_cache;
 use crate::storage::native_manifest::{self, ColumnStats, NativeManifest, Segment};
+use crate::storage::row_group_pruning::{eval_range, eval_range_f64, flip_op};
 use arrow::array::{ArrayRef, BooleanArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -402,6 +404,162 @@ fn filter_deleted_rows(
     Ok(out)
 }
 
+// ============================================================================
+// Segment-level scan pruning (native-table-pruning epic, task 001)
+//
+// Mirrors `row_group_pruning.rs::row_group_might_match`'s exact recursive
+// shape (AND/OR/NOT/BETWEEN/InList/comparison) and reuses its low-level
+// range-evaluation helpers (`eval_range`/`eval_range_f64`/`flip_op`)
+// UNCHANGED — only the top-level walk and the statistics lookup are new,
+// because a segment's `ColumnStats` (`min_i64`/`max_i64`/`min_f64`/
+// `max_f64`) is a fundamentally different representation from parquet's
+// `RowGroupMetaData`/`Statistics`, so that part cannot be reused verbatim.
+// Same philosophy as the Parquet version, restated for this module: skip a
+// segment ONLY when the predicate is PROVABLY unsatisfiable against its
+// stats; absent stats for a column (every string/binary column today, or an
+// all-null segment), an unrecognized predicate shape (NOT, unsupported
+// literal type, non-column-vs-literal comparison), or any ambiguity all
+// return `true` (never skip). `NativeTable::scan_with_filter`'s caller
+// (`FilterExec`, via `PhysicalPlanner`) always re-applies the FULL predicate
+// to whatever segments ARE read, so a wrong "might match" verdict can only
+// cost performance, never correctness.
+// ============================================================================
+
+/// Evaluate whether a segment might contain rows matching `predicate`, given
+/// only that segment's own `column_stats`. See the section doc above.
+fn segment_might_match(predicate: &Expr, stats: &BTreeMap<String, ColumnStats>) -> bool {
+    match predicate {
+        Expr::BinaryExpr { left, op, right } => match op {
+            BinaryOp::And => {
+                segment_might_match(left, stats) && segment_might_match(right, stats)
+            }
+            BinaryOp::Or => segment_might_match(left, stats) || segment_might_match(right, stats),
+            _ => check_comparison(left, op, right, stats),
+        },
+        Expr::UnaryExpr {
+            op: UnaryOp::Not, ..
+        } => true, // Conservative, mirrors row_group_pruning's own NOT handling.
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            if *negated {
+                true // Conservative for NOT BETWEEN.
+            } else {
+                // BETWEEN: expr >= low AND expr <= high.
+                let ge_low = segment_might_match(
+                    &Expr::BinaryExpr {
+                        left: expr.clone(),
+                        op: BinaryOp::GtEq,
+                        right: low.clone(),
+                    },
+                    stats,
+                );
+                let le_high = segment_might_match(
+                    &Expr::BinaryExpr {
+                        left: expr.clone(),
+                        op: BinaryOp::LtEq,
+                        right: high.clone(),
+                    },
+                    stats,
+                );
+                ge_low && le_high
+            }
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            if *negated {
+                true // Conservative for NOT IN.
+            } else {
+                // IN (v1, v2, ...): at least one value must be possible.
+                list.iter().any(|val| {
+                    segment_might_match(
+                        &Expr::BinaryExpr {
+                            left: expr.clone(),
+                            op: BinaryOp::Eq,
+                            right: Box::new(val.clone()),
+                        },
+                        stats,
+                    )
+                })
+            }
+        }
+        _ => true, // Conservative: include if the shape isn't recognized.
+    }
+}
+
+/// Check a `col op literal` (or `literal op col`) comparison against a
+/// segment's stats. Column lookup uses the SAME (unqualified, lowercase) key
+/// convention `compute_batch_stats`/`ColumnStats` already use, so a
+/// qualified predicate column (`lineitem.l_shipdate`) resolves identically
+/// to an unqualified one.
+fn check_comparison(
+    left: &Expr,
+    op: &BinaryOp,
+    right: &Expr,
+    stats: &BTreeMap<String, ColumnStats>,
+) -> bool {
+    let (col_name, literal, flipped) = match (left, right) {
+        (Expr::Column(col), Expr::Literal(lit)) => (col.name.as_str(), lit, false),
+        (Expr::Literal(lit), Expr::Column(col)) => (col.name.as_str(), lit, true),
+        _ => return true, // Not a simple column-vs-literal comparison.
+    };
+    let cs = match stats.get(&col_name.to_lowercase()) {
+        Some(cs) => cs,
+        None => return true, // No stats recorded for this column at all.
+    };
+    let effective_op = if flipped { flip_op(op) } else { *op };
+    match literal {
+        ScalarValue::Int64(v) => check_i64_stats(cs, effective_op, *v),
+        ScalarValue::Int32(v) => check_i64_stats(cs, effective_op, *v as i64),
+        ScalarValue::Int16(v) => check_i64_stats(cs, effective_op, *v as i64),
+        ScalarValue::Int8(v) => check_i64_stats(cs, effective_op, *v as i64),
+        ScalarValue::Date32(v) => check_i64_stats(cs, effective_op, *v as i64),
+        ScalarValue::Date64(v) => check_i64_stats(cs, effective_op, *v),
+        ScalarValue::Timestamp(v) => check_i64_stats(cs, effective_op, *v),
+        ScalarValue::Float64(v) => check_f64_stats(cs, effective_op, v.into_inner()),
+        ScalarValue::Float32(v) => check_f64_stats(cs, effective_op, v.into_inner() as f64),
+        // Utf8/Boolean/Decimal128/UInt*/List/etc: `ColumnStats` has no
+        // zone-map for these (string/binary columns are explicitly out of
+        // scope for this PRD; the others simply aren't populated by
+        // `column_stats_for_array`) — always scan, never skip.
+        _ => true,
+    }
+}
+
+/// `min_i64`/`max_i64` are only ever BOTH present or BOTH absent (see
+/// `column_stats_for_array`) — absence means either a non-integer-classed
+/// column or a segment with zero non-null values for it, either of which
+/// must be scanned rather than skipped.
+fn check_i64_stats(cs: &ColumnStats, op: BinaryOp, val: i64) -> bool {
+    match (cs.min_i64, cs.max_i64) {
+        (Some(min), Some(max)) => eval_range(op, val, min, max),
+        _ => true,
+    }
+}
+
+/// See [`check_i64_stats`]; same reasoning for `min_f64`/`max_f64`.
+fn check_f64_stats(cs: &ColumnStats, op: BinaryOp, val: f64) -> bool {
+    match (cs.min_f64, cs.max_f64) {
+        (Some(min), Some(max)) => eval_range_f64(op, val, min, max),
+        _ => true,
+    }
+}
+
+/// `true` when `QE_DEBUG_NATIVE_PRUNING` is set — matches this codebase's
+/// established env-gated diagnostic-switch convention (`QE_DEBUG_SCAN_BUDGET`,
+/// `QE_DEBUG_ROLLUP`, `QE_GPU_DEBUG`, ...): zero cost when unset, and lets a
+/// segment-skip decision be confirmed directly rather than inferred from
+/// wall-clock time.
+fn native_pruning_debug_enabled() -> bool {
+    std::env::var("QE_DEBUG_NATIVE_PRUNING").is_ok()
+}
+
 impl TableProvider for NativeTable {
     fn schema(&self) -> SchemaRef {
         self.logical_schema()
@@ -438,15 +596,17 @@ impl TableProvider for NativeTable {
 
     /// Reads every active segment, then filters out whatever
     /// `Segment::deleted_rows` (native-tables-mutation epic, task 003)
-    /// tombstones — the SINGLE choke point every read path (this generic
-    /// scan, the dense-direct-address fast path via `scan_with_filter`'s
-    /// default delegation below, a distributed shard's own scan) shares,
-    /// so a deleted row can never reach any consumer no matter how it got
-    /// there. A segment with an empty `deleted_rows` (every table phase 1
-    /// or task 002 ever wrote, and the common case even for a mutated
-    /// table's untouched segments) takes a fast, allocation-free path
-    /// straight through — zero behavior or performance change from before
-    /// this task.
+    /// tombstones — via `filter_deleted_rows`, the SAME helper
+    /// `scan_with_filter` below calls for whatever segments IT reads, so a
+    /// deleted row can never reach any consumer no matter which entry point
+    /// got there (this generic scan, `scan_with_filter`'s own pruning path
+    /// below, the dense-direct-address fast path — which calls
+    /// `scan_with_filter` with `filter: None` and so lands right back on
+    /// this function unchanged — or a distributed shard's own scan). A
+    /// segment with an empty `deleted_rows` (every table phase 1 or task
+    /// 002 ever wrote, and the common case even for a mutated table's
+    /// untouched segments) takes a fast, allocation-free path straight
+    /// through — zero behavior or performance change from before this task.
     fn scan(&self, projection: Option<&[usize]>) -> Result<Vec<RecordBatch>> {
         self.check_scan_budget()?;
         let mut out = Vec::new();
@@ -461,18 +621,82 @@ impl TableProvider for NativeTable {
         Ok(out)
     }
 
-    // scan_with_filter: default (delegates to scan) — no predicate pushdown
-    // into the IPC segment reader. Every other provider without pushdown
-    // (e.g. LanceTable's unfiltered path) relies on the physical planner's
-    // own FilterExec above the scan for correctness, and that applies here
-    // unchanged; a future task can add pushdown without touching callers.
-    // This default delegation is exactly why deletion filtering living
-    // ONLY inside `scan` (above) is sufficient: `try_execute_dense_direct`
-    // (`morsel_agg.rs`) and every other caller that goes through
-    // `scan_with_filter` gets deletion-filtered batches for free, with
-    // zero changes anywhere else (confirmed by reading every call site —
-    // `morsel_agg.rs`, `physical/planner.rs`'s generic `MemoryTableExec`
-    // path, and the prescan cache — all reach this same function).
+    /// Segment-level scan pruning (native-table-pruning epic, task 001).
+    ///
+    /// `PhysicalPlanner::create_physical_plan_inner`'s `LogicalPlan::Scan`
+    /// arm already calls `provider.scan_with_filter(projection,
+    /// node.filter.as_ref())` generically for every non-streaming-Parquet
+    /// provider (confirmed by reading that call site, not assumed — see
+    /// `src/physical/planner.rs`, the "No cache: use scan_with_filter..."
+    /// branch) — the caller-side wiring is ALREADY provider-agnostic and
+    /// needed no change; only this override (previously the trait's
+    /// default, which silently ignored `filter` and called `scan()`) was
+    /// missing.
+    ///
+    /// For each active segment, `segment_might_match` evaluates `filter`
+    /// against that segment's own `ColumnStats`; a segment PROVABLY unable
+    /// to match is skipped entirely — `ipc_cache::read_row_group` is never
+    /// called for it, so it is never decoded. Every segment that IS read
+    /// still goes through the exact same deletion-vector filtering `scan()`
+    /// applies (`filter_deleted_rows`), unchanged — pruning only decides
+    /// WHETHER a segment is read, never what happens to the rows once it
+    /// is. `QE_DEBUG_NATIVE_PRUNING=1` traces every segment's skip/scan
+    /// decision plus a per-call summary to stderr, so a skip can be
+    /// confirmed directly rather than inferred from wall-clock time. A
+    /// `filter: None` call (or a predicate this module can't recognize at
+    /// all) degrades to exactly `scan()`'s own behavior.
+    fn scan_with_filter(
+        &self,
+        projection: Option<&[usize]>,
+        filter: Option<&Expr>,
+    ) -> Result<Vec<RecordBatch>> {
+        self.check_scan_budget()?;
+        let Some(predicate) = filter else {
+            return self.scan(projection);
+        };
+        let debug = native_pruning_debug_enabled();
+        let mut out = Vec::new();
+        let mut scanned = 0usize;
+        let mut skipped = 0usize;
+        for seg in self.active_segments() {
+            if !segment_might_match(predicate, &seg.column_stats) {
+                skipped += 1;
+                if debug {
+                    eprintln!(
+                        "[native_pruning] table={} segment={} SKIP (predicate provably \
+                         unsatisfiable against this segment's stats)",
+                        self.dir.display(),
+                        seg.id
+                    );
+                }
+                continue;
+            }
+            scanned += 1;
+            if debug {
+                eprintln!(
+                    "[native_pruning] table={} segment={} scan",
+                    self.dir.display(),
+                    seg.id
+                );
+            }
+            let batches = ipc_cache::read_row_group(&self.dir, seg.id as usize, projection, None)?;
+            if seg.deleted_rows.is_empty() {
+                out.extend(batches);
+                continue;
+            }
+            out.extend(filter_deleted_rows(batches, &seg.deleted_rows)?);
+        }
+        if debug {
+            eprintln!(
+                "[native_pruning] table={} scanned={} skipped={} total={}",
+                self.dir.display(),
+                scanned,
+                skipped,
+                scanned + skipped
+            );
+        }
+        Ok(out)
+    }
 
     fn statistics(&self) -> Option<TableStatistics> {
         let segs = self.active_segments();
@@ -1118,5 +1342,334 @@ mod tests {
              the whole-table view"
         );
         assert_eq!(shard.statistics().unwrap().row_count, 2);
+    }
+
+    // ---------- segment-level scan pruning (native-table-pruning epic, task 001) ----------
+
+    use crate::planner::Column;
+
+    fn i64_stats(min: i64, max: i64, null_count: u64) -> BTreeMap<String, ColumnStats> {
+        let mut m = BTreeMap::new();
+        m.insert(
+            "id".to_string(),
+            ColumnStats {
+                min_i64: Some(min),
+                max_i64: Some(max),
+                null_count: Some(null_count),
+                ..Default::default()
+            },
+        );
+        m
+    }
+
+    fn col(name: &str) -> Expr {
+        Expr::Column(Column::new(name))
+    }
+
+    fn lit_i64(v: i64) -> Expr {
+        Expr::Literal(ScalarValue::Int64(v))
+    }
+
+    fn cmp(left: Expr, op: BinaryOp, right: Expr) -> Expr {
+        Expr::BinaryExpr {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        }
+    }
+
+    #[test]
+    fn segment_might_match_simple_comparisons() {
+        let stats = i64_stats(1, 10, 0);
+        assert!(segment_might_match(
+            &cmp(col("id"), BinaryOp::Eq, lit_i64(5)),
+            &stats
+        ));
+        assert!(
+            !segment_might_match(&cmp(col("id"), BinaryOp::Eq, lit_i64(50)), &stats),
+            "50 is outside [1, 10] -- must be provably unsatisfiable"
+        );
+        assert!(!segment_might_match(
+            &cmp(col("id"), BinaryOp::Lt, lit_i64(1)),
+            &stats
+        ));
+        assert!(segment_might_match(
+            &cmp(col("id"), BinaryOp::Lt, lit_i64(2)),
+            &stats
+        ));
+        assert!(!segment_might_match(
+            &cmp(col("id"), BinaryOp::Gt, lit_i64(10)),
+            &stats
+        ));
+    }
+
+    #[test]
+    fn segment_might_match_handles_flipped_literal_column_order() {
+        let stats = i64_stats(1, 10, 0);
+        // `50 = id` must behave identically to `id = 50`.
+        assert!(!segment_might_match(
+            &cmp(lit_i64(50), BinaryOp::Eq, col("id")),
+            &stats
+        ));
+        // `20 < id` (flips to `id > 20`) is unsatisfiable against max=10.
+        assert!(!segment_might_match(
+            &cmp(lit_i64(20), BinaryOp::Lt, col("id")),
+            &stats
+        ));
+    }
+
+    #[test]
+    fn segment_might_match_and_prunes_when_either_side_proves_impossible() {
+        let stats = i64_stats(1, 10, 0);
+        // id > 5 AND id < 8: both sides possible -> must scan.
+        assert!(segment_might_match(
+            &cmp(
+                cmp(col("id"), BinaryOp::Gt, lit_i64(5)),
+                BinaryOp::And,
+                cmp(col("id"), BinaryOp::Lt, lit_i64(8)),
+            ),
+            &stats
+        ));
+        // id > 20 AND id < 30: both provably impossible on their own -> skip.
+        assert!(!segment_might_match(
+            &cmp(
+                cmp(col("id"), BinaryOp::Gt, lit_i64(20)),
+                BinaryOp::And,
+                cmp(col("id"), BinaryOp::Lt, lit_i64(30)),
+            ),
+            &stats
+        ));
+        // id > 20 AND id < 5000: the first conjunct alone is impossible, so
+        // AND must skip even though the second conjunct alone would not.
+        assert!(!segment_might_match(
+            &cmp(
+                cmp(col("id"), BinaryOp::Gt, lit_i64(20)),
+                BinaryOp::And,
+                cmp(col("id"), BinaryOp::Lt, lit_i64(5000)),
+            ),
+            &stats
+        ));
+    }
+
+    #[test]
+    fn segment_might_match_or_requires_both_sides_to_fail_to_skip() {
+        let stats = i64_stats(1, 10, 0);
+        // id = 50 OR id = 5: the second side is possible -> must scan.
+        assert!(segment_might_match(
+            &cmp(
+                cmp(col("id"), BinaryOp::Eq, lit_i64(50)),
+                BinaryOp::Or,
+                cmp(col("id"), BinaryOp::Eq, lit_i64(5)),
+            ),
+            &stats
+        ));
+        // id = 50 OR id = 60: both sides impossible -> skip.
+        assert!(!segment_might_match(
+            &cmp(
+                cmp(col("id"), BinaryOp::Eq, lit_i64(50)),
+                BinaryOp::Or,
+                cmp(col("id"), BinaryOp::Eq, lit_i64(60)),
+            ),
+            &stats
+        ));
+    }
+
+    #[test]
+    fn segment_might_match_between_prunes() {
+        let stats = i64_stats(1, 10, 0);
+        assert!(!segment_might_match(
+            &Expr::Between {
+                expr: Box::new(col("id")),
+                low: Box::new(lit_i64(20)),
+                high: Box::new(lit_i64(30)),
+                negated: false,
+            },
+            &stats
+        ));
+        assert!(segment_might_match(
+            &Expr::Between {
+                expr: Box::new(col("id")),
+                low: Box::new(lit_i64(5)),
+                high: Box::new(lit_i64(8)),
+                negated: false,
+            },
+            &stats
+        ));
+        // NOT BETWEEN is always conservative (never skips).
+        assert!(segment_might_match(
+            &Expr::Between {
+                expr: Box::new(col("id")),
+                low: Box::new(lit_i64(1)),
+                high: Box::new(lit_i64(10)),
+                negated: true,
+            },
+            &stats
+        ));
+    }
+
+    #[test]
+    fn segment_might_match_inlist_prunes_only_when_every_value_is_impossible() {
+        let stats = i64_stats(1, 10, 0);
+        assert!(!segment_might_match(
+            &Expr::InList {
+                expr: Box::new(col("id")),
+                list: vec![lit_i64(50), lit_i64(60), lit_i64(70)],
+                negated: false,
+            },
+            &stats
+        ));
+        assert!(segment_might_match(
+            &Expr::InList {
+                expr: Box::new(col("id")),
+                list: vec![lit_i64(50), lit_i64(5), lit_i64(70)],
+                negated: false,
+            },
+            &stats
+        ));
+        // NOT IN is always conservative (never skips).
+        assert!(segment_might_match(
+            &Expr::InList {
+                expr: Box::new(col("id")),
+                list: vec![lit_i64(1), lit_i64(2), lit_i64(3)],
+                negated: true,
+            },
+            &stats
+        ));
+    }
+
+    #[test]
+    fn segment_might_match_not_is_always_conservative() {
+        let stats = i64_stats(1, 10, 0);
+        // NOT (id = 50) is logically always-true here, but this module
+        // deliberately never computes a "definitely matches" complement for
+        // `might_match` (mirrors row_group_pruning.rs's own NOT handling) --
+        // it must always scan rather than reason about it.
+        assert!(segment_might_match(
+            &Expr::UnaryExpr {
+                op: UnaryOp::Not,
+                expr: Box::new(cmp(col("id"), BinaryOp::Eq, lit_i64(50))),
+            },
+            &stats
+        ));
+    }
+
+    #[test]
+    fn segment_might_match_column_with_no_stats_always_scans() {
+        // A string column (or any column absent from `column_stats` --
+        // e.g. because the segment had zero non-null values) must never be
+        // skipped: `ColumnStats` has no zone-map for it.
+        let stats: BTreeMap<String, ColumnStats> = BTreeMap::new();
+        assert!(segment_might_match(
+            &cmp(col("name"), BinaryOp::Eq, Expr::Literal(ScalarValue::Utf8("z".into()))),
+            &stats
+        ));
+    }
+
+    #[test]
+    fn segment_might_match_unrecognized_predicate_shape_always_scans() {
+        let stats = i64_stats(1, 10, 0);
+        // A non-comparison, non-column-vs-literal shape (here: a scalar
+        // function call) is not recognized -- must always scan.
+        let unrecognized = Expr::ScalarFunc {
+            func: crate::planner::ScalarFunction::Abs,
+            args: vec![col("id")],
+        };
+        assert!(segment_might_match(&unrecognized, &stats));
+    }
+
+    #[test]
+    fn segment_might_match_qualified_column_name_resolves_like_unqualified() {
+        let stats = i64_stats(1, 10, 0);
+        let qualified = Expr::Column(Column::new_qualified("t", "id"));
+        assert!(!segment_might_match(
+            &cmp(qualified, BinaryOp::Eq, lit_i64(50)),
+            &stats
+        ));
+    }
+
+    /// End-to-end: `scan_with_filter` against a REAL two-segment table
+    /// (segment 0: ids [1,2,3], segment 1: ids [4,5]) actually skips the
+    /// segment its own stats prove can't match, and the surviving rows are
+    /// exactly the ones the predicate should keep -- pruning changes WHICH
+    /// segments are read, never the correctness of what comes back.
+    #[test]
+    fn scan_with_filter_skips_a_provably_unsatisfiable_segment_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_table(dir.path());
+        let table = NativeTable::try_new(dir.path()).unwrap();
+
+        // id <= 3 is entirely inside segment 0's [1,3] range -- segment 1
+        // ([4,5]) must be skipped.
+        let pred = cmp(col("id"), BinaryOp::LtEq, lit_i64(3));
+        let scanned = table.scan_with_filter(None, Some(&pred)).unwrap();
+        let ids: Vec<i64> = scanned
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+
+        // id >= 4 is entirely inside segment 1's [4,5] range -- segment 0
+        // ([1,3]) must be skipped.
+        let pred2 = cmp(col("id"), BinaryOp::GtEq, lit_i64(4));
+        let scanned2 = table.scan_with_filter(None, Some(&pred2)).unwrap();
+        let ids2: Vec<i64> = scanned2
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ids2, vec![4, 5]);
+
+        // A predicate matching nothing in either segment's range still
+        // returns an empty (never wrong) result, not an error.
+        let pred3 = cmp(col("id"), BinaryOp::Eq, lit_i64(999));
+        let scanned3 = table.scan_with_filter(None, Some(&pred3)).unwrap();
+        let total3: usize = scanned3.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total3, 0);
+
+        // `filter: None` behaves exactly like `scan()`.
+        let unfiltered = table.scan_with_filter(None, None).unwrap();
+        let total_unfiltered: usize = unfiltered.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_unfiltered, 5);
+    }
+
+    /// Pruning composes correctly with deletion vectors (native-tables-
+    /// mutation epic): a segment that survives pruning still has its own
+    /// `deleted_rows` applied, unchanged from `scan()`'s own behavior.
+    #[test]
+    fn scan_with_filter_still_applies_deletion_vectors_to_segments_it_does_read() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_table(dir.path()); // segment 0: ids [1,2,3]; segment 1: ids [4,5]
+        set_deleted_rows(dir.path(), 0, vec![1]); // delete local position 1 -> id 2
+
+        let table = NativeTable::try_new(dir.path()).unwrap();
+        // id <= 3 keeps only segment 0 (pruned away segment 1), and within
+        // segment 0 the deletion vector must still drop id=2.
+        let pred = cmp(col("id"), BinaryOp::LtEq, lit_i64(3));
+        let scanned = table.scan_with_filter(None, Some(&pred)).unwrap();
+        let ids: Vec<i64> = scanned
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ids, vec![1, 3], "id=2 must still be excluded by the deletion vector");
     }
 }
