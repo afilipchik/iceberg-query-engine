@@ -574,8 +574,8 @@ instrumentation) -> `67f5957` (001: close-out docs) -> `f1b787b`
 (re-scope 004 after task 001's fix) -> `9cfa32a` (002: streaming OOM fix)
 -> `f46e1ac` (002: close-out docs) -> `d3180ce` (003: fault-injection
 harness) -> `b607594` (004: LIMIT + sort-spill-crash fixes, collision
-verification) -> (005: this close-out, archival — commit hash recorded at
-archival time below).
+verification) -> `fd8ec20` (005: G1-G5 verdicts, close-out docs) ->
+(005: archival move, this file's final commit).
 
 ### Archival
 
