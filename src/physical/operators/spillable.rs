@@ -16,7 +16,7 @@ use arrow::compute;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use futures::stream::{self, TryStreamExt};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use hashbrown::HashMap;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
@@ -99,6 +99,83 @@ pub(crate) async fn collect_input_partitions_concurrently(
     Ok((all_batches, total_size))
 }
 
+/// Stream every output partition of `input` concurrently into ONE merged
+/// stream, without collecting anything into a `Vec` first.
+///
+/// `collect_input_partitions_concurrently` (above) gives a pipeline-breaking
+/// operator's collect side the same cross-core parallelism benefit, but by
+/// fully draining every partition into memory before returning — exactly
+/// what let `SpillableHashJoinExec`'s build side OOM before its own spill
+/// decision could ever run (spill-join-correctness-2 epic, task 002: the
+/// build side was compared against `memory_limit * spill_threshold` only
+/// AFTER `collect_input_partitions_concurrently` had already fully
+/// materialized it).
+///
+/// This function keeps the same "one task per input partition, drained
+/// concurrently" parallelism, but hands batches to the caller as they arrive
+/// via a small, FIXED-capacity channel instead of a growing `Vec`. The
+/// caller (`SpillableHashJoinExec::compute_build_decision`) can then track a
+/// running size total and switch to a bounded, spill-capable structure the
+/// moment it would exceed the threshold, without ever buffering more than a
+/// bounded number of batches ahead of that check. The channel's own fixed
+/// bound is what keeps this mechanism itself from becoming a second,
+/// subtler unbounded-memory path.
+async fn stream_merge_input_partitions(
+    input: &Arc<dyn PhysicalOperator>,
+) -> Result<RecordBatchStream> {
+    let input_partitions = input.output_partitions().max(1);
+    if input_partitions == 1 {
+        // Nothing to merge — avoid the task-spawn/channel round trip.
+        return input.execute(0).await;
+    }
+
+    // Small and FIXED per producer partition: enough that a fast producer
+    // doesn't stall on every single batch, not enough to reintroduce
+    // unbounded buffering — a handful of batches, never the whole build
+    // side, can sit in this channel at once.
+    const PER_PARTITION_CAPACITY: usize = 4;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(
+        PER_PARTITION_CAPACITY * input_partitions,
+    );
+
+    for part in 0..input_partitions {
+        let input = input.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut stream = match input.execute(part).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            };
+            loop {
+                match stream.try_next().await {
+                    Ok(Some(batch)) => {
+                        if tx.send(Ok(batch)).await.is_err() {
+                            // Receiver gone (e.g. the consumer bailed on an
+                            // earlier error) — stop pulling from our own
+                            // upstream rather than spin producing into the
+                            // void.
+                            return;
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                }
+            }
+        });
+    }
+    // Drop this function's own sender handle so the channel closes once
+    // every spawned producer task (each holds its own clone) finishes.
+    drop(tx);
+
+    Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+}
+
 // ============================================================================
 // Spillable Hash Join
 // ============================================================================
@@ -143,16 +220,28 @@ impl fmt::Debug for SpillableHashJoinExec {
 enum BuildDecision {
     /// Build fits in memory — use cached HashJoinExec for parallel probe
     InMemory(Arc<crate::physical::operators::HashJoinExec>),
-    /// Build exceeds memory — spill path (only partition 0 processes)
+    /// Build exceeds memory — spill path (only partition 0 processes).
+    ///
+    /// spill-join-correctness-2 epic, task 002: `partitions`/`spilled` are
+    /// the ALREADY hash-partitioned, already-spilled-where-needed build
+    /// side, computed ONCE by `compute_build_decision`'s bounded,
+    /// incremental collection — never a full, unbounded, unpartitioned
+    /// copy of the build side (that was the collect-fully-then-decide OOM
+    /// hole this task fixes). Kept for EVERY execution of partition 0 — an
+    /// operator above may legitimately execute its child more than once
+    /// (the fused streaming aggregate drains, aborts, and re-executes).
+    /// The old `Mutex<Option<..>>::take()` shape handed the second
+    /// execution an EMPTY build side, which joined to zero rows and
+    /// returned them as the answer; this shape avoids that the same way
+    /// the old flat-`Vec` one did, just without the flat Vec. `spill_dir`
+    /// is REUSED, not recreated, across repeat calls, so
+    /// `spilled[..].build_file` stays valid — it is removed exactly once,
+    /// in `Drop`, not at the end of every `execute_spill_path` call (see
+    /// that function's own comment).
     Spill {
-        /// Build batches, kept for EVERY execution of partition 0 — an
-        /// operator above may legitimately execute its child more than once
-        /// (the fused streaming aggregate drains, aborts, and re-executes).
-        /// The previous `Mutex<Option<..>>::take()` shape handed the second
-        /// execution an EMPTY build side, which joined to zero rows and
-        /// returned them as the answer. Cloning is cheap: RecordBatch
-        /// columns are Arc'd buffers.
-        build_batches: Vec<RecordBatch>,
+        partitions: Vec<Option<BuildPartition>>,
+        spilled: Vec<Option<SpilledPartition>>,
+        spill_dir: PathBuf,
     },
 }
 
@@ -288,10 +377,23 @@ impl BuildPartition {
     }
 }
 
-/// State for a spilled partition
+/// State for a spilled partition — build-side info only.
+///
+/// spill-join-correctness-2 epic, task 002: this struct is now memoized
+/// ONCE (inside `BuildDecision::Spill`, computed by
+/// `SpillableHashJoinExec::compute_build_decision`) and reused across
+/// every call to `execute_spill_path` (an operator above may legitimately
+/// execute its child more than once — see `BuildDecision::Spill`'s own
+/// doc comment). Probe-side spill info is call-specific (each call
+/// re-probes and writes fresh probe spill files, since the probe side is
+/// re-executed every call), so it is threaded through
+/// `execute_spill_path`/`process_spilled_partition` as separate, per-call
+/// parameters instead of being stored here — storing it here would have
+/// meant either clobbering it on a second call before the first call's
+/// results were done using it, or leaking a `Mutex`/interior-mutability
+/// dance this file doesn't otherwise need.
 struct SpilledPartition {
     build_file: PathBuf,
-    probe_file: Option<PathBuf>,
     build_rows: usize,
     /// Diagnostic only (`QE_SPILL_DEBUG`), spill-join-correctness-2 epic
     /// task 001: a checksum of the join-key values as WRITTEN to
@@ -305,8 +407,6 @@ struct SpilledPartition {
     /// unspill read with a different one). `None` when `QE_SPILL_DEBUG` is
     /// unset (never computed, zero cost).
     build_key_checksum: Option<KeyChecksum>,
-    /// Same idea, for `probe_file`.
-    probe_key_checksum: Option<KeyChecksum>,
 }
 
 #[async_trait]
@@ -344,68 +444,16 @@ impl PhysicalOperator for SpillableHashJoinExec {
                 (&self.left, &self.right, false)
             };
 
-        // Get or compute the build decision (computed ONCE, shared across all partitions)
+        // Get or compute the build decision (computed ONCE, shared across all
+        // partitions). spill-join-correctness-2 epic, task 002:
+        // `compute_build_decision` collects the build side INCREMENTALLY,
+        // checking the running size against the spill threshold as batches
+        // arrive, instead of the old `collect_input_partitions_concurrently`
+        // -then-check order that could OOM on an oversized build side before
+        // the spill decision ever ran. See that method's own doc comment.
         let decision = self
             .build_decision
-            .get_or_try_init(|| async {
-                // Drain all build partitions concurrently — the sequential await
-                // loop serialized a parallel scan beneath the build side onto one
-                // core (same fix as the agg/sort pipeline breakers).
-                let memory_threshold =
-                    (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
-                let (build_batches, build_size) =
-                    collect_input_partitions_concurrently(build_side).await?;
-                let exceeded = build_size > memory_threshold;
-
-                if !exceeded {
-                    // Build side fits in memory — create a reusable HashJoinExec
-                    let build_schema = build_batches
-                        .first()
-                        .map(|b| b.schema())
-                        .unwrap_or_else(|| build_side.schema());
-                    let build_mem = Arc::new(crate::physical::operators::MemoryTableExec::new(
-                        "join_build",
-                        build_schema,
-                        build_batches,
-                        None,
-                    ));
-                    let (left, right): (Arc<dyn PhysicalOperator>, Arc<dyn PhysicalOperator>) =
-                        if swapped {
-                            (self.left.clone(), build_mem as Arc<dyn PhysicalOperator>)
-                        } else {
-                            (build_mem as Arc<dyn PhysicalOperator>, self.right.clone())
-                        };
-                    let hash_join = if self.filter.is_some() {
-                        let mut hj = crate::physical::operators::HashJoinExec::with_filter(
-                            left,
-                            right,
-                            self.on.clone(),
-                            self.join_type,
-                            self.filter.clone(),
-                        )
-                        .with_build_right(self.build_right);
-                        hj.probe_runtime_filter = self.probe_runtime_filter.clone();
-                        hj.probe_runtime_filter_pair = self.probe_runtime_filter_pair;
-                        hj.set_retained(self.retained.clone());
-                        Arc::new(hj)
-                    } else {
-                        let mut hj = crate::physical::operators::HashJoinExec::new(
-                            left,
-                            right,
-                            self.on.clone(),
-                            self.join_type,
-                        )
-                        .with_build_right(self.build_right);
-                        hj.probe_runtime_filter = self.probe_runtime_filter.clone();
-                        hj.probe_runtime_filter_pair = self.probe_runtime_filter_pair;
-                        hj.set_retained(self.retained.clone());
-                        Arc::new(hj)
-                    };
-                    Ok::<_, QueryError>(BuildDecision::InMemory(hash_join))
-                } else {
-                    Ok(BuildDecision::Spill { build_batches })
-                }
-            })
+            .get_or_try_init(|| self.compute_build_decision(build_side, swapped))
             .await?;
 
         match decision {
@@ -413,12 +461,16 @@ impl PhysicalOperator for SpillableHashJoinExec {
                 // Delegate directly — HashJoinExec has its own OnceCell for the hash table
                 hash_join.execute(partition).await
             }
-            BuildDecision::Spill { build_batches } => {
+            BuildDecision::Spill {
+                partitions,
+                spilled,
+                spill_dir,
+            } => {
                 // Spill path runs everything through partition 0
                 if partition > 0 {
                     return Ok(Box::pin(stream::empty()));
                 }
-                self.execute_spill_path(build_batches.clone(), probe_side, swapped)
+                self.execute_spill_path(partitions, spilled, spill_dir, probe_side, swapped)
                     .await
             }
         }
@@ -430,88 +482,212 @@ impl PhysicalOperator for SpillableHashJoinExec {
 }
 
 impl SpillableHashJoinExec {
+    /// Compute the (memoized-once) build decision: does the build side fit
+    /// in memory, or must it spill?
+    ///
+    /// spill-join-correctness-2 epic, task 002: this is the actual fix for
+    /// the collect-fully-then-decide OOM hole. The OLD code called
+    /// `collect_input_partitions_concurrently`, which fully drains the
+    /// ENTIRE build side into one flat `Vec<RecordBatch>`, and only THEN
+    /// compared its total size against `memory_limit * spill_threshold` —
+    /// so an oversized build side could exhaust real memory during that
+    /// initial collection, before the spill decision (or anything it would
+    /// have triggered) ever ran.
+    ///
+    /// This is Photon's (Databricks, SIGMOD'22) two-phase reservation
+    /// pattern, adapted rather than ported literally: phase 1 below
+    /// ("reserve, possibly spill") streams the build side in via
+    /// `stream_merge_input_partitions` and tracks a running size total,
+    /// batch by batch, checking it against `memory_threshold` as each batch
+    /// arrives — never buffering more than ~`memory_threshold` bytes of
+    /// flat, unpartitioned build-side data. The MOMENT the running total
+    /// would cross the threshold, phase 2 ("guaranteed spill-free
+    /// allocation" becomes "hand off to the bounded, spill-capable
+    /// structure") takes over: everything collected so far, plus the
+    /// crossing batch, plus the rest of the stream, feeds into
+    /// `build_with_partitioning`'s existing hash-partition-and-spill-
+    /// as-needed bookkeeping — the exact same mechanism the rest of the
+    /// spill path already used, just entered mid-stream instead of only
+    /// after a full prior collection. If the whole build side is consumed
+    /// without ever crossing the threshold, this is the ordinary "fits in
+    /// memory" case — nothing about that path's cost or shape changes
+    /// versus before.
+    async fn compute_build_decision(
+        &self,
+        build_side: &Arc<dyn PhysicalOperator>,
+        swapped: bool,
+    ) -> Result<BuildDecision> {
+        let memory_threshold =
+            (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
+        let (on_left, on_right): (Vec<Expr>, Vec<Expr>) = self.on.iter().cloned().unzip();
+        let build_keys: Vec<Expr> = if swapped { on_right } else { on_left };
+
+        let sj_trace = std::env::var("QE_SPILL_DEBUG").is_ok();
+
+        // Phase 1: reserve, possibly spill. Stream in, tracking a running
+        // total as batches arrive from every build-side input partition
+        // concurrently (the streaming analog of
+        // `collect_input_partitions_concurrently`'s own parallel-drain
+        // benefit for a pipeline-breaking operator's collect side).
+        let mut build_stream = stream_merge_input_partitions(build_side).await?;
+        let mut flat_batches: Vec<RecordBatch> = Vec::new();
+        let mut flat_size: usize = 0;
+
+        while let Some(batch) = build_stream.try_next().await? {
+            let batch_size = estimate_batch_size(&batch);
+            if flat_size + batch_size > memory_threshold {
+                // Crossed the threshold: this build side must spill. Checked
+                // HERE, at the crossing point, rather than only once a full
+                // collection would have finished — an oversized non-INNER
+                // or filtered join now fails loudly this much earlier too,
+                // without ever needing to pull in the rest of the build
+                // side first.
+                if !matches!(self.join_type, JoinType::Inner) {
+                    return Err(QueryError::Execution(format!(
+                        "{} join build side exceeds the memory budget, but the join spill \
+                         path currently supports only INNER joins. Raise the memory limit \
+                         for this query.",
+                        self.join_type
+                    )));
+                }
+                if self.filter.is_some() {
+                    return Err(QueryError::Execution(
+                        "join build side exceeds the memory budget, but the join spill \
+                         path cannot evaluate an ON-clause filter. Raise the memory \
+                         limit for this query."
+                            .to_string(),
+                    ));
+                }
+
+                self.config.ensure_spill_dir()?;
+                let spill_id = SPILL_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let spill_dir = self.config.spill_path.join(format!("join_0_{}", spill_id));
+                std::fs::create_dir_all(&spill_dir).map_err(|e| {
+                    QueryError::Execution(format!("Failed to create spill directory: {}", e))
+                })?;
+
+                if sj_trace {
+                    let flat_rows: usize = flat_batches.iter().map(|b| b.num_rows()).sum();
+                    eprintln!(
+                        "[sj-trace] compute_build_decision spill_dir={:?} crossing memory_threshold={} at flat_rows={} flat_size={} (plus this batch's {} rows / {} bytes)",
+                        spill_dir, memory_threshold, flat_rows, flat_size, batch.num_rows(), batch_size
+                    );
+                }
+
+                // Phase 2: guaranteed-spill-free (for what's ALREADY
+                // collected) allocation becomes "hand off to the bounded,
+                // spill-capable structure" — everything gathered so far,
+                // plus the crossing batch, plus the rest of the stream,
+                // through the SAME hash-partition-and-spill-as-needed
+                // bookkeeping the rest of the spill path already used.
+                // Nothing collected in phase 1 is thrown away or re-pulled
+                // from the source.
+                let prefix = stream::iter(
+                    flat_batches
+                        .into_iter()
+                        .chain(std::iter::once(batch))
+                        .map(Ok),
+                );
+                let combined: RecordBatchStream = Box::pin(prefix.chain(build_stream));
+
+                let (partitions, spilled) = self
+                    .build_with_partitioning(combined, &build_keys, &spill_dir)
+                    .await?;
+
+                return Ok(BuildDecision::Spill {
+                    partitions,
+                    spilled,
+                    spill_dir,
+                });
+            }
+            flat_size += batch_size;
+            flat_batches.push(batch);
+        }
+
+        // Never crossed the threshold: the build side genuinely fits.
+        // Same in-memory HashJoinExec construction as before — reached
+        // without ever risking an unbounded collection to get here.
+        let build_schema = flat_batches
+            .first()
+            .map(|b| b.schema())
+            .unwrap_or_else(|| build_side.schema());
+        let build_mem = Arc::new(crate::physical::operators::MemoryTableExec::new(
+            "join_build",
+            build_schema,
+            flat_batches,
+            None,
+        ));
+        let (left, right): (Arc<dyn PhysicalOperator>, Arc<dyn PhysicalOperator>) = if swapped {
+            (self.left.clone(), build_mem as Arc<dyn PhysicalOperator>)
+        } else {
+            (build_mem as Arc<dyn PhysicalOperator>, self.right.clone())
+        };
+        let hash_join = if self.filter.is_some() {
+            let mut hj = crate::physical::operators::HashJoinExec::with_filter(
+                left,
+                right,
+                self.on.clone(),
+                self.join_type,
+                self.filter.clone(),
+            )
+            .with_build_right(self.build_right);
+            hj.probe_runtime_filter = self.probe_runtime_filter.clone();
+            hj.probe_runtime_filter_pair = self.probe_runtime_filter_pair;
+            hj.set_retained(self.retained.clone());
+            Arc::new(hj)
+        } else {
+            let mut hj = crate::physical::operators::HashJoinExec::new(
+                left,
+                right,
+                self.on.clone(),
+                self.join_type,
+            )
+            .with_build_right(self.build_right);
+            hj.probe_runtime_filter = self.probe_runtime_filter.clone();
+            hj.probe_runtime_filter_pair = self.probe_runtime_filter_pair;
+            hj.set_retained(self.retained.clone());
+            Arc::new(hj)
+        };
+        Ok(BuildDecision::InMemory(hash_join))
+    }
+
     /// Execute the spill path when build side exceeds memory limit.
-    /// Only called from partition 0.
+    /// Only called from partition 0. May be called MORE THAN ONCE for the
+    /// same logical query execution (an operator above may legitimately
+    /// execute its child more than once — see `BuildDecision::Spill`'s own
+    /// doc comment); `partitions`/`spilled`/`spill_dir` are borrowed from
+    /// the memoized `BuildDecision`, computed exactly once regardless of
+    /// how many times this function runs.
     async fn execute_spill_path(
         &self,
-        build_batches: Vec<RecordBatch>,
+        partitions: &[Option<BuildPartition>],
+        spilled_partitions: &[Option<SpilledPartition>],
+        spill_dir: &PathBuf,
         probe_side: &Arc<dyn PhysicalOperator>,
         swapped: bool,
     ) -> Result<RecordBatchStream> {
-        // The partitioned spill path currently implements INNER join semantics
-        // only (probe_partition ignores join_type). Producing silently-wrong
-        // results for other join types is worse than failing, and falling back
-        // to the in-memory join would risk OOM. Fail loudly until the streaming
-        // spill rewrite implements the remaining join types.
-        if !matches!(self.join_type, JoinType::Inner) {
-            return Err(QueryError::Execution(format!(
-                "{} join build side exceeds the memory budget, but the join spill \
-                 path currently supports only INNER joins. Raise the memory limit \
-                 for this query.",
-                self.join_type
-            )));
-        }
-        // The spill path also ignores the join filter (the non-equi part of an
-        // ON clause). Inner joins are lowered with a post-filter above the join
-        // so they never carry one, but never emit unfiltered rows if that ever
-        // changes.
-        if self.filter.is_some() {
-            return Err(QueryError::Execution(
-                "join build side exceeds the memory budget, but the join spill \
-                 path cannot evaluate an ON-clause filter. Raise the memory \
-                 limit for this query."
-                    .to_string(),
-            ));
-        }
-
-        self.config.ensure_spill_dir()?;
-
-        let spill_id = SPILL_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let spill_dir = self.config.spill_path.join(format!("join_0_{}", spill_id));
-        std::fs::create_dir_all(&spill_dir).map_err(|e| {
-            QueryError::Execution(format!("Failed to create spill directory: {}", e))
-        })?;
-
         // QE_SPILL_DEBUG tracing (task 001, spill-join-correctness epic):
-        // `execute_spill_path` recomputes its ENTIRE result from scratch on
-        // every call and has no cache of its own output (unlike
-        // `build_decision`, which IS memoized). If some caller ever invokes
-        // it more than once for what should be a single logical query
-        // execution (e.g. `SpillableHashAggregateExec`'s fused-streaming
-        // path aborting and falling back to
-        // `collect_input_partitions_concurrently`, which re-executes its
-        // input), this prints TWO START/DONE pairs for the SAME join
-        // instead of one — direct evidence, not inference. Zero cost when
-        // unset beyond one env lookup per call.
+        // if some caller ever invokes this more than once for what should
+        // be a single logical query execution (e.g.
+        // `SpillableHashAggregateExec`'s fused-streaming path aborting and
+        // falling back to `collect_input_partitions_concurrently`, which
+        // re-executes its input), this prints TWO START/DONE pairs for the
+        // SAME join instead of one — direct evidence, not inference. Zero
+        // cost when unset beyond one env lookup per call.
         let sj_trace = std::env::var("QE_SPILL_DEBUG").is_ok();
         let sj_t0 = std::time::Instant::now();
-        let build_rows_in: usize = build_batches.iter().map(|b| b.num_rows()).sum();
-        if sj_trace {
-            eprintln!(
-                "[sj-trace] execute_spill_path START spill_id={} build_batches={} build_rows={}",
-                spill_id,
-                build_batches.len(),
-                build_rows_in
-            );
-        }
 
         let (on_left, on_right): (Vec<_>, Vec<_>) = self.on.iter().cloned().unzip();
         let build_keys = if swapped { &on_right } else { &on_left };
         let probe_keys = if swapped { &on_left } else { &on_right };
 
-        let build_stream: RecordBatchStream =
-            Box::pin(stream::iter(build_batches.into_iter().map(Ok)));
-
-        // Build phase with partitioning
-        let (mut in_memory_partitions, spilled_partitions) = self
-            .build_with_partitioning(build_stream, build_keys, &spill_dir)
-            .await?;
-
-        // Build hash tables for in-memory partitions
+        // Build hash tables for in-memory partitions. Cheap to redo per
+        // call (rehashing already-resident batches); the batches
+        // themselves are borrowed from the memoized decision, never
+        // recollected or rewritten to disk again.
         let mut hash_tables: Vec<Option<HashMap<JoinKey, Vec<HashEntry>>>> =
             (0..NUM_PARTITIONS).map(|_| None).collect();
-
-        for (idx, part) in in_memory_partitions.iter().enumerate() {
+        for (idx, part) in partitions.iter().enumerate() {
             if let Some(p) = part {
                 if !p.batches.is_empty() {
                     let table = build_hash_table(&p.batches, build_keys)?;
@@ -521,9 +697,9 @@ impl SpillableHashJoinExec {
         }
 
         if sj_trace {
-            let in_mem_parts = in_memory_partitions.iter().filter(|p| p.is_some()).count();
+            let in_mem_parts = partitions.iter().filter(|p| p.is_some()).count();
             let spilled_parts = spilled_partitions.iter().filter(|p| p.is_some()).count();
-            let in_mem_build_rows: usize = in_memory_partitions
+            let in_mem_build_rows: usize = partitions
                 .iter()
                 .flatten()
                 .flat_map(|p| p.batches.iter())
@@ -535,8 +711,8 @@ impl SpillableHashJoinExec {
                 .map(|sp| sp.build_rows)
                 .sum();
             eprintln!(
-                "[sj-trace] execute_spill_path spill_id={} build partitioned: in_memory_partitions={} (rows={}) spilled_partitions={} (rows={})",
-                spill_id, in_mem_parts, in_mem_build_rows, spilled_parts, spilled_build_rows
+                "[sj-trace] execute_spill_path START spill_dir={:?} in_memory_partitions={} (rows={}) spilled_partitions={} (rows={})",
+                spill_dir, in_mem_parts, in_mem_build_rows, spilled_parts, spilled_build_rows
             );
         }
 
@@ -551,57 +727,62 @@ impl SpillableHashJoinExec {
         let probe_rows_in: usize = probe_batches.iter().map(|b| b.num_rows()).sum();
         if sj_trace {
             eprintln!(
-                "[sj-trace] execute_spill_path spill_id={} probe collected: probe_partitions={} probe_rows={}",
-                spill_id, probe_partitions, probe_rows_in
+                "[sj-trace] execute_spill_path probe collected: probe_partitions={} probe_rows={}",
+                probe_partitions, probe_rows_in
             );
         }
         let probe_stream: RecordBatchStream =
             Box::pin(stream::iter(probe_batches.into_iter().map(Ok)));
-        let (results, mut probe_spill_files, mut probe_key_checksums) = self
+        let (results, probe_spill_files, probe_key_checksums) = self
             .probe_with_spilling(
                 probe_stream,
                 probe_keys,
-                &mut in_memory_partitions,
+                partitions,
                 &hash_tables,
-                &spilled_partitions,
-                &spill_dir,
+                spilled_partitions,
+                spill_dir,
                 swapped,
             )
             .await?;
         let in_memory_matched_rows: usize = results.iter().map(|b| b.num_rows()).sum();
 
-        // Attach each partition's probe spill file before processing: without
-        // this, spilled build partitions are probed against an EMPTY probe side
-        // and every one of their matches is silently dropped.
-        let mut spilled_partitions = spilled_partitions;
-        for (idx, spilled) in spilled_partitions.iter_mut().enumerate() {
-            if let Some(sp) = spilled {
-                sp.probe_file = probe_spill_files[idx].take();
-                sp.probe_key_checksum = probe_key_checksums[idx].take();
-            }
-        }
-
-        // Process spilled partitions
+        // Process spilled partitions — this call's own freshly-written
+        // probe spill file (if any) for each partition, paired with the
+        // MEMOIZED build spill file from `spilled_partitions`.
         let mut all_results = results;
         let mut spilled_matched_rows: usize = 0;
         for (idx, spilled) in spilled_partitions.iter().enumerate() {
             if let Some(sp) = spilled {
+                let probe_file = probe_spill_files[idx].as_ref();
+                let probe_key_checksum = probe_key_checksums[idx];
                 let spilled_results = self
-                    .process_spilled_partition(sp, build_keys, probe_keys, swapped, idx)
+                    .process_spilled_partition(
+                        &sp.build_file,
+                        sp.build_key_checksum,
+                        probe_file,
+                        probe_key_checksum,
+                        build_keys,
+                        probe_keys,
+                        swapped,
+                        idx,
+                    )
                     .await?;
                 spilled_matched_rows += spilled_results.iter().map(|b| b.num_rows()).sum::<usize>();
                 all_results.extend(spilled_results);
             }
         }
 
-        // Clean up spill directory
-        let _ = std::fs::remove_dir_all(&spill_dir);
+        // Build-side spill files under `spill_dir` are NOT removed here —
+        // they are memoized in `self.build_decision` and must survive a
+        // possible repeat call to this same function (see this function's
+        // own doc comment). Cleaned up exactly once, in `Drop`, when this
+        // operator itself is no longer needed.
 
         if sj_trace {
             let total_matched: usize = all_results.iter().map(|b| b.num_rows()).sum();
             eprintln!(
-                "[sj-trace] execute_spill_path DONE spill_id={} in_memory_matched={} spilled_matched={} total_matched={} elapsed={:?}",
-                spill_id, in_memory_matched_rows, spilled_matched_rows, total_matched, sj_t0.elapsed()
+                "[sj-trace] execute_spill_path DONE spill_dir={:?} in_memory_matched={} spilled_matched={} total_matched={} elapsed={:?}",
+                spill_dir, in_memory_matched_rows, spilled_matched_rows, total_matched, sj_t0.elapsed()
             );
         }
 
@@ -661,10 +842,8 @@ impl SpillableHashJoinExec {
 
                     spilled[idx] = Some(SpilledPartition {
                         build_file: path,
-                        probe_file: None,
                         build_rows: part.batches.iter().map(|b| b.num_rows()).sum(),
                         build_key_checksum: write_checksum,
-                        probe_key_checksum: None,
                     });
                 }
             }
@@ -703,7 +882,7 @@ impl SpillableHashJoinExec {
         &self,
         mut probe_stream: RecordBatchStream,
         probe_keys: &[Expr],
-        in_memory_partitions: &mut [Option<BuildPartition>],
+        in_memory_partitions: &[Option<BuildPartition>],
         hash_tables: &[Option<HashMap<JoinKey, Vec<HashEntry>>>],
         spilled_partitions: &[Option<SpilledPartition>],
         spill_dir: &PathBuf,
@@ -773,7 +952,10 @@ impl SpillableHashJoinExec {
 
     async fn process_spilled_partition(
         &self,
-        spilled: &SpilledPartition,
+        build_file: &PathBuf,
+        build_key_checksum: Option<KeyChecksum>,
+        probe_file: Option<&PathBuf>,
+        probe_key_checksum: Option<KeyChecksum>,
         build_keys: &[Expr],
         probe_keys: &[Expr],
         swapped: bool,
@@ -782,18 +964,18 @@ impl SpillableHashJoinExec {
         let sj_trace = std::env::var("QE_SPILL_DEBUG").is_ok();
 
         // Read build side from disk
-        let build_batches = read_parquet(&spilled.build_file)?;
+        let build_batches = read_parquet(build_file)?;
 
         // spill-join-correctness-2 epic, task 001: directly compare the
         // join-key checksum recomputed from the data just read back off
         // disk against the checksum recorded when those SAME rows were
-        // written to `spilled.build_file` (before the spill/unspill round
+        // written to `build_file` (before the spill/unspill round
         // trip). A mismatch here would be direct, in-the-act evidence of a
         // Trino-PR#25892-shaped bug (spill-write and unspill-read
         // disagreeing about a row's join key) rather than inference from
         // reading the code.
         if sj_trace {
-            if let Some(write_cs) = spilled.build_key_checksum {
+            if let Some(write_cs) = build_key_checksum {
                 let mut read_cs = KeyChecksum::default();
                 for b in &build_batches {
                     read_cs.accumulate(batch_key_checksum(b, build_keys)?);
@@ -822,14 +1004,14 @@ impl SpillableHashJoinExec {
         let hash_table = build_hash_table(&build_batches, build_keys)?;
 
         // Read probe side from disk (if exists)
-        let probe_batches = if let Some(ref probe_path) = spilled.probe_file {
+        let probe_batches = if let Some(probe_path) = probe_file {
             read_parquet(probe_path)?
         } else {
             Vec::new()
         };
 
         if sj_trace {
-            if let Some(write_cs) = spilled.probe_key_checksum {
+            if let Some(write_cs) = probe_key_checksum {
                 let mut read_cs = KeyChecksum::default();
                 for b in &probe_batches {
                     read_cs.accumulate(batch_key_checksum(b, probe_keys)?);
@@ -865,6 +1047,24 @@ impl SpillableHashJoinExec {
             &self.schema,
             self.retained.as_deref(),
         )
+    }
+}
+
+/// spill-join-correctness-2 epic, task 002: build-side spill files
+/// (`BuildDecision::Spill { spill_dir, .. }`) are now memoized ONCE, in
+/// `compute_build_decision`, and deliberately NOT removed at the end of
+/// every `execute_spill_path` call anymore — a repeat call (e.g. a
+/// fused-streaming aggregate aborting and re-executing this join as its
+/// input) must still be able to read them back. Clean up exactly once
+/// here, when this operator itself is finally dropped (typically at the
+/// end of the query that owns it). A join whose build side never spilled
+/// (`BuildDecision::InMemory`, or `build_decision` never even
+/// initialized, e.g. an unused partition) has nothing to clean up.
+impl Drop for SpillableHashJoinExec {
+    fn drop(&mut self) {
+        if let Some(BuildDecision::Spill { spill_dir, .. }) = self.build_decision.get() {
+            let _ = std::fs::remove_dir_all(spill_dir);
+        }
     }
 }
 
