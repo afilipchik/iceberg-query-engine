@@ -2,8 +2,8 @@
 name: spill-join-correctness-2
 status: in-progress
 created: 2026-08-27T07:44:44Z
-updated: 2026-08-27T09:30:00Z
-progress: 20%
+updated: 2026-08-27T11:00:00Z
+progress: 40%
 prd: .claude/prds/spill-join-correctness-2.md
 github: (will be set on sync)
 ---
@@ -147,7 +147,25 @@ better-bounded.
       already resolves task 004's own "spill-directory collision" sibling
       bug target — task 004 should verify and cross-reference rather than
       re-fix the same field. See `001.md`'s Outcome for full detail.
-- [ ] 002.md - Fix the collect-fully-then-decide OOM hole (parallel: false)
+- [x] 002.md - Fix the collect-fully-then-decide OOM hole (parallel: false)
+      — CLOSED. `SpillableHashJoinExec::compute_build_decision` now streams
+      the build side in via a new `stream_merge_input_partitions`
+      (bounded-channel streaming analog of
+      `collect_input_partitions_concurrently`), tracking a running size
+      total per batch instead of collecting the whole build side before
+      ever checking `memory_limit * spill_threshold` — Photon's two-phase
+      reservation pattern, adapted. Real, cgroup-verified: a new
+      `examples/spill_join_oom_repro.rs` (a ~3.1GB lazily-generated build
+      side under a real `systemd-run --scope -p MemoryMax=900M` cap) shows
+      the pre-fix code genuinely OOM-killed by the kernel (2/2 trials,
+      `journalctl`-confirmed) and the post-fix code completing cleanly
+      (2/2 trials, peak RSS ~650-680MB, correct result). 10 fresh Q12
+      trials cell-exact against the archived DuckDB oracle, wall time
+      3.2-4.3s (O(n²) fix from the archived epic not regressed, matches its
+      3-6s baseline), task 001's `KeyChecksum` instrumentation intact (896
+      hash-check-ok, 0 mismatches). Full suite green, byte-identical to the
+      pre-existing baseline in all four feature combinations. See `002.md`'s
+      Outcome for full detail.
 - [ ] 003.md - Fault-injection/differential testing harness (parallel: false)
 - [ ] 004.md - Fix the three known sibling bugs (parallel: false) — NOTE:
       one of its three targets (spill-directory collision) is already
