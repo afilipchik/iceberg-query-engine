@@ -308,23 +308,82 @@ impl NativeTable {
     }
 }
 
+/// (join-order-stats-hardening epic, task 002.) Above this fraction of a
+/// table's PHYSICAL rows having been deleted, a range-bound `ndv_est`
+/// (see below) is no longer trusted and is degraded to `None` instead.
+///
+/// Reasoning, precise: `row_count` fed into the NDV formula below is
+/// already `Segment::live_row_count()` (task 003's own fix — see
+/// `statistics()`'s call site), so the ROW-COUNT term of `min(non_null,
+/// range)` already self-corrects after a DELETE/UPDATE with zero extra
+/// work here. What does NOT self-correct is the RANGE term
+/// (`max_i64 - min_i64 + 1`): per-segment `min_i64`/`max_i64` are computed
+/// once at write time and are DELIBERATELY never recomputed on
+/// DELETE/UPDATE (task 001/003's own Decision 1 — a wider bound is always
+/// safe, and re-deriving an exact bound would mean rescanning, which the
+/// epic's own "no full rescans" architecture decision forbids). Whenever
+/// the estimate is RANGE-bound (`non_null >= range`, so `min(..)` picks
+/// the range term) rather than row-count-bound, a DELETE that removes
+/// every row of one distinct value (e.g. `DELETE FROM t WHERE status =
+/// 'CANCELLED'`) can never be reflected — the range term is blind to
+/// which values inside it survived. That is the dangerous direction named
+/// by the epic ("overestimating post-deletion NDV understates true join
+/// selectivity"): a stale, too-high, range-bound NDV.
+///
+/// 10% is a deliberately modest, defensible line for "materially
+/// invalidated," not a tuned constant: small enough to catch the
+/// concentrated single-value DELETE this reasoning targets, large enough
+/// that an ordinary trickle of incidental deletes doesn't make every
+/// mutated table's range-bound columns permanently untrusted. A
+/// row-count-bound column (typically a high-cardinality/near-unique key)
+/// is NEVER degraded by this check — its estimate already shrinks
+/// correctly with live row count, so degrading it too would be pure
+/// false-positive noise.
+const DELETION_STALENESS_THRESHOLD: f64 = 0.10;
+
 /// Translate a manifest statistics rollup into `TableStatistics`. Per task
 /// 002's design (`ColumnStats` mirrors `ColumnStatistics` field-for-field),
 /// this is a direct copy for every field EXCEPT `ndv_est`, which is DERIVED
 /// here the same way `ParquetTable`/`LanceTable` already derive it: a dense
 /// integer range upper-bounds NDV (`min(non_null_rows, max - min + 1)`) —
 /// see `src/physical/operators/scan.rs`'s `ColumnStatistics::ndv_est` doc.
+///
+/// `row_count` is the LOGICAL (live, post-delete) row count;
+/// `physical_row_count` is the segments' PHYSICAL (write-time) row count —
+/// see [`DELETION_STALENESS_THRESHOLD`]'s doc for why both are needed. A
+/// column whose `ndv_est` would be RANGE-bound is emitted as `None`
+/// (rather than a possibly-stale `Some(v)`) once the table's deletion
+/// fraction crosses that threshold — `None` routes straight through
+/// `crate::optimizer::classify_join_key_ndv` (task 001's shared
+/// "untrustworthy join-key statistics" signal) as `Missing` the next time
+/// this column feeds a join edge, with zero new classification logic
+/// needed here (the epic's own "one shared signal, not two" decision).
 fn table_statistics_from(
     rollup: &BTreeMap<String, ColumnStats>,
     row_count: u64,
+    physical_row_count: u64,
     total_byte_size: u64,
 ) -> TableStatistics {
+    let deletion_fraction = if physical_row_count == 0 {
+        0.0
+    } else {
+        1.0 - (row_count as f64 / physical_row_count as f64)
+    };
     let mut column_stats = HashMap::with_capacity(rollup.len());
     for (name, cs) in rollup {
         let non_null = row_count.saturating_sub(cs.null_count.unwrap_or(0));
         let ndv_est = match (cs.min_i64, cs.max_i64) {
             (Some(min), Some(max)) if max >= min => {
-                Some(non_null.min((max - min) as u64 + 1)).filter(|v| *v > 0)
+                let range = (max - min) as u64 + 1;
+                let candidate = non_null.min(range);
+                let range_bound = candidate == range && non_null >= range;
+                if candidate > 0
+                    && !(range_bound && deletion_fraction > DELETION_STALENESS_THRESHOLD)
+                {
+                    Some(candidate)
+                } else {
+                    None
+                }
             }
             _ => None,
         };
@@ -708,6 +767,12 @@ impl TableProvider for NativeTable {
         // this is byte-for-byte the same number the pre-task-003 code
         // computed (`live_row_count()` is a no-op subtraction of 0).
         let row_count: u64 = segs.iter().map(|s| s.live_row_count()).sum();
+        // PHYSICAL (write-time) row count — join-order-stats-hardening
+        // task 002's own input for detecting deletion-driven NDV
+        // staleness. See `table_statistics_from`/`DELETION_STALENESS_
+        // THRESHOLD`'s doc for why this, alongside the LOGICAL `row_count`
+        // above, is what the degradation check needs.
+        let physical_row_count: u64 = segs.iter().map(|s| s.row_count).sum();
         let total_byte_size: u64 = segs.iter().map(|s| s.byte_size).sum();
         let rollup = match &self.only_segments {
             // Whole table: the manifest's own precomputed rollup (task 002,
@@ -724,7 +789,12 @@ impl TableProvider for NativeTable {
                 NativeManifest::rollup(&owned)
             }
         };
-        Some(table_statistics_from(&rollup, row_count, total_byte_size))
+        Some(table_statistics_from(
+            &rollup,
+            row_count,
+            physical_row_count,
+            total_byte_size,
+        ))
     }
 
     fn distributed_splits(&self, table: &str, nodes: usize) -> Option<Result<SplitSet>> {
@@ -1313,6 +1383,139 @@ mod tests {
             id_after.min_i64, id_before.min_i64,
             "column-stats rollup is deliberately NOT recomputed on delete (task 001's decision) \
              -- a wider bound is always safe"
+        );
+    }
+
+    // ---------- deletion-driven NDV staleness degradation
+    // (join-order-stats-hardening epic, task 002) ----------
+
+    /// Build a single-segment native table with an `id` (dense, unique,
+    /// `0..n_rows`) and a `category` (`i % cardinality`, deliberately
+    /// LOW-cardinality relative to `n_rows` -- the exact shape whose NDV
+    /// estimate is RANGE-bound, not row-count-bound) column. `id` is the
+    /// contrasting row-count-bound case: it self-corrects from live row
+    /// count alone with no degradation ever needed.
+    fn write_category_table(final_dir: &Path, n_rows: i64, cardinality: i64) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Int64, false),
+        ]));
+        let ids: Vec<i64> = (0..n_rows).collect();
+        let categories: Vec<i64> = (0..n_rows).map(|i| i % cardinality).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Int64Array::from(categories)),
+            ],
+        )
+        .unwrap();
+
+        let staging = staging_dir_for(final_dir);
+        std::fs::create_dir_all(&staging).unwrap();
+        let path = segment_full_path(&staging, 0);
+        let file = std::fs::File::create(&path).unwrap();
+        let mut w = arrow::ipc::writer::FileWriter::try_new(file, &batch.schema()).unwrap();
+        w.write(&batch).unwrap();
+        w.finish().unwrap();
+        let byte_size = std::fs::metadata(&path).unwrap().len();
+        let segment = Segment {
+            id: 0,
+            path: Segment::expected_file_name(0),
+            row_count: batch.num_rows() as u64,
+            byte_size,
+            column_stats: native_manifest::compute_batch_stats(&batch),
+            deleted_rows: Vec::new(),
+        };
+        let manifest = NativeManifest::build(
+            &schema,
+            NativeManifest::generate_table_id(),
+            1,
+            vec![segment],
+            1_700_000_000_000,
+        )
+        .unwrap();
+        write_manifest(&staging, &manifest).unwrap();
+        publish_table_dir(&staging, final_dir).unwrap();
+    }
+
+    #[test]
+    fn concentrated_deletion_of_a_low_cardinality_value_degrades_its_ndv_to_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        write_category_table(dir.path(), 300, 3);
+
+        let before = NativeTable::try_new(dir.path())
+            .unwrap()
+            .statistics()
+            .unwrap();
+        assert_eq!(
+            before.column_stats.get("category").unwrap().ndv_est,
+            Some(3),
+            "dense low-cardinality range, no deletions yet: NDV is exact"
+        );
+
+        // Delete every row of category == 2 (100 of 300 rows, 33% --
+        // comfortably past DELETION_STALENESS_THRESHOLD (10%)). This is a
+        // meaningful, concentrated deletion that plausibly shifts true NDV
+        // (category 2 no longer exists at all after this).
+        let deleted: Vec<u32> = (0..300u32).filter(|i| i % 3 == 2).collect();
+        assert_eq!(deleted.len(), 100);
+        set_deleted_rows(dir.path(), 0, deleted);
+
+        let after = NativeTable::try_new(dir.path())
+            .unwrap()
+            .statistics()
+            .unwrap();
+        let category_after = after.column_stats.get("category").unwrap();
+        assert_eq!(
+            category_after.ndv_est, None,
+            "category's stale range (0..=2) can never reflect that value 2 was fully \
+             deleted -- a range-bound NDV must degrade to Missing once the table's \
+             deletion fraction crosses the staleness threshold"
+        );
+        // This IS the same Missing classification JoinReorder's own DPsize
+        // cost model consults (task 001's shared signal) -- reused
+        // directly, not reinvented, per the epic's own "one shared signal,
+        // not two" architecture decision.
+        assert!(matches!(
+            crate::optimizer::classify_join_key_ndv(
+                category_after.ndv_est.map(|v| v as f64),
+                after.row_count as f64
+            ),
+            Err(crate::optimizer::UntrustworthyStats::Missing)
+        ));
+
+        // `id` is dense/unique -- row-count-bound, not range-bound -- so it
+        // self-corrects from the live row count with no degradation needed.
+        let id_after = after.column_stats.get("id").unwrap();
+        assert_eq!(
+            id_after.ndv_est,
+            Some(200),
+            "id's NDV is row-count-bound: it shrinks correctly with live row count alone, \
+             with zero need for this task's degradation mechanism"
+        );
+    }
+
+    #[test]
+    fn a_light_deletion_below_the_staleness_threshold_does_not_degrade_ndv() {
+        let dir = tempfile::tempdir().unwrap();
+        write_category_table(dir.path(), 300, 3);
+
+        // Delete only 15 of 300 rows (5%, below DELETION_STALENESS_THRESHOLD),
+        // all from category 2 -- a real deletion, but not one this table's
+        // staleness line treats as "materially invalidated."
+        let deleted: Vec<u32> = (0..300u32).filter(|i| i % 3 == 2).take(15).collect();
+        set_deleted_rows(dir.path(), 0, deleted);
+
+        let stats = NativeTable::try_new(dir.path())
+            .unwrap()
+            .statistics()
+            .unwrap();
+        assert_eq!(
+            stats.column_stats.get("category").unwrap().ndv_est,
+            Some(3),
+            "a deletion fraction at or below the staleness threshold must not \
+             false-positive degrade a range-bound NDV"
         );
     }
 

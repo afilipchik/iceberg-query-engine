@@ -95,7 +95,7 @@ Estimated total effort: S-M overall — both fixes are narrow by design.
 
 ## Tasks Created
 - [x] 001.md - Missing/degenerate join-key statistics visibility (parallel: false) — CLOSED 2026-08-27
-- [ ] 002.md - Native-table statistics staleness after mutation (parallel: false)
+- [x] 002.md - Native-table statistics staleness after mutation (parallel: false) — CLOSED 2026-08-27
 - [ ] 003.md - Validation, no-regression check, full suite, docs, epic close (parallel: false)
 
 Total tasks: 3
@@ -105,7 +105,7 @@ Estimated total effort: S-M
 
 ## Progress
 
-**33% (1/3 tasks closed).** Task 001 shipped the shared "untrustworthy
+**67% (2/3 tasks closed).** Task 001 shipped the shared "untrustworthy
 join-key statistics" signal (`crate::optimizer::classify_join_key_ndv`
 / `warn_untrustworthy_join_key_stats`, `src/optimizer/cost.rs`), wired
 into `JoinReorder`'s DPsize cost model
@@ -116,3 +116,31 @@ before/after confirming zero cost-model regression). Full suite green
 in all four feature combinations (default 1280, lance 1345, gpu 1289,
 pulsar 1283, 0 failures). See `001.md`'s Outcome section for full
 detail, including the precise reuse seam task 002 is expected to use.
+
+Task 002 confirmed native-table NDV staleness is real, but not in the
+direction the epic's own investigation had guessed: `NativeTable::
+statistics()` was already using LIVE (post-delete) row count, so the
+naive "stale physical row count" story was already fixed two epics ago.
+The actual staleness lives in `min_i64`/`max_i64` themselves, which are
+never recomputed by DELETE/UPDATE — for a RANGE-bound NDV estimate
+(typically a low/moderate-cardinality column), deleting every row of one
+distinct value can never be reflected, keeping a stale, too-high NDV
+alive (the epic's own named dangerous direction). Fixed entirely inside
+`src/storage/native_table.rs::table_statistics_from` (query-time-only,
+zero mutation-path changes — confirmed by `git diff --stat`, not just
+argued): once a table's deletion fraction crosses a 10% threshold, a
+range-bound column's NDV is emitted as `None` instead of a possibly-stale
+`Some(v)`, routing directly through task 001's existing
+`classify_join_key_ndv`/`warn_untrustworthy_join_key_stats` signal with
+zero new classification logic (the epic's own "one shared signal, not
+two" decision, honored exactly). Row-count-bound columns (dense/unique
+keys) are never touched — they already self-correct via live row count.
+Validated with a real end-to-end SQL `DELETE` test
+(`tests/native_ndv_staleness_tests.rs`) plus 2 hermetic unit tests. Full
+suite green in all four feature combinations (default 1285 [+5], lance
+1350 [+5], gpu 1294 [+5], pulsar 1288 [+5], 0 failures) — exactly task
+001's baseline plus this task's 5 new tests. See `002.md`'s Outcome
+section for full detail, including a named, honest residual limitation
+(deletion-fraction dilution over a very long history of partial
+mutations) left for a future compaction-scoped epic, matching this
+program's own established "no full rescans" discipline.
