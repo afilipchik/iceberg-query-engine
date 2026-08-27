@@ -2,13 +2,20 @@
 
 Produced from six parallel research passes: five external-literature sweeps (execution
 models, columnar storage, query optimization, GPU acceleration, distributed/spill-safe
-execution — 60+ primary sources total across academic papers and production-system
+execution — 70+ primary sources total across academic papers and production-system
 engineering writeups) and one from-scratch, code-verified architecture map of this
 engine (not taken from `CLAUDE.md`'s own prose on faith — checked against source, with
 every place `CLAUDE.md` itself had drifted flagged explicitly). Full per-thread detail
 lives in this session's own transcript; this document is the distilled, actionable
 synthesis: what the literature agrees and disagrees on, how this engine's actual design
 compares, and a ranked list of gaps worth closing.
+
+**Correction (2026-08-27, made before this document was ever acted on):** the
+execution-model research thread was the slowest of the six to return and arrived after
+this document's first draft was already written and committed. Section 2.1 below has
+been rewritten to reflect its actual findings rather than the placeholder reasoning
+used in the interim — the real research surfaced one significant, previously-missing
+gap (push- vs. pull-based execution). Everything else in this document is unaffected.
 
 Read this alongside `CLAUDE.md` (current engine state) and `.claude/prds/native-tables.md`
 (the most recently completed major program) — this document does not repeat what's
@@ -88,25 +95,67 @@ hasn't settled them either):**
 For each subsystem: what the research validates about the current design (don't touch),
 and what's a real, evidenced gap.
 
-### 2.1 Execution model — mostly validated, one major absence
+### 2.1 Execution model — mostly validated, two real gaps (one of them new)
 
-**Validated, not a gap:** vectorized `RecordBatch`-at-a-time processing, pull-based
-async streams, morsel-style rayon fan-out, and — notably — the engine's own decision to
-*reject* full query compilation/JIT is directly backed by the same VLDB'18 paper
-(Kersten et al.) the execution-model research thread surfaced independently, plus the
-engine measured this itself (`compiled_expr.rs`'s own benchmark, 0.638ms vs 0.544ms).
-Radix-partitioned hash join was proposed, benchmarked, and correctly refuted on this
-hardware's cache topology — an example of the "measure, don't assume" discipline the
-research also validates as correct practice.
+**Validated, not a gap:** columnar `RecordBatch`-at-a-time (vector-size) processing is
+the least-contested finding in the entire research corpus (universal across every
+source read, from MonetDB/X100 in 2005 through Photon in 2022) and the engine already
+does it. Morsel-style rayon fan-out mixed with structural per-partition tokio-task
+parallelism is a reasonable, evidence-consistent middle ground — the research shows
+morsel-driven parallelism's ceiling is real (30x @ 32 cores vs. exchange-based
+approaches in HyPer's own controlled study) but also surfaces a credible counter-
+position from Apache DataFusion (a comparable production Rust engine), which
+deliberately kept pull+exchange parallelism and reports "similar scalability in
+practice" for the common case — only adding morsel-style work-stealing later, and only
+for skewed scans specifically. The engine's mixed approach (structural fan-out plus
+morsel-style scheduling in the aggregation path) already sits close to this pragmatic
+position, not a naive one.
 
-**Real gap — highest priority in this whole synthesis:** the engine's plan is **fully
-fixed before execution starts**, with zero adaptive/runtime re-optimization anywhere
-(confirmed by a repo-wide grep: zero matches for "adaptive"/"re-optimiz"). This is the
-one technique the optimizer research thread ranks #1 by evidence strength, validated in
-production by three independent, competing, non-cross-citing systems (Spark, Snowflake,
-generically by the AQP survey), with concrete, large numbers (Spark: up to 8x on
-TPC-DS; Snowflake: up to 180-500x on specific production query classes). The engine has
-*none* of this.
+The engine's own decision to *reject* full query compilation/JIT is directly backed by
+the same VLDB'18 paper (Kersten et al.) the research surfaced independently — and,
+notably, by Photon's own real engineering experience abandoning codegen for
+vectorization (their own account: aggregation took "two months" to prototype with
+codegen vs. "a couple weeks" with vectorization, and vectorization was "easier to
+build, profile, debug, and operate at scale"). The engine measured this itself too
+(`compiled_expr.rs`'s own benchmark, 0.638ms vs. 0.544ms) rather than assuming it —
+this is a case of the engine's own empirical culture independently reaching the
+literature's own conclusion. Radix-partitioned hash join was similarly proposed,
+benchmarked, and correctly refuted on this hardware's cache topology.
+
+**Real gap #1, newly surfaced by the actual research (not present in this document's
+first draft):** the engine executes via **pull-based async streams** (`PhysicalOperator
+::execute(partition) -> RecordBatchStream`, classic Volcano-shaped control flow over
+`futures::Stream`), while the research thread found a fairly strong, independently-
+converging consensus toward **push-based** pipeline execution: DuckDB's own 2019
+rewrite from pull to push (explicitly motivated by parallelism/scheduling bugs),
+HyPer's original produce/consume model, ClickHouse's `Processors` pipeline, and Chroma
+(2024/2025) explicitly citing DuckDB's redesign as its own inspiration — four
+independent engineering teams, no shared codebase, converging on the same design for
+the same stated reason: push's explicit operator-state control flow (rather than
+pull's implicit stack-based control flow) is what makes dynamic scheduling,
+interruption, and adaptive execution tractable. This is a real architectural
+mismatch worth knowing about — but the research itself hedges it two ways worth
+carrying forward honestly: (a) Kersten et al. note push is measurably less natural for
+operators that need a fully-materialized input before producing output (merge-sort-
+shaped operators, which this engine has), and (b) no source gave an isolated,
+apples-to-apples "push vs. pull, everything else held equal" benchmark — every
+push-vs-pull data point found is bundled with a different design axis (compilation, or
+the scheduler). Treat this as a real, evidenced, moderate-confidence architectural
+note, not a quantified regression, and weigh the cost of a change this invasive (it
+would touch `PhysicalOperator`'s own trait signature and every operator implementing
+it) against gap #2 below, which the research validates far more strongly.
+
+**Real gap #2 — highest priority in this whole synthesis:** the engine's plan is
+**fully fixed before execution starts**, with zero adaptive/runtime re-optimization
+anywhere (confirmed by a repo-wide grep: zero matches for "adaptive"/"re-optimiz").
+This is the one technique the optimizer research thread ranks #1 by evidence strength,
+validated in production by three independent, competing, non-cross-citing systems
+(Spark, Snowflake, generically by the AQP survey), with concrete, large numbers (Spark:
+up to 8x on TPC-DS; Snowflake: up to 180-500x on specific production query classes).
+The engine has *none* of this. Worth noting: a push-based execution model (gap #1) is
+what several of these same production systems (DuckDB, ClickHouse) built their own
+adaptive-execution work on top of — if gap #1 is ever addressed, sequencing it before
+attempting real runtime adaptivity would be the more natural order, not the reverse.
 
 ### 2.2 Storage — one "wire up what already exists" quick win, one deliberate-and-defensible tradeoff, a few real additions
 
@@ -284,6 +333,7 @@ enough to fold into the same hardening effort.
 | 5 | FSST for native-table string columns + a bloom-filter-class index for equality pruning | Medium-high — well-evidenced techniques, moderate implementation lift, preserves the format's own zero-copy philosophy | M | Real win, does not require abandoning the current no-compression design stance. |
 | 6 | GPU: cost-gate the offload decision; test bounded low-cardinality GROUP BY; a narrow keys-only join-probe/Top-K primitive | Medium-high evidence, narrow scope, engine already close to state-of-the-art here | S-M each | Lowest risk of this list — the engine's current GPU design is already well-aligned; these are incremental, not corrective. |
 | 7 | Remove or wire up the dead `CostEstimator` in `cost.rs`; replace the hardcoded TPC-H-table-name join-order fallback with a general statistics-free heuristic | Internal-consistency finding, not directly from the research | S | Cheap, low-risk cleanup; bundle into whichever epic touches the optimizer next rather than standalone. |
+| 8 | Push-based pipeline execution instead of the current pull/Volcano model | Medium — real, 4-team-independent consensus (DuckDB, ClickHouse, HyPer/Umbra, Chroma), but no isolated push-vs-pull benchmark exists, and a credible production counter-position exists (DataFusion) | XL | The single most invasive item on this list — touches `PhysicalOperator`'s own trait signature and every operator. Not urgent on its own evidence; becomes more attractive as a prerequisite if item 3 (adaptive execution) is ever pursued seriously, since DuckDB/ClickHouse built their own adaptive-execution work on top of their push rewrites. |
 
 ---
 
