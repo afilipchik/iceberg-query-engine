@@ -326,7 +326,41 @@ impl Default for ExecutionConfig {
         Self {
             // Default to 1GB memory limit
             memory_limit: 1024 * 1024 * 1024,
-            spill_path: std::env::temp_dir().join("query_engine_spill"),
+            // PID-disambiguated: spill-join-correctness-2 epic, task 001.
+            // Every spilling operator (join/aggregate/sort) names its own
+            // per-query spill directory as `join_0_<id>`/`agg_..._<id>`/
+            // `sort_..._<id>`, where `<id>` comes from a PER-PROCESS-LOCAL
+            // counter that always starts at 0 in a fresh process. Without a
+            // PID (or other process-unique) component in the shared parent
+            // directory itself, two DIFFERENT `query_engine` processes on
+            // the SAME host (any multi-node-per-host deployment, this
+            // repo's own local multi-process cluster test harness, or
+            // simply two concurrently-running `serve`/benchmark
+            // invocations) landed on the IDENTICAL default path
+            // (`$TMPDIR/query_engine_spill/join_0_0/...`) for their FIRST
+            // spill. `spill-join-correctness` task 003 characterized this
+            // as a same-host collision that "fails loudly, never silently
+            // wrong" (`Parquet error`, HTTP 400). Direct instrumented
+            // evidence from task 001 of the follow-on epic
+            // (`spill-join-correctness-2`) shows that conclusion was
+            // INCOMPLETE: under a collision between two DIFFERENTLY-SIZED
+            // concurrent queries, one process's spilled build partition
+            // (e.g. SF=10) can be silently, partially overwritten with
+            // read-back data from an unrelated, concurrently-writing
+            // process (e.g. SF=100) sharing the identical file path —
+            // caught in the act via a per-partition join-key checksum
+            // comparing what was WRITTEN against what was READ BACK
+            // (`KeyChecksum`/`batch_key_checksum` in `spillable.rs`),
+            // directly correlated with an observed silently-WRONG final
+            // query answer, not just a crash. This is very likely the
+            // same mechanism behind this engine's own still-open,
+            // low-rate (~0.34% pooled) silent wrong-answer bug in
+            // `SpillableHashJoinExec`'s spill path (see CLAUDE.md's
+            // "Mutation: QA close-out" section) — a background process
+            // sharing this host's `$TMPDIR` and ALSO landing on `spill_id
+            // 0` at just the wrong moment.
+            spill_path: std::env::temp_dir()
+                .join(format!("query_engine_spill_{}", std::process::id())),
             spill_partitions: 64,
             batch_size: 8192,
             gpu_offload: false,
@@ -534,6 +568,43 @@ mod tests {
 
         pool.record_spill(300);
         assert_eq!(pool.spilled(), 800);
+    }
+
+    /// spill-join-correctness-2 epic, task 001: regression test for the
+    /// spill-directory-collision fix. FAILS without the fix (the old
+    /// default was the literal, PID-less `$TMPDIR/query_engine_spill`,
+    /// identical for every `query_engine` process on a host) and PASSES
+    /// with it (the default now embeds this process's own PID, so two
+    /// DIFFERENT processes can never compute the same default spill
+    /// directory — see `Default for ExecutionConfig`'s doc comment for
+    /// the full evidence trail, including a real, caught-in-the-act
+    /// silent wrong-answer this collision produced).
+    #[test]
+    fn default_spill_path_is_disambiguated_by_pid() {
+        let path = ExecutionConfig::default().spill_path;
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("spill_path must have a final path component");
+        let pid = std::process::id().to_string();
+        assert!(
+            file_name.contains(&pid),
+            "default spill_path ({:?}) must embed this process's own PID ({}) \
+             so two concurrent query_engine processes on the same host can \
+             never compute the identical default spill directory",
+            path,
+            pid
+        );
+        // Also pin the exact prefix so a future refactor can't accidentally
+        // satisfy the PID check via an unrelated coincidence (e.g. the
+        // whole path just happening to contain the PID's digits somewhere
+        // in an unrelated segment).
+        assert!(
+            file_name.starts_with("query_engine_spill_"),
+            "default spill_path's file name ({:?}) should still start with \
+             the established `query_engine_spill_` prefix",
+            file_name
+        );
     }
 
     #[test]

@@ -293,6 +293,20 @@ struct SpilledPartition {
     build_file: PathBuf,
     probe_file: Option<PathBuf>,
     build_rows: usize,
+    /// Diagnostic only (`QE_SPILL_DEBUG`), spill-join-correctness-2 epic
+    /// task 001: a checksum of the join-key values as WRITTEN to
+    /// `build_file`, computed from the ORIGINAL in-memory batch(es) at
+    /// spill time via the exact same `extract_join_key` code path
+    /// `build_hash_table`/`partition_batch_by_hash` use. Compared in
+    /// `process_spilled_partition` against the checksum RECOMPUTED from
+    /// the data read back off `build_file` -- directly testing whether the
+    /// spill/unspill round trip preserves join-key data, the same shape of
+    /// bug as Trino's PR #25892 (spill wrote with one hash generator,
+    /// unspill read with a different one). `None` when `QE_SPILL_DEBUG` is
+    /// unset (never computed, zero cost).
+    build_key_checksum: Option<KeyChecksum>,
+    /// Same idea, for `probe_file`.
+    probe_key_checksum: Option<KeyChecksum>,
 }
 
 #[async_trait]
@@ -543,7 +557,7 @@ impl SpillableHashJoinExec {
         }
         let probe_stream: RecordBatchStream =
             Box::pin(stream::iter(probe_batches.into_iter().map(Ok)));
-        let (results, mut probe_spill_files) = self
+        let (results, mut probe_spill_files, mut probe_key_checksums) = self
             .probe_with_spilling(
                 probe_stream,
                 probe_keys,
@@ -563,6 +577,7 @@ impl SpillableHashJoinExec {
         for (idx, spilled) in spilled_partitions.iter_mut().enumerate() {
             if let Some(sp) = spilled {
                 sp.probe_file = probe_spill_files[idx].take();
+                sp.probe_key_checksum = probe_key_checksums[idx].take();
             }
         }
 
@@ -599,6 +614,10 @@ impl SpillableHashJoinExec {
         build_keys: &[Expr],
         spill_dir: &PathBuf,
     ) -> Result<(Vec<Option<BuildPartition>>, Vec<Option<SpilledPartition>>)> {
+        // spill-join-correctness-2 epic, task 001: checked once per call,
+        // matching this file's own established convention (no `OnceLock`
+        // caching, re-read fresh — see `gpu.rs`'s `QE_GPU_DEBUG` precedent).
+        let sj_trace = std::env::var("QE_SPILL_DEBUG").is_ok();
         let mut partitions: Vec<Option<BuildPartition>> = (0..NUM_PARTITIONS)
             .map(|_| Some(BuildPartition::new()))
             .collect();
@@ -625,8 +644,16 @@ impl SpillableHashJoinExec {
                 if let Some(idx) = find_largest_partition(&partitions) {
                     let part = partitions[idx].take().unwrap();
                     let path = spill_dir.join(format!("build_{}.parquet", idx));
+                    let mut write_checksum = if sj_trace {
+                        Some(KeyChecksum::default())
+                    } else {
+                        None
+                    };
                     for b in &part.batches {
                         append_batch_streaming(&mut spill_writers[idx], &path, b)?;
+                        if let Some(cs) = write_checksum.as_mut() {
+                            cs.accumulate(batch_key_checksum(b, build_keys)?);
+                        }
                     }
 
                     self.memory_pool.record_spill(part.memory_bytes);
@@ -636,6 +663,8 @@ impl SpillableHashJoinExec {
                         build_file: path,
                         probe_file: None,
                         build_rows: part.batches.iter().map(|b| b.num_rows()).sum(),
+                        build_key_checksum: write_checksum,
+                        probe_key_checksum: None,
                     });
                 }
             }
@@ -650,11 +679,17 @@ impl SpillableHashJoinExec {
                     if let Some(ref mut part) = partitions[idx] {
                         part.add_batch(pb);
                         total_memory += pb_size;
-                    } else if let Some(ref sp) = spilled[idx] {
+                    } else if let Some(ref mut sp) = spilled[idx] {
                         // Append to spilled partition as one more row group
                         // in the already-open writer — O(batch), never
                         // re-reads or rewrites this partition's prior data.
                         append_batch_streaming(&mut spill_writers[idx], &sp.build_file, &pb)?;
+                        if sj_trace {
+                            let cs = batch_key_checksum(&pb, build_keys)?;
+                            sp.build_key_checksum
+                                .get_or_insert_with(KeyChecksum::default)
+                                .accumulate(cs);
+                        }
                     }
                 }
             }
@@ -673,9 +708,19 @@ impl SpillableHashJoinExec {
         spilled_partitions: &[Option<SpilledPartition>],
         spill_dir: &PathBuf,
         swapped: bool,
-    ) -> Result<(Vec<RecordBatch>, Vec<Option<PathBuf>>)> {
+    ) -> Result<(
+        Vec<RecordBatch>,
+        Vec<Option<PathBuf>>,
+        Vec<Option<KeyChecksum>>,
+    )> {
+        let sj_trace = std::env::var("QE_SPILL_DEBUG").is_ok();
         let mut results = Vec::new();
         let mut probe_spill_files: Vec<Option<PathBuf>> =
+            (0..NUM_PARTITIONS).map(|_| None).collect();
+        // spill-join-correctness-2 epic, task 001: write-time checksum of
+        // each spilled partition's PROBE-side join keys, compared against
+        // the read-back recomputation in `process_spilled_partition`.
+        let mut probe_key_checksums: Vec<Option<KeyChecksum>> =
             (0..NUM_PARTITIONS).map(|_| None).collect();
         // Same fix as `build_with_partitioning`: one writer per partition,
         // kept open for the whole probe phase, instead of a read-rewrite
@@ -711,13 +756,19 @@ impl SpillableHashJoinExec {
                             spill_dir.join(format!("probe_{}.parquet", idx))
                         });
                         append_batch_streaming(&mut spill_writers[idx], probe_path, &pb)?;
+                        if sj_trace {
+                            let cs = batch_key_checksum(&pb, probe_keys)?;
+                            probe_key_checksums[idx]
+                                .get_or_insert_with(KeyChecksum::default)
+                                .accumulate(cs);
+                        }
                     }
                 }
             }
         }
 
         close_spill_writers(spill_writers)?;
-        Ok((results, probe_spill_files))
+        Ok((results, probe_spill_files, probe_key_checksums))
     }
 
     async fn process_spilled_partition(
@@ -726,10 +777,46 @@ impl SpillableHashJoinExec {
         build_keys: &[Expr],
         probe_keys: &[Expr],
         swapped: bool,
-        _idx: usize,
+        idx: usize,
     ) -> Result<Vec<RecordBatch>> {
+        let sj_trace = std::env::var("QE_SPILL_DEBUG").is_ok();
+
         // Read build side from disk
         let build_batches = read_parquet(&spilled.build_file)?;
+
+        // spill-join-correctness-2 epic, task 001: directly compare the
+        // join-key checksum recomputed from the data just read back off
+        // disk against the checksum recorded when those SAME rows were
+        // written to `spilled.build_file` (before the spill/unspill round
+        // trip). A mismatch here would be direct, in-the-act evidence of a
+        // Trino-PR#25892-shaped bug (spill-write and unspill-read
+        // disagreeing about a row's join key) rather than inference from
+        // reading the code.
+        if sj_trace {
+            if let Some(write_cs) = spilled.build_key_checksum {
+                let mut read_cs = KeyChecksum::default();
+                for b in &build_batches {
+                    read_cs.accumulate(batch_key_checksum(b, build_keys)?);
+                }
+                if read_cs.rows != write_cs.rows || read_cs.xor_hash != write_cs.xor_hash {
+                    eprintln!(
+                        "[sj-trace] HASH-MISMATCH build partition idx={} write_rows={} write_xor={:016x} read_rows={} read_xor={:016x} write_unhandled={} read_unhandled={}",
+                        idx,
+                        write_cs.rows,
+                        write_cs.xor_hash,
+                        read_cs.rows,
+                        read_cs.xor_hash,
+                        write_cs.unhandled_type_rows,
+                        read_cs.unhandled_type_rows
+                    );
+                } else {
+                    eprintln!(
+                        "[sj-trace] hash-check-ok build partition idx={} rows={} xor={:016x} unhandled={}",
+                        idx, read_cs.rows, read_cs.xor_hash, read_cs.unhandled_type_rows
+                    );
+                }
+            }
+        }
 
         // Build hash table
         let hash_table = build_hash_table(&build_batches, build_keys)?;
@@ -740,6 +827,32 @@ impl SpillableHashJoinExec {
         } else {
             Vec::new()
         };
+
+        if sj_trace {
+            if let Some(write_cs) = spilled.probe_key_checksum {
+                let mut read_cs = KeyChecksum::default();
+                for b in &probe_batches {
+                    read_cs.accumulate(batch_key_checksum(b, probe_keys)?);
+                }
+                if read_cs.rows != write_cs.rows || read_cs.xor_hash != write_cs.xor_hash {
+                    eprintln!(
+                        "[sj-trace] HASH-MISMATCH probe partition idx={} write_rows={} write_xor={:016x} read_rows={} read_xor={:016x} write_unhandled={} read_unhandled={}",
+                        idx,
+                        write_cs.rows,
+                        write_cs.xor_hash,
+                        read_cs.rows,
+                        read_cs.xor_hash,
+                        write_cs.unhandled_type_rows,
+                        read_cs.unhandled_type_rows
+                    );
+                } else {
+                    eprintln!(
+                        "[sj-trace] hash-check-ok probe partition idx={} rows={} xor={:016x} unhandled={}",
+                        idx, read_cs.rows, read_cs.xor_hash, read_cs.unhandled_type_rows
+                    );
+                }
+            }
+        }
 
         // Probe
         probe_partition(
@@ -2696,6 +2809,63 @@ fn extract_join_key(arrays: &[ArrayRef], row: usize) -> JoinKey {
     JoinKey { values }
 }
 
+/// Diagnostic-only (`QE_SPILL_DEBUG`) checksum of a batch of join-key
+/// values, spill-join-correctness-2 epic task 001. Order-independent (XOR
+/// accumulation) so it survives any row reordering across a spill/unspill
+/// round trip. Deliberately built on the SAME `extract_join_key` function
+/// used by `build_hash_table`/`partition_batch_by_hash` themselves — a
+/// mismatch caught by comparing two `KeyChecksum`s can only come from the
+/// underlying ARRAY DATA differing between the two calls (e.g. a Parquet
+/// round trip changing a column's concrete Arrow type or values), never
+/// from the checksum's own logic disagreeing with the real join mechanism.
+#[derive(Clone, Copy, Default)]
+struct KeyChecksum {
+    rows: usize,
+    xor_hash: u64,
+    /// Rows whose key extraction fell through to `JoinValue::Null` despite
+    /// the underlying array being NON-null at that row — i.e. an unhandled
+    /// `extract_join_key` array type (see its downcast chain), not a
+    /// genuine SQL NULL. Tracked separately so a real mismatch reads as
+    /// "spill round-trip changed the data", not conflated with this
+    /// already-known, structurally different key-extraction gap.
+    unhandled_type_rows: usize,
+}
+
+impl KeyChecksum {
+    fn accumulate(&mut self, other: KeyChecksum) {
+        self.rows += other.rows;
+        self.xor_hash ^= other.xor_hash;
+        self.unhandled_type_rows += other.unhandled_type_rows;
+    }
+}
+
+/// Compute a [`KeyChecksum`] for one batch's join keys (`key_exprs`
+/// evaluated against `batch`, then `extract_join_key` per row — the exact
+/// path `build_hash_table` and `partition_batch_by_hash` use).
+fn batch_key_checksum(batch: &RecordBatch, key_exprs: &[Expr]) -> Result<KeyChecksum> {
+    let key_arrays: Result<Vec<ArrayRef>> =
+        key_exprs.iter().map(|e| evaluate_expr(batch, e)).collect();
+    let key_arrays = key_arrays?;
+    let mut cs = KeyChecksum::default();
+    for row in 0..batch.num_rows() {
+        let key = extract_join_key(&key_arrays, row);
+        let source_is_null = key_arrays.iter().any(|a| a.is_null(row));
+        let key_is_all_null = key.values.iter().all(|v| matches!(v, JoinValue::Null));
+        if key_is_all_null && !source_is_null {
+            cs.unhandled_type_rows += 1;
+        }
+        // A dedicated, fixed seed — distinct from `partition_batch_by_hash`'s
+        // own routing-hash seed, since this checksum only ever needs to
+        // agree with ITSELF (write time vs. read time), never with the
+        // routing function.
+        let mut hasher = xxhash_rust::xxh64::Xxh64::new(0x9e37_79b9_7f4a_7c15);
+        key.hash(&mut hasher);
+        cs.xor_hash ^= hasher.finish();
+        cs.rows += 1;
+    }
+    Ok(cs)
+}
+
 fn build_hash_table(
     batches: &[RecordBatch],
     key_exprs: &[Expr],
@@ -3546,6 +3716,106 @@ mod tests {
             matches!(result.column(1).data_type(), DataType::Dictionary(_, _)),
             "joined output column 1 should still be Dictionary-encoded, got {:?}",
             result.column(1).data_type()
+        );
+    }
+
+    /// spill-join-correctness-2 epic, task 001: `KeyChecksum` is the direct
+    /// write-vs-read comparison mechanism this task added to catch a
+    /// Trino-PR#25892-shaped bug (spill wrote a join key one way, unspill
+    /// read it back differently) in the act. This test pins its two
+    /// load-bearing properties: identical logical key data produces an
+    /// IDENTICAL checksum regardless of how it's split across batches or
+    /// what order the rows appear in (both are true of a real Parquet
+    /// spill/unspill round trip — row-group boundaries and, in general,
+    /// row order are not guaranteed to match the pre-spill batch shape),
+    /// and genuinely DIFFERENT key data produces a different checksum (so
+    /// the mechanism would actually catch a real mismatch, not just always
+    /// report "ok").
+    #[test]
+    fn key_checksum_is_order_and_batch_split_independent_but_detects_real_differences() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let key_expr = vec![Expr::column("k")];
+
+        let one_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50]))],
+        )
+        .unwrap();
+        let cs_one = batch_key_checksum(&one_batch, &key_expr).unwrap();
+
+        // Same logical rows, split across three batches AND reordered —
+        // exactly what a spill (writes in arrival order, across many
+        // batches) followed by an unspill (reads back in row-group order,
+        // which need not match) can produce.
+        let split_a = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![40, 10]))],
+        )
+        .unwrap();
+        let split_b =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![50]))])
+                .unwrap();
+        let split_c = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![20, 30]))],
+        )
+        .unwrap();
+        let mut cs_split = KeyChecksum::default();
+        for b in [&split_a, &split_b, &split_c] {
+            cs_split.accumulate(batch_key_checksum(b, &key_expr).unwrap());
+        }
+
+        assert_eq!(
+            cs_one.rows, cs_split.rows,
+            "row count must match regardless of batch splitting"
+        );
+        assert_eq!(
+            cs_one.xor_hash, cs_split.xor_hash,
+            "checksum must be identical for the same logical keys \
+             regardless of batch splitting or row order"
+        );
+        assert_eq!(cs_one.unhandled_type_rows, 0);
+        assert_eq!(cs_split.unhandled_type_rows, 0);
+
+        // Genuinely different key data (one value changed) must NOT
+        // checksum the same — otherwise this mechanism could never catch a
+        // real mismatch.
+        let different = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![10, 20, 30, 40, 999]))],
+        )
+        .unwrap();
+        let cs_different = batch_key_checksum(&different, &key_expr).unwrap();
+        assert_eq!(cs_different.rows, cs_one.rows);
+        assert_ne!(
+            cs_different.xor_hash, cs_one.xor_hash,
+            "a real difference in key data must change the checksum"
+        );
+    }
+
+    /// A NULL-valued key (real SQL NULL) must never be flagged as
+    /// `unhandled_type_rows` — that counter exists specifically to isolate
+    /// `extract_join_key`'s downcast-chain gap (an array type it doesn't
+    /// recognize, e.g. a Dictionary-encoded key column) from an ordinary,
+    /// expected NULL.
+    #[test]
+    fn key_checksum_does_not_confuse_real_null_with_an_unhandled_array_type() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let key_expr = vec![Expr::column("k")];
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![Some(1), None, Some(3)]))],
+        )
+        .unwrap();
+        let cs = batch_key_checksum(&batch, &key_expr).unwrap();
+        assert_eq!(cs.rows, 3);
+        assert_eq!(
+            cs.unhandled_type_rows, 0,
+            "a genuine SQL NULL is a handled case, not an unhandled array type"
         );
     }
 }
