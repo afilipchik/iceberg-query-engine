@@ -2,8 +2,8 @@
 name: join-order-stats-hardening
 status: in-progress
 created: 2026-08-27T17:23:53Z
-updated: 2026-08-27T17:23:53Z
-progress: 0%
+updated: 2026-08-27T18:10:00Z
+progress: 33%
 prd: .claude/prds/join-order-stats-hardening.md
 github: (will be set on sync)
 ---
@@ -94,7 +94,7 @@ Estimated total effort: S-M overall — both fixes are narrow by design.
 - 003: S.
 
 ## Tasks Created
-- [ ] 001.md - Missing/degenerate join-key statistics visibility (parallel: false)
+- [x] 001.md - Missing/degenerate join-key statistics visibility (parallel: false) — CLOSED 2026-08-27
 - [ ] 002.md - Native-table statistics staleness after mutation (parallel: false)
 - [ ] 003.md - Validation, no-regression check, full suite, docs, epic close (parallel: false)
 
@@ -102,3 +102,17 @@ Total tasks: 3
 Parallel tasks: 0
 Sequential tasks: 3
 Estimated total effort: S-M
+
+## Progress
+
+**33% (1/3 tasks closed).** Task 001 shipped the shared "untrustworthy
+join-key statistics" signal (`crate::optimizer::classify_join_key_ndv`
+/ `warn_untrustworthy_join_key_stats`, `src/optimizer/cost.rs`), wired
+into `JoinReorder`'s DPsize cost model
+(`src/optimizer/rules/join_reorder.rs`), validated against the live
+go/no-go repro (warning fires correctly for the corrupted-stats leg,
+zero false positives on the accurate leg, byte-identical join shapes
+before/after confirming zero cost-model regression). Full suite green
+in all four feature combinations (default 1280, lance 1345, gpu 1289,
+pulsar 1283, 0 failures). See `001.md`'s Outcome section for full
+detail, including the precise reuse seam task 002 is expected to use.

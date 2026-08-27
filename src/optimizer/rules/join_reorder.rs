@@ -740,12 +740,32 @@ impl JoinReorder {
         // is 240M — the DP then buried a 240M-row intermediate at the bottom
         // of Q09's plan. Full correlation is the conservative direction: it
         // can only overestimate join outputs, never hide a blow-up.
+        // Missing/degenerate NDV visibility (join-order-stats-hardening
+        // task 001): the fallback below (`base_rows[rel].max(10.0)`) is the
+        // exact silent near-arbitrary default the investigation's own repro
+        // (`examples/adaptive_reopt_ndv_repro.rs`) found produces a
+        // >60,000x cardinality misestimate. `classify_join_key_ndv` +
+        // `warn_untrustworthy_join_key_stats` (src/optimizer/cost.rs) make
+        // that fallback loud, in normal operation, without changing the
+        // numeric fallback itself -- see cost.rs's own doc comment for why
+        // that pair lives there and how task 002 is meant to reuse it.
         let side_combined_ndv = |rel: usize, exprs: &[&Expr]| -> f64 {
             let mut max_ndv = 1.0f64;
             for e in exprs {
-                let ndv = self
-                    .column_ndv(&relations[rel], e)
-                    .unwrap_or(base_rows[rel].max(10.0));
+                let raw_ndv = self.column_ndv(&relations[rel], e);
+                let ndv = match crate::optimizer::classify_join_key_ndv(raw_ndv, base_rows[rel]) {
+                    Ok(v) => v,
+                    Err(reason) => {
+                        let fallback = base_rows[rel].max(10.0);
+                        crate::optimizer::warn_untrustworthy_join_key_stats(
+                            &relations[rel].name,
+                            &Self::describe_join_key_expr(e),
+                            reason,
+                            fallback,
+                        );
+                        fallback
+                    }
+                };
                 max_ndv = max_ndv.max(ndv);
             }
             max_ndv.min(base_rows[rel].max(1.0))
@@ -1212,6 +1232,24 @@ impl JoinReorder {
         let stats = self.table_stats.get(&table)?;
         let col_stats = stats.column_stats.get(&col)?;
         col_stats.ndv_est.map(|v| v as f64)
+    }
+
+    /// Human-readable label for a join-key expression, for the
+    /// missing/degenerate-statistics warning: the bare column name for a
+    /// plain column reference, or every referenced column name joined with
+    /// `+` for a composite/expression key (e.g. a packed composite key
+    /// produced by `PackedJoinKeys`).
+    fn describe_join_key_expr(expr: &Expr) -> String {
+        if let Expr::Column(c) = expr {
+            return c.name.clone();
+        }
+        let mut names: Vec<String> = Vec::new();
+        crate::physical::morsel::collect_expr_columns(expr, &mut names);
+        if names.is_empty() {
+            format!("{:?}", expr)
+        } else {
+            names.join("+")
+        }
     }
 
     /// Rebuild filter predicate without the conditions used as join conditions
@@ -2296,5 +2334,96 @@ mod tests {
             }
             _ => false,
         }
+    }
+
+    /// join-order-stats-hardening task 001: a relation with REAL statistics
+    /// (`a`) joined to one whose `TableStatistics` entry is present but
+    /// carries an EMPTY `column_stats` map (`b`) -- exactly
+    /// `MemoryTable::statistics()`'s shape, the real, shipped
+    /// `register_table` cold-start path this task's whole repro is built
+    /// on. The DP must still produce a real join tree (no panic, no
+    /// silent fallback to a cross join) even though `column_ndv` can never
+    /// resolve for `b`'s join key; the missing-stats fallback path this
+    /// exercises is exactly where `classify_join_key_ndv` +
+    /// `warn_untrustworthy_join_key_stats` (src/optimizer/cost.rs) now
+    /// fire.
+    #[test]
+    fn dpsize_handles_a_relation_with_empty_column_stats() {
+        use crate::physical::operators::ColumnStatistics;
+
+        let a = make_scan("a", vec!["a_id"]);
+        let b = make_scan("b", vec!["b_id"]);
+        let c = make_scan("c", vec!["c_a_id", "c_b_id"]);
+
+        let a_schema = a.schema();
+        let b_schema = b.schema();
+        let ab_schema = a_schema.merge(&b_schema);
+        let c_schema = c.schema();
+        let abc_schema = ab_schema.merge(&c_schema);
+
+        let inner_ab = LogicalPlan::Join(JoinNode {
+            left: Arc::new(a),
+            right: Arc::new(b),
+            join_type: JoinType::Cross,
+            on: vec![],
+            filter: None,
+            schema: ab_schema,
+        });
+        let inner_abc = LogicalPlan::Join(JoinNode {
+            left: Arc::new(inner_ab),
+            right: Arc::new(c),
+            join_type: JoinType::Inner,
+            on: vec![
+                (Expr::column("a_id"), Expr::column("c_a_id")),
+                (Expr::column("b_id"), Expr::column("c_b_id")),
+            ],
+            filter: None,
+            schema: abc_schema,
+        });
+
+        let mut stats = HashMap::new();
+        stats.insert(
+            "a".to_string(),
+            TableStatistics {
+                row_count: 1_000_000,
+                total_byte_size: 0,
+                column_stats: {
+                    let mut m = HashMap::new();
+                    m.insert(
+                        "a_id".to_string(),
+                        ColumnStatistics {
+                            ndv_est: Some(1_000_000),
+                            ..Default::default()
+                        },
+                    );
+                    m
+                },
+            },
+        );
+        // `b`: a real TableStatistics entry with a real row count, but an
+        // EMPTY column_stats map -- MemoryTable::statistics()'s exact shape.
+        stats.insert(
+            "b".to_string(),
+            TableStatistics {
+                row_count: 50,
+                total_byte_size: 0,
+                column_stats: HashMap::new(),
+            },
+        );
+        stats.insert(
+            "c".to_string(),
+            TableStatistics {
+                row_count: 10_000_000,
+                total_byte_size: 0,
+                column_stats: HashMap::new(),
+            },
+        );
+
+        let rule = JoinReorder::with_table_statistics(stats);
+        let optimized = rule.optimize(&inner_abc).unwrap();
+
+        // Still a real join tree: no panic, and the DP path (not a
+        // degenerate cross-join fallback) was taken.
+        assert!(!has_cross_joins(&optimized));
     }
 }

@@ -2,6 +2,115 @@
 
 use crate::planner::LogicalPlan;
 
+/// Why a join-key NDV estimate could not be trusted at face value.
+///
+/// Shared, reusable classification for "this relation's join-key statistics
+/// are missing or degenerate" — built for `optimizer::rules::join_reorder`'s
+/// DPsize cost model (join-order-stats-hardening epic, task 001), but
+/// deliberately free-standing here rather than living inside
+/// `join_reorder.rs` itself: `JoinReorder`'s own module is private
+/// (`mod join_reorder;` in `rules/mod.rs`, only the `JoinReorder` struct is
+/// re-exported), while `cost`'s public items are glob-re-exported at
+/// `crate::optimizer::*` (see `optimizer/mod.rs`'s `pub use cost::*;`), so
+/// this is reachable crate-wide as `crate::optimizer::classify_join_key_ndv`
+/// / `crate::optimizer::warn_untrustworthy_join_key_stats` with zero further
+/// plumbing. That is the intended reuse seam for task 002 (native-table
+/// statistics staleness after mutation): once a DELETE/UPDATE has
+/// materially invalidated a native table's own derived NDV, task 002 should
+/// route that case through THIS SAME `UntrustworthyStats::Degenerate`
+/// classification and `warn_untrustworthy_join_key_stats` call, not build a
+/// second, parallel "don't trust this number" mechanism. Note the dead
+/// `CostEstimator` below this point in the file is genuinely unrelated to
+/// this mechanism — it has zero call sites anywhere in the crate (confirmed
+/// via `grep`), operates on a completely different `Statistics`/
+/// `ColumnStatistics` pair of types that never carries NDV at all
+/// (`column_stats: vec![]` at every call site), and was investigated and
+/// ruled out as a fit before this code was added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UntrustworthyStats {
+    /// No NDV estimate was recorded at all for this relation/column — e.g.
+    /// a relation registered via `ExecutionContext::register_table`
+    /// (`MemoryTable`), whose `statistics()` always returns a real row
+    /// count but an EMPTY `column_stats` map (see
+    /// `examples/adaptive_reopt_ndv_repro.rs` and CLAUDE.md's "Adaptive
+    /// join-order re-optimization" section for the load-bearing repro).
+    Missing,
+    /// An NDV estimate exists but is degenerate given the relation's own
+    /// row count: non-positive (reachable today — `ParquetTable`'s
+    /// `ndv_est` derivation can compute `Some(0)` for an all-null integer
+    /// column), or a single-value range for a relation that plainly holds
+    /// far more rows than that (a collapsed min==max range, which for a
+    /// native table can also arise from `Segment` statistics that were
+    /// computed once at write time and never revisited by a later
+    /// DELETE/UPDATE — see `src/storage/native_manifest.rs`).
+    Degenerate,
+}
+
+impl UntrustworthyStats {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UntrustworthyStats::Missing => "no recorded NDV statistics",
+            UntrustworthyStats::Degenerate => {
+                "a degenerate NDV estimate (non-positive, or collapsed to a single value despite a much larger row count)"
+            }
+        }
+    }
+}
+
+/// A relation whose join key resolves to a single-value NDV is only
+/// classified as degenerate (as opposed to a genuinely constant column)
+/// once its own row count clears this bar — a small dimension table
+/// (TPC-H `region`/`nation`-scale, tens of rows) can legitimately have a
+/// tiny or even singleton NDV without that being a statistics problem.
+const DEGENERATE_SINGLETON_ROW_THRESHOLD: f64 = 1000.0;
+
+/// Classify a join-key NDV estimate: `Ok(ndv)` when it is directly usable,
+/// `Err(reason)` when it is missing or degenerate and the caller should
+/// fall back to an estimate AND surface it via
+/// `warn_untrustworthy_join_key_stats`. Pure and side-effect-free by
+/// design (no tracing here) so a caller can classify without necessarily
+/// warning immediately.
+pub fn classify_join_key_ndv(
+    ndv_est: Option<f64>,
+    relation_row_count: f64,
+) -> std::result::Result<f64, UntrustworthyStats> {
+    match ndv_est {
+        None => Err(UntrustworthyStats::Missing),
+        Some(v) if v <= 0.0 => Err(UntrustworthyStats::Degenerate),
+        Some(v) if v <= 1.0 && relation_row_count > DEGENERATE_SINGLETON_ROW_THRESHOLD => {
+            Err(UntrustworthyStats::Degenerate)
+        }
+        Some(v) => Ok(v),
+    }
+}
+
+/// The single, shared visibility mechanism this task builds: fires in
+/// NORMAL operation via `tracing::warn!` — never gated behind a
+/// debug-only env var the way this codebase's `DP_DEBUG`/`PLAN_DEBUG`
+/// switches are — so a catastrophically bad join order caused by
+/// missing/degenerate statistics is diagnosable without anyone already
+/// knowing to look for it. Names the relation and column explicitly (as
+/// structured `tracing` fields, matching this codebase's existing
+/// convention in e.g. `src/distributed/server.rs`) and states the
+/// fallback NDV being substituted so the resulting plan's cost numbers
+/// are traceable back to this exact decision.
+pub fn warn_untrustworthy_join_key_stats(
+    relation: &str,
+    column: &str,
+    reason: UntrustworthyStats,
+    fallback_ndv: f64,
+) {
+    tracing::warn!(
+        relation = relation,
+        column = column,
+        reason = reason.as_str(),
+        fallback_ndv = fallback_ndv,
+        "join_reorder: join key has untrustworthy statistics for this join edge; \
+         falling back to an estimated NDV (can misorder joins catastrophically if wrong \
+         -- see CLAUDE.md's 'Adaptive join-order re-optimization' section)"
+    );
+}
+
 /// Statistics for a table or intermediate result
 #[derive(Debug, Clone, Default)]
 pub struct Statistics {
@@ -443,5 +552,51 @@ mod tests {
         let filter_stats = estimator.estimate_statistics(&filter);
 
         assert!(filter_stats.row_count.unwrap() < scan_stats.row_count.unwrap());
+    }
+
+    #[test]
+    fn classify_missing_ndv_as_missing() {
+        assert_eq!(
+            classify_join_key_ndv(None, 1_500_000.0),
+            Err(UntrustworthyStats::Missing)
+        );
+    }
+
+    #[test]
+    fn classify_zero_ndv_as_degenerate() {
+        assert_eq!(
+            classify_join_key_ndv(Some(0.0), 1_500_000.0),
+            Err(UntrustworthyStats::Degenerate)
+        );
+    }
+
+    #[test]
+    fn classify_collapsed_range_on_large_relation_as_degenerate() {
+        // A join key that resolves to a single distinct value on a
+        // 1.5M-row relation is suspicious, not a genuine constant column.
+        assert_eq!(
+            classify_join_key_ndv(Some(1.0), 1_500_000.0),
+            Err(UntrustworthyStats::Degenerate)
+        );
+    }
+
+    #[test]
+    fn classify_singleton_ndv_on_small_dimension_table_is_not_degenerate() {
+        // TPC-H `region`-scale table (5 rows): a singleton NDV there is a
+        // perfectly ordinary real value, not a statistics problem.
+        assert_eq!(classify_join_key_ndv(Some(1.0), 5.0), Ok(1.0));
+    }
+
+    #[test]
+    fn classify_real_ndv_as_ok() {
+        assert_eq!(classify_join_key_ndv(Some(25.0), 1_500_000.0), Ok(25.0));
+    }
+
+    #[test]
+    fn untrustworthy_stats_reason_strings_are_distinct() {
+        assert_ne!(
+            UntrustworthyStats::Missing.as_str(),
+            UntrustworthyStats::Degenerate.as_str()
+        );
     }
 }
