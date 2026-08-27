@@ -4742,3 +4742,64 @@ KILL 120 scripts/claude-safe-build.sh ./target/release/examples/
 adaptive_reopt_ndv_repro --data data/tpch-10gb --mode corrupted` — it is
 deliberately constructing a plan that may attempt a many-billion-row
 intermediate and will not finish on its own).
+
+**Update (`join-order-stats-hardening` epic, closed 2026-08-27): both of
+this recommendation's own two named "cheap, targeted stats-hygiene
+fixes" shipped.** Full adaptive replanning itself is still NOT pursued —
+that verdict stands unchanged — but the visibility mechanism and the
+native-table staleness fix this section recommended in place of it are
+both real, shipped, and validated:
+
+1. **Missing/degenerate join-key statistics are now loud, not silent**
+   (task 001). `side_combined_ndv` inside `JoinReorder`'s DPsize cost
+   model (`src/optimizer/rules/join_reorder.rs`) no longer silently
+   substitutes `base_rows[rel].max(10.0)` when a relation's join-key
+   column has no usable NDV — it classifies the condition
+   (`crate::optimizer::classify_join_key_ndv`, `src/optimizer/cost.rs`:
+   `Missing` for no stats at all, `Degenerate` for a non-positive NDV or
+   a collapsed single-value range on a relation with >1000 rows) and
+   fires `tracing::warn!` unconditionally, naming the relation and
+   column, before falling back to the SAME unchanged cost value — a
+   pure visibility addition, zero cost-model behavior change (confirmed
+   by byte-identical join shapes before/after). Re-running this
+   section's own repro with a tracing subscriber installed (`--mode
+   plan-only`) now prints 0 warnings on the accurate leg and warnings
+   naming exactly `supplier.s_nationkey`, `supplier.s_suppkey`,
+   `customer.c_nationkey`, `customer.c_custkey` on the corrupted leg —
+   this section's own "make missing/degenerate stats loud rather than
+   silent" recommendation, delivered.
+2. **Native-table NDV staleness after DELETE/UPDATE is fixed** (task
+   002) — but the real mechanism was NOT what this section's own
+   "Realism assessment" paragraph above guessed. Row count was already
+   LIVE-corrected (fixed two epics earlier, by native-tables-mutation
+   task 003) — the actual staleness lives in `min_i64`/`max_i64`
+   themselves, which DELETE/UPDATE never recompute. For a RANGE-BOUND
+   NDV estimate (a low/moderate-cardinality column), deleting every row
+   of one distinct value leaves the stale range spanning a now-
+   nonexistent value, keeping `ndv_est` too high — the exact dangerous
+   direction this section names. Fixed query-time-only in
+   `src/storage/native_table.rs::table_statistics_from`: once a table's
+   deletion fraction exceeds 10%, a range-bound column's `ndv_est` is
+   emitted as `None` rather than a possibly-stale `Some(v)`, routing
+   directly through task 001's own `classify_join_key_ndv`/
+   `warn_untrustworthy_join_key_stats` signal with ZERO new
+   classification code (the "one shared signal, not two" design this
+   epic committed to, honored exactly) — a stale column now produces the
+   identical warning described in point 1. Zero mutation-path changes
+   (`native_write.rs`/`native_delete.rs`/`native_update.rs` untouched,
+   confirmed by `git diff --stat`), so none of this doc's own recorded
+   native-table mutation performance numbers move. One honestly-named
+   residual limitation: `deletion_fraction`'s denominator can dilute
+   below the threshold over a very long history of many small, partial
+   (not whole-segment) mutations, in principle letting an earlier
+   genuine staleness go undetected once diluted — real, bounded, not
+   observed at any scale this program's fixtures reach today, left for
+   a future compaction-scoped epic per this program's own "no full
+   rescans" discipline.
+
+Full validation (re-confirmed at HEAD by the epic's own close-out task,
+003): all four feature combinations green, `examples/
+adaptive_reopt_ndv_repro.rs` re-run and confirmed firing correctly,
+`tests/native_ndv_staleness_tests.rs` re-confirmed passing end to end.
+Full epic detail: `.claude/epics/archived/join-order-stats-hardening/
+epic.md`.

@@ -1,9 +1,24 @@
 ---
 name: join-order-stats-hardening
 description: Surface missing/degenerate join-key statistics loudly instead of a silent bad fallback, and fix native-table statistics going stale after mutation
-status: backlog
+status: completed
 created: 2026-08-27T17:23:53Z
+updated: 2026-08-27T19:35:00Z
 ---
+
+> **Status note (2026-08-27).** `completed` reflects the epic running
+> its full course and closing (all 3 tasks closed, each meeting its OWN
+> acceptance criteria; this PRD's own G1-G4 success criteria all
+> verified MET with direct evidence). Both problem statements got real,
+> narrow, validated fixes: missing/degenerate join-key statistics now
+> fire an unconditional `tracing::warn!` naming the relation/column
+> (task 001), and native-table NDV staleness after DELETE/UPDATE is
+> fixed query-time-only by degrading a range-bound column's estimate to
+> `None` once deletion fraction crosses 10%, routed through the same
+> signal (task 002) — exactly the "one shared signal, not two"
+> architecture decision this PRD's own epic committed to. Full detail:
+> `.claude/epics/archived/join-order-stats-hardening/epic.md`'s own
+> close-out section.
 
 # PRD: join-order-stats-hardening
 
