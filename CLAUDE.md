@@ -4635,3 +4635,110 @@ scale.
 | Metastore REST client | `src/metastore/mod.rs` |
 | Larger-than-memory plan | `.claude/plans/larger-than-memory-support.md` |
 | Development roadmap | `.claude/plans/ROADMAP.md` |
+
+## Adaptive join-order re-optimization: investigated, NOT pursued yet (2026-08-27)
+
+A go/no-go investigation (not a shipped feature) for the large,
+invasive "true adaptive re-optimization" epic the modern-OLAP research
+synthesis (`.claude/plans/research/2026-08-27-modern-olap-research-synthesis.md`,
+item 3) flagged as the highest-evidence but highest-effort gap. Goal: build
+a FRESH, live, measured repro of the same failure class as the historical
+Q05/Lance incident above (missing NDV stats -> catastrophic DPsize join
+order), then use real numbers to decide whether the big investment
+(a `PhysicalOperator` trait-signature change or a new execution driver) is
+justified now, or whether the smaller "extend the runtime-filter-bitmap
+mechanism" option is the better next step.
+
+**The repro, real and live, SF=10 `data/tpch-10gb`, TPC-H Q5** (a genuine
+6-way join with a real dangerous edge: `c_nationkey = s_nationkey` joins
+`customer`/`supplier` directly on a column whose TRUE cardinality is ~25
+nation values, even though the tables themselves have 1.5M/100K rows).
+`examples/adaptive_reopt_ndv_repro.rs` (new, committed) registers
+`customer`+`supplier` via `ExecutionContext::register_table` (in-memory,
+`MemoryTable`) instead of `register_parquet`, loading the SAME real parquet
+data — but `MemoryTable::statistics()` (`src/physical/operators/scan.rs`)
+returns a real row count with an EMPTY `column_stats` map, so the DPsize
+cost model has ZERO NDV information for this relation's join keys. This is
+a real, first-class, already-shipped code path (`register_table` is public,
+documented, ordinary API), not a hack on `join_reorder.rs` itself — nothing
+in the optimizer or cost model was touched.
+
+**Confirmed the join order actually changes** (`PLAN_DEBUG=1 DP_DEBUG=1`,
+both baked into the example): accurate stats produce
+`(((region JOIN nation) JOIN supplier) JOIN ((customer JOIN orders) JOIN lineitem))`;
+corrupted stats produce a fully linear chain,
+`(((((region JOIN nation) JOIN supplier) JOIN customer) JOIN orders) JOIN lineitem)`,
+joining `customer` immediately after `supplier`. The DP's own cost trace
+shows why: with real stats it correctly prices the `customer x supplier`
+edge as enormous (a sibling memo entry for the same FK-FK shape in this
+exact dataset independently priced a comparable pair at 6,000,000,000 rows);
+with the corrupted stats, missing NDV falls back to
+`base_rows[rel].max(10.0)` (`join_reorder.rs`'s `side_combined_ndv`), so the
+DP believes `customer JOIN supplier` costs only ~100,000 rows — a
+>60,000x underestimate — and greedily builds it first.
+
+**Real wall-clock, same query, same data, same machine:**
+
+| stats | result |
+|---|---|
+| accurate (`register_parquet`, real footer NDV) | **1.13s**, correct 5-row answer |
+| corrupted (`register_table` for customer+supplier, zero NDV) | **never completes**: SIGKILL'd by a 32GiB cgroup cap in ~4.1s (burned ~88 CPU-seconds across ~21 threads first); given a much more generous 64GiB cap, still actively growing RSS (26GB -> 42GB) and CPU-bound after a full 120s wall-clock timeout, force-killed |
+
+This is not a memory-cap artifact — two different memory budgets (32G,
+64G) both failed to let it finish, one by OOM, one by timeout, matching
+this doc's own historical Q05/Lance framing (">10 min, killed") almost
+exactly, just reproduced fresh, live, and independently.
+
+**Realism assessment.** The `register_table`/cold-start-no-stats path used
+for the repro is real and already shipped, but count it as a moderate- not
+overwhelming-confidence everyday risk: it requires a caller to choose
+in-memory registration over `register_parquet`/`register_native_table` for
+a relation that then participates in a multi-way join with a real FK-FK
+edge — plausible (ad hoc data, a small lookup table someone loads by hand,
+a testing/notebook workflow) but not the default path most real TPC-H-style
+workloads take. A SEPARATE, independently-confirmed staleness mechanism
+exists in the engine's own mutation-path code, found by reading (not
+constructing) `src/storage/native_manifest.rs` and CLAUDE.md's own DELETE
+section above: a native table's per-segment `ColumnStats` (including
+`ndv_est`) is computed ONCE at segment write time and is DELIBERATELY never
+recomputed by DELETE or UPDATE — only `live_row_count()` changes. A
+heavily-deleted-from native table can therefore carry a real, live,
+increasingly-stale NDV estimate with no code path that ever refreshes it.
+This is a genuine "stats go stale after mutation" story in this engine's
+actual design, not a hypothetical — though it was not itself exercised as
+part of this repro (the `register_table` path was more directly
+controllable and sufficient to prove the failure class).
+
+**Recommendation.** The measured gap here (1.1s vs. does-not-finish) is
+real and large, but it is a **cold-start/missing-stats problem**, not
+evidence that TODAY's stats-driven DPsize cost model routinely produces bad
+orders that a mid-query correction would need to fix. Every table
+registered through this engine's normal production paths
+(`register_parquet`, `register_native_table`, `register_iceberg`) already
+carries real footer/manifest NDV, and the DPsize enumerator with real stats
+chose the correct, efficient order in this repro's own accurate leg (as it
+does across the full TPC-H suite per this doc's own benchmark history).
+The investment this finding justifies is narrower than "build adaptive
+join-order replanning": (1) make missing/degenerate stats loud rather than
+silent — e.g. `JoinReorder` could log or flag when it falls back to the
+`base_rows[rel]` NDV default for a relation feeding a multi-way join, so a
+cold-start table doesn't fail silently at 60,000x cost error; (2)
+periodically or eagerly refresh native-table column stats on
+DELETE/UPDATE, closing the second, independently-found staleness path.
+Neither requires the large `PhysicalOperator` trait-signature change or a
+new execution driver the full adaptive-reopt epic would need. Per the
+research synthesis's own ranked list (item 3 vs. the narrower
+runtime-filter-bitmap extension), this investigation's evidence does NOT
+justify prioritizing the big adaptive-replanning epic next — it justifies
+the cheap, targeted stats-hygiene fixes above, with the narrower
+runtime-filter-bitmap extension remaining the better first "real adaptive
+mechanism" investment when the team is ready for one. Reproduce:
+`scripts/claude-safe-build.sh cargo build --release --example
+adaptive_reopt_ndv_repro`, then `./target/release/examples/
+adaptive_reopt_ndv_repro --data data/tpch-10gb --mode plan-only` (safe,
+no execution) or `--mode accurate|corrupted` (the `corrupted` mode should
+only be run under a memory+time cap, e.g. `SAFE_BUILD_MEM=32G timeout -s
+KILL 120 scripts/claude-safe-build.sh ./target/release/examples/
+adaptive_reopt_ndv_repro --data data/tpch-10gb --mode corrupted` — it is
+deliberately constructing a plan that may attempt a many-billion-row
+intermediate and will not finish on its own).
