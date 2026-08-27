@@ -222,9 +222,42 @@ impl TableProvider for MemoryTable {
                 .map(|batch| {
                     let columns: Vec<_> =
                         indices.iter().map(|&i| batch.column(i).clone()).collect();
+                    // Field TYPES must follow the actual columns, not the
+                    // declared logical schema -- mirrors
+                    // `MemoryTableExec::execute`'s own `rewrap` a few lines
+                    // below in this same file (see its doc comment): a
+                    // `MemoryTable` backing a native table's unfiltered
+                    // `scan()` output can carry dictionary-encoded string
+                    // columns (native tables dictionary-coerce
+                    // low-cardinality Utf8 columns; `NativeTable::schema()`
+                    // reports the plain logical type) while `self.schema`
+                    // here still declares the plain type. Building the
+                    // projected schema straight from `self.schema.field(i)`
+                    // without this check makes `RecordBatch::try_new` fail
+                    // outright ("expected Utf8 but found
+                    // Dictionary(Int32, Utf8)") the moment ANY projection is
+                    // pushed down to this call -- caught by task 002's own
+                    // broader pruning-sweep validation
+                    // (native-table-pruning epic), which is the first place
+                    // in this codebase's history a dictionary-coerced
+                    // native table's data was ever re-registered as a
+                    // `MemoryTable` and then queried with a pushed-down
+                    // projection.
                     let fields: Vec<_> = indices
                         .iter()
-                        .map(|&i| self.schema.field(i).clone())
+                        .zip(&columns)
+                        .map(|(&i, c)| {
+                            let f = self.schema.field(i);
+                            if f.data_type() == c.data_type() {
+                                f.clone()
+                            } else {
+                                arrow::datatypes::Field::new(
+                                    f.name(),
+                                    c.data_type().clone(),
+                                    f.is_nullable(),
+                                )
+                            }
+                        })
                         .collect();
                     let schema = Arc::new(arrow::datatypes::Schema::new(fields));
                     RecordBatch::try_new(schema, columns).map_err(Into::into)
@@ -497,5 +530,80 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].num_rows(), 3);
         assert_eq!(results[0].num_columns(), 1);
+    }
+
+    /// Regression test (native-table-pruning epic, task 002): a `MemoryTable`
+    /// registered with a plain-`Utf8`-declared schema but whose ACTUAL
+    /// batches carry a `Dictionary(Int32, Utf8)` array for that column (the
+    /// exact shape a native table's own `scan()` output has for a
+    /// dictionary-coerced low-cardinality string column, per `native_table
+    /// .rs`'s module doc) must still be projectable via `TableProvider::
+    /// scan(Some(projection))` -- before this fix, `MemoryTable::scan`
+    /// built the projected schema straight from the DECLARED field type
+    /// and `RecordBatch::try_new` failed outright ("column types must
+    /// match schema types, expected Utf8 but found Dictionary(Int32,
+    /// Utf8)") the moment any predicate pushed a narrower projection down
+    /// to a table in this shape. Found by task 002's own broader
+    /// pruning-sweep validation (`examples/native_pruning_sweep.rs`),
+    /// which was the first place in this codebase to re-register a
+    /// dictionary-coerced native table's `scan(None)` output as a
+    /// `MemoryTable` and then query it with a pushed-down projection.
+    #[test]
+    fn memory_table_scan_projection_tolerates_declared_vs_actual_dictionary_mismatch() {
+        use arrow::array::{DictionaryArray, Int32Array};
+        use arrow::datatypes::Int32Type;
+
+        // Declared (logical) schema says `name` is plain Utf8 -- matches
+        // what `NativeTable::schema()` reports for a dictionary-coerced
+        // column.
+        let declared_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        // ACTUAL batch carries a Dictionary-encoded array for `name` --
+        // matches what a native table's `ipc_cache`-backed segments
+        // physically store on disk.
+        let dict_array: DictionaryArray<Int32Type> = vec!["a", "b", "c"].into_iter().collect();
+        let actual_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new(
+                    "name",
+                    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                    true,
+                ),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(dict_array),
+            ],
+        )
+        .unwrap();
+
+        let table = MemoryTable::new(declared_schema, vec![actual_batch]);
+
+        // Full (unprojected) scan already worked before this fix (it never
+        // rebuilds a RecordBatch from a separately-declared schema).
+        let full = TableProvider::scan(&table, None).expect("unprojected scan");
+        assert_eq!(full[0].num_columns(), 2);
+
+        // Projected scan is the shape that used to fail.
+        let projected = TableProvider::scan(&table, Some(&[1]))
+            .expect("projected scan must tolerate a declared-vs-actual dictionary mismatch");
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].num_columns(), 1);
+        assert_eq!(
+            projected[0].column(0).data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            "projected field type must follow the ACTUAL column, not the declared Utf8 schema"
+        );
+
+        // A column whose actual type DOES match the declaration keeps its
+        // original field metadata (name/nullability), not just its type --
+        // confirms the fast (types_match) path is still exercised.
+        let id_only = TableProvider::scan(&table, Some(&[0])).expect("projected scan of id");
+        assert_eq!(id_only[0].schema().field(0).data_type(), &DataType::Int64);
+        assert!(!id_only[0].schema().field(0).is_nullable());
     }
 }

@@ -4004,6 +4004,59 @@ cluster_local.sh verify-m2 && scripts/cluster_local.sh stop` (M1/M2).
   join-spill streaming rewrite or directly root-causing the
   duplicate-counting mechanism can. Full detail: `.claude/epics/
   archived/spill-join-correctness/epic.md`.
+  **Further update (`native-table-pruning` epic, closed 2026-08-27):**
+  the read-side half of scan-level pruning named as one of the "three real
+  levers" above is now **implemented** (`NativeTable::scan_with_filter`
+  really skips segments PROVABLY unsatisfiable against per-segment
+  `ColumnStats`, mirroring `row_group_pruning.rs`'s own logic) and
+  **measurably works** — a real, traced AND-of-two-comparisons predicate on
+  `lineitem.l_orderkey` skips 55 of 58 segments at SF=10, cell-exact
+  against an independent DuckDB oracle across 10 predicate shapes (single-
+  column range, equality, multi-column AND, a no-stats string column, a
+  predicate spanning several segments). **But it does NOT close the
+  Q4/Q12/Q13 gap**, measured honestly, not estimated: real before/after
+  runs (identical on-disk native tables, two binaries built from either
+  side of this epic) at SF=10 show Q4 6-14% SLOWER, Q13 4-6% SLOWER, Q12
+  flat (±1%, within noise) — a small NET REGRESSION on the suite total
+  (+0.5 to +1.1%), not an improvement. Root cause, directly confirmed by
+  inspecting these three tables' own per-segment `ColumnStats` (not
+  inferred): `l_orderkey`/`o_orderkey` ARE disjoint per segment (the write
+  path preserves source-parquet order, which IS key order) so key-range
+  predicates prune very well, but Q4/Q12/Q13's actual selective predicates
+  are all DATE-range filters (`o_orderdate`, `l_receiptdate`,
+  `l_commitdate`/`l_shipdate`) and this generator's dates are NOT
+  correlated with write order at all — EVERY segment checked (58/58 for
+  lineitem, 15/15 for orders) spans the table's full date range, so a
+  date-range predicate provably cannot skip a single segment (confirmed
+  directly via `QE_DEBUG_NATIVE_PRUNING=1` tracing: `scanned=58 skipped=0`
+  for `l_shipdate BETWEEN ...`). Pruning only avoids work it can PROVE is
+  unneeded; with zero prunable segments for these three queries' own
+  predicates, all that's left is a small constant per-segment
+  `segment_might_match` evaluation cost with no offsetting benefit — hence
+  the measured slowdown, not just "no speedup." At SF=100: Q4 fails
+  IDENTICALLY before and after pruning (`SEMI join build side exceeds the
+  memory budget, but the join spill path currently supports only INNER
+  joins` — Q4's `EXISTS` subquery compiles to a SEMI join, a DIFFERENT,
+  previously-undocumented gap in `SpillableHashJoinExec` unrelated to
+  pruning, and a safe refusal, not a crash or wrong answer); Q12, measured
+  correctly with BOTH binaries' disk-page-cache warm (an initial cold-vs-
+  warm run misleadingly showed a 43% "speedup" that a same-footing rerun
+  of both binaries eliminated entirely — 46041ms vs 46027ms, 0.03%, pure
+  noise) shows NO measurable difference either; Q13 fails on BOTH binaries
+  (before: 900s timeout; after: a pre-existing `SpillableHashJoinExec`
+  temp-file-rename error), a pre-existing gap this epic's changes do not
+  touch (neither the pruning logic nor its one incidental bug fix, both
+  confined to `NativeTable`/`MemoryTable`'s own scan path, ever runs code
+  in the spill temp-file path). **Conclusion, stated as plainly as the
+  measurement supports: this epic's mechanism is real, correct, and
+  measurably effective for key-range/equality predicates, but the
+  Q4/Q12/Q13 regression this PRD was written to address is NOT a
+  scan-pruning problem for THIS dataset — it is a join-spill-cost problem
+  (Q12) and two separate, previously-undocumented `SpillableHashJoinExec`
+  gaps (Q4's SEMI-join-spill unsupported; Q13's temp-file-rename error at
+  SF=100), all of which remain open, all of which are join-spill-path
+  work, not scan-path work.** Full detail, every command, every number:
+  `.claude/epics/archived/native-table-pruning/002.md`.
 - **No compaction** (native-tables-mutation epic, confirmed OUT OF SCOPE
   by design — task 001's Decision 3, not merely deferred incidentally). A
   deletion vector is correctness-preserving indefinitely — reads always

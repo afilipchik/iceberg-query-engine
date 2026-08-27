@@ -1,7 +1,7 @@
 ---
 name: native-table-pruning
 description: Wire native tables' already-computed per-segment min/max stats into actual scan-time segment skipping
-status: backlog
+status: completed (2026-08-27) — mechanism shipped and validated (G1/G2/G4 met); G3 measured honestly and did NOT close the named Q4/Q12/Q13 regression (root cause is join-spill cost/gaps, not scan pruning, for this dataset — see .claude/epics/archived/native-table-pruning/epic.md's close-out)
 created: 2026-08-27T07:44:44Z
 ---
 
