@@ -2,8 +2,8 @@
 name: spill-join-correctness-2
 status: in-progress
 created: 2026-08-27T07:44:44Z
-updated: 2026-08-27T11:00:00Z
-progress: 60%
+updated: 2026-08-27T13:00:00Z
+progress: 80%
 prd: .claude/prds/spill-join-correctness-2.md
 github: (will be set on sync)
 ---
@@ -195,10 +195,33 @@ better-bounded.
       Outcome). Full suite green, 4/4 feature combinations, each exactly
       +2 over task 002's own baseline. See `003.md`'s Outcome for full
       detail.
-- [ ] 004.md - Fix the three known sibling bugs (parallel: false) — NOTE:
-      one of its three targets (spill-directory collision) is already
-      fixed by task 001; task 004 should verify/cross-reference, not
-      duplicate.
+- [x] 004.md - Fix the three known sibling bugs (parallel: false) — CLOSED.
+      Bug 1 (spill-directory collision): VERIFIED, not re-fixed — task
+      001's PID-embedded default `spill_path` already resolves it; added
+      a new committed regression test
+      (`tests/spill_directory_collision_tests.rs`) covering the real
+      2-concurrent-OS-process case neither of task 001's own committed
+      tests exercised (its own 2-process reproduction lived only in an
+      ephemeral, gitignored `.scratch/` script). Bug 2 (LIMIT not
+      enforced under spill, Q2/Q3-shaped): root-caused to
+      `ExternalSortExec::execute()`'s spill branch never consulting
+      `self.fetch` (the top-k fusion rule in `planner.rs` folds a
+      `skip == 0` LIMIT straight into `ExternalSortExec::with_fetch`,
+      never wrapping a separate `LimitExec`) — fixed with a new
+      `truncate_batches_to_limit` helper. Bug 3 (sort-spill run-file-
+      not-found crash, Q10-shaped): root-caused to `multi_pass_merge`'s
+      cleanup step unconditionally deleting every path in a pass's
+      `current_runs`, including a `chunk.len() == 1` leftover carried
+      forward UNCHANGED into `next_runs` (whenever a pass's run count
+      isn't an exact multiple of `MAX_MERGE_FANIN` = 8) — fixed by never
+      deleting a path still referenced by `next_runs`. All three
+      regression tests independently confirmed to fail against a
+      temporarily-reverted fix and pass against the restored one. Zero
+      changes to `SpillableHashJoinExec` (both bugs 2/3 live entirely in
+      `ExternalSortExec`'s own spill/merge path) — no interaction with
+      the still-unconfirmed main duplicate-counting wrong-answer bug.
+      Full suite green, 4/4 feature combinations, each exactly task 003's
+      own baseline +3. See `004.md`'s Outcome for full detail.
 - [ ] 005.md - QA close-out (parallel: false)
 
 Total tasks: 5
@@ -227,3 +250,19 @@ reproduction, and a 615-trial clean sweep). Full detail, including the
 mid-investigation worktree-isolation incident (an almost poetic parallel
 to the bug itself — two unrelated concurrent agents colliding on one
 shared resource), in `001.md`'s Outcome section.
+
+## Task 004 close-out (2026-08-27)
+
+All three sibling bugs resolved: bug 1 verified (task 001's fix already
+covers it; added the committed real-2-process regression test task 001's
+own tests didn't provide), bugs 2 and 3 root-caused by direct code
+reading and fixed with small, targeted changes entirely inside
+`ExternalSortExec`'s own spill/merge path — zero overlap with
+`SpillableHashJoinExec`, so no interaction with the still-unconfirmed
+main duplicate-counting wrong-answer bug. All three regression tests
+independently confirmed to fail against a temporarily-reverted fix and
+pass against the restored one — this program's own established
+discipline, applied to a fix task for the first time in this epic (tasks
+001-003 were investigation/hardening/tooling). Full suite green, 4/4
+feature combinations, each exactly task 003's own baseline +3; `cargo fmt
+--all -- --check` clean. Full detail in `004.md`'s Outcome section.

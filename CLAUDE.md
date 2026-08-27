@@ -1121,6 +1121,12 @@ Based on the codebase structure, these appear to be planned but not fully implem
   side exceeds the budget fail loudly instead of returning wrong results.
   `SpillableHashJoinExec` still materializes the build side before deciding to
   spill (known hole, fixed by the Phase-5 streaming spill rewrite, see ROADMAP).
+  `tests/spill_directory_collision_tests.rs` (added `spill-join-correctness-2`
+  task 004) is the real-2-OS-process regression test for the spill-directory-
+  collision fix (`src/execution/memory.rs`'s PID-embedded default
+  `spill_path`, `spill-join-correctness-2` task 001) — two real
+  `query_engine serve` processes sharing `$TMPDIR`, firing the same spilling
+  join concurrently.
 
 ## SF=100: the four-way matrix (2026-08-18, warm, same machine, duckdb 1.4.4)
 
@@ -3269,6 +3275,35 @@ previously recorded — plausible, not proven, as an explanation for this
 section's own historical bug. See item 1's own "Update" note above and
 `.claude/epics/spill-join-correctness-2/001.md`'s Outcome for the full
 evidence.
+
+**Update (`spill-join-correctness-2` epic, task 004, 2026-08-27):**
+residue items 2 (`LIMIT` not enforced under spill) and 3 (sort-spill
+run-file-not-found crash) above are now FIXED, both entirely inside
+`ExternalSortExec`'s own spill/merge path in `src/physical/operators/
+spillable.rs`, both root-caused by direct code reading rather than
+assumption. Bug 2: the top-k fusion rule in `planner.rs` folds a
+`skip == 0` `LIMIT` directly into `ExternalSortExec::with_fetch` instead
+of wrapping a separate `LimitExec`, and `execute()`'s SPILL branch never
+consulted `self.fetch` at all — fixed with a new
+`truncate_batches_to_limit` helper applied to the spill branch's final
+result. Bug 3: `multi_pass_merge`'s run-cleanup step unconditionally
+deleted every path in a pass's `current_runs`, including a
+`chunk.len() == 1` leftover carried forward UNCHANGED into `next_runs`
+(whenever a pass's run count isn't an exact multiple of
+`MAX_MERGE_FANIN` = 8) — a later pass, or the final merge, then tried to
+open a file this same function had just deleted. Fixed by never deleting
+a path still referenced by `next_runs`. Bug 1 (spill-directory collision,
+above) was VERIFIED as already fixed by task 001 — not re-fixed — with a
+new committed regression test (`tests/
+spill_directory_collision_tests.rs`) covering the real-2-OS-process case
+neither of task 001's own committed tests exercised. All three
+regression tests independently confirmed to FAIL against a
+temporarily-reverted fix and PASS against the restored one. None of
+these three fixes touch `SpillableHashJoinExec`'s build/probe/
+partition-routing code — this section's own headline ~0.34%-rate
+duplicate-counting bug remains unconfirmed and unaffected, exactly as
+expected. Full evidence: `.claude/epics/spill-join-correctness-2/
+004.md`'s Outcome section.
 
 **Full suite, all four feature combinations**, final state (all fixes +
 all new tests included), through `scripts/claude-safe-build.sh`:

@@ -2240,6 +2240,22 @@ impl PhysicalOperator for ExternalSortExec {
             self.merge_runs(&runs)?
         };
 
+        // Apply the top-K `fetch` limit, mirroring the in-memory branch above
+        // (`SortExec::with_fetch`). The top-k fusion rule in `planner.rs`
+        // (`LogicalPlan::Limit` folding a `skip == 0` LIMIT directly into
+        // `ExternalSortExec::with_fetch` instead of wrapping a separate
+        // `LimitExec` around it) means THIS is the only place a spilled
+        // `ORDER BY ... LIMIT N` query's row count is ever truncated — before
+        // this fix, `self.fetch` was read by `with_fetch`/`new` but never
+        // consulted again anywhere in this spill branch, so `runs`/`result`
+        // (a correct, fully globally-sorted top-K PREFIX followed by every
+        // remaining row) was returned in full: correct values, wrong (too
+        // large) row count.
+        let result = match self.fetch {
+            Some(fetch) => truncate_batches_to_limit(result, fetch),
+            None => result,
+        };
+
         // Clean up
         let _ = std::fs::remove_dir_all(&spill_dir);
 
@@ -2404,10 +2420,27 @@ impl ExternalSortExec {
                 }
             }
 
-            // Clean up old runs from previous pass (except original runs)
+            // Clean up old runs from previous pass (except original runs).
+            //
+            // A chunk of exactly one leftover run (`chunk.len() == 1` above,
+            // whenever `current_runs.len()` isn't an exact multiple of
+            // `fanin`) is carried forward into `next_runs` UNCHANGED — same
+            // path, not rewritten to a new `merged_pass{N}_*.parquet` file.
+            // Unconditionally deleting every path in `current_runs` here
+            // (the previous behavior) deleted that carried-forward file too,
+            // even though `next_runs` (this iteration's own output, about to
+            // become `current_runs` for the NEXT iteration or the final
+            // merge below) still points at it — a real, deterministic crash
+            // ("Failed to open run file ... No such file or directory") on
+            // any multi-pass merge whose leftover-chunk arithmetic hits this
+            // shape, not a rare/timing-dependent one. Skip deleting any path
+            // that's still referenced by `next_runs`.
             if pass > 0 {
+                let still_needed: std::collections::HashSet<&PathBuf> = next_runs.iter().collect();
                 for run in &current_runs {
-                    let _ = std::fs::remove_file(run);
+                    if !still_needed.contains(run) {
+                        let _ = std::fs::remove_file(run);
+                    }
                 }
             }
 
@@ -2784,6 +2817,30 @@ impl fmt::Display for ExternalSortExec {
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+/// Truncate a sequence of already-globally-sorted batches to the first
+/// `limit` rows total, dropping/slicing batches as needed. Used by
+/// `ExternalSortExec::execute()`'s spill branch to apply a `LIMIT` fused
+/// into a `fetch` (see the top-k fusion rule in `planner.rs`) — the merge
+/// step produces every row of the sort, not just the top-K prefix, so this
+/// is the only place that prefix gets cut down to exactly `limit` rows.
+fn truncate_batches_to_limit(batches: Vec<RecordBatch>, limit: usize) -> Vec<RecordBatch> {
+    let mut remaining = limit;
+    let mut out = Vec::new();
+    for batch in batches {
+        if remaining == 0 {
+            break;
+        }
+        if batch.num_rows() <= remaining {
+            remaining -= batch.num_rows();
+            out.push(batch);
+        } else {
+            out.push(batch.slice(0, remaining));
+            remaining = 0;
+        }
+    }
+    out
+}
 
 /// Estimate the memory size of a RecordBatch
 /// Bytes a batch LOGICALLY holds, computed slice-aware.
@@ -4323,6 +4380,165 @@ mod tests {
         let some = ChaosPartitionSpec::Indices([1usize, 2, 3].into_iter().collect());
         assert!(some.contains(2));
         assert!(!some.contains(4));
+    }
+
+    /// spill-join-correctness-2 epic, task 004, bug 2: `ORDER BY ... LIMIT`
+    /// under spill (Q2/Q3-shaped, per the archived epic's own `003.md`
+    /// characterization). The top-k fusion rule in `planner.rs`
+    /// (`LogicalPlan::Limit` with `skip == 0` over a `Sort` folds directly
+    /// into `ExternalSortExec::with_fetch` instead of wrapping a separate
+    /// `LimitExec` around it) means `ExternalSortExec::execute()`'s SPILL
+    /// branch is the only place a spilled top-K query's row count is ever
+    /// truncated — before the fix, `self.fetch` was stored but never
+    /// consulted again anywhere in that branch, so the full, correctly
+    /// globally-sorted output was returned instead of just its first
+    /// `fetch` rows: right values, wrong (too large) row count, matching
+    /// the archived epic's own exact symptom description.
+    #[tokio::test]
+    async fn external_sort_spill_path_enforces_limit_under_forced_spill() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+
+        // 20 single-row batches, descending values 19..0 — enough rows that
+        // a tiny memory budget forces several separate spill runs (not just
+        // a trivial single-run passthrough), while staying under
+        // `MAX_MERGE_FANIN` = 8 runs so this test stays focused on the
+        // LIMIT bug alone, not entangled with the separate multi-pass-merge
+        // bug covered by its own test below.
+        let mut batches = Vec::new();
+        for v in (0..20i64).rev() {
+            batches.push(
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![v]))])
+                    .unwrap(),
+            );
+        }
+
+        let input: Arc<dyn PhysicalOperator> = Arc::new(
+            crate::physical::operators::MemoryTableExec::new("t", schema.clone(), batches, None),
+        );
+
+        let pool = crate::execution::create_memory_pool(1024);
+        let mut config = ExecutionConfig::default();
+        config.memory_limit = 64;
+        config.spill_threshold = 0.5;
+        config.spill_path =
+            std::env::temp_dir().join(format!("qe_sort_limit_spill_test_{}", std::process::id()));
+
+        let fetch = 5usize;
+        let sort = ExternalSortExec::with_fetch(
+            input,
+            vec![crate::planner::SortExpr::new(Expr::column("k"))],
+            pool,
+            config,
+            fetch,
+        );
+
+        let mut stream = sort
+            .execute(0)
+            .await
+            .expect("spilled sort with LIMIT must not error");
+        let mut keys = Vec::new();
+        while let Some(batch) = stream
+            .try_next()
+            .await
+            .expect("collecting limited sorted output")
+        {
+            let k = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            keys.extend(k.values().iter().copied());
+        }
+
+        assert_eq!(
+            keys.len(),
+            fetch,
+            "spilled ORDER BY ... LIMIT {fetch} must return exactly {fetch} rows, got {}: {keys:?}",
+            keys.len()
+        );
+        assert_eq!(
+            keys,
+            (0..fetch as i64).collect::<Vec<_>>(),
+            "the LIMIT-ed rows must be the correct top-K prefix (right values), \
+             not just the right count: {keys:?}"
+        );
+    }
+
+    /// spill-join-correctness-2 epic, task 004, bug 3: sort-spill
+    /// run-file-not-found crash (Q10-shaped, per the archived epic's own
+    /// `003.md`: `Failed to open run file ".../sort_0_27/
+    /// merged_pass0_48.parquet": No such file or directory`).
+    /// `multi_pass_merge`'s "clean up old runs from previous pass" step
+    /// unconditionally deleted every path in that pass's `current_runs` —
+    /// including any carried forward UNCHANGED into `next_runs` (a chunk of
+    /// exactly one leftover run, whenever a pass's run count isn't an exact
+    /// multiple of `MAX_MERGE_FANIN` = 8) — so a later pass, or the final
+    /// merge, tried to open a file this same function had just deleted out
+    /// from under it. Reproduces the exact arithmetic deterministically:
+    /// 129 initial single-row runs -> pass 0's chunking (129 = 16*8 + 1)
+    /// leaves a 1-run leftover chunk at the tail, carried into pass 1 as
+    /// one of 17 runs; pass 1's own chunking (17 = 2*8 + 1) again leaves a
+    /// 1-run leftover chunk at the tail — exactly the run this bug deleted
+    /// while pass 1's own `next_runs` (and the final merge right after)
+    /// still needed it.
+    #[tokio::test]
+    async fn external_sort_multi_pass_merge_survives_a_leftover_singleton_chunk() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let dir =
+            std::env::temp_dir().join(format!("qe_multi_pass_merge_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 129 single-row sorted "runs", one per distinct value 0..129.
+        const N: i64 = 129;
+        let mut run_paths = Vec::new();
+        for v in 0..N {
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![v]))])
+                    .unwrap();
+            let path = dir.join(format!("run_{v}.parquet"));
+            write_batches_to_parquet(&path, &[batch]).unwrap();
+            run_paths.push(path);
+        }
+
+        let pool = crate::execution::create_memory_pool(64 * 1024 * 1024);
+        let config = ExecutionConfig::default();
+        let sort = ExternalSortExec::new(
+            Arc::new(crate::physical::operators::MemoryTableExec::new(
+                "t",
+                schema,
+                vec![],
+                None,
+            )),
+            vec![crate::planner::SortExpr::new(Expr::column("k"))],
+            pool,
+            config,
+        );
+
+        let merged = sort
+            .merge_runs(&run_paths)
+            .expect("multi-pass merge must not fail to open a run file it itself deleted");
+
+        let mut vals: Vec<i64> = Vec::new();
+        for batch in &merged {
+            let arr = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            vals.extend(arr.values().iter().copied());
+        }
+        let expected: Vec<i64> = (0..N).collect();
+        assert_eq!(
+            vals, expected,
+            "multi-pass merge must produce every run's row, in order, exactly once"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Deliberately NO unit test here that calls
