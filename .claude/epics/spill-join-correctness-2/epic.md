@@ -3,7 +3,7 @@ name: spill-join-correctness-2
 status: in-progress
 created: 2026-08-27T07:44:44Z
 updated: 2026-08-27T11:00:00Z
-progress: 40%
+progress: 60%
 prd: .claude/prds/spill-join-correctness-2.md
 github: (will be set on sync)
 ---
@@ -166,7 +166,35 @@ better-bounded.
       hash-check-ok, 0 mismatches). Full suite green, byte-identical to the
       pre-existing baseline in all four feature combinations. See `002.md`'s
       Outcome for full detail.
-- [ ] 003.md - Fault-injection/differential testing harness (parallel: false)
+- [x] 003.md - Fault-injection/differential testing harness (parallel: false)
+      — CLOSED. Two new orthogonal, env-gated hooks in `spillable.rs`
+      (`QE_SPILL_CHAOS_FORCE_SPILL` forces WHEN the build/no-build decision
+      crosses into the disk-spill branch; `QE_SPILL_CHAOS_FORCE_SPILL_PARTITIONS`
+      forces WHICH hash partitions actually write/read spill files,
+      regardless of memory pressure — one lever covers both build and
+      probe, since probe-side spill routing already follows the build
+      partition's spilled state), plus a new permanent, reusable binary
+      (`examples/spill_chaos_harness.rs`) that drives them: each trial runs
+      one unaggregated INNER-join query twice (baseline vs. randomly
+      chosen forced-spill injection) and compares an order-independent
+      output checksum (modeled on task 001's own `KeyChecksum`). Used for
+      real: **2,330 post-fix trials across 5 sweeps (2 fixture scales, 2
+      RNG seeds, 1 with `QE_SPILL_DEBUG` cross-checking task 001's fix
+      directly — 17,628 hash-check-ok, 0 HASH-MISMATCH), 0 mismatches, 0
+      missed-injection warnings** — 8x the prior epic's own 290-trial
+      total, at ~15-160ms/trial (vs. that epic's 140-291s/trial pre-fix).
+      No new failure caught; confidence tightened, honestly reported as
+      such — a valid outcome per the epic's own culture. Along the way,
+      diagnosing a genuine "requested crossing point unreachable for a
+      single-batch build side" gap led to an end-of-stream forcing
+      fallback (`finish_via_spill`), and a real (test-only) concurrency
+      bug in this task's own work-in-progress (an env-var-mutating unit
+      test racing an unrelated LEFT JOIN test under `cargo test`'s default
+      concurrent execution) was caught and fixed before landing. Both
+      tasks 001 and 002's own fixes confirmed unregressed (see `003.md`'s
+      Outcome). Full suite green, 4/4 feature combinations, each exactly
+      +2 over task 002's own baseline. See `003.md`'s Outcome for full
+      detail.
 - [ ] 004.md - Fix the three known sibling bugs (parallel: false) — NOTE:
       one of its three targets (spill-directory collision) is already
       fixed by task 001; task 004 should verify/cross-reference, not

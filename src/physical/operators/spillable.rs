@@ -51,6 +51,121 @@ fn next_sj_trace_id() -> u64 {
     SJ_TRACE_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
+// ============================================================================
+// Fault injection: forced spill (spill-join-correctness-2 epic, task 003)
+// ============================================================================
+//
+// A reusable, permanent mechanism to force `SpillableHashJoinExec`'s
+// spill/unspill machinery to engage at a CHOSEN, controllable point in
+// build/probe, decoupled from whether the data is actually oversized — the
+// harness this enables (`examples/spill_chaos_harness.rs`) runs a query once
+// with this forced and once without, and differentially compares the two
+// results. Same style as this file's own `QE_SPILL_DEBUG` and the archived
+// `spill-join-correctness` epic's own `QE_SPILL_CHAOS_FORCE_ABORT`: plain,
+// explicitly-opt-in env vars, checked fresh (never cached) at each call site,
+// zero cost and zero behavior change unless a caller sets them.
+//
+// Two independent, orthogonal levers:
+//
+// 1. `QE_SPILL_CHAOS_FORCE_SPILL` (`compute_build_decision`, WHEN): forces
+//    the top-level build/no-build decision to take the disk-spill branch
+//    (`BuildDecision::Spill`) after a CHOSEN number of build batches have
+//    already been collected flat (0 = force on the very first batch),
+//    regardless of the configured `memory_limit`/`spill_threshold` or how
+//    much data is actually present. On its own this only guarantees the
+//    `BuildDecision::Spill` CODE PATH is taken — whether any individual
+//    partition's rows actually touch disk still depends on memory pressure
+//    inside `build_with_partitioning`, since a small build side may still
+//    fit every partition in memory once inside it.
+// 2. `QE_SPILL_CHAOS_FORCE_SPILL_PARTITIONS` (`build_with_partitioning`,
+//    WHICH): forces specific hash partitions — "all", or a comma-separated
+//    list of indices in `0..NUM_PARTITIONS` — to write their resident
+//    batches to disk the moment they receive their first one, regardless of
+//    memory pressure. This is the lever that guarantees a REAL write +
+//    read-back round trip happens for chosen rows, even when the whole
+//    build side is a handful of rows that would otherwise trivially fit in
+//    memory end to end. Because probe-side routing (`probe_with_spilling`)
+//    decides whether to spill a probe batch purely from whether its build
+//    partition already spilled, forcing build-side partitions here also
+//    forces the PROBE-side disk round trip (through
+//    `process_spilled_partition`) for those same partitions — one lever
+//    covers both build and probe.
+//
+// Pure parsing logic is factored out (`parse_chaos_force_spill_after_batches`
+// / `ChaosPartitionSpec::parse`) so it is unit-testable without mutating the
+// real process environment — `cargo test` runs many tests from one binary
+// concurrently, and a test calling `std::env::set_var` here would race every
+// other test reading the same key (see `gpu.rs`'s `parse_cache_budget_mb` and
+// `execution::context::parse_merge_concurrency` for this exact, established
+// precedent in this codebase).
+
+/// Pure parsing logic for `QE_SPILL_CHAOS_FORCE_SPILL` — see the module-level
+/// "Fault injection" doc comment above. `None` (env var unset) means no
+/// forcing at all; `Some(raw)` (env var set, to any string, including empty
+/// or unparseable) means "force spill," at the batch count `raw` parses to,
+/// defaulting to 0 (force on the very first batch) if `raw` doesn't parse.
+fn parse_chaos_force_spill_after_batches(raw: Option<&str>) -> Option<usize> {
+    raw.map(|v| v.trim().parse::<usize>().unwrap_or(0))
+}
+
+fn chaos_force_spill_after_batches() -> Option<usize> {
+    parse_chaos_force_spill_after_batches(
+        std::env::var("QE_SPILL_CHAOS_FORCE_SPILL").ok().as_deref(),
+    )
+}
+
+/// Which hash partitions `build_with_partitioning` should force to disk,
+/// independent of memory pressure — see the module-level "Fault injection"
+/// doc comment above for why this is needed alongside
+/// `chaos_force_spill_after_batches`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChaosPartitionSpec {
+    /// Force every one of the `NUM_PARTITIONS` hash partitions to disk —
+    /// maximum coverage in a single trial.
+    All,
+    /// Force exactly these partition indices to disk; every other
+    /// partition still spills only if memory pressure demands it.
+    Indices(std::collections::HashSet<usize>),
+}
+
+impl ChaosPartitionSpec {
+    fn contains(&self, idx: usize) -> bool {
+        match self {
+            ChaosPartitionSpec::All => true,
+            ChaosPartitionSpec::Indices(set) => set.contains(&idx),
+        }
+    }
+
+    /// "all" (case-insensitive) forces every partition. Otherwise, a
+    /// comma-separated list of partition indices; any comma-separated
+    /// token that fails to parse as a `usize` is silently skipped (an
+    /// empty or fully-unparseable spec is `Indices(<empty set>)`, i.e. "no
+    /// partitions forced" — never a panic).
+    fn parse(spec: &str) -> Self {
+        let spec = spec.trim();
+        if spec.eq_ignore_ascii_case("all") {
+            return ChaosPartitionSpec::All;
+        }
+        let indices = spec
+            .split(',')
+            .filter_map(|s| s.trim().parse::<usize>().ok())
+            .collect();
+        ChaosPartitionSpec::Indices(indices)
+    }
+}
+
+fn parse_chaos_force_spill_partitions(raw: Option<&str>) -> Option<ChaosPartitionSpec> {
+    raw.map(ChaosPartitionSpec::parse)
+}
+
+fn chaos_force_spill_partitions() -> Option<ChaosPartitionSpec> {
+    parse_chaos_force_spill_partitions(
+        std::env::var("QE_SPILL_CHAOS_FORCE_SPILL_PARTITIONS")
+            .ok()
+            .as_deref(),
+    )
+}
+
 /// Drain every input partition concurrently and return the collected batches
 /// together with their estimated in-memory size.
 ///
@@ -512,6 +627,78 @@ impl SpillableHashJoinExec {
     /// without ever crossing the threshold, this is the ordinary "fits in
     /// memory" case — nothing about that path's cost or shape changes
     /// versus before.
+    /// Enter the disk-spill branch: validate join shape (INNER-only, no
+    /// filter), create the spill directory, and hand `prefix` (already
+    /// flat-collected batches) chained with `rest` (whatever remains of the
+    /// build stream — empty if the stream was already exhausted) to
+    /// `build_with_partitioning`. Factored out of `compute_build_decision`
+    /// (spill-join-correctness-2 epic, task 003) so its two crossing sites
+    /// — the ordinary mid-stream crossing (organic memory pressure or
+    /// `QE_SPILL_CHAOS_FORCE_SPILL`, `rest` non-empty) and the
+    /// end-of-stream chaos fallback (`rest` always empty, see that
+    /// fallback's own comment) — share one copy of the INNER/filter guard
+    /// and spill-directory setup rather than risking drift between two
+    /// copies.
+    async fn finish_via_spill(
+        &self,
+        prefix: Vec<RecordBatch>,
+        rest: RecordBatchStream,
+        build_keys: &[Expr],
+        sj_trace: bool,
+    ) -> Result<BuildDecision> {
+        if !matches!(self.join_type, JoinType::Inner) {
+            return Err(QueryError::Execution(format!(
+                "{} join build side exceeds the memory budget, but the join spill \
+                 path currently supports only INNER joins. Raise the memory limit \
+                 for this query.",
+                self.join_type
+            )));
+        }
+        if self.filter.is_some() {
+            return Err(QueryError::Execution(
+                "join build side exceeds the memory budget, but the join spill \
+                 path cannot evaluate an ON-clause filter. Raise the memory \
+                 limit for this query."
+                    .to_string(),
+            ));
+        }
+
+        self.config.ensure_spill_dir()?;
+        let spill_id = SPILL_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let spill_dir = self.config.spill_path.join(format!("join_0_{}", spill_id));
+        std::fs::create_dir_all(&spill_dir).map_err(|e| {
+            QueryError::Execution(format!("Failed to create spill directory: {}", e))
+        })?;
+
+        if sj_trace {
+            let prefix_rows: usize = prefix.iter().map(|b| b.num_rows()).sum();
+            eprintln!(
+                "[sj-trace] compute_build_decision spill_dir={:?} entering build_with_partitioning prefix_rows={}",
+                spill_dir, prefix_rows
+            );
+        }
+
+        // Phase 2: guaranteed-spill-free (for what's ALREADY collected)
+        // allocation becomes "hand off to the bounded, spill-capable
+        // structure" — everything gathered so far (`prefix`) plus whatever
+        // remains of the stream (`rest`), through the SAME
+        // hash-partition-and-spill-as-needed bookkeeping the rest of the
+        // spill path already used. Nothing collected in phase 1 is thrown
+        // away or re-pulled from the source.
+        let combined: RecordBatchStream =
+            Box::pin(stream::iter(prefix.into_iter().map(Ok)).chain(rest));
+
+        let (partitions, spilled) = self
+            .build_with_partitioning(combined, build_keys, &spill_dir)
+            .await?;
+
+        Ok(BuildDecision::Spill {
+            partitions,
+            spilled,
+            spill_dir,
+        })
+    }
+
     async fn compute_build_decision(
         &self,
         build_side: &Arc<dyn PhysicalOperator>,
@@ -523,6 +710,9 @@ impl SpillableHashJoinExec {
         let build_keys: Vec<Expr> = if swapped { on_right } else { on_left };
 
         let sj_trace = std::env::var("QE_SPILL_DEBUG").is_ok();
+        // spill-join-correctness-2 epic, task 003: see this file's own
+        // "Fault injection: forced spill" module doc comment.
+        let chaos_after_batches = chaos_force_spill_after_batches();
 
         // Phase 1: reserve, possibly spill. Stream in, tracking a running
         // total as batches arrive from every build-side input partition
@@ -535,73 +725,61 @@ impl SpillableHashJoinExec {
 
         while let Some(batch) = build_stream.try_next().await? {
             let batch_size = estimate_batch_size(&batch);
-            if flat_size + batch_size > memory_threshold {
+            let chaos_crossing = chaos_after_batches
+                .map(|n| flat_batches.len() >= n)
+                .unwrap_or(false);
+            if flat_size + batch_size > memory_threshold || chaos_crossing {
+                if chaos_crossing && sj_trace {
+                    eprintln!(
+                        "[sj-trace] compute_build_decision CHAOS forcing spill (QE_SPILL_CHAOS_FORCE_SPILL) at flat_batches={} flat_size={}",
+                        flat_batches.len(),
+                        flat_size
+                    );
+                }
                 // Crossed the threshold: this build side must spill. Checked
                 // HERE, at the crossing point, rather than only once a full
                 // collection would have finished — an oversized non-INNER
                 // or filtered join now fails loudly this much earlier too,
                 // without ever needing to pull in the rest of the build
                 // side first.
-                if !matches!(self.join_type, JoinType::Inner) {
-                    return Err(QueryError::Execution(format!(
-                        "{} join build side exceeds the memory budget, but the join spill \
-                         path currently supports only INNER joins. Raise the memory limit \
-                         for this query.",
-                        self.join_type
-                    )));
-                }
-                if self.filter.is_some() {
-                    return Err(QueryError::Execution(
-                        "join build side exceeds the memory budget, but the join spill \
-                         path cannot evaluate an ON-clause filter. Raise the memory \
-                         limit for this query."
-                            .to_string(),
-                    ));
-                }
-
-                self.config.ensure_spill_dir()?;
-                let spill_id = SPILL_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let spill_dir = self.config.spill_path.join(format!("join_0_{}", spill_id));
-                std::fs::create_dir_all(&spill_dir).map_err(|e| {
-                    QueryError::Execution(format!("Failed to create spill directory: {}", e))
-                })?;
-
-                if sj_trace {
-                    let flat_rows: usize = flat_batches.iter().map(|b| b.num_rows()).sum();
-                    eprintln!(
-                        "[sj-trace] compute_build_decision spill_dir={:?} crossing memory_threshold={} at flat_rows={} flat_size={} (plus this batch's {} rows / {} bytes)",
-                        spill_dir, memory_threshold, flat_rows, flat_size, batch.num_rows(), batch_size
-                    );
-                }
-
-                // Phase 2: guaranteed-spill-free (for what's ALREADY
-                // collected) allocation becomes "hand off to the bounded,
-                // spill-capable structure" — everything gathered so far,
-                // plus the crossing batch, plus the rest of the stream,
-                // through the SAME hash-partition-and-spill-as-needed
-                // bookkeeping the rest of the spill path already used.
-                // Nothing collected in phase 1 is thrown away or re-pulled
-                // from the source.
-                let prefix = stream::iter(
-                    flat_batches
-                        .into_iter()
-                        .chain(std::iter::once(batch))
-                        .map(Ok),
-                );
-                let combined: RecordBatchStream = Box::pin(prefix.chain(build_stream));
-
-                let (partitions, spilled) = self
-                    .build_with_partitioning(combined, &build_keys, &spill_dir)
-                    .await?;
-
-                return Ok(BuildDecision::Spill {
-                    partitions,
-                    spilled,
-                    spill_dir,
-                });
+                let prefix: Vec<RecordBatch> = flat_batches
+                    .into_iter()
+                    .chain(std::iter::once(batch))
+                    .collect();
+                return self
+                    .finish_via_spill(prefix, build_stream, &build_keys, sj_trace)
+                    .await;
             }
             flat_size += batch_size;
             flat_batches.push(batch);
+        }
+
+        // spill-join-correctness-2 epic, task 003: the build stream is now
+        // fully exhausted without ever organically crossing
+        // `memory_threshold`. If `QE_SPILL_CHAOS_FORCE_SPILL` requested a
+        // crossing point (a batch count) the stream never actually reached
+        // — e.g. a small/single-batch build side, common for this
+        // mechanism's own differential-testing harness fixtures — force it
+        // HERE instead of silently falling through to "fits in memory,"
+        // which would make the WHEN lever a no-op for exactly the small
+        // inputs it's most useful against. `rest` is empty (nothing left
+        // to chain; the stream is already drained).
+        if chaos_after_batches.is_some() && !flat_batches.is_empty() {
+            if sj_trace {
+                eprintln!(
+                    "[sj-trace] compute_build_decision CHAOS forcing spill at end-of-stream (requested crossing point never reached; flat_batches={} flat_size={})",
+                    flat_batches.len(),
+                    flat_size
+                );
+            }
+            return self
+                .finish_via_spill(
+                    flat_batches,
+                    Box::pin(stream::empty()),
+                    &build_keys,
+                    sj_trace,
+                )
+                .await;
         }
 
         // Never crossed the threshold: the build side genuinely fits.
@@ -789,6 +967,58 @@ impl SpillableHashJoinExec {
         Ok(Box::pin(stream::iter(all_results.into_iter().map(Ok))))
     }
 
+    /// Evict partition `idx`'s currently-resident batches to disk right now,
+    /// opening/reusing its spill writer — the exact mechanism
+    /// `build_with_partitioning`'s own memory-pressure eviction used
+    /// inline before spill-join-correctness-2 epic task 003 pulled it out,
+    /// so the fault-injection path (which forces a CHOSEN partition to disk
+    /// regardless of memory pressure, see this file's own "Fault injection:
+    /// forced spill" module doc comment) shares it byte-for-byte with the
+    /// organic memory-pressure path rather than risking behavioral drift
+    /// between two separate copies of the same spill-write logic. No-op
+    /// (returns 0 freed bytes) if the partition is already empty/spilled.
+    /// Only ever called on a still-resident partition by either caller, so
+    /// `spilled[idx]` is always `None` on entry here in practice — asserted
+    /// implicitly by simply overwriting it, matching the pre-refactor code's
+    /// own assumption.
+    fn evict_build_partition_to_disk(
+        &self,
+        idx: usize,
+        partitions: &mut [Option<BuildPartition>],
+        spilled: &mut [Option<SpilledPartition>],
+        spill_writers: &mut [Option<ArrowWriter<File>>],
+        spill_dir: &PathBuf,
+        build_keys: &[Expr],
+        sj_trace: bool,
+    ) -> Result<usize> {
+        let Some(part) = partitions[idx].take() else {
+            return Ok(0);
+        };
+        let path = spill_dir.join(format!("build_{}.parquet", idx));
+        let mut write_checksum = if sj_trace {
+            Some(KeyChecksum::default())
+        } else {
+            None
+        };
+        for b in &part.batches {
+            append_batch_streaming(&mut spill_writers[idx], &path, b)?;
+            if let Some(cs) = write_checksum.as_mut() {
+                cs.accumulate(batch_key_checksum(b, build_keys)?);
+            }
+        }
+
+        self.memory_pool.record_spill(part.memory_bytes);
+        let freed = part.memory_bytes;
+
+        spilled[idx] = Some(SpilledPartition {
+            build_file: path,
+            build_rows: part.batches.iter().map(|b| b.num_rows()).sum(),
+            build_key_checksum: write_checksum,
+        });
+
+        Ok(freed)
+    }
+
     async fn build_with_partitioning(
         &self,
         mut build_stream: RecordBatchStream,
@@ -799,6 +1029,9 @@ impl SpillableHashJoinExec {
         // matching this file's own established convention (no `OnceLock`
         // caching, re-read fresh — see `gpu.rs`'s `QE_GPU_DEBUG` precedent).
         let sj_trace = std::env::var("QE_SPILL_DEBUG").is_ok();
+        // spill-join-correctness-2 epic, task 003: see this file's own
+        // "Fault injection: forced spill" module doc comment.
+        let chaos_partitions = chaos_force_spill_partitions();
         let mut partitions: Vec<Option<BuildPartition>> = (0..NUM_PARTITIONS)
             .map(|_| Some(BuildPartition::new()))
             .collect();
@@ -823,28 +1056,15 @@ impl SpillableHashJoinExec {
             if total_memory + batch_size > memory_threshold {
                 // Find the largest partition to spill
                 if let Some(idx) = find_largest_partition(&partitions) {
-                    let part = partitions[idx].take().unwrap();
-                    let path = spill_dir.join(format!("build_{}.parquet", idx));
-                    let mut write_checksum = if sj_trace {
-                        Some(KeyChecksum::default())
-                    } else {
-                        None
-                    };
-                    for b in &part.batches {
-                        append_batch_streaming(&mut spill_writers[idx], &path, b)?;
-                        if let Some(cs) = write_checksum.as_mut() {
-                            cs.accumulate(batch_key_checksum(b, build_keys)?);
-                        }
-                    }
-
-                    self.memory_pool.record_spill(part.memory_bytes);
-                    total_memory -= part.memory_bytes;
-
-                    spilled[idx] = Some(SpilledPartition {
-                        build_file: path,
-                        build_rows: part.batches.iter().map(|b| b.num_rows()).sum(),
-                        build_key_checksum: write_checksum,
-                    });
+                    total_memory -= self.evict_build_partition_to_disk(
+                        idx,
+                        &mut partitions,
+                        &mut spilled,
+                        &mut spill_writers,
+                        spill_dir,
+                        build_keys,
+                        sj_trace,
+                    )?;
                 }
             }
 
@@ -858,6 +1078,22 @@ impl SpillableHashJoinExec {
                     if let Some(ref mut part) = partitions[idx] {
                         part.add_batch(pb);
                         total_memory += pb_size;
+                        // spill-join-correctness-2 epic, task 003: force
+                        // this partition to disk right now if a fault-
+                        // injection trial chose it, regardless of memory
+                        // pressure — see `evict_build_partition_to_disk`'s
+                        // own doc comment.
+                        if chaos_partitions.as_ref().is_some_and(|s| s.contains(idx)) {
+                            total_memory -= self.evict_build_partition_to_disk(
+                                idx,
+                                &mut partitions,
+                                &mut spilled,
+                                &mut spill_writers,
+                                spill_dir,
+                                build_keys,
+                                sj_trace,
+                            )?;
+                        }
                     } else if let Some(ref mut sp) = spilled[idx] {
                         // Append to spilled partition as one more row group
                         // in the already-open writer — O(batch), never
@@ -4018,4 +4254,100 @@ mod tests {
             "a genuine SQL NULL is a handled case, not an unhandled array type"
         );
     }
+
+    /// spill-join-correctness-2 epic, task 003: pure-parsing unit tests for
+    /// the two fault-injection env vars (see this file's own "Fault
+    /// injection: forced spill" module doc comment). Deliberately test the
+    /// `parse_*`/`ChaosPartitionSpec::parse` functions directly rather than
+    /// `std::env::set_var` + the `chaos_force_spill_*` wrappers — this test
+    /// binary runs many tests concurrently in one process, and mutating the
+    /// real environment here would race any other test reading the same
+    /// keys (same reasoning as `gpu.rs`'s `parse_cache_budget_mb` and
+    /// `execution::context::parse_merge_concurrency`).
+    #[test]
+    fn chaos_force_spill_after_batches_parsing() {
+        assert_eq!(parse_chaos_force_spill_after_batches(None), None);
+        // Set but empty/unparseable: still "force," defaulting to batch 0.
+        assert_eq!(parse_chaos_force_spill_after_batches(Some("")), Some(0));
+        assert_eq!(
+            parse_chaos_force_spill_after_batches(Some("not_a_number")),
+            Some(0)
+        );
+        assert_eq!(parse_chaos_force_spill_after_batches(Some("0")), Some(0));
+        assert_eq!(parse_chaos_force_spill_after_batches(Some("7")), Some(7));
+        // Whitespace tolerated, matching this file's own `QE_SPILL_DEBUG`-
+        // adjacent env-parsing conventions elsewhere.
+        assert_eq!(parse_chaos_force_spill_after_batches(Some(" 3 ")), Some(3));
+    }
+
+    #[test]
+    fn chaos_partition_spec_parsing() {
+        assert!(matches!(
+            ChaosPartitionSpec::parse("all"),
+            ChaosPartitionSpec::All
+        ));
+        assert!(matches!(
+            ChaosPartitionSpec::parse("ALL"),
+            ChaosPartitionSpec::All
+        ));
+        assert!(matches!(
+            ChaosPartitionSpec::parse("  all  "),
+            ChaosPartitionSpec::All
+        ));
+
+        match ChaosPartitionSpec::parse("0,3,17") {
+            ChaosPartitionSpec::Indices(set) => {
+                assert_eq!(set, [0usize, 3, 17].into_iter().collect())
+            }
+            other => panic!("expected Indices, got {other:?}"),
+        }
+
+        // Whitespace around entries tolerated; unparseable tokens silently
+        // skipped rather than panicking (a malformed harness invocation
+        // should force nothing, not crash the query it's testing).
+        match ChaosPartitionSpec::parse(" 2 , x , 9,") {
+            ChaosPartitionSpec::Indices(set) => {
+                assert_eq!(set, [2usize, 9].into_iter().collect())
+            }
+            other => panic!("expected Indices, got {other:?}"),
+        }
+
+        match ChaosPartitionSpec::parse("") {
+            ChaosPartitionSpec::Indices(set) => assert!(set.is_empty()),
+            other => panic!("expected empty Indices, got {other:?}"),
+        }
+
+        for idx in 0..NUM_PARTITIONS {
+            assert!(ChaosPartitionSpec::All.contains(idx));
+        }
+        let some = ChaosPartitionSpec::Indices([1usize, 2, 3].into_iter().collect());
+        assert!(some.contains(2));
+        assert!(!some.contains(4));
+    }
+
+    // Deliberately NO unit test here that calls
+    // `std::env::set_var("QE_SPILL_CHAOS_FORCE_SPILL"/"_PARTITIONS", ...)`.
+    // An earlier version of this task's own work-in-progress added one
+    // (guarded by a local `Mutex` around its own set/unset section) and it
+    // genuinely broke an unrelated, pre-existing, otherwise-unmodified test
+    // in this exact file
+    // (`spillable_hash_join_retained_mask_matches_delegate_schema`, a LEFT
+    // JOIN case) under a real `cargo test` run: `cargo test`'s default
+    // concurrent-test-thread execution ran that LEFT JOIN test WHILE this
+    // module's own chaos test held `QE_SPILL_CHAOS_FORCE_SPILL` set, so the
+    // LEFT JOIN's `execute()` call was forced into the disk-spill branch's
+    // INNER-only guard and errored/panicked — a real, observed instance of
+    // exactly the hazard `gpu.rs`'s `parse_cache_budget_mb` and
+    // `execution::context::parse_merge_concurrency` already document
+    // ("a test that called `std::env::set_var` here would race every other
+    // test reading the same key"). A local mutex only serializes against
+    // OTHER tests that also acquire IT — it does nothing for the hundreds
+    // of unrelated tests in this same shared binary that don't know it
+    // exists. The end-to-end "forced spill produces the same result as an
+    // unforced run" invariant this would have checked is instead verified
+    // by `examples/spill_chaos_harness.rs` — a SEPARATE PROCESS, so no
+    // shared-binary env var race is possible — at far greater scale
+    // (thousands of trials; see that file's own module doc comment and
+    // this task's Outcome in `003.md` for real run counts/results) than
+    // any single unit test would exercise anyway.
 }
