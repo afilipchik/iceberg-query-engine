@@ -175,6 +175,21 @@ fn parse_args() -> (String, String) {
 
 #[tokio::main]
 async fn main() -> query_engine::Result<()> {
+    // join-order-stats-hardening task 001: install the SAME tracing
+    // subscriber `src/main.rs` installs for `query_engine serve`/the CLI, so
+    // this example demonstrates the missing/degenerate-statistics warning
+    // exactly as it appears in ordinary operation (`tracing::warn!` is a
+    // silent no-op with no subscriber installed at all -- this example
+    // previously had none). INFO is the default level, so the WARN-level
+    // signal shows up with no env var required, matching the whole point of
+    // this task: visible without already knowing to look for it.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::INFO.into()),
+        )
+        .init();
+
     let (data_dir, mode) = parse_args();
     // Both diagnostic switches this codebase already ships (CLAUDE.md);
     // set programmatically so a single binary invocation prints everything
