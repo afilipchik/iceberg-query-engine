@@ -1,9 +1,36 @@
 ---
 name: spill-join-correctness-2
 description: Follow-on hardening of SpillableHashJoinExec's spill path -- a new, concrete root-cause hypothesis, a real OOM hole, a fault-injection test harness, and three known sibling bugs
-status: backlog
+status: completed
 created: 2026-08-27T07:44:44Z
+updated: 2026-08-27T14:30:00Z
 ---
+
+> **Status note (2026-08-27).** `completed` reflects the epic running its
+> full course and closing (all 5 tasks closed, each meeting its OWN
+> acceptance criteria), NOT that this PRD's own headline goal — root-cause
+> and fix the archived `spill-join-correctness` epic's main wrong-answer
+> bug — was reached. **That bug remains OPEN and unfixed — root cause
+> still unconfirmed**, exactly matching the precedent set by the prior
+> `spill-join-correctness` PRD's own status note. What this epic actually
+> delivered: task 001's hash/derived-state-consistency hypothesis, in its
+> literal form, was NOT confirmed — but the same "instrument, don't just
+> re-read" investigation caught something structurally adjacent, and
+> arguably more serious, in the act: the spill-directory-collision bug the
+> prior epic characterized as "fails loudly, never silently wrong" is
+> actually capable of a SILENT WRONG ANSWER under concurrent-process
+> collision, not just a crash — now fixed (PID-embedded default spill
+> path). Task 002 closed a real, documented collect-fully-then-decide OOM
+> hole (verified with a real kernel OOM-kill pre-fix under a real cgroup
+> cap). Task 003 built a permanent fault-injection/differential testing
+> harness and ran it for 2,330 trials (8x the prior epic's own 290-trial
+> total), 0 mismatches — confidence-tightening, not a new discovery. Task
+> 004 fixed the two remaining named sibling bugs (LIMIT not enforced under
+> spill; a sort-spill run-file-not-found crash), with zero changes to
+> `SpillableHashJoinExec`'s own build/probe/partition-routing code. See
+> `.claude/epics/archived/spill-join-correctness-2/epic.md`'s close-out
+> and `CLAUDE.md`'s "Mutation: QA close-out" section for the full picture
+> before picking the main bug back up.
 
 # PRD: spill-join-correctness-2
 

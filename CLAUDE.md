@@ -1119,14 +1119,37 @@ Based on the codebase structure, these appear to be planned but not fully implem
   memory limits (uses `data/tpch-10mb`) and compares against unlimited runs.
   The join spill path supports INNER joins only — non-inner joins whose build
   side exceeds the budget fail loudly instead of returning wrong results.
-  `SpillableHashJoinExec` still materializes the build side before deciding to
-  spill (known hole, fixed by the Phase-5 streaming spill rewrite, see ROADMAP).
+  `SpillableHashJoinExec` no longer materializes the whole build side before
+  deciding to spill — `spill-join-correctness-2` task 002 replaced the old
+  collect-fully-then-decide `OnceCell` closure with a streaming, Photon-style
+  two-phase reservation (`compute_build_decision` + `stream_merge_input_partitions`):
+  the build side is read batch by batch with a running size total checked on
+  every batch, so a build side that would previously OOM before the spill
+  decision ever ran now spills cleanly instead (verified under a real
+  `systemd-run --scope -p MemoryMax=900M` cgroup cap, `examples/
+  spill_join_oom_repro.rs`: pre-fix 2/2 trials genuinely OOM-killed by the
+  kernel, post-fix 2/2 clean, peak RSS ~650-680MB). This closes the
+  collect-fully-then-decide hole for `SpillableHashJoinExec` specifically —
+  `SpillableHashAggregateExec` and `ExternalSortExec` still use the old
+  `collect_input_partitions_concurrently` pattern, unexamined; ROADMAP.md's
+  broader item 5 ("true streaming spill + SF=100 certification") is not
+  fully closed by this.
   `tests/spill_directory_collision_tests.rs` (added `spill-join-correctness-2`
   task 004) is the real-2-OS-process regression test for the spill-directory-
   collision fix (`src/execution/memory.rs`'s PID-embedded default
   `spill_path`, `spill-join-correctness-2` task 001) — two real
   `query_engine serve` processes sharing `$TMPDIR`, firing the same spilling
   join concurrently.
+  `examples/spill_chaos_harness.rs` (added `spill-join-correctness-2` task
+  003) is a permanent, reusable fault-injection/differential testing tool for
+  `SpillableHashJoinExec`'s spill/unspill boundary — two env-gated hooks
+  (`QE_SPILL_CHAOS_FORCE_SPILL` for WHEN, `QE_SPILL_CHAOS_FORCE_SPILL_PARTITIONS`
+  for WHICH partitions) force a genuine disk round-trip at a chosen point,
+  then compare against an unforced baseline via an order-independent output
+  checksum. Run for real: 2,330 post-fix trials, 0 mismatches (8x the
+  archived `spill-join-correctness` epic's own 290-trial total, at
+  ~15-160ms/trial). Use this before reaching for the older, much more
+  expensive `.scratch/spill_join_repro/repro.sh` manual loop.
 
 ## SF=100: the four-way matrix (2026-08-18, warm, same machine, duckdb 1.4.4)
 
@@ -3304,6 +3327,27 @@ partition-routing code — this section's own headline ~0.34%-rate
 duplicate-counting bug remains unconfirmed and unaffected, exactly as
 expected. Full evidence: `.claude/epics/spill-join-correctness-2/
 004.md`'s Outcome section.
+
+**`spill-join-correctness-2` epic close-out (2026-08-27).** Two more
+things landed alongside the above, both independent of the still-open
+duplicate-counting bug: **task 002 fixed the documented collect-fully-
+then-decide OOM hole** in `SpillableHashJoinExec::execute` (a Photon-style
+streaming two-phase reservation, verified under a real cgroup memory cap
+— see the "Spill tests" bullet above for detail); **task 003 built a
+permanent fault-injection/differential testing harness**
+(`examples/spill_chaos_harness.rs`) and ran it for 2,330 trials, 0
+mismatches — 8x the archived epic's own 290-trial total, at a fraction
+of the per-trial cost (see the "Spill tests" bullet above). Neither
+result confirms or refutes this section's own headline bug. **Bottom
+line, unchanged from the paragraph above and stated again here so it
+isn't missed**: the ~0.34%-rate duplicate-counting wrong-answer bug in
+`SpillableHashJoinExec`'s own build/probe/partition-routing logic is
+still OPEN, root cause still UNCONFIRMED, at the close of this second
+follow-on epic too. What DID get confirmed, worse than previously
+recorded: the spill-directory-collision bug (residue item 1 above) is
+capable of a silent wrong answer, not just a loud crash — now fixed.
+Full epic close-out, G1-G5 verdicts, and every commit:
+`.claude/epics/archived/spill-join-correctness-2/epic.md`.
 
 **Full suite, all four feature combinations**, final state (all fixes +
 all new tests included), through `scripts/claude-safe-build.sh`:
