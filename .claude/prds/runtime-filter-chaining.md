@@ -1,9 +1,20 @@
 ---
 name: runtime-filter-chaining
 description: Extend the runtime join-filter bitmap mechanism to propagate/combine across multiple joins touching the same probe-side leaf
-status: completed (shipped 2026-08-27, epic archived at .claude/epics/archived/runtime-filter-chaining/) — G2/G3/G4 (correctness, no-regression, full suite) cleanly MET; G1 (Q7 SF=100 measurable improvement) NOT cleanly met — the mechanism is correct and safe, but its net wall-clock value on the grounding example was not confidently established (small, direction-ambiguous effect on a noisy shared machine; see epic.md's close-out and CLAUDE.md's "Runtime filter chaining" section for full evidence and a named re-measure-on-a-quiet-machine follow-up)
+status: completed
 created: 2026-08-28T00:43:03Z
+updated: 2026-08-28T00:00:00Z
 ---
+
+> **Status note (2026-08-28).** Shipped, epic archived at
+> `.claude/epics/archived/runtime-filter-chaining/`. G2/G3/G4
+> (correctness, no-regression, full suite) cleanly MET. G1 (Q7 SF=100
+> measurable improvement) NOT cleanly met — the mechanism is correct and
+> safe, but its net wall-clock value on the grounding example was not
+> confidently established (small, direction-ambiguous effect measured on
+> a noisy shared machine). See `epic.md`'s close-out and `CLAUDE.md`'s
+> "Runtime filter chaining" section for full evidence and a named
+> re-measure-on-a-quiet-machine follow-up.
 
 # PRD: runtime-filter-chaining
 
