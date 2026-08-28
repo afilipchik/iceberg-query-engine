@@ -64,9 +64,17 @@ pub type SharedRuntimeFilter =
     std::sync::Arc<parking_lot::Mutex<Option<std::sync::Arc<RuntimeFilterPayload>>>>;
 
 /// Plan-time configuration handle: the planner links a join to a scan by
-/// writing (file column index, filter slot) here.
+/// pushing (file column index, filter slot) here. A `Vec` rather than a
+/// single slot: a probe-side leaf touched by more than one independently
+/// eligible join (directly, or transitively through an already-linked join
+/// above it -- see `PhysicalPlanner`'s `streaming_scans` registry) publishes
+/// one entry per linking join, each on its own build side's schedule. Every
+/// populated entry is applied as an independent, AND-combined predicate at
+/// read time (parquet `RowFilter` ANDs its predicates in sequence; the IPC
+/// sidecar path applies them as a fold) -- so a leaf that has already been
+/// filtered by one join can only ever narrow further, never contradict.
 pub type RuntimeFilterConfig =
-    std::sync::Arc<parking_lot::Mutex<Option<(usize, SharedRuntimeFilter)>>>;
+    std::sync::Arc<parking_lot::Mutex<Vec<(usize, SharedRuntimeFilter)>>>;
 
 pub struct StreamingParquetScanExec {
     table_name: String,
@@ -413,14 +421,18 @@ impl PhysicalOperator for StreamingParquetScanExec {
 
                     let work = work_iter.next()?;
 
-                    // Re-resolve the runtime filter for this row group: the
-                    // driving join publishes the key set only after its build
-                    // side drains.
-                    let runtime: Option<(usize, std::sync::Arc<RuntimeFilterPayload>)> =
-                        runtime_cfg
-                            .lock()
-                            .as_ref()
-                            .and_then(|(idx, slot)| slot.lock().clone().map(|set| (*idx, set)));
+                    // Re-resolve the runtime filter(s) for this row group: each
+                    // driving join publishes its own key set only after its own
+                    // build side drains, independently -- so a leaf linked to
+                    // more than one join may see them populate on different
+                    // row groups. Every populated slot at this point is
+                    // collected; unpopulated ones are simply skipped (that
+                    // join hasn't finished building yet).
+                    let runtime: Vec<(usize, std::sync::Arc<RuntimeFilterPayload>)> = runtime_cfg
+                        .lock()
+                        .iter()
+                        .filter_map(|(idx, slot)| slot.lock().clone().map(|set| (*idx, set)))
+                        .collect();
 
                     // IPC sidecar: decode-free, filters applied post-load.
                     // Dictionary-coercion scans keep the parquet path: their
@@ -456,7 +468,7 @@ impl PhysicalOperator for StreamingParquetScanExec {
                             &work,
                             projection.as_deref(),
                             filter_spec.as_ref().as_ref(),
-                            runtime.as_ref(),
+                            &runtime,
                             &schema,
                         ) {
                             Ok(batches) => {
@@ -549,7 +561,12 @@ impl PhysicalOperator for StreamingParquetScanExec {
                             ),
                         ));
                     }
-                    if let Some((col_idx, set)) = &runtime {
+                    // One predicate per LINKED join (see `RuntimeFilterConfig`'s
+                    // own doc comment) -- `RowFilter` applies its predicates in
+                    // order, ANDing them together, so N independently-populated
+                    // filters on this leaf narrow the same way N `AND`-combined
+                    // WHERE clauses would.
+                    for (col_idx, set) in &runtime {
                         let mask = parquet::arrow::ProjectionMask::roots(
                             builder.parquet_schema(),
                             [*col_idx],
@@ -724,7 +741,7 @@ fn ipc_read_work(
     work: &RowGroupWork,
     projection: Option<&[usize]>,
     filter_spec: Option<&(Expr, Vec<usize>)>,
-    runtime: Option<&(usize, std::sync::Arc<RuntimeFilterPayload>)>,
+    runtime: &[(usize, std::sync::Arc<RuntimeFilterPayload>)],
     out_schema: &SchemaRef,
 ) -> Result<Vec<RecordBatch>> {
     // Read the union of output + filter + runtime-key columns; positions
@@ -736,7 +753,7 @@ fn ipc_read_work(
             if let Some((_, idxs)) = filter_spec {
                 s.extend(idxs.iter().copied());
             }
-            if let Some((ridx, _)) = runtime {
+            for (ridx, _) in runtime {
                 s.push(*ridx);
             }
             s.sort_unstable();
@@ -765,7 +782,11 @@ fn ipc_read_work(
     if let Some((expr, _)) = filter_spec {
         batches = crate::physical::operators::filter_batches(batches, expr)?;
     }
-    if let Some((ridx, set)) = runtime {
+    // One AND-combined pass per LINKED join (mirrors the parquet decoder
+    // RowFilter path's own multi-predicate semantics above) -- each pass
+    // only narrows `batches` further, so order among the entries never
+    // matters for correctness.
+    for (ridx, set) in runtime {
         let col = pos_of(*ridx)?;
         let mut kept = Vec::with_capacity(batches.len());
         for batch in batches {
