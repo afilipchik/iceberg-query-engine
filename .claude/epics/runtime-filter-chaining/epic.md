@@ -2,8 +2,8 @@
 name: runtime-filter-chaining
 status: in-progress
 created: 2026-08-28T00:43:03Z
-updated: 2026-08-28T02:10:00Z
-progress: 33%
+updated: 2026-08-28T02:40:00Z
+progress: 67%
 prd: .claude/prds/runtime-filter-chaining.md
 github: (will be set on sync)
 ---
@@ -92,10 +92,28 @@ existing infrastructure end to end.
 
 ## Tasks Created
 - [x] 001.md - Extend leaf-resolution/linking for multi-join chaining (parallel: false) — closed 2026-08-28
-- [ ] 002.md - Validation — real measurement, cell-exact, no-regression (parallel: false)
+- [x] 002.md - Validation — real measurement, cell-exact, no-regression (parallel: false) — closed 2026-08-28
 - [ ] 003.md - QA close-out (parallel: false)
 
 Total tasks: 3
 Parallel tasks: 0
 Sequential tasks: 3
 Estimated total effort: S-M
+
+## Task 002 summary (honest, not a clean win)
+
+Real measurement found G2 (cell-exact, both scale factors), G3 (no
+regression to Q19/Q21) and G4 (full suite green, all 4 combinations)
+cleanly MET. **G1 ("Q7 SF=100 measurably improves") is only partially
+met**: task 001's second filter link is real (RT_DEBUG-confirmed), but
+the direct before/after A/B (10 interleaved pairs) showed a small,
+consistent SLOWDOWN (+1.8% avg, 10/10 pairs), and the `RT_DISABLE=1`
+isolation of the whole mechanism was noisy enough (interleaved pairs:
++2.3% avg favoring the filter, 15/20 pairs; two 8-iteration block runs:
+~5% favoring NO filter) that its sign could not be confidently pinned
+down at the noise level available on this shared, heavily-loaded
+machine this session. Full detail: `002.md`'s Outcome section. Task 003
+(QA close-out) should weigh G1 as a genuine, small/inconclusive
+performance result rather than an unambiguous win — the PRD's own
+~150-200ms/11-13% grounding figure was for the ORIGINAL single filter,
+not this epic's own second-filter addition.
