@@ -2,8 +2,8 @@
 name: runtime-filter-chaining
 status: in-progress
 created: 2026-08-28T00:43:03Z
-updated: 2026-08-28T00:43:03Z
-progress: 0%
+updated: 2026-08-28T02:10:00Z
+progress: 33%
 prd: .claude/prds/runtime-filter-chaining.md
 github: (will be set on sync)
 ---
@@ -91,7 +91,7 @@ existing infrastructure end to end.
 - 003: S.
 
 ## Tasks Created
-- [ ] 001.md - Extend leaf-resolution/linking for multi-join chaining (parallel: false)
+- [x] 001.md - Extend leaf-resolution/linking for multi-join chaining (parallel: false) — closed 2026-08-28
 - [ ] 002.md - Validation — real measurement, cell-exact, no-regression (parallel: false)
 - [ ] 003.md - QA close-out (parallel: false)
 
