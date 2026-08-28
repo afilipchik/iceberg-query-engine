@@ -1268,6 +1268,21 @@ src/tpch/queries.rs; Q11 threshold needs no adjustment at SF=1).
 
 ## TPC-H Benchmark Status (SF=10, updated 2026-08-23)
 
+**See also**: `.claude/plans/research/2026-08-28-sf10-sixway-benchmark.md`
+— a fresh, freshly-measured (not historical) SF=10 six-leg comparison
+(engine over Parquet/Native/Lance vs DuckDB over Native/Parquet/Lance, all
+independently cell-exact validated). Engine/Parquet like-for-like landed
+**1.14x** DuckDB/Parquet (Auto cache premise), consistent with/slightly
+better than this section's own 1.36x-1.67x band below. That report also
+found and explains (citing this file's own already-documented
+`SpillableHashJoinExec` join-spill-cost finding, not a new bug) why
+Engine/Native's Q12 is currently ~24x DuckDB/Parquet at SF=10 — the
+native-tables Benchmarks section's own 5.324s SF=10 total below is now
+STALE, superseded by intervening epics (native-tables-mutation,
+spill-join-correctness, native-table-pruning) that changed the join-spill
+path; the fresh SF=10 native-table total is **8.20s** (1.93x DuckDB/
+Parquet, 1.08x excluding Q12 alone).
+
 **Re-baselined again at the close of `duckdb-parity-2` (six tasks: IPC-cache
 defaults, Q13 disjoint-threshold + join-pruning, Q16 anti-join parallelism +
 hasher swap, dense-group-id Stage 0). Both IPC-cache premises forced and
@@ -1548,6 +1563,12 @@ before it was written. They are env-gated and cost nothing when unset.
 | `RT_DEBUG`, `HJ_TIMING`, `AGG_TIMING`, `DP_DEBUG` | join/agg/CBO internals | `RT_DEBUG` now also prints `slots_now=N` per link — see "Runtime filter chaining" below |
 
 ### Lance vs Parquet vs DuckDB (SF=10, 2026-08-09, serialized, same binary)
+
+**See also**: `.claude/plans/research/2026-08-28-sf10-sixway-benchmark.md`
+re-measured this like-for-like Lance comparison fresh — Engine/Lance 6.03s
+vs DuckDB/Lance 10.66s = **0.57x, engine 1.77x faster**, an even wider win
+than the 0.92x/1.44x-slower figures below (both independently 22/22
+cell-exact vs a fresh DuckDB-over-the-same-Lance-dataset oracle).
 
 All three legs on the same idle machine. Engine legs use ONE binary built with
 `--features lance`, so Lance and Parquet differ only in the storage path.
@@ -4287,6 +4308,18 @@ cluster_local.sh verify-m2 && scripts/cluster_local.sh stop` (M1/M2).
   numbers and reasoning).
 
 ### Benchmarks (2026-08-23, task 008 close-out)
+
+**STALE at SF=10, see `.claude/plans/research/2026-08-28-sf10-sixway-
+benchmark.md`**: the SF=10 5.324s total below predates the
+native-tables-mutation, spill-join-correctness, and native-table-pruning
+epics, all of which touched the native-table join-spill path. A fresh
+2026-08-28 measurement puts SF=10 native-table total at **8.20s** (1.93x
+DuckDB/Parquet, 1.20x DuckDB/Iceberg), driven almost entirely by Q12
+(~3.1s, ~24x DuckDB/Parquet) crossing `SpillableHashJoinExec`'s spill
+threshold — the exact, already-documented mechanism in this section's own
+"Current limitations" below, not a new bug. Excluding Q12, native/parquet
+(engine-to-engine) is a much more expected 1.08x. SF=100 not re-measured
+this session.
 
 Both scales load `data/tpch-{10gb,100gb}` (plain parquet) into native
 tables via `write-native --from-parquet`, then compare the ENGINE
