@@ -1542,12 +1542,33 @@ impl PhysicalPlanner {
                     .iter()
                     .position(|(_, r)| matches!(r, Expr::Column(_)))
                     .unwrap_or(0);
+                // `linked_scan_cfg`, when set, is the (multi-slot filter
+                // config, provider schema) this join successfully linked to
+                // -- either a DIRECT probe-side streaming scan, or,
+                // transitively, an already-linked ANCESTOR join's own probe
+                // scan (see the re-registration below the branch that builds
+                // `result`). Captured here so it can be re-published under
+                // THIS join's own resulting operator pointer once that
+                // pointer exists, letting a LATER join up the tree chain
+                // through this one exactly as if it were a plain scan.
+                let mut linked_scan_cfg: Option<(
+                    crate::physical::operators::streaming_parquet_scan::RuntimeFilterConfig,
+                    SchemaRef,
+                )> = None;
                 let probe_rt_filter = if rt_eligible && !on.is_empty() {
                     if let Some(Expr::Column(c)) = on.get(rt_pair).map(|(_, r)| r) {
                         // The probe-side streaming scan may sit under column
                         // pass-through Projects (decorrelated subquery
                         // shapes); the filter column is resolved by NAME in
                         // the provider schema, so digging through is safe.
+                        // It may ALSO, after unwrapping Projects, land
+                        // directly on an already-linked ANCESTOR join's own
+                        // output (registered below): a leaf touched by two or
+                        // more independently eligible joins is reached this
+                        // way without walking back down into that ancestor's
+                        // children, which would risk resolving its BUILD
+                        // side instead of its probe side for a join this
+                        // code didn't itself gate as build-stays-left.
                         let mut probe_leaf = Arc::clone(&right);
                         while probe_leaf.name() == "Project" {
                             let ch = probe_leaf.children();
@@ -1566,7 +1587,7 @@ impl PhysicalPlanner {
                                 c.name
                             );
                         }
-                        scans.get(&key).and_then(|(cfg, pschema)| {
+                        let linked = scans.get(&key).and_then(|(cfg, pschema)| {
                             pschema
                                 .fields()
                                 .iter()
@@ -1575,13 +1596,30 @@ impl PhysicalPlanner {
                                 .map(|idx| {
                                     let slot: crate::physical::operators::SharedRuntimeFilter =
                                         Default::default();
-                                    *cfg.lock() = Some((idx, Arc::clone(&slot)));
+                                    // Push, never overwrite: a leaf already
+                                    // linked to an earlier join's filter gets
+                                    // ANOTHER, independent, AND-combined slot
+                                    // rather than losing the first one.
+                                    cfg.lock().push((idx, Arc::clone(&slot)));
                                     if std::env::var("RT_DEBUG").is_ok() {
-                                        eprintln!("[rt] linked col {} ({})", idx, c.name);
+                                        eprintln!(
+                                            "[rt] linked col {} ({}) slots_now={}",
+                                            idx,
+                                            c.name,
+                                            cfg.lock().len()
+                                        );
                                     }
-                                    slot
+                                    (slot, Arc::clone(cfg), Arc::clone(pschema))
                                 })
-                        })
+                        });
+                        drop(scans);
+                        match linked {
+                            Some((slot, cfg, pschema)) => {
+                                linked_scan_cfg = Some((cfg, pschema));
+                                Some(slot)
+                            }
+                            None => None,
+                        }
                     } else {
                         None
                     }
@@ -1589,7 +1627,7 @@ impl PhysicalPlanner {
                     None
                 };
 
-                if self.use_spillable() {
+                let result: Arc<dyn PhysicalOperator> = if self.use_spillable() {
                     // Use spillable hash join with memory management
                     let mut join = SpillableHashJoinExec::new(
                         left,
@@ -1653,14 +1691,14 @@ impl PhysicalPlanner {
                     // (for them ON and WHERE are equivalent).
                     if filter_inside_join && node.filter.is_some() {
                         join = join.with_filter(node.filter.clone());
-                        Ok(Arc::new(join))
+                        Arc::new(join)
                     } else {
                         match &node.filter {
                             Some(predicate) => {
                                 let filter = self.create_filter(Arc::new(join), predicate.clone());
-                                Ok(Arc::new(filter))
+                                Arc::new(filter)
                             }
-                            None => Ok(Arc::new(join)),
+                            None => Arc::new(join),
                         }
                     }
                 } else if filter_inside_join && node.filter.is_some() {
@@ -1674,7 +1712,7 @@ impl PhysicalPlanner {
                         node.filter.clone(),
                     )
                     .with_build_right(build_right_for_left);
-                    Ok(Arc::new(join))
+                    Arc::new(join)
                 } else {
                     // Use regular hash join (no memory management)
                     let join = HashJoinExec::new(left, right, on, node.join_type)
@@ -1684,11 +1722,30 @@ impl PhysicalPlanner {
                     match &node.filter {
                         Some(predicate) => {
                             let filter = self.create_filter(Arc::new(join), predicate.clone());
-                            Ok(Arc::new(filter))
+                            Arc::new(filter)
                         }
-                        None => Ok(Arc::new(join)),
+                        None => Arc::new(join),
                     }
+                };
+
+                // Chain runtime-filter linking: a join that itself linked to
+                // a probe-side scan (directly, or transitively through an
+                // earlier-linked join below it) re-publishes that SAME
+                // (config, schema) pair under its OWN resulting operator's
+                // pointer. A LATER, independently eligible join whose probe
+                // side is exactly THIS join's output then finds it through
+                // the ordinary Project-unwrap-only lookup above, with no
+                // extra downcasting or children()-walking needed -- and,
+                // being a fresh `push` onto the SAME multi-slot config
+                // rather than a new one, both joins' filters apply
+                // AND-combined at the original scan.
+                if let Some(scan_link) = linked_scan_cfg {
+                    self.streaming_scans
+                        .borrow_mut()
+                        .insert(Arc::as_ptr(&result) as *const () as usize, scan_link);
                 }
+
+                Ok(result)
             }
 
             LogicalPlan::Aggregate(node) => {
