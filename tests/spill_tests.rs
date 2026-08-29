@@ -239,6 +239,26 @@ async fn count_distinct_spill_matches_in_memory() {
     assert_eq!(rows, expected, "COUNT(DISTINCT) disagrees with DuckDB");
 }
 
+/// High-cardinality COUNT(DISTINCT) GROUP BY at a very low limit —
+/// oom-safety-hardening task 002's streaming two-phase reservation feeds
+/// `aggregate_with_spilling` mid-stream, and the per-partition finalize
+/// gate (raw bytes + predicted aggregation state vs the threshold)
+/// necessarily trips at 128KB, forcing the chunked (sub-partitioned)
+/// read-back for every partition. Results must match the unlimited run
+/// exactly through the full SQL path.
+#[tokio::test]
+async fn agg_spill_chunked_finalize_matches_in_memory() {
+    assert_spill_matches(
+        "SELECT l_partkey, COUNT(DISTINCT l_orderkey) AS orders, SUM(l_quantity) AS qty \
+         FROM lineitem, orders WHERE l_orderkey = o_orderkey \
+         GROUP BY l_partkey",
+        128 * 1024,
+        "agg_chunked_finalize",
+        false,
+    )
+    .await;
+}
+
 /// Non-inner joins are not yet supported by the join spill path
 /// (probe_partition implements inner semantics only). They must FAIL LOUDLY
 /// when the build side exceeds the budget — silently returning inner-join

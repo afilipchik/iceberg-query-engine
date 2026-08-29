@@ -25,7 +25,7 @@ use parquet::file::properties::WriterProperties;
 use std::fmt;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
@@ -35,6 +35,12 @@ static SPILL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Number of hash partitions for spilling
 const NUM_PARTITIONS: usize = 64;
+
+/// Row granularity for re-chunking oversized batches during spill ingestion
+/// AND for streaming a spilled aggregate partition back off disk
+/// (`aggregate_partition_chunked`). Matches `append_batch_streaming`'s
+/// `SPILL_WRITER_ROW_GROUP_ROWS` — one shared magic number, not three.
+const AGG_CHUNK_ROWS: usize = 8_192;
 
 /// Monotonic call-sequence id for `QE_SPILL_DEBUG` join/aggregate spill-path
 /// tracing (task 001, spill-join-correctness epic). Diagnostic only — lets
@@ -2027,6 +2033,12 @@ impl SpillableHashAggregateExec {
 struct AggregatePartition {
     batches: Vec<RecordBatch>,
     memory_bytes: usize,
+    /// Total rows across `batches` — kept incrementally (mirroring
+    /// `BuildPartition::rows`, oom-safety-hardening task 007) so the
+    /// finalize step's aggregation-state accounting
+    /// (`predicted_agg_state_bytes`, task 002) never rescans batches to
+    /// price the state this partition's rows imply.
+    rows: usize,
 }
 
 impl AggregatePartition {
@@ -2034,18 +2046,37 @@ impl AggregatePartition {
         Self {
             batches: Vec::new(),
             memory_bytes: 0,
+            rows: 0,
         }
     }
 
     fn add_batch(&mut self, batch: RecordBatch) {
         self.memory_bytes += estimate_batch_size(&batch);
+        self.rows += batch.num_rows();
         self.batches.push(batch);
     }
 
     fn clear(&mut self) {
         self.batches.clear();
         self.memory_bytes = 0;
+        self.rows = 0;
     }
+}
+
+/// State for a spilled aggregate partition: the (single, incrementally
+/// appended) Parquet file plus running row/byte totals of what was written
+/// to it. The totals are what lets the finalize step price a partition's
+/// read-back + aggregation-state cost BEFORE materializing anything
+/// (oom-safety-hardening task 002, mirroring task 007's accounting
+/// discipline for the join spill path's hash tables).
+struct SpilledAggPartition {
+    file: PathBuf,
+    rows: usize,
+    /// Estimated IN-MEMORY bytes of the batches written to `file`
+    /// (accumulated `estimate_batch_size` at spill time — NOT the
+    /// compressed on-disk size, which under-counts what read-back will
+    /// actually materialize).
+    raw_bytes: usize,
 }
 
 #[async_trait]
@@ -2080,31 +2111,63 @@ impl PhysicalOperator for SpillableHashAggregateExec {
         // reaching here after `fused_eligible` was true means
         // `execute_fused_streaming` returned `Ok(None)` (see its own DONE/
         // ABORTED trace lines) and its input is about to be driven a SECOND
-        // time by `collect_input_partitions_concurrently` below — for a
-        // child like `SpillableHashJoinExec`'s spill path, which has no
-        // cache of its own output, this reruns the ENTIRE join computation
-        // from scratch. Not proof of duplication by itself (this second run
-        // is the one whose results are actually returned), but a query
-        // whose log shows this line is a query where the join's expensive
-        // work happened twice, and a wrong answer that also shows two
-        // `execute_spill_path` DONE lines is direct evidence they share a
-        // cause.
+        // time by the streaming reservation below — for a child like
+        // `SpillableHashJoinExec`'s spill path, which has no cache of its
+        // own output, this reruns the ENTIRE join computation from scratch.
+        // Not proof of duplication by itself (this second run is the one
+        // whose results are actually returned), but a query whose log shows
+        // this line is a query where the join's expensive work happened
+        // twice, and a wrong answer that also shows two `execute_spill_path`
+        // DONE lines is direct evidence they share a cause.
         if std::env::var("QE_SPILL_DEBUG").is_ok() {
             eprintln!(
                 "[sj-trace] agg fallback: fused_eligible={} -> (re-)executing input via \
-                 collect_input_partitions_concurrently",
+                 the streaming two-phase reservation (stream_merge_input_partitions)",
                 fused_eligible
             );
         }
 
-        // Drain all input partitions concurrently so a parallel scan/join beneath this
-        // aggregate is not serialized onto a single core.
+        // Phase 1: reserve, possibly spill (oom-safety-hardening task 002 —
+        // the same Photon-style streaming two-phase reservation
+        // `SpillableHashJoinExec::compute_build_decision` ships, mirrored
+        // rather than reinvented). The OLD code called
+        // `collect_input_partitions_concurrently`, which fully drained the
+        // ENTIRE input into one flat `Vec<RecordBatch>` and only THEN
+        // compared its total size against `memory_limit * spill_threshold`
+        // — so an oversized input could exhaust real memory during that
+        // initial collection, before the spill decision ever ran (the
+        // harness `agg` scenario: 250M rows / ~4GB streamed into a 256MB
+        // budget was kernel-OOM-killed here). Now the input streams in via
+        // `stream_merge_input_partitions` (same one-task-per-partition
+        // cross-core drain benefit, bounded channel instead of a growing
+        // Vec) with a running size total checked as each batch arrives —
+        // never buffering more than ~`memory_threshold` bytes of flat,
+        // unpartitioned input. The MOMENT the total would cross the
+        // threshold, everything collected so far plus the crossing batch
+        // plus the rest of the stream feeds `aggregate_with_spilling`'s
+        // hash-partition-and-spill-as-needed bookkeeping, entered
+        // mid-stream instead of only after a full prior collection.
         let memory_threshold =
             (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
-        let (all_batches, total_size) = collect_input_partitions_concurrently(&self.input).await?;
-        let exceeded = total_size > memory_threshold;
+        let mut input_stream = stream_merge_input_partitions(&self.input).await?;
+        let mut flat_batches: Vec<RecordBatch> = Vec::new();
+        let mut flat_size: usize = 0;
+        let mut crossing_batch: Option<RecordBatch> = None;
+        while let Some(batch) = input_stream.try_next().await? {
+            let batch_size = estimate_batch_size(&batch);
+            if flat_size + batch_size > memory_threshold {
+                crossing_batch = Some(batch);
+                break;
+            }
+            flat_size += batch_size;
+            flat_batches.push(batch);
+        }
 
-        if !exceeded {
+        if crossing_batch.is_none() {
+            // Never crossed the threshold: the input genuinely fits — the
+            // ordinary in-memory case, reached without ever risking an
+            // unbounded collection to get here.
+            let all_batches = flat_batches;
             // Data fits in memory — delegate to the proven HashAggregateExec
             let hash_aggs: Vec<crate::physical::operators::hash_agg::AggregateExpr> = self
                 .aggregates
@@ -2140,7 +2203,7 @@ impl PhysicalOperator for SpillableHashAggregateExec {
             return Ok(stream);
         }
 
-        // Data exceeds memory — use spillable aggregation path
+        // Threshold crossed mid-stream — use the spillable aggregation path.
         self.config.ensure_spill_dir()?;
 
         let spill_id = SPILL_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -2154,29 +2217,35 @@ impl PhysicalOperator for SpillableHashAggregateExec {
 
         if std::env::var("QE_SPILL_DEBUG").is_ok() {
             eprintln!(
-                "[spill-agg] collected {} batches, {} rows, {} bytes",
-                all_batches.len(),
-                all_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
-                total_size
+                "[spill-agg] threshold crossed mid-stream at {} buffered batches ({} bytes, \
+                 threshold {}) — entering streaming spill path",
+                flat_batches.len() + 1,
+                flat_size,
+                memory_threshold
             );
         }
-        let input_stream: RecordBatchStream =
-            Box::pin(stream::iter(all_batches.into_iter().map(Ok)));
+
+        // Phase 2: everything gathered so far (`flat_batches`), plus the
+        // crossing batch, plus whatever remains of the stream, feeds the
+        // bounded, spill-capable structure. Nothing collected in phase 1 is
+        // thrown away or re-pulled from the source (mirrors
+        // `SpillableHashJoinExec::finish_via_spill`).
+        let combined: RecordBatchStream = Box::pin(
+            stream::iter(flat_batches.into_iter().chain(crossing_batch).map(Ok))
+                .chain(input_stream),
+        );
 
         // Process with partitioning and spilling
-        let (in_memory_partitions, spilled_files) = self
-            .aggregate_with_spilling(input_stream, &spill_dir)
-            .await?;
+        let (mut in_memory_partitions, mut spilled_parts) =
+            self.aggregate_with_spilling(combined, &spill_dir).await?;
         if std::env::var("QE_SPILL_DEBUG").is_ok() {
-            let mem_rows: usize = in_memory_partitions
-                .iter()
-                .flatten()
-                .map(|p| p.batches.iter().map(|b| b.num_rows()).sum::<usize>())
-                .sum();
+            let mem_rows: usize = in_memory_partitions.iter().flatten().map(|p| p.rows).sum();
+            let spilled_rows: usize = spilled_parts.iter().flatten().map(|s| s.rows).sum();
             eprintln!(
-                "[spill-agg] in-memory rows {}, spilled files {}",
+                "[spill-agg] in-memory rows {}, spilled files {} (spilled rows {})",
                 mem_rows,
-                spilled_files.iter().flatten().count()
+                spilled_parts.iter().flatten().count(),
+                spilled_rows
             );
         }
 
@@ -2202,27 +2271,92 @@ impl PhysicalOperator for SpillableHashAggregateExec {
             })
             .collect();
 
+        // Finalize, one partition at a time, under the SAME accounting
+        // discipline task 007 established for the join spill path's hash
+        // tables: BEFORE materializing a partition's read-back + building
+        // its aggregation hash state, price both (raw batch bytes actually
+        // written/held for the partition + `predicted_agg_state_bytes`, the
+        // conservative worst-case-all-unique-groups analogue of
+        // `predicted_hash_table_bytes`) against the same
+        // `memory_limit * spill_threshold` threshold. A partition that
+        // provably cannot fit is aggregated via the chunked
+        // (sub-partitioned) read-back instead
+        // (`aggregate_partition_chunked`, the aggregate analogue of task
+        // 007's chunked read-back in `process_spilled_partition`) — groups
+        // stay whole because sub-partitioning re-hashes the SAME group key
+        // at a finer modulus, so the per-sub aggregation still sees every
+        // row of each of its groups.
+        //
+        // Documented residual constants on top of the threshold: the
+        // not-yet-processed partitions' resident batches (bounded at
+        // ~threshold total by the ingestion loop), one partition's (or
+        // sub-partition's) read-back + aggregation state (bounded at
+        // ~threshold by this gate), and the accumulated output batches
+        // (irreducible — the operator returns a materialized result).
+        let group_cols = self.group_by.len();
+        let n_aggs = self.aggregates.len();
+        let n_distinct = self
+            .aggregates
+            .iter()
+            .filter(|a| {
+                a.distinct || matches!(a.func, crate::planner::AggregateFunction::CountDistinct)
+            })
+            .count();
+
         let mut all_results = Vec::new();
-        for (idx, part) in in_memory_partitions.into_iter().enumerate() {
-            let mut batches: Vec<RecordBatch> = Vec::new();
-            if let Some(path) = &spilled_files[idx] {
-                batches.extend(read_parquet(path)?);
-            }
-            if let Some(part) = part {
-                batches.extend(part.batches);
-            }
-            if batches.is_empty() {
+        for idx in 0..NUM_PARTITIONS {
+            let resident = in_memory_partitions[idx].take();
+            let spilled = spilled_parts[idx].take();
+            let resident_rows = resident.as_ref().map(|p| p.rows).unwrap_or(0);
+            let resident_bytes = resident.as_ref().map(|p| p.memory_bytes).unwrap_or(0);
+            let spilled_rows = spilled.as_ref().map(|s| s.rows).unwrap_or(0);
+            let spilled_bytes = spilled.as_ref().map(|s| s.raw_bytes).unwrap_or(0);
+            let rows = resident_rows + spilled_rows;
+            if rows == 0 {
                 continue;
             }
-            let result = crate::physical::operators::hash_agg::aggregate_batches_external(
-                &batches,
-                &self.group_by,
-                &agg_exprs,
-                &self.schema,
-            )?;
-            if result.num_rows() > 0 {
-                all_results.push(result);
-            }
+            let raw_bytes = resident_bytes + spilled_bytes;
+            let predicted =
+                raw_bytes + predicted_agg_state_bytes(rows, group_cols, n_aggs, n_distinct);
+            // An empty GROUP BY cannot be sub-partitioned (one global group
+            // — every row hashes identically, so a finer modulus would put
+            // everything in one sub anyway); its state is O(1) except for
+            // DISTINCT's value set, which is irreducible without a sorted
+            // spill of the values themselves (documented residual).
+            let result_batches = if !self.group_by.is_empty() && predicted > memory_threshold {
+                self.aggregate_partition_chunked(
+                    idx,
+                    resident,
+                    spilled,
+                    predicted,
+                    memory_threshold,
+                    &spill_dir,
+                    &agg_exprs,
+                )?
+            } else {
+                let mut batches: Vec<RecordBatch> = Vec::new();
+                if let Some(sp) = &spilled {
+                    batches.extend(read_parquet(&sp.file)?);
+                }
+                if let Some(part) = resident {
+                    batches.extend(part.batches);
+                }
+                if batches.is_empty() {
+                    continue;
+                }
+                let result = crate::physical::operators::hash_agg::aggregate_batches_external(
+                    &batches,
+                    &self.group_by,
+                    &agg_exprs,
+                    &self.schema,
+                )?;
+                if result.num_rows() > 0 {
+                    vec![result]
+                } else {
+                    Vec::new()
+                }
+            };
+            all_results.extend(result_batches);
         }
 
         // Clean up spill directory
@@ -2248,17 +2382,78 @@ impl PhysicalOperator for SpillableHashAggregateExec {
 }
 
 impl SpillableHashAggregateExec {
-    /// Process input with hash partitioning and spilling when memory limit is reached
+    /// Evict one aggregate partition's resident batches to its (single,
+    /// incrementally appended) spill file, leaving the partition resident
+    /// and empty so it keeps accumulating in memory afterwards — an
+    /// aggregate re-reads spilled + resident rows TOGETHER at finalize, so
+    /// unlike the join's `evict_build_partition_to_disk` (which retires the
+    /// partition entirely) there is no resident-vs-spilled routing
+    /// dichotomy to maintain here.
+    ///
+    /// oom-safety-hardening task 002: this replaces the old
+    /// `write_batches_to_parquet` + `merge_parquet_files` (read the whole
+    /// existing file + rewrite + rename on EVERY eviction — the same
+    /// O(n²)-in-bytes pattern `append_batch_streaming`'s doc comment
+    /// records being fixed for the join in spill-join-correctness task
+    /// 002) with the join's own open-writer plumbing, reused byte-for-byte:
+    /// one `ArrowWriter` per partition, kept open across the whole
+    /// ingestion phase, each eviction appending O(batch) row groups.
+    fn evict_agg_partition_to_disk(
+        &self,
+        idx: usize,
+        partitions: &mut [Option<AggregatePartition>],
+        spilled: &mut [Option<SpilledAggPartition>],
+        spill_writers: &mut [Option<ArrowWriter<File>>],
+        spill_dir: &Path,
+    ) -> Result<usize> {
+        let Some(part) = partitions[idx].as_mut() else {
+            return Ok(0);
+        };
+        if part.batches.is_empty() {
+            return Ok(0);
+        }
+        let path = spill_dir.join(format!("agg_part_{}.parquet", idx));
+        for b in &part.batches {
+            append_batch_streaming(&mut spill_writers[idx], &path, b)?;
+        }
+        let freed = part.memory_bytes;
+        let rows = part.rows;
+        self.memory_pool.record_spill(freed);
+        let sp = spilled[idx].get_or_insert_with(|| SpilledAggPartition {
+            file: path,
+            rows: 0,
+            raw_bytes: 0,
+        });
+        sp.rows += rows;
+        sp.raw_bytes += freed;
+        part.clear();
+        Ok(freed)
+    }
+
+    /// Process input with hash partitioning and spilling when memory limit
+    /// is reached. Consumes `input_stream` batch by batch — combined with
+    /// `execute()`'s streaming phase-1 reservation this is what keeps the
+    /// spill path's ingestion memory bounded at ~`memory_threshold`
+    /// regardless of input size (oom-safety-hardening task 002).
     async fn aggregate_with_spilling(
         &self,
         mut input_stream: RecordBatchStream,
         spill_dir: &PathBuf,
-    ) -> Result<(Vec<Option<AggregatePartition>>, Vec<Option<PathBuf>>)> {
+    ) -> Result<(
+        Vec<Option<AggregatePartition>>,
+        Vec<Option<SpilledAggPartition>>,
+    )> {
         let mut partitions: Vec<Option<AggregatePartition>> = (0..NUM_PARTITIONS)
             .map(|_| Some(AggregatePartition::new()))
             .collect();
-        let mut spilled_files: Vec<Option<PathBuf>> = (0..NUM_PARTITIONS).map(|_| None).collect();
-        let mut spill_file_counts: Vec<usize> = vec![0; NUM_PARTITIONS];
+        let mut spilled: Vec<Option<SpilledAggPartition>> =
+            (0..NUM_PARTITIONS).map(|_| None).collect();
+        // One incrementally-written Parquet file per spilled partition,
+        // kept OPEN for the whole ingestion phase and closed exactly once
+        // at the end — the join's `build_with_partitioning` plumbing,
+        // reused (see `evict_agg_partition_to_disk`).
+        let mut spill_writers: Vec<Option<ArrowWriter<File>>> =
+            (0..NUM_PARTITIONS).map(|_| None).collect();
 
         let mut total_memory: usize = 0;
         let memory_threshold =
@@ -2271,11 +2466,10 @@ impl SpillableHashAggregateExec {
             // whole budget it could decide nothing — the answer stayed
             // correct but the budget became advisory.
             let mut chunks: Vec<RecordBatch> = Vec::new();
-            const CHUNK_ROWS: usize = 8_192;
-            if big.num_rows() > CHUNK_ROWS {
+            if big.num_rows() > AGG_CHUNK_ROWS {
                 let mut off = 0;
                 while off < big.num_rows() {
-                    let len = CHUNK_ROWS.min(big.num_rows() - off);
+                    let len = AGG_CHUNK_ROWS.min(big.num_rows() - off);
                     chunks.push(big.slice(off, len));
                     off += len;
                 }
@@ -2286,67 +2480,170 @@ impl SpillableHashAggregateExec {
             for batch in chunks {
                 let batch_size = estimate_batch_size(&batch);
 
-                // Check if we need to spill before adding more data
+                // Check if we need to spill before adding more data.
+                //
+                // Ingestion charges resident partitions their BATCH bytes
+                // only — deliberately NOT a predicted-state charge the way
+                // the join's streaming loop charges predicted table bytes
+                // (task 007): during aggregate ingestion no hash/accumulator
+                // state exists yet (partitions hold raw rows), and the
+                // state that eventually materializes at finalize covers
+                // SPILLED rows too, so charging it against residency here
+                // could not bound it. The state cost is priced where it
+                // actually materializes: `execute()`'s finalize gate
+                // (`predicted_agg_state_bytes` + `aggregate_partition_chunked`).
                 if total_memory + batch_size > memory_threshold {
-                    // Find the largest partition to spill
+                    // Spill the largest partition (largest-first, matching
+                    // the join: maximizes freed bytes per eviction).
                     if let Some(idx) = find_largest_agg_partition(&partitions) {
-                        if let Some(ref mut part) = partitions[idx] {
-                            if !part.batches.is_empty() {
-                                // Spill this partition
-                                let spill_path = spill_dir.join(format!(
-                                    "part_{}_{}.parquet",
-                                    idx, spill_file_counts[idx]
-                                ));
-                                spill_file_counts[idx] += 1;
-
-                                write_batches_to_parquet(&spill_path, &part.batches)?;
-                                self.memory_pool.record_spill(part.memory_bytes);
-                                total_memory -= part.memory_bytes;
-
-                                // If we already have a spill file for this partition, merge them
-                                if let Some(ref existing_path) = spilled_files[idx] {
-                                    // Append new file path to a list file or merge
-                                    // For simplicity, we'll just keep the latest and merge on read
-                                    merge_parquet_files(
-                                        existing_path,
-                                        &spill_path,
-                                        spill_dir,
-                                        idx,
-                                    )?;
-                                } else {
-                                    spilled_files[idx] = Some(spill_path);
-                                }
-
-                                part.clear();
-                            }
-                        }
+                        let freed = self.evict_agg_partition_to_disk(
+                            idx,
+                            &mut partitions,
+                            &mut spilled,
+                            &mut spill_writers,
+                            spill_dir,
+                        )?;
+                        total_memory = total_memory.saturating_sub(freed);
                     }
                 }
 
                 // Partition the batch by group key hash
-                let partitioned = partition_batch_by_hash(&batch, &self.group_by, NUM_PARTITIONS)?;
+                let partitioned =
+                    partition_batch_by_group_hash(&batch, &self.group_by, NUM_PARTITIONS)?;
 
                 for (idx, part_batch) in partitioned.into_iter().enumerate() {
                     if let Some(pb) = part_batch {
                         let pb_size = estimate_batch_size(&pb);
-
                         if let Some(ref mut part) = partitions[idx] {
                             part.add_batch(pb);
                             total_memory += pb_size;
-                        } else if let Some(ref spill_path) = spilled_files[idx] {
-                            // Partition was fully spilled, append to spill file
-                            let temp_path = spill_dir
-                                .join(format!("temp_{}_{}.parquet", idx, spill_file_counts[idx]));
-                            spill_file_counts[idx] += 1;
-                            write_batches_to_parquet(&temp_path, &[pb])?;
-                            merge_parquet_files(spill_path, &temp_path, spill_dir, idx)?;
                         }
                     }
                 }
             }
         }
 
-        Ok((partitions, spilled_files))
+        close_spill_writers(spill_writers)?;
+        Ok((partitions, spilled))
+    }
+
+    /// Chunked (sub-partitioned) read-back for one aggregate partition
+    /// whose priced finalize cost (raw batch bytes + predicted aggregation
+    /// state, see `execute()`'s finalize gate) exceeds the memory
+    /// threshold — the aggregate analogue of task 007's chunked read-back
+    /// in the join's `process_spilled_partition`.
+    ///
+    /// A join can chunk its build rows arbitrarily (probing is per-row);
+    /// an aggregate cannot — every row of a group must reach ONE hash
+    /// state. So chunking here is BY GROUP: the partition's rows (spill
+    /// file streamed in `AGG_CHUNK_ROWS` batches, then the resident
+    /// remainder) are re-routed with the SAME group-key hash at modulus
+    /// `NUM_PARTITIONS * fan`. Rows of top-level partition `idx` satisfy
+    /// `hash % NUM_PARTITIONS == idx`, so exactly `fan` residues
+    /// `{idx + NUM_PARTITIONS * j}` occur; sub-partition `j = i /
+    /// NUM_PARTITIONS` therefore holds a group-disjoint subset and each
+    /// sub-aggregation sees every row of each of its groups — the same
+    /// disjointness argument the top-level partitioning already relies on.
+    /// One level only: a sub-partition is aggregated directly (documented
+    /// residual: one sub's real state, targeted at ~threshold by `fan`).
+    #[allow(clippy::too_many_arguments)]
+    fn aggregate_partition_chunked(
+        &self,
+        idx: usize,
+        resident: Option<AggregatePartition>,
+        spilled: Option<SpilledAggPartition>,
+        predicted_bytes: usize,
+        memory_threshold: usize,
+        spill_dir: &Path,
+        agg_exprs: &[crate::physical::operators::hash_agg::AggregateExpr],
+    ) -> Result<Vec<RecordBatch>> {
+        let fan = predicted_bytes
+            .div_ceil(memory_threshold.max(1))
+            .clamp(2, NUM_PARTITIONS);
+        let sub_paths: Vec<PathBuf> = (0..fan)
+            .map(|j| spill_dir.join(format!("agg_sub_{}_{}.parquet", idx, j)))
+            .collect();
+        let mut sub_writers: Vec<Option<ArrowWriter<File>>> = (0..fan).map(|_| None).collect();
+        if std::env::var("QE_SPILL_DEBUG").is_ok() {
+            eprintln!(
+                "[spill-agg] partition {} finalize predicted {} bytes > threshold {} — \
+                 chunked read-back with fan {}",
+                idx, predicted_bytes, memory_threshold, fan
+            );
+        }
+
+        let group_by = &self.group_by;
+        let route =
+            |batch: &RecordBatch, sub_writers: &mut [Option<ArrowWriter<File>>]| -> Result<()> {
+                let pieces = partition_batch_by_group_hash(batch, group_by, NUM_PARTITIONS * fan)?;
+                for (i, pb) in pieces.into_iter().enumerate() {
+                    let Some(pb) = pb else { continue };
+                    if i % NUM_PARTITIONS != idx {
+                        // Would silently split a group across sub-partitions —
+                        // the group-hash must route identically at write time
+                        // and read-back time. Fail loudly instead of ever
+                        // returning wrong aggregates.
+                        return Err(QueryError::Execution(format!(
+                            "aggregate spill sub-partitioning routed rows of partition {} to \
+                         residue {} — group-hash routing diverged across the spill round trip",
+                            idx,
+                            i % NUM_PARTITIONS
+                        )));
+                    }
+                    let j = i / NUM_PARTITIONS;
+                    append_batch_streaming(&mut sub_writers[j], &sub_paths[j], &pb)?;
+                }
+                Ok(())
+            };
+
+        if let Some(sp) = &spilled {
+            // Stream the spill file back in bounded batches — never the
+            // whole partition at once (that materialization is exactly
+            // what this path exists to avoid).
+            let file = File::open(&sp.file).map_err(|e| {
+                QueryError::Execution(format!(
+                    "Failed to open agg spill file {:?}: {}",
+                    sp.file, e
+                ))
+            })?;
+            let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+                .with_batch_size(AGG_CHUNK_ROWS)
+                .build()?;
+            for batch in reader {
+                route(&batch?, &mut sub_writers)?;
+            }
+        }
+        if let Some(part) = resident {
+            for b in &part.batches {
+                route(b, &mut sub_writers)?;
+            }
+        }
+        if let Some(sp) = &spilled {
+            let _ = std::fs::remove_file(&sp.file);
+        }
+        close_spill_writers(sub_writers)?;
+
+        let mut results = Vec::new();
+        for path in &sub_paths {
+            if !path.exists() {
+                continue;
+            }
+            let batches = read_parquet(path)?;
+            let _ = std::fs::remove_file(path);
+            if batches.is_empty() {
+                continue;
+            }
+            let result = crate::physical::operators::hash_agg::aggregate_batches_external(
+                &batches,
+                &self.group_by,
+                agg_exprs,
+                &self.schema,
+            )?;
+            if result.num_rows() > 0 {
+                results.push(result);
+            }
+        }
+        Ok(results)
     }
 }
 
@@ -3217,73 +3514,6 @@ fn find_largest_agg_partition(partitions: &[Option<AggregatePartition>]) -> Opti
         .map(|(idx, _)| idx)
 }
 
-/// Merge two parquet files into one, using streaming to limit memory
-fn merge_parquet_files(
-    existing: &PathBuf,
-    new_file: &PathBuf,
-    spill_dir: &PathBuf,
-    partition_idx: usize,
-) -> Result<()> {
-    // Use a streaming approach: create a new merged file
-    let merged_path = spill_dir.join(format!("merged_{}.parquet", partition_idx));
-
-    // Open readers for both files
-    let file1 = File::open(existing)
-        .map_err(|e| QueryError::Execution(format!("Failed to open file {:?}: {}", existing, e)))?;
-    let file2 = File::open(new_file)
-        .map_err(|e| QueryError::Execution(format!("Failed to open file {:?}: {}", new_file, e)))?;
-
-    let reader1 = ParquetRecordBatchReaderBuilder::try_new(file1)?
-        .with_batch_size(8192)
-        .build()?;
-    let reader2 = ParquetRecordBatchReaderBuilder::try_new(file2)?
-        .with_batch_size(8192)
-        .build()?;
-
-    // Get schema from first file
-    let schema = {
-        let file = File::open(existing)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-        builder.schema().clone()
-    };
-
-    // Create output file
-    let output_file = File::create(&merged_path).map_err(|e| {
-        QueryError::Execution(format!(
-            "Failed to create merged file {:?}: {}",
-            merged_path, e
-        ))
-    })?;
-
-    let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .build();
-
-    let mut writer = ArrowWriter::try_new(output_file, schema, Some(props))?;
-
-    // Stream batches from both files
-    for batch_result in reader1 {
-        let batch = batch_result?;
-        writer.write(&batch)?;
-    }
-
-    for batch_result in reader2 {
-        let batch = batch_result?;
-        writer.write(&batch)?;
-    }
-
-    writer.close()?;
-
-    // Replace existing file with merged file
-    std::fs::rename(&merged_path, existing)
-        .map_err(|e| QueryError::Execution(format!("Failed to rename merged file: {}", e)))?;
-
-    // Remove the new file since it's been merged
-    let _ = std::fs::remove_file(new_file);
-
-    Ok(())
-}
-
 /// Compare two array values at given indices
 fn compare_array_values(
     a: &ArrayRef,
@@ -3385,6 +3615,80 @@ fn partition_batch_by_hash(
         }
     }
 
+    Ok(result)
+}
+
+/// `SpillableHashAggregateExec`'s partition routing (oom-safety-hardening
+/// task 002): the same fixed-seed `hash % num_partitions` loop as
+/// `partition_batch_by_hash`, with ONE aggregate-specific difference — a
+/// `Dictionary`-encoded group-key column is decoded to its value type
+/// before key extraction. `extract_join_key`'s downcast chain has no
+/// Dictionary arm (it falls through to `JoinValue::Null`), which for the
+/// JOIN is merely degenerate routing, but for an aggregate would (a) route
+/// EVERY row of a Dictionary-keyed GROUP BY into one partition (still
+/// correct — groups never split — but the memory bounding this operator
+/// exists for degenerates to nothing) and (b) make the finalize step's
+/// sub-partitioning (`aggregate_partition_chunked`) structurally unable to
+/// split such a partition. Decoding makes the routing value the SAME
+/// string `hash_agg::extract_group_value` resolves a Dictionary key to,
+/// and it is applied identically at ingestion time and read-back time
+/// (Parquet spill files preserve Dictionary via the embedded Arrow
+/// schema), so routing is stable across the spill round trip.
+///
+/// Deliberately a SEPARATE function rather than a change to
+/// `partition_batch_by_hash`: that function is part of the join's
+/// build/probe partition routing, which oom-safety-hardening task 002 is
+/// hard-bounded from touching (the open ~0.34% duplicate-counting bug
+/// lives somewhere in that logic; its routing must stay byte-identical).
+fn partition_batch_by_group_hash(
+    batch: &RecordBatch,
+    group_by: &[Expr],
+    num_partitions: usize,
+) -> Result<Vec<Option<RecordBatch>>> {
+    let key_arrays: Result<Vec<ArrayRef>> = group_by
+        .iter()
+        .map(|e| {
+            let arr = evaluate_expr(batch, e)?;
+            match arr.data_type() {
+                arrow::datatypes::DataType::Dictionary(_, value_type) => {
+                    compute::cast(arr.as_ref(), value_type).map_err(Into::into)
+                }
+                _ => Ok(arr),
+            }
+        })
+        .collect();
+    let key_arrays = key_arrays?;
+
+    let mut partition_indices: Vec<Vec<usize>> = (0..num_partitions).map(|_| Vec::new()).collect();
+    for row in 0..batch.num_rows() {
+        let key = extract_join_key(&key_arrays, row);
+        // Same EXPLICITLY seeded hasher as `partition_batch_by_hash` (see
+        // its comment): routing must give the same answer for the same key
+        // from every call site — including this function called at modulus
+        // `NUM_PARTITIONS` (ingestion) and `NUM_PARTITIONS * fan`
+        // (chunked read-back), whose residues must agree mod NUM_PARTITIONS.
+        let mut hasher = xxhash_rust::xxh64::Xxh64::new(0x517c_c1b7_2722_0a95);
+        key.hash(&mut hasher);
+        let partition = (hasher.finish() as usize) % num_partitions;
+        partition_indices[partition].push(row);
+    }
+
+    let mut result: Vec<Option<RecordBatch>> = Vec::with_capacity(num_partitions);
+    for indices in partition_indices {
+        if indices.is_empty() {
+            result.push(None);
+        } else {
+            let indices_arr =
+                UInt32Array::from(indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
+            let columns: Result<Vec<ArrayRef>> = batch
+                .columns()
+                .iter()
+                .map(|col| compute::take(col.as_ref(), &indices_arr, None).map_err(Into::into))
+                .collect();
+            let part_batch = RecordBatch::try_new(batch.schema(), columns?)?;
+            result.push(Some(part_batch));
+        }
+    }
     Ok(result)
 }
 
@@ -3783,6 +4087,53 @@ fn predicted_hash_table_bytes(rows: usize, key_cols: usize) -> usize {
     let per_row = HASH_TABLE_BUCKET_BYTES_AMORTIZED
         + (std::mem::size_of::<JoinValue>() * key_cols.max(1) + HEAP_ALLOC_OVERHEAD_BYTES)
         + (std::mem::size_of::<HashEntry>() + HEAP_ALLOC_OVERHEAD_BYTES);
+    rows.saturating_mul(per_row)
+}
+
+/// Documented approximation of `hash_agg::AccumulatorState`'s size (private
+/// to `hash_agg.rs`, so not `size_of`-able from here): ~30 fields — counts,
+/// power sums, per-type min/max `Option`s, two `Option<String>`s, an
+/// `Option<HashSet>`, correlation sums, a `Vec` header — land it in the
+/// 350-400B range; 384 is the conservative round-up.
+const AGG_ACCUMULATOR_STATE_BYTES: usize = 384;
+/// `hash_agg::GroupValue` (enum whose largest variant holds a `String`
+/// header): 8B discriminant + 24B String ≈ 32B.
+const AGG_GROUP_VALUE_BYTES: usize = 32;
+/// Amortized hashbrown SET entry for one `GroupValue` in a
+/// `distinct_set: HashSet<GroupValue>`: 32B value + 1 control byte, times
+/// the 8/7 inverse load factor, rounded up to 48 to cover growth slack.
+const AGG_DISTINCT_ENTRY_BYTES: usize = 48;
+
+/// Conservative PREDICTED heap footprint of the `HashMap<GroupKey,
+/// Vec<AccumulatorState>>` (plus DISTINCT value sets) that
+/// `aggregate_batches_external` would build over `rows` rows — the
+/// aggregate analogue of `predicted_hash_table_bytes`, priced the same
+/// worst-case way (task 007's discipline): every row is its own group.
+/// Duplicate-heavy group keys cost LESS than this (shared buckets/states),
+/// so the prediction only ever errs toward the chunked read-back
+/// (`aggregate_partition_chunked`) — the safe direction, whose cost is
+/// bounded extra I/O over one already-spilling partition, never a wrong
+/// answer or an unbudgeted allocation. DISTINCT aggregates additionally
+/// pay a real (not worst-case) per-row set entry — every row inserts into
+/// its group's `distinct_set` regardless of group cardinality — so
+/// `n_distinct` charges per row unconditionally. String contents
+/// (group-key bytes, distinct String values) are NOT predicted here
+/// (unknowable pre-build), mirroring `predicted_hash_table_bytes`'s own
+/// documented String gap.
+fn predicted_agg_state_bytes(
+    rows: usize,
+    group_cols: usize,
+    n_aggs: usize,
+    n_distinct: usize,
+) -> usize {
+    // (GroupKey, Vec<AccumulatorState>) is the same 48-byte
+    // (24B Vec-holding struct + 24B Vec header) map-entry shape as the
+    // join's (JoinKey, Vec<HashEntry>), so the amortized bucket constant
+    // is shared deliberately.
+    let per_group = HASH_TABLE_BUCKET_BYTES_AMORTIZED
+        + (AGG_GROUP_VALUE_BYTES * group_cols.max(1) + HEAP_ALLOC_OVERHEAD_BYTES)
+        + (AGG_ACCUMULATOR_STATE_BYTES * n_aggs.max(1) + HEAP_ALLOC_OVERHEAD_BYTES);
+    let per_row = per_group + n_distinct * AGG_DISTINCT_ENTRY_BYTES;
     rows.saturating_mul(per_row)
 }
 
@@ -5381,5 +5732,400 @@ mod tests {
         );
         drop(join);
         let _ = std::fs::remove_dir_all(&spill_dir);
+    }
+    // ------------------------------------------------------------------
+    // oom-safety-hardening task 002: streaming two-phase reservation +
+    // accounted finalize for SpillableHashAggregateExec.
+    // ------------------------------------------------------------------
+
+    /// Run one SpillableHashAggregateExec over `batches` with the given
+    /// memory limit; returns (sorted rows, spilled bytes recorded by the
+    /// pool). Rows are (group rendered as String, per-agg i64 values).
+    async fn run_agg_collect(
+        batches: Vec<RecordBatch>,
+        schema: SchemaRef,
+        group_by: Vec<Expr>,
+        aggregates: Vec<AggregateExpr>,
+        out_schema: SchemaRef,
+        memory_limit: usize,
+        spill_tag: &str,
+    ) -> (Vec<Vec<String>>, usize) {
+        use futures::TryStreamExt;
+        let input: Arc<dyn PhysicalOperator> = Arc::new(
+            crate::physical::operators::MemoryTableExec::new("t", schema, batches, None),
+        );
+        let spill_path = std::env::temp_dir().join(format!(
+            "qe_spillable_agg_test_{}_{}",
+            spill_tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&spill_path);
+        let pool = crate::execution::create_memory_pool(memory_limit);
+        let config = ExecutionConfig::new()
+            .with_memory_limit(memory_limit)
+            .with_spill_path(spill_path.clone());
+        let agg = SpillableHashAggregateExec::new(
+            input,
+            group_by,
+            aggregates,
+            out_schema,
+            pool.clone(),
+            config,
+        );
+        let mut stream = agg.execute(0).await.unwrap();
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        while let Some(b) = stream.try_next().await.unwrap() {
+            for r in 0..b.num_rows() {
+                let mut row = Vec::with_capacity(b.num_columns());
+                for c in b.columns() {
+                    row.push(render_cell(c, r));
+                }
+                rows.push(row);
+            }
+        }
+        rows.sort();
+        let spilled = pool.spilled();
+        let _ = std::fs::remove_dir_all(&spill_path);
+        (rows, spilled)
+    }
+
+    fn render_cell(col: &ArrayRef, row: usize) -> String {
+        use arrow::array::Array;
+        if col.is_null(row) {
+            return "NULL".to_string();
+        }
+        if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+            return a.value(row).to_string();
+        }
+        if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+            return a.value(row).to_string();
+        }
+        if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
+            return format!("{:.6}", a.value(row));
+        }
+        panic!("render_cell: unhandled type {:?}", col.data_type());
+    }
+
+    /// Cell-exact: a Dictionary(Int32, Utf8)-keyed GROUP BY with a DISTINCT
+    /// aggregate (fused-streaming-INELIGIBLE by construction, so execution
+    /// takes the streaming two-phase reservation path) must return results
+    /// byte-identical to an unlimited-memory run when forced through the
+    /// spill path — including the chunked (sub-partitioned) finalize, which
+    /// the tiny limit's predicted-state gate necessarily trips. Covers the
+    /// Dictionary spill round trip (Parquet preserves the Dictionary type
+    /// via the embedded Arrow schema) and the dictionary-decoded group-hash
+    /// routing staying stable across write/read-back.
+    #[tokio::test]
+    async fn agg_spill_dictionary_group_by_cell_exact_vs_in_memory() {
+        use arrow::array::{DictionaryArray, Int32Array};
+        use arrow::datatypes::{DataType, Field, Int32Type, Schema};
+
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", dict_type, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let values = StringArray::from(
+            (0..40)
+                .map(|i| format!("group_{:02}", i))
+                .collect::<Vec<_>>(),
+        );
+        let mut batches = Vec::new();
+        let n_batches = 24usize;
+        let rows_per_batch = 8_192usize;
+        for b in 0..n_batches {
+            let start = (b * rows_per_batch) as i64;
+            let keys = Int32Array::from(
+                (0..rows_per_batch)
+                    .map(|i| (i % 40) as i32)
+                    .collect::<Vec<_>>(),
+            );
+            let dict: DictionaryArray<Int32Type> =
+                DictionaryArray::try_new(keys, Arc::new(values.clone())).unwrap();
+            let ids: Vec<i64> = (start..start + rows_per_batch as i64).collect();
+            let vals: Vec<i64> = ids.iter().map(|i| i % 91).collect();
+            batches.push(
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(dict),
+                        Arc::new(Int64Array::from(ids)),
+                        Arc::new(Int64Array::from(vals)),
+                    ],
+                )
+                .unwrap(),
+            );
+        }
+
+        let group_by = vec![Expr::column("g")];
+        let aggregates = vec![
+            AggregateExpr {
+                func: crate::planner::AggregateFunction::CountDistinct,
+                input: Expr::column("id"),
+                distinct: true,
+                second_arg: None,
+            },
+            AggregateExpr {
+                func: crate::planner::AggregateFunction::Sum,
+                input: Expr::column("v"),
+                distinct: false,
+                second_arg: None,
+            },
+        ];
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Utf8, false),
+            Field::new("cnt", DataType::Int64, true),
+            Field::new("sum_v", DataType::Int64, true),
+        ]));
+
+        let (baseline, base_spilled) = run_agg_collect(
+            batches.clone(),
+            schema.clone(),
+            group_by.clone(),
+            aggregates.clone(),
+            out_schema.clone(),
+            8 * 1024 * 1024 * 1024,
+            "dict_base",
+        )
+        .await;
+        let (spilled_rows, spilled_bytes) = run_agg_collect(
+            batches,
+            schema,
+            group_by,
+            aggregates,
+            out_schema,
+            256 * 1024,
+            "dict_spill",
+        )
+        .await;
+
+        assert_eq!(base_spilled, 0, "unlimited run must not spill");
+        assert!(
+            spilled_bytes > 0,
+            "256KB limit over ~4MB of input must force a spill"
+        );
+        assert_eq!(baseline.len(), 40, "expected exactly 40 groups");
+        assert_eq!(
+            baseline, spilled_rows,
+            "spilled Dictionary-keyed aggregate must be byte-identical to the in-memory run"
+        );
+    }
+
+    /// Cell-exact through the chunked (sub-partitioned) finalize with a
+    /// plain Int64 group key: high group cardinality + COUNT(DISTINCT)
+    /// makes the per-partition predicted state cross the tiny threshold,
+    /// so every partition takes `aggregate_partition_chunked`; groups whose
+    /// rows straddle the resident/spilled boundary AND multiple read-back
+    /// batches must still aggregate exactly once each (the aggregate
+    /// analogue of the join's chunk-straddling duplicate-key test).
+    #[tokio::test]
+    async fn agg_spill_chunked_finalize_high_cardinality_cell_exact() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Int64, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let mut batches = Vec::new();
+        let n_batches = 25usize;
+        let rows_per_batch = 8_192usize;
+        for b in 0..n_batches {
+            let start = (b * rows_per_batch) as i64;
+            let ids: Vec<i64> = (start..start + rows_per_batch as i64).collect();
+            let groups: Vec<i64> = ids.iter().map(|i| i % 997).collect();
+            let vals: Vec<i64> = ids.iter().map(|i| i % 13).collect();
+            batches.push(
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(groups)),
+                        Arc::new(Int64Array::from(ids)),
+                        Arc::new(Int64Array::from(vals)),
+                    ],
+                )
+                .unwrap(),
+            );
+        }
+        let total_rows = (n_batches * rows_per_batch) as i64;
+
+        let group_by = vec![Expr::column("g")];
+        let aggregates = vec![
+            AggregateExpr {
+                func: crate::planner::AggregateFunction::CountDistinct,
+                input: Expr::column("id"),
+                distinct: true,
+                second_arg: None,
+            },
+            AggregateExpr {
+                func: crate::planner::AggregateFunction::Sum,
+                input: Expr::column("v"),
+                distinct: false,
+                second_arg: None,
+            },
+        ];
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Int64, false),
+            Field::new("cnt", DataType::Int64, true),
+            Field::new("sum_v", DataType::Int64, true),
+        ]));
+
+        let (baseline, _) = run_agg_collect(
+            batches.clone(),
+            schema.clone(),
+            group_by.clone(),
+            aggregates.clone(),
+            out_schema.clone(),
+            8 * 1024 * 1024 * 1024,
+            "chunk_base",
+        )
+        .await;
+        let (spilled_rows, spilled_bytes) = run_agg_collect(
+            batches,
+            schema,
+            group_by,
+            aggregates,
+            out_schema,
+            256 * 1024,
+            "chunk_spill",
+        )
+        .await;
+
+        assert!(spilled_bytes > 0, "tiny limit must force a spill");
+        assert_eq!(baseline.len(), 997, "expected exactly 997 groups");
+        // Self-consistency: all ids are unique, so the distinct counts must
+        // sum to the total row count — a duplication or loss across the
+        // sub-partition boundary breaks this even if both runs drifted.
+        let count_sum: i64 = baseline.iter().map(|r| r[1].parse::<i64>().unwrap()).sum();
+        assert_eq!(count_sum, total_rows);
+        assert_eq!(
+            baseline, spilled_rows,
+            "chunked-finalize aggregate must be byte-identical to the in-memory run"
+        );
+    }
+
+    /// The chunked finalize's group-disjointness rests on this invariant:
+    /// routing the same rows at modulus NUM_PARTITIONS (ingestion) and
+    /// NUM_PARTITIONS * fan (sub-partitioning) must agree mod
+    /// NUM_PARTITIONS for every row — same fixed-seed hash, coarser vs
+    /// finer modulus.
+    #[test]
+    fn group_hash_routing_consistent_across_fanout() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let keys: Vec<i64> = (0..10_000).map(|i| i * 2654435761i64 % 5_000).collect();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(keys))]).unwrap();
+        let exprs = vec![Expr::column("k")];
+
+        let coarse = partition_batch_by_group_hash(&batch, &exprs, NUM_PARTITIONS).unwrap();
+        let mut key_to_coarse: HashMap<i64, usize> = HashMap::new();
+        for (idx, piece) in coarse.iter().enumerate() {
+            let Some(piece) = piece else { continue };
+            let col = piece
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for r in 0..piece.num_rows() {
+                key_to_coarse.insert(col.value(r), idx);
+            }
+        }
+
+        let fan = 7usize;
+        let fine = partition_batch_by_group_hash(&batch, &exprs, NUM_PARTITIONS * fan).unwrap();
+        let mut nonempty_fine = 0usize;
+        for (i, piece) in fine.iter().enumerate() {
+            let Some(piece) = piece else { continue };
+            nonempty_fine += 1;
+            let col = piece
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for r in 0..piece.num_rows() {
+                assert_eq!(
+                    key_to_coarse[&col.value(r)],
+                    i % NUM_PARTITIONS,
+                    "fine residue must agree with coarse routing mod NUM_PARTITIONS"
+                );
+            }
+        }
+        assert!(nonempty_fine > NUM_PARTITIONS, "fanout must actually split");
+    }
+
+    /// A Dictionary-encoded group key must route by its decoded VALUE (and
+    /// therefore spread across partitions), identically to the same data as
+    /// plain Utf8 — not fall through `extract_join_key`'s downcast chain to
+    /// a constant Null key that lands every row in one partition.
+    #[test]
+    fn group_hash_routing_splits_dictionary_group_keys() {
+        use arrow::array::{DictionaryArray, Int32Array};
+        use arrow::datatypes::{DataType, Field, Int32Type, Schema};
+
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let schema = Arc::new(Schema::new(vec![Field::new("g", dict_type, false)]));
+        let values = StringArray::from(
+            (0..40)
+                .map(|i| format!("group_{:02}", i))
+                .collect::<Vec<_>>(),
+        );
+        let keys = Int32Array::from((0..4_000).map(|i| (i % 40) as i32).collect::<Vec<_>>());
+        let dict: DictionaryArray<Int32Type> =
+            DictionaryArray::try_new(keys, Arc::new(values)).unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(dict)]).unwrap();
+        let exprs = vec![Expr::column("g")];
+
+        let routed = partition_batch_by_group_hash(&batch, &exprs, NUM_PARTITIONS).unwrap();
+        let nonempty = routed.iter().flatten().count();
+        assert!(
+            nonempty > 1,
+            "40 distinct dictionary values must spread across partitions, got {}",
+            nonempty
+        );
+
+        // And identically to the decoded plain-Utf8 rendering of the same data.
+        let plain_schema = Arc::new(Schema::new(vec![Field::new("g", DataType::Utf8, false)]));
+        let plain = StringArray::from(
+            (0..4_000)
+                .map(|i| format!("group_{:02}", i % 40))
+                .collect::<Vec<_>>(),
+        );
+        let plain_batch = RecordBatch::try_new(plain_schema, vec![Arc::new(plain)]).unwrap();
+        let routed_plain =
+            partition_batch_by_group_hash(&plain_batch, &exprs, NUM_PARTITIONS).unwrap();
+        let counts: Vec<usize> = routed
+            .iter()
+            .map(|p| p.as_ref().map(|b| b.num_rows()).unwrap_or(0))
+            .collect();
+        let counts_plain: Vec<usize> = routed_plain
+            .iter()
+            .map(|p| p.as_ref().map(|b| b.num_rows()).unwrap_or(0))
+            .collect();
+        assert_eq!(
+            counts, counts_plain,
+            "dictionary and plain encodings of the same values must route identically"
+        );
+    }
+
+    /// The aggregate-state prediction must stay conservative (per-row cost
+    /// at least covers the map-entry shape) and monotonic in every input,
+    /// with DISTINCT charging strictly more — mirroring
+    /// `predicted_hash_table_bytes_is_conservative_for_duplicate_keys`'s
+    /// role for the join prediction.
+    #[test]
+    fn predicted_agg_state_bytes_is_conservative_and_monotonic() {
+        let base = predicted_agg_state_bytes(1_000, 1, 1, 0);
+        // At minimum the map-entry bucket + one accumulator per row.
+        assert!(base >= 1_000 * (HASH_TABLE_BUCKET_BYTES_AMORTIZED + AGG_ACCUMULATOR_STATE_BYTES));
+        assert!(predicted_agg_state_bytes(2_000, 1, 1, 0) > base);
+        assert!(predicted_agg_state_bytes(1_000, 2, 1, 0) > base);
+        assert!(predicted_agg_state_bytes(1_000, 1, 2, 0) > base);
+        assert!(
+            predicted_agg_state_bytes(1_000, 1, 1, 1) >= base + 1_000 * AGG_DISTINCT_ENTRY_BYTES
+        );
+        // Zero-arg floors: a global aggregate (0 group cols) still prices
+        // its single group's state per row (worst case).
+        assert!(predicted_agg_state_bytes(1_000, 0, 0, 0) > 0);
     }
 }
