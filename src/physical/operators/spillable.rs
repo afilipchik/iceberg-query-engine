@@ -353,8 +353,23 @@ enum BuildDecision {
     /// `spilled[..].build_file` stays valid — it is removed exactly once,
     /// in `Drop`, not at the end of every `execute_spill_path` call (see
     /// that function's own comment).
+    ///
+    /// oom-safety-hardening task 007: `tables` are the in-memory
+    /// partitions' join hash tables, built ONCE by
+    /// `build_with_partitioning`'s hash-table budgeting pass under DIRECT
+    /// memory accounting (`hash_table_memory_bytes`) — the resident set's
+    /// batches PLUS tables together fit under `memory_limit *
+    /// spill_threshold` by construction, with partitions evicted to disk
+    /// when the running total would cross it. Memoizing them here (rather
+    /// than rebuilding per `execute_spill_path` call, as before) means the
+    /// bound holds for the operator's whole lifetime and a repeat
+    /// execution never re-pays the build. Before this task these tables
+    /// were rebuilt per call with ZERO accounting at ~10-20x the batch
+    /// bytes the spill decision budgeted (task 001's root-caused hole:
+    /// measured 15-24x budget overshoot, ≥7.3GB at a 500MB budget).
     Spill {
         partitions: Vec<Option<BuildPartition>>,
+        tables: Vec<Option<HashMap<JoinKey, Vec<HashEntry>>>>,
         spilled: Vec<Option<SpilledPartition>>,
         spill_dir: PathBuf,
     },
@@ -578,6 +593,7 @@ impl PhysicalOperator for SpillableHashJoinExec {
             }
             BuildDecision::Spill {
                 partitions,
+                tables,
                 spilled,
                 spill_dir,
             } => {
@@ -585,7 +601,7 @@ impl PhysicalOperator for SpillableHashJoinExec {
                 if partition > 0 {
                     return Ok(Box::pin(stream::empty()));
                 }
-                self.execute_spill_path(partitions, spilled, spill_dir, probe_side, swapped)
+                self.execute_spill_path(partitions, tables, spilled, spill_dir, probe_side, swapped)
                     .await
             }
         }
@@ -688,12 +704,13 @@ impl SpillableHashJoinExec {
         let combined: RecordBatchStream =
             Box::pin(stream::iter(prefix.into_iter().map(Ok)).chain(rest));
 
-        let (partitions, spilled) = self
+        let (partitions, tables, spilled) = self
             .build_with_partitioning(combined, build_keys, &spill_dir)
             .await?;
 
         Ok(BuildDecision::Spill {
             partitions,
+            tables,
             spilled,
             spill_dir,
         })
@@ -839,6 +856,7 @@ impl SpillableHashJoinExec {
     async fn execute_spill_path(
         &self,
         partitions: &[Option<BuildPartition>],
+        hash_tables: &[Option<HashMap<JoinKey, Vec<HashEntry>>>],
         spilled_partitions: &[Option<SpilledPartition>],
         spill_dir: &PathBuf,
         probe_side: &Arc<dyn PhysicalOperator>,
@@ -859,20 +877,15 @@ impl SpillableHashJoinExec {
         let build_keys = if swapped { &on_right } else { &on_left };
         let probe_keys = if swapped { &on_left } else { &on_right };
 
-        // Build hash tables for in-memory partitions. Cheap to redo per
-        // call (rehashing already-resident batches); the batches
-        // themselves are borrowed from the memoized decision, never
-        // recollected or rewritten to disk again.
-        let mut hash_tables: Vec<Option<HashMap<JoinKey, Vec<HashEntry>>>> =
-            (0..NUM_PARTITIONS).map(|_| None).collect();
-        for (idx, part) in partitions.iter().enumerate() {
-            if let Some(p) = part {
-                if !p.batches.is_empty() {
-                    let table = build_hash_table(&p.batches, build_keys)?;
-                    hash_tables[idx] = Some(table);
-                }
-            }
-        }
+        // oom-safety-hardening task 007: the in-memory partitions' hash
+        // tables are NO LONGER built here. They are built exactly once, in
+        // `build_with_partitioning`'s hash-table budgeting pass, under
+        // direct memory accounting (resident batches + measured table
+        // bytes <= memory_threshold, partitions evicted when the total
+        // would cross), and memoized in the build decision alongside the
+        // batches they index. This function's old unbudgeted rebuild loop
+        // was task 001's root-caused accounting hole (~10-20x the batch
+        // bytes the spill decision budgeted, measured 15-24x overshoot).
 
         if sj_trace {
             let in_mem_parts = partitions.iter().filter(|p| p.is_some()).count();
@@ -916,7 +929,7 @@ impl SpillableHashJoinExec {
                 probe_stream,
                 probe_keys,
                 partitions,
-                &hash_tables,
+                hash_tables,
                 spilled_partitions,
                 spill_dir,
                 swapped,
@@ -1019,12 +1032,17 @@ impl SpillableHashJoinExec {
         Ok(freed)
     }
 
+    #[allow(clippy::type_complexity)]
     async fn build_with_partitioning(
         &self,
         mut build_stream: RecordBatchStream,
         build_keys: &[Expr],
         spill_dir: &PathBuf,
-    ) -> Result<(Vec<Option<BuildPartition>>, Vec<Option<SpilledPartition>>)> {
+    ) -> Result<(
+        Vec<Option<BuildPartition>>,
+        Vec<Option<HashMap<JoinKey, Vec<HashEntry>>>>,
+        Vec<Option<SpilledPartition>>,
+    )> {
         // spill-join-correctness-2 epic, task 001: checked once per call,
         // matching this file's own established convention (no `OnceLock`
         // caching, re-read fresh — see `gpu.rs`'s `QE_GPU_DEBUG` precedent).
@@ -1110,8 +1128,157 @@ impl SpillableHashJoinExec {
             }
         }
 
+        // oom-safety-hardening task 007: hash-table budgeting pass. The
+        // streaming loop above bounded resident BATCH bytes at
+        // `memory_threshold`, but the join hash tables built over those
+        // same rows cost ~10-20x the batch bytes (task 001's root-caused
+        // accounting hole — the tables were previously built later, in
+        // `execute_spill_path`, with zero accounting, measured at 15-24x
+        // the configured budget). Build the tables HERE, while
+        // `partitions`/`spilled`/`spill_writers` are still mutable, under
+        // direct accounting: resident batch bytes + measured table bytes
+        // must stay under the SAME `memory_threshold`, with partitions
+        // evicted to disk (the existing eviction mechanism, byte-for-byte)
+        // when the running total would cross it.
+        let tables = self.budget_partition_hash_tables(
+            &mut partitions,
+            &mut spilled,
+            &mut spill_writers,
+            spill_dir,
+            build_keys,
+            sj_trace,
+        )?;
+
         close_spill_writers(spill_writers)?;
-        Ok((partitions, spilled))
+        Ok((partitions, tables, spilled))
+    }
+
+    /// oom-safety-hardening task 007: decide which resident build
+    /// partitions may keep an in-memory join hash table, under DIRECT
+    /// memory accounting, evicting the rest to disk.
+    ///
+    /// The running total starts at the sum of all resident partitions'
+    /// batch bytes (what `build_with_partitioning`'s streaming loop
+    /// already bounded) and must never cross `memory_limit *
+    /// spill_threshold` — the same formula every other spill decision in
+    /// this file uses. Per resident partition, largest first (keeping the
+    /// largest resident minimizes both spill I/O and the biggest
+    /// per-partition transient read-back cost later):
+    ///
+    /// 1. a conservative PREDICTED table cost
+    ///    (`predicted_hash_table_bytes`, worst-case all-unique keys) gates
+    ///    whether the table is even built — so a table that provably
+    ///    cannot fit is never materialized at all;
+    /// 2. if built, the table's REAL footprint is measured
+    ///    (`hash_table_memory_bytes` — real capacity, real per-key Vec
+    ///    buffers, real String bytes) and charged against the budget; a
+    ///    measured crossing (possible when the prediction under-counts,
+    ///    e.g. long String keys) drops the table and evicts the partition,
+    ///    bounding the transient overshoot at one partition's table.
+    ///
+    /// Eviction reuses `evict_build_partition_to_disk` unchanged (same
+    /// writer, same spill files, same checksum path), so probe routing is
+    /// untouched: an evicted partition simply becomes one more
+    /// `SpilledPartition`, exactly as if the streaming loop's own
+    /// memory-pressure eviction had chosen it.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn budget_partition_hash_tables(
+        &self,
+        partitions: &mut [Option<BuildPartition>],
+        spilled: &mut [Option<SpilledPartition>],
+        spill_writers: &mut [Option<ArrowWriter<File>>],
+        spill_dir: &PathBuf,
+        build_keys: &[Expr],
+        sj_trace: bool,
+    ) -> Result<Vec<Option<HashMap<JoinKey, Vec<HashEntry>>>>> {
+        let memory_threshold =
+            (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
+        let mut tables: Vec<Option<HashMap<JoinKey, Vec<HashEntry>>>> =
+            (0..NUM_PARTITIONS).map(|_| None).collect();
+
+        // Resident batch bytes are already in memory and stay charged for
+        // the operator's lifetime (memoized in the build decision).
+        let mut running: usize = partitions
+            .iter()
+            .flatten()
+            .map(|p| p.memory_bytes)
+            .sum::<usize>();
+        let mut table_bytes_total: usize = 0;
+        let mut evicted_for_tables = 0usize;
+
+        let mut order: Vec<usize> = (0..partitions.len())
+            .filter(|&i| {
+                partitions[i]
+                    .as_ref()
+                    .is_some_and(|p| !p.batches.is_empty())
+            })
+            .collect();
+        order.sort_by_key(|&i| {
+            std::cmp::Reverse(partitions[i].as_ref().map(|p| p.memory_bytes).unwrap_or(0))
+        });
+
+        for idx in order {
+            let rows: usize = partitions[idx]
+                .as_ref()
+                .map(|p| p.batches.iter().map(|b| b.num_rows()).sum())
+                .unwrap_or(0);
+            let predicted = predicted_hash_table_bytes(rows, build_keys.len());
+            if running + predicted > memory_threshold {
+                running = running.saturating_sub(self.evict_build_partition_to_disk(
+                    idx,
+                    partitions,
+                    spilled,
+                    spill_writers,
+                    spill_dir,
+                    build_keys,
+                    sj_trace,
+                )?);
+                evicted_for_tables += 1;
+                continue;
+            }
+            let table = build_hash_table(
+                &partitions[idx]
+                    .as_ref()
+                    .expect("resident partition filtered above")
+                    .batches,
+                build_keys,
+            )?;
+            let actual = hash_table_memory_bytes(&table);
+            if running + actual > memory_threshold {
+                drop(table);
+                running = running.saturating_sub(self.evict_build_partition_to_disk(
+                    idx,
+                    partitions,
+                    spilled,
+                    spill_writers,
+                    spill_dir,
+                    build_keys,
+                    sj_trace,
+                )?);
+                evicted_for_tables += 1;
+                continue;
+            }
+            running += actual;
+            table_bytes_total += actual;
+            tables[idx] = Some(table);
+        }
+
+        if sj_trace {
+            let resident = tables.iter().filter(|t| t.is_some()).count();
+            let resident_batch_bytes: usize =
+                partitions.iter().flatten().map(|p| p.memory_bytes).sum();
+            eprintln!(
+                "[sj-trace] budget_partition_hash_tables resident_partitions={} table_bytes={} batch_bytes={} running_total={} threshold={} evicted_for_table_budget={}",
+                resident,
+                table_bytes_total,
+                resident_batch_bytes,
+                running,
+                memory_threshold,
+                evicted_for_tables
+            );
+        }
+
+        Ok(tables)
     }
 
     async fn probe_with_spilling(
@@ -1236,9 +1403,6 @@ impl SpillableHashJoinExec {
             }
         }
 
-        // Build hash table
-        let hash_table = build_hash_table(&build_batches, build_keys)?;
-
         // Read probe side from disk (if exists)
         let probe_batches = if let Some(probe_path) = probe_file {
             read_parquet(probe_path)?
@@ -1272,17 +1436,65 @@ impl SpillableHashJoinExec {
             }
         }
 
-        // Probe
-        probe_partition(
-            &build_batches,
-            &probe_batches,
-            &hash_table,
-            probe_keys,
-            self.join_type,
-            swapped,
-            &self.schema,
-            self.retained.as_deref(),
-        )
+        // oom-safety-hardening task 007: build the read-back partition's
+        // hash table in CHUNKS of whole batches sized so the PREDICTED
+        // table cost stays under `memory_limit * spill_threshold`, probing
+        // the full probe set per chunk and dropping each chunk's table
+        // before building the next. This bounds the previously-unbudgeted
+        // per-read-back table (task 001's second unbudgeted call site) at
+        // ~one threshold's worth of transient table instead of the whole
+        // partition's rows x ~136B. Correctness: the spill path accepts
+        // ONLY INNER joins (`finish_via_spill` refuses everything else),
+        // and chunks partition the build rows disjointly, so each
+        // (build row, probe row) match pair is emitted exactly once and
+        // the union over chunks equals the single-table result. Probe
+        // routing and `probe_partition` itself are untouched.
+        let memory_threshold =
+            (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
+        let key_cols = build_keys.len();
+        let mut results: Vec<RecordBatch> = Vec::new();
+        let mut chunk_start = 0usize;
+        let mut chunk_count = 0usize;
+        while chunk_start < build_batches.len() {
+            let mut chunk_end = chunk_start;
+            let mut chunk_rows = 0usize;
+            while chunk_end < build_batches.len() {
+                let next_rows = chunk_rows + build_batches[chunk_end].num_rows();
+                // Always take at least one batch per chunk, then stop
+                // BEFORE the predicted table cost would cross the budget.
+                if chunk_end > chunk_start
+                    && predicted_hash_table_bytes(next_rows, key_cols) > memory_threshold
+                {
+                    break;
+                }
+                chunk_rows = next_rows;
+                chunk_end += 1;
+            }
+            let chunk = &build_batches[chunk_start..chunk_end];
+            let hash_table = build_hash_table(chunk, build_keys)?;
+            results.extend(probe_partition(
+                chunk,
+                &probe_batches,
+                &hash_table,
+                probe_keys,
+                self.join_type,
+                swapped,
+                &self.schema,
+                self.retained.as_deref(),
+            )?);
+            chunk_count += 1;
+            chunk_start = chunk_end;
+        }
+        if sj_trace && chunk_count > 1 {
+            eprintln!(
+                "[sj-trace] process_spilled_partition idx={} build table chunked: {} chunks over {} batches (table budget {})",
+                idx,
+                chunk_count,
+                build_batches.len(),
+                memory_threshold
+            );
+        }
+        Ok(results)
     }
 }
 
@@ -3491,6 +3703,79 @@ fn batch_key_checksum(batch: &RecordBatch, key_exprs: &[Expr]) -> Result<KeyChec
     Ok(cs)
 }
 
+/// Approximate per-heap-allocation bookkeeping overhead (allocator bin
+/// rounding + header amortization under mimalloc). Every 1-element
+/// `Vec<JoinValue>` / `Vec<HashEntry>` a join hash table holds is its own
+/// heap allocation, so at millions of keys this overhead is a first-order
+/// term, not noise — oom-safety-hardening task 001's profiler evidence
+/// measured ~300MB of exactly these untracked small allocations at the
+/// dict repro's 640MB peak.
+const HEAP_ALLOC_OVERHEAD_BYTES: usize = 16;
+
+/// Amortized hashbrown bucket cost per OCCUPIED entry for
+/// `HashMap<JoinKey, Vec<HashEntry>>`: `size_of::<(JoinKey,
+/// Vec<HashEntry>)>() = 48` plus 1 control byte, times hashbrown's 8/7
+/// inverse load factor ≈ 56 bytes. Used by the PREDICTED (pre-build)
+/// estimate; the post-build measurement uses the table's real `capacity()`
+/// instead.
+const HASH_TABLE_BUCKET_BYTES_AMORTIZED: usize =
+    (std::mem::size_of::<(JoinKey, Vec<HashEntry>)>() + 1) * 8 / 7;
+
+/// Conservative PREDICTED heap footprint of the `HashMap<JoinKey,
+/// Vec<HashEntry>>` that `build_hash_table` would produce over `rows` rows
+/// with `key_cols` join-key columns — the worst (all-unique-keys) case,
+/// which is exactly the shape both oom-safety-hardening repros (and any
+/// PK-keyed build side) hit. Per row:
+///   ~56B amortized hashbrown bucket
+/// + key-values `Vec<JoinValue>` heap buffer (`key_cols` × 32B + overhead)
+/// + entries `Vec<HashEntry>` heap buffer (16B + overhead)
+/// ≈ 136B/row for a single-column key — vs the ~12B/row of raw batch data
+/// `estimate_batch_size` accounts, i.e. the measured 10-20x amplification
+/// task 001 root-caused. Duplicate-heavy key sets cost LESS than this
+/// (shared buckets/entry vecs), so the prediction only ever errs toward
+/// spilling more readily — the safe direction. String keys' character
+/// bytes are NOT predicted here (unknowable pre-build); the post-build
+/// `hash_table_memory_bytes` measurement catches them, at the cost of one
+/// partition table's transient overshoot.
+fn predicted_hash_table_bytes(rows: usize, key_cols: usize) -> usize {
+    let per_row = HASH_TABLE_BUCKET_BYTES_AMORTIZED
+        + (std::mem::size_of::<JoinValue>() * key_cols.max(1) + HEAP_ALLOC_OVERHEAD_BYTES)
+        + (std::mem::size_of::<HashEntry>() + HEAP_ALLOC_OVERHEAD_BYTES);
+    rows.saturating_mul(per_row)
+}
+
+/// DIRECT measurement of a built join hash table's heap footprint: the
+/// hashbrown bucket array at its REAL `capacity()`, plus every key's
+/// `Vec<JoinValue>` buffer (and any `String` key's character buffer), plus
+/// every entry list's `Vec<HashEntry>` buffer, each with
+/// `HEAP_ALLOC_OVERHEAD_BYTES` of allocator overhead. O(keys) walk —
+/// negligible next to the O(rows) build that produced the table. This is
+/// the number the spill path's memory accounting charges against the
+/// budget (oom-safety-hardening task 007); `estimate_batch_size` only ever
+/// covered the batches underneath.
+fn hash_table_memory_bytes(table: &HashMap<JoinKey, Vec<HashEntry>>) -> usize {
+    let bucket_bytes = std::mem::size_of::<(JoinKey, Vec<HashEntry>)>() + 1;
+    let mut total = table.capacity().saturating_mul(bucket_bytes);
+    for (key, entries) in table.iter() {
+        if key.values.capacity() > 0 {
+            total += key.values.capacity() * std::mem::size_of::<JoinValue>()
+                + HEAP_ALLOC_OVERHEAD_BYTES;
+        }
+        for v in &key.values {
+            if let JoinValue::String(s) = v {
+                if s.capacity() > 0 {
+                    total += s.capacity() + HEAP_ALLOC_OVERHEAD_BYTES;
+                }
+            }
+        }
+        if entries.capacity() > 0 {
+            total +=
+                entries.capacity() * std::mem::size_of::<HashEntry>() + HEAP_ALLOC_OVERHEAD_BYTES;
+        }
+    }
+    total
+}
+
 fn build_hash_table(
     batches: &[RecordBatch],
     key_exprs: &[Expr],
@@ -4788,4 +5073,271 @@ mod tests {
     // (thousands of trials; see that file's own module doc comment and
     // this task's Outcome in `003.md` for real run counts/results) than
     // any single unit test would exercise anyway.
+
+    // ------------------------------------------------------------------
+    // oom-safety-hardening task 007: join spill-path hash-table budgeting
+    // ------------------------------------------------------------------
+
+    fn int64_key_batch(schema: &SchemaRef, ids: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(ids))]).unwrap()
+    }
+
+    /// The sizing helpers must reflect the REAL ~10-20x table-over-batch
+    /// amplification task 001 measured (~120-200B/row for unique Int64
+    /// keys vs ~12B/row of batch data), or the budgeting they drive is
+    /// fiction. Bounds are deliberately loose (allocator/capacity
+    /// granularity varies) but strict enough that a regression to "tables
+    /// cost roughly what batches cost" fails loudly.
+    #[test]
+    fn hash_table_sizing_reflects_real_amplification() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let rows: usize = 10_000;
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = int64_key_batch(&schema, (0..rows as i64).collect());
+        let table = build_hash_table(&[batch.clone()], &[Expr::column("id")]).unwrap();
+        assert_eq!(table.len(), rows);
+
+        let measured = hash_table_memory_bytes(&table);
+        let predicted = predicted_hash_table_bytes(rows, 1);
+        let batch_bytes = estimate_batch_size(&batch);
+
+        // Real per-row cost band from task 001's profiler evidence.
+        assert!(
+            measured >= rows * 100 && measured <= rows * 300,
+            "measured {} bytes for {} unique keys ({}B/row) — outside the \
+             100-300B/row band the real allocations occupy",
+            measured,
+            rows,
+            measured / rows
+        );
+        assert!(
+            predicted >= rows * 100 && predicted <= rows * 200,
+            "predicted {}B/row outside 100-200B/row",
+            predicted / rows
+        );
+        // The amplification the budget must account for: table >= 8x the
+        // batch bytes the old accounting covered.
+        assert!(
+            measured >= batch_bytes * 8,
+            "measured table bytes ({measured}) should be many times the \
+             batch bytes ({batch_bytes})"
+        );
+    }
+
+    /// Duplicate-heavy keys must cost LESS than the all-unique prediction
+    /// (shared buckets/entry vecs) — the prediction only ever errs toward
+    /// spilling more readily, never toward under-budgeting.
+    #[test]
+    fn predicted_hash_table_bytes_is_conservative_for_duplicate_keys() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let rows: usize = 10_000;
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        // 100 distinct keys, 100 occurrences each.
+        let batch = int64_key_batch(&schema, (0..rows as i64).map(|i| i % 100).collect());
+        let table = build_hash_table(&[batch], &[Expr::column("id")]).unwrap();
+        assert_eq!(table.len(), 100);
+        let measured = hash_table_memory_bytes(&table);
+        let predicted = predicted_hash_table_bytes(rows, 1);
+        assert!(
+            measured < predicted,
+            "duplicate-heavy table ({measured}) should cost less than the \
+             all-unique prediction ({predicted})"
+        );
+        // Entries themselves (16B x 10_000) must still be counted.
+        assert!(measured >= rows * std::mem::size_of::<HashEntry>());
+    }
+
+    /// End-to-end: a spilling INNER join over many unique keys must (1)
+    /// stay cell-exact, and (2) hold the memoized resident set — batch
+    /// bytes PLUS measured hash-table bytes — under `memory_limit *
+    /// spill_threshold`. Before task 007 the tables were built with zero
+    /// accounting at ~10-20x the budgeted batch bytes (the 15-24x overshoot
+    /// of both oom repros); this asserts the budgeting invariant directly
+    /// on the build decision, not just survival.
+    #[tokio::test]
+    async fn spill_path_hash_tables_are_budgeted_and_join_stays_exact() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let build_schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let total_rows: i64 = 200_000;
+        let mut build_batches = Vec::new();
+        let mut start = 0i64;
+        while start < total_rows {
+            let end = (start + 8192).min(total_rows);
+            build_batches.push(int64_key_batch(&build_schema, (start..end).collect()));
+            start = end;
+        }
+        let build: Arc<dyn PhysicalOperator> =
+            Arc::new(crate::physical::operators::MemoryTableExec::new(
+                "build",
+                build_schema,
+                build_batches,
+                None,
+            ));
+
+        let probe_schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("pid", DataType::Int64, false)]));
+        // 4 existing keys (one duplicated → 2 output rows) + 1 missing key.
+        let probe_ids = vec![0i64, 12_345, 12_345, 199_999, 777_777_777];
+        let probe_batch = int64_key_batch(&probe_schema, probe_ids);
+        let probe: Arc<dyn PhysicalOperator> =
+            Arc::new(crate::physical::operators::MemoryTableExec::new(
+                "probe",
+                probe_schema,
+                vec![probe_batch],
+                None,
+            ));
+
+        // 256KB limit: the ~1.6MB of build batches must spill, and the
+        // ~27MB of worst-case table bytes must be budgeted, not built.
+        let limit = 256 * 1024;
+        let pool = crate::execution::create_memory_pool(limit);
+        let spill_dir =
+            std::env::temp_dir().join(format!("qe_join_table_budget_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&spill_dir);
+        let config = ExecutionConfig::new()
+            .with_memory_limit(limit)
+            .with_spill_path(spill_dir.clone());
+        let threshold = (limit as f64 * config.spill_threshold) as usize;
+
+        let join = SpillableHashJoinExec::new(
+            build,
+            probe,
+            vec![(Expr::column("id"), Expr::column("pid"))],
+            JoinType::Inner,
+            pool,
+            config,
+        );
+
+        let mut matched: Vec<i64> = Vec::new();
+        let mut stream = join.execute(0).await.unwrap();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                matched.push(ids.value(i));
+            }
+        }
+        matched.sort_unstable();
+        assert_eq!(
+            matched,
+            vec![0, 12_345, 12_345, 199_999],
+            "spilling join with budgeted tables must stay cell-exact"
+        );
+
+        // The budgeting invariant, asserted on the memoized decision.
+        match join.build_decision.get() {
+            Some(BuildDecision::Spill {
+                partitions, tables, ..
+            }) => {
+                let batch_bytes: usize = partitions.iter().flatten().map(|p| p.memory_bytes).sum();
+                let table_bytes: usize = tables.iter().flatten().map(hash_table_memory_bytes).sum();
+                assert!(
+                    batch_bytes + table_bytes <= threshold,
+                    "resident batches ({batch_bytes}) + measured tables \
+                     ({table_bytes}) exceed the budget ({threshold})"
+                );
+            }
+            _ => panic!("expected a memoized Spill decision"),
+        }
+        drop(join);
+        let _ = std::fs::remove_dir_all(&spill_dir);
+    }
+
+    /// Read-back (spilled-partition) processing must chunk its transient
+    /// hash table under the budget AND stay exact when a key's multiple
+    /// build rows straddle a chunk boundary — every (build,probe) pair
+    /// emitted exactly once, unioned across chunks. Build keys appear
+    /// TWICE (in two well-separated row ranges, so the two occurrences
+    /// land in different read-back batches/chunks); every probed key must
+    /// come back exactly twice.
+    #[tokio::test]
+    async fn spilled_partition_chunked_table_build_is_cell_exact() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let build_schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let distinct: i64 = 20_000;
+        let mut build_batches = Vec::new();
+        for _pass in 0..2 {
+            let mut start = 0i64;
+            while start < distinct {
+                let end = (start + 1024).min(distinct);
+                build_batches.push(int64_key_batch(&build_schema, (start..end).collect()));
+                start = end;
+            }
+        }
+        let build: Arc<dyn PhysicalOperator> =
+            Arc::new(crate::physical::operators::MemoryTableExec::new(
+                "build",
+                build_schema,
+                build_batches,
+                None,
+            ));
+
+        let probe_schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("pid", DataType::Int64, false)]));
+        let probe_ids: Vec<i64> = (0..distinct).step_by(7).collect();
+        let expected_rows = probe_ids.len() * 2;
+        let probe_batch = int64_key_batch(&probe_schema, probe_ids.clone());
+        let probe: Arc<dyn PhysicalOperator> =
+            Arc::new(crate::physical::operators::MemoryTableExec::new(
+                "probe",
+                probe_schema,
+                vec![probe_batch],
+                None,
+            ));
+
+        // 64KB limit → ~51KB threshold: every partition's predicted table
+        // (~625 rows x ~136B ≈ 85KB) exceeds it, so partitions evict to
+        // disk and read-back chunking engages (multiple chunks per
+        // partition).
+        let limit = 64 * 1024;
+        let pool = crate::execution::create_memory_pool(limit);
+        let spill_dir = std::env::temp_dir().join(format!(
+            "qe_join_chunked_readback_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&spill_dir);
+        let config = ExecutionConfig::new()
+            .with_memory_limit(limit)
+            .with_spill_path(spill_dir.clone());
+
+        let join = SpillableHashJoinExec::new(
+            build,
+            probe,
+            vec![(Expr::column("id"), Expr::column("pid"))],
+            JoinType::Inner,
+            pool,
+            config,
+        );
+
+        let mut matched: Vec<i64> = Vec::new();
+        let mut stream = join.execute(0).await.unwrap();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                matched.push(ids.value(i));
+            }
+        }
+        matched.sort_unstable();
+        let mut expected: Vec<i64> = probe_ids.iter().flat_map(|&k| [k, k]).collect();
+        expected.sort_unstable();
+        assert_eq!(matched.len(), expected_rows);
+        assert_eq!(
+            matched, expected,
+            "each probed key must match exactly its two build occurrences, \
+             even when they land in different read-back chunks"
+        );
+        drop(join);
+        let _ = std::fs::remove_dir_all(&spill_dir);
+    }
 }
