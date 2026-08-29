@@ -1,8 +1,8 @@
 ---
 name: oom-safety-hardening
-status: backlog
+status: in-progress
 created: 2026-08-29T21:30:20Z
-progress: 0%
+progress: 14%
 prd: .claude/prds/oom-safety-hardening.md
 github: (will be set on sync)
 ---
@@ -116,17 +116,24 @@ post-fix-passing, and G5 requiring all four feature combinations green
 plus unregressed recorded native-table and RSS numbers.
 
 ## Tasks Created
-- [ ] 001.md - Adversarial cap harness + pre-fix evidence + 2026-08-28 root-cause (parallel: true)
+- [x] 001.md - Adversarial cap harness + pre-fix evidence + 2026-08-28 root-cause (parallel: true) — CLOSED 2026-08-29
 - [ ] 002.md - Streaming two-phase reservation for SpillableHashAggregateExec (parallel: false, conflicts: 003)
 - [ ] 003.md - Streaming two-phase reservation for ExternalSortExec (parallel: false, conflicts: 002)
 - [ ] 004.md - Streaming native-table scan into spilling consumers (parallel: true)
 - [ ] 005.md - Formal admission check for INSERT/CTAS write path (parallel: true)
 - [ ] 006.md - QA close-out: post-fix harness sweep, full suite, perf non-regression, docs (parallel: false)
+- [ ] 007.md - Budget the join spill path's hash-table memory — the confirmed fourth gap from 001 (parallel: false, conflicts: 002/003, runs FIRST in the spillable.rs queue)
 
-Total tasks: 6
+Total tasks: 7
 Parallel tasks: 3
-Sequential tasks: 3
-Estimated total effort: 39 hours (+ external spill-size-estimate-fix epic first)
+Sequential tasks: 4
+Estimated total effort: 47 hours
+
+Note (2026-08-29): task 001 closed — root cause of the accounting hole
+AND the 2026-08-28 incident both named with evidence (unbudgeted spill-
+path hash tables, ~10-20x amplification; incident was a bare uncapped
+repro run pre-hook, 58.4G at kill / 107.2G was scope lifetime peak).
+Task 007 added per 001's fourth-gap rule.
 
 ## Estimated Effort
 
