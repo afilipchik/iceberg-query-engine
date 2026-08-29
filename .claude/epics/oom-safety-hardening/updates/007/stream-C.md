@@ -96,8 +96,16 @@ All runs wrapped (systemd-run scopes / claude-safe-build.sh); logs in
 - [x] code implemented (commits 9565685, 50959e7)
 - [x] unit tests
 - [x] repro validation under caps
-- [ ] Q12 native re-check
-- [ ] harness re-run
-- [x] chaos harness / spill_tests
-- [ ] default suite
-- [ ] Outcome appended
+- [x] Q12 native re-check — no spill traces, cell-exact
+      (MAIL,353822,529784 / SHIP,352224,530051), 0.17-0.21s over 3 runs
+      at --memory-limit 40G under a 48G scope
+- [x] harness re-run — agg/sort unchanged (002/003 scope), native-scan
+      now completes (task 004), insert now clean-refusal (task 005); no
+      scenario regresses (`.scratch/oom007/harness_postfix007`)
+- [x] chaos harness (100/100, 93 disk trials) / spill_tests 7/7
+- [x] default suite green (lib 456/0/1-ignored + all integration targets,
+      exit 0); cargo fmt --check clean
+- [x] key checksums: 135 hash-check-ok, 0 HASH-MISMATCH across both
+      repro runs (relevant to the out-of-scope ~0.34% duplicate bug: the
+      spill round trip and chunked read-back are not implicated)
+- [x] Outcome appended to 007.md; status: closed
