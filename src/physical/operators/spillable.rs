@@ -235,7 +235,9 @@ pub(crate) async fn collect_input_partitions_concurrently(
 /// This function keeps the same "one task per input partition, drained
 /// concurrently" parallelism, but hands batches to the caller as they arrive
 /// via a small, FIXED-capacity channel instead of a growing `Vec`. The
-/// caller (`SpillableHashJoinExec::compute_build_decision`) can then track a
+/// callers (`SpillableHashJoinExec::compute_build_decision`,
+/// `SpillableHashAggregateExec::execute` — oom-safety-hardening task 002 —
+/// and `ExternalSortExec::execute` — task 003) can then track a
 /// running size total and switch to a bounded, spill-capable structure the
 /// moment it would exceed the threshold, without ever buffering more than a
 /// bounded number of batches ahead of that check. The channel's own fixed

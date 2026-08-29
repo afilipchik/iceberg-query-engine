@@ -74,4 +74,28 @@ inside the 1G cap with the ~30-60MB runtime baseline.
 
 ## Log
 
-- (this commit) design + before-state recorded; implementation follows.
+- design + before-state recorded; implementation followed in 6422fef.
+- Unit suite after the rewrite: spillable 24/24 (including
+  `k_way_merge_survives_a_run_needing_more_than_one_buffer_load`,
+  `external_sort_multi_pass_merge_survives_a_leftover_singleton_chunk`,
+  `external_sort_spill_path_handles_dictionary_encoded_columns`,
+  `external_sort_spill_path_enforces_limit_under_forced_spill`).
+  spill_tests 9/9 (prior 8 + new SQL-level
+  `sort_spill_with_limit_matches_in_memory`: ORDER BY ... LIMIT 50 with a
+  unique sort key, ordered cell-exact vs unlimited, spill asserted).
+- Small-scale smoke (25M rows, 25MB limit, QE_SPILL_DEBUG, 512M scope):
+  crossing at 10 buffered batches / 19.2MB vs 20.97MB threshold; 22
+  sorted runs (multi-pass reduction exercised, 22 > fanin 8); COMPLETED,
+  globally ordered, peak RSS 186MB, 5.6s.
+
+### Harness sort scenario: before -> after (same caps)
+
+| lever | before (002's post-fix matrix, same sort code) | after (6422fef) |
+|---|---|---|
+| cgroup 1G | FAIL oom-sigkill (kernel killed the unit) | **PASS exit 0, rows=250000000 globally ordered, peak 776MB, 53.9s** |
+| rlimit ~1975MB | FAIL abort ("memory allocation of 1048576 bytes failed", peak ~1875MB) | **PASS exit 0, rows=250000000 globally ordered, peak 831MB, 43.7s** |
+
+Logs: `.scratch/oom003/harness_sort_postfix/`. Peak ~776-831MB matches
+the predicted ~3x-threshold residual (flush_run's concat + sort copies of
+a ~205MB run buffer) — the documented, bounded worst case of this design,
+inside the 1G cap.
