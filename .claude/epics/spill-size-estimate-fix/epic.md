@@ -2,8 +2,8 @@
 name: spill-size-estimate-fix
 status: in-progress
 created: 2026-08-28T19:02:39Z
-updated: 2026-08-28T19:02:39Z
-progress: 0%
+updated: 2026-08-29T21:44:27Z
+progress: 50%
 prd: .claude/prds/spill-size-estimate-fix.md
 github: (will be set on sync)
 ---
@@ -87,7 +87,7 @@ Estimated total effort: S — precisely diagnosed, narrowly scoped.
 - 002: S.
 
 ## Tasks Created
-- [ ] 001.md - Fix estimate_batch_size + validate against Q12 and a real stress case (parallel: false)
+- [x] 001.md - Fix estimate_batch_size + validate against Q12 and a real stress case (parallel: false) — CLOSED 2026-08-29; the stress-case criterion lives on in oom-safety-hardening task 001 (formal handoff, see 001.md's Outcome part 2)
 - [ ] 002.md - Broader sweep, full suite, docs, epic close (parallel: false)
 
 Total tasks: 2
