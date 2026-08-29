@@ -32,9 +32,35 @@ use std::sync::{Mutex, OnceLock};
 /// ArrowWriter internal encoders) are.
 const LARGE_THRESHOLD: usize = 256 * 1024;
 
+/// `oom-safety-hardening` task 001 fix: this MUST NOT use
+/// `OnceLock::get_or_init` with a closure that reads the environment.
+/// `std::env::var_os` heap-allocates the returned value whenever the
+/// variable is PRESENT, and every heap allocation re-enters this very
+/// function (we are the global allocator) — a reentrant
+/// `OnceLock::get_or_init` on the same thread deadlocks (futex wait,
+/// single thread, before `main` even runs). Confirmed live: any binary
+/// run with `QE_ALLOC_PROFILE=1` hung at startup at ~9MB RSS / 0% CPU;
+/// the identical binary with the variable UNSET ran normally (unset →
+/// `var_os` returns `None` without allocating → no recursion, which is
+/// why the deadlock hid until the first genuinely-enabled run).
+/// The tri-state atomic below marks the state "disabled" DURING its own
+/// env read, so the read's own allocations see a settled value instead
+/// of recursing. The store-store race between two first-callers is
+/// benign (both compute the same answer).
 fn enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("QE_ALLOC_PROFILE").as_deref() == Ok("1"))
+    use std::sync::atomic::AtomicU8;
+    // 0 = uninitialized, 1 = disabled (also the value DURING init), 2 = enabled.
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        2 => true,
+        1 => false,
+        _ => {
+            STATE.store(1, Ordering::Relaxed);
+            let on = std::env::var_os("QE_ALLOC_PROFILE").is_some_and(|v| v == "1");
+            STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
 }
 
 static CURRENT_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -122,7 +148,20 @@ fn record_alloc(ptr: *mut u8, size: usize) {
 fn record_dealloc(ptr: *mut u8, size: usize) {
     CURRENT_BYTES.fetch_sub(size, Ordering::Relaxed);
     if size >= LARGE_THRESHOLD {
-        live().lock().unwrap().remove(&(ptr as usize));
+        // `oom-safety-hardening` task 001 fix: same reentrancy guard the
+        // alloc side already had. Without it, a large DEALLOC issued while
+        // profiler code itself holds the `live()` mutex on this same
+        // thread self-deadlocks — concretely, `live().lock().insert(..)`
+        // in `record_alloc` resizing the map's own >=256KB backing table
+        // frees the old table, which lands here and re-locks `live()`.
+        // Skipping the removal is safe: any allocation made while
+        // IN_PROFILER was set was never inserted in the first place.
+        let reentrant = IN_PROFILER.with(|f| f.get());
+        if !reentrant {
+            IN_PROFILER.with(|f| f.set(true));
+            live().lock().unwrap().remove(&(ptr as usize));
+            IN_PROFILER.with(|f| f.set(false));
+        }
     }
 }
 

@@ -82,10 +82,101 @@ Corroboration: later kernel records (19:33:43, 19:48:57 local) show
 `_control_int32_` killed at 3G memcg caps with anon-rss ~3.1G,
 total-vm ~6.4G — growth is unbounded, cap-limited only.
 
+## PROFILER: found dead-on-arrival, fixed (2 bugs in alloc_profile.rs)
+
+The diagnostic allocator (`QE_ALLOC_PROFILE=1`) had NEVER successfully run
+enabled — any binary run with the var set hung at startup (1 thread, futex
+wait, ~9MB RSS, 0% CPU; confirmed live on the freshly-rebuilt dict repro).
+Root cause: `enabled()` used `OnceLock::get_or_init` with a closure calling
+`std::env::var` — `var_os` heap-allocates the RETURNED VALUE whenever the
+variable is PRESENT, every heap allocation re-enters `enabled()` (we are
+the global allocator), and a reentrant `get_or_init` deadlocks. With the
+var UNSET, `var_os` returns `None` without allocating — which is why the
+bug hid: disabled runs (all runs to date) never allocated inside init.
+Fixed with a tri-state `AtomicU8` that reads "disabled" DURING its own env
+read. Second latent deadlock fixed in the same pass: `record_dealloc`
+locked `live()` with no reentrancy guard — `record_alloc`'s
+`live().lock().insert()` resizing the map's own >=256KB backing table
+frees the old table mid-insert → same-thread relock → deadlock (would have
+hit any long profiled run once ~10K large allocations were live). Both
+fixes validated: profiled dict repro now runs to completion.
+
+## ROOT CAUSE OF THE ACCOUNTING HOLE — profiler evidence (dict repro)
+
+Run: `QE_ALLOC_PROFILE=1 RUST_BACKTRACE=1` dict repro under
+`systemd-run -p MemoryMax=2G` → completes, `RESULT: PASS`,
+`peak_rss_mb=784` (unprofiled control run same day: 737MB), allocator-level
+`global_peak=640.4MB` against a 30MB configured budget.
+Log: `.scratch/oom001/dictprof2.log`.
+
+**Dominant call site at EVERY recorded peak (the only site with live
+>=256KB allocations, all snapshots):**
+
+```
+hashbrown::raw::RawTableInner::fallible_with_capacity
+hashbrown::raw::RawTable<T,A>::reserve_rehash
+query_engine::physical::operators::spillable::build_hash_table
+query_engine::physical::operators::spillable::SpillableHashJoinExec::execute_spill_path
+```
+
+Timeline (allocator totals): phase-1 flat collection peaks ~54MB (the
+budget, correctly bounded); then `execute_spill_path`'s in-memory-partition
+`build_hash_table` loop (lines 868-875 of spillable.rs) climbs 163 → 452MB
+BEFORE the `execute_spill_path START` trace prints; spilled-partition
+processing (`process_spilled_partition` → `read_parquet` + second
+`build_hash_table` call site, line 1240) pushes to the 640MB final peak.
+FINAL snapshot: 343MB across 4 live hashbrown tables; the remaining
+~300MB of the peak is untracked-small allocations — exactly what the
+mechanism predicts (per-key `Vec<HashEntry>` heap buffers + per-key
+`JoinKey.values` Vec heap buffers, ~32B each, millions of them).
+
+**Mechanism (quantified):** the spill path's hash tables are
+`HashMap<JoinKey, Vec<HashEntry>>` where `JoinKey { values: Vec<JoinValue> }`
+and `HashEntry { batch_idx: usize, row_idx: usize }` (16B). For a
+unique-Int64-key build side each row costs:
+- ~56B amortized in the hashbrown table entry ((24B Vec header for key
+  values + 24B Vec header for entries) × 8/7 load factor + control), plus
+- one ~32B heap allocation for the key's 1-element `Vec<JoinValue>`, plus
+- one ~32B heap allocation for the 1-element `Vec<HashEntry>`,
+= **~120-150 bytes/row across 3 allocations, vs the ~12 bytes/row of raw
+batch data that `estimate_batch_size`/`total_memory` accounts for — a
+~10-20x amplification that is NEVER checked against the memory budget.**
+
+Concretely for the dict repro (30MB limit → 24MB threshold): the 2
+in-memory partitions correctly hold ~22.5MB of BATCHES (1,873,454 rows —
+the accounting works for batches), but `execute_spill_path` then builds
+unbudgeted hash tables over those same rows: 1.87M keys × ~150B ≈ ~280MB,
+held live for the entire probe + spilled-partition phase; each spilled
+partition read-back (938K rows) adds a transient table + read-back batches
+≈ ~150-200MB more. Sum matches the observed 640MB allocator peak / 737MB
+RSS ≈ 24x budget.
+
+For the control repro (500MB limit → 400MB threshold): in-memory
+partitions hold ~400MB of batches = ~33M rows → in-memory table build
+alone needs 33M × ~150B ≈ **~5GB**, unbounded by anything — explains the
+kernel kill at 3.1GB anon under a 3G cap (mid-table-build) and the
+incident's uncapped growth. Profiled confirmation run in progress
+(`.scratch/oom001/ctrlprof.log`).
+
+**Named root cause: `SpillableHashJoinExec::execute_spill_path` (and
+`process_spilled_partition`) build per-partition
+`HashMap<JoinKey, Vec<HashEntry>>` hash tables whose real footprint is
+~10-20x the batch bytes the spill decision budgeted, with zero memory
+accounting — the budget bounds batches, not the join tables built over
+them.** The same shape exists in the ALREADY-RULED-IN in-memory fast path
+(`HashJoinExec`) but there the whole build side fit the budget by
+definition; in the spill path the in-memory partitions are deliberately
+kept AT the budget, so the table amplification lands entirely on top.
+
+Also noted: `append_batch_streaming`'s doc comment (spillable.rs
+~line 3226) claims the row-count-flush fix made the control case "now
+complete cleanly" — contradicted by spill-size-estimate-fix 001's own
+Outcome ("still genuinely OOM-killed at the same ~3G cap, unchanged") and
+by this session's reruns. The comment is stale/wrong; the Outcome is
+correct.
+
 ## Next
 
-- [in progress] rebuild repros with current alloc_profile.rs
-- [ ] profile dict repro (QE_ALLOC_PROFILE=1, completes at ~738MB under 900M cap)
-- [ ] profile control repro under caps, iterate to catch peak
-- [ ] name dominant call site(s)
-- [ ] build oom_cap_harness (4 scenarios × 2 levers)
+- [in progress] profiled control repro under 3G cap (confirm site at death)
+- [in progress] build examples/oom_cap_harness.rs (+ scripts/oom_cap_harness.sh written)
+- [ ] run harness: 4 scenarios × 2 levers, record pre-fix evidence
