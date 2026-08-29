@@ -107,6 +107,24 @@
 //!   1GiB `memory_limit` was never meant to bound a real multi-GB scan (it
 //!   already never has for Parquet either — see `spillable.rs`'s own
 //!   `memory_limit * spill_threshold` budgets, sized the same way).
+//!
+//! **Update (oom-safety-hardening epic, task 004): the refusal above now
+//! guards only genuinely MATERIALIZING shapes.** A query whose native-table
+//! scan sits beneath an Aggregate in the logical plan is planned onto
+//! `NativeStreamingScanExec` (`src/physical/operators/native_scan.rs`)
+//! whenever this provider's [`scan_budget_exceeded`](NativeTable::
+//! scan_budget_exceeded) is true — segment-at-a-time streaming through the
+//! same `ipc_cache::read_row_group` reader, deletion-vector-filtered
+//! ([`read_segment_batches`](NativeTable::read_segment_batches)) and
+//! segment-pruned ([`streaming_segment_ids`](NativeTable::
+//! streaming_segment_ids)), feeding the always-spillable aggregate/join
+//! operators — so the query COMPLETES by spilling instead of refusing
+//! (PRD G2). Raw `SELECT *`/filter-only/ORDER BY-only shapes still funnel
+//! through `check_scan_budget`'s named refusal, deliberately: their output
+//! materializes at the `QueryResult` root, so streaming the scan would only
+//! relocate the OOM. See `PhysicalPlanner::collect_agg_covered_scans` for
+//! the exact gate and `tests/native_streaming_scan_tests.rs` for the tests
+//! pinning both halves of the boundary.
 
 use crate::distributed::{Split, SplitSet};
 use crate::error::{QueryError, Result};

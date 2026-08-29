@@ -2466,6 +2466,37 @@ Parquet's streaming path, which needs no such cap, a native-table query
 against SF=10/SF=100-scale data WILL refuse cleanly under the engine's
 1GiB default. This doc's own benchmark commands below always pass one.
 
+**Update (oom-safety-hardening epic, task 004, 2026-08-29): the refusal
+boundary above is now SHAPE-DEPENDENT, not table-wide.** A new streaming
+operator, `NativeStreamingScanExec` (`src/physical/operators/
+native_scan.rs` — epic Architecture Decision 4, mirroring the
+`ParquetTable::scan()` vs `StreamingParquetScanExec` split), reads an
+over-budget native table segment-at-a-time through the SAME
+`ipc_cache::read_row_group` mmap reader, with deletion-vector filtering
+(`filter_deleted_rows`) and segment pruning (`segment_might_match`)
+applied identically to the materializing path. The planner
+(`src/physical/planner.rs`, Scan arm + `collect_agg_covered_scans`
+pre-pass) routes a native-table scan onto it ONLY when BOTH hold: (1)
+`NativeTable::scan_budget_exceeded()` — i.e. the materializing scan
+WOULD refuse — and (2) the Scan node has an **Aggregate ancestor** in
+the logical plan (joins/filters/projects may sit in between; the
+aggregate is what bounds what reaches the root, and any join en route
+is `SpillableHashJoinExec`, which spills). So: `SELECT ... GROUP BY`
+and aggregate-over-join queries over a larger-than-budget native table
+now COMPLETE (spilling as needed) instead of refusing, while **raw
+materializing shapes — `SELECT *` dumps, filter/project-only, ORDER
+BY-only — still refuse by name through `check_scan_budget`,
+deliberately**: streaming those would only move the OOM from the scan
+to the `QueryResult` collection at the root. That boundary is pinned by
+tests (`tests/native_streaming_scan_tests.rs`), not just documented.
+In-budget tables take the byte-identical pre-existing path (the
+condition short-circuits on `scan_budget_exceeded()`), so the
+dense-direct-address fast path and GPU-offload eligibility are
+untouched for them; an OVER-budget table is additionally declined by
+`try_extract_native_dense_source` so the dense-direct route (whose
+execution-time scan would refuse) falls through to the spillable
+aggregate over the streaming scan.
+
 ### GPU-offload eligibility (task 007)
 
 `TableProvider::identity() -> Option<Vec<u8>>` (new trait method,
