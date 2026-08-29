@@ -121,6 +121,30 @@ Observed spill activity (QE_SPILL_DEBUG traces in both logs):
   runtime baseline, i.e. within the documented residual constants,
   ~0.4x of the 1G cap instead of blowing through it.
 
+## Full harness matrix re-run (no scenario regresses)
+
+Same log dir: agg **PASS/PASS** (the flip, above); native-scan
+PASS/PASS completed (175/189MB peak — unchanged from post-004
+behavior); insert PASS/PASS clean-refusal exit 2 (unchanged from
+post-005); sort FAIL oom-sigkill (exit 143, the fast-kill spelling the
+harness script documents) / abort-at-rlimit 134 — unchanged, task 003's
+scope, untouched by this task (`collect_input_partitions_concurrently`
+is retained solely for `ExternalSortExec`).
+
+## Non-spilling perf spot-checks (SF=10, `benchmark-parquet --query N
+--iterations 3`, release, wrapped in a 48G scope, serialized — no
+concurrent load, so no machine-contention caveat)
+
+| query | this run (avg / min of 3) | reference |
+|---|---|---|
+| Q1 | 276.0ms / 267.9ms | 10x-DuckDB band ≤1.1s; consistent with the documented engine/parquet envelope |
+| Q13 | 244.7ms / 222.2ms | INSIDE the documented duckdb-parity-2 band (cache-off 259.9ms avg / cache-on 223.0ms avg) |
+| Q18 | 385.4ms / 363.3ms | 10x-DuckDB band ≤2.4s; consistent with prior SF=10 parquet runs |
+
+All three are fused-streaming shapes (the path this task did not touch)
+— confirming the rewritten decision path costs nothing when the fused
+path serves the query, and nothing regressed suite-side.
+
 ## Tests
 
 - 5 new unit tests in `spillable.rs`
