@@ -48,6 +48,20 @@ This ensures consistent code formatting across the codebase.
 - Being slow on larger-than-memory datasets is acceptable; crashing with OOM is not
 - When adding new operators, they MUST handle memory limits and spill to disk when needed
 - Never add a parameter that lets users opt out of memory safety
+- **In-binary hard process cap (2026-08-29)**: `main()`'s first statement is
+  `enforce_process_memory_cap()` (`src/execution/memory.rs`) —
+  `setrlimit(RLIMIT_DATA)` to **64G by default**, sized via `QE_MEM_CAP`
+  (same grammar as `--memory-limit`; floor 256MB; NO unlimited spelling —
+  garbage falls back to the default with a warning). Kernel-enforced: at the
+  cap, mimalloc's mmap fails and the ENGINE aborts ("memory allocation of N
+  bytes failed") while the terminal's cgroup is untouched. Both soft and
+  hard rlimits are lowered, which is irreversible in-process — so runs that
+  legitimately need more (e.g. SF=100 native benchmarks with
+  `--memory-limit 100G`) must set `QE_MEM_CAP=110G` up front. This is the
+  defense-in-depth layer that exists because the safe-build wrapper rule
+  was bypassed twice; it does NOT replace the wrapper (builds/tests still
+  go through `claude-safe-build.sh` — cargo/rustc themselves are not capped
+  by the engine's own rlimit).
 
 ### Sandboxed Build Rule
 
@@ -69,6 +83,24 @@ terminal scope — including the Claude session and remote-control bridge.
 A build must never share a cgroup with the session that launched it.
 Never run bare `cargo build/test/bench` for release or heavy-feature
 builds; there is no situation where bypassing the wrapper is worth it.
+
+**This rule was documented but not enforced, and it happened again**
+(2026-08-28 12:35, 107.2G peak, terminal scope killed, 11 processes) —
+root cause: `.claude/settings.local.json`'s own permission allowlist
+pre-approves bare `cargo run --release`, `cargo build`, `cargo test`,
+`cargo bench`, and direct `./target/{release,debug}/query_engine`
+execution, so nothing actually stopped a command from silently bypassing
+the wrapper; the rule only worked when whoever typed the command
+remembered it. **Fixed with an enforcement layer, not just a reminder**:
+`scripts/claude_hooks/enforce_safe_build.sh`, wired as a `PreToolUse`
+hook on `Bash` in `.claude/settings.json`, denies (with a message
+pointing at the wrapper) any `cargo build/test/bench/run`, direct
+`target/{release,debug}/query_engine`(`/examples/...`) execution, or
+direct `scripts/*.sh`/`scripts/*.py` invocation (several of this repo's
+own benchmark drivers spawn the engine as an uncapped subprocess) that
+isn't already wrapped in `claude-safe-build.sh`/`oomsafe.sh`/
+`safe_benchmark.sh`/`systemd-run ... -p MemoryMax=...`. This runs
+regardless of what the permission allowlist happens to pre-approve.
 
 ### Benchmark Timeout Rule
 

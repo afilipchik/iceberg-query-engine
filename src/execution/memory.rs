@@ -67,6 +67,121 @@ pub fn disable_transparent_hugepages() {
     }
 }
 
+/// Default hard process cap: 64GiB, matching `scripts/claude-safe-build.sh`'s
+/// own cgroup cap on this program's 128GB development box.
+const DEFAULT_PROCESS_MEM_CAP: u64 = 64 * 1024 * 1024 * 1024;
+/// Floor below which a configured cap is treated as a typo (e.g. a bare "64"
+/// parsing as 64 BYTES) rather than an intent the engine could even start
+/// under. The floor is applied with a warning, never silently.
+const MIN_PROCESS_MEM_CAP: u64 = 256 * 1024 * 1024;
+
+/// Resolve the process-wide memory cap from `QE_MEM_CAP` (same size grammar
+/// as `--memory-limit`: "48G", "512MB", raw bytes). Returns the cap plus an
+/// optional warning describing why the input was overridden. There is no
+/// "unlimited" spelling on purpose: an unparseable value falls back to the
+/// default WITH a warning instead of removing the cap.
+fn resolve_process_mem_cap(raw: Option<&str>) -> (u64, Option<String>) {
+    let raw = match raw {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => return (DEFAULT_PROCESS_MEM_CAP, None),
+    };
+    match parse_memory_size(raw) {
+        Ok(bytes) if bytes as u64 >= MIN_PROCESS_MEM_CAP => (bytes as u64, None),
+        Ok(bytes) => (
+            MIN_PROCESS_MEM_CAP,
+            Some(format!(
+                "QE_MEM_CAP={} ({} bytes) is below the {}MB floor; using the floor",
+                raw,
+                bytes,
+                MIN_PROCESS_MEM_CAP / (1024 * 1024)
+            )),
+        ),
+        Err(_) => (
+            DEFAULT_PROCESS_MEM_CAP,
+            Some(format!(
+                "QE_MEM_CAP={} is not a valid size; using the {}G default",
+                raw,
+                DEFAULT_PROCESS_MEM_CAP / (1024 * 1024 * 1024)
+            )),
+        ),
+    }
+}
+
+/// Kernel-enforced hard cap on this process's memory. Call once, first thing
+/// in `main`. No-op off Linux.
+///
+/// # Why this exists (2026-08-29)
+///
+/// Documented rules and the safe-build wrapper both failed twice: a bare
+/// engine run inside the terminal's cgroup peaked over 100G and systemd-oomd
+/// killed the whole terminal scope — session, remote-control bridge,
+/// everything. This is the layer that cannot be forgotten or bypassed,
+/// because it lives in the binary itself: the ENGINE fails when it exceeds
+/// its budget; the terminal never does.
+///
+/// # Mechanism
+///
+/// `setrlimit(RLIMIT_DATA)` — since Linux 4.7 it covers brk AND private
+/// anonymous mmap, which is where mimalloc (and thread stacks) get every
+/// byte. When the engine crosses the cap, mimalloc's mmap fails, the global
+/// allocator returns null, and Rust aborts THIS process with "memory
+/// allocation of N bytes failed" (fallible paths like `try_reserve` get a
+/// clean `Err` instead). `RLIMIT_DATA` rather than `RLIMIT_AS` on purpose:
+/// AS also counts file-backed mmaps, and the IPC sidecar / native-table read
+/// path maps tens of GB of page-cache-backed segments that pose no OOM risk.
+///
+/// Note the cap counts MAPPED anonymous bytes, not resident ones. mimalloc
+/// frees with MADV_DONTNEED while keeping regions mapped, so the accounted
+/// figure can exceed RSS — meaning the cap can only trip EARLY, never late.
+/// That is the safe direction.
+///
+/// Both the soft and hard limits are lowered, and lowering the hard limit is
+/// irreversible without CAP_SYS_RESOURCE — so the cap must be sized BEFORE
+/// startup via `QE_MEM_CAP` (e.g. `QE_MEM_CAP=110G` for the SF=100 native
+/// benchmarks that pass `--memory-limit 100G`); it cannot be raised later in
+/// the process's life. That irreversibility is the point.
+pub fn enforce_process_memory_cap() {
+    #[cfg(target_os = "linux")]
+    {
+        let raw = std::env::var("QE_MEM_CAP").ok();
+        let (mut cap, warning) = resolve_process_mem_cap(raw.as_deref());
+        if let Some(w) = warning {
+            eprintln!("[mem-cap] WARNING: {}", w);
+        }
+        unsafe {
+            // Never try to RAISE an already-lower hard limit (EPERM without
+            // CAP_SYS_RESOURCE) — take the minimum instead.
+            let mut current = libc::rlimit {
+                rlim_cur: libc::RLIM_INFINITY,
+                rlim_max: libc::RLIM_INFINITY,
+            };
+            if libc::getrlimit(libc::RLIMIT_DATA, &mut current) == 0
+                && current.rlim_max != libc::RLIM_INFINITY
+            {
+                cap = cap.min(current.rlim_max);
+            }
+            let lim = libc::rlimit {
+                rlim_cur: cap,
+                rlim_max: cap,
+            };
+            if libc::setrlimit(libc::RLIMIT_DATA, &lim) != 0 {
+                eprintln!(
+                    "[mem-cap] WARNING: setrlimit(RLIMIT_DATA) failed ({}); \
+                     process memory is NOT capped",
+                    std::io::Error::last_os_error()
+                );
+            } else {
+                eprintln!(
+                    "[mem-cap] process hard-capped at {:.1}G anonymous memory \
+                     (RLIMIT_DATA; the engine aborts if exceeded, the terminal \
+                     survives; size with QE_MEM_CAP)",
+                    cap as f64 / (1024.0 * 1024.0 * 1024.0)
+                );
+            }
+        }
+    }
+}
+
 /// Memory pool for tracking memory usage
 #[derive(Debug)]
 pub struct MemoryPool {
@@ -605,6 +720,41 @@ mod tests {
              the established `query_engine_spill_` prefix",
             file_name
         );
+    }
+
+    #[test]
+    fn test_resolve_process_mem_cap() {
+        // Unset / empty -> default, no warning.
+        assert_eq!(
+            resolve_process_mem_cap(None),
+            (DEFAULT_PROCESS_MEM_CAP, None)
+        );
+        assert_eq!(
+            resolve_process_mem_cap(Some("")),
+            (DEFAULT_PROCESS_MEM_CAP, None)
+        );
+
+        // Ordinary sizes pass through.
+        assert_eq!(
+            resolve_process_mem_cap(Some("48G")),
+            (48 * 1024 * 1024 * 1024, None)
+        );
+        assert_eq!(
+            resolve_process_mem_cap(Some("512MB")),
+            (512 * 1024 * 1024, None)
+        );
+
+        // A bare small number is bytes — clamped up to the floor with a
+        // warning, so a typo can't make the engine unable to start.
+        let (cap, warn) = resolve_process_mem_cap(Some("64"));
+        assert_eq!(cap, MIN_PROCESS_MEM_CAP);
+        assert!(warn.is_some());
+
+        // Garbage (including any "unlimited" spelling) falls back to the
+        // default WITH a warning — there is no way to remove the cap.
+        let (cap, warn) = resolve_process_mem_cap(Some("unlimited"));
+        assert_eq!(cap, DEFAULT_PROCESS_MEM_CAP);
+        assert!(warn.is_some());
     }
 
     #[test]
