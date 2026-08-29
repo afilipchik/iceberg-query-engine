@@ -199,6 +199,28 @@ async fn sort_spill_matches_in_memory() {
     .await;
 }
 
+/// `ORDER BY ... LIMIT` with input exceeding the budget → ExternalSortExec's
+/// spill branch with a fused `fetch` (the top-k fusion rule folds a
+/// `skip == 0` LIMIT straight into `with_fetch`, so the spill branch's own
+/// truncation is the ONLY place the row count is cut —
+/// spill-join-correctness-2 task 004's fix, re-pinned here at the SQL level
+/// against oom-safety-hardening task 003's streamed merge delivery, where
+/// the limit is now applied per arriving batch and ends the output stream
+/// early). Sort keys are unique per row ((l_orderkey, l_linenumber) is a
+/// key), so the ordered comparison is fully deterministic — no tie at the
+/// LIMIT boundary can make two correct answers differ.
+#[tokio::test]
+async fn sort_spill_with_limit_matches_in_memory() {
+    assert_spill_matches(
+        "SELECT l_orderkey, l_linenumber, l_quantity, l_extendedprice FROM lineitem \
+         ORDER BY l_extendedprice DESC, l_orderkey, l_linenumber LIMIT 50",
+        256 * 1024,
+        "sort_spill_limit",
+        true,
+    )
+    .await;
+}
+
 /// Distinct aggregation across the spill boundary (COUNT(DISTINCT) has its own
 /// accumulator path).
 #[tokio::test]

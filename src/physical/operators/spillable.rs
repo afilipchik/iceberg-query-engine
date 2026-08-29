@@ -2728,24 +2728,52 @@ impl PhysicalOperator for ExternalSortExec {
         // Sort always produces a single partition
         crate::physical::check_partition(self, partition)?;
 
-        // Drain all input partitions concurrently so a parallel scan/join beneath this
-        // sort is not serialized onto a single core.
+        // Phase 1: reserve, possibly spill (oom-safety-hardening task 003 —
+        // the same Photon-style streaming two-phase reservation the join's
+        // `compute_build_decision` and the aggregate's `execute()` (task
+        // 002) already ship, mirrored rather than reinvented). The OLD code
+        // called `collect_input_partitions_concurrently`, which fully
+        // drained the ENTIRE input into one flat `Vec<RecordBatch>` and
+        // only THEN compared its total size against
+        // `memory_limit * spill_threshold` — so an oversized input could
+        // exhaust real memory during that initial collection, before the
+        // spill decision ever ran (the harness `sort` scenario: 250M rows /
+        // ~4GB streamed into a 256MB budget was kernel-OOM-killed under a
+        // 1G cgroup cap, and aborted at ~1.9GB under the rlimit lever).
+        // Now the input streams in via `stream_merge_input_partitions`
+        // (same one-task-per-partition cross-core drain benefit, bounded
+        // channel instead of a growing Vec) with a running size total
+        // checked as each batch arrives.
         let memory_threshold =
             (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
-        let (all_batches, total_size) = collect_input_partitions_concurrently(&self.input).await?;
-        let exceeded = total_size > memory_threshold;
-
-        if all_batches.is_empty() {
-            return Ok(Box::pin(stream::empty()));
+        let mut input_stream = stream_merge_input_partitions(&self.input).await?;
+        let mut flat_batches: Vec<RecordBatch> = Vec::new();
+        let mut flat_size: usize = 0;
+        let mut crossing_batch: Option<RecordBatch> = None;
+        while let Some(batch) = input_stream.try_next().await? {
+            let batch_size = estimate_batch_size(&batch);
+            if flat_size + batch_size > memory_threshold {
+                crossing_batch = Some(batch);
+                break;
+            }
+            flat_size += batch_size;
+            flat_batches.push(batch);
         }
 
-        if !exceeded {
-            // Data fits in memory — use the regular SortExec path for correctness
-            // Create a temporary MemoryTableExec with our already-collected data
+        if crossing_batch.is_none() {
+            // Never crossed the threshold: the input genuinely fits — the
+            // ordinary in-memory case, reached without ever risking an
+            // unbounded collection to get here.
+            if flat_batches.is_empty() {
+                return Ok(Box::pin(stream::empty()));
+            }
+            // Data fits in memory — use the regular SortExec path for
+            // correctness. Create a temporary MemoryTableExec with our
+            // already-collected data.
             let mem = crate::physical::operators::MemoryTableExec::new(
                 "sort_input",
                 self.schema.clone(),
-                all_batches,
+                flat_batches,
                 None,
             );
             let sort = if let Some(fetch) = self.fetch {
@@ -2760,7 +2788,7 @@ impl PhysicalOperator for ExternalSortExec {
             return sort.execute(0).await;
         }
 
-        // Data exceeds memory — use external sort with spilling
+        // Threshold crossed mid-stream — external sort with spilling.
         self.config.ensure_spill_dir()?;
 
         let spill_id = SPILL_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -2772,45 +2800,113 @@ impl PhysicalOperator for ExternalSortExec {
             QueryError::Execution(format!("Failed to create spill directory: {}", e))
         })?;
 
-        let input_stream: RecordBatchStream =
-            Box::pin(stream::iter(all_batches.into_iter().map(Ok)));
+        if std::env::var("QE_SPILL_DEBUG").is_ok() {
+            eprintln!(
+                "[spill-sort] threshold crossed mid-stream at {} buffered batches ({} bytes, \
+                 threshold {}) — entering streaming run-generation path",
+                flat_batches.len() + 1,
+                flat_size,
+                memory_threshold
+            );
+        }
 
-        // Generate sorted runs
-        let runs = self.generate_runs(input_stream, &spill_dir).await?;
+        // Phase 2: everything gathered so far (`flat_batches`), plus the
+        // crossing batch, plus whatever remains of the stream, feeds
+        // `generate_runs`'s bounded buffer-to-threshold / cut-sorted-run
+        // ingestion loop. Nothing collected in phase 1 is thrown away or
+        // re-pulled from the source (mirrors the aggregate's phase 2).
+        let combined: RecordBatchStream = Box::pin(
+            stream::iter(flat_batches.into_iter().chain(crossing_batch).map(Ok))
+                .chain(input_stream),
+        );
 
-        // Merge runs
-        let result = if runs.is_empty() {
-            Vec::new()
-        } else if runs.len() == 1 {
-            if runs[0].is_file() {
-                read_parquet(&runs[0])?
-            } else {
-                Vec::new()
+        // Generate sorted runs, batch by batch.
+        let runs = self.generate_runs(combined, &spill_dir).await?;
+
+        if std::env::var("QE_SPILL_DEBUG").is_ok() {
+            eprintln!(
+                "[spill-sort] {} sorted run(s) generated in {:?}",
+                runs.len(),
+                spill_dir
+            );
+        }
+
+        if runs.is_empty() {
+            let _ = std::fs::remove_dir_all(&spill_dir);
+            return Ok(Box::pin(stream::empty()));
+        }
+
+        // Merge the runs on a blocking thread, delivering merged batches
+        // through a small bounded channel that IS this operator's output
+        // stream — the merged result is never re-materialized into one
+        // Vec (the full sorted output is the size of the entire input,
+        // exactly what this operator just spilled to AVOID holding). The
+        // merge machinery itself is unchanged (same multi-pass reduction,
+        // same k-way merge core, same carried-run bookkeeping and
+        // buffer-transition flush) — only the DELIVERY of already-built
+        // output batches changed from `Vec::push` to a channel send.
+        //
+        // The merge thread owns spill-dir cleanup: it removes the
+        // directory when the merge finishes, errors, OR aborts early
+        // because the receiver was dropped (query abandoned / LIMIT
+        // satisfied below — the next sink send fails and the merge
+        // returns).
+        let merger = self.merger();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(4);
+        let cleanup_dir = spill_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let batch_tx = tx.clone();
+            let mut sink = move |batch: RecordBatch| -> Result<bool> {
+                Ok(batch_tx.blocking_send(Ok(batch)).is_ok())
+            };
+            if let Err(e) = merger.merge_runs_into(&runs, &mut sink) {
+                let _ = tx.blocking_send(Err(e));
             }
-        } else {
-            self.merge_runs(&runs)?
-        };
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        });
+        let merged = tokio_stream::wrappers::ReceiverStream::new(rx);
 
-        // Apply the top-K `fetch` limit, mirroring the in-memory branch above
-        // (`SortExec::with_fetch`). The top-k fusion rule in `planner.rs`
-        // (`LogicalPlan::Limit` folding a `skip == 0` LIMIT directly into
-        // `ExternalSortExec::with_fetch` instead of wrapping a separate
-        // `LimitExec` around it) means THIS is the only place a spilled
-        // `ORDER BY ... LIMIT N` query's row count is ever truncated — before
-        // this fix, `self.fetch` was read by `with_fetch`/`new` but never
-        // consulted again anywhere in this spill branch, so `runs`/`result`
-        // (a correct, fully globally-sorted top-K PREFIX followed by every
-        // remaining row) was returned in full: correct values, wrong (too
-        // large) row count.
-        let result = match self.fetch {
-            Some(fetch) => truncate_batches_to_limit(result, fetch),
-            None => result,
-        };
-
-        // Clean up
-        let _ = std::fs::remove_dir_all(&spill_dir);
-
-        Ok(Box::pin(stream::iter(result.into_iter().map(Ok))))
+        // Apply the top-K `fetch` limit, mirroring the in-memory branch
+        // above (`SortExec::with_fetch`). The top-k fusion rule in
+        // `planner.rs` (`LogicalPlan::Limit` folding a `skip == 0` LIMIT
+        // directly into `ExternalSortExec::with_fetch` instead of wrapping
+        // a separate `LimitExec` around it) means THIS is the only place a
+        // spilled `ORDER BY ... LIMIT N` query's row count is ever
+        // truncated — the merge produces every row of the sort, not just
+        // the top-K prefix (spill-join-correctness-2 task 004's fix,
+        // preserved). Applied per arriving batch via the SAME
+        // `truncate_batches_to_limit` helper (one implementation of the
+        // slicing semantics, not two); once the limit is reached the
+        // stream ends, the receiver drops, and the merge thread aborts
+        // early instead of merging rows nobody will read.
+        match self.fetch {
+            Some(fetch) => {
+                let limited = merged.scan(fetch, |remaining, item| {
+                    futures::future::ready(match item {
+                        Err(e) => {
+                            *remaining = 0;
+                            Some(Err(e))
+                        }
+                        Ok(batch) => {
+                            if *remaining == 0 {
+                                None
+                            } else {
+                                let mut kept = truncate_batches_to_limit(vec![batch], *remaining);
+                                match kept.pop() {
+                                    Some(b) => {
+                                        *remaining -= b.num_rows();
+                                        Some(Ok(b))
+                                    }
+                                    None => None,
+                                }
+                            }
+                        }
+                    })
+                });
+                Ok(Box::pin(limited))
+            }
+            None => Ok(Box::pin(merged)),
+        }
     }
 
     fn name(&self) -> &str {
@@ -2918,32 +3014,132 @@ impl ExternalSortExec {
         Ok(())
     }
 
-    fn merge_runs(&self, runs: &[PathBuf]) -> Result<Vec<RecordBatch>> {
-        // Streaming k-way merge: process runs in batches to limit memory
-        // Maximum number of runs to merge at once
-        const MAX_MERGE_FANIN: usize = 8;
-        // Maximum rows to buffer per run during merge
-        const MERGE_BUFFER_ROWS: usize = 8192;
+    /// Build the owned, `'static` merge-machinery handle `execute()`'s
+    /// spill branch hands to its blocking merge thread. The merge methods
+    /// live on `SortRunMerger` (not `&self`) purely so they can be MOVED
+    /// onto that thread — every algorithm is byte-for-byte the code that
+    /// used to live on `ExternalSortExec` itself.
+    fn merger(&self) -> SortRunMerger {
+        SortRunMerger {
+            order_by: self.order_by.clone(),
+            schema: self.schema.clone(),
+        }
+    }
 
+    /// Test-only Vec-collecting entry point (regression tests
+    /// `external_sort_multi_pass_merge_survives_a_leftover_singleton_chunk`
+    /// etc. call this); production merging goes through
+    /// `SortRunMerger::merge_runs_into`'s sink form.
+    #[cfg(test)]
+    fn merge_runs(&self, runs: &[PathBuf]) -> Result<Vec<RecordBatch>> {
+        let merger = self.merger();
+        let mut out = Vec::new();
+        let mut sink = |batch: RecordBatch| -> Result<bool> {
+            out.push(batch);
+            Ok(true)
+        };
+        merger.merge_runs_into(runs, &mut sink)?;
+        Ok(out)
+    }
+
+    /// Test-only Vec-collecting entry point (regression test
+    /// `k_way_merge_survives_a_run_needing_more_than_one_buffer_load`
+    /// calls this).
+    #[cfg(test)]
+    fn streaming_k_way_merge(
+        &self,
+        runs: &[PathBuf],
+        buffer_rows: usize,
+    ) -> Result<Vec<RecordBatch>> {
+        let merger = self.merger();
+        let mut out = Vec::new();
+        let mut sink = |batch: RecordBatch| -> Result<bool> {
+            out.push(batch);
+            Ok(true)
+        };
+        merger.streaming_k_way_merge_into(runs, buffer_rows, &mut sink)?;
+        Ok(out)
+    }
+}
+
+/// The run-merge machinery of `ExternalSortExec`, factored onto an owned,
+/// `Send + 'static` value so `execute()`'s spill branch can run it on a
+/// `spawn_blocking` thread that streams merged batches out through a
+/// bounded channel instead of accumulating the ENTIRE sorted output into
+/// one `Vec<RecordBatch>` (which is the size of the whole input — exactly
+/// the materialization this operator spills to avoid;
+/// oom-safety-hardening task 003). The algorithms themselves — multi-pass
+/// reduction, carried-run bookkeeping, the k-way merge core with its
+/// buffer-transition flush, `batch_with_actual_types` reconciliation —
+/// are unchanged from when these methods lived on `ExternalSortExec`.
+///
+/// Every output-producing method takes a `sink: &mut dyn FnMut(RecordBatch)
+/// -> Result<bool>`; a sink returning `Ok(false)` means "stop producing"
+/// (the consumer is gone — query abandoned, or a fused `LIMIT` already
+/// satisfied) and the merge returns early and cleanly.
+struct SortRunMerger {
+    order_by: Vec<crate::planner::SortExpr>,
+    schema: SchemaRef,
+}
+
+impl SortRunMerger {
+    /// Maximum number of runs to merge at once.
+    const MAX_MERGE_FANIN: usize = 8;
+    /// Maximum rows to buffer per run during merge.
+    const MERGE_BUFFER_ROWS: usize = 8192;
+
+    /// Merge `runs` (already individually sorted) into globally-sorted
+    /// output batches, delivered through `sink`.
+    fn merge_runs_into(
+        &self,
+        runs: &[PathBuf],
+        sink: &mut dyn FnMut(RecordBatch) -> Result<bool>,
+    ) -> Result<()> {
         if runs.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         if runs.len() == 1 {
-            return read_parquet(&runs[0]);
+            // A single run is already globally sorted — stream it straight
+            // off disk in bounded reads (the old code's `read_parquet`
+            // one-shot load, made incremental).
+            if !runs[0].is_file() {
+                return Ok(());
+            }
+            let file = File::open(&runs[0]).map_err(|e| {
+                QueryError::Execution(format!("Failed to open run file {:?}: {}", runs[0], e))
+            })?;
+            let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+                .with_batch_size(Self::MERGE_BUFFER_ROWS)
+                .build()?;
+            for batch in reader {
+                if !sink(batch?)? {
+                    return Ok(());
+                }
+            }
+            return Ok(());
         }
 
-        // If we have too many runs, merge in multiple passes
-        if runs.len() > MAX_MERGE_FANIN {
-            return self.multi_pass_merge(runs, MAX_MERGE_FANIN);
+        // If we have too many runs, reduce in multiple passes first.
+        if runs.len() > Self::MAX_MERGE_FANIN {
+            let reduced = self.reduce_runs_to_fanin(runs, Self::MAX_MERGE_FANIN)?;
+            return self.streaming_k_way_merge_into(&reduced, Self::MERGE_BUFFER_ROWS, sink);
         }
 
-        // Single-pass k-way merge with bounded memory
-        self.streaming_k_way_merge(runs, MERGE_BUFFER_ROWS)
+        // Single-pass k-way merge with bounded memory.
+        self.streaming_k_way_merge_into(runs, Self::MERGE_BUFFER_ROWS, sink)
     }
 
-    /// Multi-pass merge for when there are too many runs
-    fn multi_pass_merge(&self, runs: &[PathBuf], fanin: usize) -> Result<Vec<RecordBatch>> {
+    /// Multi-pass reduction for when there are too many runs: repeatedly
+    /// merge `fanin`-sized chunks of runs into new on-disk runs until at
+    /// most `fanin` remain (the FINAL merge is the caller's, so it can
+    /// stream). Each chunk's merged output is sunk straight into an open
+    /// `ArrowWriter` (`append_batch_streaming`, the join/agg spill paths'
+    /// own open-writer plumbing) instead of the previous
+    /// collect-into-a-Vec-then-`write_batches_to_parquet` — a chunk of
+    /// `fanin` runs each ~`memory_threshold`-sized would otherwise
+    /// materialize `fanin * threshold` bytes per intermediate pass.
+    fn reduce_runs_to_fanin(&self, runs: &[PathBuf], fanin: usize) -> Result<Vec<PathBuf>> {
         let mut current_runs = runs.to_vec();
         let mut pass = 0;
 
@@ -2957,15 +3153,23 @@ impl ExternalSortExec {
                 if chunk.len() == 1 {
                     next_runs.push(chunk[0].clone());
                 } else {
-                    // Merge this chunk into a new run
-                    let merged = self.streaming_k_way_merge(chunk, 8192)?;
-                    if !merged.is_empty() {
-                        let output_path = spill_dir.join(format!(
-                            "merged_pass{}_{}.parquet",
-                            pass,
-                            next_runs.len()
-                        ));
-                        write_batches_to_parquet(&output_path, &merged)?;
+                    // Merge this chunk into a new run, streamed batch by
+                    // batch into an open writer (lazily created on the
+                    // first batch, so an empty chunk merge creates no file
+                    // and pushes no run — mirrors the old
+                    // `if !merged.is_empty()` guard).
+                    let output_path =
+                        spill_dir.join(format!("merged_pass{}_{}.parquet", pass, next_runs.len()));
+                    let mut writer_slot: Option<ArrowWriter<File>> = None;
+                    {
+                        let mut sink = |batch: RecordBatch| -> Result<bool> {
+                            append_batch_streaming(&mut writer_slot, &output_path, &batch)?;
+                            Ok(true)
+                        };
+                        self.streaming_k_way_merge_into(chunk, Self::MERGE_BUFFER_ROWS, &mut sink)?;
+                    }
+                    if let Some(writer) = writer_slot {
+                        writer.close()?;
                         next_runs.push(output_path);
                     }
                 }
@@ -2999,20 +3203,35 @@ impl ExternalSortExec {
             pass += 1;
         }
 
-        // Final merge
-        self.streaming_k_way_merge(&current_runs, 8192)
+        Ok(current_runs)
     }
 
-    /// Streaming k-way merge with bounded memory usage
-    fn streaming_k_way_merge(
+    /// Streaming k-way merge with bounded memory usage, delivering each
+    /// built output batch through `sink` as soon as it exists instead of
+    /// accumulating a `result_batches` Vec (whose total size is the whole
+    /// merged output). The merge ALGORITHM — row-by-row min-scan, the
+    /// buffer-transition flush, `build_merged_batch`(+`_final` fallback)
+    /// construction — is unchanged.
+    ///
+    /// One hoist, semantics-preserving (oom-safety-hardening task 003):
+    /// sort-key columns are evaluated ONCE per LOADED buffer
+    /// (`eval_key_cols`), not twice per row-COMPARISON as the old
+    /// `compare_rows` closure did — `evaluate_expr` is deterministic per
+    /// batch, so per-comparison re-evaluation only cost time (billions of
+    /// calls for a 250M-row merge: rows × fan-in × keys × 2), never
+    /// changed a result. A key expression that fails to evaluate is
+    /// skipped for the comparison (both sides), exactly as the old
+    /// `.ok()`-based closure did.
+    fn streaming_k_way_merge_into(
         &self,
         runs: &[PathBuf],
         buffer_rows: usize,
-    ) -> Result<Vec<RecordBatch>> {
+        sink: &mut dyn FnMut(RecordBatch) -> Result<bool>,
+    ) -> Result<()> {
         use std::cmp::Ordering;
 
         if runs.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         // Open iterators for each run
@@ -3021,6 +3240,18 @@ impl ExternalSortExec {
         > = Vec::new();
         let mut run_buffers: Vec<Option<RecordBatch>> = Vec::new();
         let mut run_indices: Vec<usize> = Vec::new(); // Current row index in each buffer
+                                                      // Hoisted sort-key columns for each run's CURRENT buffer, one
+                                                      // entry per `order_by` expression (None = that key failed to
+                                                      // evaluate against this buffer — skipped in comparisons, matching
+                                                      // the old per-comparison `.ok()` behavior).
+        let mut run_keys: Vec<Vec<Option<ArrayRef>>> = Vec::new();
+
+        let eval_key_cols = |batch: &RecordBatch| -> Vec<Option<ArrayRef>> {
+            self.order_by
+                .iter()
+                .map(|s| evaluate_expr(batch, &s.expr).ok())
+                .collect()
+        };
 
         for run in runs {
             let file = File::open(run).map_err(|e| {
@@ -3032,34 +3263,33 @@ impl ExternalSortExec {
             run_iterators.push(Box::new(reader));
             run_buffers.push(None);
             run_indices.push(0);
+            run_keys.push(Vec::new());
         }
 
         // Load initial batch from each run
         for (i, iter) in run_iterators.iter_mut().enumerate() {
             if let Some(batch_result) = iter.next() {
-                run_buffers[i] = Some(batch_result?);
+                let batch = batch_result?;
+                run_keys[i] = eval_key_cols(&batch);
+                run_buffers[i] = Some(batch);
                 run_indices[i] = 0;
             }
         }
 
         // Build output batches using a simple row-by-row merge
         // For better performance, we'd want to do vectorized merge, but this is memory-safe
-        let mut result_batches = Vec::new();
         let mut output_rows: Vec<(usize, usize)> = Vec::new(); // (run_idx, row_idx)
 
-        // Helper to compare rows
-        let compare_rows = |batch_a: &RecordBatch,
+        // Helper to compare rows via the hoisted key columns.
+        let compare_rows = |keys_a: &[Option<ArrayRef>],
                             row_a: usize,
-                            batch_b: &RecordBatch,
+                            keys_b: &[Option<ArrayRef>],
                             row_b: usize,
                             order_by: &[crate::planner::SortExpr]|
          -> std::cmp::Ordering {
-            for sort_expr in order_by {
-                let col_a = evaluate_expr(batch_a, &sort_expr.expr).ok();
-                let col_b = evaluate_expr(batch_b, &sort_expr.expr).ok();
-
-                if let (Some(a), Some(b)) = (col_a, col_b) {
-                    let cmp = compare_array_values(&a, row_a, &b, row_b);
+            for (key_idx, sort_expr) in order_by.iter().enumerate() {
+                if let (Some(a), Some(b)) = (&keys_a[key_idx], &keys_b[key_idx]) {
+                    let cmp = compare_array_values(a, row_a, b, row_b);
                     let cmp = if sort_expr.direction == crate::planner::SortDirection::Desc {
                         cmp.reverse()
                     } else {
@@ -3085,9 +3315,9 @@ impl ExternalSortExec {
                             None => Some(run_idx),
                             Some(current_min) => {
                                 let cmp = compare_rows(
-                                    batch,
+                                    &run_keys[run_idx],
                                     run_indices[run_idx],
-                                    run_buffers[current_min].as_ref().unwrap(),
+                                    &run_keys[current_min],
                                     run_indices[current_min],
                                     &self.order_by,
                                 );
@@ -3142,15 +3372,20 @@ impl ExternalSortExec {
                             // invariant `build_merged_batch` requires.
                             if !output_rows.is_empty() {
                                 let batch = self.build_merged_batch(&run_buffers, &output_rows)?;
-                                result_batches.push(batch);
                                 output_rows.clear();
+                                if !sink(batch)? {
+                                    return Ok(());
+                                }
                             }
                             // Try to load next batch from this run
                             if let Some(next_batch) = run_iterators[run_idx].next() {
-                                run_buffers[run_idx] = Some(next_batch?);
+                                let batch = next_batch?;
+                                run_keys[run_idx] = eval_key_cols(&batch);
+                                run_buffers[run_idx] = Some(batch);
                                 run_indices[run_idx] = 0;
                             } else {
                                 run_buffers[run_idx] = None;
+                                run_keys[run_idx] = Vec::new();
                             }
                         }
                     }
@@ -3158,8 +3393,10 @@ impl ExternalSortExec {
                     // Flush output when buffer is full
                     if output_rows.len() >= buffer_rows {
                         let batch = self.build_merged_batch(&run_buffers, &output_rows)?;
-                        result_batches.push(batch);
                         output_rows.clear();
+                        if !sink(batch)? {
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -3175,14 +3412,29 @@ impl ExternalSortExec {
         if !output_rows.is_empty() {
             // For the final batch, we need to reload any exhausted buffers
             // that are referenced in output_rows
-            let batch = self.build_merged_batch_final(&runs, &output_rows, buffer_rows)?;
-            result_batches.push(batch);
+            let batch = self.build_merged_batch_final(runs, &output_rows, buffer_rows)?;
+            if !sink(batch)? {
+                return Ok(());
+            }
         }
 
-        Ok(result_batches)
+        Ok(())
     }
 
-    /// Build a merged batch from the given row references
+    /// Build a merged batch from the given row references.
+    ///
+    /// Fast path (oom-safety-hardening task 003, semantics-preserving):
+    /// when every referenced run buffer is present, wide enough, and the
+    /// referenced buffers agree on column types, gather with ONE
+    /// `arrow::compute::interleave` call per column — the kernel built for
+    /// exactly this (row_idx, batch)-addressed k-way-merge output shape —
+    /// instead of the generic path below, which materializes a fresh
+    /// 1-ROW array per output row per column and then concatenates
+    /// thousands of them (the dominant merge cost at real spill scale:
+    /// 2 arrays/row/column). The generic path is KEPT verbatim as the
+    /// fallback for any shape the fast path can't prove safe (missing
+    /// buffer, short batch, cross-run type disagreement), and both paths
+    /// end in the same `batch_with_actual_types` reconciliation.
     fn build_merged_batch(
         &self,
         run_buffers: &[Option<RecordBatch>],
@@ -3191,6 +3443,53 @@ impl ExternalSortExec {
         if rows.is_empty() {
             return Ok(RecordBatch::new_empty(self.schema.clone()));
         }
+
+        let num_cols = self.schema.fields().len();
+
+        // ---- interleave fast path ------------------------------------
+        let mut referenced: Vec<usize> = rows.iter().map(|&(run_idx, _)| run_idx).collect();
+        referenced.sort_unstable();
+        referenced.dedup();
+
+        let mut fast_ok = referenced
+            .iter()
+            .all(|&r| matches!(&run_buffers[r], Some(b) if b.num_columns() >= num_cols));
+        if fast_ok {
+            if let Some((&first_ref, rest)) = referenced.split_first() {
+                let first = run_buffers[first_ref].as_ref().unwrap();
+                'cols: for col_idx in 0..num_cols {
+                    let dt = first.column(col_idx).data_type();
+                    for &r in rest {
+                        if run_buffers[r].as_ref().unwrap().column(col_idx).data_type() != dt {
+                            fast_ok = false;
+                            break 'cols;
+                        }
+                    }
+                }
+            }
+        }
+        if fast_ok {
+            // Dense position of each referenced run in the interleave
+            // input array list.
+            let mut dense_pos = vec![usize::MAX; run_buffers.len()];
+            for (pos, &r) in referenced.iter().enumerate() {
+                dense_pos[r] = pos;
+            }
+            let indices: Vec<(usize, usize)> = rows
+                .iter()
+                .map(|&(run_idx, row_idx)| (dense_pos[run_idx], row_idx))
+                .collect();
+            let mut final_columns: Vec<ArrayRef> = Vec::with_capacity(num_cols);
+            for col_idx in 0..num_cols {
+                let arrays: Vec<&dyn arrow::array::Array> = referenced
+                    .iter()
+                    .map(|&r| run_buffers[r].as_ref().unwrap().column(col_idx).as_ref())
+                    .collect();
+                final_columns.push(compute::interleave(&arrays, &indices)?);
+            }
+            return batch_with_actual_types(&self.schema, final_columns);
+        }
+        // ---- generic fallback (pre-existing path, unchanged) ---------
 
         // Group rows by run
         let mut run_row_groups: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
@@ -3202,7 +3501,6 @@ impl ExternalSortExec {
         }
 
         // Build output columns
-        let num_cols = self.schema.fields().len();
         let mut output_columns: Vec<Vec<(usize, ArrayRef)>> = vec![Vec::new(); num_cols];
 
         for (run_idx, row_list) in run_row_groups {
