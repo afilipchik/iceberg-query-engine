@@ -80,14 +80,16 @@ for scenario in $SCENARIOS; do
       # mimalloc reserves a ~1GiB arena up front and 32 tokio worker
       # stacks reserve ~0.3G more, none of it resident. Measured on this
       # box: the example fails thread-spawn (EAGAIN, exit 101) at
-      # QE_MEM_CAP=1G before the scenario even starts, and runs at 2G.
-      # So the rlimit lever's cap = scenario cap + fixed 1536MB virtual
-      # headroom — the scenario's own REAL allocations still hit the
-      # limit at (approximately) the same point the cgroup lever's RSS
-      # cap represents.
+      # QE_MEM_CAP=1G before the scenario even starts, runs at 1536M,
+      # and completed a 1.66GB-RSS CTAS at 2048M (allocations INSIDE the
+      # reserved arena don't recount, so usable-beyond-startup is closer
+      # to the cap than a naive "cap minus 1.3G" model suggests). So the
+      # rlimit lever's cap = scenario cap + fixed 1024MB virtual headroom
+      # — enough to get past startup reservations, tight enough that the
+      # scenarios' real multi-GB pre-fix appetites still hit it.
       cap_mb="$(numfmt --from=iec "${cap^^}" 2>/dev/null || echo $((1024 * 1024 * 1024)))"
       cap_mb=$((cap_mb / 1024 / 1024))
-      rlimit_cap="$((cap_mb + 1536))M"
+      rlimit_cap="$((cap_mb + 1024))M"
       timeout -s KILL "$RUN_TIMEOUT" systemd-run --user --scope --quiet --collect \
         --unit="$unit" \
         -p MemoryMax=8G -p MemorySwapMax=0 \
@@ -110,19 +112,25 @@ for scenario in $SCENARIOS; do
       124) verdict=FAIL reason=timeout ;;
       *) verdict=FAIL reason="exit-$code" ;;
     esac
-    # A memcg kill can surface as other codes (e.g. /usr/bin/time itself
-    # SIGTERM'd during scope teardown → 143, or "terminated by signal 9"
-    # in time's own output) — reclassify from the direct evidence.
-    if [[ "$verdict" == FAIL ]] && grep -qiE 'terminated by signal 9' "$log"; then
-      reason=oom-sigkill
-    fi
-    if [[ "$verdict" == FAIL ]] && grep -qiE "memory allocation of .* failed|abort" "$log"; then
-      [[ "$reason" == "exit-$code" ]] && reason=abort-at-rlimit
-    fi
-    # Journal evidence for kernel/memcg kills of this exact unit.
+    # Journal evidence for kernel/memcg kills of this exact unit. NOTE:
+    # the unit name itself contains "oomharness", so the kill filter must
+    # match the KILL PHRASES, never just the substring "oom".
     kill_line="$(journalctl --user -q --since "$start_ts" --no-pager 2>/dev/null \
-      | grep -F "$unit" | grep -i 'oom' | head -1)"
+      | grep -F "$unit" \
+      | grep -E 'killed by the OOM killer|oom-kill|systemd-oomd killed' | head -1)"
     [[ -n "$kill_line" ]] && echo "JOURNAL: $kill_line" >>"$log"
+    # A memcg kill can surface as other codes (a fast kill takes
+    # /usr/bin/time down with the scope before it can report → 143 or
+    # empty output) — reclassify from direct evidence. The abort match is
+    # the EXACT Rust OOM-abort message; never bare "abort" (the mem-cap
+    # startup banner contains the word "aborts").
+    if [[ "$verdict" == FAIL ]]; then
+      if grep -qiE 'terminated by signal 9' "$log" || [[ -n "$kill_line" ]]; then
+        reason=oom-sigkill
+      elif grep -qE 'memory allocation of [0-9]+ bytes failed' "$log"; then
+        reason=abort-at-rlimit
+      fi
+    fi
 
     echo "RESULT scenario=$scenario lever=$lever cap=$cap exit=$code peak_rss_mb=$peak_mb verdict=$verdict reason=$reason detail=${detail:-n/a} log=$log"
     [[ "$verdict" == "FAIL" ]] && overall=1

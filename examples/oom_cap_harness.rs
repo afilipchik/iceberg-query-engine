@@ -39,7 +39,7 @@
 //!   137 = SIGKILL by the kernel/memcg — a FAIL verdict
 //!
 //! Env knobs:
-//!   QE_HARNESS_ROWS          synthetic rows for agg/sort (default 100_000_000)
+//!   QE_HARNESS_ROWS          synthetic rows for agg/sort (default 250_000_000 — ~4GB raw, comfortably above BOTH default cap levers)
 //!   QE_HARNESS_MEMORY_LIMIT  engine memory_limit bytes for agg/sort
 //!                            (default 256MB — far below the input, so the
 //!                            operator MUST decide to spill to survive)
@@ -164,7 +164,7 @@ fn spill_dir(tag: &str) -> std::path::PathBuf {
 }
 
 async fn scenario_agg() -> query_engine::Result<String> {
-    let total_rows = env_usize("QE_HARNESS_ROWS", 100_000_000) as i64;
+    let total_rows = env_usize("QE_HARNESS_ROWS", 250_000_000) as i64;
     let memory_limit = env_usize("QE_HARNESS_MEMORY_LIMIT", 256 * 1024 * 1024);
     let input: Arc<dyn PhysicalOperator> = Arc::new(LazyGeneratorExec {
         schema: gen_schema(),
@@ -213,7 +213,7 @@ async fn scenario_agg() -> query_engine::Result<String> {
 }
 
 async fn scenario_sort() -> query_engine::Result<String> {
-    let total_rows = env_usize("QE_HARNESS_ROWS", 100_000_000) as i64;
+    let total_rows = env_usize("QE_HARNESS_ROWS", 250_000_000) as i64;
     let memory_limit = env_usize("QE_HARNESS_MEMORY_LIMIT", 256 * 1024 * 1024);
     let input: Arc<dyn PhysicalOperator> = Arc::new(LazyGeneratorExec {
         schema: gen_schema(),

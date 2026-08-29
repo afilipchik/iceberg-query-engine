@@ -193,8 +193,52 @@ Outcome ("still genuinely OOM-killed at the same ~3G cap, unchanged") and
 by this session's reruns. The comment is stale/wrong; the Outcome is
 correct.
 
+## HARNESS: built + first full battery (calibration findings)
+
+`examples/oom_cap_harness.rs` (4 scenarios, exit protocol 0=completed /
+2=clean refusal / 134=rlimit abort / 137=memcg kill; calls
+`enforce_process_memory_cap()` first, like `main.rs`, since examples don't
+inherit it) + `scripts/oom_cap_harness.sh` (both levers, machine-readable
+`RESULT scenario= lever= cap= exit= peak_rss_mb= verdict= reason=` lines,
+per-run journal kill-evidence appended to each log).
+
+Calibration findings from battery run 1+2 (`.scratch/oom001/
+harness_prefix{,2}*`), each fixed in the driver:
+- **rlimit lever needs virtual headroom**: `RLIMIT_DATA` counts virtual
+  private-anon mappings — mimalloc reserves a ~1GiB arena up front + 32
+  tokio worker stacks; at `QE_MEM_CAP=1G` the example dies at startup
+  (thread-spawn EAGAIN, exit 101, 11MB RSS) before any scenario code.
+  Probes: 1G fails, 1536M runs, 2048M ran a 1.66GB-RSS CTAS to
+  completion. Driver now uses cap + 1024MB for the rlimit lever.
+- **Fast memcg kills take `/usr/bin/time` down with the scope** (exit
+  143 / empty output) — driver reclassifies from journal evidence; the
+  journal filter must match kill PHRASES, not the substring "oom" (the
+  unit names contain "oomharness").
+- 100M-row default made the rlimit lever too loose for agg/sort (input
+  1.6GB < effective allowance): both completed CORRECTLY through the
+  spill paths (agg: 1,000,003 groups exact at 1899MB peak; sort: 100M
+  rows verified globally ordered at 2253MB peak) — useful validation
+  that the scenarios are well-formed and the operators' spill paths are
+  correct ONCE COLLECT FITS, but not a bite. Default rows now 250M
+  (~4GB raw > both levers).
+
+Interim pre-fix evidence already firm from run 2:
+- agg/cgroup 1G: exit 137, peak 1026MB — kernel memcg kill during
+  `collect_input_partitions_concurrently` (the G1 hole, demonstrated).
+- sort/cgroup 1G: exit 137, peak 1025MB — same.
+- native-scan both levers: exit 2 clean refusal naming exact bytes
+  ("needs an estimated 5641105508 bytes ... exceeds the configured
+  memory safety budget of 429496729 bytes") — today's documented
+  boundary; post-fix (G2) must COMPLETE instead.
+- insert/cgroup 512M: memcg SIGKILL (journal: "A process of this unit
+  has been killed by the OOM killer"), killed within ~1s — the
+  documented native-tables-mutation task-005 residual, confirmed live.
+- insert/rlimit 2048M: completed at 1662MB peak — independently
+  reproduces the documented ~1.63GB bounded-merge CTAS peak almost
+  exactly.
+
 ## Next
 
-- [in progress] profiled control repro under 3G cap (confirm site at death)
-- [in progress] build examples/oom_cap_harness.rs (+ scripts/oom_cap_harness.sh written)
-- [ ] run harness: 4 scenarios × 2 levers, record pre-fix evidence
+- [in progress] rebuild harness at 250M-row default; final battery for the
+  pre-fix evidence table
+- [ ] Outcome section in 001.md
