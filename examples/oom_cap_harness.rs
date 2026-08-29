@@ -105,7 +105,9 @@ fn make_batch(schema: &SchemaRef, start: i64, n: i64) -> RecordBatch {
     let ids: Vec<i64> = (start..start + n).collect();
     // `val` cycles through a large-but-bounded space so COUNT(DISTINCT val)
     // and ORDER BY val both do real work without degenerate all-equal keys.
-    let vals: Vec<i64> = (0..n).map(|i| (start + i).wrapping_mul(2654435761) % 1_000_003).collect();
+    let vals: Vec<i64> = (0..n)
+        .map(|i| (start + i).wrapping_mul(2654435761) % 1_000_003)
+        .collect();
     RecordBatch::try_new(
         schema.clone(),
         vec![
@@ -259,7 +261,10 @@ async fn scenario_sort() -> query_engine::Result<String> {
 
 async fn scenario_native_scan() -> query_engine::Result<String> {
     let table_dir = env_str("QE_HARNESS_NATIVE_TABLE", "data/tpch-10gb-native/lineitem");
-    if !std::path::Path::new(&table_dir).join("_manifest.json").exists() {
+    if !std::path::Path::new(&table_dir)
+        .join("_manifest.json")
+        .exists()
+    {
         return Err(query_engine::QueryError::Execution(format!(
             "SKIP: native table dir {table_dir} not found"
         )));
