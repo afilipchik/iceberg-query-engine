@@ -11,8 +11,8 @@
 //!     --native-dir data/tpch-10gb-native
 
 use arrow::array::Array;
-use query_engine::planner::{Expr, ScalarValue};
 use query_engine::physical::TableProvider;
+use query_engine::planner::{Expr, ScalarValue};
 use query_engine::storage::NativeTable;
 use std::path::PathBuf;
 
@@ -79,7 +79,8 @@ fn real_content_size(batch: &arrow::record_batch::RecordBatch) -> usize {
                     // the raw buffer capacity)
                     let dict = c
                         .as_any()
-                        .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int32Type>>()
+                        .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int32Type>>(
+                        )
                         .unwrap();
                     let keys_bytes = rows * 4;
                     let values = dict.values();
@@ -114,7 +115,10 @@ fn main() -> query_engine::Result<()> {
     println!("Opening native lineitem table at {:?}", native_dir);
     let table = NativeTable::try_new(&native_dir)?;
     let schema = table.schema();
-    println!("schema: {:?}", schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>());
+    println!(
+        "schema: {:?}",
+        schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
+    );
 
     // Column indices matching Q12's build-side need: l_orderkey(0),
     // l_shipdate(10), l_commitdate(11), l_receiptdate(12), l_shipmode(14)
@@ -168,33 +172,20 @@ fn main() -> query_engine::Result<()> {
     let ship = "SHIP";
     let mut batches: Vec<arrow::record_batch::RecordBatch> = Vec::with_capacity(raw_batches.len());
     for b in &raw_batches {
-        let shipdate = b
-            .column(1)
-            .as_any()
-            .downcast_ref::<Date32Array>()
-            .unwrap();
-        let commitdate = b
-            .column(2)
-            .as_any()
-            .downcast_ref::<Date32Array>()
-            .unwrap();
-        let receiptdate = b
-            .column(3)
-            .as_any()
-            .downcast_ref::<Date32Array>()
-            .unwrap();
+        let shipdate = b.column(1).as_any().downcast_ref::<Date32Array>().unwrap();
+        let commitdate = b.column(2).as_any().downcast_ref::<Date32Array>().unwrap();
+        let receiptdate = b.column(3).as_any().downcast_ref::<Date32Array>().unwrap();
         let shipmode_col = b.column(4);
-        let shipmode_str: StringArray = if let Some(sa) =
-            shipmode_col.as_any().downcast_ref::<StringArray>()
-        {
-            sa.clone()
-        } else {
-            arrow::compute::cast(shipmode_col, &arrow::datatypes::DataType::Utf8)?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap()
-                .clone()
-        };
+        let shipmode_str: StringArray =
+            if let Some(sa) = shipmode_col.as_any().downcast_ref::<StringArray>() {
+                sa.clone()
+            } else {
+                arrow::compute::cast(shipmode_col, &arrow::datatypes::DataType::Utf8)?
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .clone()
+            };
         let mut mask = arrow::array::BooleanBuilder::with_capacity(b.num_rows());
         for i in 0..b.num_rows() {
             let sm = shipmode_str.value(i);
@@ -279,7 +270,10 @@ fn main() -> query_engine::Result<()> {
     // Per-column breakdown of the FIRST batch, to isolate which column(s)
     // drive the estimate_batch_size number.
     if let Some(b) = batches.first() {
-        println!("\n=== Per-column breakdown of first batch (rows={}) ===", b.num_rows());
+        println!(
+            "\n=== Per-column breakdown of first batch (rows={}) ===",
+            b.num_rows()
+        );
         for (i, col) in b.columns().iter().enumerate() {
             let name = schema.field(projection[i]).name();
             let dt = col.data_type();

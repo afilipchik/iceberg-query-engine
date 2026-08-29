@@ -2849,10 +2849,64 @@ fn truncate_batches_to_limit(batches: Vec<RecordBatch>, limit: usize) -> Vec<Rec
 /// which for an array sliced out of a larger allocation — every batch an
 /// mmap-backed IPC read produces — counts the whole mapping per batch. Spill
 /// decisions made on that number spill everything unconditionally (and the
-/// spilled join's build-side estimate was off by ~50x). Offsets-based sizing
+/// spilled join's build-side estimate was off by ~50x, and by ~4,000x for a
+/// Dictionary-column-heavy build side — see below). Offsets-based sizing
 /// counts the rows the batch actually references; unknown types fall back to
-/// the capacity number, which over- rather than under-counts (the safe
-/// direction for a spill decision).
+/// a slice-aware generic computation (see below), which over- rather than
+/// under-counts (the safe direction for a spill decision) but never counts
+/// an mmap segment's whole on-disk size.
+///
+/// `spill-size-estimate-fix` epic, task 001 (2026-08-28): the generic
+/// fallback used to be `c.get_array_memory_size()`, which walks each
+/// `Buffer`'s `capacity()` — and for a `Buffer` built by
+/// `Buffer::from_custom_allocation` (every column read through
+/// `ipc_cache.rs`'s mmap path, i.e. every native-table and IPC-sidecar
+/// scan), `capacity()` unconditionally returns the FULL LENGTH PASSED AT
+/// MMAP TIME, forever, regardless of how small a slice/sub-buffer is later
+/// carved out of it (`Bytes::capacity()`'s `Deallocation::Custom(_, size)`
+/// arm returns the original `size`, not the current view's length — see
+/// arrow-buffer's `bytes.rs`). One mmap `Buffer` backs an ENTIRE segment
+/// file and is shared by every column's every sub-buffer in that segment,
+/// so ANY type reaching this fallback reported the whole segment file's
+/// on-disk size as its own — confirmed via `examples/
+/// spill_size_estimate_check.rs`: Q12's real ~42MB Dictionary-column-heavy
+/// build side estimated at ~167.7GB (~4,000x over), which crossed the spill
+/// threshold and forced an unnecessary spill.
+///
+/// Fix: fall back to `ArrayData::get_slice_memory_size()` (arrow-data)
+/// instead. It computes size purely from the array's own LOGICAL length and
+/// data-type layout — for `Dictionary(K, V)` specifically: `self.len *
+/// size_of::<K>()` for the keys (the type's own `layout()` delegates to the
+/// key type's fixed-width layout) PLUS the dictionary VALUES array's own
+/// real content bytes, computed by recursing into `child_data[0]` (arrow
+/// stores a `DictionaryArray`'s values as its first — and only — child
+/// `ArrayData`) — i.e. exactly `keys.len() * key_width +
+/// dictionary_values_actual_bytes`, this function's own target formula, but
+/// generalized by arrow itself to ANY key/value type combination rather
+/// than hand-rolled against one hard-coded `Int32Type`/`StringArray` shape.
+/// It NEVER reads `Buffer::capacity()`. This generalizes the SAME fix to
+/// every other type that previously reached this fallback and could carry
+/// the identical mmap-capacity-vs-logical-content problem — `LargeUtf8`/
+/// `LargeBinary` (content-aware via `typed_offsets::<i64>()`, the exact
+/// same offsets-delta approach this function's own Utf8/Binary branch
+/// above already uses by hand), `FixedSizeBinary`/`Union` (fixed-width,
+/// scaled by `self.len`, not by buffer capacity), and `List`/`LargeList`/
+/// `Struct`/`Map`/`FixedSizeList`/`RunEndEncoded` (offsets sized by
+/// `self.len`, recursing into child `ArrayData` the same way Dictionary's
+/// values do) — audited against this engine's actual mmap-backed write
+/// surface: `NativeManifest::ManifestDataType::from_arrow` (`src/storage/
+/// native_manifest.rs`) is the ONLY schema gate a native table (or an IPC
+/// sidecar, which mirrors the same coercion) can be written through, and it
+/// explicitly REJECTS every nested type (List/Struct/Map/Union/
+/// FixedSizeList/RunEndEncoded) at write time — so those are not reachable
+/// via this engine's own mmap-backed tables today, but are still fixed here
+/// defensively (never worse than the old behavior, no correctness/
+/// performance cost when unreached) rather than left as a live landmine for
+/// a future writer that adds them. `.unwrap_or_else(|_| c.
+/// get_array_memory_size())` is a defensive-only fallback for the
+/// `Result`'s error path (not expected to fire for any type this function
+/// can be called with) — if it ever does, it lands back on the OLD,
+/// over-counting-safe behavior, never a new failure mode.
 fn estimate_batch_size(batch: &RecordBatch) -> usize {
     use arrow::array::Array;
     batch
@@ -2880,7 +2934,10 @@ fn estimate_batch_size(batch: &RecordBatch) -> usize {
                     };
                     data + rows * 4 + null_bytes
                 }
-                _ => c.get_array_memory_size(),
+                _ => c
+                    .to_data()
+                    .get_slice_memory_size()
+                    .unwrap_or_else(|_| c.get_array_memory_size()),
             }
         })
         .sum()
@@ -3123,20 +3180,85 @@ fn write_batches_to_parquet(path: &PathBuf, batches: &[RecordBatch]) -> Result<(
 /// disk, for a partition that never receives a batch) and reused for every
 /// subsequent one, so the cost of any single append no longer grows with
 /// how much has already been spilled for that partition. The on-disk
-/// SHAPE is unchanged (still exactly one Parquet file per partition, still
-/// one row group per appended batch) — `read_parquet`/
-/// `process_spilled_partition` need no changes.
+/// SHAPE is unchanged (still exactly one Parquet file per partition) —
+/// `read_parquet`/`process_spilled_partition` need no changes.
+///
+/// **`oom-safety-hardening` epic (2026-08-29): the "kept open for the
+/// whole build/probe phase" design above has a real, confirmed memory-
+/// accounting hole this fixes.** `ArrowWriter::write()` does NOT flush a
+/// batch to disk per call — it buffers into the CURRENT row group's
+/// in-progress column encoders until `parquet`'s own row-group limit is
+/// hit (this file previously relied on the crate's row-COUNT default,
+/// 1,048,576, via an unset `WriterProperties`) or `.close()` runs. With
+/// `NUM_PARTITIONS` = 64 spilled partitions and a real build side's rows
+/// hash-partitioned roughly evenly across them, MOST spilled partitions
+/// never individually accumulate 1M+ rows before the build/probe phase
+/// ends — so their data sits fully memory-resident inside the writer's
+/// own internal buffer for the ENTIRE phase, invisible to `total_memory`
+/// (which already decremented as if that data were freed the moment
+/// `evict_build_partition_to_disk` ran). Confirmed live, not just by
+/// reading the code: `examples/_control_int32_repro.rs` (a PLAIN Int32
+/// build side, no Dictionary column at all — ruling out any connection
+/// to this epic's own Dictionary-sizing fix) with a 500MB configured
+/// `memory_limit` was genuinely OOM-killed by the kernel at ~3.1GB RSS
+/// under a real `systemd-run -p MemoryMax=3G` cap (`journalctl -k`:
+/// "Memory cgroup out of memory: Killed process ... (_control_int32_)");
+/// `examples/spill_dictionary_oversized_build_repro.rs` at a 30MB limit
+/// survived under a 900M cap but peaked at 723MB RSS — 24x its own
+/// configured budget.
+///
+/// **First attempt (byte-based `set_max_row_group_bytes`) measured, and
+/// REJECTED — a second instance of the exact bug class this epic exists
+/// to fix.** `parquet`'s own doc comment on that setter says row groups
+/// "are flushed when their ESTIMATED ENCODED SIZE exceeds this
+/// threshold" — encoded/compressed, not raw. Both repros above use
+/// deliberately low-cardinality, highly repetitive keys (a 7-entry
+/// dictionary; `i % 7` for the control's plain Int32), so their
+/// COMPRESSED footprint stays tiny no matter how many raw rows are
+/// buffered — the estimate this setting flushes against can be
+/// arbitrarily smaller than the actual uncompressed memory being held,
+/// the identical "estimate vs. real content" failure mode
+/// `estimate_batch_size` was fixed for elsewhere in this file. Measured,
+/// not assumed: re-ran both repros with only that fix — peak RSS was
+/// UNCHANGED (723MB → 740MB for the dictionary case, within noise; the
+/// control case was STILL genuinely OOM-killed at the same ~3G cap).
+///
+/// Fix that actually measures bounded: `set_max_row_group_row_count`
+/// (in addition to, not instead of, the byte cap above as a secondary
+/// net for genuinely wide rows) — a ROW-count limit bounds RAW buffered
+/// rows directly, immune to how well those rows happen to compress.
+/// `SPILL_WRITER_ROW_GROUP_ROWS` (8,192) matches this same file's own
+/// `CHUNK_ROWS` precedent (`SpillableHashAggregateExec::
+/// aggregate_with_spilling`) rather than inventing a new magic number.
+/// Verified this time by RE-RUNNING both adversarial repros after the
+/// change, not just by re-reading the code: the control case (previously
+/// OOM-killed at ~3.1GB against a 500MB limit under a 3G cap) now
+/// completes cleanly; the dictionary case's peak RSS dropped
+/// correspondingly. See this epic's own task notes for the exact
+/// before/after numbers from both fix attempts.
 fn append_batch_streaming(
     writer_slot: &mut Option<ArrowWriter<File>>,
     path: &PathBuf,
     batch: &RecordBatch,
 ) -> Result<()> {
+    /// Secondary net for genuinely wide rows whose compressed size tracks
+    /// their raw size reasonably closely. Matches `DEFAULT_PAGE_SIZE`
+    /// (1MB), already used elsewhere in this codebase as a natural unit.
+    const SPILL_WRITER_ROW_GROUP_BYTES: usize = 1024 * 1024;
+    /// The binding limit for narrow/repetitive rows (see this function's
+    /// own doc comment for why the byte-based cap alone measured as a
+    /// no-op): bounds RAW buffered rows directly, regardless of how well
+    /// they compress. Matches this file's own `CHUNK_ROWS` precedent.
+    const SPILL_WRITER_ROW_GROUP_ROWS: usize = 8_192;
+
     if writer_slot.is_none() {
         let file = File::create(path).map_err(|e| {
             QueryError::Execution(format!("Failed to create spill file {:?}: {}", path, e))
         })?;
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
+            .set_max_row_group_bytes(Some(SPILL_WRITER_ROW_GROUP_BYTES))
+            .set_max_row_group_row_count(Some(SPILL_WRITER_ROW_GROUP_ROWS))
             .build();
         *writer_slot = Some(ArrowWriter::try_new(file, batch.schema(), Some(props))?);
     }
@@ -3574,6 +3696,96 @@ mod tests {
 
         let size = estimate_batch_size(&batch);
         assert!(size > 0);
+    }
+
+    /// Regression test for `spill-size-estimate-fix` epic, task 001: builds
+    /// a Dictionary column whose values array is sliced out of a single
+    /// oversized shared allocation via `Buffer::from_custom_allocation` --
+    /// exactly `ipc_cache.rs::read_row_group`'s own mmap mechanics, where
+    /// ONE `Buffer` backs an entire native-table segment file and every
+    /// column's sub-buffers are views into it. Before the fix,
+    /// `estimate_batch_size` fell through to `c.get_array_memory_size()`
+    /// for `Dictionary` columns, which sums `Buffer::capacity()` --
+    /// and a `Buffer` built by `from_custom_allocation` reports the FULL
+    /// length passed at construction time forever, regardless of how small
+    /// a slice is later carved out of it (this is `Deallocation::Custom`'s
+    /// documented behavior in arrow-buffer's `bytes.rs`). This test proves
+    /// two things: (1) the oversized-allocation setup below genuinely
+    /// reproduces the precondition (`get_array_memory_size()` on the raw
+    /// column is tens of MB for 5 logical rows), and (2)
+    /// `estimate_batch_size` on the very same batch is now content-aware --
+    /// on the order of the real ~50-ish logical bytes, not the shared
+    /// allocation's size.
+    #[test]
+    fn dictionary_column_estimate_is_content_aware_not_mmap_capacity() {
+        use arrow::array::{Array, ArrayData, DictionaryArray};
+        use arrow::buffer::Buffer;
+        use arrow::datatypes::{DataType, Field, Int32Type, Schema};
+
+        // A 32 MiB "mmap" standing in for one native-table segment file --
+        // `ipc_cache.rs::read_row_group`'s single `Buffer::from_custom_allocation`
+        // over the whole mapped file, which every column's every buffer in
+        // that segment is then sliced out of.
+        let oversized_len = 32 * 1024 * 1024;
+        let raw: Arc<Box<[u8]>> = Arc::new(vec![0u8; oversized_len].into_boxed_slice());
+        let ptr = std::ptr::NonNull::new(raw.as_ptr() as *mut u8).unwrap();
+        // SAFETY: `raw` (kept alive via the `Arc` passed as the allocation
+        // owner) is a `oversized_len`-byte heap allocation; `ptr`/`oversized_len`
+        // describe exactly that allocation.
+        let mmap_buffer = unsafe { Buffer::from_custom_allocation(ptr, oversized_len, raw) };
+
+        // Dictionary VALUES ("MAIL"/"SHIP"/"RAIL", Q12's own l_shipmode
+        // values): a small Utf8 array whose data buffer is a slice of the
+        // oversized shared allocation above -- the same shape
+        // `read_dictionary`'s `buffer.slice_with_length(...)` produces.
+        let values_bytes = b"MAILSHIPRAIL";
+        let values_data_buf = mmap_buffer.slice_with_length(0, values_bytes.len());
+        let offsets_buf = Buffer::from_slice_ref(&[0i32, 4, 8, 12]);
+        let values_data = ArrayData::builder(DataType::Utf8)
+            .len(3)
+            .add_buffer(offsets_buf)
+            .add_buffer(values_data_buf)
+            .build()
+            .unwrap();
+
+        // Keys: 5 rows referencing the 3 dictionary entries (a normal,
+        // non-oversized buffer -- only the values buffer needs to be
+        // mmap-backed to reproduce the bug, since the OLD fallback summed
+        // buffer capacities across the Dictionary array AND its child
+        // (values) data).
+        let keys_buf = Buffer::from_slice_ref(&[0i32, 1, 2, 0, 1]);
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let dict_data = ArrayData::builder(dict_type.clone())
+            .len(5)
+            .add_buffer(keys_buf)
+            .child_data(vec![values_data])
+            .build()
+            .unwrap();
+        let dict_array: DictionaryArray<Int32Type> = DictionaryArray::from(dict_data);
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "l_shipmode",
+            dict_type,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(dict_array) as ArrayRef]).unwrap();
+
+        let col = batch.column(0);
+        let old_buggy_size = col.get_array_memory_size();
+        assert!(
+            old_buggy_size > 16 * 1024 * 1024,
+            "test setup didn't reproduce the mmap-capacity precondition: \
+             get_array_memory_size()={old_buggy_size}"
+        );
+
+        let fixed_size = estimate_batch_size(&batch);
+        assert!(
+            fixed_size < 1024,
+            "estimate_batch_size should be content-aware (tens of bytes for \
+             5 rows over a 3-entry dictionary), got {fixed_size} bytes -- \
+             still reading the mmap-backed buffer's capacity instead of its \
+             logical content"
+        );
     }
 
     /// `append_batch_streaming` is the task 002 fix for `append_to_parquet`'s
