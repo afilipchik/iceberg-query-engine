@@ -491,6 +491,11 @@ impl SpillableHashJoinExec {
 struct BuildPartition {
     batches: Vec<RecordBatch>,
     memory_bytes: usize,
+    /// Total rows across `batches` — kept incrementally so the spill
+    /// path's hash-table accounting (`predicted_hash_table_bytes`,
+    /// oom-safety-hardening task 007) never rescans batches to price the
+    /// table this partition's rows imply.
+    rows: usize,
 }
 
 impl BuildPartition {
@@ -498,12 +503,26 @@ impl BuildPartition {
         Self {
             batches: Vec::new(),
             memory_bytes: 0,
+            rows: 0,
         }
     }
 
     fn add_batch(&mut self, batch: RecordBatch) {
         self.memory_bytes += estimate_batch_size(&batch);
+        self.rows += batch.num_rows();
         self.batches.push(batch);
+    }
+
+    /// What keeping this partition resident REALLY costs once its join
+    /// hash table exists: batch bytes plus the (conservative, worst-case
+    /// all-unique-keys) predicted table bytes. oom-safety-hardening task
+    /// 007: this is the charge the streaming build loop accounts against
+    /// the memory threshold — before it, only `memory_bytes` was charged,
+    /// so resident partitions were kept AT the threshold in batch bytes
+    /// and the 10-20x table amplification landed entirely on top,
+    /// unbudgeted (the measured 15-24x overshoot of task 001's repros).
+    fn charged_bytes(&self, key_cols: usize) -> usize {
+        self.memory_bytes + predicted_hash_table_bytes(self.rows, key_cols)
     }
 }
 
@@ -1063,18 +1082,36 @@ impl SpillableHashJoinExec {
         // comment (spill-join-correctness epic, task 002).
         let mut spill_writers: Vec<Option<ArrowWriter<File>>> =
             (0..NUM_PARTITIONS).map(|_| None).collect();
+        // oom-safety-hardening task 007: `total_memory` charges each
+        // resident partition its batch bytes PLUS the predicted bytes of
+        // the join hash table those rows imply
+        // (`BuildPartition::charged_bytes`), so residency settles where
+        // batches AND tables genuinely fit — not where batch bytes alone
+        // hit the threshold with the 10-20x table amplification unbudgeted
+        // on top (task 001's root-caused hole). The later budgeting pass
+        // (`budget_partition_hash_tables`) then replaces the prediction
+        // with DIRECT measurement of the built tables and evicts any
+        // residual overshoot.
+        let key_cols = build_keys.len();
         let mut total_memory: usize = 0;
         let memory_threshold =
             (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
 
         while let Some(batch) = build_stream.try_next().await? {
-            let batch_size = estimate_batch_size(&batch);
+            let batch_charge = estimate_batch_size(&batch)
+                + predicted_hash_table_bytes(batch.num_rows(), key_cols);
 
             // Check if we need to spill
-            if total_memory + batch_size > memory_threshold {
+            if total_memory + batch_charge > memory_threshold {
                 // Find the largest partition to spill
                 if let Some(idx) = find_largest_partition(&partitions) {
-                    total_memory -= self.evict_build_partition_to_disk(
+                    // Uncharge the partition's FULL charge (batches +
+                    // predicted table), matching what was added below.
+                    let charge = partitions[idx]
+                        .as_ref()
+                        .map(|p| p.charged_bytes(key_cols))
+                        .unwrap_or(0);
+                    self.evict_build_partition_to_disk(
                         idx,
                         &mut partitions,
                         &mut spilled,
@@ -1083,6 +1120,7 @@ impl SpillableHashJoinExec {
                         build_keys,
                         sj_trace,
                     )?;
+                    total_memory = total_memory.saturating_sub(charge);
                 }
             }
 
@@ -1091,18 +1129,23 @@ impl SpillableHashJoinExec {
 
             for (idx, part_batch) in partitioned.into_iter().enumerate() {
                 if let Some(pb) = part_batch {
-                    let pb_size = estimate_batch_size(&pb);
+                    let pb_charge = estimate_batch_size(&pb)
+                        + predicted_hash_table_bytes(pb.num_rows(), key_cols);
 
                     if let Some(ref mut part) = partitions[idx] {
                         part.add_batch(pb);
-                        total_memory += pb_size;
+                        total_memory += pb_charge;
                         // spill-join-correctness-2 epic, task 003: force
                         // this partition to disk right now if a fault-
                         // injection trial chose it, regardless of memory
                         // pressure — see `evict_build_partition_to_disk`'s
                         // own doc comment.
                         if chaos_partitions.as_ref().is_some_and(|s| s.contains(idx)) {
-                            total_memory -= self.evict_build_partition_to_disk(
+                            let charge = partitions[idx]
+                                .as_ref()
+                                .map(|p| p.charged_bytes(key_cols))
+                                .unwrap_or(0);
+                            self.evict_build_partition_to_disk(
                                 idx,
                                 &mut partitions,
                                 &mut spilled,
@@ -1111,6 +1154,7 @@ impl SpillableHashJoinExec {
                                 build_keys,
                                 sj_trace,
                             )?;
+                            total_memory = total_memory.saturating_sub(charge);
                         }
                     } else if let Some(ref mut sp) = spilled[idx] {
                         // Append to spilled partition as one more row group
@@ -1129,17 +1173,17 @@ impl SpillableHashJoinExec {
         }
 
         // oom-safety-hardening task 007: hash-table budgeting pass. The
-        // streaming loop above bounded resident BATCH bytes at
-        // `memory_threshold`, but the join hash tables built over those
-        // same rows cost ~10-20x the batch bytes (task 001's root-caused
-        // accounting hole — the tables were previously built later, in
-        // `execute_spill_path`, with zero accounting, measured at 15-24x
-        // the configured budget). Build the tables HERE, while
-        // `partitions`/`spilled`/`spill_writers` are still mutable, under
-        // direct accounting: resident batch bytes + measured table bytes
-        // must stay under the SAME `memory_threshold`, with partitions
-        // evicted to disk (the existing eviction mechanism, byte-for-byte)
-        // when the running total would cross it.
+        // streaming loop above bounded resident batch bytes + PREDICTED
+        // table bytes at `memory_threshold`; this pass builds the actual
+        // tables, while `partitions`/`spilled`/`spill_writers` are still
+        // mutable, and replaces the prediction with DIRECT measurement:
+        // resident batch bytes + measured table bytes must stay under the
+        // SAME `memory_threshold`, with partitions evicted to disk (the
+        // existing eviction mechanism, byte-for-byte) when the running
+        // total would cross it. Before this task the tables were built
+        // later, in `execute_spill_path`, with zero accounting at ~10-20x
+        // the batch bytes the spill decision budgeted (task 001's
+        // root-caused hole, measured 15-24x budget overshoot).
         let tables = self.budget_partition_hash_tables(
             &mut partitions,
             &mut spilled,
@@ -1158,12 +1202,13 @@ impl SpillableHashJoinExec {
     /// memory accounting, evicting the rest to disk.
     ///
     /// The running total starts at the sum of all resident partitions'
-    /// batch bytes (what `build_with_partitioning`'s streaming loop
-    /// already bounded) and must never cross `memory_limit *
-    /// spill_threshold` — the same formula every other spill decision in
-    /// this file uses. Per resident partition, largest first (keeping the
-    /// largest resident minimizes both spill I/O and the biggest
-    /// per-partition transient read-back cost later):
+    /// batch bytes and must never cross `memory_limit * spill_threshold`
+    /// — the same formula every other spill decision in this file uses.
+    /// (The streaming loop already bounded batch bytes + PREDICTED table
+    /// bytes at the same threshold; this pass swaps the prediction for
+    /// direct measurement.) Per resident partition, largest first
+    /// (keeping the largest resident minimizes both spill I/O and the
+    /// biggest per-partition transient read-back cost later):
     ///
     /// 1. a conservative PREDICTED table cost
     ///    (`predicted_hash_table_bytes`, worst-case all-unique keys) gates
@@ -1218,10 +1263,7 @@ impl SpillableHashJoinExec {
         });
 
         for idx in order {
-            let rows: usize = partitions[idx]
-                .as_ref()
-                .map(|p| p.batches.iter().map(|b| b.num_rows()).sum())
-                .unwrap_or(0);
+            let rows: usize = partitions[idx].as_ref().map(|p| p.rows).unwrap_or(0);
             let predicted = predicted_hash_table_bytes(rows, build_keys.len());
             if running + predicted > memory_threshold {
                 running = running.saturating_sub(self.evict_build_partition_to_disk(
