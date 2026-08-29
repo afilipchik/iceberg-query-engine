@@ -73,14 +73,26 @@ for scenario in $SCENARIOS; do
       code=$?
     else
       # rlimit lever: QE_MEM_CAP applies RLIMIT_DATA inside the binary
-      # itself; the outer scope (4x the cap, min 4G) is pure containment
-      # in case the rlimit lever itself has a hole — the terminal must
-      # never be the victim.
+      # itself; the outer scope is pure containment in case the rlimit
+      # lever itself has a hole — the terminal must never be the victim.
+      #
+      # RLIMIT_DATA counts VIRTUAL private-anonymous mappings, not RSS:
+      # mimalloc reserves a ~1GiB arena up front and 32 tokio worker
+      # stacks reserve ~0.3G more, none of it resident. Measured on this
+      # box: the example fails thread-spawn (EAGAIN, exit 101) at
+      # QE_MEM_CAP=1G before the scenario even starts, and runs at 2G.
+      # So the rlimit lever's cap = scenario cap + fixed 1536MB virtual
+      # headroom — the scenario's own REAL allocations still hit the
+      # limit at (approximately) the same point the cgroup lever's RSS
+      # cap represents.
+      cap_mb="$(numfmt --from=iec "${cap^^}" 2>/dev/null || echo $((1024 * 1024 * 1024)))"
+      cap_mb=$((cap_mb / 1024 / 1024))
+      rlimit_cap="$((cap_mb + 1536))M"
       timeout -s KILL "$RUN_TIMEOUT" systemd-run --user --scope --quiet --collect \
         --unit="$unit" \
         -p MemoryMax=8G -p MemorySwapMax=0 \
         -p ManagedOOMMemoryPressure=kill \
-        --setenv=QE_MEM_CAP="$cap" \
+        --setenv=QE_MEM_CAP="$rlimit_cap" \
         -- /usr/bin/time -v "$BIN" "$scenario" >"$log" 2>&1
       code=$?
     fi
@@ -98,6 +110,15 @@ for scenario in $SCENARIOS; do
       124) verdict=FAIL reason=timeout ;;
       *) verdict=FAIL reason="exit-$code" ;;
     esac
+    # A memcg kill can surface as other codes (e.g. /usr/bin/time itself
+    # SIGTERM'd during scope teardown → 143, or "terminated by signal 9"
+    # in time's own output) — reclassify from the direct evidence.
+    if [[ "$verdict" == FAIL ]] && grep -qiE 'terminated by signal 9' "$log"; then
+      reason=oom-sigkill
+    fi
+    if [[ "$verdict" == FAIL ]] && grep -qiE "memory allocation of .* failed|abort" "$log"; then
+      [[ "$reason" == "exit-$code" ]] && reason=abort-at-rlimit
+    fi
     # Journal evidence for kernel/memcg kills of this exact unit.
     kill_line="$(journalctl --user -q --since "$start_ts" --no-pager 2>/dev/null \
       | grep -F "$unit" | grep -i 'oom' | head -1)"

@@ -3230,12 +3230,22 @@ fn write_batches_to_parquet(path: &PathBuf, batches: &[RecordBatch]) -> Result<(
 /// `SPILL_WRITER_ROW_GROUP_ROWS` (8,192) matches this same file's own
 /// `CHUNK_ROWS` precedent (`SpillableHashAggregateExec::
 /// aggregate_with_spilling`) rather than inventing a new magic number.
-/// Verified this time by RE-RUNNING both adversarial repros after the
-/// change, not just by re-reading the code: the control case (previously
-/// OOM-killed at ~3.1GB against a 500MB limit under a 3G cap) now
-/// completes cleanly; the dictionary case's peak RSS dropped
-/// correspondingly. See this epic's own task notes for the exact
-/// before/after numbers from both fix attempts.
+///
+/// **CORRECTION (`oom-safety-hardening` task 001, 2026-08-29): the
+/// paragraph this one replaced claimed the row-count cap made the
+/// control repro "complete cleanly" — that was WRONG** (contradicted by
+/// `spill-size-estimate-fix` 001's own Outcome section, which is the
+/// honest record: peak RSS unchanged, control still OOM-killed at a 3G
+/// cap). This writer-flush fix is real and worth keeping, but it was
+/// never the dominant driver. The actual dominant driver, root-caused
+/// with the (fixed) `QE_ALLOC_PROFILE` diagnostic allocator: the
+/// UNBUDGETED `HashMap<JoinKey, Vec<HashEntry>>` hash tables
+/// `execute_spill_path` builds over the in-memory partitions (and each
+/// read-back spilled partition) cost ~120-200 bytes/row across three
+/// allocations per key — ~10-20x the raw batch bytes the spill decision
+/// budgeted — and are never checked against `memory_limit`. See
+/// `.claude/epics/oom-safety-hardening/updates/001/stream-A.md` for the
+/// full evidence (profiler call-site snapshots, cap-sweep numbers).
 fn append_batch_streaming(
     writer_slot: &mut Option<ArrowWriter<File>>,
     path: &PathBuf,

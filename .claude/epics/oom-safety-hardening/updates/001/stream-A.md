@@ -152,11 +152,29 @@ partition read-back (938K rows) adds a transient table + read-back batches
 RSS ≈ 24x budget.
 
 For the control repro (500MB limit → 400MB threshold): in-memory
-partitions hold ~400MB of batches = ~33M rows → in-memory table build
-alone needs 33M × ~150B ≈ **~5GB**, unbounded by anything — explains the
-kernel kill at 3.1GB anon under a 3G cap (mid-table-build) and the
-incident's uncapped growth. Profiled confirmation run in progress
-(`.scratch/oom001/ctrlprof.log`).
+partitions hold ~400MB of batches = ~33M rows → the in-memory table build
+alone needs 33M × ~130-200B ≈ **~5-7GB**, unbounded by any budget check.
+
+**Confirmed by two further runs:**
+- Profiled control repro under 3G memcg cap
+  (`.scratch/oom001/ctrlprof.log`): killed (exit 137, kernel memcg record)
+  at allocator total 2830.8MB with **1347.5MB tracked across 15 live
+  hashbrown tables, all at the same
+  `build_hash_table ← execute_spill_path` site** — died mid-way through
+  the in-memory-partition table-building loop (the `execute_spill_path
+  START` trace, which prints only AFTER that loop, never appeared).
+  Untracked remainder ≈ per-key small Vec heap buffers, as predicted.
+- Unprofiled control repro under a generous 24G scope cap
+  (`.scratch/oom001/ctrlbig.log`): survived table build, reached spilled-
+  partition processing (idx=35 of 62), then systemd-oomd killed the scope
+  on PRESSURE (67.95% > 60% for 20s) at **7.3G current usage** — i.e. the
+  mechanism PLATEAUS around ~7-8GB for this repro (≈15x its 500MB
+  budget), matching 33M keys × ~130-200B + ~400MB batches + transients.
+  (The kill was pressure-based because the box was heavily loaded — 10G
+  free — not because 24G was exceeded.)
+
+Amplification is consistent across both repros: dict 30MB budget → 737MB
+peak (~24x); control 500MB budget → ~7.3GB+ (~15x).
 
 **Named root cause: `SpillableHashJoinExec::execute_spill_path` (and
 `process_spilled_partition`) build per-partition

@@ -293,7 +293,7 @@ async fn scenario_insert() -> query_engine::Result<String> {
     let res = ctx
         .create_table_as_select("CREATE TABLE oom_harness_ctas AS SELECT * FROM lineitem_src")
         .await?;
-    let rows = res.row_count;
+    let rows = res.rows;
     let _ = std::fs::remove_dir_all(&root);
     Ok(format!("CTAS completed: {rows} rows written"))
 }
