@@ -50,6 +50,9 @@
 //!                            (default data/tpch-10gb/lineitem.parquet)
 //!   QE_HARNESS_CTAS_ROOT     native_table_root for `insert`
 //!                            (default .scratch/oom001/ctas_root)
+//!   QE_HARNESS_INSERT_LIMIT  engine memory_limit bytes for `insert`
+//!                            (default 512MB, matching the shell driver's
+//!                            512M cap — see scenario_insert's comment)
 
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -273,9 +276,15 @@ async fn scenario_native_scan() -> query_engine::Result<String> {
     let config = ExecutionConfig::new().with_memory_limit(memory_limit);
     let mut ctx = ExecutionContext::with_config(config);
     ctx.register_native_table("lineitem", &table_dir)?;
-    let result = ctx
-        .sql("SELECT l_returnflag, COUNT(*) AS c FROM lineitem GROUP BY l_returnflag")
-        .await?;
+    // QE_HARNESS_SCAN_SQL (task 004, additive): override the consumer shape
+    // — e.g. an aggregate-over-JOIN — while keeping the default aggregate
+    // query byte-identical to task 001's pre-fix evidence runs. The table
+    // registered is always `lineitem` (self-joins cover the join shape).
+    let sql = env_str(
+        "QE_HARNESS_SCAN_SQL",
+        "SELECT l_returnflag, COUNT(*) AS c FROM lineitem GROUP BY l_returnflag",
+    );
+    let result = ctx.sql(&sql).await?;
     Ok(format!("completed: {} group rows", result.row_count))
 }
 
@@ -289,10 +298,20 @@ async fn scenario_insert() -> query_engine::Result<String> {
     let root = env_str("QE_HARNESS_CTAS_ROOT", ".scratch/oom001/ctas_root");
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).ok();
-    // Generous engine memory_limit ON PURPOSE: the gap under test is that
-    // the CTAS/INSERT write path has NO formal admission check consulting
-    // the limit at all (PRD gap 3) — the external cap is what bites.
-    let config = ExecutionConfig::new().with_memory_limit(8 * 1024 * 1024 * 1024);
+    // Engine memory_limit for the CTAS (default 512MB, matching the shell
+    // driver's 512M cap — override via QE_HARNESS_INSERT_LIMIT, bytes).
+    //
+    // History: task 001's PRE-FIX evidence runs used a deliberately
+    // GENEROUS 8GB here, because the gap under test was that the
+    // CTAS/INSERT write path had NO admission check consulting the limit
+    // at all (and native-tables-mutation task 005 had already PROVEN the
+    // limit had zero effect on this path — 1GB limit, 5.4GB actual use).
+    // Post-fix (oom-safety-hardening task 005's named pre-flight
+    // admission check in `ExecutionContext::check_insert_write_admission`)
+    // the limit is exactly what drives the clean refusal, so the harness
+    // now models a consistently-configured engine: limit == external cap.
+    let memory_limit = env_usize("QE_HARNESS_INSERT_LIMIT", 512 * 1024 * 1024);
+    let config = ExecutionConfig::new().with_memory_limit(memory_limit);
     let mut ctx = ExecutionContext::with_config(config).with_native_table_root(&root);
     ctx.register_parquet("lineitem_src", &parquet)?;
     let res = ctx

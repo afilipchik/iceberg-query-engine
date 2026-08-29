@@ -60,6 +60,19 @@ pub struct PhysicalPlanner {
     /// (left ++ right) output columns: unmatched columns (typically
     /// ON-only keys) are dropped from the join's output and never gathered.
     join_retained: RefCell<HashMap<usize, Vec<crate::planner::Column>>>,
+    /// Scan nodes (keyed by `&ScanNode` address) that have an Aggregate
+    /// ANCESTOR in the logical plan, computed by
+    /// `collect_agg_covered_scans` before planning (oom-safety-hardening
+    /// epic, task 004). An over-budget native table's scan streams
+    /// (`NativeStreamingScanExec`) ONLY when its Scan node is in this set:
+    /// an aggregate bounds what reaches the root, so its inputs may be
+    /// larger than memory (the aggregate/any join en route spill); every
+    /// other shape (raw `SELECT *`, filter/project-only, bare join dumps,
+    /// ORDER BY-only) still takes the materializing scan, whose
+    /// `check_scan_budget` refusal remains the correct, documented answer —
+    /// streaming those would only move the OOM from the scan to the
+    /// `QueryResult` collection at the root.
+    agg_covered_scans: RefCell<std::collections::HashSet<usize>>,
 }
 
 impl Default for PhysicalPlanner {
@@ -81,6 +94,7 @@ impl PhysicalPlanner {
             pending_agg_filter: RefCell::new(None),
             streaming_scans: RefCell::new(HashMap::new()),
             join_retained: RefCell::new(HashMap::new()),
+            agg_covered_scans: RefCell::new(std::collections::HashSet::new()),
         }
     }
 
@@ -96,6 +110,7 @@ impl PhysicalPlanner {
             pending_agg_filter: RefCell::new(None),
             streaming_scans: RefCell::new(HashMap::new()),
             join_retained: RefCell::new(HashMap::new()),
+            agg_covered_scans: RefCell::new(std::collections::HashSet::new()),
         }
     }
 
@@ -213,9 +228,18 @@ impl PhysicalPlanner {
                     return None;
                 }
                 let provider = self.tables.get(&node.table_name)?;
-                provider
+                let native = provider
                     .as_any()
                     .downcast_ref::<crate::storage::NativeTable>()?;
+                // An over-budget table must NOT take the dense-direct
+                // route: its execution-time `scan_with_filter` call would
+                // hit `check_scan_budget`'s refusal. Declining here lets it
+                // fall through to the generic spillable aggregate over the
+                // STREAMING scan path instead (oom-safety-hardening task
+                // 004). In-budget tables are unaffected.
+                if native.scan_budget_exceeded() {
+                    return None;
+                }
                 let input_schema = provider.schema();
                 let projection = node.projection.clone();
                 Some((provider.clone(), input_schema, projection))
@@ -1104,7 +1128,41 @@ impl PhysicalPlanner {
         // o_orderkey through ~604M-row gathers this way — HJ_PROF measured
         // gather+batch at ~75% of the probe pipeline.
         self.analyze_join_output_usage(logical, None);
+        // Streaming-scan eligibility pre-pass (oom-safety-hardening task
+        // 004): which Scan nodes sit beneath an Aggregate? See the
+        // `agg_covered_scans` field doc for why this — and only this — is
+        // the gate for the over-budget native-table streaming path.
+        {
+            let mut covered = self.agg_covered_scans.borrow_mut();
+            covered.clear();
+            Self::collect_agg_covered_scans(logical, false, &mut covered);
+        }
         self.create_physical_plan_inner(logical)
+    }
+
+    /// Walk `plan`, recording the address of every `ScanNode` that has an
+    /// `Aggregate` ancestor (oom-safety-hardening task 004). Keyed by node
+    /// ADDRESS, not table name: the same table may legitimately appear both
+    /// under an aggregate and in a raw-dump position within one query
+    /// (e.g. a UNION branch), and only the aggregate-covered occurrence is
+    /// safe to stream. Addresses are stable for the duration of planning —
+    /// `create_physical_plan_inner` recurses over the SAME tree object this
+    /// pre-pass walked.
+    fn collect_agg_covered_scans(
+        plan: &LogicalPlan,
+        under_agg: bool,
+        out: &mut std::collections::HashSet<usize>,
+    ) {
+        if let LogicalPlan::Scan(node) = plan {
+            if under_agg {
+                out.insert(node as *const _ as usize);
+            }
+            return;
+        }
+        let under = under_agg || matches!(plan, LogicalPlan::Aggregate(_));
+        for child in plan.children() {
+            Self::collect_agg_covered_scans(child, under, out);
+        }
     }
 
     /// The normal (CPU) lowering of an Aggregate node: morsel path for
@@ -1298,6 +1356,48 @@ impl PhysicalPlanner {
                             (cfg, provider.schema()),
                         );
                         return Ok(arc);
+                    }
+                }
+
+                // Over-budget native tables stream into spill-capable
+                // consumers instead of refusing (oom-safety-hardening task
+                // 004; epic Architecture Decision 4). Fires ONLY when the
+                // materializing scan WOULD refuse (`scan_budget_exceeded`)
+                // AND the Scan feeds an Aggregate (see `agg_covered_scans`)
+                // — in-budget tables take the exact pre-existing path below
+                // (dense-direct-address and GPU-offload eligibility
+                // unchanged), and materializing shapes (raw `SELECT *`)
+                // still reach `check_scan_budget`'s named refusal.
+                if !self.scan_cache.borrow().contains_key(&node.table_name)
+                    && self
+                        .agg_covered_scans
+                        .borrow()
+                        .contains(&(node as *const _ as usize))
+                {
+                    if let Some(native) = provider
+                        .as_any()
+                        .downcast_ref::<crate::storage::NativeTable>()
+                    {
+                        if native.scan_budget_exceeded() {
+                            let exec = crate::physical::operators::NativeStreamingScanExec::new(
+                                &node.table_name,
+                                native,
+                                logical_schema.clone(),
+                                node.projection.clone(),
+                                node.filter.as_ref(),
+                            );
+                            let arc: Arc<dyn PhysicalOperator> = Arc::new(exec);
+                            // The operator prunes segments but never
+                            // evaluates predicates — always re-apply the
+                            // full filter above it.
+                            return match &node.filter {
+                                Some(predicate) => {
+                                    let filter = self.create_filter(arc, predicate.clone());
+                                    Ok(Arc::new(filter))
+                                }
+                                None => Ok(arc),
+                            };
+                        }
                     }
                 }
 
