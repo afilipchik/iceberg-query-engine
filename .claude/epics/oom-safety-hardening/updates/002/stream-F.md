@@ -96,7 +96,30 @@ Pre-fix evidence (task 001 `harness_final` + re-confirmed post-007
 
 ## Harness scenario 1 (agg) — after
 
-(to be filled after the release-build run)
+`.scratch/oom002/harness_postfix002/` (QE_SPILL_DEBUG=1, same caps,
+`scripts/oom_cap_harness.sh` wrapped in a `systemd-run` scope):
+
+| lever | after |
+|---|---|
+| cgroup 1G | **PASS exit 0 COMPLETED, groups=1000003 (correct), peak RSS 403MB, wall 64.2s** |
+| rlimit (QE_MEM_CAP=2048M, 8G containment) | **PASS exit 0 COMPLETED, groups=1000003, peak RSS 405MB, wall 58.9s** |
+
+Observed spill activity (QE_SPILL_DEBUG traces in both logs):
+
+- `[spill-agg] threshold crossed mid-stream at 101 buffered batches
+  (212992000 bytes, threshold 214748364)` — phase 1 handed off at the
+  crossing point, never buffering past the threshold (the old code
+  would have collected all ~4GB first; pre-fix peaks 1025MB+/1975MB
+  were exactly that collection dying).
+- `[spill-agg] in-memory rows 12835803, spilled files 64 (spilled rows
+  237164197)` — 237M of 250M rows routed to disk during ingestion.
+- 64x `[spill-agg] partition N finalize predicted ~2.2GB bytes >
+  threshold 214748364 — chunked read-back with fan 11` — the finalize
+  gate priced every partition's read-back + worst-case state over the
+  threshold and took the sub-partitioned path; peak RSS 403MB ≈
+  resident batches (~205MB) + one sub's read-back + real state +
+  runtime baseline, i.e. within the documented residual constants,
+  ~0.4x of the 1G cap instead of blowing through it.
 
 ## Tests
 
