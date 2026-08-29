@@ -237,8 +237,50 @@ Interim pre-fix evidence already firm from run 2:
   reproduces the documented ~1.63GB bounded-merge CTAS peak almost
   exactly.
 
-## Next
+## FINAL PRE-FIX EVIDENCE TABLE (battery `.scratch/oom001/harness_final*`, 2026-08-29)
 
-- [in progress] rebuild harness at 250M-row default; final battery for the
-  pre-fix evidence table
-- [ ] Outcome section in 001.md
+Defaults: agg/sort 250M synthetic rows (~4GB raw) at 256MB engine
+memory_limit; native-scan `data/tpch-10gb-native/lineitem` (5.64GB
+on-disk) at 512MB limit; insert CTAS of SF=10 `lineitem.parquet` (60M
+rows). rlimit lever = `QE_MEM_CAP = cap + 1024M` virtual headroom.
+
+| scenario | lever | cap | exit | peak RSS | verdict (reason) |
+|---|---|---|---|---|---|
+| agg  | cgroup | 1G | 137 | 1025MB | FAIL oom-sigkill (memcg kill during `collect_input_partitions_concurrently`) |
+| agg  | rlimit | 1G(+1G) | 134 | 1974MB | FAIL abort-at-rlimit ("memory allocation of N bytes failed") |
+| sort | cgroup | 1G | 137 | 1026MB | FAIL oom-sigkill |
+| sort | rlimit | 1G(+1G) | 134 | 1975MB | FAIL abort-at-rlimit |
+| native-scan | cgroup | 2G | 2 | 27MB | PASS clean-refusal (exact bytes named: needs 5,641,105,508 > budget 429,496,729) |
+| native-scan | rlimit | 2G(+1G) | 2 | 27MB | PASS clean-refusal (identical message) |
+| insert | cgroup | 512M | 143 (reclassified) | killed <1s | FAIL oom-sigkill (journal: "A process of this unit has been killed by the OOM killer"; kill so fast /usr/bin/time died with the scope) |
+| insert | rlimit | 512M(+1G) | 0 | 1683MB | completed — see the lever-coarseness note below; scenario still FAILS overall via the cgroup lever |
+
+Scenario-level pre-fix verdicts (PRD: pass requires complete-or-refuse
+under BOTH levers): **agg FAIL, sort FAIL, insert FAIL, native-scan
+clean-refusal** — exactly the expected pre-fix pattern (scenarios 1/2/4
+demonstrably fail today; scenario 3 demonstrably refuses; post-fix G2
+requires scenario 3 to COMPLETE).
+
+**rlimit-lever coarseness (honest limitation, documented not hidden):**
+`RLIMIT_DATA` is enforced at mmap time against VIRTUAL private-anon
+totals. mimalloc reserves its first ~1GiB arena during pre-`main` init —
+BEFORE `enforce_process_memory_cap()` can run — and later allocations
+served INSIDE an already-reserved arena add no new mappings. Measured
+consequence: the CTAS scenario ran to completion at 1683MB RSS under a
+1536M RLIMIT_DATA. The lever reliably catches multi-GB fresh-mmap
+overshoots (agg/sort both aborted 134) but can under-enforce by roughly
+an arena's worth for workloads that fit inside prior reservations. The
+cgroup lever has no such gap and remains the authoritative one; the
+rlimit lever's unique value is that the failure mode is a clean in-process
+abort rather than a SIGKILL.
+
+Journal kill evidence is appended as a `JOURNAL:` line inside each
+scenario log (`.scratch/oom001/harness_final/*.log`).
+
+## Done
+
+- [x] incident root-caused with evidence
+- [x] profiler fixed + accounting hole root-caused and named
+- [x] harness built (examples/oom_cap_harness.rs + scripts/oom_cap_harness.sh)
+- [x] pre-fix evidence recorded for all four scenarios under both levers
+- [x] Outcome appended to 001.md
