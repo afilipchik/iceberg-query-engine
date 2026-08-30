@@ -1,8 +1,9 @@
 ---
 name: oom-safety-hardening
-status: in-progress
+status: completed
 created: 2026-08-29T21:30:20Z
-progress: 85%
+progress: 100%
+updated: 2026-08-29T23:59:00Z
 prd: .claude/prds/oom-safety-hardening.md
 github: (will be set on sync)
 ---
@@ -117,12 +118,12 @@ plus unregressed recorded native-table and RSS numbers.
 
 ## Tasks Created
 - [x] 001.md - Adversarial cap harness + pre-fix evidence + 2026-08-28 root-cause (parallel: true) — CLOSED 2026-08-29
-- [ ] 002.md - Streaming two-phase reservation for SpillableHashAggregateExec (parallel: false, conflicts: 003)
-- [ ] 003.md - Streaming two-phase reservation for ExternalSortExec (parallel: false, conflicts: 002)
-- [ ] 004.md - Streaming native-table scan into spilling consumers (parallel: true)
-- [ ] 005.md - Formal admission check for INSERT/CTAS write path (parallel: true)
-- [ ] 006.md - QA close-out: post-fix harness sweep, full suite, perf non-regression, docs (parallel: false)
-- [ ] 007.md - Budget the join spill path's hash-table memory — the confirmed fourth gap from 001 (parallel: false, conflicts: 002/003, runs FIRST in the spillable.rs queue)
+- [x] 002.md - Streaming two-phase reservation for SpillableHashAggregateExec (parallel: false, conflicts: 003)
+- [x] 003.md - Streaming two-phase reservation for ExternalSortExec (parallel: false, conflicts: 002)
+- [x] 004.md - Streaming native-table scan into spilling consumers (parallel: true)
+- [x] 005.md - Formal admission check for INSERT/CTAS write path (parallel: true)
+- [x] 006.md - QA close-out: post-fix harness sweep, full suite, perf non-regression, docs (parallel: false)
+- [x] 007.md - Budget the join spill path's hash-table memory — the confirmed fourth gap from 001 (parallel: false, conflicts: 002/003, runs FIRST in the spillable.rs queue)
 
 Total tasks: 7
 Parallel tasks: 3
@@ -140,3 +141,85 @@ Task 007 added per 001's fourth-gap rule.
 6 tasks + 2 external dependency tasks; the two spillable.rs rewrites are
 the risk center (L each); harness and admission check are S-M. Rough
 total: 30-45 focused hours.
+
+## Epic close-out (2026-08-29, task 006 — COMPLETED)
+
+All 7 tasks closed. Everything below re-verified at FINAL HEAD by task
+006 (do-not-trust-mid-epic-results discipline); full evidence in
+`006.md`'s Outcome and `.scratch/oom006/`.
+
+### G1-G6 verdicts
+
+- **G1 — MET.** `SpillableHashAggregateExec` (task 002) and
+  `ExternalSortExec` (task 003) now stream input with a running
+  `estimate_batch_size` total and decide to spill MID-STREAM (the join's
+  two-phase reservation pattern, mirrored), with accounted finalize /
+  streamed merge delivery. Hardware-backed before/after: harness agg and
+  sort scenarios were FAIL 137 (cgroup kill) / FAIL 134 (rlimit abort) at
+  1.0-2.0GB peaks pre-fix (task 001's recorded battery); at final HEAD
+  both complete exit 0 under the SAME 1G caps — agg 406/408MB peak with
+  groups=1000003 exact, sort 845/858MB with 250M rows globally ordered.
+- **G2 — MET.** Aggregate AND join consumer shapes over a native table
+  exceeding `check_scan_budget` now COMPLETE via
+  `NativeStreamingScanExec` + real spilling (task 004): harness
+  native-scan flipped clean-refusal → completed (exit 0, 164/148MB peak
+  on a 5.64GB table at 512MB limit); join consumer verified with
+  observed `execute_spill_path` spill on both levers. The remaining
+  raw-materialization boundary (`SELECT *`/filter-only/ORDER BY-only
+  dumps still refuse by name) is deliberate, documented in CLAUDE.md +
+  `native_table.rs`, and pinned by tests.
+- **G3 — MET.** `check_insert_write_admission` (task 005): harness
+  insert scenario is a clean named refusal (exit 2, ~30MB peak, both
+  levers) citing check name, exact estimate/budget bytes, and both
+  knobs; admitted-side calibration held (2GiB limit → completed under a
+  real 2G cap). RSS band unregressed at final HEAD: sql-mode INSERT of
+  60M rows peaked 1,670,048 KB (~1.59GB, band ~1.6-1.7GB).
+- **G4 — MET.** Task 001 NAMED the root cause with profiler evidence:
+  `execute_spill_path`'s per-partition hash tables were built with ZERO
+  memory accounting (~10-20x amplification over budgeted batch bytes) —
+  a distinct fourth gap, fixed inside this epic as task 007 (measured +
+  predicted table budgeting, eviction, chunked read-back). The
+  2026-08-28 incident itself: a bare uncapped repro run pre-hook (58.4G
+  at kill). Also fixed en route: two latent self-deadlocks in the
+  `QE_ALLOC_PROFILE` diagnostic allocator.
+- **G5 — MET.** Cell-exactness pinned everywhere touched (Dictionary
+  agg/sort/join spill tests, chunk-straddling duplicate-key test,
+  streaming-scan vs independent recomputation, Q12 3/3 cell-exact).
+  Full suite green in all four combos at HEAD: default 1317/0, lance
+  1382/0, gpu 1326/0, pulsar 1320/0 (pre-epic 1285/1350/1294/1288 —
+  +32 accounted-for new tests each), `cargo fmt` clean. Perf
+  unregressed: SF=10 native sweep 22/22, 5288ms (vs 8.20s pre-fix,
+  better than the 5324-5667ms band; Q12 177.6ms); parquet cache-off
+  7.29-7.37s (22/22, historical 7.03-7.40s range); M1/M2 distributed
+  gates PASS.
+- **G6 — MET.** `examples/oom_cap_harness.rs` +
+  `scripts/oom_cap_harness.sh` (task 001): one documented, reusable
+  harness, machine-readable verdicts, journal kill evidence, BOTH cap
+  levers, run pre-fix (001) and post-fix per task (002/003/004/005/007)
+  and finally 006's full sweep: **8/8 PASS, zero 137s, zero 134s**.
+
+### Remains OPEN by design (tracked, not regressions)
+
+1. **The ~0.34% spilling-INNER-join duplicate-counting bug**
+   (spill-join-correctness epic) — out of this epic's scope, still
+   open, still needs its own root-cause task. Task 007's evidence adds:
+   nothing implicates the (now-budgeted) table build/chunked read-back —
+   all write-vs-read checksums `hash-check-ok`.
+2. **The rollup last-ULP float flake** — proven PRE-existing by task 003
+   (`.scratch/oom003/pre003_rollup_flake_repro.log`); did not manifest
+   in 006's four-combo sweep; needs its own small task (tolerance or
+   deterministic accumulation order).
+3. **Task 004's documented refusal boundary**: raw materializing shapes
+   over an over-budget native table refuse by name (streaming them would
+   move the OOM to the QueryResult root). Deliberate; pinned by tests.
+4. **RLIMIT_DATA coarseness caveat**: `QE_MEM_CAP` counts virtual
+   private-anonymous mappings (mimalloc ~1GiB arena + tokio stacks up
+   front), so it needs ~1GB headroom and cannot enforce tight sub-GB
+   budgets — documented in CLAUDE.md's Memory Safety Rule; the cgroup
+   lever is the precise one.
+5. Pre-existing, separately documented: Q4 SEMI-join spill unsupported
+   (clean refusal), Q13 SF=100 spill temp-file-rename error, spill-dir
+   collision between co-located serve processes.
+
+Archival of this epic directory to `.claude/epics/archived/` happens at
+branch merge, per repo convention.

@@ -1,9 +1,9 @@
 ---
 name: spill-size-estimate-fix
-status: in-progress
+status: completed
 created: 2026-08-28T19:02:39Z
-updated: 2026-08-29T21:44:27Z
-progress: 50%
+updated: 2026-08-29T23:59:00Z
+progress: 100%
 prd: .claude/prds/spill-size-estimate-fix.md
 github: (will be set on sync)
 ---
@@ -88,9 +88,44 @@ Estimated total effort: S — precisely diagnosed, narrowly scoped.
 
 ## Tasks Created
 - [x] 001.md - Fix estimate_batch_size + validate against Q12 and a real stress case (parallel: false) — CLOSED 2026-08-29; the stress-case criterion lives on in oom-safety-hardening task 001 (formal handoff, see 001.md's Outcome part 2)
-- [ ] 002.md - Broader sweep, full suite, docs, epic close (parallel: false)
+- [x] 002.md - Broader sweep, full suite, docs, epic close (parallel: false) — CLOSED 2026-08-29 jointly with oom-safety-hardening 006 (shared QA close-out)
 
 Total tasks: 2
 Parallel tasks: 0
 Sequential tasks: 2
 Estimated total effort: S
+
+## Epic close-out (2026-08-29 — COMPLETED)
+
+Task 001 closed 2026-08-29 (fix + Q12 validation; stress-case criterion
+formally handed off to `oom-safety-hardening` 001/007, where it was
+root-caused and FIXED — the unbudgeted spill-path hash tables are now
+budgeted, both adversarial repros complete under real caps). Task 002
+closed jointly with `oom-safety-hardening` task 006's QA close-out (one
+shared final-HEAD run set; see that task's Outcome and 002.md's own).
+
+### G1-G4 verdicts
+
+- **G1 — MET.** Q12 over native tables no longer spills (zero
+  `QE_SPILL_DEBUG` join-spill traces at 40G); the ~4,000x Dictionary
+  mmap-capacity overestimate (~167.7GB claimed vs ~42MB real) is fixed
+  content-aware via `ArrayData::get_slice_memory_size()`. Wall time
+  0.18s — Q12 native (177.6ms in the full sweep) is now FASTER than the
+  parquet leg (216ms), i.e. the gap to Parquet is fully closed.
+- **G2 — MET.** Cell-exact 3/3 at final HEAD (`MAIL,353822,529784` /
+  `SHIP,352224,530051`), plus the committed unit regression test.
+- **G3 — MET.** Genuinely oversized build sides still spill and now
+  survive: the fix never under-counted (both adversarial repros still
+  entered the spill path), and after `oom-safety-hardening` 007 the
+  500MB-limit Int32 repro completes at 555MB peak under a 3G cap and
+  the 30MB-limit Dictionary repro at 106MB under 2G — no OOM, no spill
+  suppression. Harness join-consumer scenario shows real observed spill
+  end to end.
+- **G4 — MET.** Full suite green at HEAD in all four combos (1317/1382/
+  1326/1320, 0 failures, fmt clean).
+
+Broader-sweep finding (task 002's charter): Q12 was the ONLY affected
+query — no other TPC-H query's spill behavior changed, confirmed by a
+zero-spill-trace 22-query sweep at the same premise.
+
+Directory archival to `.claude/epics/archived/` at branch merge.

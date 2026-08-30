@@ -1,7 +1,7 @@
 ---
 name: spill-size-estimate-fix
 description: Fix SpillableHashJoinExec's build-side size estimator massively overcounting Dictionary-typed (and similar) columns, causing unnecessary spills
-status: backlog
+status: complete
 created: 2026-08-28T19:02:39Z
 ---
 
