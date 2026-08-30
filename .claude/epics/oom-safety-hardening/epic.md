@@ -2,7 +2,7 @@
 name: oom-safety-hardening
 status: in-progress
 created: 2026-08-29T21:30:20Z
-progress: 57%
+progress: 85%
 prd: .claude/prds/oom-safety-hardening.md
 github: (will be set on sync)
 ---
