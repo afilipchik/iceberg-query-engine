@@ -99,3 +99,65 @@ Logs: `.scratch/oom003/harness_sort_postfix/`. Peak ~776-831MB matches
 the predicted ~3x-threshold residual (flush_run's concat + sort copies of
 a ~205MB run buffer) — the documented, bounded worst case of this design,
 inside the 1G cap.
+
+### Full harness matrix re-run (post-fix, `.scratch/oom003/harness_full_postfix/`)
+
+All 8 (scenario, lever) pairs PASS — no scenario regresses:
+
+| scenario | cgroup | rlimit |
+|---|---|---|
+| agg | PASS 0, groups=1000003, peak 406MB | PASS 0, groups=1000003, peak 408MB |
+| sort | PASS 0, 250M rows ordered, peak 776MB | PASS 0, 250M rows ordered, peak 832MB |
+| native-scan | PASS 0, peak 168MB | PASS 0, peak 160MB |
+| insert | PASS clean-refusal exit 2 | PASS clean-refusal exit 2 |
+
+agg peaks (406/408MB) match 002's own post-fix numbers (403/405MB) —
+the shared `stream_merge_input_partitions`/ingestion plumbing is
+untouched for the aggregate.
+
+### Non-spilling perf spot-check (SF=10, benchmark-parquet --iterations 3, wrapped 48G scope + QE_MEM_CAP)
+
+ORDER BY-heavy shapes through the rewritten decision path, all
+non-spilling (40GB limit). First pass ran during machine contention
+(scopes flagged by the coordinator); re-run serialized on the idle
+machine — both passes agree, re-run quoted:
+
+| query | iters (ms) | avg | documented band (CLAUDE.md SF=10 table) |
+|---|---|---|---|
+| Q02 | 123.6 / 57.2 / 37.5 | 72.8ms | ~97ms |
+| Q03 | 300.3 / 237.4 / 245.1 | 261.0ms | ~425ms |
+| Q10 | 259.9 / 214.3 / 202.2 | 225.5ms | ~420ms |
+
+All inside (below) the documented bands — the streaming reservation
+costs nothing when input fits: the in-memory branch is the identical
+`MemoryTableExec` + `SortExec[::with_fetch]` delegate, reached with the
+same batches, just collected through the bounded channel.
+Logs: `.scratch/oom003/bench_q{2,3,10}_rerun.log` (and the earlier
+contended-pass logs `bench_q{2,3,10}.log`, which show the same shape).
+
+### Default-suite flake investigated and ruled OUT of 003's scope
+
+One full-suite run at d70c060 failed a single test:
+`native_rollup_qa_closeout_tests::ddl_registered_rollup_survives_an_insert_triggered_refresh_via_ordinary_sql`,
+by ONE last-ULP float cell (`sum_qty` 25929.19821324246 vs
+25929.198213242456) — a float-summation-ORDER difference between the
+rollup refresh's aggregate and the reference recompute's aggregate.
+Investigated rather than waved off:
+
+- No mechanism: the MV definition has no ORDER BY (refresh =
+  aggregate-only, a bare scan-aggregate on the morsel path, never
+  `ExternalSortExec`); the query's ORDER BY sorts 6 ALREADY-summed rows.
+  Task 003 touches only `ExternalSortExec` + the sort merge machinery —
+  nothing that computes a float sum.
+- Isolation: 20/20 green at HEAD single-test.
+- Interleaved A/B at target level, same machine, alternating runs:
+  HEAD 59 pass / 1 fail vs PRE-003 (worktree at 6c52199, the commit
+  before any 003 change) 58 pass / 2 fail — same rate, both sides.
+- Signature match at PRE-003: captured a pre-003 failure
+  (`.scratch/oom003/pre003_rollup_flake_repro.log`, iteration 10 of a
+  retry loop) — the SAME test, SAME cell, SAME two values.
+
+Verdict: pre-existing, scheduling-dependent partial-sum merge-order
+nondeterminism in the (untouched) aggregate path, present before 003.
+Flagged here for a future epic; not fixed in this task (out of file
+scope — the aggregate paths are a hard boundary).
