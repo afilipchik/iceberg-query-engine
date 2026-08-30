@@ -276,8 +276,13 @@ cmd_verify() {
     for q in 1 3 6 10 12; do
         local qq; qq="$(printf 'q%02d' "$q")"
         local sql
+        # NOTE: `query` interleaves tracing on stdout (e.g. the deliberate
+        # join_reorder missing-NDV WARNs from join-order-stats-hardening,
+        # ANSI-colored) after the SQL text — stop capturing at the first
+        # tracing/ESC line too, or the POSTed "SQL" ends in an ESC byte and
+        # every node correctly returns a parse error (seen 2026-08-29 on Q3).
         sql="$("$BINARY" query --num "$q" --sf 0.001 2>/dev/null \
-               | awk '/^Query:$/{f=1;next} /^Schema:/{f=0} f')"
+               | awk '/^Query:$/{f=1;next} /^Schema:/{f=0} /\x1b|^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z +(TRACE|DEBUG|INFO|WARN|ERROR)/{f=0} f')"
         if [[ -z "${sql// }" ]]; then
             bad "could not extract the SQL text for Q$q"; failures=$((failures + 1)); continue
         fi
