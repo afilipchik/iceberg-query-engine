@@ -1,6 +1,7 @@
 # Task 004 — Streaming native-table scan into spilling consumers (stream D)
 
-Status: in progress (started 2026-08-29)
+Status: CLOSED 2026-08-30 — all acceptance criteria met (see 004.md's
+Outcome section for the full evidence table).
 
 ## Design (decided before code)
 
@@ -37,3 +38,25 @@ Mirrors epic Architecture Decision 4: a NEW operator, not a rewrite of
 - 2026-08-29: read 004.md, epic AD4, native_table.rs, planner.rs Scan arm,
   spillable.rs fused-streaming path (read-only — task 007's file),
   oom_cap_harness.{rs,sh}. Design above fixed.
+- 2026-08-29 (impl): NativeStreamingScanExec + NativeTable helpers +
+  planner gate + dense-source decline landed (commit 981ffcb); boundary
+  docs (commit d7f33a0). 3 operator tests + 7 e2e tests green;
+  sql_comprehensive + native insert/delete/update suites green.
+- 2026-08-29 (evidence, scenario 3): `.scratch/oom001/harness_20260829_152639`
+  — native-scan COMPLETES both levers: cgroup exit 0 peak 170MB (was
+  refusal at 27MB), rlimit exit 0 peak 165MB; 3 group rows, 0.10s wall,
+  5.64GB table at 512MB memory_limit under 2G cap. Independently
+  re-confirmed by task 007's post-fix sweep (0/143MB + 0/152MB,
+  `.scratch/oom007/harness_postfix007`).
+- 2026-08-29 (evidence, join consumer): re-verified tests green on the
+  post-002/003/005/007 tree; join-consumer harness run in flight
+  (`QE_HARNESS_SCAN_SQL` self-join of lineitem on (l_orderkey,
+  l_linenumber), GROUP BY l_returnflag; QE_SPILL_DEBUG traces show
+  execute_spill_path engaged: 63 spilled build partitions, 60M probe
+  rows; logs `.scratch/oom004/join_evidence/`).
+- 2026-08-30 (close-out): join-consumer run COMPLETED both levers
+  (exit 0, peaks 2097/2048MB pinned at the 2G cap by reclaimable page
+  cache, spill confirmed on both). Serve spot-check on pristine
+  tpch-10gb-native: 22/22 OK, TOTAL 5513.76ms vs recorded
+  5324/5667ms band — no regression. Outcome appended to 004.md,
+  status: closed.
