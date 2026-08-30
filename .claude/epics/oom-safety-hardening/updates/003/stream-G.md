@@ -161,3 +161,10 @@ Verdict: pre-existing, scheduling-dependent partial-sum merge-order
 nondeterminism in the (untouched) aggregate path, present before 003.
 Flagged here for a future epic; not fixed in this task (out of file
 scope — the aggregate paths are a hard boundary).
+
+### Final suite run (close-out)
+
+`cargo test --release` at HEAD: **exit 0, 30 targets, 1,317 tests
+passed, 0 failed** (lib 461 passed / 1 ignored); log
+`.scratch/oom003/default_suite_final.log`. `cargo fmt --all --check`
+clean. Task closed — Outcome appended to 003.md.
