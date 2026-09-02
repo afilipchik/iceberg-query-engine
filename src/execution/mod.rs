@@ -1,5 +1,6 @@
 //! Query execution module
 
+pub mod alloc_profile;
 mod context;
 mod memory;
 pub mod topology;

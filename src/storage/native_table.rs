@@ -107,6 +107,24 @@
 //!   1GiB `memory_limit` was never meant to bound a real multi-GB scan (it
 //!   already never has for Parquet either — see `spillable.rs`'s own
 //!   `memory_limit * spill_threshold` budgets, sized the same way).
+//!
+//! **Update (oom-safety-hardening epic, task 004): the refusal above now
+//! guards only genuinely MATERIALIZING shapes.** A query whose native-table
+//! scan sits beneath an Aggregate in the logical plan is planned onto
+//! `NativeStreamingScanExec` (`src/physical/operators/native_scan.rs`)
+//! whenever this provider's [`scan_budget_exceeded`](NativeTable::
+//! scan_budget_exceeded) is true — segment-at-a-time streaming through the
+//! same `ipc_cache::read_row_group` reader, deletion-vector-filtered
+//! ([`read_segment_batches`](NativeTable::read_segment_batches)) and
+//! segment-pruned ([`streaming_segment_ids`](NativeTable::
+//! streaming_segment_ids)), feeding the always-spillable aggregate/join
+//! operators — so the query COMPLETES by spilling instead of refusing
+//! (PRD G2). Raw `SELECT *`/filter-only/ORDER BY-only shapes still funnel
+//! through `check_scan_budget`'s named refusal, deliberately: their output
+//! materializes at the `QueryResult` root, so streaming the scan would only
+//! relocate the OOM. See `PhysicalPlanner::collect_agg_covered_scans` for
+//! the exact gate and `tests/native_streaming_scan_tests.rs` for the tests
+//! pinning both halves of the boundary.
 
 use crate::distributed::{Split, SplitSet};
 use crate::error::{QueryError, Result};
@@ -284,6 +302,90 @@ impl NativeTable {
     /// The table directory this provider reads from.
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// `true` when a `scan()` call on this provider would refuse for being
+    /// over its admission budget (`check_scan_budget`'s exact condition,
+    /// exposed so the physical planner can route an over-budget table into
+    /// the STREAMING scan path instead of letting a spill-capable query
+    /// shape die on the materializing scan's refusal — oom-safety-hardening
+    /// epic, task 004). A provider with no budget (built directly rather
+    /// than through `ExecutionContext::register_native_table`) never
+    /// reports `true`, so nothing changes for it.
+    pub fn scan_budget_exceeded(&self) -> bool {
+        match self.memory_budget_bytes {
+            Some(budget) => {
+                let estimated = self.statistics().map(|s| s.total_byte_size).unwrap_or(0);
+                estimated > budget
+            }
+            None => false,
+        }
+    }
+
+    /// The segment ids a STREAMING scan should read, in canonical
+    /// (id-ascending) order, after applying the SAME segment-level pruning
+    /// `scan_with_filter` performs (`segment_might_match` against each
+    /// segment's own `ColumnStats`) — oom-safety-hardening epic, task 004.
+    /// A `filter: None` call returns every active segment. Honors
+    /// `only_segments` (a sharded provider's streaming scan reads only its
+    /// own shard) and `QE_DEBUG_NATIVE_PRUNING=1` (same summary trace as
+    /// `scan_with_filter`, tagged `streaming` so the two paths are
+    /// distinguishable in a log).
+    pub fn streaming_segment_ids(&self, filter: Option<&Expr>) -> Vec<u32> {
+        let segs = self.active_segments();
+        let total = segs.len();
+        let ids: Vec<u32> = segs
+            .into_iter()
+            .filter(|seg| match filter {
+                Some(pred) => segment_might_match(pred, &seg.column_stats),
+                None => true,
+            })
+            .map(|s| s.id)
+            .collect();
+        if native_pruning_debug_enabled() {
+            eprintln!(
+                "[native_pruning] table={} streaming scanned={} skipped={} total={}",
+                self.dir.display(),
+                ids.len(),
+                total - ids.len(),
+                total
+            );
+        }
+        ids
+    }
+
+    /// Read ONE segment's batches, deletion-vector-filtered — the streaming
+    /// scan path's unit of work (oom-safety-hardening epic, task 004).
+    /// Exactly what `scan()`'s per-segment loop body does for one segment:
+    /// `ipc_cache::read_row_group` (mmap zero-copy, dictionary-aware) then
+    /// `filter_deleted_rows` whenever the segment's `deleted_rows` is
+    /// non-empty — so a tombstoned row can never reach a consumer through
+    /// the streaming path any more than through the materializing one.
+    /// Deliberately does NOT consult `check_scan_budget`: this reads one
+    /// segment at a time by construction, which is the whole point of the
+    /// streaming path.
+    pub fn read_segment_batches(
+        &self,
+        segment_id: u32,
+        projection: Option<&[usize]>,
+    ) -> Result<Vec<RecordBatch>> {
+        let seg = self
+            .manifest
+            .segments
+            .iter()
+            .find(|s| s.id == segment_id)
+            .ok_or_else(|| {
+                QueryError::Execution(format!(
+                    "native table at {}: unknown segment id {segment_id}",
+                    self.dir.display()
+                ))
+            })?;
+        let batches = ipc_cache::read_row_group(&self.dir, seg.id as usize, projection, None)?;
+        if seg.deleted_rows.is_empty() {
+            Ok(batches)
+        } else {
+            filter_deleted_rows(batches, &seg.deleted_rows)
+        }
     }
 
     /// Segments this provider actually reads, in canonical (id-ascending)

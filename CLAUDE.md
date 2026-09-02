@@ -48,6 +48,50 @@ This ensures consistent code formatting across the codebase.
 - Being slow on larger-than-memory datasets is acceptable; crashing with OOM is not
 - When adding new operators, they MUST handle memory limits and spill to disk when needed
 - Never add a parameter that lets users opt out of memory safety
+- **In-binary hard process cap (2026-08-29)**: `main()`'s first statement is
+  `enforce_process_memory_cap()` (`src/execution/memory.rs`) —
+  `setrlimit(RLIMIT_DATA)` to **64G by default**, sized via `QE_MEM_CAP`
+  (same grammar as `--memory-limit`; floor 256MB; NO unlimited spelling —
+  garbage falls back to the default with a warning). Kernel-enforced: at the
+  cap, mimalloc's mmap fails and the ENGINE aborts ("memory allocation of N
+  bytes failed") while the terminal's cgroup is untouched. Both soft and
+  hard rlimits are lowered, which is irreversible in-process — so runs that
+  legitimately need more (e.g. SF=100 native benchmarks with
+  `--memory-limit 100G`) must set `QE_MEM_CAP=110G` up front. This is the
+  defense-in-depth layer that exists because the safe-build wrapper rule
+  was bypassed twice; it does NOT replace the wrapper (builds/tests still
+  go through `claude-safe-build.sh` — cargo/rustc themselves are not capped
+  by the engine's own rlimit). **Coarseness caveat**: `RLIMIT_DATA` counts
+  VIRTUAL private-anonymous mappings, not RSS — mimalloc reserves a ~1GiB
+  arena up front and 32 tokio worker stacks ~0.3G more, none of it
+  resident, so `QE_MEM_CAP` needs roughly 1GB of headroom above the real
+  intended budget and cannot enforce tight sub-GB budgets; the cgroup
+  lever (`systemd-run -p MemoryMax=`) is the precise RSS cap. Both levers
+  are exercised by the harness below.
+- **Operator coverage closed (oom-safety-hardening epic, 2026-08-29)**:
+  with a configured `--memory-limit`, every known operator path now either
+  completes by spilling or refuses cleanly by name — proven under real
+  caps by the reusable adversarial harness (`scripts/oom_cap_harness.sh`
+  driving `examples/oom_cap_harness.rs`: 4 scenarios × both cap levers;
+  **8/8 PASS at epic close**, zero kernel kills, zero rlimit aborts). The
+  five gaps closed: (1) the join spill path's per-partition hash tables
+  are budgeted — measured real footprint + worst-case prediction, with
+  eviction and chunked spilled-partition read-back (task 007; this was the
+  root-caused ~10-20x unbudgeted amplification behind the 2026-08-28
+  incident's repro); (2) `SpillableHashAggregateExec` and (3)
+  `ExternalSortExec` stream their input with a running-size mid-stream
+  spill decision instead of collect-fully-then-decide, with accounted
+  finalize / streamed merge delivery (tasks 002/003 — e.g. 250M-row
+  GROUP BY and global ORDER BY both complete under a real 1G cgroup cap
+  at ~0.4GB / ~0.85GB peak); (4) over-budget native-table scans stream
+  segment-at-a-time into aggregate-covered consumers instead of refusing
+  (task 004 — raw `SELECT *`/filter-only/ORDER BY-only dumps still refuse
+  by name, the documented boundary); (5) INSERT/CTAS has a formal named
+  pre-flight admission check (task 005,
+  `check_insert_write_admission`). Feeding all of these, the
+  `estimate_batch_size` Dictionary-column ~4,000x overestimate (mmap
+  capacity vs logical content) was fixed first (`spill-size-estimate-fix`
+  epic) so spill decisions act on real sizes.
 
 ### Sandboxed Build Rule
 
@@ -69,6 +113,24 @@ terminal scope — including the Claude session and remote-control bridge.
 A build must never share a cgroup with the session that launched it.
 Never run bare `cargo build/test/bench` for release or heavy-feature
 builds; there is no situation where bypassing the wrapper is worth it.
+
+**This rule was documented but not enforced, and it happened again**
+(2026-08-28 12:35, 107.2G peak, terminal scope killed, 11 processes) —
+root cause: `.claude/settings.local.json`'s own permission allowlist
+pre-approves bare `cargo run --release`, `cargo build`, `cargo test`,
+`cargo bench`, and direct `./target/{release,debug}/query_engine`
+execution, so nothing actually stopped a command from silently bypassing
+the wrapper; the rule only worked when whoever typed the command
+remembered it. **Fixed with an enforcement layer, not just a reminder**:
+`scripts/claude_hooks/enforce_safe_build.sh`, wired as a `PreToolUse`
+hook on `Bash` in `.claude/settings.json`, denies (with a message
+pointing at the wrapper) any `cargo build/test/bench/run`, direct
+`target/{release,debug}/query_engine`(`/examples/...`) execution, or
+direct `scripts/*.sh`/`scripts/*.py` invocation (several of this repo's
+own benchmark drivers spawn the engine as an uncapped subprocess) that
+isn't already wrapped in `claude-safe-build.sh`/`oomsafe.sh`/
+`safe_benchmark.sh`/`systemd-run ... -p MemoryMax=...`. This runs
+regardless of what the permission allowlist happens to pre-approve.
 
 ### Benchmark Timeout Rule
 
@@ -1282,6 +1344,19 @@ STALE, superseded by intervening epics (native-tables-mutation,
 spill-join-correctness, native-table-pruning) that changed the join-spill
 path; the fresh SF=10 native-table total is **8.20s** (1.93x DuckDB/
 Parquet, 1.08x excluding Q12 alone).
+**Update (spill-size-estimate-fix epic, 2026-08-29): the Q12-native
+slowness is root-caused and FIXED — it was never really join-spill cost.**
+`estimate_batch_size` priced Dictionary columns via Arrow's
+`get_array_memory_size()`, which returns the ENTIRE underlying mmap'd
+segment buffer's size, not the column's logical content — Q12's real
+~42MB build side was estimated at ~167.7GB (~4,000x), spuriously crossing
+the spill threshold. Fixed content-aware (via
+`ArrayData::get_slice_memory_size()`, generalizing the existing
+Utf8/Binary pattern); Q12 native now runs the in-memory join fast path:
+**~0.18s** (was ~3.1s still-spilling / ~150s before the O(n²) writer
+fix), cell-exact. Fresh full SF=10 native sweep at the
+`oom-safety-hardening` epic close (2026-08-29, same harnessed premise):
+**22/22 OK, TOTAL 5288ms** — the 8.20s figure above is itself now STALE.
 
 **Re-baselined again at the close of `duckdb-parity-2` (six tasks: IPC-cache
 defaults, Q13 disjoint-threshold + join-pruning, Q16 anti-join parallelism +
@@ -2434,6 +2509,37 @@ Parquet's streaming path, which needs no such cap, a native-table query
 against SF=10/SF=100-scale data WILL refuse cleanly under the engine's
 1GiB default. This doc's own benchmark commands below always pass one.
 
+**Update (oom-safety-hardening epic, task 004, 2026-08-29): the refusal
+boundary above is now SHAPE-DEPENDENT, not table-wide.** A new streaming
+operator, `NativeStreamingScanExec` (`src/physical/operators/
+native_scan.rs` — epic Architecture Decision 4, mirroring the
+`ParquetTable::scan()` vs `StreamingParquetScanExec` split), reads an
+over-budget native table segment-at-a-time through the SAME
+`ipc_cache::read_row_group` mmap reader, with deletion-vector filtering
+(`filter_deleted_rows`) and segment pruning (`segment_might_match`)
+applied identically to the materializing path. The planner
+(`src/physical/planner.rs`, Scan arm + `collect_agg_covered_scans`
+pre-pass) routes a native-table scan onto it ONLY when BOTH hold: (1)
+`NativeTable::scan_budget_exceeded()` — i.e. the materializing scan
+WOULD refuse — and (2) the Scan node has an **Aggregate ancestor** in
+the logical plan (joins/filters/projects may sit in between; the
+aggregate is what bounds what reaches the root, and any join en route
+is `SpillableHashJoinExec`, which spills). So: `SELECT ... GROUP BY`
+and aggregate-over-join queries over a larger-than-budget native table
+now COMPLETE (spilling as needed) instead of refusing, while **raw
+materializing shapes — `SELECT *` dumps, filter/project-only, ORDER
+BY-only — still refuse by name through `check_scan_budget`,
+deliberately**: streaming those would only move the OOM from the scan
+to the `QueryResult` collection at the root. That boundary is pinned by
+tests (`tests/native_streaming_scan_tests.rs`), not just documented.
+In-budget tables take the byte-identical pre-existing path (the
+condition short-circuits on `scan_budget_exceeded()`), so the
+dense-direct-address fast path and GPU-offload eligibility are
+untouched for them; an OVER-budget table is additionally declined by
+`try_extract_native_dense_source` so the dense-direct route (whose
+execution-time scan would refuse) falls through to the spillable
+aggregate over the streaming scan.
+
 ### GPU-offload eligibility (task 007)
 
 `TableProvider::identity() -> Option<Vec<u8>>` (new trait method,
@@ -3179,7 +3285,13 @@ kept open per partition for the whole build/probe phase, appending
 each batch as one more row group instead of re-reading and rewriting
 everything already spilled): **140-291s -> 3-6s on this exact Q12
 repro, a ~40-90x speedup**, 40/40 trials cell-exact, zero regression,
-full suite green in all four feature combinations. This was always a
+full suite green in all four feature combinations. (**Superseded for Q12
+specifically, 2026-08-29**: the `spill-size-estimate-fix` epic then found
+Q12 native should never have spilled AT ALL — `estimate_batch_size`'s
+Dictionary-column mmap-capacity bug overestimated its ~42MB build side
+~4,000x; with that fixed, Q12 native runs the in-memory join fast path at
+**~0.18s**, cell-exact, zero spill traces. The O(n²) fix remains fully
+live for genuinely-spilling joins.) This was always a
 mechanism SEPARATE from the wrongness (task 001's own chaos-test
 experiment had already shown a forced ~2x-retry-and-discard does not
 reproduce the wrong answer even though it fully explains the
@@ -4202,6 +4314,23 @@ cluster_local.sh verify-m2 && scripts/cluster_local.sh stop` (M1/M2).
   SF=100), all of which remain open, all of which are join-spill-path
   work, not scan-path work.** Full detail, every command, every number:
   `.claude/epics/archived/native-table-pruning/002.md`.
+  **Further update (`spill-size-estimate-fix` + `oom-safety-hardening`
+  epics, closed 2026-08-29): the Q12@SF=10 leg of this saga is CLOSED —
+  it was never a real spill-cost problem at all.** `estimate_batch_size`
+  priced Q12's Dictionary `l_shipmode` build column at the whole mmap'd
+  segment's size (~167.7GB claimed vs ~42MB real, ~4,000x), so the join
+  was misrouted onto the spill path it never needed; fixed content-aware,
+  Q12 native now completes in-memory at **~0.18s** (was ~3.1s spilling /
+  ~150s pre-O(n²)-fix), cell-exact. Separately, the join spill path that
+  remains (for genuinely oversized build sides) now BUDGETS its
+  per-partition hash tables (measured + predicted bytes, eviction,
+  chunked read-back — `oom-safety-hardening` task 007), and
+  aggregate/sort/native-scan/INSERT all complete-or-refuse under real
+  memory caps (see the Memory Safety Rule section's epic-close bullet).
+  Still OPEN from this list: the ~0.34% duplicate-counting bug (no new
+  evidence implicating the rewritten paths — task 007's checksummed runs
+  all `hash-check-ok`), Q4's SEMI-join-spill refusal, and Q13's SF=100
+  temp-file-rename error.
 - **No compaction** (native-tables-mutation epic, confirmed OUT OF SCOPE
   by design — task 001's Decision 3, not merely deferred incidentally). A
   deletion vector is correctness-preserving indefinitely — reads always
@@ -4320,6 +4449,14 @@ threshold — the exact, already-documented mechanism in this section's own
 "Current limitations" below, not a new bug. Excluding Q12, native/parquet
 (engine-to-engine) is a much more expected 1.08x. SF=100 not re-measured
 this session.
+**Update (2026-08-29, `spill-size-estimate-fix` + `oom-safety-hardening`
+close)**: Q12's threshold crossing was the now-fixed `estimate_batch_size`
+Dictionary mmap-capacity bug (~4,000x overestimate of a ~42MB build
+side), not real spill need — Q12 native is now **~0.18s** (in-memory fast
+path, cell-exact). Fresh SF=10 native sweep at epic close
+(`native_bench_compare.py --no-duckdb`, 40G limit, iterations 2):
+**22/22 OK, TOTAL 5288ms** — back in line with (slightly better than)
+this section's own 5.324s figure. SF=100 still not re-measured.
 
 Both scales load `data/tpch-{10gb,100gb}` (plain parquet) into native
 tables via `write-native --from-parquet`, then compare the ENGINE
