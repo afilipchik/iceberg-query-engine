@@ -114,3 +114,50 @@ Recalibrate the ~0.34% duplicate-counting bug against the rewritten
   124 hash-check-ok) — more eviction/chunked-read-back pressure.
 - Artifacts: `.scratch/sjc3-001/q12/lane{1,2}/` (per-trial serve.log +
   result.csv kept), `probe{64,32M,16M,12M}/`.
+
+## Q12 wave 2 + FINAL VERDICT
+
+- Lane 3 (110 @ 16M): 109 pass / 0 wrong / 1 infrastructure error —
+  trial 1's serve hit `cannot bind 127.0.0.1:25001: Address already in
+  use` at startup; NO query was ever executed, so it is excluded from
+  the denominator (not a correctness event; artifacts kept at
+  `q12/lane3/trial_1/`). 13,516 hash-check-ok / 0 HASH-MISMATCH.
+- Lane 4 (110 @ 12M, tighter budget): 110/110 pass, 13,640
+  hash-check-ok / 0 HASH-MISMATCH.
+
+### Totals on the pinned post-rewrite binary (306dc15)
+
+| class | trials | wrong | notes |
+|---|---|---|---|
+| chaos harness (mixed FORCE_SPILL/_PARTITIONS) | 5,600 | 0 | 5,021 genuine-disk, 0 missed-injection; 34,528 hash-check-ok / 0 mismatch (batch E) |
+| Q12 full-query, native, spilling budgets (16M/12M) | 441 | 0 | 441/441 `execute_spill_path` confirmed; every trial cell-exact vs oracle; 54,684 hash-check-ok / 0 HASH-MISMATCH |
+| **pooled** | **6,041** | **0** | 1 excluded infra error (port collision, no query ran) |
+
+### Verdict (binomial 95% Clopper-Pearson)
+
+**0 wrong / 6,041 verified trials on the post-rewrite spill path.**
+- Full-query Q12-class leg alone: 0/441 → 95% CI [0%, 0.833%]
+  (one-sided 95% bound 0.677%). At the archived 0.34% rate, seeing
+  0/441 had probability ~22% — so this leg alone DISFAVORS but cannot
+  exclude the old rate.
+- Chaos leg: 0/5,600 → 95% CI [0%, 0.066%].
+- Pooled: 0/6,041 → 95% CI [0%, 0.061%].
+
+**This is a BOUND, not proof of absence.** The pooled bound leans on
+the chaos leg, whose trials adversarially cover the same
+spill/unspill machinery (forced WHEN/WHICH injection, real disk round
+trips, order-independent checksums) but are NOT the original trigger
+distribution (small parquet fixtures vs SF=10 native natural spill);
+the full-query leg IS the original condition class (same join, same
+oracle, archived total_matched=1,765,881 signature, genuinely spilling
+budgets on current code) and independently bounds the rate at 0.83%.
+No wrong answer, no checksum mismatch, and no missed injection was
+observed anywhere in this task. The bug as previously measured
+(1/290 = 0.34%, CI [0.01%, 1.91%]) did NOT reproduce on the rewritten
+path.
+
+- Nothing to hand to task 002: no artifacts of a failure exist because
+  no failure occurred. Task closed clean.
+- Cleanup: no stray serve/harness processes (verified via pgrep);
+  pinned binaries never rebuilt (mtimes 08:13 throughout; task 003's
+  concurrent spillable.rs work never entered this sample).
