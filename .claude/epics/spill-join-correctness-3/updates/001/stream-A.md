@@ -91,3 +91,26 @@ Recalibrate the ~0.34% duplicate-counting bug against the rewritten
   **34,528 `hash-check-ok` lines, 0 `HASH-MISMATCH`.**
 - Logs: `.scratch/sjc3-001/chaos/batch_{A..E}.log`, `driver.log`.
 - Chaos wall time total: ~5.2 min (~19.7-181 ms/trial).
+
+## Q12 full-query battery, wave 1: 220/220 cell-exact, 0 wrong
+
+- 2 lanes x 110 cold trials (fresh `serve` per trial, pinned binary,
+  native tables, `--memory-limit 16M`, QE_SPILL_DEBUG=1, per-trial
+  TMPDIR isolation, each lane under `systemd-run --user --scope
+  -p MemoryMax=12G`, `QE_MEM_CAP=8G`).
+- **220 pass / 0 wrong / 0 nospill / 0 error.** Every single trial
+  verified to fire `execute_spill_path` (220/220 START lines); every
+  result cell-exact vs the archived oracle (MAIL,353822,529784 /
+  SHIP,352224,530051).
+- Write-vs-read spill checksums: **27,280 `hash-check-ok`
+  (124/trial = 62 spilled build + 62 probe partitions), 0
+  `HASH-MISMATCH`.**
+- Counting the spilling 16M probe trial: full-query class so far
+  0 wrong / 221 spilling trials.
+- Wave 2 launched to strengthen this leg (0/221 alone would still be
+  47% likely even if the old 0.34% rate persisted): lane3 = 110 more at
+  16M, lane4 = 110 at a tighter 12M (probe: spills, cell-exact,
+  in_memory_partitions=2 rows=54464, spilled=62, total_matched=1765881,
+  124 hash-check-ok) — more eviction/chunked-read-back pressure.
+- Artifacts: `.scratch/sjc3-001/q12/lane{1,2}/` (per-trial serve.log +
+  result.csv kept), `probe{64,32M,16M,12M}/`.
