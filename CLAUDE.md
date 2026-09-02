@@ -4329,8 +4329,31 @@ cluster_local.sh verify-m2 && scripts/cluster_local.sh stop` (M1/M2).
   memory caps (see the Memory Safety Rule section's epic-close bullet).
   Still OPEN from this list: the ~0.34% duplicate-counting bug (no new
   evidence implicating the rewritten paths — task 007's checksummed runs
-  all `hash-check-ok`), Q4's SEMI-join-spill refusal, and Q13's SF=100
-  temp-file-rename error.
+  all `hash-check-ok`) and Q4's SEMI-join-spill refusal.
+  **Q13's SF=100 "temp-file rename error" is CLOSED
+  (`spill-join-correctness-3` task 003, 2026-09-02), root-caused with a
+  live reproduction at the pruning epic's own failing commit (`2534739`,
+  same binary lineage/settings):** the failing operator was never the
+  join — it was the spillable AGGREGATE above it. Until
+  `oom-safety-hardening` 002, `SpillableHashAggregateExec`'s repeat
+  evictions appended via `merge_parquet_files` (write
+  `merged_{idx}.parquet`, then `fs::rename` it over the partition's spill
+  file — the file's ONLY rename), and until `spill-join-correctness-2`
+  001 the default spill root was PID-less, so any concurrent engine
+  process's cleanup could delete that intermediate inside the whole
+  read+merge+rename window → `Failed to rename merged file: No such file
+  or directory` (reproduced on demand at `2534739` by deleting a
+  `merged_*` file from `/tmp/query_engine_spill/agg_0_*` mid-query:
+  HTTP 400 with exactly that error; 2026-08-27 had documented concurrent
+  agents sharing that path). Doubly removed on main: the PID-embedded
+  spill root ends cross-process sharing, and the open-writer agg rewrite
+  deleted `merge_parquet_files` — no rename exists in `spillable.rs` at
+  all. With the Dictionary estimate fix the path isn't even entered: Q13
+  SF=100 native at the previously-failing settings (`--memory-limit
+  100G`) now completes in **~13.5s, cell-exact vs a fresh DuckDB oracle**
+  (2 rows: `15,10000000` / `0,5000000`), zero spill traces. Pinned by
+  `agg_spill_has_no_rename_window_under_adversarial_intermediate_deletion`
+  (spillable.rs).
 - **No compaction** (native-tables-mutation epic, confirmed OUT OF SCOPE
   by design — task 001's Decision 3, not merely deferred incidentally). A
   deletion vector is correctness-preserving indefinitely — reads always

@@ -6305,6 +6305,189 @@ mod tests {
         );
     }
 
+    /// Q13 SF=100 "temp-file rename" lifecycle pin (spill-join-correctness-3
+    /// task 003). Until oom-safety-hardening task 002 rewrote it, the agg
+    /// spill path appended by read-rewrite-rename: `merge_parquet_files`
+    /// staged `temp_{idx}_{n}.parquet` / `merged_{idx}.parquet`
+    /// intermediates in the spill dir and `fs::rename`d the merged file over
+    /// the partition's existing spill file on EVERY repeat eviction (the
+    /// only `fs::rename` this file ever had — the join's own rename-per-
+    /// append died earlier, in spill-join-correctness task 002). Between
+    /// create and rename those intermediates were deletable by any other
+    /// process sharing the spill root — and the default spill path was
+    /// PID-less until spill-join-correctness-2 task 001, so concurrent
+    /// engine processes really did share it. A colliding process's
+    /// `remove_dir_all` cleanup landing inside that window produced
+    /// `Failed to rename merged file: No such file or directory` — the Q13
+    /// SF=100 failure the native-table-pruning epic recorded on 2026-08-27
+    /// (its binaries predate BOTH fixes). The open-writer rewrite
+    /// (`evict_agg_partition_to_disk` + `append_batch_streaming`) keeps one
+    /// ArrowWriter per partition open for the whole ingestion phase: no
+    /// merged_*/temp_* intermediate ever exists and there is no rename at
+    /// all. This test pins that shape: a forced-spill aggregate runs while
+    /// an adversary thread continuously deletes any `merged_*`/`temp_*`
+    /// file appearing anywhere under the spill root (simulating the
+    /// colliding process's cleanup); the spill must engage, the adversary
+    /// must observe ZERO rename-window intermediates, and the result must
+    /// be byte-identical to an unlimited-memory run.
+    #[tokio::test]
+    async fn agg_spill_has_no_rename_window_under_adversarial_intermediate_deletion() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use futures::TryStreamExt;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Mutex;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Int64, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let mut batches = Vec::new();
+        for b in 0..25usize {
+            let start = (b * 8_192) as i64;
+            let ids: Vec<i64> = (start..start + 8_192).collect();
+            let groups: Vec<i64> = ids.iter().map(|i| i % 331).collect();
+            let vals: Vec<i64> = ids.iter().map(|i| i % 17).collect();
+            batches.push(
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(groups)),
+                        Arc::new(Int64Array::from(ids)),
+                        Arc::new(Int64Array::from(vals)),
+                    ],
+                )
+                .unwrap(),
+            );
+        }
+        // COUNT(DISTINCT) keeps this fused-streaming-INELIGIBLE, so
+        // execution must take the spillable two-phase path (the same
+        // construction the dictionary/chunked-finalize tests above use).
+        let group_by = vec![Expr::column("g")];
+        let aggregates = vec![
+            AggregateExpr {
+                func: crate::planner::AggregateFunction::CountDistinct,
+                input: Expr::column("id"),
+                distinct: true,
+                second_arg: None,
+            },
+            AggregateExpr {
+                func: crate::planner::AggregateFunction::Sum,
+                input: Expr::column("v"),
+                distinct: false,
+                second_arg: None,
+            },
+        ];
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Int64, false),
+            Field::new("cnt", DataType::Int64, true),
+            Field::new("sum_v", DataType::Int64, true),
+        ]));
+
+        let (baseline, base_spilled) = run_agg_collect(
+            batches.clone(),
+            schema.clone(),
+            group_by.clone(),
+            aggregates.clone(),
+            out_schema.clone(),
+            8 * 1024 * 1024 * 1024,
+            "rename_window_base",
+        )
+        .await;
+        assert_eq!(base_spilled, 0, "unlimited run must not spill");
+        assert_eq!(baseline.len(), 331, "expected exactly 331 groups");
+
+        // Forced-spill run with the adversary watching the spill root.
+        let spill_path =
+            std::env::temp_dir().join(format!("qe_agg_rename_window_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&spill_path);
+        std::fs::create_dir_all(&spill_path).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let observed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let adversary = {
+            let root = spill_path.clone();
+            let stop = stop.clone();
+            let observed = observed.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let mut dirs = vec![root.clone()];
+                    while let Some(dir) = dirs.pop() {
+                        let Ok(entries) = std::fs::read_dir(&dir) else {
+                            continue;
+                        };
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.is_dir() {
+                                dirs.push(path);
+                                continue;
+                            }
+                            let name = entry.file_name();
+                            let name = name.to_string_lossy();
+                            if name.starts_with("merged_") || name.starts_with("temp_") {
+                                observed.lock().unwrap().push(name.into_owned());
+                                // The colliding process's cleanup: delete the
+                                // rename-window intermediate out from under
+                                // the (old) read-rewrite-rename append.
+                                let _ = std::fs::remove_file(&path);
+                            }
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+            })
+        };
+
+        let limit = 256 * 1024;
+        let input: Arc<dyn PhysicalOperator> = Arc::new(
+            crate::physical::operators::MemoryTableExec::new("t", schema, batches, None),
+        );
+        let pool = crate::execution::create_memory_pool(limit);
+        let config = ExecutionConfig::new()
+            .with_memory_limit(limit)
+            .with_spill_path(spill_path.clone());
+        let agg = SpillableHashAggregateExec::new(
+            input,
+            group_by,
+            aggregates,
+            out_schema,
+            pool.clone(),
+            config,
+        );
+        let mut stream = agg.execute(0).await.unwrap();
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        while let Some(b) = stream.try_next().await.unwrap() {
+            for r in 0..b.num_rows() {
+                let mut row = Vec::with_capacity(b.num_columns());
+                for c in b.columns() {
+                    row.push(render_cell(c, r));
+                }
+                rows.push(row);
+            }
+        }
+        rows.sort();
+        stop.store(true, Ordering::Relaxed);
+        adversary.join().unwrap();
+        let spilled = pool.spilled();
+        let _ = std::fs::remove_dir_all(&spill_path);
+
+        assert!(
+            spilled > 0,
+            "256KB limit over ~5MB of input must force a spill"
+        );
+        let seen = observed.lock().unwrap();
+        assert!(
+            seen.is_empty(),
+            "agg spill path produced rename-window intermediates (merged_*/temp_*): {:?} — \
+             the read-rewrite-rename append pattern may have returned",
+            &*seen
+        );
+        assert_eq!(
+            baseline, rows,
+            "adversarial deletion of merged_*/temp_* names must not affect a spilling aggregate"
+        );
+    }
+
     /// The chunked finalize's group-disjointness rests on this invariant:
     /// routing the same rows at modulus NUM_PARTITIONS (ingestion) and
     /// NUM_PARTITIONS * fan (sub-partitioning) must agree mod
