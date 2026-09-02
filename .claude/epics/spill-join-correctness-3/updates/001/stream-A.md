@@ -68,3 +68,26 @@ Recalibrate the ~0.34% duplicate-counting bug against the rewritten
   E=400@seed1234/10mb+QE_SPILL_DEBUG=1. Total 5,600.
 - Q12 battery launched: 2 parallel lanes x 110 cold trials at 16M
   (=220; NOSPILL trials won't count, will top up if needed).
+
+## Chaos battery: COMPLETE — 5,600/5,600 passed, 0 mismatches
+
+| batch | trials | seed | fixture | passed | mismatch | genuine-disk | missed-injection |
+|---|---|---|---|---|---|---|---|
+| A | 2000 | 20260902 | tpch-10mb | 2000 | 0 | 1784 | 0 |
+| B | 2000 | 987654321 | tpch-10mb | 2000 | 0 | 1807 | 0 |
+| C | 600 | 424242 | tpch-100mb | 600 | 0 | 520 | 0 |
+| D | 600 | 777 | tpch-100mb | 600 | 0 | 540 | 0 |
+| E | 400 | 1234 | tpch-10mb (QE_SPILL_DEBUG=1) | 400 | 0 | 370 | 0 |
+| **total** | **5600** | | | **5600** | **0** | **5021** | **0** |
+
+- All 5 batches `RESULT: PASS`, exit 0, each under its own
+  `systemd-run --user --scope -p MemoryMax=8G` with `QE_MEM_CAP=6G`.
+- Per-trial WHEN (QE_SPILL_CHAOS_FORCE_SPILL 0-2) and WHICH
+  (_PARTITIONS: 10% decision-only / 40% all / 50% random subset) mixed
+  by the harness's per-trial RNG; order-independent XOR checksum
+  verified per trial by the harness (prints diagnostics + exit 1 on any
+  mismatch — none occurred).
+- Batch E additionally captured write-vs-read spill checksums:
+  **34,528 `hash-check-ok` lines, 0 `HASH-MISMATCH`.**
+- Logs: `.scratch/sjc3-001/chaos/batch_{A..E}.log`, `driver.log`.
+- Chaos wall time total: ~5.2 min (~19.7-181 ms/trial).
