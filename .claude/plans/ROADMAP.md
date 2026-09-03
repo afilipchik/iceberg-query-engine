@@ -56,3 +56,45 @@ Full plan with per-task files/verification:
 - Memory safety is not optional; spillable operators only, no opt-outs.
 - All 10x claims measured against the re-baselined DuckDB constants on identical
   data + queries. Re-run `scripts/duckdb_rebaseline.py` whenever either changes.
+
+## Addendum — ground truth as of 2026-09-03
+
+The 2026-08-07 sections above are now historical. Between 2026-08-08 and
+2026-09-03 the following epics landed on `main` (each archived under
+`.claude/epics/archived/<name>/` with per-task evidence; CLAUDE.md is the
+authoritative running record): duckdb-parity-2, close-parquet-gap,
+dependency-modernization, gpu-acceleration, native-tables-{foundation,
+mutation,rollups,tiering}, native-table-pruning, join-order-stats-
+hardening, runtime-filter-chaining, spill-join-correctness (1, 2, 3),
+spill-size-estimate-fix, oom-safety-hardening.
+
+**Memory safety / larger-than-memory (phase 5 above) — DONE and certified
+2026-09-03** (`spill-join-correctness-3`): every covered operator spills
+or refuses cleanly by name under a configured `--memory-limit`; the join
+spill path covers INNER, SEMI and ANTI in both build orientations;
+TPC-H SF=100 is **22/22 cell-exact on parquet at 64G, 8G and 1G** (six
+queries genuinely spilling at 1G, zero write/read checksum mismatches)
+and **22/22 on native tables at 100G**; the historical ~0.34% duplicate-
+counting bug did not reproduce in 6,041 trials on the rewritten path
+(bound [0%, 0.061%]). Three remaining boundaries, all clean named
+refusals, all documented in CLAUDE.md "Current limitations":
+LEFT/RIGHT/FULL join spill (Q20 at 256M), ON-clause-filter join spill
+(Q21 at 256M), and over-budget NATIVE scans feeding joins (Q02/Q10/Q11/
+Q15/Q20 at 1G on native; the parquet provider streams).
+
+**Open items surfaced by the certification (candidate next epics, in
+suggested order):**
+1. In-memory `HashJoinExec` wrong answer: build-side-output SEMI/ANTI
+   with `Dictionary(Int32,Utf8)` keys and repeated build keys marks one
+   build row per distinct key (pinned `#[ignore]`d in spillable.rs
+   tests). Correctness — highest priority.
+2. Join spill path performance at scale: the whole probe side is
+   materialized before probing and spilled partitions are processed one
+   at a time on one thread (Q09 ~1,400s at 1G/256M SF=100). Stream the
+   probe side through the partition writers; parallelize read-back.
+3. `NativeTable::scan()` spill-aware for join consumers (the native-scan
+   boundary above).
+4. Outer-join spill and ON-clause-filter spill (design-level; PRD-scoped
+   out of `spill-join-correctness-3`).
+5. The phase-6/7 items above (Iceberg via iceberg-rust; SQL debt) remain
+   as listed; check CLAUDE.md before assuming their status.
