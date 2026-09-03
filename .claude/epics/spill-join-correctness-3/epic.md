@@ -2,7 +2,8 @@
 name: spill-join-correctness-3
 status: in-progress
 created: 2026-09-02T15:05:55Z
-progress: 40%
+updated: 2026-09-03T18:54:09Z
+progress: 80%
 prd: .claude/prds/spill-join-correctness-3.md
 github: (will be set on sync)
 ---
@@ -69,12 +70,12 @@ as verdict-only), then 005 SF=100 certification + close-out.
 
 ## Task Breakdown Preview
 
-- [ ] 001: Recalibrate the duplicate-counting bug on the rewritten
+- [x] 001: Recalibrate the duplicate-counting bug on the rewritten
       spill path (≥5k chaos + ≥200 repro trials, verdict + CI)
-- [ ] 002: Conditional — root-cause + fix + regression-pin the dup bug
+- [x] 002: Conditional — root-cause + fix + regression-pin the dup bug
       (only if 001 reproduces it)
-- [ ] 003: Q13 SF=100 temp-file rename error: reproduce, root-cause, fix
-- [ ] 004: SEMI/ANTI join spill support (Q4 SF=100 completes cell-exact)
+- [x] 003: Q13 SF=100 temp-file rename error: reproduce, root-cause, fix
+- [x] 004: SEMI/ANTI join spill support (Q4 SF=100 completes cell-exact)
 - [ ] 005: SF=100 certification + epic close-out (22/22 cell-exact
       parquet+native under spilling budgets, harness at scale, suites,
       docs)
@@ -97,10 +98,10 @@ are long-running but mechanical. Rough total: 28-40 focused hours plus
 SF=100 machine time.
 
 ## Tasks Created
-- [ ] 001.md - Recalibrate the duplicate-counting bug on the rewritten spill path (parallel: true)
-- [ ] 002.md - Conditional: root-cause + fix + regression-pin the dup bug (parallel: false, after 001/003/004)
-- [ ] 003.md - Q13 SF=100 temp-file rename error: reproduce, root-cause, fix (parallel: true, conflicts: 002/004)
-- [ ] 004.md - SEMI/ANTI join spill support, Q4 SF=100 (parallel: false, after 003)
+- [x] 001.md - Recalibrate the duplicate-counting bug on the rewritten spill path (parallel: true)
+- [x] 002.md - Conditional: root-cause + fix + regression-pin the dup bug (parallel: false, after 001/003/004)
+- [x] 003.md - Q13 SF=100 temp-file rename error: reproduce, root-cause, fix (parallel: true, conflicts: 002/004)
+- [x] 004.md - SEMI/ANTI join spill support, Q4 SF=100 (parallel: false, after 003)
 - [ ] 005.md - SF=100 certification + epic close-out (parallel: false, last)
 
 Total tasks: 5

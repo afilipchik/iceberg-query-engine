@@ -34,11 +34,15 @@
 #   OOM_HARNESS_CAP_AGG    cap for agg/sort (default 1G)
 #   OOM_HARNESS_CAP_SCAN   cap for native-scan (default 2G)
 #   OOM_HARNESS_CAP_INSERT cap for insert (default 512M)
+#   OOM_HARNESS_BIN        harness binary (default target/release/examples/oom_cap_harness)
 # plus every QE_HARNESS_* knob examples/oom_cap_harness.rs documents.
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
-BIN=target/release/examples/oom_cap_harness
+# OOM_HARNESS_BIN overrides the harness binary (spill-join-correctness-3 task
+# 004: run a pinned pre-fix build of the example through the same driver for
+# an honest before/after verdict).
+BIN="${OOM_HARNESS_BIN:-target/release/examples/oom_cap_harness}"
 if [[ ! -x "$BIN" ]]; then
   echo "ERROR: $BIN not built. Run: scripts/claude-safe-build.sh cargo build --release --example oom_cap_harness" >&2
   exit 2

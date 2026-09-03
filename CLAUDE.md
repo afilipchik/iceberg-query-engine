@@ -92,6 +92,16 @@ This ensures consistent code formatting across the codebase.
   `estimate_batch_size` Dictionary-column ~4,000x overestimate (mmap
   capacity vs logical content) was fixed first (`spill-size-estimate-fix`
   epic) so spill decisions act on real sizes.
+- **Join spill path covers SEMI/ANTI (`spill-join-correctness-3` task
+  004, 2026-09-03)**: a SEMI or ANTI join whose build side exceeds the
+  budget now spills instead of refusing (both build orientations; the
+  refusal is now Left/Right/Full only, by name). Proven on Q4 SF=100
+  native at `--memory-limit 64M` and `16M` (cell-exact, real spill
+  activity, 0 checksum mismatches) and by the harness's new
+  `semi-join`/`anti-join` scenarios (8/8 COMPLETED under a 1G cap on both
+  levers, pre-fix 4/4 clean refusals). Known residual on this path: the
+  probe side is still fully materialized before probing (see Current
+  limitations).
 
 ### Sandboxed Build Rule
 
@@ -3482,6 +3492,28 @@ capable of a silent wrong answer, not just a loud crash — now fixed.
 Full epic close-out, G1-G5 verdicts, and every commit:
 `.claude/epics/archived/spill-join-correctness-2/epic.md`.
 
+**Update (`spill-join-correctness-3` tasks 001 + 002, 2026-09-02/03):
+the duplicate-counting bug's tracking is CLOSED with a bound, not a
+proof.** Task 001 recalibrated against the REWRITTEN spill path (the
+merged oom-safety-hardening code, pinned binary at `306dc15`, never
+rebuilt mid-battery): **0 wrong / 6,041 verified trials** — 5,600 chaos
+trials (5 batches, 2 fixture scales, 5 seeds, mixed
+`QE_SPILL_CHAOS_FORCE_SPILL`/`_PARTITIONS`, 5,021 genuine-disk, 0 missed
+injections) plus **441 cold full-query Q12-class trials** at genuinely
+spilling budgets (16M/12M: the archived `total_matched=1,765,881`
+signature reproduced exactly; Q12 no longer spills at 40G/64M/32M post
+estimate-fix), every one cell-exact vs the archived oracle, **89,212
+`hash-check-ok` / 0 `HASH-MISMATCH`** task-wide. 95% Clopper-Pearson:
+pooled **[0%, 0.061%]**; the Q12-class leg alone **[0%, 0.833%]** (0/441
+had ~22% probability under the old 0.34% rate, so that leg disfavors but
+cannot exclude it — the tighter pooled bound leans on the chaos leg,
+which covers the same machinery but not the original trigger
+distribution). No post-rewrite sighting exists; every prior sighting
+predates the rewrite. Task 002 (the conditional root-cause/fix) closed
+verdict-only — nothing to start from. Evidence:
+`.claude/epics/spill-join-correctness-3/001.md` + `updates/001/stream-A.md`,
+artifacts under `.scratch/sjc3-001/`.
+
 **Full suite, all four feature combinations**, final state (all fixes +
 all new tests included), through `scripts/claude-safe-build.sh`:
 
@@ -4327,9 +4359,12 @@ cluster_local.sh verify-m2 && scripts/cluster_local.sh stop` (M1/M2).
   chunked read-back — `oom-safety-hardening` task 007), and
   aggregate/sort/native-scan/INSERT all complete-or-refuse under real
   memory caps (see the Memory Safety Rule section's epic-close bullet).
-  Still OPEN from this list: the ~0.34% duplicate-counting bug (no new
-  evidence implicating the rewritten paths — task 007's checksummed runs
-  all `hash-check-ok`) and Q4's SEMI-join-spill refusal.
+  Both remaining items from this list are now CLOSED by
+  `spill-join-correctness-3`: the ~0.34% duplicate-counting bug (task
+  001, 2026-09-02 — 0 wrong / 6,041 verified trials on the rewritten
+  path, 95% CI [0%, 0.061%], stated as a bound, not proof; see the
+  duplicate-counting section's own update) and Q4's SEMI-join-spill
+  refusal (task 004, 2026-09-03 — see below).
   **Q13's SF=100 "temp-file rename error" is CLOSED
   (`spill-join-correctness-3` task 003, 2026-09-02), root-caused with a
   live reproduction at the pruning epic's own failing commit (`2534739`,
@@ -4354,6 +4389,89 @@ cluster_local.sh verify-m2 && scripts/cluster_local.sh stop` (M1/M2).
   (2 rows: `15,10000000` / `0,5000000`), zero spill traces. Pinned by
   `agg_spill_has_no_rename_window_under_adversarial_intermediate_deletion`
   (spillable.rs).
+  **Q4's SF=100 SEMI-join-spill refusal is CLOSED (`spill-join-
+  correctness-3` task 004, 2026-09-03): `SpillableHashJoinExec`'s spill
+  path now supports SEMI and ANTI joins in BOTH build orientations.**
+  The planner keeps the build on the LEFT (output) side for Semi/Anti
+  unless the left is estimated at >2x the right (`build_right_for_left`),
+  so both shapes are real: probe-side output (build = right) decides each
+  probe row against its own partition's table, with a per-probe-row match
+  bitmap OR-accumulated across the chunked read-back of a spilled
+  partition and emitted after the LAST chunk (per-chunk emission would
+  double-emit SEMI rows / prematurely emit ANTI rows when a key's build
+  rows straddle chunks); build-side output (build = left) keeps a
+  per-resident-partition build-matched bitmap across the whole probe
+  stream and emits per read-back chunk (exact, since chunks partition
+  build rows disjointly). Two ANTI-only hazards are handled explicitly:
+  probe batches whose partition holds NO build rows (previously silently
+  dropped — correct for INNER/SEMI, wrong for ANTI) and build partitions
+  that receive ZERO probe rows (all rows unmatched → emitted). NULL keys
+  never match, exactly as the in-memory join. Left/Right/Full stay
+  refused by name ("supports only INNER, SEMI and ANTI joins"). Measured,
+  not assumed: the pruning epic's 100G premise NO LONGER refuses on
+  pre-fix code (the Dictionary estimate fix moved the boundary; pre-fix
+  Q4 SF=100 native completes cell-exact down to `--memory-limit 80M` and
+  refuses at 64M and 16M), so the acceptance budget is **64M**: post-fix
+  Q4 SF=100 native completes **HTTP 200 in 61.2s at 64M (65.6s at 16M),
+  cell-exact vs a fresh DuckDB oracle** (5 rows, `1-URGENT,999120` ...
+  `5-LOW,998946`), with a real `execute_spill_path` (62 of 64 build
+  partitions spilled, ~84.5k build rows each, ~7.07M probe rows each,
+  **122/128 `hash-check-ok`, 0 HASH-MISMATCH**). `oom_cap_harness` gained
+  `semi-join`/`anti-join` scenarios (build side 2.5x the 256MB limit,
+  closed-form row counts, `QE_HARNESS_JOIN_BUILD_RIGHT` selects the
+  orientation): pinned pre-fix binary **4/4 REFUSED by name**, post-fix
+  **8/8 COMPLETED** with exact counts under the 1G cap on both levers
+  (peak RSS 551-888MB). Two pre-existing spill-path bugs were found and
+  fixed on the way, both reachable by INNER too: (1) `extract_join_key`
+  had no Dictionary arm, so every Dictionary-encoded join key became
+  `JoinValue::Null` — never inserted, never matched — and a SPILLING join
+  on such a key (native tables' low-cardinality strings) returned ZERO
+  rows; `join_key_arrays` now decodes Dictionary keys at the single
+  key-evaluation point (build, probe, routing and checksum), non-Dictionary
+  keys byte-identical to before; (2) `evict_build_partition_to_disk`
+  turned an EMPTY partition into a file-less `SpilledPartition` when the
+  first build batch alone crossed the threshold, and sparse keys (few
+  distinct values → ~60 never-populated partitions) then failed read-back
+  with "Failed to open parquet file"; an empty partition now stays
+  resident. Tests (all vs an independent naive-join ground truth, never
+  vs the spill path itself): SEMI/ANTI x {probe-side, build-side} x
+  {dense with chunk-straddling duplicates, sparse}; Dictionary keys x
+  {SEMI, ANTI, INNER} x both orientations; the sparse-key INNER pin;
+  outer-join refusal pin; `tests/spill_tests.rs` EXISTS / NOT EXISTS /
+  NOT IN at an 8KB budget. INNER non-regression: 300/300 chaos trials
+  (25,188 `hash-check-ok`, 0 mismatch), Q16/Q22 SF=10 unchanged (320 / 7
+  rows; 172.6ms / 165.9ms vs 200.5ms / 179.9ms on the pinned pre-fix
+  binary, same machine, back to back). Suite 1326/0/2 (= 1318/0/1
+  baseline + 8 new tests + 1 deliberately-ignored findings test). Full
+  evidence: `.claude/epics/spill-join-correctness-3/004.md` and its
+  `updates/004/stream-{A,B}.md`.
+- **OPEN (found by `spill-join-correctness-3` task 004, NOT fixed there —
+  it is in `hash_join.rs`, outside that task's scope): the IN-MEMORY
+  `HashJoinExec` returns wrong answers for build-side-output SEMI/ANTI
+  (build = LEFT = output) when the join key is `Dictionary(Int32, Utf8)`
+  and build keys repeat** — it marks exactly ONE build row per distinct
+  matched key: on a 60k-row build over 40 values probed by 2k rows over
+  20 of them, SEMI returns 20 rows (truth 30,000) and ANTI 59,980 (=
+  60,000 − 20; truth 30,000). The identical fixture with plain `Utf8`
+  keys is correct (30,000 / 30,000), so the defect is Dictionary-specific;
+  probe-side output (build = right) with Dictionary keys is correct; the
+  SPILL path is correct in all four cases. Executable pin, deliberately
+  `#[ignore]`d so the suite stays green on task 004's own claims:
+  `in_memory_hash_join_findings_from_task004_fixtures` (spillable.rs
+  tests; run with `--ignored --nocapture`). Planner-reachable when a
+  Semi/Anti's left side is not >2x its right and the key is a native
+  table's Dictionary column (e.g. `... WHERE l_shipmode IN (SELECT ...)`
+  with a comparably-sized subquery). Needs its own task.
+- **Documented boundary (pre-existing, observed by task 004, unchanged):
+  the join spill path materializes the ENTIRE probe side in memory
+  before probing** (`execute_spill_path` collects all probe partitions
+  into a `Vec<RecordBatch>`, then routes/spills per partition). The build
+  side is bounded by the budget; the probe side is not. Q4 SF=100 at 64M
+  worked because its probe side (~452M filtered `lineitem` rows, key-only
+  projection) fit in the 32G cap of that run; a probe side larger than
+  physical memory would still OOM (or hit `QE_MEM_CAP`) on this path.
+  Streaming the probe side batch-by-batch through the same partition
+  writers is the obvious fix and is the natural next join-spill task.
 - **No compaction** (native-tables-mutation epic, confirmed OUT OF SCOPE
   by design — task 001's Decision 3, not merely deferred incidentally). A
   deletion vector is correctness-preserving indefinitely — reads always
