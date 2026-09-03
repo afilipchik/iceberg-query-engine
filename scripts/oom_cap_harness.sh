@@ -26,6 +26,8 @@
 #
 # Env knobs:
 #   OOM_HARNESS_SCENARIOS  default "agg sort native-scan insert"
+#                          (also: semi-join anti-join — spill-join-correctness-3
+#                          task 004; cap OOM_HARNESS_CAP_JOIN, default 1G)
 #   OOM_HARNESS_LEVERS     default "cgroup rlimit"
 #   OOM_HARNESS_TIMEOUT    per-run timeout seconds (default 900)
 #   OOM_HARNESS_LOGDIR     default .scratch/oom001/harness_<timestamp>
@@ -53,6 +55,7 @@ cap_for() {
     agg | sort) echo "${OOM_HARNESS_CAP_AGG:-1G}" ;;
     native-scan) echo "${OOM_HARNESS_CAP_SCAN:-2G}" ;;
     insert) echo "${OOM_HARNESS_CAP_INSERT:-512M}" ;;
+    semi-join | anti-join) echo "${OOM_HARNESS_CAP_JOIN:-1G}" ;;
     *) echo "1G" ;;
   esac
 }
