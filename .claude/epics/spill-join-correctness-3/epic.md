@@ -2,7 +2,7 @@
 name: spill-join-correctness-3
 status: in-progress
 created: 2026-09-02T15:05:55Z
-progress: 0%
+progress: 40%
 prd: .claude/prds/spill-join-correctness-3.md
 github: (will be set on sync)
 ---
