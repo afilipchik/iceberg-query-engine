@@ -1,7 +1,7 @@
 ---
 name: spill-join-correctness-3
 description: Settle the ~0.34% duplicate-counting bug on the rewritten spill path, close the two known SF=100 spill failures (Q4 SEMI-join refusal, Q13 rename error), and certify TPC-H SF=100 under tight memory budgets
-status: active
+status: completed
 created: 2026-09-02T15:05:55Z
 ---
 

@@ -4610,7 +4610,7 @@ data two ways — plain parquet (`read_parquet` views) and, at SF=10 only
 | scale | queries | engine total | vs DuckDB-parquet | vs DuckDB-iceberg |
 |---|---|---|---|---|
 | SF=10 | 22/22 cell-exact | **5.324s** | 4.321s → **1.23x** | 6.888s → **0.77x (engine faster)** |
-| SF=100 | 19/22 cell-exact + successful (Q4/Q12/Q13: see Limitations) | **75.17s** | 50.02s (same 19) → **1.50x** | n/a (no SF=100 Iceberg fixture) |
+| SF=100 | 19/22 cell-exact + successful (Q4/Q12/Q13: see Limitations) — **superseded 2026-09-03: 22/22, see the certification note below** | **75.17s** | 50.02s (same 19) → **1.50x** | n/a (no SF=100 Iceberg fixture) |
 
 Disk footprint, both scales: smaller than the parquet source it was
 loaded from (SF=10: 6.5GB vs 9.6GB; SF=100: 65GB vs 97GB) — dictionary
@@ -4623,6 +4623,51 @@ data/tpch-10gb --iceberg-dir data/tpch-10gb-iceberg --sf 10
 --memory-limit 40G --iterations 2` (SF=100: `--memory-limit 100G`, no
 `--iceberg-dir`, and exclude Q4/Q12/Q13 via `--queries` if a bounded run
 is wanted — see Limitations for why).
+
+**SF=100 certification (`spill-join-correctness-3` task 005, 2026-09-03;
+HEAD 7607f34, engine from 67f7cea).** Every premise below is a separate
+`serve` process over the SAME data, every completed query checked
+cell-by-cell against a FRESH DuckDB oracle computed the same day
+(`.scratch/sjc3-005/oracle22.py`, 46.6s; Q11 SF-adjusted on both sides),
+`QE_SPILL_DEBUG=1` attributing spill traces per query, all under
+`systemd-run` caps with `QE_MEM_CAP` set. `benchmark-parquet` hardcodes
+its budget at min(4G·SF, 64G) with no override, so the parquet premises
+go through `serve --data data/tpch-100gb --memory-limit <B>` (same scan
+path); native through `serve --tables data/tpch-100gb-native`.
+
+| premise | cell-exact | engine total | spill activity (QE_SPILL_DEBUG) |
+|---|---|---|---|
+| parquet, 64G (the historical premise) | **22/22** | 58.9s (DuckDB 46.6s) | none |
+| parquet, 8G | **22/22** | 47.9s | none — SF=100 build sides are far below 6.4GB after join-order stats / runtime filters / semi-join pushdown |
+| parquet, **1G — the spilling premise** | **22/22** | 1616s | Q03, Q09, Q13, Q16, Q18, Q20 spilled; join spill path on Q09 (2 joins) and Q16; 366 hash-check-ok / 0 mismatch |
+| parquet, 256M (harsher) | **20/22** + 2 clean named refusals | 2207s | 11 queries spilled, join spill path on 8 (1,566 hash-check-ok / 0 mismatch); **Q20 refuses** ("LEFT join build side exceeds the memory budget ... LEFT/RIGHT/FULL outer joins are not spillable") and **Q21 refuses** ("cannot evaluate an ON-clause filter") — the two documented boundaries, HTTP 400 by name, no crash |
+| native, 100G (Q4/Q13's previously-failing settings) | **22/22** | 91.8s | none; **Q4 1.45s, Q13 10.2s** |
+| native, 1G (spilling premise) | **17/22 cell-exact + 5 clean named refusals** (Q02 `part` 1.15GB, Q10 `customer` 1.40GB, Q11 + Q20 `partsupp` 2.61GB, Q15 `lineitem` 56.4GB: "native table ... needs an estimated N bytes to scan (its full on-disk size — this provider's scan() is not yet spill-aware) ... exceeds the configured memory safety budget" — the documented native-scan boundary: an over-budget native scan only streams segment-at-a-time into aggregate-covered consumers; these five feed joins), 1601.6s; spilled: Q03, Q09 (join spill path x2), Q13, Q16 (join spill path), Q18; **366 hash-check-ok / 0 mismatch**; zero OOM | 1601.6s | Q03, Q09, Q13, Q16, Q18 |
+
+Zero kernel kills and zero rlimit aborts in every engine run above. The
+native-1G refusals are the native-scan admission boundary
+(`oom-safety-hardening` 004: an over-budget native scan streams
+segment-at-a-time only into aggregate-covered consumers; feeding a join
+it refuses by name) — the parquet provider streams, so the same queries
+complete at 1G on parquet; making `NativeTable::scan()` spill-aware for
+join consumers is the corresponding backlog item.
+Alongside: the oom-cap harness at SF=100-class inputs is **12/12 PASS**
+(agg + sort at 600M synthetic rows under a 1G cap, 478-491MB / 860MB
+peak; native-scan over the 100GB `lineitem` native table under 2G;
+insert from the 100GB `lineitem` parquet → clean admission refusal under
+512M; semi-join/anti-join with a 600M-row build side — 9.6GB against a
+256MB budget, spilled — under a 12G cap, 5.3GB / 8.0GB peak, which is
+the still-materialized 300M-row probe side, see Current limitations),
+both levers. No-regression legs at HEAD: SF=10 harness 8/8, SF=10 native
+5,524ms (band 5288-5667), parquet cache-off 7.29s (7.03-7.40), INSERT RSS
+1.57GB (~1.6-1.7), M1/M2 PASS, four suites default 1326/0/2 · lance
+1391/0/3 · gpu 1335/0/2 · pulsar 1329/0/2 (= the 1317/1382/1326/1320
+baselines + 9 new tests, +1 deliberately-ignored). Honest cost line: the
+join spill path is correct but slow at this scale (Q09 ~1,400s at both
+1G and 256M; Q18 355s and Q03 188s at 256M) for the two documented
+reasons — whole-probe-side materialization and one-thread
+spilled-partition processing. Full evidence:
+`.claude/epics/spill-join-correctness-3/005.md` + `updates/005/stream-A.md`.
 
 **CPU vs GPU split** (`--features gpu`, per this program's standing
 convention of reporting these as separate rows): see the "GPU Aggregate
