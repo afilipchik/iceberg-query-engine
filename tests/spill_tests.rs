@@ -302,6 +302,61 @@ async fn left_join_spill_fails_loudly_not_wrong() {
          implements non-inner join types — silent inner-join results are worse",
     );
     assert!(err.to_string().contains("INNER"), "unexpected error: {err}");
+    assert!(
+        err.to_string()
+            .contains("supports only INNER, SEMI and ANTI joins"),
+        "refusal must name exactly what the spill path supports: {err}"
+    );
+}
+
+/// spill-join-correctness-3 task 004: a Q4-shaped `EXISTS` (SEMI join)
+/// whose build side exceeds the budget must now COMPLETE through the join
+/// spill path, cell-exact vs the in-memory run. No date filter on
+/// `orders`, so both sides are far above an 8KB budget whichever side the
+/// planner builds from.
+#[tokio::test]
+async fn semi_join_exists_spill_matches_in_memory() {
+    assert_spill_matches(
+        "SELECT o_orderpriority, COUNT(*) AS order_count FROM orders \
+         WHERE EXISTS (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey \
+         AND l_commitdate < l_receiptdate) \
+         GROUP BY o_orderpriority ORDER BY o_orderpriority",
+        8 * 1024,
+        "semi_exists_spill",
+        true,
+    )
+    .await;
+}
+
+/// spill-join-correctness-3 task 004: a `NOT EXISTS` (ANTI join) — the
+/// Q16/Q22 shape — through the spill path, cell-exact vs in-memory. Counts
+/// per priority so every unmatched `orders` row is accounted for.
+#[tokio::test]
+async fn anti_join_not_exists_spill_matches_in_memory() {
+    assert_spill_matches(
+        "SELECT o_orderpriority, COUNT(*) AS cnt FROM orders \
+         WHERE NOT EXISTS (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey \
+         AND l_shipmode = 'AIR') \
+         GROUP BY o_orderpriority ORDER BY o_orderpriority",
+        8 * 1024,
+        "anti_not_exists_spill",
+        true,
+    )
+    .await;
+}
+
+/// spill-join-correctness-3 task 004: `NOT IN` over a subquery (Q16's own
+/// shape) through the spill path.
+#[tokio::test]
+async fn anti_join_not_in_spill_matches_in_memory() {
+    assert_spill_matches(
+        "SELECT COUNT(*) AS cnt, MIN(o_orderkey) AS mn, MAX(o_orderkey) AS mx FROM orders \
+         WHERE o_orderkey NOT IN (SELECT l_orderkey FROM lineitem WHERE l_shipmode = 'AIR')",
+        8 * 1024,
+        "anti_not_in_spill",
+        true,
+    )
+    .await;
 }
 
 /// A memory-limited context must still produce correct results for queries

@@ -21,6 +21,20 @@
 //!                      source at a 512MB-class cap (the documented residual
 //!                      from `native-tables-mutation` task 005). Pre-fix
 //!                      expectation: SIGKILL.
+//!   5. `semi-join` / `anti-join` — `spill-join-correctness-3` task 004: a
+//!                      SEMI (resp. ANTI) `SpillableHashJoinExec` whose BUILD
+//!                      side is far above `memory_limit`, so the join must
+//!                      take the spill path. Pre-fix expectation: CLEAN NAMED
+//!                      REFUSAL ("SEMI join build side exceeds the memory
+//!                      budget, but the join spill path currently supports
+//!                      only INNER joins", exit 2 — the documented Q4@SF=100
+//!                      gap); post-fix this must COMPLETE with the closed-form
+//!                      row count below. Orientation via
+//!                      `QE_HARNESS_JOIN_BUILD_RIGHT` (default 1: build = right,
+//!                      probe = left = output; 0: build = left = output). The
+//!                      probe side is sized to stay well under the cap because
+//!                      the join spill path materializes the whole probe side
+//!                      before probing (pre-existing, not this task's scope).
 //!
 //! Cap levers (driven by `scripts/oom_cap_harness.sh`, which wraps every run):
 //!   - cgroup: `systemd-run --user --scope -p MemoryMax=<N>` — kernel
@@ -53,6 +67,13 @@
 //!   QE_HARNESS_INSERT_LIMIT  engine memory_limit bytes for `insert`
 //!                            (default 512MB, matching the shell driver's
 //!                            512M cap — see scenario_insert's comment)
+//!   QE_HARNESS_JOIN_BUILD_ROWS  build-side rows for `semi-join`/`anti-join`
+//!                            (default 40_000_000 — ~640MB raw, 2.5x the
+//!                            256MB default memory_limit). Build ids are
+//!                            0..B; the probe side is B/2 rows with ids
+//!                            [3B/4, 5B/4) so exactly half of it matches.
+//!   QE_HARNESS_JOIN_BUILD_RIGHT  1 (default) = build right / emit probe
+//!                            rows; 0 = build left / emit build rows.
 
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -60,9 +81,11 @@ use arrow::record_batch::RecordBatch;
 use futures::stream::TryStreamExt;
 use query_engine::execution::create_memory_pool;
 use query_engine::physical::operators::spillable::AggregateExpr;
-use query_engine::physical::operators::{ExternalSortExec, SpillableHashAggregateExec};
+use query_engine::physical::operators::{
+    ExternalSortExec, SpillableHashAggregateExec, SpillableHashJoinExec,
+};
 use query_engine::physical::{PhysicalOperator, RecordBatchStream};
-use query_engine::planner::{AggregateFunction, Expr, SortExpr};
+use query_engine::planner::{AggregateFunction, Expr, JoinType, SortExpr};
 use query_engine::{ExecutionConfig, ExecutionContext};
 use std::sync::Arc;
 
@@ -102,6 +125,10 @@ fn peak_rss_mb() -> Option<u64> {
 struct LazyGeneratorExec {
     schema: SchemaRef,
     total_rows: i64,
+    /// First `id` emitted (ids are `id_offset .. id_offset + total_rows`).
+    /// 0 for every scenario except the join ones, whose probe side needs
+    /// a key range that only partially overlaps the build side.
+    id_offset: i64,
 }
 
 fn make_batch(schema: &SchemaRef, start: i64, n: i64) -> RecordBatch {
@@ -141,6 +168,7 @@ impl PhysicalOperator for LazyGeneratorExec {
         }
         let schema = self.schema.clone();
         let total_rows = self.total_rows;
+        let id_offset = self.id_offset;
         let stream = futures::stream::unfold(0i64, move |emitted| {
             let schema = schema.clone();
             async move {
@@ -148,7 +176,7 @@ impl PhysicalOperator for LazyGeneratorExec {
                     return None;
                 }
                 let n = BATCH_ROWS.min(total_rows - emitted);
-                Some((Ok(make_batch(&schema, emitted, n)), emitted + n))
+                Some((Ok(make_batch(&schema, id_offset + emitted, n)), emitted + n))
             }
         });
         Ok(Box::pin(stream))
@@ -172,6 +200,7 @@ async fn scenario_agg() -> query_engine::Result<String> {
     let input: Arc<dyn PhysicalOperator> = Arc::new(LazyGeneratorExec {
         schema: gen_schema(),
         total_rows,
+        id_offset: 0,
     });
     // GROUP BY val (1,000,003 distinct groups), COUNT(DISTINCT id).
     // `distinct: true` makes this fused-streaming-INELIGIBLE by
@@ -221,6 +250,7 @@ async fn scenario_sort() -> query_engine::Result<String> {
     let input: Arc<dyn PhysicalOperator> = Arc::new(LazyGeneratorExec {
         schema: gen_schema(),
         total_rows,
+        id_offset: 0,
     });
     let sd = spill_dir("sort");
     let _ = std::fs::remove_dir_all(&sd);
@@ -322,6 +352,79 @@ async fn scenario_insert() -> query_engine::Result<String> {
     Ok(format!("CTAS completed: {rows} rows written"))
 }
 
+/// `spill-join-correctness-3` task 004: SEMI/ANTI join whose build side
+/// exceeds the budget. Build ids 0..B; probe ids [3B/4, 5B/4) (B/2 rows),
+/// so exactly B/4 probe rows match and B/4 do not, and on the build side
+/// exactly B/4 build rows are matched and 3B/4 are not. Closed-form
+/// expectation per orientation:
+///   build_right=1 (build = right, probe = LEFT = output):
+///       SEMI emits B/4 probe rows, ANTI emits B/4 probe rows.
+///   build_right=0 (build = LEFT = output):
+///       SEMI emits B/4 build rows, ANTI emits 3B/4 build rows.
+async fn scenario_join(join_type: JoinType) -> query_engine::Result<String> {
+    let build_rows = env_usize("QE_HARNESS_JOIN_BUILD_ROWS", 40_000_000) as i64;
+    let build_right = env_str("QE_HARNESS_JOIN_BUILD_RIGHT", "1") != "0";
+    let memory_limit = env_usize("QE_HARNESS_MEMORY_LIMIT", 256 * 1024 * 1024);
+    let probe_rows = build_rows / 2;
+    let probe_offset = build_rows * 3 / 4;
+    let build: Arc<dyn PhysicalOperator> = Arc::new(LazyGeneratorExec {
+        schema: gen_schema(),
+        total_rows: build_rows,
+        id_offset: 0,
+    });
+    let probe: Arc<dyn PhysicalOperator> = Arc::new(LazyGeneratorExec {
+        schema: gen_schema(),
+        total_rows: probe_rows,
+        id_offset: probe_offset,
+    });
+    let (left, right) = if build_right {
+        (probe, build)
+    } else {
+        (build, probe)
+    };
+    let sd = spill_dir(if matches!(join_type, JoinType::Semi) {
+        "semi_join"
+    } else {
+        "anti_join"
+    });
+    let _ = std::fs::remove_dir_all(&sd);
+    let config = ExecutionConfig::new()
+        .with_memory_limit(memory_limit)
+        .with_spill_path(sd.clone());
+    let join = SpillableHashJoinExec::new(
+        left,
+        right,
+        vec![(Expr::column("id"), Expr::column("id"))],
+        join_type,
+        create_memory_pool(memory_limit),
+        config,
+    )
+    .with_build_right(build_right);
+    let mut stream = join.execute(0).await?;
+    let mut rows = 0usize;
+    while let Some(batch) = stream.try_next().await? {
+        rows += batch.num_rows();
+    }
+    drop(join);
+    let _ = std::fs::remove_dir_all(&sd);
+    let quarter = (build_rows / 4) as usize;
+    let expected = match (join_type, build_right) {
+        (JoinType::Semi, _) => quarter,
+        (JoinType::Anti, true) => quarter,
+        (JoinType::Anti, false) => 3 * quarter,
+        _ => unreachable!("scenario_join only runs SEMI/ANTI"),
+    };
+    if rows == expected {
+        Ok(format!(
+            "{join_type:?} join (build_right={build_right}) rows={rows} (expected {expected})"
+        ))
+    } else {
+        Err(query_engine::QueryError::Execution(format!(
+            "WRONG RESULT: {join_type:?} join (build_right={build_right}) rows={rows}, expected {expected}"
+        )))
+    }
+}
+
 fn main() {
     // FIRST statement, mirroring src/main.rs: the rlimit lever
     // (`QE_MEM_CAP`) only works if the example applies it itself.
@@ -338,8 +441,10 @@ fn main() {
             "sort" => scenario_sort().await,
             "native-scan" => scenario_native_scan().await,
             "insert" => scenario_insert().await,
+            "semi-join" => scenario_join(JoinType::Semi).await,
+            "anti-join" => scenario_join(JoinType::Anti).await,
             other => Err(query_engine::QueryError::InvalidArgument(format!(
-                "usage: oom_cap_harness <agg|sort|native-scan|insert> (got {other:?})"
+                "usage: oom_cap_harness <agg|sort|native-scan|insert|semi-join|anti-join> (got {other:?})"
             ))),
         }
     });

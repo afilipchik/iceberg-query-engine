@@ -26,17 +26,23 @@
 #
 # Env knobs:
 #   OOM_HARNESS_SCENARIOS  default "agg sort native-scan insert"
+#                          (also: semi-join anti-join — spill-join-correctness-3
+#                          task 004; cap OOM_HARNESS_CAP_JOIN, default 1G)
 #   OOM_HARNESS_LEVERS     default "cgroup rlimit"
 #   OOM_HARNESS_TIMEOUT    per-run timeout seconds (default 900)
 #   OOM_HARNESS_LOGDIR     default .scratch/oom001/harness_<timestamp>
 #   OOM_HARNESS_CAP_AGG    cap for agg/sort (default 1G)
 #   OOM_HARNESS_CAP_SCAN   cap for native-scan (default 2G)
 #   OOM_HARNESS_CAP_INSERT cap for insert (default 512M)
+#   OOM_HARNESS_BIN        harness binary (default target/release/examples/oom_cap_harness)
 # plus every QE_HARNESS_* knob examples/oom_cap_harness.rs documents.
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
-BIN=target/release/examples/oom_cap_harness
+# OOM_HARNESS_BIN overrides the harness binary (spill-join-correctness-3 task
+# 004: run a pinned pre-fix build of the example through the same driver for
+# an honest before/after verdict).
+BIN="${OOM_HARNESS_BIN:-target/release/examples/oom_cap_harness}"
 if [[ ! -x "$BIN" ]]; then
   echo "ERROR: $BIN not built. Run: scripts/claude-safe-build.sh cargo build --release --example oom_cap_harness" >&2
   exit 2
@@ -53,6 +59,7 @@ cap_for() {
     agg | sort) echo "${OOM_HARNESS_CAP_AGG:-1G}" ;;
     native-scan) echo "${OOM_HARNESS_CAP_SCAN:-2G}" ;;
     insert) echo "${OOM_HARNESS_CAP_INSERT:-512M}" ;;
+    semi-join | anti-join) echo "${OOM_HARNESS_CAP_JOIN:-1G}" ;;
     *) echo "1G" ;;
   esac
 }
