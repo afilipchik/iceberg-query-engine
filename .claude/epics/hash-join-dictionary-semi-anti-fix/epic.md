@@ -1,8 +1,8 @@
 ---
 name: hash-join-dictionary-semi-anti-fix
-status: backlog
+status: in-progress
 created: 2026-09-05T01:36:45Z
-updated: 2026-09-05T01:36:45Z
+updated: 2026-09-05T01:39:23Z
 progress: 0%
 prd: .claude/prds/hash-join-dictionary-semi-anti-fix.md
 github: (will be set on sync)
