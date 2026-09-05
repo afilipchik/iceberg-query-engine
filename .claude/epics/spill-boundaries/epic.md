@@ -1,8 +1,8 @@
 ---
 name: spill-boundaries
-status: backlog
+status: in-progress
 created: 2026-09-05T01:39:08Z
-updated: 2026-09-05T01:39:08Z
+updated: 2026-09-05T06:36:53Z
 progress: 0%
 prd: .claude/prds/spill-boundaries.md
 github: (will be set on sync)
