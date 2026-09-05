@@ -60,19 +60,48 @@ pub struct PhysicalPlanner {
     /// (left ++ right) output columns: unmatched columns (typically
     /// ON-only keys) are dropped from the join's output and never gathered.
     join_retained: RefCell<HashMap<usize, Vec<crate::planner::Column>>>,
-    /// Scan nodes (keyed by `&ScanNode` address) that have an Aggregate
-    /// ANCESTOR in the logical plan, computed by
-    /// `collect_agg_covered_scans` before planning (oom-safety-hardening
-    /// epic, task 004). An over-budget native table's scan streams
-    /// (`NativeStreamingScanExec`) ONLY when its Scan node is in this set:
-    /// an aggregate bounds what reaches the root, so its inputs may be
-    /// larger than memory (the aggregate/any join en route spill); every
-    /// other shape (raw `SELECT *`, filter/project-only, bare join dumps,
-    /// ORDER BY-only) still takes the materializing scan, whose
-    /// `check_scan_budget` refusal remains the correct, documented answer —
-    /// streaming those would only move the OOM from the scan to the
-    /// `QueryResult` collection at the root.
-    agg_covered_scans: RefCell<std::collections::HashSet<usize>>,
+    /// Scan nodes (keyed by `&ScanNode` address) that are SPILL-COVERED,
+    /// computed by `collect_spill_covered_scans` before planning
+    /// (oom-safety-hardening task 004, generalized by spill-boundaries task
+    /// 001). An over-budget native table's scan streams
+    /// (`NativeStreamingScanExec`) ONLY when its Scan node is in this set.
+    /// Covered = a spill-capable pipeline breaker sits between the scan
+    /// and the root (a spillable aggregate / DISTINCT, a
+    /// `SpillableHashJoinExec` on EITHER side, an `ExternalSortExec`) and
+    /// no materializing consumer (a Window, a DelimJoin, a vector-search
+    /// fallback, a non-spillable join/sort, or a shared-CTE
+    /// materialization) sits between the scan and that breaker without an
+    /// output-bounding aggregate in between. Every other shape (raw
+    /// `SELECT *`, filter/project-only, LIMIT-only dumps) still takes the
+    /// materializing scan, whose `check_scan_budget` refusal remains the
+    /// correct, documented answer — streaming those would only move the
+    /// OOM from the scan to the `QueryResult` collection at the root.
+    spill_covered_scans: RefCell<std::collections::HashSet<usize>>,
+}
+
+/// State carried top-down by `PhysicalPlanner::collect_spill_covered_scans`
+/// (spill-boundaries task 001): `covered` = a spill-capable pipeline
+/// breaker has been passed on the way down; `blocked` = a materializing
+/// consumer has been passed with no output-bounding aggregate below it yet.
+#[derive(Clone, Copy, Debug)]
+struct CoverWalk {
+    covered: bool,
+    blocked: bool,
+}
+
+impl CoverWalk {
+    fn root() -> Self {
+        Self {
+            covered: false,
+            blocked: false,
+        }
+    }
+    fn block(self) -> Self {
+        Self {
+            covered: self.covered,
+            blocked: true,
+        }
+    }
 }
 
 impl Default for PhysicalPlanner {
@@ -94,7 +123,7 @@ impl PhysicalPlanner {
             pending_agg_filter: RefCell::new(None),
             streaming_scans: RefCell::new(HashMap::new()),
             join_retained: RefCell::new(HashMap::new()),
-            agg_covered_scans: RefCell::new(std::collections::HashSet::new()),
+            spill_covered_scans: RefCell::new(std::collections::HashSet::new()),
         }
     }
 
@@ -110,7 +139,7 @@ impl PhysicalPlanner {
             pending_agg_filter: RefCell::new(None),
             streaming_scans: RefCell::new(HashMap::new()),
             join_retained: RefCell::new(HashMap::new()),
-            agg_covered_scans: RefCell::new(std::collections::HashSet::new()),
+            spill_covered_scans: RefCell::new(std::collections::HashSet::new()),
         }
     }
 
@@ -1116,6 +1145,22 @@ impl PhysicalPlanner {
         if let Some(ref executor) = self.subquery_executor {
             executor.set_cte_cache(self.cte_cache_ref());
         }
+        // Streaming-scan eligibility pre-pass (oom-safety-hardening task
+        // 004; spill-boundaries task 001): which Scan nodes are spill-
+        // covered? See the `spill_covered_scans` field doc. Runs BEFORE
+        // the shared-CTE materialization below: a CTE referenced twice is
+        // lowered through `create_physical_plan_inner` right there, and
+        // with the set still empty its scans were routed onto the
+        // materializing path — Q11's CSE'd HAVING subquery and Q15's
+        // `revenue` CTE refused this way at SF=100 native @1G even though
+        // both sit under an aggregate.
+        {
+            let mut covered = self.spill_covered_scans.borrow_mut();
+            covered.clear();
+            let mut cte_counts: HashMap<String, usize> = HashMap::new();
+            Self::count_cte_refs(logical, &mut cte_counts);
+            self.collect_spill_covered_scans(logical, CoverWalk::root(), &cte_counts, &mut covered);
+        }
         self.materialize_shared_ctes(logical)?;
         // Pre-scan tables that are accessed multiple times to avoid redundant parquet reads
         self.prescan_shared_tables(logical);
@@ -1128,40 +1173,84 @@ impl PhysicalPlanner {
         // o_orderkey through ~604M-row gathers this way — HJ_PROF measured
         // gather+batch at ~75% of the probe pipeline.
         self.analyze_join_output_usage(logical, None);
-        // Streaming-scan eligibility pre-pass (oom-safety-hardening task
-        // 004): which Scan nodes sit beneath an Aggregate? See the
-        // `agg_covered_scans` field doc for why this — and only this — is
-        // the gate for the over-budget native-table streaming path.
-        {
-            let mut covered = self.agg_covered_scans.borrow_mut();
-            covered.clear();
-            Self::collect_agg_covered_scans(logical, false, &mut covered);
-        }
         self.create_physical_plan_inner(logical)
     }
 
-    /// Walk `plan`, recording the address of every `ScanNode` that has an
-    /// `Aggregate` ancestor (oom-safety-hardening task 004). Keyed by node
-    /// ADDRESS, not table name: the same table may legitimately appear both
-    /// under an aggregate and in a raw-dump position within one query
-    /// (e.g. a UNION branch), and only the aggregate-covered occurrence is
-    /// safe to stream. Addresses are stable for the duration of planning —
-    /// `create_physical_plan_inner` recurses over the SAME tree object this
-    /// pre-pass walked.
-    fn collect_agg_covered_scans(
+    /// Walk `plan`, recording the address of every `ScanNode` that is
+    /// spill-covered (spill-boundaries task 001, generalizing
+    /// oom-safety-hardening task 004's "has an Aggregate ancestor"). Keyed
+    /// by node ADDRESS, not table name: the same table may legitimately
+    /// appear both under a breaker and in a raw-dump position within one
+    /// query (e.g. a UNION branch), and only the covered occurrence is safe
+    /// to stream. Addresses are stable for the duration of planning —
+    /// `create_physical_plan_inner` (and `materialize_shared_ctes`, which
+    /// lowers `&SubqueryAliasNode::input` of the SAME tree) recurse over
+    /// the tree object this pre-pass walked.
+    ///
+    /// Top-down, carrying a `CoverWalk`:
+    /// - Aggregate / Distinct: covered, and the output is BOUNDED, so any
+    ///   materializing consumer above no longer matters (`blocked` resets).
+    /// - Join / Sort: `SpillableHashJoinExec` (the build side spills, the
+    ///   probe side streams — either child may be the over-budget scan) /
+    ///   `ExternalSortExec` when spillable → covered; `blocked` unchanged.
+    ///   Without a memory config they are plain in-memory operators →
+    ///   blocked.
+    /// - Window, DelimJoin, VectorSearch: materialize their input → blocked.
+    /// - A shared CTE's root (`SubqueryAlias` with a `cte_name` referenced
+    ///   twice or more): `materialize_shared_ctes` collects its OUTPUT into
+    ///   memory, so it is a materializing consumer and a fresh root for
+    ///   everything below it (its own aggregate, if any, re-covers).
+    /// - Filter / Project / Limit / Union / plain SubqueryAlias: pass
+    ///   through unchanged.
+    /// A Scan is recorded when `covered && !blocked`.
+    fn collect_spill_covered_scans(
+        &self,
         plan: &LogicalPlan,
-        under_agg: bool,
+        walk: CoverWalk,
+        cte_counts: &HashMap<String, usize>,
         out: &mut std::collections::HashSet<usize>,
     ) {
-        if let LogicalPlan::Scan(node) = plan {
-            if under_agg {
-                out.insert(node as *const _ as usize);
+        let spillable = self.use_spillable();
+        let next = match plan {
+            LogicalPlan::Scan(node) => {
+                if walk.covered && !walk.blocked {
+                    out.insert(node as *const _ as usize);
+                }
+                return;
             }
-            return;
-        }
-        let under = under_agg || matches!(plan, LogicalPlan::Aggregate(_));
+            // An aggregate bounds its output whichever operator lowers it
+            // (spillable, morsel, or the plain in-memory hash aggregate a
+            // config-less planner builds — the pre-001 rule covered these
+            // too), so it always re-covers.
+            LogicalPlan::Aggregate(_) | LogicalPlan::Distinct(_) => CoverWalk {
+                covered: true,
+                blocked: false,
+            },
+            LogicalPlan::Join(_) | LogicalPlan::Sort(_) => {
+                if spillable {
+                    CoverWalk {
+                        covered: true,
+                        blocked: walk.blocked,
+                    }
+                } else {
+                    walk.block()
+                }
+            }
+            LogicalPlan::Window(_) | LogicalPlan::DelimJoin(_) | LogicalPlan::VectorSearch(_) => {
+                walk.block()
+            }
+            LogicalPlan::SubqueryAlias(node)
+                if node
+                    .cte_name
+                    .as_ref()
+                    .is_some_and(|n| cte_counts.get(n).copied().unwrap_or(0) >= 2) =>
+            {
+                CoverWalk::root().block()
+            }
+            _ => walk,
+        };
         for child in plan.children() {
-            Self::collect_agg_covered_scans(child, under, out);
+            self.collect_spill_covered_scans(child, next, cte_counts, out);
         }
     }
 
@@ -1361,16 +1450,19 @@ impl PhysicalPlanner {
 
                 // Over-budget native tables stream into spill-capable
                 // consumers instead of refusing (oom-safety-hardening task
-                // 004; epic Architecture Decision 4). Fires ONLY when the
-                // materializing scan WOULD refuse (`scan_budget_exceeded`)
-                // AND the Scan feeds an Aggregate (see `agg_covered_scans`)
-                // — in-budget tables take the exact pre-existing path below
-                // (dense-direct-address and GPU-offload eligibility
-                // unchanged), and materializing shapes (raw `SELECT *`)
-                // still reach `check_scan_budget`'s named refusal.
+                // 004; epic Architecture Decision 4; spill-boundaries task
+                // 001 widened "feeds an Aggregate" to "spill-covered": a
+                // spillable join on either side or an external sort covers
+                // too). Fires ONLY when the materializing scan WOULD refuse
+                // (`scan_budget_exceeded`) AND the Scan is in
+                // `spill_covered_scans` — in-budget tables take the exact
+                // pre-existing path below (dense-direct-address and
+                // GPU-offload eligibility unchanged), and materializing
+                // shapes (raw `SELECT *`, LIMIT-only) still reach
+                // `check_scan_budget`'s named refusal.
                 if !self.scan_cache.borrow().contains_key(&node.table_name)
                     && self
-                        .agg_covered_scans
+                        .spill_covered_scans
                         .borrow()
                         .contains(&(node as *const _ as usize))
                 {
@@ -2371,7 +2463,7 @@ fn collect_aggregates(expr: &Expr, aggregates: &mut Vec<AggregateExpr>) {
 mod tests {
     use super::*;
     use crate::physical::operators::MemoryTable;
-    use crate::planner::{Binder, InMemoryCatalog, SchemaField};
+    use crate::planner::{Binder, InMemoryCatalog, ScalarValue, SchemaField};
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::DataType;
     use arrow::record_batch::RecordBatch;
@@ -2517,5 +2609,283 @@ mod tests {
 
         let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 3);
+    }
+    // ------------------------------------------------------------------
+    // spill-boundaries task 001: spill-covered scan routing pre-pass.
+    // ------------------------------------------------------------------
+
+    fn scan_addrs(plan: &LogicalPlan, out: &mut Vec<(String, usize)>) {
+        if let LogicalPlan::Scan(node) = plan {
+            out.push((node.table_name.clone(), node as *const _ as usize));
+        }
+        for c in plan.children() {
+            scan_addrs(c, out);
+        }
+    }
+
+    /// `(table -> covered?)` for every Scan in `plan`, through the SAME
+    /// pre-pass `create_physical_plan` runs (CTE ref counts included).
+    fn coverage(planner: &PhysicalPlanner, plan: &LogicalPlan) -> Vec<(String, bool)> {
+        let mut covered = std::collections::HashSet::new();
+        let mut cte_counts: HashMap<String, usize> = HashMap::new();
+        PhysicalPlanner::count_cte_refs(plan, &mut cte_counts);
+        planner.collect_spill_covered_scans(plan, CoverWalk::root(), &cte_counts, &mut covered);
+        let mut scans = Vec::new();
+        scan_addrs(plan, &mut scans);
+        scans
+            .into_iter()
+            .map(|(t, a)| (t, covered.contains(&a)))
+            .collect()
+    }
+
+    fn cover_schema() -> PlanSchema {
+        PlanSchema::new(vec![
+            SchemaField::new("id", DataType::Int64),
+            SchemaField::new("value", DataType::Int64),
+        ])
+    }
+
+    fn spillable_planner() -> PhysicalPlanner {
+        let config = ExecutionConfig::new().with_memory_limit(1 << 20);
+        PhysicalPlanner::with_config(crate::execution::create_memory_pool(1 << 20), config)
+    }
+
+    fn scan(name: &str) -> crate::planner::LogicalPlanBuilder {
+        crate::planner::LogicalPlanBuilder::scan(name, cover_schema())
+    }
+
+    fn count_star() -> Expr {
+        Expr::Aggregate {
+            func: crate::planner::AggregateFunction::Count,
+            args: vec![Expr::column("id")],
+            distinct: false,
+        }
+    }
+
+    fn sort_by_value() -> Vec<crate::planner::SortExpr> {
+        vec![crate::planner::SortExpr::new(Expr::column("value"))]
+    }
+
+    fn cte_alias(name: &str, input: LogicalPlan) -> LogicalPlan {
+        let schema = input.schema();
+        LogicalPlan::SubqueryAlias(crate::planner::SubqueryAliasNode {
+            input: Arc::new(input),
+            alias: name.to_string(),
+            schema,
+            cte_name: Some(name.to_string()),
+        })
+    }
+
+    #[test]
+    fn spill_covered_scans_materializing_shapes_stay_uncovered() {
+        let planner = spillable_planner();
+        // Raw dump.
+        assert_eq!(
+            coverage(&planner, &scan("big").build()),
+            vec![("big".to_string(), false)]
+        );
+        // Filter/project-only.
+        let plan = scan("big")
+            .filter(Expr::column("value").gt(Expr::literal(ScalarValue::Int64(1))))
+            .project(vec![Expr::column("id")])
+            .unwrap()
+            .build();
+        assert_eq!(coverage(&planner, &plan), vec![("big".to_string(), false)]);
+        // LIMIT-only.
+        let plan = scan("big").limit(0, Some(10)).build();
+        assert_eq!(coverage(&planner, &plan), vec![("big".to_string(), false)]);
+        // A Window materializes its input.
+        let input = scan("big").build();
+        let plan = LogicalPlan::Window(crate::planner::WindowNode {
+            schema: input.schema(),
+            input: Arc::new(input),
+            window_exprs: vec![],
+        });
+        assert_eq!(coverage(&planner, &plan), vec![("big".to_string(), false)]);
+        // A bare join dump: both sides stream into the join, but the join's
+        // own output is dumped — covered by the coordinator's rule (the
+        // join IS a spill-capable breaker); a Window ABOVE the join blocks.
+        let joined = scan("l")
+            .join(
+                scan("r").build(),
+                JoinType::Inner,
+                vec![(Expr::column("id"), Expr::column("id"))],
+                None,
+            )
+            .build();
+        let plan = LogicalPlan::Window(crate::planner::WindowNode {
+            schema: joined.schema(),
+            input: Arc::new(joined),
+            window_exprs: vec![],
+        });
+        assert_eq!(
+            coverage(&planner, &plan),
+            vec![("l".to_string(), false), ("r".to_string(), false)]
+        );
+    }
+
+    #[test]
+    fn spill_covered_scans_breakers_cover_and_aggregates_rebound() {
+        let planner = spillable_planner();
+        // Aggregate (the pre-001 rule).
+        let plan = scan("big")
+            .aggregate(vec![Expr::column("id")], vec![count_star()])
+            .unwrap()
+            .build();
+        assert_eq!(coverage(&planner, &plan), vec![("big".to_string(), true)]);
+        // Join: BOTH sides, with a sort + limit above (Q02/Q10's shape).
+        let plan = scan("l")
+            .join(
+                scan("r").build(),
+                JoinType::Left,
+                vec![(Expr::column("id"), Expr::column("id"))],
+                None,
+            )
+            .sort(sort_by_value())
+            .limit(0, Some(100))
+            .build();
+        assert_eq!(
+            coverage(&planner, &plan),
+            vec![("l".to_string(), true), ("r".to_string(), true)]
+        );
+        // Sort alone, with a filter and projection in between.
+        let plan = scan("big")
+            .filter(Expr::column("value").gt(Expr::literal(ScalarValue::Int64(1))))
+            .project(vec![Expr::column("id"), Expr::column("value")])
+            .unwrap()
+            .sort(sort_by_value())
+            .build();
+        assert_eq!(coverage(&planner, &plan), vec![("big".to_string(), true)]);
+        // Window above an aggregate: the aggregate bounds what the window
+        // materializes, so the scan under it is covered.
+        let agg = scan("big")
+            .aggregate(vec![Expr::column("id")], vec![count_star()])
+            .unwrap()
+            .build();
+        let plan = LogicalPlan::Window(crate::planner::WindowNode {
+            schema: agg.schema(),
+            input: Arc::new(agg),
+            window_exprs: vec![],
+        });
+        assert_eq!(coverage(&planner, &plan), vec![("big".to_string(), true)]);
+        // Address-keyed: the same table covered in one branch and not the
+        // other of a UNION ALL.
+        let covered = scan("big")
+            .aggregate(vec![Expr::column("id")], vec![count_star()])
+            .unwrap()
+            .project(vec![Expr::column("id")])
+            .unwrap()
+            .build();
+        let dumped = scan("big")
+            .project(vec![Expr::column("id")])
+            .unwrap()
+            .build();
+        let plan = LogicalPlan::Union(crate::planner::UnionNode {
+            schema: covered.schema(),
+            inputs: vec![Arc::new(covered), Arc::new(dumped)],
+            all: true,
+        });
+        assert_eq!(
+            coverage(&planner, &plan),
+            vec![("big".to_string(), true), ("big".to_string(), false)]
+        );
+    }
+
+    #[test]
+    fn spill_covered_scans_shared_cte_is_a_materializing_root() {
+        let planner = spillable_planner();
+        // A twice-referenced CTE is materialized whole: a raw scan inside it
+        // is NOT covered by the join above the CTE...
+        let cte_body = || scan("big").build();
+        let plan = crate::planner::LogicalPlanBuilder::scan("s", cover_schema())
+            .join(
+                cte_alias("c", cte_body()),
+                JoinType::Inner,
+                vec![(Expr::column("id"), Expr::column("id"))],
+                None,
+            )
+            .join(
+                cte_alias("c", cte_body()),
+                JoinType::Inner,
+                vec![(Expr::column("id"), Expr::column("id"))],
+                None,
+            )
+            .aggregate(vec![], vec![count_star()])
+            .unwrap()
+            .build();
+        assert_eq!(
+            coverage(&planner, &plan),
+            vec![
+                ("s".to_string(), true),
+                ("big".to_string(), false),
+                ("big".to_string(), false)
+            ]
+        );
+        // ...but an aggregate INSIDE the CTE re-covers it (Q15's `revenue`,
+        // Q11's CSE'd HAVING subquery).
+        let cte_body = || {
+            scan("big")
+                .aggregate(vec![Expr::column("id")], vec![count_star()])
+                .unwrap()
+                .build()
+        };
+        let plan = crate::planner::LogicalPlanBuilder::scan("s", cover_schema())
+            .join(
+                cte_alias("c", cte_body()),
+                JoinType::Inner,
+                vec![(Expr::column("id"), Expr::column("id"))],
+                None,
+            )
+            .join(
+                cte_alias("c", cte_body()),
+                JoinType::Inner,
+                vec![(Expr::column("id"), Expr::column("id"))],
+                None,
+            )
+            .build();
+        assert_eq!(
+            coverage(&planner, &plan),
+            vec![
+                ("s".to_string(), true),
+                ("big".to_string(), true),
+                ("big".to_string(), true)
+            ]
+        );
+        // A once-referenced CTE alias is a plain pass-through.
+        let plan = crate::planner::LogicalPlanBuilder::scan("s", cover_schema())
+            .join(
+                cte_alias("once", scan("big").build()),
+                JoinType::Inner,
+                vec![(Expr::column("id"), Expr::column("id"))],
+                None,
+            )
+            .build();
+        assert_eq!(
+            coverage(&planner, &plan),
+            vec![("s".to_string(), true), ("big".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn spill_covered_scans_without_a_memory_config_only_aggregates_cover() {
+        let planner = PhysicalPlanner::new();
+        let plan = scan("l")
+            .join(
+                scan("r").build(),
+                JoinType::Inner,
+                vec![(Expr::column("id"), Expr::column("id"))],
+                None,
+            )
+            .sort(sort_by_value())
+            .build();
+        assert_eq!(
+            coverage(&planner, &plan),
+            vec![("l".to_string(), false), ("r".to_string(), false)]
+        );
+        let plan = scan("big")
+            .aggregate(vec![Expr::column("id")], vec![count_star()])
+            .unwrap()
+            .build();
+        assert_eq!(coverage(&planner, &plan), vec![("big".to_string(), true)]);
     }
 }

@@ -122,7 +122,7 @@
 //! (PRD G2). Raw `SELECT *`/filter-only/ORDER BY-only shapes still funnel
 //! through `check_scan_budget`'s named refusal, deliberately: their output
 //! materializes at the `QueryResult` root, so streaming the scan would only
-//! relocate the OOM. See `PhysicalPlanner::collect_agg_covered_scans` for
+//! relocate the OOM. See `PhysicalPlanner::collect_spill_covered_scans` for
 //! the exact gate and `tests/native_streaming_scan_tests.rs` for the tests
 //! pinning both halves of the boundary.
 

@@ -17,7 +17,7 @@
 //! This operator is the streaming half of that split; `check_scan_budget`
 //! stays as the guard for the materializing half, and the planner
 //! (`src/physical/planner.rs`, Scan arm) decides which half a given query
-//! shape gets — see `PhysicalPlanner::collect_agg_covered_scans`.
+//! shape gets — see `PhysicalPlanner::collect_spill_covered_scans`.
 //!
 //! # What it preserves from the materializing path — deliberately identical
 //!
