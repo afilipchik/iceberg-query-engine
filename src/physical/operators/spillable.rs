@@ -1784,6 +1784,33 @@ const PHASE_A_GROUP_ROWS: usize = 262_144;
 /// Companion cap on batches per group (a source emitting tiny batches).
 const PHASE_A_GROUP_BATCHES: usize = 64;
 
+/// Threads in phase A's OWN rayon pool (join-spill-streaming task 003).
+/// Measured on the 600M-row harness `semi-join` leg with a 1s RSS
+/// sampler, same code and data: on the global 32-thread pool phase A
+/// peaked at 583MB vs 207MB single-threaded and the excess PERSISTED into
+/// phase B; with `RAYON_NUM_THREADS=8` it was 279MB and with
+/// `MIMALLOC_PURGE_DELAY=0` 305MB. The cost is freed memory the
+/// allocator keeps per thread, proportional to how many threads touched
+/// a group's short-lived allocations — not live data. Eight threads keep
+/// phase A's wall time within ~2x of the 32-thread pool (well under 20s of
+/// Q9's ~240s at SF=100/1G) at roughly a quarter of the retention.
+const SPILL_JOIN_PHASE_A_THREADS: usize = 8;
+
+fn spill_join_phase_a_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, SPILL_JOIN_PHASE_A_THREADS);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("sj-phase-a-{i}"))
+            .build()
+            .expect("build the join spill path's phase A thread pool")
+    })
+}
+
 /// Phase A's mutable per-call state, moved into each group's blocking job
 /// and back (all of it is `Send`; `ArrowWriter<File>` was already carried
 /// across awaits before this task).
@@ -1873,10 +1900,13 @@ fn phase_a_process_group(
         .step_by(SPILL_READ_BATCH_ROWS)
         .map(|s| (s, SPILL_READ_BATCH_ROWS.min(n - s)))
         .collect();
-    let ids_per_range: Vec<Vec<u32>> = ranges
-        .par_iter()
-        .map(|&(s, len)| partition_row_ids(&merged.slice(s, len), probe_keys, NUM_PARTITIONS))
-        .collect::<Result<_>>()?;
+    let pool = spill_join_phase_a_pool();
+    let ids_per_range: Vec<Vec<u32>> = pool.install(|| {
+        ranges
+            .par_iter()
+            .map(|&(s, len)| partition_row_ids(&merged.slice(s, len), probe_keys, NUM_PARTITIONS))
+            .collect::<Result<_>>()
+    })?;
     let mut per_partition: Vec<Vec<u32>> = (0..NUM_PARTITIONS).map(|_| Vec::new()).collect();
     for (&(s, _), ids) in ranges.iter().zip(&ids_per_range) {
         for (i, p) in ids.iter().enumerate() {
@@ -1906,70 +1936,72 @@ fn phase_a_process_group(
         .filter(|(_, ((((rows, _), _), _), _))| !rows.is_empty())
         .map(|(idx, ((((rows, w), f), cs), bm))| (idx, rows, w, f, cs, bm.as_ref()))
         .collect();
-    let outputs_per_partition: Vec<Vec<RecordBatch>> = slots
-        .into_par_iter()
-        .map(
-            |(idx, rows, writer, file, checksum, build_bm)| -> Result<Vec<RecordBatch>> {
-                let indices = UInt32Array::from(rows);
-                let columns: Result<Vec<ArrayRef>> = merged
-                    .columns()
-                    .iter()
-                    .map(|c| compute::take(c.as_ref(), &indices, None).map_err(Into::into))
-                    .collect();
-                let pb = RecordBatch::try_new(merged.schema(), columns?)?;
-                let mut outputs: Vec<RecordBatch> = Vec::new();
-                if let Some(ref ht) = state.tables[idx] {
-                    // Probe in-memory partition
-                    let Some(build_part) = state.partitions[idx].as_ref() else {
-                        return Ok(outputs);
-                    };
-                    if !is_semi_anti {
-                        outputs.extend(probe_partition(
-                            &build_part.batches,
-                            std::slice::from_ref(&pb),
-                            ht,
-                            probe_keys,
-                            ctx.join_type,
-                            ctx.swapped,
-                            &ctx.schema,
-                            ctx.retained.as_deref(),
-                        )?);
-                    } else if ctx.swapped {
-                        let flags = probe_match_flags(&pb, ht, probe_keys)?;
-                        if let Some(out) = take_probe_rows(&pb, &flags, is_semi, &ctx.schema)? {
-                            outputs.push(out);
+    let outputs_per_partition: Vec<Vec<RecordBatch>> = pool.install(|| {
+        slots
+            .into_par_iter()
+            .map(
+                |(idx, rows, writer, file, checksum, build_bm)| -> Result<Vec<RecordBatch>> {
+                    let indices = UInt32Array::from(rows);
+                    let columns: Result<Vec<ArrayRef>> = merged
+                        .columns()
+                        .iter()
+                        .map(|c| compute::take(c.as_ref(), &indices, None).map_err(Into::into))
+                        .collect();
+                    let pb = RecordBatch::try_new(merged.schema(), columns?)?;
+                    let mut outputs: Vec<RecordBatch> = Vec::new();
+                    if let Some(ref ht) = state.tables[idx] {
+                        // Probe in-memory partition
+                        let Some(build_part) = state.partitions[idx].as_ref() else {
+                            return Ok(outputs);
+                        };
+                        if !is_semi_anti {
+                            outputs.extend(probe_partition(
+                                &build_part.batches,
+                                std::slice::from_ref(&pb),
+                                ht,
+                                probe_keys,
+                                ctx.join_type,
+                                ctx.swapped,
+                                &ctx.schema,
+                                ctx.retained.as_deref(),
+                            )?);
+                        } else if ctx.swapped {
+                            let flags = probe_match_flags(&pb, ht, probe_keys)?;
+                            if let Some(out) = take_probe_rows(&pb, &flags, is_semi, &ctx.schema)? {
+                                outputs.push(out);
+                            }
+                        } else if let Some(bm) = build_bm {
+                            mark_build_matches_atomic(&pb, ht, probe_keys, bm)?;
                         }
-                    } else if let Some(bm) = build_bm {
-                        mark_build_matches_atomic(&pb, ht, probe_keys, bm)?;
+                    } else if state.spilled[idx].is_some() {
+                        // Spill probe rows for this partition
+                        spilled_bytes.fetch_add(
+                            estimate_batch_size(&pb),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        let path = file.get_or_insert_with(|| ctx.probe_file(spill_dir, idx));
+                        append_batch_streaming(writer, path, &pb)?;
+                        if sj_trace {
+                            let cs = batch_key_checksum(&pb, probe_keys)?;
+                            checksum
+                                .get_or_insert_with(KeyChecksum::default)
+                                .accumulate(cs);
+                        }
+                    } else if is_semi_anti && ctx.swapped && !is_semi {
+                        // task 004: this partition holds NO build row at all
+                        // (nothing was ever routed here, or it was emptied
+                        // before the table pass), so every probe row in it is
+                        // unmatched. INNER and SEMI correctly drop the batch;
+                        // ANTI must EMIT it whole — the previously silent
+                        // drop was exactly the wrong-result hazard for the
+                        // probe-side-output ANTI orientation.
+                        outputs.push(batch_with_actual_types(&ctx.schema, pb.columns().to_vec())?);
                     }
-                } else if state.spilled[idx].is_some() {
-                    // Spill probe rows for this partition
-                    spilled_bytes.fetch_add(
-                        estimate_batch_size(&pb),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    let path = file.get_or_insert_with(|| ctx.probe_file(spill_dir, idx));
-                    append_batch_streaming(writer, path, &pb)?;
-                    if sj_trace {
-                        let cs = batch_key_checksum(&pb, probe_keys)?;
-                        checksum
-                            .get_or_insert_with(KeyChecksum::default)
-                            .accumulate(cs);
-                    }
-                } else if is_semi_anti && ctx.swapped && !is_semi {
-                    // task 004: this partition holds NO build row at all
-                    // (nothing was ever routed here, or it was emptied
-                    // before the table pass), so every probe row in it is
-                    // unmatched. INNER and SEMI correctly drop the batch;
-                    // ANTI must EMIT it whole — the previously silent
-                    // drop was exactly the wrong-result hazard for the
-                    // probe-side-output ANTI orientation.
-                    outputs.push(batch_with_actual_types(&ctx.schema, pb.columns().to_vec())?);
-                }
-                Ok(outputs)
-            },
-        )
-        .collect::<Result<_>>()?;
+                    Ok(outputs)
+                },
+            )
+            .collect::<Result<_>>()
+    })?;
     let spilled = spilled_bytes.into_inner();
     if spilled > 0 {
         ctx.memory_pool.record_spill(spilled);

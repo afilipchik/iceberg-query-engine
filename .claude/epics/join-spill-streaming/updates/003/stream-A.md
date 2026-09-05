@@ -121,3 +121,22 @@ within a partition, K + per-partition elapsed traces.
   `native_dictionary_semi_anti` 4/4, fmt clean. Release build (003c)
   launched; the whole 003 battery (RSS trace, harness @1G ×8, Q9, chaos
   300, SF=10 sweep) is re-run on it — 003b's numbers are superseded.
+
+## 2026-09-05T06:40:00Z — the +300MB is allocator retention across rayon threads; bounded pool
+
+- 003c (partition-major phase A, 7a8f287) did NOT move the phase-A peak
+  (583MB vs 573MB) — the allocation-shape hypothesis was wrong. Q9 on
+  003c, quiet machine: **243.6s CELL-EXACT, 246/0, peak 10.9GB**; chaos
+  300/300.
+- Controlled experiments, same leg (semi-join build_right=1, 600M build,
+  2G scope, `rss_trace.py`): global 32-thread rayon pool **583MB** phase-A
+  peak; `RAYON_NUM_THREADS=8` **279MB**; `MIMALLOC_PURGE_DELAY=0` **305MB**;
+  single-threaded phase A (003) 207MB. Verdict: freed memory retained
+  per rayon thread by mimalloc, proportional to the number of threads
+  that touched a group's short-lived allocations — not live data, and
+  not fixable by reshaping the work.
+- Fix (this commit): phase A runs its two `par_iter`s on its OWN rayon
+  pool of min(available_parallelism, 8) threads (`spill_join_phase_a_pool`,
+  `OnceLock`), phase B stays on the global pool (its 003 peak of 432MB on
+  this leg was the accepted baseline). Gates green (34/34, 12/12, 4/4,
+  fmt). Release 003d building; RSS trace + full battery re-run on it.
