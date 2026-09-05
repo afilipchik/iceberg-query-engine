@@ -4767,8 +4767,13 @@ shaped it) and `.claude/epics/query-ui/`. What shipped:
   identity/transport/timing, spill peak + spill facts at a 16KB budget);
   `scripts/cluster_local.sh verify` step 5/6 hits `/queries`, `/stats`,
   `/tables`, `/ui` on every node and checks the log lists the gate's own
-  queries with plans. Visual pass: headless Firefox screenshots of every
-  view against a real node over `data/tpch-100mb`.
+  queries with plans. **`scripts/ui_check.py`** (Playwright + its own
+  Firefox, `.venv/bin/pip install playwright && .venv/bin/playwright
+  install firefox`, no sudo) drives every view AND the SQL console
+  against a running node, fails on any browser console/page error, and
+  writes screenshots to `.scratch/ui_check/`; it caught two console bugs
+  (a sticky results header floating over rows, a stray "null" text node
+  from `replaceChildren(null)`) that static headless screenshots missed.
 - **Not done (named)**: per-operator runtime metrics (rows/time per
   operator — the plan tree is shown without them), cross-node aggregated
   history, persistence of the log, cancellation, authentication.
@@ -5055,7 +5060,7 @@ shaped it) and `.claude/epics/query-ui/`. What shipped:
 | Async Parquet reader | `src/storage/parquet.rs` (AsyncParquetReader) |
 | Server mode (`serve`) | `src/distributed/server.rs` |
 | Query log (`/queries`, `/stats`) | `src/distributed/query_log.rs` |
-| Web UI (`/ui`) | `src/distributed/ui/` (embedded), tests in `tests/ui_tests.rs` |
+| Web UI (`/ui`) | `src/distributed/ui/` (embedded), tests in `tests/ui_tests.rs`, browser gate `scripts/ui_check.py` |
 | Arrow Flight endpoint | `src/distributed/flight.rs` |
 | Flight integration tests | `tests/flight_tests.rs` |
 | Flight acceptance gate (pyarrow) | `scripts/flight_validate.py` |

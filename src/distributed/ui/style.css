@@ -155,6 +155,6 @@ details.plan pre { padding: 10px 12px; background: var(--surface); border: 1px s
 .console .row { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
 .results { overflow: auto; max-height: 60vh; border: 1px solid var(--line); border-radius: var(--radius); }
 .results table.data { border: 0; }
-.results th { top: 0; }
+.results table.data th { top: 0; }
 .kv { display: inline-flex; gap: 12px; color: var(--ink-2); font-size: 12px; }
 .kv b { color: var(--ink); font-weight: 500; }

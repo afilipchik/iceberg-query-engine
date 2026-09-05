@@ -475,10 +475,14 @@ views.sql = {
       if (!rows.length) { out.replaceChildren(h('div', { class: 'empty' }, 'Query returned no rows.')); return; }
       const cols = Object.keys(rows[0]);
       const shown = rows.slice(0, 1000);
-      out.replaceChildren(h('div', { class: 'results' }, h('table', { class: 'data' },
+      // h() drops null children; replaceChildren() would render one as the text "null".
+      const cell = v => (v == null ? h('span', { class: 'muted' }, 'null') : typeof v === 'object' ? JSON.stringify(v) : String(v));
+      const table = h('table', { class: 'data' },
         h('thead', null, h('tr', null, cols.map(c => h('th', null, c)))),
-        h('tbody', null, shown.map(row => h('tr', null, cols.map(c => h('td', { class: typeof row[c] === 'number' ? 'num' : '' }, row[c] == null ? h('span', { class: 'muted' }, 'null') : typeof row[c] === 'object' ? JSON.stringify(row[c]) : String(row[c])))))))),
-        rows.length > shown.length ? h('div', { class: 'muted small' }, `showing ${shown.length} of ${rows.length} rows`) : null);
+        h('tbody', null, shown.map(row => h('tr', null, cols.map(c => h('td', { class: typeof row[c] === 'number' ? 'num' : '' }, cell(row[c])))))));
+      out.replaceChildren(h('div', null,
+        h('div', { class: 'results' }, table),
+        rows.length > shown.length ? h('div', { class: 'muted small' }, `showing ${shown.length} of ${rows.length} rows`) : null));
     }
     return h('div', { class: 'console' }, h('h1', null, 'SQL console'), ta, h('div', { class: 'row' }, modeSel, runBtn, status), out);
   },
