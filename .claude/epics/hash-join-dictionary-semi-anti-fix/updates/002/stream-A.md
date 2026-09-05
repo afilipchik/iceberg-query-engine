@@ -2,7 +2,7 @@
 issue: 002
 stream: dictionary-vht-fast-path
 started: 2026-09-05T02:50:00Z
-status: in_progress
+status: completed
 ---
 ## Scope
 Dictionary(Int32, Utf8) join keys on the vectorized hash-table path:
