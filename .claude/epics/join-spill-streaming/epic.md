@@ -2,8 +2,8 @@
 name: join-spill-streaming
 status: in-progress
 created: 2026-09-05T01:38:00Z
-updated: 2026-09-05T03:03:56Z
-progress: 0%
+updated: 2026-09-05T08:45:00Z
+progress: 75%
 prd: .claude/prds/join-spill-streaming.md
 github: (will be set on sync)
 ---
@@ -55,11 +55,11 @@ output streaming (the structural change) → 003 parallel read-back →
 
 ## Task Breakdown Preview
 
-- [ ] 001: Stream the probe side (no full materialization); measure
+- [x] 001: Stream the probe side (no full materialization); measure
       harness join peak RSS and Q4@64M cap
-- [ ] 002: Stream the output (phase A per batch, phase B per chunk);
+- [x] 002: Stream the output (phase A per batch, phase B per chunk);
       harness join scenarios under a 1G cap
-- [ ] 003: Parallel spilled-partition processing under the shared
+- [x] 003: Parallel spilled-partition processing under the shared
       budget; Q9 @1G ≤ 300s
 - [ ] 004: SF=100 certification re-run, chaos, suites, docs, close-out
 
@@ -76,9 +76,9 @@ PRD G1-G4.
 4 tasks, ~14-18 focused hours + SF=100 machine time.
 
 ## Tasks Created
-- [ ] 001.md - Stream the probe side through the spill path (parallel: false)
-- [ ] 002.md - Stream the join output (parallel: false, after 001)
-- [ ] 003.md - Parallel spilled-partition processing under the shared budget (parallel: false, after 002)
+- [x] 001.md - Stream the probe side through the spill path (parallel: false)
+- [x] 002.md - Stream the join output (parallel: false, after 001)
+- [x] 003.md - Parallel spilled-partition processing under the shared budget (parallel: false, after 002)
 - [ ] 004.md - SF=100 certification re-run + docs + epic close-out (parallel: false, last)
 
 Total tasks: 4

@@ -2,7 +2,7 @@
 issue: 003
 stream: spill-streaming
 started: 2026-09-05T04:10:00Z
-status: in_progress
+status: completed
 ---
 ## Scope
 Phase B K-way parallel under the SHARED budget (chunk budget = threshold
@@ -167,3 +167,28 @@ within a partition, K + per-partition elapsed traces.
   release what they retained. "probe collected" trace gains
   `phase_a_threads=`. Gates green (34/34, 12/12, 4/4, fmt). Release 003e
   building; the whole battery re-runs on it.
+
+## 2026-09-05T08:05:00Z — 003e (24a3138) battery: phase A back at the single-thread footprint
+
+- 003d record closed: anti-join build_right=0 **991MB cgroup / 978MB
+  rlimit** — PASS by 30-40MB; exactly the near-miss the budget-sized
+  pool was made for.
+- 003e RSS trace (semi-join build_right=1, 256MB budget → `phase_a_threads=3`):
+  phase-A peak **213MB** (single-threaded 003: 207MB; 003d 284MB; 003c
+  583MB); whole-run peak 474MB (003: 432MB).
+- Q9 SF=100 parquet @1G under 16G on 003e (`phase_a_threads=8`):
+  **222.3s, CELL-EXACT, 246 hash-check-ok / 0 mismatch**, peak 10.7GB;
+  second join 79.3s (K=2), first join 206.3s (K=5).
+- Chaos 003e: **300/300** (179 + 92 genuine-disk), 0 mismatch.
+- Launched: harness @1G ×8 on 003e, Q4 @64M on 003e; SF=10 native sweep
+  next, alone.
+
+## 2026-09-05T08:45:00Z — closed
+
+- Harness @1G on 003e: **8/8 COMPLETED** — build_right=0 semi 829/870MB,
+  anti 849/881MB; build_right=1 semi 466/496MB, anti 475/464MB (cgroup /
+  rlimit), counts exact, 3:20-6:07 wall.
+- Q4 @64M under 8G on 003e: 40.1s CELL-EXACT, peak 2,889MB (`phase_a_threads=1`).
+- SF=10 native sweep, quiet machine: **22/22 OK, 5,578.12ms** (band
+  5288-5667). No engine/harness processes left running.
+- 001/002/003 closed with Outcome sections; stream files completed.

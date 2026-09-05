@@ -2,7 +2,7 @@
 issue: 002
 stream: spill-streaming
 started: 2026-09-05T03:45:00Z
-status: in_progress
+status: completed
 ---
 ## Scope
 Stream the join spill path's OUTPUT (phase A per probe batch, A' resident
