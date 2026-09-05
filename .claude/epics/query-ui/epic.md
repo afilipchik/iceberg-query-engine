@@ -1,9 +1,9 @@
 ---
 name: query-ui
-status: in-progress
+status: completed
 created: 2026-09-05T04:12:00Z
-updated: 2026-09-05T04:34:36Z
-progress: 83%
+updated: 2026-09-05T04:47:42Z
+progress: 100%
 prd: .claude/prds/query-ui.md
 github: (will be set on sync)
 ---
@@ -137,9 +137,12 @@ contention on the ring under concurrent load — held for a push only;
 - [x] 003.md - UI shell, embedded static serving, Overview + Queries list + Query detail views (parallel: false)
 - [x] 004.md - Statistics view: tiles, sparkline, latency histogram, breakdowns (parallel: true)
 - [x] 005.md - Cluster, Tables and SQL console views (parallel: true)
-- [ ] 006.md - Verification: integration suite, cluster gate step, docs, timing check (parallel: false)
+- [x] 006.md - Verification: integration suite, cluster gate step, docs, timing check (parallel: false)
 
 Total tasks: 6
 Parallel tasks: 3
 Sequential tasks: 3
 Estimated total effort: 34 hours
+
+## Close-out (2026-09-05)
+All six tasks closed; G1–G7 met (see 006.md). Branch `epic/query-ui` (from main @020cbe5) is ready to merge; not merged from this session because the main checkout is mid-way through `join-spill-streaming`. Screenshots of every view: `.scratch/qui/shots/`. Suite 1354/0/1; M1 gate 6/6 PASS; SF=1 A/B flat.

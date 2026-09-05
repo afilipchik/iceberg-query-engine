@@ -1,7 +1,7 @@
 ---
 name: query-ui
 description: Built-in web UI for `serve` nodes — recent-query list, per-query debugging detail, and engine statistics — backed by an in-memory query log and JSON endpoints
-status: backlog
+status: completed
 created: 2026-09-05T04:05:24Z
 ---
 
