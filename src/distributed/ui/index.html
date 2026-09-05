@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>query_engine</title>
+<link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="#/">query_engine <span id="node-badge" class="badge">node ?</span></a>
+  <nav id="nav">
+    <a href="#/" data-route="overview">Overview</a>
+    <a href="#/queries" data-route="queries">Queries</a>
+    <a href="#/stats" data-route="stats">Statistics</a>
+    <a href="#/cluster" data-route="cluster">Cluster</a>
+    <a href="#/tables" data-route="tables">Tables</a>
+    <a href="#/sql" data-route="sql">SQL</a>
+  </nav>
+  <div class="top-right">
+    <label class="toggle"><input type="checkbox" id="auto-refresh" checked> auto-refresh</label>
+    <span id="refresh-state" class="muted"></span>
+  </div>
+</header>
+<div id="banner" class="banner" hidden></div>
+<main id="view" class="view"></main>
+<div id="tooltip" class="tooltip" hidden></div>
+<script type="module" src="/ui/app.js"></script>
+</body>
+</html>

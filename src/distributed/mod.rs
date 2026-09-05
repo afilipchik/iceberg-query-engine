@@ -37,6 +37,7 @@ pub mod gather;
 pub mod http_client;
 pub mod membership;
 pub mod plan;
+pub mod query_log;
 pub mod server;
 pub mod shard;
 pub mod splits;
@@ -50,6 +51,10 @@ pub use gather::{plan_gather, GatherPlan, GatherTable};
 pub use http_client::{get as http_get, post_text as http_post, HttpResponse};
 pub use membership::{Discovery, Member, Membership, MembershipChange, NodeId, PeerStatus};
 pub use plan::{plan_distributed, DistributedPlan, MergeShape};
+pub use query_log::{
+    FrontDoor, ListFilter, QueryLog, QueryOrigin, QueryRecord, QueryState, QuerySummary, StatsView,
+    DEFAULT_QUERY_LOG_SIZE, MIN_QUERY_LOG_SIZE,
+};
 pub use server::{serve, spawn, NodeState, ServeOptions, ServerHandle, TableLoader};
 pub use shard::ShardedParquetTable;
 pub use splits::{assign_lpt, enumerate_parquet, Assignment, Split, SplitSet};

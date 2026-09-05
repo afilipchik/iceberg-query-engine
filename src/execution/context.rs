@@ -47,8 +47,26 @@ pub struct QueryMetrics {
     pub execute_time: Duration,
     /// Total time
     pub total_time: Duration,
-    /// Peak memory usage during execution (bytes)
+    /// Peak memory usage during execution (bytes): the memory pool's
+    /// high-water mark between this query's start and end (query-ui epic,
+    /// task 001 — before that this was `pool.used()` read AFTER every
+    /// reservation had been released, i.e. ~0 for any query that spilled).
+    /// Pool-wide: concurrent queries sharing the context's pool all see the
+    /// peak of their sum.
     pub peak_memory_bytes: usize,
+    /// Number of result batches (before dictionary decoding, which is 1:1).
+    pub batches: usize,
+    /// Base tables the bound plan scans, sorted and deduplicated; when a
+    /// rollup answered the query its name is included too, because it is
+    /// what was actually read. Debugging surface for the query log
+    /// (query-ui epic, task 001).
+    pub tables: Vec<String>,
+    /// `Display` of the optimized logical plan, capped at
+    /// [`DEBUG_TEXT_CAP`] bytes. Rendered from the plan `sql()` already
+    /// built — no second planning pass.
+    pub optimized_plan: Option<String>,
+    /// `display_plan` of the physical operator tree, same cap.
+    pub physical_plan: Option<String>,
     /// Spill metrics if any spilling occurred
     pub spill_metrics: Option<SpillMetrics>,
     /// Number of files pruned by Iceberg statistics
@@ -295,6 +313,103 @@ fn parse_merge_concurrency(raw: Option<&str>) -> usize {
     raw.and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(8)
+}
+
+/// The formal name of the INSERT/CTAS write-path pre-flight admission check
+/// (oom-safety-hardening epic, task 005). Appears verbatim in every refusal
+/// message so a refused user (or a harness) can attribute the refusal to
+/// THIS check by name, mirroring `NativeTable::check_scan_budget`'s own
+/// named-refusal precedent (`src/storage/native_table.rs`).
+const INSERT_ADMISSION_CHECK_NAME: &str = "insert/CTAS write-path admission check";
+
+/// Decode-expansion factor applied to a parquet row group's on-disk
+/// UNCOMPRESSED byte size (`RowGroupMetaData::total_byte_size`) to estimate
+/// its decoded in-memory Arrow footprint plus per-stream pipeline slack.
+///
+/// Calibration (SF=10 `lineitem`, the measured workload behind
+/// native-tables-mutation task 005's own 1.63GB-peak number): each of its
+/// 58 row groups is ~59.1MB by `total_byte_size` but decodes to ~132MB of
+/// Arrow buffers (dictionary/RLE parquet encodings stay compact even
+/// "uncompressed" — measured 2.24x, via pyarrow `Table.nbytes` on a real
+/// row group), and each in-flight partition stream additionally holds
+/// read-ahead/transit batches. 3x covers both with a margin while keeping
+/// the SF=10 estimate (8 streams x 59.1MB x 3 = ~1.42GB) comfortably under
+/// a 2GiB memory_limit's budget (1.72GB) — the epic's own "no false
+/// refusal" calibration point — and comfortably over a 512MiB limit's
+/// budget (0.43GB), the SIGKILL case that must flip to a named refusal.
+const INSERT_ADMISSION_DECODE_EXPANSION: u64 = 3;
+
+/// Pure decision core of the INSERT/CTAS write-path admission check —
+/// factored out of `ExecutionContext::check_insert_write_admission` so the
+/// estimate arithmetic and the refusal message are unit-testable without a
+/// real parquet source or a real context (same testability reasoning as
+/// `parse_merge_concurrency` directly above).
+///
+/// The estimated working set is deliberately NOT the source's total size —
+/// the write path streams row group by row group, so what is actually
+/// resident at once is bounded by `bounded_partition_merge`'s concurrency
+/// cap: at most `min(merge_concurrency, num_partitions)` partition streams
+/// are polled concurrently, each holding roughly one decoded row group
+/// (`StreamingParquetScanExec` partitions ARE row-group work lists).
+///
+///   estimate = min(merge_concurrency, num_partitions)
+///              x max_row_group_bytes x INSERT_ADMISSION_DECODE_EXPANSION
+///
+/// `max_row_group_bytes == 0` means "no parquet-backed source found in the
+/// plan" (a `VALUES` list, a memory table, a native-table source — whose
+/// own scan is already budget-guarded by `check_scan_budget`): there is no
+/// estimate basis and the statement is admitted, never refused on a guess.
+///
+/// Returns `Some(message)` when the statement must be refused, `None` when
+/// it is admitted. The message names the check, both byte counts, and both
+/// knobs (`--memory-limit`, `QE_INSERT_MERGE_CONCURRENCY`).
+fn evaluate_insert_admission(
+    statement_kind: &str,
+    budget_bytes: u64,
+    memory_limit_bytes: usize,
+    merge_concurrency: usize,
+    num_partitions: usize,
+    max_row_group_bytes: u64,
+) -> Option<String> {
+    if max_row_group_bytes == 0 {
+        return None;
+    }
+    let effective = merge_concurrency.min(num_partitions.max(1)).max(1) as u64;
+    let per_stream = max_row_group_bytes.saturating_mul(INSERT_ADMISSION_DECODE_EXPANSION);
+    let estimated = per_stream.saturating_mul(effective);
+    if estimated <= budget_bytes {
+        return None;
+    }
+    Some(format!(
+        "{INSERT_ADMISSION_CHECK_NAME}: refusing {statement_kind} before driving any partition \
+         stream: the estimated streaming working set of {estimated} bytes ({effective} \
+         concurrently polled partition stream(s) x {per_stream} bytes per stream — the largest \
+         source parquet row group of {max_row_group_bytes} bytes x \
+         {INSERT_ADMISSION_DECODE_EXPANSION}x decode expansion) exceeds the memory safety \
+         budget of {budget_bytes} bytes (memory_limit {memory_limit_bytes} bytes * \
+         spill_threshold, the same formula NativeTable::check_scan_budget uses). Raise \
+         --memory-limit / ExecutionConfig::memory_limit for this statement, or lower \
+         QE_INSERT_MERGE_CONCURRENCY (currently {merge_concurrency}, the bounded-merge \
+         concurrency cap) so fewer decoded row groups are resident at once."
+    ))
+}
+
+/// Collect the table names of every `Scan` node reachable through
+/// `LogicalPlan::children()` — the sources whose parquet row groups the
+/// admission check estimates against. Plans embedded inside subquery
+/// EXPRESSIONS are not visited (`children()` does not expose them — the
+/// same documented boundary `native_rollup::substitute`'s walk has); the
+/// check stays deliberately conservative-but-incomplete rather than
+/// growing a second plan-traversal mechanism.
+fn collect_scan_table_names(plan: &LogicalPlan, out: &mut Vec<String>) {
+    if let LogicalPlan::Scan(node) = plan {
+        if !out.contains(&node.table_name) {
+            out.push(node.table_name.clone());
+        }
+    }
+    for child in plan.children() {
+        collect_scan_table_names(child, out);
+    }
 }
 
 impl ExecutionContext {
@@ -1121,6 +1236,8 @@ impl ExecutionContext {
     pub async fn sql(&self, query: &str) -> Result<QueryResult> {
         let start = Instant::now();
         let mut metrics = QueryMetrics::default();
+        // Open this query's peak-memory window (see `QueryMetrics::peak_memory_bytes`).
+        self.memory_pool.reset_peak();
 
         // Parse
         let parse_start = Instant::now();
@@ -1248,6 +1365,7 @@ impl ExecutionContext {
         let mut binder = Binder::new(&self.catalog);
         let logical = binder.bind(&stmt)?;
         metrics.plan_time = plan_start.elapsed();
+        metrics.tables = collect_scan_tables(&logical);
 
         // Rollup substitution (native-tables-rollups epic, task 001):
         // given real registry access this method has and a plain
@@ -1275,6 +1393,16 @@ impl ExecutionContext {
         if std::env::var("PLAN_DEBUG").is_ok() {
             eprintln!("[plan]\n{}", optimized);
         }
+        // Decorrelation and rollup substitution can introduce scans the
+        // bound plan did not have (DelimJoin sides, the rollup itself):
+        // union them in so `tables` names everything actually read.
+        for t in collect_scan_tables(&optimized) {
+            if !metrics.tables.contains(&t) {
+                metrics.tables.push(t);
+            }
+        }
+        metrics.tables.sort();
+        metrics.optimized_plan = Some(cap_debug_text(optimized.to_string()));
 
         // Physical planning with spillable operators for memory safety
         let physical_start = Instant::now();
@@ -1287,6 +1415,10 @@ impl ExecutionContext {
         planner.enable_subquery_execution();
         let physical = planner.create_physical_plan(&optimized)?;
         metrics.plan_time += physical_start.elapsed();
+        metrics.physical_plan = Some(cap_debug_text(crate::physical::display_plan(
+            physical.as_ref(),
+            0,
+        )));
 
         // Execute
         let execute_start = Instant::now();
@@ -1330,8 +1462,9 @@ impl ExecutionContext {
 
         metrics.total_time = start.elapsed();
 
-        // Capture memory metrics
-        metrics.peak_memory_bytes = self.memory_pool.used();
+        // Capture memory metrics: the pool's high-water mark over this
+        // query's window, not the post-release residual.
+        metrics.peak_memory_bytes = self.memory_pool.peak();
         let spilled = self.memory_pool.spilled();
         if spilled > 0 {
             metrics.spill_metrics = Some(SpillMetrics {
@@ -1342,6 +1475,7 @@ impl ExecutionContext {
 
         let schema = physical.schema();
         let row_count: usize = all_batches.iter().map(|b| b.num_rows()).sum();
+        metrics.batches = all_batches.len();
 
         // Dictionary-encoded columns (small-build join gathers) are an
         // internal representation; results hand plain arrays to formatters,
@@ -1406,6 +1540,95 @@ impl ExecutionContext {
         parse_merge_concurrency(std::env::var("QE_INSERT_MERGE_CONCURRENCY").ok().as_deref())
     }
 
+    /// The largest single parquet row group (by the footer's UNCOMPRESSED
+    /// `total_byte_size`) across every parquet-backed table the plan scans
+    /// — the per-stream working-set basis of the admission check. Footer
+    /// metadata only (same read `StreamingParquetScanExec::new` already
+    /// performs at planning time); never touches row data. A table without
+    /// `parquet_files()` (memory table, native table, `VALUES`) simply
+    /// contributes nothing; an unreadable footer is skipped rather than
+    /// failing the statement — this is an ESTIMATE source, and the scan
+    /// itself will surface any real I/O error loudly moments later.
+    fn max_source_row_group_bytes(&self, plan: &LogicalPlan) -> u64 {
+        let mut names: Vec<String> = Vec::new();
+        collect_scan_table_names(plan, &mut names);
+        let mut max_bytes = 0u64;
+        for name in &names {
+            let Some(provider) = self.tables.get(name) else {
+                continue;
+            };
+            let Some(files) = provider.parquet_files() else {
+                continue;
+            };
+            for path in files {
+                let Ok(file) = std::fs::File::open(&path) else {
+                    continue;
+                };
+                use parquet::file::reader::FileReader;
+                let Ok(reader) = parquet::file::reader::SerializedFileReader::new(file) else {
+                    continue;
+                };
+                for rg in reader.metadata().row_groups() {
+                    max_bytes = max_bytes.max(rg.total_byte_size().max(0) as u64);
+                }
+            }
+        }
+        max_bytes
+    }
+
+    /// The formal, named pre-flight admission check for the INSERT/CTAS
+    /// write path (oom-safety-hardening epic, task 005 — PRD G3). Runs
+    /// AFTER the physical plan is built (so the partition count is known)
+    /// and BEFORE any partition stream is driven, mirroring
+    /// `NativeTable::check_scan_budget`'s budget formula
+    /// (`memory_limit * spill_threshold`) and named-refusal error style.
+    ///
+    /// Closes the documented residual from native-tables-mutation task 005:
+    /// `bounded_partition_merge` cut the write path's peak RSS ~70%, but a
+    /// 512MB-class cgroup cap still got a kernel SIGKILL because nothing on
+    /// this path consulted `--memory-limit` before starting. Now a
+    /// statement whose bounded-merge working set (concurrency x decoded
+    /// row group — see `evaluate_insert_admission` for the exact formula
+    /// and its SF=10 calibration) provably cannot fit refuses cleanly, by
+    /// name, with exact byte counts and the knobs to turn.
+    ///
+    /// `QE_DEBUG_INSERT_ADMISSION=1` traces every decision to stderr —
+    /// the same cheap, env-gated diagnostic-switch convention as
+    /// `QE_DEBUG_SCAN_BUDGET`/`QE_DEBUG_ROLLUP`.
+    fn check_insert_write_admission(
+        &self,
+        statement_kind: &str,
+        optimized: &LogicalPlan,
+        physical: &Arc<dyn PhysicalOperator>,
+    ) -> Result<()> {
+        let budget = (self.config.memory_limit as f64 * self.config.spill_threshold) as u64;
+        let merge_concurrency = Self::insert_merge_concurrency();
+        let num_partitions = physical.output_partitions().max(1);
+        let max_rg_bytes = self.max_source_row_group_bytes(optimized);
+        let verdict = evaluate_insert_admission(
+            statement_kind,
+            budget,
+            self.config.memory_limit,
+            merge_concurrency,
+            num_partitions,
+            max_rg_bytes,
+        );
+        if std::env::var("QE_DEBUG_INSERT_ADMISSION").is_ok() {
+            eprintln!(
+                "[insert_admission] {statement_kind}: budget={budget} \
+                 memory_limit={} merge_concurrency={merge_concurrency} \
+                 num_partitions={num_partitions} max_row_group_bytes={max_rg_bytes} \
+                 verdict={}",
+                self.config.memory_limit,
+                if verdict.is_some() { "REFUSE" } else { "ADMIT" }
+            );
+        }
+        match verdict {
+            Some(message) => Err(QueryError::Execution(message)),
+            None => Ok(()),
+        }
+    }
+
     /// Execute `CREATE TABLE <name> AS SELECT ...` end to end: parse, bind
     /// the inner `SELECT` via the ordinary `Binder::bind()` path (which also
     /// validates the `CREATE TABLE` clause is a shape this epic supports —
@@ -1463,6 +1686,15 @@ impl ExecutionContext {
         }
         planner.enable_subquery_execution();
         let physical = planner.create_physical_plan(&optimized)?;
+        // Formal pre-flight admission check (oom-safety-hardening task 005):
+        // partition count is known now, and NO partition stream has been
+        // driven yet — refuse cleanly here, by name, rather than let a
+        // statement that provably cannot fit run into a kernel OOM-kill.
+        self.check_insert_write_admission(
+            &format!("CREATE TABLE {table_name} AS SELECT"),
+            &optimized,
+            &physical,
+        )?;
         // A bare `SELECT * FROM t` (no explicit column list) binds through
         // `Binder::bind_select_items`'s `SelectItem::Wildcard` arm, which
         // reuses the scan's OWN `SchemaField`s verbatim — including their
@@ -1647,6 +1879,16 @@ impl ExecutionContext {
         }
         planner.enable_subquery_execution();
         let physical = planner.create_physical_plan(&optimized)?;
+        // Formal pre-flight admission check (oom-safety-hardening task 005)
+        // -- see `create_table_as_select`'s identical call site. Runs
+        // BEFORE any partition stream is driven AND before the target's
+        // write lock is ever taken, so a refusal leaves the table
+        // byte-for-byte untouched.
+        self.check_insert_write_admission(
+            &format!("INSERT INTO {table_name}"),
+            &optimized,
+            &physical,
+        )?;
 
         // Drive every output partition's stream directly, then merge them
         // into ONE stream -- `native_write::append_to_native_table` takes
@@ -2258,11 +2500,104 @@ fn format_bytes(bytes: usize) -> String {
     }
 }
 
+/// Upper bound on a plan rendering kept in `QueryMetrics` (and therefore in
+/// the `serve` query log): a pathological plan is truncated with a marker
+/// rather than allowed to make the bounded ring unbounded.
+pub const DEBUG_TEXT_CAP: usize = 64 * 1024;
+
+/// Truncate `s` to [`DEBUG_TEXT_CAP`] bytes on a char boundary, marking the cut.
+pub fn cap_debug_text(mut s: String) -> String {
+    if s.len() <= DEBUG_TEXT_CAP {
+        return s;
+    }
+    let mut cut = DEBUG_TEXT_CAP;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
+    s.push_str("\n…[truncated]");
+    s
+}
+
+/// Every table a plan tree scans (including through `VectorSearch`, whose
+/// scan sits inside its `input`), sorted and deduplicated. Walks plan
+/// children only; a subquery still folded inside an expression is picked up
+/// once the optimizer has decorrelated it into the tree.
+pub fn collect_scan_tables(plan: &LogicalPlan) -> Vec<String> {
+    fn walk(plan: &LogicalPlan, out: &mut Vec<String>) {
+        if let LogicalPlan::Scan(node) = plan {
+            if !out.contains(&node.table_name) {
+                out.push(node.table_name.clone());
+            }
+        }
+        for child in plan.children() {
+            walk(child, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(plan, &mut out);
+    out.sort();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field};
+
+    // query-ui epic, task 001: the debugging facts `sql()` now records.
+    #[tokio::test]
+    async fn sql_records_plans_tables_and_batches() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+        let mut ctx = ExecutionContext::new();
+        ctx.register_batch("people", batch.clone());
+        ctx.register_batch("other", batch);
+
+        let r = ctx
+            .sql("SELECT p.id FROM people p JOIN other o ON p.id = o.id WHERE p.id > 1")
+            .await
+            .unwrap();
+        assert_eq!(r.row_count, 2);
+        assert_eq!(
+            r.metrics.tables,
+            vec!["other".to_string(), "people".to_string()]
+        );
+        let opt = r
+            .metrics
+            .optimized_plan
+            .as_deref()
+            .expect("optimized plan captured");
+        assert!(opt.contains("people") && opt.contains("other"), "{opt}");
+        let phys = r
+            .metrics
+            .physical_plan
+            .as_deref()
+            .expect("physical plan captured");
+        assert!(phys.contains("Join") || phys.contains("join"), "{phys}");
+        assert_eq!(r.metrics.batches, r.batches.len());
+        assert!(r.metrics.total_time >= r.metrics.execute_time);
+    }
+
+    #[test]
+    fn cap_debug_text_truncates_on_a_char_boundary() {
+        let s = "é".repeat(DEBUG_TEXT_CAP); // 2 bytes each
+        let out = cap_debug_text(s);
+        assert!(out.ends_with("…[truncated]"));
+        assert!(out.len() <= DEBUG_TEXT_CAP + "\n…[truncated]".len());
+        assert_eq!(cap_debug_text("short".into()), "short");
+    }
 
     // ------------------------------------------------------------------
     // native-tables-mutation epic, task 005: bounded partition-merge
@@ -2293,6 +2628,126 @@ mod tests {
 
     fn int_batch(schema: &SchemaRef, vals: Vec<i64>) -> RecordBatch {
         RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vals))]).unwrap()
+    }
+
+    // ------------------------------------------------------------------
+    // oom-safety-hardening epic, task 005: the INSERT/CTAS write-path
+    // admission check's pure decision core (`evaluate_insert_admission`).
+    // The two named constants below are the epic's own calibration
+    // points, taken from REAL measurements, not invented for the test:
+    // SF=10 lineitem's largest row group is 59,120,848 bytes
+    // (`total_byte_size`, 58 row groups -> 32 scan partitions on a
+    // 32-thread box), and the measured post-task-005 append peak with
+    // the default merge concurrency of 8 was ~1.63GB.
+    // ------------------------------------------------------------------
+
+    const SF10_MAX_RG_BYTES: u64 = 59_120_848;
+
+    fn budget_for(memory_limit: usize) -> u64 {
+        // The same formula as `check_insert_write_admission` /
+        // `check_scan_budget`, with the default spill_threshold.
+        (memory_limit as f64 * ExecutionConfig::default().spill_threshold) as u64
+    }
+
+    #[test]
+    fn insert_admission_admits_the_sf10_calibration_point_at_2gib() {
+        // 8 streams x 59.1MB x 3 = ~1.42GB <= 1.72GB budget: the 2GiB
+        // memory-limit run that MEASURABLY completes under a 2GB cgroup
+        // cap must never be falsely refused.
+        let limit = 2 * 1024 * 1024 * 1024usize;
+        assert_eq!(
+            evaluate_insert_admission(
+                "INSERT INTO t",
+                budget_for(limit),
+                limit,
+                8,
+                32,
+                SF10_MAX_RG_BYTES
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn insert_admission_refuses_the_sf10_calibration_point_at_512mib() {
+        // Same workload at a 512MiB limit (budget ~429MB): pre-fix this
+        // was a kernel SIGKILL; it must now be a named refusal citing the
+        // exact byte counts and both knobs.
+        let limit = 512 * 1024 * 1024usize;
+        let msg = evaluate_insert_admission(
+            "INSERT INTO t",
+            budget_for(limit),
+            limit,
+            8,
+            32,
+            SF10_MAX_RG_BYTES,
+        )
+        .expect("the 512MiB-limit SF=10 append must be refused");
+        let estimated = 8 * SF10_MAX_RG_BYTES * INSERT_ADMISSION_DECODE_EXPANSION;
+        assert!(msg.contains(INSERT_ADMISSION_CHECK_NAME), "{msg}");
+        assert!(msg.contains(&estimated.to_string()), "{msg}");
+        assert!(msg.contains(&budget_for(limit).to_string()), "{msg}");
+        assert!(msg.contains("--memory-limit"), "{msg}");
+        assert!(msg.contains("QE_INSERT_MERGE_CONCURRENCY"), "{msg}");
+        assert!(msg.contains("INSERT INTO t"), "{msg}");
+    }
+
+    #[test]
+    fn insert_admission_effective_concurrency_is_capped_by_partition_count() {
+        // A single-partition source (one row group) can never have more
+        // than one stream in flight, whatever the merge concurrency says
+        // -- 1 x 59.1MB x 3 = ~177MB fits a 512MiB limit's budget.
+        let limit = 512 * 1024 * 1024usize;
+        assert_eq!(
+            evaluate_insert_admission(
+                "INSERT INTO t",
+                budget_for(limit),
+                limit,
+                8,
+                1,
+                SF10_MAX_RG_BYTES
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn insert_admission_lowering_merge_concurrency_shrinks_the_estimate() {
+        // The refusal message's own advice must be true: at concurrency 1
+        // the SF=10 shape is admitted where concurrency 8 was refused.
+        let limit = 1024 * 1024 * 1024usize;
+        assert!(evaluate_insert_admission(
+            "INSERT INTO t",
+            budget_for(limit),
+            limit,
+            8,
+            32,
+            SF10_MAX_RG_BYTES
+        )
+        .is_some());
+        assert_eq!(
+            evaluate_insert_admission(
+                "INSERT INTO t",
+                budget_for(limit),
+                limit,
+                1,
+                32,
+                SF10_MAX_RG_BYTES
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn insert_admission_admits_when_no_parquet_source_exists() {
+        // max_row_group_bytes == 0 means "no estimate basis" (VALUES,
+        // memory tables, native-table sources already guarded by
+        // check_scan_budget) -- admitted even at a zero budget, never
+        // refused on a guess.
+        assert_eq!(
+            evaluate_insert_admission("INSERT INTO t", 0, 0, 8, 32, 0),
+            None
+        );
     }
 
     /// `bounded_partition_merge` must emit every row from every input

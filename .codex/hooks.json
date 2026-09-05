@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/scripts/claude_hooks/enforce_safe_build.sh",
+            "timeout": 10,
+            "statusMessage": "Checking command against the safe-build sandbox rule..."
+          }
+        ]
+      }
+    ]
+  }
+}

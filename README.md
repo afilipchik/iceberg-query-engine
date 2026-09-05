@@ -16,6 +16,7 @@ A high-performance SQL query engine built from scratch in Rust, designed for ana
 - **Catalog Integrations**: Apache Gravitino (fileset AND relational catalogs — `serve --metastore`) and Apache Pulsar (feature `pulsar`: topics as tables via the admin API + schema registry, bounded snapshot reads over the WebSocket reader)
 - **Vector Search**: k-NN over embedding columns (`cosine_distance`, `l2_distance`, …), exact by default with opt-in IVF_PQ index pushdown
 - **Arrow Flight RPC**: standard gRPC endpoint (`serve --flight-bind`) — query from `pyarrow.flight` or any Flight client, single-node or distributed
+- **Web UI + query log**: every `serve` node keeps a bounded log of the statements it ran and serves a dependency-free UI at `/ui` — recent queries, per-query debugging detail (timings, memory, spill, pruning, plans, distribution, error), statistics, cluster, tables and a SQL console; the same facts are JSON at `/queries`, `/queries/{id}`, `/stats`, `/tables`
 - **GPU Aggregate Offload** (feature `gpu`): fused filter+aggregate kernels over VRAM-resident columns — 39-59x on Q6-shaped scans, 9-17x on Q1-shaped grouped aggregates (RTX 5090); first touch stays on the CPU and uploads in the background, so the GPU is never slower
 - **Larger-Than-Memory**: Spillable operators for datasets exceeding available RAM
 - **Interactive REPL**: SQL shell with history and tab completion
@@ -253,6 +254,39 @@ auto/scatter/gather machinery as `POST /sql`, and the final stream chunk
 carries execution metadata (rows, elapsed, distributed, shard count) as
 JSON in `app_metadata`. Send `{"sql": "...", "mode": "force"}` as the
 command to require distributed execution (`off` forces local).
+
+### Web UI and query log
+
+Every `serve` node records each statement it runs — from `POST /sql`, Arrow
+Flight `DoGet`, and the `/fragment` calls it serves as a worker — in an
+in-memory ring (default 1,000 records, `--query-log-size N` or
+`QE_QUERY_LOG_SIZE`). A record is inserted when the statement starts, so
+running queries are visible, and completed with everything the engine knows:
+
+- timing: elapsed plus parse / plan / optimize / execute phases
+- output: rows, batches, encoded bytes and format
+- memory: the pool's high-water mark while the query ran, the configured
+  limit, and how many statements were concurrently running
+- spill bytes / partitions / files, files pruned by statistics and by
+  partition, rollups that answered the query, tables read
+- the optimized logical plan and the physical operator tree
+- distributed runs: the full distribution record (shards, imbalance, per-node
+  splits/bytes/rows/elapsed, partial SQL); fragments: initiator and shard
+- failures: the `QueryError` variant name and message
+
+```bash
+./target/release/query_engine serve --bind 0.0.0.0:7777 --data ./data/tpch-10mb
+open http://127.0.0.1:7777/ui               # Overview · Queries · Statistics · Cluster · Tables · SQL
+
+curl 'http://127.0.0.1:7777/queries?limit=20&state=failed'   # newest first
+curl  http://127.0.0.1:7777/queries/<query_id>               # one record in full
+curl  http://127.0.0.1:7777/stats                            # p50/p95/p99, per-minute, errors, memory
+curl  http://127.0.0.1:7777/tables                           # schemas
+```
+
+Every `/sql` response carries `x-qe-query-id`; the Flight metadata trailer
+carries `query_id`. The UI is plain HTML/CSS/JS compiled into the binary —
+no build step, no external resources, works air-gapped, light and dark.
 
 ## Architecture
 

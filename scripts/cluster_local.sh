@@ -14,7 +14,7 @@
 #   scripts/cluster_local.sh start [N]        Start N nodes (default 3)
 #   scripts/cluster_local.sh status           Print each node's /cluster view
 #   scripts/cluster_local.sh query "<SQL>"    Run SQL on every node, diff results
-#   scripts/cluster_local.sh verify           Run the full M1 acceptance gate
+#   scripts/cluster_local.sh verify           Run the full M1 acceptance gate (incl. query log + UI)
 #   scripts/cluster_local.sh verify-m2        Run the M2 gate (balance, two-phase
 #                                             aggregation, loud rejection)
 #   scripts/cluster_local.sh splits <table>   Show how a table divides at 2..16 nodes
@@ -236,7 +236,7 @@ cmd_verify() {
     echo -e "${BOLD}=== M1 acceptance gate, $n local processes ===${NC}"
 
     # 1. Identical membership view on every node.
-    info "1/5  /cluster agrees on every node"
+    info "1/6  /cluster agrees on every node"
     if ! wait_converged "$n" 60; then
         bad "the cluster never converged on an all-up $n-member view"
         failures=$((failures + 1))
@@ -271,13 +271,18 @@ cmd_verify() {
     #    associative, so the last bits legitimately differ. The distributed
     #    answers are gated separately by `verify-m2`, against DuckDB, with the
     #    same numeric tolerance the DuckDB-validated suite uses.
-    info "2/5  TPC-H results match the single-process binary, byte for byte (local path)"
+    info "2/6  TPC-H results match the single-process binary, byte for byte (local path)"
     mkdir -p "$STATE_DIR/verify" "$STATE_DIR/ref"
     for q in 1 3 6 10 12; do
         local qq; qq="$(printf 'q%02d' "$q")"
         local sql
+        # NOTE: `query` interleaves tracing on stdout (e.g. the deliberate
+        # join_reorder missing-NDV WARNs from join-order-stats-hardening,
+        # ANSI-colored) after the SQL text — stop capturing at the first
+        # tracing/ESC line too, or the POSTed "SQL" ends in an ESC byte and
+        # every node correctly returns a parse error (seen 2026-08-29 on Q3).
         sql="$("$BINARY" query --num "$q" --sf 0.001 2>/dev/null \
-               | awk '/^Query:$/{f=1;next} /^Schema:/{f=0} f')"
+               | awk '/^Query:$/{f=1;next} /^Schema:/{f=0} /\x1b|^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z +(TRACE|DEBUG|INFO|WARN|ERROR)/{f=0} f')"
         if [[ -z "${sql// }" ]]; then
             bad "could not extract the SQL text for Q$q"; failures=$((failures + 1)); continue
         fi
@@ -305,7 +310,7 @@ cmd_verify() {
     done
 
     # 3. Health/readiness semantics.
-    info "3/5  /healthz and /readyz"
+    info "3/6  /healthz and /readyz"
     for ((i = 0; i < n; i++)); do
         local h r
         h="$(curl -s -o /dev/null -w '%{http_code}' "http://$(addr_of "$i")/healthz")"
@@ -320,7 +325,7 @@ cmd_verify() {
     # 4. Arrow Flight parity: the same statement over Flight and over HTTP
     #    must agree on every node — values AND the distributed/shards facts.
     #    Runs BEFORE the SIGTERM step, which takes a node down.
-    info "4/5  Arrow Flight answers match POST /sql on every node"
+    info "4/6  Arrow Flight answers match POST /sql on every node"
     local py=".venv/bin/python"
     if [[ ! -x "$py" ]]; then
         bad "$py not found; the Flight gate needs pyarrow"; failures=$((failures + 1))
@@ -339,8 +344,56 @@ cmd_verify() {
         fi
     fi
 
-    # 5. SIGTERM the last node; the rest must report it down and keep serving.
-    info "5/5  SIGTERM node $((n - 1)); survivors must mark it down, not crash"
+    # 5. Query log + web UI (query-ui epic): every node must list the queries
+    #    step 2 just sent it, reconcile /stats with that list, describe its
+    #    tables, and serve the UI. Runs BEFORE the SIGTERM step so all n nodes
+    #    are still up.
+    info "5/6  /queries, /stats, /tables and /ui on every node"
+    local lagree=1
+    for ((i = 0; i < n; i++)); do
+        local base="http://$(addr_of "$i")"
+        local qs; qs="$(curl -s "$base/queries?limit=all&door=http")"
+        local listed; listed="$(echo "$qs" | grep -o '"matched": *[0-9]*' | grep -o '[0-9]*$')"
+        # Step 2 posted 5 queries (Q1/Q3/Q6/Q10/Q12) to every node.
+        if [[ -z "$listed" || "$listed" -lt 5 ]]; then
+            lagree=0; bad "node $i /queries lists ${listed:-?} http statements, expected >= 5"
+        fi
+        # Responses are pretty-printed (arrays span lines): flatten before grepping.
+        if ! echo "$qs" | tr -d '\n ' | grep -q '"tables":\[[^]]*"lineitem"'; then
+            lagree=0; bad "node $i /queries does not name lineitem in any record"
+        fi
+        local st; st="$(curl -s "$base/stats")"
+        local total finished failed running
+        total="$(echo "$st" | grep -o '"total": *[0-9]*' | head -1 | grep -o '[0-9]*$')"
+        finished="$(echo "$st" | grep -o '"finished": *[0-9]*' | head -1 | grep -o '[0-9]*$')"
+        failed="$(echo "$st" | grep -o '"failed": *[0-9]*' | head -1 | grep -o '[0-9]*$')"
+        running="$(echo "$st" | grep -o '"running": *[0-9]*' | head -1 | grep -o '[0-9]*$')"
+        if [[ -z "$total" || $((finished + failed + running)) -ne "$total" ]]; then
+            lagree=0; bad "node $i /stats does not reconcile: total=$total finished=$finished failed=$failed running=$running"
+        fi
+        local tc; tc="$(curl -s "$base/tables" | grep -o '"table_count": *[0-9]*' | grep -o '[0-9]*$')"
+        [[ "$tc" == "8" ]] || { lagree=0; bad "node $i /tables reports $tc tables, expected 8"; }
+        for asset in /ui /ui/app.js /ui/style.css; do
+            local code; code="$(curl -s -o /dev/null -w '%{http_code}' "$base$asset")"
+            [[ "$code" == "200" ]] || { lagree=0; bad "node $i $asset -> HTTP $code"; }
+        done
+        # A detail record carries the plan the query ran with.
+        local first; first="$(echo "$qs" | grep -o '"query_id": *"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
+        if [[ -n "$first" ]]; then
+            curl -s "$base/queries/$first" | grep -q '"physical_plan": *"' \
+                || { lagree=0; bad "node $i /queries/$first has no physical plan"; }
+        else
+            lagree=0; bad "node $i: no query id to fetch"
+        fi
+    done
+    if [[ $lagree -eq 1 ]]; then
+        ok "query log, stats, tables and UI answer correctly on all $n nodes"
+    else
+        failures=$((failures + 1))
+    fi
+
+    # 6. SIGTERM the last node; the rest must report it down and keep serving.
+    info "6/6  SIGTERM node $((n - 1)); survivors must mark it down, not crash"
     local victim=$((n - 1)) vpid
     vpid="$(cat "$STATE_DIR/node$victim.pid")"
     kill -TERM "$vpid"

@@ -389,6 +389,12 @@ enum Commands {
         #[arg(long)]
         flight_bind: Option<String>,
 
+        /// Capacity of the in-memory query log behind `/queries`, `/stats`
+        /// and the web UI at `/ui` (default 1000, floor 10; env
+        /// QE_QUERY_LOG_SIZE).
+        #[arg(long)]
+        query_log_size: Option<usize>,
+
         /// Pulsar broker web-service URL (`http://host:8080`): every
         /// schema'd topic of --pulsar-namespace registers as a table
         /// (requires --features pulsar).
@@ -454,6 +460,14 @@ fn detect_sf(path: &Path) -> f64 {
 
 #[tokio::main]
 async fn main() {
+    // Hard, kernel-enforced cap on this process's memory (RLIMIT_DATA),
+    // BEFORE anything can allocate at scale. Twice now an uncapped engine
+    // run peaked >100G and systemd-oomd killed the whole terminal scope;
+    // this layer lives in the binary itself so it cannot be forgotten or
+    // bypassed. The engine may abort at the cap — the terminal never dies.
+    // Size with QE_MEM_CAP (default 64G); see enforce_process_memory_cap().
+    query_engine::execution::enforce_process_memory_cap();
+
     // Serve the engine's memory on 4KB pages, not 2MB transparent huge pages.
     // Measured, not assumed: 17 of 22 TPC-H queries get faster and peak RSS
     // drops. See disable_transparent_hugepages() for the evidence and why the
@@ -1428,6 +1442,7 @@ async fn main() {
             drain_ms,
             shutdown_grace_ms,
             flight_bind,
+            query_log_size,
             pulsar_admin,
             pulsar_namespace,
         } => {
@@ -1449,6 +1464,14 @@ async fn main() {
                     schema: metastore_schema,
                 });
 
+            let query_log_size = query_log_size
+                .or_else(|| {
+                    std::env::var("QE_QUERY_LOG_SIZE")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                })
+                .unwrap_or(query_engine::distributed::DEFAULT_QUERY_LOG_SIZE)
+                .max(query_engine::distributed::MIN_QUERY_LOG_SIZE);
             let opts = ServeOptions {
                 bind,
                 advertise,
@@ -1461,6 +1484,7 @@ async fn main() {
                 drain: Duration::from_millis(drain_ms),
                 shutdown_grace: Duration::from_millis(shutdown_grace_ms),
                 flight_bind,
+                query_log_size,
             };
 
             let loader = Box::new(move || {

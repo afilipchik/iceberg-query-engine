@@ -199,6 +199,28 @@ async fn sort_spill_matches_in_memory() {
     .await;
 }
 
+/// `ORDER BY ... LIMIT` with input exceeding the budget → ExternalSortExec's
+/// spill branch with a fused `fetch` (the top-k fusion rule folds a
+/// `skip == 0` LIMIT straight into `with_fetch`, so the spill branch's own
+/// truncation is the ONLY place the row count is cut —
+/// spill-join-correctness-2 task 004's fix, re-pinned here at the SQL level
+/// against oom-safety-hardening task 003's streamed merge delivery, where
+/// the limit is now applied per arriving batch and ends the output stream
+/// early). Sort keys are unique per row ((l_orderkey, l_linenumber) is a
+/// key), so the ordered comparison is fully deterministic — no tie at the
+/// LIMIT boundary can make two correct answers differ.
+#[tokio::test]
+async fn sort_spill_with_limit_matches_in_memory() {
+    assert_spill_matches(
+        "SELECT l_orderkey, l_linenumber, l_quantity, l_extendedprice FROM lineitem \
+         ORDER BY l_extendedprice DESC, l_orderkey, l_linenumber LIMIT 50",
+        256 * 1024,
+        "sort_spill_limit",
+        true,
+    )
+    .await;
+}
+
 /// Distinct aggregation across the spill boundary (COUNT(DISTINCT) has its own
 /// accumulator path).
 #[tokio::test]
@@ -239,27 +261,157 @@ async fn count_distinct_spill_matches_in_memory() {
     assert_eq!(rows, expected, "COUNT(DISTINCT) disagrees with DuckDB");
 }
 
-/// Non-inner joins are not yet supported by the join spill path
-/// (probe_partition implements inner semantics only). They must FAIL LOUDLY
-/// when the build side exceeds the budget — silently returning inner-join
-/// results, which is what happened before the guard, is data corruption.
-/// When the streaming spill rewrite adds outer/semi/anti support, replace
-/// this with a results-match test like the ones above.
+/// High-cardinality COUNT(DISTINCT) GROUP BY at a very low limit —
+/// oom-safety-hardening task 002's streaming two-phase reservation feeds
+/// `aggregate_with_spilling` mid-stream, and the per-partition finalize
+/// gate (raw bytes + predicted aggregation state vs the threshold)
+/// necessarily trips at 128KB, forcing the chunked (sub-partitioned)
+/// read-back for every partition. Results must match the unlimited run
+/// exactly through the full SQL path.
 #[tokio::test]
-async fn left_join_spill_fails_loudly_not_wrong() {
-    let ctx = spilling_ctx(256 * 1024, "left_join_spill");
-    let result = ctx
-        .sql(
-            "SELECT o_orderpriority, COUNT(*) AS cnt FROM orders \
-             LEFT JOIN lineitem ON o_orderkey = l_orderkey \
-             GROUP BY o_orderpriority ORDER BY o_orderpriority",
-        )
-        .await;
-    let err = result.expect_err(
-        "LEFT JOIN needing the spill path must error until the spill path \
-         implements non-inner join types — silent inner-join results are worse",
-    );
-    assert!(err.to_string().contains("INNER"), "unexpected error: {err}");
+async fn agg_spill_chunked_finalize_matches_in_memory() {
+    assert_spill_matches(
+        "SELECT l_partkey, COUNT(DISTINCT l_orderkey) AS orders, SUM(l_quantity) AS qty \
+         FROM lineitem, orders WHERE l_orderkey = o_orderkey \
+         GROUP BY l_partkey",
+        128 * 1024,
+        "agg_chunked_finalize",
+        false,
+    )
+    .await;
+}
+
+/// spill-boundaries task 003: LEFT/RIGHT/FULL joins whose build side
+/// exceeds the budget now COMPLETE through the join spill path, cell-exact
+/// vs the in-memory run (until this task they failed loudly by name —
+/// `left_join_spill_fails_loudly_not_wrong`, replaced by this test).
+/// `COUNT(<other side's key>)` alongside `COUNT(*)` pins the NULL-extended
+/// rows: an inner-join-shaped answer would make the two counts equal.
+/// Shapes: build = LEFT = the preserved side (orders LEFT JOIN lineitem —
+/// the planner keeps the build on the left since 15k < 2 x 60k rows);
+/// build = RIGHT with the PROBE side preserved and an ON-clause filter
+/// (lineitem LEFT JOIN orders — 60k > 2 x 15k flips the build to the
+/// right); a RIGHT join; a FULL join with an ON-clause filter.
+#[tokio::test]
+async fn outer_join_spill_matches_in_memory() {
+    assert_spill_matches(
+        "SELECT o_orderpriority, COUNT(*) AS cnt, COUNT(l_orderkey) AS matched FROM orders \
+         LEFT JOIN lineitem ON o_orderkey = l_orderkey \
+         GROUP BY o_orderpriority ORDER BY o_orderpriority",
+        256 * 1024,
+        "left_join_spill_build_preserved",
+        true,
+    )
+    .await;
+    assert_spill_matches(
+        "SELECT l_linestatus, COUNT(*) AS cnt, COUNT(o_orderkey) AS matched FROM lineitem \
+         LEFT JOIN orders ON l_orderkey = o_orderkey AND o_custkey <> l_suppkey \
+         GROUP BY l_linestatus ORDER BY l_linestatus",
+        8 * 1024,
+        "left_join_spill_probe_preserved_filtered",
+        true,
+    )
+    .await;
+    assert_spill_matches(
+        "SELECT o_orderpriority, COUNT(*) AS cnt, COUNT(l_orderkey) AS matched FROM lineitem \
+         RIGHT JOIN orders ON l_orderkey = o_orderkey \
+         GROUP BY o_orderpriority ORDER BY o_orderpriority",
+        8 * 1024,
+        "right_join_spill",
+        true,
+    )
+    .await;
+    assert_spill_matches(
+        "SELECT COUNT(*) AS cnt, COUNT(l_orderkey) AS l_rows, COUNT(o_orderkey) AS o_rows \
+         FROM lineitem FULL JOIN orders ON l_orderkey = o_orderkey AND l_quantity > 25.0",
+        8 * 1024,
+        "full_join_spill_filtered",
+        true,
+    )
+    .await;
+}
+
+/// spill-join-correctness-3 task 004: a Q4-shaped `EXISTS` (SEMI join)
+/// whose build side exceeds the budget must now COMPLETE through the join
+/// spill path, cell-exact vs the in-memory run. No date filter on
+/// `orders`, so both sides are far above an 8KB budget whichever side the
+/// planner builds from.
+#[tokio::test]
+async fn semi_join_exists_spill_matches_in_memory() {
+    assert_spill_matches(
+        "SELECT o_orderpriority, COUNT(*) AS order_count FROM orders \
+         WHERE EXISTS (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey \
+         AND l_commitdate < l_receiptdate) \
+         GROUP BY o_orderpriority ORDER BY o_orderpriority",
+        8 * 1024,
+        "semi_exists_spill",
+        true,
+    )
+    .await;
+}
+
+/// spill-join-correctness-3 task 004: a `NOT EXISTS` (ANTI join) — the
+/// Q16/Q22 shape — through the spill path, cell-exact vs in-memory. Counts
+/// per priority so every unmatched `orders` row is accounted for.
+#[tokio::test]
+async fn anti_join_not_exists_spill_matches_in_memory() {
+    assert_spill_matches(
+        "SELECT o_orderpriority, COUNT(*) AS cnt FROM orders \
+         WHERE NOT EXISTS (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey \
+         AND l_shipmode = 'AIR') \
+         GROUP BY o_orderpriority ORDER BY o_orderpriority",
+        8 * 1024,
+        "anti_not_exists_spill",
+        true,
+    )
+    .await;
+}
+
+/// spill-join-correctness-3 task 004: `NOT IN` over a subquery (Q16's own
+/// shape) through the spill path.
+#[tokio::test]
+async fn anti_join_not_in_spill_matches_in_memory() {
+    assert_spill_matches(
+        "SELECT COUNT(*) AS cnt, MIN(o_orderkey) AS mn, MAX(o_orderkey) AS mx FROM orders \
+         WHERE o_orderkey NOT IN (SELECT l_orderkey FROM lineitem WHERE l_shipmode = 'AIR')",
+        8 * 1024,
+        "anti_not_in_spill",
+        true,
+    )
+    .await;
+}
+
+/// spill-boundaries task 002: a SEMI join (EXISTS) and an ANTI join
+/// (NOT EXISTS) whose correlated subquery carries a NON-EQUI predicate over
+/// both sides — the ON-clause filter the spill path used to refuse
+/// ("cannot evaluate an ON-clause filter"). At 8KB whichever side the
+/// planner builds from is far above the budget, so a pass here means the
+/// filter was evaluated per candidate pair INSIDE the spill path.
+/// `l_suppkey <> o_custkey` is the compiled (two-column) shape;
+/// `l_extendedprice > o_totalprice / 4` needs the gathered
+/// `evaluate_expr` path.
+#[tokio::test]
+async fn filtered_semi_anti_join_spill_matches_in_memory() {
+    assert_spill_matches(
+        "SELECT o_orderpriority, COUNT(*) AS cnt FROM orders \
+         WHERE EXISTS (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey \
+         AND l_suppkey <> o_custkey) \
+         GROUP BY o_orderpriority ORDER BY o_orderpriority",
+        8 * 1024,
+        "filtered_semi_spill",
+        true,
+    )
+    .await;
+    assert_spill_matches(
+        "SELECT o_orderpriority, COUNT(*) AS cnt FROM orders \
+         WHERE NOT EXISTS (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey \
+         AND l_extendedprice > o_totalprice / 4) \
+         GROUP BY o_orderpriority ORDER BY o_orderpriority",
+        8 * 1024,
+        "filtered_anti_spill",
+        true,
+    )
+    .await;
 }
 
 /// A memory-limited context must still produce correct results for queries

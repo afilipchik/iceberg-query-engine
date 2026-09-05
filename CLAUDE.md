@@ -48,6 +48,62 @@ This ensures consistent code formatting across the codebase.
 - Being slow on larger-than-memory datasets is acceptable; crashing with OOM is not
 - When adding new operators, they MUST handle memory limits and spill to disk when needed
 - Never add a parameter that lets users opt out of memory safety
+- **In-binary hard process cap (2026-08-29)**: `main()`'s first statement is
+  `enforce_process_memory_cap()` (`src/execution/memory.rs`) —
+  `setrlimit(RLIMIT_DATA)` to **64G by default**, sized via `QE_MEM_CAP`
+  (same grammar as `--memory-limit`; floor 256MB; NO unlimited spelling —
+  garbage falls back to the default with a warning). Kernel-enforced: at the
+  cap, mimalloc's mmap fails and the ENGINE aborts ("memory allocation of N
+  bytes failed") while the terminal's cgroup is untouched. Both soft and
+  hard rlimits are lowered, which is irreversible in-process — so runs that
+  legitimately need more (e.g. SF=100 native benchmarks with
+  `--memory-limit 100G`) must set `QE_MEM_CAP=110G` up front. This is the
+  defense-in-depth layer that exists because the safe-build wrapper rule
+  was bypassed twice; it does NOT replace the wrapper (builds/tests still
+  go through `claude-safe-build.sh` — cargo/rustc themselves are not capped
+  by the engine's own rlimit). **Coarseness caveat**: `RLIMIT_DATA` counts
+  VIRTUAL private-anonymous mappings, not RSS — mimalloc reserves a ~1GiB
+  arena up front and 32 tokio worker stacks ~0.3G more, none of it
+  resident, so `QE_MEM_CAP` needs roughly 1GB of headroom above the real
+  intended budget and cannot enforce tight sub-GB budgets; the cgroup
+  lever (`systemd-run -p MemoryMax=`) is the precise RSS cap. Both levers
+  are exercised by the harness below.
+- **Operator coverage closed (oom-safety-hardening epic, 2026-08-29)**:
+  with a configured `--memory-limit`, every known operator path now either
+  completes by spilling or refuses cleanly by name — proven under real
+  caps by the reusable adversarial harness (`scripts/oom_cap_harness.sh`
+  driving `examples/oom_cap_harness.rs`: 4 scenarios × both cap levers;
+  **8/8 PASS at epic close**, zero kernel kills, zero rlimit aborts). The
+  five gaps closed: (1) the join spill path's per-partition hash tables
+  are budgeted — measured real footprint + worst-case prediction, with
+  eviction and chunked spilled-partition read-back (task 007; this was the
+  root-caused ~10-20x unbudgeted amplification behind the 2026-08-28
+  incident's repro); (2) `SpillableHashAggregateExec` and (3)
+  `ExternalSortExec` stream their input with a running-size mid-stream
+  spill decision instead of collect-fully-then-decide, with accounted
+  finalize / streamed merge delivery (tasks 002/003 — e.g. 250M-row
+  GROUP BY and global ORDER BY both complete under a real 1G cgroup cap
+  at ~0.4GB / ~0.85GB peak); (4) over-budget native-table scans stream
+  segment-at-a-time into aggregate-covered consumers instead of refusing
+  (task 004 — raw `SELECT *`/filter-only/ORDER BY-only dumps still refuse
+  by name, the documented boundary); (5) INSERT/CTAS has a formal named
+  pre-flight admission check (task 005,
+  `check_insert_write_admission`). Feeding all of these, the
+  `estimate_batch_size` Dictionary-column ~4,000x overestimate (mmap
+  capacity vs logical content) was fixed first (`spill-size-estimate-fix`
+  epic) so spill decisions act on real sizes.
+- **Join spill path covers SEMI/ANTI (`spill-join-correctness-3` task
+  004, 2026-09-03)**: a SEMI or ANTI join whose build side exceeds the
+  budget now spills instead of refusing (both build orientations; the
+  refusal is now Left/Right/Full only, by name). Proven on Q4 SF=100
+  native at `--memory-limit 64M` and `16M` (cell-exact, real spill
+  activity, 0 checksum mismatches) and by the harness's new
+  `semi-join`/`anti-join` scenarios (8/8 COMPLETED under a 1G cap on both
+  levers, pre-fix 4/4 clean refusals). **Residual closed 2026-09-04
+  (`join-spill-streaming`)**: the probe side and the output now stream
+  and spilled partitions are processed K-way under the same budget —
+  the same harness joins with a 600M-row build complete under the
+  default 1G cap (464-881MB peak), Q9 SF=100 @1G 222s (was ~1,650s).
 
 ### Sandboxed Build Rule
 
@@ -69,6 +125,24 @@ terminal scope — including the Claude session and remote-control bridge.
 A build must never share a cgroup with the session that launched it.
 Never run bare `cargo build/test/bench` for release or heavy-feature
 builds; there is no situation where bypassing the wrapper is worth it.
+
+**This rule was documented but not enforced, and it happened again**
+(2026-08-28 12:35, 107.2G peak, terminal scope killed, 11 processes) —
+root cause: `.claude/settings.local.json`'s own permission allowlist
+pre-approves bare `cargo run --release`, `cargo build`, `cargo test`,
+`cargo bench`, and direct `./target/{release,debug}/query_engine`
+execution, so nothing actually stopped a command from silently bypassing
+the wrapper; the rule only worked when whoever typed the command
+remembered it. **Fixed with an enforcement layer, not just a reminder**:
+`scripts/claude_hooks/enforce_safe_build.sh`, wired as a `PreToolUse`
+hook on `Bash` in `.claude/settings.json`, denies (with a message
+pointing at the wrapper) any `cargo build/test/bench/run`, direct
+`target/{release,debug}/query_engine`(`/examples/...`) execution, or
+direct `scripts/*.sh`/`scripts/*.py` invocation (several of this repo's
+own benchmark drivers spawn the engine as an uncapped subprocess) that
+isn't already wrapped in `claude-safe-build.sh`/`oomsafe.sh`/
+`safe_benchmark.sh`/`systemd-run ... -p MemoryMax=...`. This runs
+regardless of what the permission allowlist happens to pre-approve.
 
 ### Benchmark Timeout Rule
 
@@ -235,9 +309,12 @@ src/
 ├── metastore/
 │   └── mod.rs                # BranchingMetastoreClient REST API client
 │
-├── distributed/              # `query_engine serve` — MILESTONE 1 ONLY
+├── distributed/              # `query_engine serve`
 │   ├── mod.rs                # Module exports
-│   ├── server.rs             # hyper HTTP server: /healthz /readyz /cluster /sql
+│   ├── server.rs             # hyper HTTP server: /healthz /readyz /cluster /sql /queries /stats /tables /ui
+│   ├── query_log.rs          # Bounded in-memory query log + /queries, /stats views (query-ui epic)
+│   ├── ui/                   # Embedded web UI (index.html, app.js, style.css; include_str!)
+│   ├── flight.rs             # Arrow Flight endpoint
 │   ├── membership.rs         # Peer discovery (static + DNS), self-id, probes
 │   └── http_client.rs        # ~100-line HTTP client used for peer probes
 │
@@ -786,7 +863,7 @@ query_engine repl
 # Start REPL with TPC-H tables preloaded
 query_engine repl --tpch ./data/tpch-10mb
 
-# Run as a cluster node (MILESTONE 1: /sql executes LOCALLY, no fan-out yet)
+# Run as a cluster node (web UI at http://<node>:7777/ui; --query-log-size N)
 query_engine serve --bind 0.0.0.0:7777 --node-id 0 \
     --peers 10.0.0.1:7777,10.0.0.2:7777 --data ./data/tpch-10mb
 # ...or with Kubernetes-style DNS discovery against a headless Service:
@@ -809,6 +886,11 @@ fixed before M3 (shuffle).
 | `GET /splits` | `?table=<t>&nodes=<n>` — how a table divides, with imbalance. |
 | `POST /sql` | Body is the statement. `?format=arrow (default)|json|csv`; `?distributed=auto (default)|1|0`. Headers report `x-qe-distributed`, `x-qe-distribution` (full JSON), `x-qe-imbalance`, `x-qe-shards`. |
 | `POST /fragment` | One shard of a distributed query (internal). Digest-checked. |
+| `GET /queries` | The node's query log, newest first (query-ui epic, 2026-09-05). `?limit=N|all&state=running|finished|failed&door=http|flight|fragment&q=<substring>`. Summaries only (no plans). |
+| `GET /queries/{id}` | One statement in full: phases, rows/bytes, pool peak + limit + concurrency, spill, pruning, rollups, tables, optimized + physical plans, distribution record, error. 404 once evicted. |
+| `GET /stats` | Computed on request from the log: counts by state/door, p50/p95/p99, 60 one-minute buckets, rows/bytes/spill totals, errors by kind, tables by query count, slowest 5, pool used/peak/max, cluster counts. |
+| `GET /tables` | Registered tables with column names/types/nullability. Answers before readiness. |
+| `GET /ui` | The embedded web UI (`/ui/app.js`, `/ui/style.css`). |
 
 **Arrow Flight endpoint (2026-08-21, `src/distributed/flight.rs`).** `serve`
 also runs an Arrow Flight gRPC server: `--flight-bind <addr>` (default = HTTP
@@ -1282,6 +1364,19 @@ STALE, superseded by intervening epics (native-tables-mutation,
 spill-join-correctness, native-table-pruning) that changed the join-spill
 path; the fresh SF=10 native-table total is **8.20s** (1.93x DuckDB/
 Parquet, 1.08x excluding Q12 alone).
+**Update (spill-size-estimate-fix epic, 2026-08-29): the Q12-native
+slowness is root-caused and FIXED — it was never really join-spill cost.**
+`estimate_batch_size` priced Dictionary columns via Arrow's
+`get_array_memory_size()`, which returns the ENTIRE underlying mmap'd
+segment buffer's size, not the column's logical content — Q12's real
+~42MB build side was estimated at ~167.7GB (~4,000x), spuriously crossing
+the spill threshold. Fixed content-aware (via
+`ArrayData::get_slice_memory_size()`, generalizing the existing
+Utf8/Binary pattern); Q12 native now runs the in-memory join fast path:
+**~0.18s** (was ~3.1s still-spilling / ~150s before the O(n²) writer
+fix), cell-exact. Fresh full SF=10 native sweep at the
+`oom-safety-hardening` epic close (2026-08-29, same harnessed premise):
+**22/22 OK, TOTAL 5288ms** — the 8.20s figure above is itself now STALE.
 
 **Re-baselined again at the close of `duckdb-parity-2` (six tasks: IPC-cache
 defaults, Q13 disjoint-threshold + join-pruning, Q16 anti-join parallelism +
@@ -2434,6 +2529,37 @@ Parquet's streaming path, which needs no such cap, a native-table query
 against SF=10/SF=100-scale data WILL refuse cleanly under the engine's
 1GiB default. This doc's own benchmark commands below always pass one.
 
+**Update (oom-safety-hardening epic, task 004, 2026-08-29): the refusal
+boundary above is now SHAPE-DEPENDENT, not table-wide.** A new streaming
+operator, `NativeStreamingScanExec` (`src/physical/operators/
+native_scan.rs` — epic Architecture Decision 4, mirroring the
+`ParquetTable::scan()` vs `StreamingParquetScanExec` split), reads an
+over-budget native table segment-at-a-time through the SAME
+`ipc_cache::read_row_group` mmap reader, with deletion-vector filtering
+(`filter_deleted_rows`) and segment pruning (`segment_might_match`)
+applied identically to the materializing path. The planner
+(`src/physical/planner.rs`, Scan arm + `collect_agg_covered_scans`
+pre-pass) routes a native-table scan onto it ONLY when BOTH hold: (1)
+`NativeTable::scan_budget_exceeded()` — i.e. the materializing scan
+WOULD refuse — and (2) the Scan node has an **Aggregate ancestor** in
+the logical plan (joins/filters/projects may sit in between; the
+aggregate is what bounds what reaches the root, and any join en route
+is `SpillableHashJoinExec`, which spills). So: `SELECT ... GROUP BY`
+and aggregate-over-join queries over a larger-than-budget native table
+now COMPLETE (spilling as needed) instead of refusing, while **raw
+materializing shapes — `SELECT *` dumps, filter/project-only, ORDER
+BY-only — still refuse by name through `check_scan_budget`,
+deliberately**: streaming those would only move the OOM from the scan
+to the `QueryResult` collection at the root. That boundary is pinned by
+tests (`tests/native_streaming_scan_tests.rs`), not just documented.
+In-budget tables take the byte-identical pre-existing path (the
+condition short-circuits on `scan_budget_exceeded()`), so the
+dense-direct-address fast path and GPU-offload eligibility are
+untouched for them; an OVER-budget table is additionally declined by
+`try_extract_native_dense_source` so the dense-direct route (whose
+execution-time scan would refuse) falls through to the spillable
+aggregate over the streaming scan.
+
 ### GPU-offload eligibility (task 007)
 
 `TableProvider::identity() -> Option<Vec<u8>>` (new trait method,
@@ -3179,7 +3305,13 @@ kept open per partition for the whole build/probe phase, appending
 each batch as one more row group instead of re-reading and rewriting
 everything already spilled): **140-291s -> 3-6s on this exact Q12
 repro, a ~40-90x speedup**, 40/40 trials cell-exact, zero regression,
-full suite green in all four feature combinations. This was always a
+full suite green in all four feature combinations. (**Superseded for Q12
+specifically, 2026-08-29**: the `spill-size-estimate-fix` epic then found
+Q12 native should never have spilled AT ALL — `estimate_batch_size`'s
+Dictionary-column mmap-capacity bug overestimated its ~42MB build side
+~4,000x; with that fixed, Q12 native runs the in-memory join fast path at
+**~0.18s**, cell-exact, zero spill traces. The O(n²) fix remains fully
+live for genuinely-spilling joins.) This was always a
 mechanism SEPARATE from the wrongness (task 001's own chaos-test
 experiment had already shown a forced ~2x-retry-and-discard does not
 reproduce the wrong answer even though it fully explains the
@@ -3369,6 +3501,28 @@ recorded: the spill-directory-collision bug (residue item 1 above) is
 capable of a silent wrong answer, not just a loud crash — now fixed.
 Full epic close-out, G1-G5 verdicts, and every commit:
 `.claude/epics/archived/spill-join-correctness-2/epic.md`.
+
+**Update (`spill-join-correctness-3` tasks 001 + 002, 2026-09-02/03):
+the duplicate-counting bug's tracking is CLOSED with a bound, not a
+proof.** Task 001 recalibrated against the REWRITTEN spill path (the
+merged oom-safety-hardening code, pinned binary at `306dc15`, never
+rebuilt mid-battery): **0 wrong / 6,041 verified trials** — 5,600 chaos
+trials (5 batches, 2 fixture scales, 5 seeds, mixed
+`QE_SPILL_CHAOS_FORCE_SPILL`/`_PARTITIONS`, 5,021 genuine-disk, 0 missed
+injections) plus **441 cold full-query Q12-class trials** at genuinely
+spilling budgets (16M/12M: the archived `total_matched=1,765,881`
+signature reproduced exactly; Q12 no longer spills at 40G/64M/32M post
+estimate-fix), every one cell-exact vs the archived oracle, **89,212
+`hash-check-ok` / 0 `HASH-MISMATCH`** task-wide. 95% Clopper-Pearson:
+pooled **[0%, 0.061%]**; the Q12-class leg alone **[0%, 0.833%]** (0/441
+had ~22% probability under the old 0.34% rate, so that leg disfavors but
+cannot exclude it — the tighter pooled bound leans on the chaos leg,
+which covers the same machinery but not the original trigger
+distribution). No post-rewrite sighting exists; every prior sighting
+predates the rewrite. Task 002 (the conditional root-cause/fix) closed
+verdict-only — nothing to start from. Evidence:
+`.claude/epics/spill-join-correctness-3/001.md` + `updates/001/stream-A.md`,
+artifacts under `.scratch/sjc3-001/`.
 
 **Full suite, all four feature combinations**, final state (all fixes +
 all new tests included), through `scripts/claude-safe-build.sh`:
@@ -4202,6 +4356,220 @@ cluster_local.sh verify-m2 && scripts/cluster_local.sh stop` (M1/M2).
   SF=100), all of which remain open, all of which are join-spill-path
   work, not scan-path work.** Full detail, every command, every number:
   `.claude/epics/archived/native-table-pruning/002.md`.
+  **Further update (`spill-size-estimate-fix` + `oom-safety-hardening`
+  epics, closed 2026-08-29): the Q12@SF=10 leg of this saga is CLOSED —
+  it was never a real spill-cost problem at all.** `estimate_batch_size`
+  priced Q12's Dictionary `l_shipmode` build column at the whole mmap'd
+  segment's size (~167.7GB claimed vs ~42MB real, ~4,000x), so the join
+  was misrouted onto the spill path it never needed; fixed content-aware,
+  Q12 native now completes in-memory at **~0.18s** (was ~3.1s spilling /
+  ~150s pre-O(n²)-fix), cell-exact. Separately, the join spill path that
+  remains (for genuinely oversized build sides) now BUDGETS its
+  per-partition hash tables (measured + predicted bytes, eviction,
+  chunked read-back — `oom-safety-hardening` task 007), and
+  aggregate/sort/native-scan/INSERT all complete-or-refuse under real
+  memory caps (see the Memory Safety Rule section's epic-close bullet).
+  Both remaining items from this list are now CLOSED by
+  `spill-join-correctness-3`: the ~0.34% duplicate-counting bug (task
+  001, 2026-09-02 — 0 wrong / 6,041 verified trials on the rewritten
+  path, 95% CI [0%, 0.061%], stated as a bound, not proof; see the
+  duplicate-counting section's own update) and Q4's SEMI-join-spill
+  refusal (task 004, 2026-09-03 — see below).
+  **Q13's SF=100 "temp-file rename error" is CLOSED
+  (`spill-join-correctness-3` task 003, 2026-09-02), root-caused with a
+  live reproduction at the pruning epic's own failing commit (`2534739`,
+  same binary lineage/settings):** the failing operator was never the
+  join — it was the spillable AGGREGATE above it. Until
+  `oom-safety-hardening` 002, `SpillableHashAggregateExec`'s repeat
+  evictions appended via `merge_parquet_files` (write
+  `merged_{idx}.parquet`, then `fs::rename` it over the partition's spill
+  file — the file's ONLY rename), and until `spill-join-correctness-2`
+  001 the default spill root was PID-less, so any concurrent engine
+  process's cleanup could delete that intermediate inside the whole
+  read+merge+rename window → `Failed to rename merged file: No such file
+  or directory` (reproduced on demand at `2534739` by deleting a
+  `merged_*` file from `/tmp/query_engine_spill/agg_0_*` mid-query:
+  HTTP 400 with exactly that error; 2026-08-27 had documented concurrent
+  agents sharing that path). Doubly removed on main: the PID-embedded
+  spill root ends cross-process sharing, and the open-writer agg rewrite
+  deleted `merge_parquet_files` — no rename exists in `spillable.rs` at
+  all. With the Dictionary estimate fix the path isn't even entered: Q13
+  SF=100 native at the previously-failing settings (`--memory-limit
+  100G`) now completes in **~13.5s, cell-exact vs a fresh DuckDB oracle**
+  (2 rows: `15,10000000` / `0,5000000`), zero spill traces. Pinned by
+  `agg_spill_has_no_rename_window_under_adversarial_intermediate_deletion`
+  (spillable.rs).
+  **Q4's SF=100 SEMI-join-spill refusal is CLOSED (`spill-join-
+  correctness-3` task 004, 2026-09-03): `SpillableHashJoinExec`'s spill
+  path now supports SEMI and ANTI joins in BOTH build orientations.**
+  The planner keeps the build on the LEFT (output) side for Semi/Anti
+  unless the left is estimated at >2x the right (`build_right_for_left`),
+  so both shapes are real: probe-side output (build = right) decides each
+  probe row against its own partition's table, with a per-probe-row match
+  bitmap OR-accumulated across the chunked read-back of a spilled
+  partition and emitted after the LAST chunk (per-chunk emission would
+  double-emit SEMI rows / prematurely emit ANTI rows when a key's build
+  rows straddle chunks); build-side output (build = left) keeps a
+  per-resident-partition build-matched bitmap across the whole probe
+  stream and emits per read-back chunk (exact, since chunks partition
+  build rows disjointly). Two ANTI-only hazards are handled explicitly:
+  probe batches whose partition holds NO build rows (previously silently
+  dropped — correct for INNER/SEMI, wrong for ANTI) and build partitions
+  that receive ZERO probe rows (all rows unmatched → emitted). NULL keys
+  never match, exactly as the in-memory join. Left/Right/Full stay
+  refused by name ("supports only INNER, SEMI and ANTI joins"). Measured,
+  not assumed: the pruning epic's 100G premise NO LONGER refuses on
+  pre-fix code (the Dictionary estimate fix moved the boundary; pre-fix
+  Q4 SF=100 native completes cell-exact down to `--memory-limit 80M` and
+  refuses at 64M and 16M), so the acceptance budget is **64M**: post-fix
+  Q4 SF=100 native completes **HTTP 200 in 61.2s at 64M (65.6s at 16M),
+  cell-exact vs a fresh DuckDB oracle** (5 rows, `1-URGENT,999120` ...
+  `5-LOW,998946`), with a real `execute_spill_path` (62 of 64 build
+  partitions spilled, ~84.5k build rows each, ~7.07M probe rows each,
+  **122/128 `hash-check-ok`, 0 HASH-MISMATCH**). `oom_cap_harness` gained
+  `semi-join`/`anti-join` scenarios (build side 2.5x the 256MB limit,
+  closed-form row counts, `QE_HARNESS_JOIN_BUILD_RIGHT` selects the
+  orientation): pinned pre-fix binary **4/4 REFUSED by name**, post-fix
+  **8/8 COMPLETED** with exact counts under the 1G cap on both levers
+  (peak RSS 551-888MB). Two pre-existing spill-path bugs were found and
+  fixed on the way, both reachable by INNER too: (1) `extract_join_key`
+  had no Dictionary arm, so every Dictionary-encoded join key became
+  `JoinValue::Null` — never inserted, never matched — and a SPILLING join
+  on such a key (native tables' low-cardinality strings) returned ZERO
+  rows; `join_key_arrays` now decodes Dictionary keys at the single
+  key-evaluation point (build, probe, routing and checksum), non-Dictionary
+  keys byte-identical to before; (2) `evict_build_partition_to_disk`
+  turned an EMPTY partition into a file-less `SpilledPartition` when the
+  first build batch alone crossed the threshold, and sparse keys (few
+  distinct values → ~60 never-populated partitions) then failed read-back
+  with "Failed to open parquet file"; an empty partition now stays
+  resident. Tests (all vs an independent naive-join ground truth, never
+  vs the spill path itself): SEMI/ANTI x {probe-side, build-side} x
+  {dense with chunk-straddling duplicates, sparse}; Dictionary keys x
+  {SEMI, ANTI, INNER} x both orientations; the sparse-key INNER pin;
+  outer-join refusal pin; `tests/spill_tests.rs` EXISTS / NOT EXISTS /
+  NOT IN at an 8KB budget. INNER non-regression: 300/300 chaos trials
+  (25,188 `hash-check-ok`, 0 mismatch), Q16/Q22 SF=10 unchanged (320 / 7
+  rows; 172.6ms / 165.9ms vs 200.5ms / 179.9ms on the pinned pre-fix
+  binary, same machine, back to back). Suite 1326/0/2 (= 1318/0/1
+  baseline + 8 new tests + 1 deliberately-ignored findings test). Full
+  evidence: `.claude/epics/spill-join-correctness-3/004.md` and its
+  `updates/004/stream-{A,B}.md`.
+- **CLOSED (`hash-join-dictionary-semi-anti-fix` epic, 2026-09-04) — the
+  in-memory `HashJoinExec` wrong answer for build-side-output SEMI/ANTI
+  (build = LEFT = output) with `Dictionary(Int32, Utf8)` keys and
+  repeated build keys.** Root cause, confirmed with a failing test before
+  the change (SEMI 20 / ANTI 59,980 vs truth 30,000 / 30,000 on the
+  task-004 fixture): `VectorizedHashTable::build` rejected Dictionary
+  keys, so such joins fell to `probe_semi_anti_parallel`'s generic map
+  path, whose candidate loop `break`s after marking the FIRST build
+  entry — right when the probe row is the output, wrong when the build
+  rows are. Fixed by one shared `consider(bb, br, pr)` step per candidate
+  that stops only on `pass && swapped`. Three sibling defects in the same
+  function were found by the audit tests and fixed too: Int64 keys + a
+  compiled ON filter (build-side output) stopped on the first pass;
+  Utf8 keys + any filter, and Int64 keys + a non-compilable filter,
+  matched NOTHING in either orientation (the generic map was skipped when
+  a VHT existed and the "local i64 safety net" was keyed with the probe
+  expression over the build batches); and swapped Semi/Anti emission
+  over IPC-sidecar parquet failed `RecordBatch::try_new` (Dictionary
+  arrays under a Utf8 schema — now `batch_with_actual_types` at all four
+  emission sites). Dictionary keys now take the vectorized path
+  (`decode_dictionary_key`/`evaluate_join_keys` decode once per batch at
+  build and every probe entry point). The naive correctness fix was
+  quadratic under duplicated keys (7 ship modes over a 30.6M-row build:
+  the 001-only binary did not finish in 10 minutes) — build-side marking
+  is now O(probe + build) (`VectorizedHashTable::mark_build_matches`: a
+  walker whose first equal-key entry is already marked stops; bits are
+  monotonic and chains are walked in one order; gated to the no-filter
+  case). Measured SF=10 native, back to back: pre-fix best 2.60s with the
+  WRONG answer; fixed best 2.18s, correct, `vht=true`. Pinned by
+  `semi_anti_build_side_output_dictionary_keys_marks_every_build_row`,
+  `semi_anti_build_side_output_with_on_filter_marks_every_build_row`,
+  `semi_anti_utf8_keys_with_on_filter_are_exact`,
+  `dictionary_keys_build_a_vectorized_hash_table`,
+  `inner_semi_anti_left_over_dictionary_keys_are_cell_exact`,
+  `build_side_semi_anti_over_heavily_duplicated_keys_is_linear`
+  (hash_join.rs), the un-ignored
+  `in_memory_hash_join_dictionary_build_side_semi_anti_is_exact`
+  (spillable.rs) and the SQL-level `tests/native_dictionary_semi_anti.rs`
+  (CTAS native lineitem from tpch-10mb, Semi/Anti on `l_shipmode`,
+  build-left and build-right, cell-exact vs the parquet source). Evidence:
+  `.claude/epics/archived/hash-join-dictionary-semi-anti-fix/`.
+- **CLOSED (`join-spill-streaming` epic, 2026-09-04): the join spill path
+  no longer materializes its probe side or its output, and processes
+  spilled partitions in parallel under the operator's own budget.**
+  Before: `execute_spill_path` collected the ENTIRE probe side into a
+  `Vec<RecordBatch>` (Q9 SF=100 @1G: 333,333,330 rows) and then the
+  ENTIRE join output into another (1,333,333,320 rows — 1,396s of Q9's
+  ~1,650s), and read spilled partitions back one at a time on one
+  thread; the probe side and the output were unbounded by
+  `--memory-limit` (Q4 @64M needed a 32G cap; the SF=100-class harness
+  join needed 12G for a 256MB budget). Now: the probe side flows through
+  `stream_merge_input_partitions` (bounded channel); the memoized build
+  state lives in `BuildDecision::Spill(Arc<SpillState>)` and a spawned
+  producer streams matched batches through a bounded `mpsc(8)` channel
+  (phase A: resident partitions probed per incoming batch, partition-
+  major on a per-call rayon pool sized one worker per 64MB of threshold,
+  clamped 1..8 — sized by the budget because mimalloc's per-thread
+  retention (~12MB/thread) was measured, not guessed, to break the 1G
+  target with a fixed 8-thread pool; phase B: up to K spilled partitions
+  concurrently via `spawn_blocking`, K = min(available parallelism, 8,
+  spilled count, threshold / largest partition table), overridable with
+  `QE_SPILL_JOIN_PARALLELISM`, each chunk's table budget = threshold / K
+  so the total transient table memory is unchanged, spill files read
+  row-group by row-group so a job holds one chunk + one probe group,
+  never a partition file); per-call probe files
+  `probe_<call>_<idx>.parquet` cleaned by the producer, the spill dir in
+  `SpillState::drop`. Measured on the same machine: harness `semi-join`/
+  `anti-join` with a 600M-row build (9.6GB vs a 256MB budget) **8/8
+  COMPLETED under the DEFAULT 1G cap** on both levers and both
+  orientations (464-881MB peak; before: 4.7-8.0GB under a 12G cap);
+  **Q4 SF=100 native @64M: 2,889MB peak, 40.1s** (before 6,185MB, 71.1s);
+  **Q9 SF=100 parquet @1G: 222.3s cell-exact** (before ~1,650s), 246
+  hash-check-ok / 0 mismatch, whole-engine peak 10.7GB under a 16G cap
+  (scan parallelism + in-flight channels, not the join — bounded but
+  budget-exceeding, worth its own look); chaos 300/300 on the final
+  binary; SF=10 native 5,578ms in band. Honest cost line: at tiny
+  budgets the phase-A pool is small by design (Q4 @64M: 40s vs 14s with
+  a fixed 8-thread pool) — memory first. Evidence:
+  `.claude/epics/archived/join-spill-streaming/` (003.md carries the
+  controlled allocator-retention experiments).
+- **CLOSED (`spill-boundaries` epic, 2026-09-05): the three remaining
+  clean-refusal boundaries — over-budget NATIVE scans feeding joins,
+  ON-clause-filter join spill, and LEFT/RIGHT/FULL outer-join spill.**
+  (1) Planner: `collect_agg_covered_scans` became
+  `collect_spill_covered_scans` — a Scan streams (`NativeStreamingScanExec`)
+  when every pipeline breaker between it and the root is spill-capable
+  (aggregate/DISTINCT; `SpillableHashJoinExec` on EITHER side; `ExternalSortExec`);
+  Window/DelimJoin/VectorSearch block, raw dumps / filter-only / LIMIT-only
+  still refuse by name; the pre-pass now runs BEFORE shared-CTE
+  materialization (Q11's HAVING subquery and Q15's `revenue` CTE are
+  twice-referenced CTEs that were being lowered first). Native SF=100 @1G:
+  Q02 0.32s, Q10 1.9s, Q11 0.21s, Q15 0.89s, Q20 17.6s — all cell-exact
+  (all refused on 2026-09-04). (2) Spill path: `PairFilter` compiled once
+  per call; `visit_candidate_pairs` is the single pair enumeration for
+  INNER/SEMI/ANTI/outer in phase A and the chunked phase B; `CompiledFilter`
+  fast path gated per batch on actual types and NULL slots, else 65,536-pair
+  gathered `evaluate_expr` chunks ("NULL is not TRUE"). Q21 SF=100 parquet
+  @256M: 74.5s cell-exact, 3 `execute_spill_path`, 334 hash-check-ok / 0
+  mismatch. (3) Outer joins reuse the SEMI/ANTI bitmaps: preserved-side
+  match bitmaps (`preserve_probe`/`preserve_build`), one
+  `probe_batch_against_table` pass emits pairs and marks both bitmaps,
+  NULL-extended emission via the full schema + retained mask; probe-
+  preserved emits after the last chunk, build-preserved per partition/chunk;
+  K-way phase B and the budget discipline unchanged. Q20 SF=100 parquet
+  @256M: 33.1s cell-exact, 118 hash-check-ok / 0 mismatch. The spill path's
+  refusal is now CROSS/SINGLE/MARK only. Tests: 21 filtered fixtures + 31
+  outer-join fixtures vs a row-level naive oracle (both orientations,
+  dense/sparse, NULL keys, filter, retained mask, K=3), planner cover/
+  uncover unit tests, `native_streaming_scan_tests` moved to the widened
+  rule, `spill_tests::outer_join_spill_matches_in_memory`; chaos 300/300
+  (26,054 hash-check-ok / 0 mismatch); SF=10 native 5,113ms. Certification
+  after this epic: SF=100 parquet 22/22 at 1G AND 256M, native 22/22 at
+  100G AND 1G on the final binary, 0 checksum mismatches — see the
+  re-certification table in the SF=100 section. Evidence:
+  `.claude/epics/archived/spill-boundaries/`.
 - **No compaction** (native-tables-mutation epic, confirmed OUT OF SCOPE
   by design — task 001's Decision 3, not merely deferred incidentally). A
   deletion vector is correctness-preserving indefinitely — reads always
@@ -4320,6 +4688,14 @@ threshold — the exact, already-documented mechanism in this section's own
 "Current limitations" below, not a new bug. Excluding Q12, native/parquet
 (engine-to-engine) is a much more expected 1.08x. SF=100 not re-measured
 this session.
+**Update (2026-08-29, `spill-size-estimate-fix` + `oom-safety-hardening`
+close)**: Q12's threshold crossing was the now-fixed `estimate_batch_size`
+Dictionary mmap-capacity bug (~4,000x overestimate of a ~42MB build
+side), not real spill need — Q12 native is now **~0.18s** (in-memory fast
+path, cell-exact). Fresh SF=10 native sweep at epic close
+(`native_bench_compare.py --no-duckdb`, 40G limit, iterations 2):
+**22/22 OK, TOTAL 5288ms** — back in line with (slightly better than)
+this section's own 5.324s figure. SF=100 still not re-measured.
 
 Both scales load `data/tpch-{10gb,100gb}` (plain parquet) into native
 tables via `write-native --from-parquet`, then compare the ENGINE
@@ -4332,7 +4708,7 @@ data two ways — plain parquet (`read_parquet` views) and, at SF=10 only
 | scale | queries | engine total | vs DuckDB-parquet | vs DuckDB-iceberg |
 |---|---|---|---|---|
 | SF=10 | 22/22 cell-exact | **5.324s** | 4.321s → **1.23x** | 6.888s → **0.77x (engine faster)** |
-| SF=100 | 19/22 cell-exact + successful (Q4/Q12/Q13: see Limitations) | **75.17s** | 50.02s (same 19) → **1.50x** | n/a (no SF=100 Iceberg fixture) |
+| SF=100 | 19/22 cell-exact + successful (Q4/Q12/Q13: see Limitations) — **superseded 2026-09-03: 22/22, see the certification note below** | **75.17s** | 50.02s (same 19) → **1.50x** | n/a (no SF=100 Iceberg fixture) |
 
 Disk footprint, both scales: smaller than the parquet source it was
 loaded from (SF=10: 6.5GB vs 9.6GB; SF=100: 65GB vs 97GB) — dictionary
@@ -4346,6 +4722,103 @@ data/tpch-10gb --iceberg-dir data/tpch-10gb-iceberg --sf 10
 `--iceberg-dir`, and exclude Q4/Q12/Q13 via `--queries` if a bounded run
 is wanted — see Limitations for why).
 
+**SF=100 certification (`spill-join-correctness-3` task 005, 2026-09-03;
+HEAD 7607f34, engine from 67f7cea).** Every premise below is a separate
+`serve` process over the SAME data, every completed query checked
+cell-by-cell against a FRESH DuckDB oracle computed the same day
+(`.scratch/sjc3-005/oracle22.py`, 46.6s; Q11 SF-adjusted on both sides),
+`QE_SPILL_DEBUG=1` attributing spill traces per query, all under
+`systemd-run` caps with `QE_MEM_CAP` set. `benchmark-parquet` hardcodes
+its budget at min(4G·SF, 64G) with no override, so the parquet premises
+go through `serve --data data/tpch-100gb --memory-limit <B>` (same scan
+path); native through `serve --tables data/tpch-100gb-native`.
+
+| premise | cell-exact | engine total | spill activity (QE_SPILL_DEBUG) |
+|---|---|---|---|
+| parquet, 64G (the historical premise) | **22/22** | 58.9s (DuckDB 46.6s) | none |
+| parquet, 8G | **22/22** | 47.9s | none — SF=100 build sides are far below 6.4GB after join-order stats / runtime filters / semi-join pushdown |
+| parquet, **1G — the spilling premise** | **22/22** | 1616s | Q03, Q09, Q13, Q16, Q18, Q20 spilled; join spill path on Q09 (2 joins) and Q16; 366 hash-check-ok / 0 mismatch |
+| parquet, 256M (harsher) | **20/22** + 2 clean named refusals | 2207s | 11 queries spilled, join spill path on 8 (1,566 hash-check-ok / 0 mismatch); **Q20 refuses** ("LEFT join build side exceeds the memory budget ... LEFT/RIGHT/FULL outer joins are not spillable") and **Q21 refuses** ("cannot evaluate an ON-clause filter") — the two documented boundaries, HTTP 400 by name, no crash |
+| native, 100G (Q4/Q13's previously-failing settings) | **22/22** | 91.8s | none; **Q4 1.45s, Q13 10.2s** |
+| native, 1G (spilling premise) | **17/22 cell-exact + 5 clean named refusals** (Q02 `part` 1.15GB, Q10 `customer` 1.40GB, Q11 + Q20 `partsupp` 2.61GB, Q15 `lineitem` 56.4GB: "native table ... needs an estimated N bytes to scan (its full on-disk size — this provider's scan() is not yet spill-aware) ... exceeds the configured memory safety budget" — the documented native-scan boundary: an over-budget native scan only streams segment-at-a-time into aggregate-covered consumers; these five feed joins), 1601.6s; spilled: Q03, Q09 (join spill path x2), Q13, Q16 (join spill path), Q18; **366 hash-check-ok / 0 mismatch**; zero OOM | 1601.6s | Q03, Q09, Q13, Q16, Q18 |
+
+Zero kernel kills and zero rlimit aborts in every engine run above. The
+native-1G refusals are the native-scan admission boundary
+(`oom-safety-hardening` 004: an over-budget native scan streams
+segment-at-a-time only into aggregate-covered consumers; feeding a join
+it refuses by name) — the parquet provider streams, so the same queries
+complete at 1G on parquet; making `NativeTable::scan()` spill-aware for
+join consumers is the corresponding backlog item.
+Alongside: the oom-cap harness at SF=100-class inputs is **12/12 PASS**
+(agg + sort at 600M synthetic rows under a 1G cap, 478-491MB / 860MB
+peak; native-scan over the 100GB `lineitem` native table under 2G;
+insert from the 100GB `lineitem` parquet → clean admission refusal under
+512M; semi-join/anti-join with a 600M-row build side — 9.6GB against a
+256MB budget, spilled — under a 12G cap, 5.3GB / 8.0GB peak, which is
+the still-materialized 300M-row probe side, see Current limitations),
+both levers. No-regression legs at HEAD: SF=10 harness 8/8, SF=10 native
+5,524ms (band 5288-5667), parquet cache-off 7.29s (7.03-7.40), INSERT RSS
+1.57GB (~1.6-1.7), M1/M2 PASS, four suites default 1326/0/2 · lance
+1391/0/3 · gpu 1335/0/2 · pulsar 1329/0/2 (= the 1317/1382/1326/1320
+baselines + 9 new tests, +1 deliberately-ignored). Honest cost line: the
+join spill path is correct but slow at this scale (Q09 ~1,400s at both
+1G and 256M; Q18 355s and Q03 188s at 256M) for the two documented
+reasons — whole-probe-side materialization and one-thread
+spilled-partition processing. Full evidence:
+`.claude/epics/spill-join-correctness-3/005.md` + `updates/005/stream-A.md`.
+
+**Re-certified 2026-09-04 (`join-spill-streaming` task 004, HEAD of that
+epic; same drivers, same oracle, same caps or smaller).** Every verdict
+identical to 2026-09-03, every spilling premise much faster and under a
+smaller cap:
+
+| premise | cell-exact | 2026-09-03 total | 2026-09-04 total | cap |
+|---|---|---|---|---|
+| parquet, 1G | **22/22** (same 6 spilling; join spill on Q09 x2 + Q16; 366 hash-check-ok / 0 mismatch) | 1616s | **637s** (Q09 318s under load; 222s quiet) | 32G (was 80G) |
+| parquet, 256M | **20/22 + Q20/Q21 named refusals** (11 spilling, join spill on 8; 0 mismatch) | 2207s | **933s** | 32G (was 80G) |
+| native, 100G | **22/22** (Q4 1.39s, Q13 9.9s) | 91.8s | **79.0s** | 110G |
+| native, 1G | **17/22 + the same 5 native-scan admission refusals** (spilling Q03/Q09/Q13/Q16/Q18; 0 mismatch) | 1602s | **856s** (Q09 292s, was 1,255s) | 32G (was 80G) |
+
+Harness: SF=100-class core 8/8 (agg 473/494MB, sort 839/797MB @1G;
+native-scan 120/122MB @2G; insert 2x clean refusal @512M) and join
+scenarios 8/8 under the DEFAULT 1G cap (464-881MB, both levers, both
+orientations — previously needed 12G); SF=10 harness 8/8. No-regression
+legs: SF=10 native 5,578ms (band 5288-5667); parquet cache-off
+7.39s, 22/22 PASS (band 7.03-7.40s); INSERT RSS 1,665,924 KB (~1.59GB), 60M rows in 9.2s (~1.6-1.7GB
+band); chaos 300/300 on the final binary; M1/M2 PASS. Suites: default
+1340/0/1, lance 1405/0/2, gpu 1349/0/1, pulsar 1342/1/1 with --no-fail-fast — the one failure (`three_real_processes_serve_and_survive_a_sigterm`: a spawned server 'never became ready' within 60s while the 65GB native-100G sweep loaded concurrently) passes 2/2 in isolation, and the first run's only failure (the pre-existing rollup last-ULP flake) passes 3/3 in isolation, so 1343 tests are green individually (each =
+the 2026-09-03 counts + epic hash-join-dictionary-semi-anti-fix's 11 +
+this epic's 3). The sweep timings shared the machine with the suite
+builds; the task-003 quiet-machine numbers are the ones to quote for
+speed. Evidence: `.claude/epics/archived/join-spill-streaming/004.md` +
+`updates/004/stream-A.md`, `.scratch/jss/`.
+
+**Re-certified 2026-09-05 (`spill-boundaries` task 004).** Every SF=100 premise
+re-run on the final binary (ec1839f; same drivers, oracle and caps as
+2026-09-04; the sweeps shared the machine with suite builds, so totals
+are upper bounds):
+
+| premise | 2026-09-04 | 2026-09-05 (final binary) |
+|---|---|---|
+| parquet, 1G | 22/22, 637s | **22/22, 566s**; spilling Q03/Q09/Q13/Q16/Q18/Q20; 0 mismatch |
+| parquet, 256M | 20/22 + Q20/Q21 named refusals, 933s | **22/22, 1,004s** — Q20 54.9s via the LEFT-join spill path, Q21 117.6s via the filtered spill path; 0 mismatch on all 22 |
+| native, 100G | 22/22, 79s | **22/22, 178s** (Q4 3.5s, Q13 13.1s; under load) |
+| native, 1G | 17/22 + 5 native-scan admission refusals, 856s | **22/22, 918s** — Q02 1.1s, Q10 10.3s, Q11 0.73s, Q15 10.2s, Q20 42.9s now stream into their joins; 0 mismatch |
+
+No named refusal remains on TPC-H at any tested budget on either
+provider. Harness: join scenarios `semi-join`/`anti-join`/`left-join`/
+`filtered-join` **18/18 PASS under the DEFAULT 1G cap** (both orientations,
+both levers; left 795-803MB, filtered eq 785-842MB, semi 591-674MB, anti
+618-717MB — the 003 follow-up replaced a per-row take+concat gather with
+one interleave per column and sliced every emission to 8,192 rows, after
+a 1s-RSS-sampler root cause showed the LEFT/filtered phase-B plateau at
+992-1,180MB); SF=10 harness core 8/8; SF=100-class harness core
+**8/8 PASS** (agg 483/489MB, sort 852/816MB at 600M rows under 1G; native-scan 116/119MB over the 100GB lineitem native table under 2G; insert from the 100GB lineitem parquet 2x clean admission refusal under 512M); chaos 300/300 on the final binary (24,250 hash-check-ok / 0
+mismatch); M1/M2 PASS. Suites at the final binary: default 1353/0/1,
+lance **1418/0/2**, gpu **1362/0/1**, pulsar **1356/0/1** (all `--no-fail-fast`, exit 0; identical to the pre-follow-up counts — the follow-up added no tests). No-regression legs: SF=10 native **5,891 / 6,610ms** (22/22 OK) and parquet cache-off **7.52s then 7.24s** (22/22 PASS) on a machine under interactive load (load average 11-21 from the desktop shell, a browser and a peer session; the same native sweep measured 5,113ms at 8f38273 when the load was ~2.7) — an alternating A/B under identical load, pre-follow-up binary vs final binary, gave 6,163/6,113ms vs 6,226/5,916ms (within 2%, final not slower), so the band miss is load, not the code; INSERT RSS 1.57GB in band; chaos 300/300; M1/M2 PASS. Evidence:
+`.claude/epics/archived/spill-boundaries/004.md` + `updates/004/stream-A.md`,
+`.scratch/sb/`.
+
 **CPU vs GPU split** (`--features gpu`, per this program's standing
 convention of reporting these as separate rows): see the "GPU Aggregate
 Offload" section's own CPU/GPU-split subsection below for the combined
@@ -4353,6 +4826,75 @@ parquet+native-table finding — task 007 confirmed the offload path is
 reachable for native tables (identity plumbing unit-tested end to end);
 task 008 measured whether it produces a full-query win at native-table
 scale.
+
+## Web UI and query log (query-ui epic, 2026-09-05)
+
+`.claude/prds/query-ui.md` (with the survey of Trino/Presto, ClickHouse,
+Snowflake, Spark, Dremio, Doris/StarRocks, Pinot, DuckDB/DataFusion that
+shaped it) and `.claude/epics/query-ui/`. What shipped:
+
+- **`src/distributed/query_log.rs`** — `QueryLog`, a `Mutex<VecDeque<
+  QueryRecord>>` ring (default 1,000, `--query-log-size` / `QE_QUERY_LOG_
+  SIZE`, floor 10). `begin()` inserts a `running` record BEFORE execution;
+  `finish()`/`fail()` complete it; eviction drops the oldest FINISHED
+  record, so a live query is never evicted (the ring can exceed capacity
+  only by the number of concurrently running statements). SQL kept up to
+  64KB, plans up to 64KB (`execution::cap_debug_text`). `list()` returns
+  `QuerySummary` (no plans/distribution, 200-char preview); `get()` the
+  full record; `stats()` computes percentiles (nearest rank), 60
+  one-minute buckets, totals and breakdowns on request — microseconds
+  at ring size, no background aggregator.
+- **Fed from ONE place**: `server::execute_statement` (HTTP and Flight)
+  now takes a `QueryOrigin` and returns `Executed { query_id, outcome }`;
+  `/fragment` records `fragment` entries with the initiator's address and
+  shard. HTTP adds `x-qe-query-id` (also on failures); Flight adds
+  `query_id` to the trailer and records the encoded byte count. The
+  initiator's own shard of a distributed query runs in-process, so only
+  WORKERS carry fragment records; the initiator's record carries the full
+  `Distribution`, its `tables` name the sharded table (never the internal
+  `qe_dist_partial`), and its plans are labelled as the merge stage.
+- **Engine facts added for it** (`execution/context.rs`, `memory.rs`):
+  `QueryMetrics::{batches, tables, optimized_plan, physical_plan}` are
+  rendered from the objects `sql()` already built (no re-planning);
+  `collect_scan_tables` unions bound + optimized plan scans. **`peak_
+  memory_bytes` is now a real high-water mark**: `MemoryPool` gained
+  `peak` (fetch_max), `reset_peak()` (called on `sql()` entry) and
+  `observe(bytes)`; the spillable join/aggregate/sort call `observe` at
+  every running-size/threshold check, so a spilling query reports the
+  footprint it crossed the budget with. Before this the field was
+  `pool.used()` read after every reservation was released — ~0 for any
+  spilling query. Caveats, stated in the record: in-memory operators that
+  never budget (plain `HashJoinExec`, morsel aggregates) still contribute
+  nothing, so a non-spilling query can report a small/zero peak; the pool
+  is shared, so `concurrent_at_start` says how many statements overlapped
+  the window. `QueryError::kind()` gives the variant name for
+  `errors_by_kind`.
+- **UI** (`src/distributed/ui/`, ~600 lines of vanilla ES modules, no
+  npm): hash-routed views Overview / Queries / Query detail / Statistics
+  / Cluster / Tables / SQL console; 2s polling that pauses when the tab is
+  hidden, auto-refresh is off, or a chart tooltip is open; light/dark via
+  `prefers-color-scheme`; inline-SVG charts (per-minute columns with the
+  failed subset, log-bucket latency histogram, per-query phase bar)
+  following the dataviz reference palette (validated light + dark).
+  Embedding rather than a React toolchain was a deliberate choice
+  (ClickHouse `play.html` precedent; Rust-only repo, no Node in CI).
+- **Gates**: `tests/ui_tests.rs` (6 tests: list/detail/stats/tables,
+  ring eviction + running visibility via a deterministic slow
+  `TableProvider`, 3-node distribution + worker fragments, static assets
+  + self-containment, HTTP-vs-Flight record equivalence modulo
+  identity/transport/timing, spill peak + spill facts at a 16KB budget);
+  `scripts/cluster_local.sh verify` step 5/6 hits `/queries`, `/stats`,
+  `/tables`, `/ui` on every node and checks the log lists the gate's own
+  queries with plans. **`scripts/ui_check.py`** (Playwright + its own
+  Firefox, `.venv/bin/pip install playwright && .venv/bin/playwright
+  install firefox`, no sudo) drives every view AND the SQL console
+  against a running node, fails on any browser console/page error, and
+  writes screenshots to `.scratch/ui_check/`; it caught two console bugs
+  (a sticky results header floating over rows, a stray "null" text node
+  from `replaceChildren(null)`) that static headless screenshots missed.
+- **Not done (named)**: per-operator runtime metrics (rows/time per
+  operator — the plan tree is shown without them), cross-node aggregated
+  history, persistence of the log, cancellation, authentication.
 
 ## Recently Implemented Features
 
@@ -4635,6 +5177,8 @@ scale.
 | Streaming Parquet reader | `src/storage/parquet.rs` (StreamingParquetReader) |
 | Async Parquet reader | `src/storage/parquet.rs` (AsyncParquetReader) |
 | Server mode (`serve`) | `src/distributed/server.rs` |
+| Query log (`/queries`, `/stats`) | `src/distributed/query_log.rs` |
+| Web UI (`/ui`) | `src/distributed/ui/` (embedded), tests in `tests/ui_tests.rs`, browser gate `scripts/ui_check.py` |
 | Arrow Flight endpoint | `src/distributed/flight.rs` |
 | Flight integration tests | `tests/flight_tests.rs` |
 | Flight acceptance gate (pyarrow) | `scripts/flight_validate.py` |

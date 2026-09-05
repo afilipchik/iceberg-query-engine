@@ -7,8 +7,16 @@
 /// allocations at pipeline boundaries (per-group accumulators, batch arrays);
 /// glibc malloc serializes those frees behind arena locks and munmap
 /// consolidation stalls (measured 550ms on a single Q18 aggregate teardown).
+///
+/// TEMPORARY (`oom-safety-hardening` investigation, 2026-08-29): wrapped in
+/// `execution::alloc_profile::ProfilingAlloc`, a zero-cost-when-disabled
+/// diagnostic layer (see that module's own doc comment) used because no
+/// external profiler (heaptrack/valgrind/perf) is usable on this box
+/// without root. Revert to bare `mimalloc::MiMalloc` once the
+/// investigation concludes.
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: execution::alloc_profile::ProfilingAlloc<mimalloc::MiMalloc> =
+    execution::alloc_profile::ProfilingAlloc(mimalloc::MiMalloc);
 
 pub mod arrow_ffi;
 pub mod distributed;

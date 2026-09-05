@@ -25,7 +25,7 @@ use parquet::file::properties::WriterProperties;
 use std::fmt;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
@@ -35,6 +35,12 @@ static SPILL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Number of hash partitions for spilling
 const NUM_PARTITIONS: usize = 64;
+
+/// Row granularity for re-chunking oversized batches during spill ingestion
+/// AND for streaming a spilled aggregate partition back off disk
+/// (`aggregate_partition_chunked`). Matches `append_batch_streaming`'s
+/// `SPILL_WRITER_ROW_GROUP_ROWS` — one shared magic number, not three.
+const AGG_CHUNK_ROWS: usize = 8_192;
 
 /// Monotonic call-sequence id for `QE_SPILL_DEBUG` join/aggregate spill-path
 /// tracing (task 001, spill-join-correctness epic). Diagnostic only — lets
@@ -229,7 +235,9 @@ pub(crate) async fn collect_input_partitions_concurrently(
 /// This function keeps the same "one task per input partition, drained
 /// concurrently" parallelism, but hands batches to the caller as they arrive
 /// via a small, FIXED-capacity channel instead of a growing `Vec`. The
-/// caller (`SpillableHashJoinExec::compute_build_decision`) can then track a
+/// callers (`SpillableHashJoinExec::compute_build_decision`,
+/// `SpillableHashAggregateExec::execute` — oom-safety-hardening task 002 —
+/// and `ExternalSortExec::execute` — task 003) can then track a
 /// running size total and switch to a bounded, spill-capable structure the
 /// moment it would exceed the threshold, without ever buffering more than a
 /// bounded number of batches ahead of that check. The channel's own fixed
@@ -312,6 +320,12 @@ pub struct SpillableHashJoinExec {
     on: Vec<(Expr, Expr)>,
     join_type: JoinType,
     schema: SchemaRef,
+    /// The FULL (left ++ right, nullability-adjusted) output schema, kept
+    /// unpruned even after `set_retained` narrows `schema` — the spill
+    /// path's outer-join emission (spill-boundaries task 003) needs the
+    /// declared type of every column, including the pruned ones, to
+    /// NULL-extend the non-preserved side before applying the mask.
+    full_schema: SchemaRef,
     memory_pool: SharedMemoryPool,
     config: ExecutionConfig,
     /// When true, build hash table from right side (smaller) for Left joins.
@@ -320,6 +334,11 @@ pub struct SpillableHashJoinExec {
     filter: Option<Expr>,
     /// Cached build decision — computed once, shared across all partition executions
     build_decision: OnceCell<BuildDecision>,
+    /// join-spill-streaming task 003: explicit spilled-partition read-back
+    /// parallelism (K), overriding both the machine-derived default and
+    /// `QE_SPILL_JOIN_PARALLELISM`. `None` = derive (see `plan_phase_b`).
+    /// Set by tests/harnesses that need a deterministic K.
+    spill_join_parallelism: Option<usize>,
 }
 
 impl fmt::Debug for SpillableHashJoinExec {
@@ -327,6 +346,7 @@ impl fmt::Debug for SpillableHashJoinExec {
         f.debug_struct("SpillableHashJoinExec")
             .field("join_type", &self.join_type)
             .field("on", &self.on)
+            .field("build_right", &self.build_right)
             .finish()
     }
 }
@@ -351,13 +371,56 @@ enum BuildDecision {
     /// the old flat-`Vec` one did, just without the flat Vec. `spill_dir`
     /// is REUSED, not recreated, across repeat calls, so
     /// `spilled[..].build_file` stays valid — it is removed exactly once,
-    /// in `Drop`, not at the end of every `execute_spill_path` call (see
-    /// that function's own comment).
-    Spill {
-        partitions: Vec<Option<BuildPartition>>,
-        spilled: Vec<Option<SpilledPartition>>,
-        spill_dir: PathBuf,
-    },
+    /// when the LAST holder of the `Arc<SpillState>` goes away (see
+    /// `SpillState`'s own `Drop`).
+    ///
+    /// oom-safety-hardening task 007: `tables` are the in-memory
+    /// partitions' join hash tables, built ONCE by
+    /// `build_with_partitioning`'s hash-table budgeting pass under DIRECT
+    /// memory accounting (`hash_table_memory_bytes`) — the resident set's
+    /// batches PLUS tables together fit under `memory_limit *
+    /// spill_threshold` by construction, with partitions evicted to disk
+    /// when the running total would cross it. Memoizing them here (rather
+    /// than rebuilding per `execute_spill_path` call, as before) means the
+    /// bound holds for the operator's whole lifetime and a repeat
+    /// execution never re-pays the build. Before this task these tables
+    /// were rebuilt per call with ZERO accounting at ~10-20x the batch
+    /// bytes the spill decision budgeted (task 001's root-caused hole:
+    /// measured 15-24x budget overshoot, ≥7.3GB at a 500MB budget).
+    ///
+    /// join-spill-streaming task 002: the state sits behind an `Arc` so
+    /// that each execution's OUTPUT STREAM — a `'static` producer task
+    /// that yields batches as they are produced instead of a
+    /// materialized `Vec` — can own a handle to it without borrowing
+    /// `&self` (a `RecordBatchStream` cannot).
+    Spill(Arc<SpillState>),
+}
+
+/// The memoized, already-partitioned build side of a spilling join (see
+/// `BuildDecision::Spill`): the resident partitions and their hash tables,
+/// the spilled partitions' build files, and the directory holding them.
+///
+/// join-spill-streaming task 002: shared (`Arc`) between the operator's
+/// memoized decision and every in-flight output stream's producer task.
+/// The spill directory is removed in THIS type's `Drop` — i.e. by whichever
+/// holder is dropped LAST — so a producer that is still reading build files
+/// (or writing its per-call probe files) can never have the directory
+/// pulled out from under it by the operator being dropped first, and an
+/// operator that outlives an abandoned stream still cleans up exactly
+/// once. Per-call probe files (`probe_<call>_<idx>.parquet`) are removed
+/// by their own producer at the end of the call; anything left over (a
+/// producer killed mid-flight) goes with the directory here.
+struct SpillState {
+    partitions: Vec<Option<BuildPartition>>,
+    tables: Vec<Option<HashMap<JoinKey, Vec<HashEntry>>>>,
+    spilled: Vec<Option<SpilledPartition>>,
+    spill_dir: PathBuf,
+}
+
+impl Drop for SpillState {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.spill_dir);
+    }
 }
 
 impl SpillableHashJoinExec {
@@ -404,16 +467,28 @@ impl SpillableHashJoinExec {
             right,
             on,
             join_type,
+            full_schema: schema.clone(),
             schema,
             memory_pool,
             config,
             build_right: false,
             filter: None,
             build_decision: OnceCell::new(),
+            spill_join_parallelism: None,
             probe_runtime_filter: None,
             probe_runtime_filter_pair: 0,
             retained: None,
         }
+    }
+
+    /// join-spill-streaming task 003: force the spilled-partition read-back
+    /// parallelism K (`Some(n)`, clamped to the number of spilled
+    /// partitions) instead of deriving it from the machine and the budget.
+    /// The chunk table budget is `threshold / K` either way, so a larger K
+    /// never raises the operator's transient memory — it only splits it.
+    pub fn with_spill_join_parallelism(mut self, k: Option<usize>) -> Self {
+        self.spill_join_parallelism = k.filter(|&k| k >= 1);
+        self
     }
 
     /// Set build_right flag: when true, build hash table from right side.
@@ -476,6 +551,11 @@ impl SpillableHashJoinExec {
 struct BuildPartition {
     batches: Vec<RecordBatch>,
     memory_bytes: usize,
+    /// Total rows across `batches` — kept incrementally so the spill
+    /// path's hash-table accounting (`predicted_hash_table_bytes`,
+    /// oom-safety-hardening task 007) never rescans batches to price the
+    /// table this partition's rows imply.
+    rows: usize,
 }
 
 impl BuildPartition {
@@ -483,12 +563,26 @@ impl BuildPartition {
         Self {
             batches: Vec::new(),
             memory_bytes: 0,
+            rows: 0,
         }
     }
 
     fn add_batch(&mut self, batch: RecordBatch) {
         self.memory_bytes += estimate_batch_size(&batch);
+        self.rows += batch.num_rows();
         self.batches.push(batch);
+    }
+
+    /// What keeping this partition resident REALLY costs once its join
+    /// hash table exists: batch bytes plus the (conservative, worst-case
+    /// all-unique-keys) predicted table bytes. oom-safety-hardening task
+    /// 007: this is the charge the streaming build loop accounts against
+    /// the memory threshold — before it, only `memory_bytes` was charged,
+    /// so resident partitions were kept AT the threshold in batch bytes
+    /// and the 10-20x table amplification landed entirely on top,
+    /// unbudgeted (the measured 15-24x overshoot of task 001's repros).
+    fn charged_bytes(&self, key_cols: usize) -> usize {
+        self.memory_bytes + predicted_hash_table_bytes(self.rows, key_cols)
     }
 }
 
@@ -576,17 +670,12 @@ impl PhysicalOperator for SpillableHashJoinExec {
                 // Delegate directly — HashJoinExec has its own OnceCell for the hash table
                 hash_join.execute(partition).await
             }
-            BuildDecision::Spill {
-                partitions,
-                spilled,
-                spill_dir,
-            } => {
+            BuildDecision::Spill(state) => {
                 // Spill path runs everything through partition 0
                 if partition > 0 {
                     return Ok(Box::pin(stream::empty()));
                 }
-                self.execute_spill_path(partitions, spilled, spill_dir, probe_side, swapped)
-                    .await
+                self.execute_spill_path(state, probe_side, swapped).await
             }
         }
     }
@@ -627,8 +716,8 @@ impl SpillableHashJoinExec {
     /// without ever crossing the threshold, this is the ordinary "fits in
     /// memory" case — nothing about that path's cost or shape changes
     /// versus before.
-    /// Enter the disk-spill branch: validate join shape (INNER-only, no
-    /// filter), create the spill directory, and hand `prefix` (already
+    /// Enter the disk-spill branch: validate join shape (INNER/SEMI/ANTI),
+    /// create the spill directory, and hand `prefix` (already
     /// flat-collected batches) chained with `rest` (whatever remains of the
     /// build stream — empty if the stream was already exhausted) to
     /// `build_with_partitioning`. Factored out of `compute_build_decision`
@@ -646,21 +735,33 @@ impl SpillableHashJoinExec {
         build_keys: &[Expr],
         sj_trace: bool,
     ) -> Result<BuildDecision> {
-        if !matches!(self.join_type, JoinType::Inner) {
+        // spill-join-correctness-3 task 004: SEMI and ANTI take the spill
+        // path (existence semantics survive hash partitioning — see
+        // `probe_with_spilling` / `process_spilled_partition`).
+        // spill-boundaries task 002: an ON-clause filter no longer refuses
+        // — it is applied to every candidate pair where the pair is formed
+        // (`visit_candidate_pairs`). Task 003: LEFT/RIGHT/FULL spill too —
+        // the SEMI/ANTI match bitmaps, per preserved side, plus
+        // NULL-extended emission of the unmatched rows (see
+        // `SpillJoinCtx::probe_emit` / `build_emit`). What remains refused,
+        // by name: CROSS (no key to partition on), SINGLE and MARK (the
+        // DelimJoin-only types).
+        if !matches!(
+            self.join_type,
+            JoinType::Inner
+                | JoinType::Left
+                | JoinType::Right
+                | JoinType::Full
+                | JoinType::Semi
+                | JoinType::Anti
+        ) {
             return Err(QueryError::Execution(format!(
                 "{} join build side exceeds the memory budget, but the join spill \
-                 path currently supports only INNER joins. Raise the memory limit \
-                 for this query.",
+                 path supports INNER, LEFT, RIGHT, FULL, SEMI and ANTI joins only \
+                 (CROSS/SINGLE/MARK are not spillable). Raise the memory limit for \
+                 this query.",
                 self.join_type
             )));
-        }
-        if self.filter.is_some() {
-            return Err(QueryError::Execution(
-                "join build side exceeds the memory budget, but the join spill \
-                 path cannot evaluate an ON-clause filter. Raise the memory \
-                 limit for this query."
-                    .to_string(),
-            ));
         }
 
         self.config.ensure_spill_dir()?;
@@ -688,15 +789,16 @@ impl SpillableHashJoinExec {
         let combined: RecordBatchStream =
             Box::pin(stream::iter(prefix.into_iter().map(Ok)).chain(rest));
 
-        let (partitions, spilled) = self
+        let (partitions, tables, spilled) = self
             .build_with_partitioning(combined, build_keys, &spill_dir)
             .await?;
 
-        Ok(BuildDecision::Spill {
+        Ok(BuildDecision::Spill(Arc::new(SpillState {
             partitions,
+            tables,
             spilled,
             spill_dir,
-        })
+        })))
     }
 
     async fn compute_build_decision(
@@ -728,6 +830,8 @@ impl SpillableHashJoinExec {
             let chaos_crossing = chaos_after_batches
                 .map(|n| flat_batches.len() >= n)
                 .unwrap_or(false);
+            // The batch is already in memory when this decision is made: record it.
+            self.memory_pool.observe(flat_size + batch_size);
             if flat_size + batch_size > memory_threshold || chaos_crossing {
                 if chaos_crossing && sj_trace {
                     eprintln!(
@@ -751,6 +855,7 @@ impl SpillableHashJoinExec {
                     .await;
             }
             flat_size += batch_size;
+            self.memory_pool.observe(flat_size);
             flat_batches.push(batch);
         }
 
@@ -833,14 +938,38 @@ impl SpillableHashJoinExec {
     /// Only called from partition 0. May be called MORE THAN ONCE for the
     /// same logical query execution (an operator above may legitimately
     /// execute its child more than once — see `BuildDecision::Spill`'s own
-    /// doc comment); `partitions`/`spilled`/`spill_dir` are borrowed from
-    /// the memoized `BuildDecision`, computed exactly once regardless of
-    /// how many times this function runs.
+    /// doc comment); `state` is the memoized `BuildDecision`, computed
+    /// exactly once regardless of how many times this function runs.
+    ///
+    /// join-spill-streaming task 002: returns a stream that yields matched
+    /// batches AS THEY ARE PRODUCED. Before this task the whole join
+    /// output was materialized into a `Vec<RecordBatch>` first (Q9 at
+    /// SF=100/1G: 1,333,333,320 rows in memory, ~1,396s of a ~1,400s
+    /// query) — the output, like the probe side before task 001, was
+    /// unbounded by `--memory-limit`. The shape: a `tokio::spawn`ed
+    /// producer task (`run_spill_join_producer`) owning an
+    /// `Arc<SpillState>` + a cloned `SpillJoinCtx`, sending through a
+    /// bounded mpsc channel of `SPILL_JOIN_OUTPUT_CHANNEL_CAPACITY`
+    /// batches → `ReceiverStream`. Phase A consumes the probe stream:
+    /// resident partitions are probed per batch and their output sent at
+    /// once, probe rows routed to spilled partitions are appended to this
+    /// call's own probe spill files; phase A' (build-side SEMI/ANTI) sends
+    /// the resident partitions' final emission once the probe stream
+    /// ends; phase B processes the spilled partitions, sending per chunk
+    /// (INNER, build-side SEMI/ANTI) or per partition (probe-side
+    /// SEMI/ANTI bitmap). Errors travel through the same channel. Peak
+    /// in-flight memory is the channel's capacity plus what the probe
+    /// merge channel holds — never the output. A consumer that drops the
+    /// stream early stops the producer at its next send (or at the next
+    /// probe batch, via `is_closed`).
+    ///
+    /// Trace semantics (`QE_SPILL_DEBUG`) are preserved: START is printed
+    /// here, "probe collected" once the probe stream has been consumed,
+    /// DONE (with the same counters) when the producer finishes — i.e.
+    /// at the END of the output stream now, not before its first batch.
     async fn execute_spill_path(
         &self,
-        partitions: &[Option<BuildPartition>],
-        spilled_partitions: &[Option<SpilledPartition>],
-        spill_dir: &PathBuf,
+        state: &Arc<SpillState>,
         probe_side: &Arc<dyn PhysicalOperator>,
         swapped: bool,
     ) -> Result<RecordBatchStream> {
@@ -853,118 +982,134 @@ impl SpillableHashJoinExec {
         // SAME join instead of one — direct evidence, not inference. Zero
         // cost when unset beyond one env lookup per call.
         let sj_trace = std::env::var("QE_SPILL_DEBUG").is_ok();
-        let sj_t0 = std::time::Instant::now();
+        // Per-call id: names this call's probe spill files so an earlier,
+        // abandoned call's still-running producer can never share a file
+        // with a repeat call (task 002), and tags its trace lines.
+        let call_id = next_sj_trace_id();
 
-        let (on_left, on_right): (Vec<_>, Vec<_>) = self.on.iter().cloned().unzip();
-        let build_keys = if swapped { &on_right } else { &on_left };
-        let probe_keys = if swapped { &on_left } else { &on_right };
+        let (on_left, on_right): (Vec<Expr>, Vec<Expr>) = self.on.iter().cloned().unzip();
+        let (build_keys, probe_keys) = if swapped {
+            (on_right, on_left)
+        } else {
+            (on_left, on_right)
+        };
 
-        // Build hash tables for in-memory partitions. Cheap to redo per
-        // call (rehashing already-resident batches); the batches
-        // themselves are borrowed from the memoized decision, never
-        // recollected or rewritten to disk again.
-        let mut hash_tables: Vec<Option<HashMap<JoinKey, Vec<HashEntry>>>> =
-            (0..NUM_PARTITIONS).map(|_| None).collect();
-        for (idx, part) in partitions.iter().enumerate() {
-            if let Some(p) = part {
-                if !p.batches.is_empty() {
-                    let table = build_hash_table(&p.batches, build_keys)?;
-                    hash_tables[idx] = Some(table);
-                }
-            }
-        }
+        // oom-safety-hardening task 007: the in-memory partitions' hash
+        // tables are NO LONGER built here. They are built exactly once, in
+        // `build_with_partitioning`'s hash-table budgeting pass, under
+        // direct memory accounting (resident batches + measured table
+        // bytes <= memory_threshold, partitions evicted when the total
+        // would cross), and memoized in the build decision alongside the
+        // batches they index. This function's old unbudgeted rebuild loop
+        // was task 001's root-caused accounting hole (~10-20x the batch
+        // bytes the spill decision budgeted, measured 15-24x overshoot).
 
         if sj_trace {
-            let in_mem_parts = partitions.iter().filter(|p| p.is_some()).count();
-            let spilled_parts = spilled_partitions.iter().filter(|p| p.is_some()).count();
-            let in_mem_build_rows: usize = partitions
+            let in_mem_parts = state.partitions.iter().filter(|p| p.is_some()).count();
+            let spilled_parts = state.spilled.iter().filter(|p| p.is_some()).count();
+            let in_mem_build_rows: usize = state
+                .partitions
                 .iter()
                 .flatten()
                 .flat_map(|p| p.batches.iter())
                 .map(|b| b.num_rows())
                 .sum();
-            let spilled_build_rows: usize = spilled_partitions
-                .iter()
-                .flatten()
-                .map(|sp| sp.build_rows)
-                .sum();
+            let spilled_build_rows: usize =
+                state.spilled.iter().flatten().map(|sp| sp.build_rows).sum();
             eprintln!(
-                "[sj-trace] execute_spill_path START spill_dir={:?} in_memory_partitions={} (rows={}) spilled_partitions={} (rows={})",
-                spill_dir, in_mem_parts, in_mem_build_rows, spilled_parts, spilled_build_rows
+                "[sj-trace] execute_spill_path START spill_dir={:?} in_memory_partitions={} (rows={}) spilled_partitions={} (rows={}) call_id={}",
+                state.spill_dir, in_mem_parts, in_mem_build_rows, spilled_parts, spilled_build_rows, call_id
             );
         }
 
-        // Collect ALL probe-side partitions into a single stream
+        // join-spill-streaming task 001: the probe side is STREAMED through
+        // the partition writers, never collected. Before this the whole
+        // probe side was drained into one `Vec<RecordBatch>` first (Q9 at
+        // SF=100/1G: 333M rows; the SF=100-class harness join peaked at
+        // 5.3-8.0GB against a 256MB budget — the probe side, not the
+        // build side, set the peak). `stream_merge_input_partitions` is the
+        // same bounded-channel merge the build side already uses: every
+        // probe input partition is drained concurrently, a handful of
+        // batches can be in flight at once, never the whole side.
         let probe_partitions = probe_side.output_partitions().max(1);
-        let mut probe_batches = Vec::new();
-        for p in 0..probe_partitions {
-            let probe_stream = probe_side.execute(p).await?;
-            let batches: Vec<RecordBatch> = probe_stream.try_collect().await?;
-            probe_batches.extend(batches);
-        }
-        let probe_rows_in: usize = probe_batches.iter().map(|b| b.num_rows()).sum();
-        if sj_trace {
-            eprintln!(
-                "[sj-trace] execute_spill_path probe collected: probe_partitions={} probe_rows={}",
-                probe_partitions, probe_rows_in
-            );
-        }
-        let probe_stream: RecordBatchStream =
-            Box::pin(stream::iter(probe_batches.into_iter().map(Ok)));
-        let (results, probe_spill_files, probe_key_checksums) = self
-            .probe_with_spilling(
-                probe_stream,
-                probe_keys,
-                partitions,
-                &hash_tables,
-                spilled_partitions,
-                spill_dir,
+        let probe_stream = stream_merge_input_partitions(probe_side).await?;
+
+        let (build_side, _) = if swapped {
+            (&self.right, &self.left)
+        } else {
+            (&self.left, &self.right)
+        };
+        let filter = self.filter.as_ref().map(|f| {
+            Arc::new(PairFilter::new(
+                f.clone(),
+                &build_side.schema(),
+                &probe_side.schema(),
                 swapped,
-            )
-            .await?;
-        let in_memory_matched_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-
-        // Process spilled partitions — this call's own freshly-written
-        // probe spill file (if any) for each partition, paired with the
-        // MEMOIZED build spill file from `spilled_partitions`.
-        let mut all_results = results;
-        let mut spilled_matched_rows: usize = 0;
-        for (idx, spilled) in spilled_partitions.iter().enumerate() {
-            if let Some(sp) = spilled {
-                let probe_file = probe_spill_files[idx].as_ref();
-                let probe_key_checksum = probe_key_checksums[idx];
-                let spilled_results = self
-                    .process_spilled_partition(
-                        &sp.build_file,
-                        sp.build_key_checksum,
-                        probe_file,
-                        probe_key_checksum,
-                        build_keys,
-                        probe_keys,
-                        swapped,
-                        idx,
-                    )
-                    .await?;
-                spilled_matched_rows += spilled_results.iter().map(|b| b.num_rows()).sum::<usize>();
-                all_results.extend(spilled_results);
+            ))
+        });
+        let ctx = SpillJoinCtx {
+            build_keys,
+            probe_keys,
+            join_type: self.join_type,
+            swapped,
+            schema: self.schema.clone(),
+            full_schema: self.full_schema.clone(),
+            retained: self.retained.clone(),
+            filter,
+            memory_threshold: (self.config.memory_limit as f64 * self.config.spill_threshold)
+                as usize,
+            memory_pool: self.memory_pool.clone(),
+            sj_trace,
+            call_id,
+            probe_partitions,
+            parallelism_override: self.spill_join_parallelism.or_else(|| {
+                std::env::var("QE_SPILL_JOIN_PARALLELISM")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .filter(|&k| k >= 1)
+            }),
+        };
+        let state = Arc::clone(state);
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<Result<RecordBatch>>(SPILL_JOIN_OUTPUT_CHANNEL_CAPACITY);
+        tokio::spawn(async move {
+            let sj_t0 = std::time::Instant::now();
+            match run_spill_join_producer(&state, &ctx, probe_stream, &tx).await {
+                Ok(Some(stats)) => {
+                    // Build-side spill files under `spill_dir` are NOT
+                    // removed here — they are memoized in the operator's
+                    // build decision and must survive a possible repeat
+                    // call (see `SpillState`'s own doc comment).
+                    if sj_trace {
+                        eprintln!(
+                            "[sj-trace] execute_spill_path DONE spill_dir={:?} in_memory_matched={} spilled_matched={} total_matched={} elapsed={:?} call_id={}",
+                            state.spill_dir,
+                            stats.in_memory_matched,
+                            stats.spilled_matched,
+                            stats.in_memory_matched + stats.spilled_matched,
+                            sj_t0.elapsed(),
+                            call_id
+                        );
+                    }
+                }
+                Ok(None) => {
+                    if sj_trace {
+                        eprintln!(
+                            "[sj-trace] execute_spill_path ABANDONED spill_dir={:?} (output stream dropped by its consumer) elapsed={:?} call_id={}",
+                            state.spill_dir,
+                            sj_t0.elapsed(),
+                            call_id
+                        );
+                    }
+                }
+                Err(e) => {
+                    // The consumer sees the error as the stream's next item
+                    // (or nothing, if it already went away).
+                    let _ = tx.send(Err(e)).await;
+                }
             }
-        }
-
-        // Build-side spill files under `spill_dir` are NOT removed here —
-        // they are memoized in `self.build_decision` and must survive a
-        // possible repeat call to this same function (see this function's
-        // own doc comment). Cleaned up exactly once, in `Drop`, when this
-        // operator itself is no longer needed.
-
-        if sj_trace {
-            let total_matched: usize = all_results.iter().map(|b| b.num_rows()).sum();
-            eprintln!(
-                "[sj-trace] execute_spill_path DONE spill_dir={:?} in_memory_matched={} spilled_matched={} total_matched={} elapsed={:?}",
-                spill_dir, in_memory_matched_rows, spilled_matched_rows, total_matched, sj_t0.elapsed()
-            );
-        }
-
-        Ok(Box::pin(stream::iter(all_results.into_iter().map(Ok))))
+        });
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 
     /// Evict partition `idx`'s currently-resident batches to disk right now,
@@ -994,6 +1139,22 @@ impl SpillableHashJoinExec {
         let Some(part) = partitions[idx].take() else {
             return Ok(0);
         };
+        if part.batches.is_empty() {
+            // spill-join-correctness-3 task 004: nothing to evict — keep
+            // the partition RESIDENT. Before this guard an empty partition
+            // (reachable when the very first build batch alone exceeds the
+            // threshold, so `find_largest_partition` runs while every
+            // partition is still empty) was turned into a `SpilledPartition`
+            // whose `build_file` is only ever created by a later append; if
+            // no build row ever routed there, read-back failed with
+            // "Failed to open parquet file ... No such file or directory".
+            // Dense join keys populate all 64 partitions so this never
+            // surfaced; sparse keys (few distinct values) expose it on
+            // INNER as well as SEMI/ANTI — pinned by
+            // `inner_spill_with_sparse_build_keys_survives_empty_partition_eviction`.
+            partitions[idx] = Some(part);
+            return Ok(0);
+        }
         let path = spill_dir.join(format!("build_{}.parquet", idx));
         let mut write_checksum = if sj_trace {
             Some(KeyChecksum::default())
@@ -1019,12 +1180,17 @@ impl SpillableHashJoinExec {
         Ok(freed)
     }
 
+    #[allow(clippy::type_complexity)]
     async fn build_with_partitioning(
         &self,
         mut build_stream: RecordBatchStream,
         build_keys: &[Expr],
         spill_dir: &PathBuf,
-    ) -> Result<(Vec<Option<BuildPartition>>, Vec<Option<SpilledPartition>>)> {
+    ) -> Result<(
+        Vec<Option<BuildPartition>>,
+        Vec<Option<HashMap<JoinKey, Vec<HashEntry>>>>,
+        Vec<Option<SpilledPartition>>,
+    )> {
         // spill-join-correctness-2 epic, task 001: checked once per call,
         // matching this file's own established convention (no `OnceLock`
         // caching, re-read fresh — see `gpu.rs`'s `QE_GPU_DEBUG` precedent).
@@ -1045,18 +1211,38 @@ impl SpillableHashJoinExec {
         // comment (spill-join-correctness epic, task 002).
         let mut spill_writers: Vec<Option<ArrowWriter<File>>> =
             (0..NUM_PARTITIONS).map(|_| None).collect();
+        // oom-safety-hardening task 007: `total_memory` charges each
+        // resident partition its batch bytes PLUS the predicted bytes of
+        // the join hash table those rows imply
+        // (`BuildPartition::charged_bytes`), so residency settles where
+        // batches AND tables genuinely fit — not where batch bytes alone
+        // hit the threshold with the 10-20x table amplification unbudgeted
+        // on top (task 001's root-caused hole). The later budgeting pass
+        // (`budget_partition_hash_tables`) then replaces the prediction
+        // with DIRECT measurement of the built tables and evicts any
+        // residual overshoot.
+        let key_cols = build_keys.len();
         let mut total_memory: usize = 0;
         let memory_threshold =
             (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
 
         while let Some(batch) = build_stream.try_next().await? {
-            let batch_size = estimate_batch_size(&batch);
+            let batch_charge = estimate_batch_size(&batch)
+                + predicted_hash_table_bytes(batch.num_rows(), key_cols);
 
             // Check if we need to spill
-            if total_memory + batch_size > memory_threshold {
+            // The batch is already in memory when this decision is made: record it.
+            self.memory_pool.observe(total_memory + batch_charge);
+            if total_memory + batch_charge > memory_threshold {
                 // Find the largest partition to spill
                 if let Some(idx) = find_largest_partition(&partitions) {
-                    total_memory -= self.evict_build_partition_to_disk(
+                    // Uncharge the partition's FULL charge (batches +
+                    // predicted table), matching what was added below.
+                    let charge = partitions[idx]
+                        .as_ref()
+                        .map(|p| p.charged_bytes(key_cols))
+                        .unwrap_or(0);
+                    self.evict_build_partition_to_disk(
                         idx,
                         &mut partitions,
                         &mut spilled,
@@ -1065,6 +1251,7 @@ impl SpillableHashJoinExec {
                         build_keys,
                         sj_trace,
                     )?;
+                    total_memory = total_memory.saturating_sub(charge);
                 }
             }
 
@@ -1073,18 +1260,24 @@ impl SpillableHashJoinExec {
 
             for (idx, part_batch) in partitioned.into_iter().enumerate() {
                 if let Some(pb) = part_batch {
-                    let pb_size = estimate_batch_size(&pb);
+                    let pb_charge = estimate_batch_size(&pb)
+                        + predicted_hash_table_bytes(pb.num_rows(), key_cols);
 
                     if let Some(ref mut part) = partitions[idx] {
                         part.add_batch(pb);
-                        total_memory += pb_size;
+                        total_memory += pb_charge;
+                        self.memory_pool.observe(total_memory);
                         // spill-join-correctness-2 epic, task 003: force
                         // this partition to disk right now if a fault-
                         // injection trial chose it, regardless of memory
                         // pressure — see `evict_build_partition_to_disk`'s
                         // own doc comment.
                         if chaos_partitions.as_ref().is_some_and(|s| s.contains(idx)) {
-                            total_memory -= self.evict_build_partition_to_disk(
+                            let charge = partitions[idx]
+                                .as_ref()
+                                .map(|p| p.charged_bytes(key_cols))
+                                .unwrap_or(0);
+                            self.evict_build_partition_to_disk(
                                 idx,
                                 &mut partitions,
                                 &mut spilled,
@@ -1093,12 +1286,19 @@ impl SpillableHashJoinExec {
                                 build_keys,
                                 sj_trace,
                             )?;
+                            total_memory = total_memory.saturating_sub(charge);
                         }
                     } else if let Some(ref mut sp) = spilled[idx] {
                         // Append to spilled partition as one more row group
                         // in the already-open writer — O(batch), never
                         // re-reads or rewrites this partition's prior data.
                         append_batch_streaming(&mut spill_writers[idx], &sp.build_file, &pb)?;
+                        // join-spill-streaming task 003: keep `build_rows`
+                        // exact across appends (before, it froze at the
+                        // eviction-time count — a diagnostic-only field
+                        // until `plan_phase_b` started sizing K from the
+                        // largest spilled partition).
+                        sp.build_rows += pb.num_rows();
                         if sj_trace {
                             let cs = batch_key_checksum(&pb, build_keys)?;
                             sp.build_key_checksum
@@ -1110,199 +1310,1331 @@ impl SpillableHashJoinExec {
             }
         }
 
+        // oom-safety-hardening task 007: hash-table budgeting pass. The
+        // streaming loop above bounded resident batch bytes + PREDICTED
+        // table bytes at `memory_threshold`; this pass builds the actual
+        // tables, while `partitions`/`spilled`/`spill_writers` are still
+        // mutable, and replaces the prediction with DIRECT measurement:
+        // resident batch bytes + measured table bytes must stay under the
+        // SAME `memory_threshold`, with partitions evicted to disk (the
+        // existing eviction mechanism, byte-for-byte) when the running
+        // total would cross it. Before this task the tables were built
+        // later, in `execute_spill_path`, with zero accounting at ~10-20x
+        // the batch bytes the spill decision budgeted (task 001's
+        // root-caused hole, measured 15-24x budget overshoot).
+        let tables = self.budget_partition_hash_tables(
+            &mut partitions,
+            &mut spilled,
+            &mut spill_writers,
+            spill_dir,
+            build_keys,
+            sj_trace,
+        )?;
+
         close_spill_writers(spill_writers)?;
-        Ok((partitions, spilled))
+        Ok((partitions, tables, spilled))
     }
 
-    async fn probe_with_spilling(
+    /// oom-safety-hardening task 007: decide which resident build
+    /// partitions may keep an in-memory join hash table, under DIRECT
+    /// memory accounting, evicting the rest to disk.
+    ///
+    /// The running total starts at the sum of all resident partitions'
+    /// batch bytes and must never cross `memory_limit * spill_threshold`
+    /// — the same formula every other spill decision in this file uses.
+    /// (The streaming loop already bounded batch bytes + PREDICTED table
+    /// bytes at the same threshold; this pass swaps the prediction for
+    /// direct measurement.) Per resident partition, largest first
+    /// (keeping the largest resident minimizes both spill I/O and the
+    /// biggest per-partition transient read-back cost later):
+    ///
+    /// 1. a conservative PREDICTED table cost
+    ///    (`predicted_hash_table_bytes`, worst-case all-unique keys) gates
+    ///    whether the table is even built — so a table that provably
+    ///    cannot fit is never materialized at all;
+    /// 2. if built, the table's REAL footprint is measured
+    ///    (`hash_table_memory_bytes` — real capacity, real per-key Vec
+    ///    buffers, real String bytes) and charged against the budget; a
+    ///    measured crossing (possible when the prediction under-counts,
+    ///    e.g. long String keys) drops the table and evicts the partition,
+    ///    bounding the transient overshoot at one partition's table.
+    ///
+    /// Eviction reuses `evict_build_partition_to_disk` unchanged (same
+    /// writer, same spill files, same checksum path), so probe routing is
+    /// untouched: an evicted partition simply becomes one more
+    /// `SpilledPartition`, exactly as if the streaming loop's own
+    /// memory-pressure eviction had chosen it.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn budget_partition_hash_tables(
         &self,
-        mut probe_stream: RecordBatchStream,
-        probe_keys: &[Expr],
-        in_memory_partitions: &[Option<BuildPartition>],
-        hash_tables: &[Option<HashMap<JoinKey, Vec<HashEntry>>>],
-        spilled_partitions: &[Option<SpilledPartition>],
+        partitions: &mut [Option<BuildPartition>],
+        spilled: &mut [Option<SpilledPartition>],
+        spill_writers: &mut [Option<ArrowWriter<File>>],
         spill_dir: &PathBuf,
-        swapped: bool,
-    ) -> Result<(
-        Vec<RecordBatch>,
-        Vec<Option<PathBuf>>,
-        Vec<Option<KeyChecksum>>,
-    )> {
-        let sj_trace = std::env::var("QE_SPILL_DEBUG").is_ok();
-        let mut results = Vec::new();
-        let mut probe_spill_files: Vec<Option<PathBuf>> =
-            (0..NUM_PARTITIONS).map(|_| None).collect();
-        // spill-join-correctness-2 epic, task 001: write-time checksum of
-        // each spilled partition's PROBE-side join keys, compared against
-        // the read-back recomputation in `process_spilled_partition`.
-        let mut probe_key_checksums: Vec<Option<KeyChecksum>> =
-            (0..NUM_PARTITIONS).map(|_| None).collect();
-        // Same fix as `build_with_partitioning`: one writer per partition,
-        // kept open for the whole probe phase, instead of a read-rewrite
-        // per appended batch.
-        let mut spill_writers: Vec<Option<ArrowWriter<File>>> =
+        build_keys: &[Expr],
+        sj_trace: bool,
+    ) -> Result<Vec<Option<HashMap<JoinKey, Vec<HashEntry>>>>> {
+        let memory_threshold =
+            (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
+        let mut tables: Vec<Option<HashMap<JoinKey, Vec<HashEntry>>>> =
             (0..NUM_PARTITIONS).map(|_| None).collect();
 
-        while let Some(batch) = probe_stream.try_next().await? {
-            // Partition probe batch
-            let partitioned = partition_batch_by_hash(&batch, probe_keys, NUM_PARTITIONS)?;
+        // Resident batch bytes are already in memory and stay charged for
+        // the operator's lifetime (memoized in the build decision).
+        let mut running: usize = partitions
+            .iter()
+            .flatten()
+            .map(|p| p.memory_bytes)
+            .sum::<usize>();
+        let mut table_bytes_total: usize = 0;
+        let mut evicted_for_tables = 0usize;
 
-            for (idx, part_batch) in partitioned.into_iter().enumerate() {
-                if let Some(pb) = part_batch {
-                    if let Some(ref ht) = hash_tables[idx] {
-                        // Probe in-memory partition
-                        if let Some(ref build_part) = in_memory_partitions[idx] {
-                            let matched = probe_partition(
-                                &build_part.batches,
-                                &[pb],
-                                ht,
-                                probe_keys,
-                                self.join_type,
-                                swapped,
-                                &self.schema,
-                                self.retained.as_deref(),
-                            )?;
-                            results.extend(matched);
+        let mut order: Vec<usize> = (0..partitions.len())
+            .filter(|&i| {
+                partitions[i]
+                    .as_ref()
+                    .is_some_and(|p| !p.batches.is_empty())
+            })
+            .collect();
+        order.sort_by_key(|&i| {
+            std::cmp::Reverse(partitions[i].as_ref().map(|p| p.memory_bytes).unwrap_or(0))
+        });
+
+        for idx in order {
+            let rows: usize = partitions[idx].as_ref().map(|p| p.rows).unwrap_or(0);
+            let predicted = predicted_hash_table_bytes(rows, build_keys.len());
+            if running + predicted > memory_threshold {
+                running = running.saturating_sub(self.evict_build_partition_to_disk(
+                    idx,
+                    partitions,
+                    spilled,
+                    spill_writers,
+                    spill_dir,
+                    build_keys,
+                    sj_trace,
+                )?);
+                evicted_for_tables += 1;
+                continue;
+            }
+            let table = build_hash_table(
+                &partitions[idx]
+                    .as_ref()
+                    .expect("resident partition filtered above")
+                    .batches,
+                build_keys,
+            )?;
+            let actual = hash_table_memory_bytes(&table);
+            if running + actual > memory_threshold {
+                drop(table);
+                running = running.saturating_sub(self.evict_build_partition_to_disk(
+                    idx,
+                    partitions,
+                    spilled,
+                    spill_writers,
+                    spill_dir,
+                    build_keys,
+                    sj_trace,
+                )?);
+                evicted_for_tables += 1;
+                continue;
+            }
+            running += actual;
+            table_bytes_total += actual;
+            self.memory_pool.observe(table_bytes_total);
+            tables[idx] = Some(table);
+        }
+
+        if sj_trace {
+            let resident = tables.iter().filter(|t| t.is_some()).count();
+            let resident_batch_bytes: usize =
+                partitions.iter().flatten().map(|p| p.memory_bytes).sum();
+            eprintln!(
+                "[sj-trace] budget_partition_hash_tables resident_partitions={} table_bytes={} batch_bytes={} running_total={} threshold={} evicted_for_table_budget={}",
+                resident,
+                table_bytes_total,
+                resident_batch_bytes,
+                running,
+                memory_threshold,
+                evicted_for_tables
+            );
+        }
+
+        Ok(tables)
+    }
+}
+
+// ============================================================================
+// Spill-path output stream producer (join-spill-streaming task 002)
+// ============================================================================
+
+/// Bound on the join spill path's OUTPUT channel: at most this many
+/// produced-but-unconsumed batches exist at once. Small on purpose — the
+/// point of the stream is that the output is never materialized; a few
+/// batches of slack are enough to keep the producer from stalling on
+/// every send.
+const SPILL_JOIN_OUTPUT_CHANNEL_CAPACITY: usize = 8;
+
+type SpillJoinOutputSender = tokio::sync::mpsc::Sender<Result<RecordBatch>>;
+
+/// Everything the output stream's producer task needs from the operator,
+/// cloned once per `execute_spill_path` call (the stream is `'static` and
+/// cannot borrow `&self`). Cheap: key expressions, a schema handle, the
+/// retention mask, the threshold, and the memory-pool `Arc`.
+#[derive(Clone)]
+struct SpillJoinCtx {
+    build_keys: Vec<Expr>,
+    probe_keys: Vec<Expr>,
+    join_type: JoinType,
+    swapped: bool,
+    schema: SchemaRef,
+    /// The unpruned left ++ right output schema (see
+    /// `SpillableHashJoinExec::full_schema`).
+    full_schema: SchemaRef,
+    retained: Option<Vec<bool>>,
+    /// spill-boundaries task 002: the ON-clause predicate (compiled once
+    /// per call), applied to every candidate pair. `None` = key equality
+    /// alone decides.
+    filter: Option<Arc<PairFilter>>,
+    memory_threshold: usize,
+    memory_pool: SharedMemoryPool,
+    sj_trace: bool,
+    /// Per-call id (see `execute_spill_path`): names this call's probe
+    /// spill files and tags its trace lines.
+    call_id: u64,
+    /// Diagnostic only (the "probe collected" trace line).
+    probe_partitions: usize,
+    /// join-spill-streaming task 003: explicit K for phase B (operator
+    /// setting first, then `QE_SPILL_JOIN_PARALLELISM`), else derived.
+    parallelism_override: Option<usize>,
+}
+
+/// What the spill path emits for the rows of one side once their match
+/// status is final (spill-boundaries task 003, generalizing the SEMI/ANTI
+/// `want` flag): nothing (the side is not an output side on its own),
+/// the matched rows alone (SEMI), the unmatched rows alone (ANTI), or the
+/// unmatched rows NULL-extended with the other side's columns (the
+/// preserved side of an outer join).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowEmit {
+    None,
+    Matched,
+    Unmatched,
+    UnmatchedNullExtended,
+}
+
+impl SpillJoinCtx {
+    /// Matched (build row, probe row) pairs are output rows: INNER and the
+    /// outer joins. SEMI/ANTI emit one side's rows by match status only.
+    fn emit_pairs(&self) -> bool {
+        matches!(
+            self.join_type,
+            JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full
+        )
+    }
+    /// The PROBE side is preserved (its unmatched rows are output,
+    /// NULL-extended): LEFT with build = right, RIGHT with build = left,
+    /// FULL either way.
+    fn preserve_probe(&self) -> bool {
+        match self.join_type {
+            JoinType::Left => self.swapped,
+            JoinType::Right => !self.swapped,
+            JoinType::Full => true,
+            _ => false,
+        }
+    }
+    /// The BUILD side is preserved: LEFT with build = left, RIGHT with
+    /// build = right, FULL either way.
+    fn preserve_build(&self) -> bool {
+        match self.join_type {
+            JoinType::Left => !self.swapped,
+            JoinType::Right => self.swapped,
+            JoinType::Full => true,
+            _ => false,
+        }
+    }
+    /// A per-probe-row match bitmap is needed: probe-side-output SEMI/ANTI
+    /// (spill-join-correctness-3 task 004) or a preserved probe side.
+    fn probe_bitmap(&self) -> bool {
+        (matches!(self.join_type, JoinType::Semi | JoinType::Anti) && self.swapped)
+            || self.preserve_probe()
+    }
+    /// A per-build-row match bitmap is needed: build-side-output SEMI/ANTI
+    /// or a preserved build side.
+    fn build_bitmap(&self) -> bool {
+        (matches!(self.join_type, JoinType::Semi | JoinType::Anti) && !self.swapped)
+            || self.preserve_build()
+    }
+    /// What to emit for a probe batch once its bitmap is final.
+    fn probe_emit(&self) -> RowEmit {
+        match (self.join_type, self.swapped) {
+            (JoinType::Semi, true) => RowEmit::Matched,
+            (JoinType::Anti, true) => RowEmit::Unmatched,
+            _ if self.preserve_probe() => RowEmit::UnmatchedNullExtended,
+            _ => RowEmit::None,
+        }
+    }
+    /// What to emit for a build partition / chunk once its bitmap is final.
+    fn build_emit(&self) -> RowEmit {
+        match (self.join_type, self.swapped) {
+            (JoinType::Semi, false) => RowEmit::Matched,
+            (JoinType::Anti, false) => RowEmit::Unmatched,
+            _ if self.preserve_build() => RowEmit::UnmatchedNullExtended,
+            _ => RowEmit::None,
+        }
+    }
+    /// This call's probe spill file for partition `idx` — PER CALL (the
+    /// probe side is re-executed and re-partitioned on every call, and an
+    /// earlier call's producer may still be draining when a repeat call
+    /// starts), never shared.
+    fn probe_file(&self, spill_dir: &Path, idx: usize) -> PathBuf {
+        spill_dir.join(format!("probe_{}_{}.parquet", self.call_id, idx))
+    }
+}
+
+/// Counters for the DONE trace.
+struct SpillJoinStats {
+    in_memory_matched: usize,
+    spilled_matched: usize,
+}
+
+/// What phase A leaves for phase B: this call's probe spill files (one per
+/// spilled partition that received probe rows), their write-time key
+/// checksums, and the counters — plus whether the consumer went away
+/// mid-phase (in which case nothing more is produced, but the files still
+/// need removing).
+struct ProbePhase {
+    /// Diagnostic: size of this call's phase-A pool.
+    phase_a_threads: usize,
+    probe_spill_files: Vec<Option<PathBuf>>,
+    probe_key_checksums: Vec<Option<KeyChecksum>>,
+    probe_rows: usize,
+    in_memory_matched: usize,
+    abandoned: bool,
+}
+
+/// Send one output batch; `false` means the consumer dropped the stream.
+async fn emit_join_batch(
+    tx: &SpillJoinOutputSender,
+    batch: RecordBatch,
+    counter: &mut usize,
+) -> bool {
+    *counter += batch.num_rows();
+    tx.send(Ok(batch)).await.is_ok()
+}
+
+fn remove_probe_files(files: &[Option<PathBuf>]) {
+    for f in files.iter().flatten() {
+        let _ = std::fs::remove_file(f);
+    }
+}
+
+/// The producer behind `execute_spill_path`'s output stream: phase A
+/// (`probe_with_spilling`), then phase B (`process_spilled_partition` per
+/// spilled partition). Returns `Ok(None)` when the consumer dropped the
+/// stream before the end (nothing is wrong; the remaining work is simply
+/// not done), `Ok(Some(stats))` on completion. This call's probe spill
+/// files are removed on every exit path; the build files stay (memoized).
+async fn run_spill_join_producer(
+    state: &Arc<SpillState>,
+    ctx: &SpillJoinCtx,
+    probe_stream: RecordBatchStream,
+    tx: &SpillJoinOutputSender,
+) -> Result<Option<SpillJoinStats>> {
+    let phase_a = probe_with_spilling(state, ctx, probe_stream, tx).await?;
+    if phase_a.abandoned {
+        remove_probe_files(&phase_a.probe_spill_files);
+        return Ok(None);
+    }
+    if ctx.sj_trace {
+        // Same line as before task 001, now printed once the probe stream
+        // has been consumed (the count is accumulated as batches flow, not
+        // from a materialized Vec).
+        eprintln!(
+            "[sj-trace] execute_spill_path probe collected: probe_partitions={} probe_rows={} (streamed, phase_a_threads={}) call_id={}",
+            ctx.probe_partitions, phase_a.probe_rows, phase_a.phase_a_threads, ctx.call_id
+        );
+    }
+
+    // Phase B: spilled partitions — this call's own freshly-written probe
+    // spill file (if any) for each partition, paired with the MEMOIZED
+    // build spill file from `state.spilled`. The read-back is CPU + disk
+    // work with no await points, so it runs on the blocking pool and
+    // pushes batches through `blocking_send` (bounded, back-pressured).
+    let outcome = process_spilled_partitions(state, ctx, &phase_a, tx).await;
+    remove_probe_files(&phase_a.probe_spill_files);
+    let spilled_matched = match outcome? {
+        Some(n) => n,
+        None => return Ok(None),
+    };
+    Ok(Some(SpillJoinStats {
+        in_memory_matched: phase_a.in_memory_matched,
+        spilled_matched,
+    }))
+}
+
+/// Upper bound on phase B's parallelism K (join-spill-streaming task 003):
+/// beyond this the read-back is I/O- and channel-bound, and every job's
+/// chunk budget (`threshold / K`) gets small enough that chunk count — and
+/// with it the number of probe passes — climbs for no wall-time gain.
+const SPILL_JOIN_MAX_PARALLELISM: usize = 8;
+
+/// Probe batches probed together inside one read-back job (rayon
+/// `par_iter` over the group): 16 × 8,192-row batches = ~131k probe rows
+/// in memory per job at a time, whatever the probe partition's size.
+const PROBE_GROUP_BATCHES: usize = 16;
+
+/// Rows per batch when a spill file is streamed back (matches the writer's
+/// `SPILL_WRITER_ROW_GROUP_ROWS` in `append_batch_streaming`, so batch
+/// boundaries are the row groups' and a re-read of the same file yields
+/// the same batches in the same order — the probe-side SEMI/ANTI bitmaps
+/// below index probe batches by position across re-reads).
+const SPILL_READ_BATCH_ROWS: usize = 8_192;
+
+/// The chosen shape of phase B for one call.
+struct PhaseBPlan {
+    spilled_count: usize,
+    /// Concurrent spilled partitions.
+    k: usize,
+    /// Per-job chunk budget = `memory_threshold / k` — the K jobs SHARE the
+    /// operator's one threshold; never `K × threshold`.
+    chunk_budget: usize,
+    k_hw: usize,
+    k_budget: usize,
+}
+
+/// join-spill-streaming task 003: pick K.
+///
+/// `k_hw` = min(available_parallelism, `SPILL_JOIN_MAX_PARALLELISM`).
+/// `k_budget` = threshold / (largest spilled partition's predicted table
+/// bytes): a partition whose table alone is bigger than the whole budget
+/// is read back in ≥ K× more chunks at budget/K, and each chunk re-probes
+/// the entire probe partition, so K jobs do K× the lookups in the same
+/// wall time — splitting the budget buys nothing there, and the CPU is
+/// better spent on the parallel probe WITHIN the partition. K =
+/// min(k_hw, k_budget, spilled) ≥ 1, unless overridden (operator setting,
+/// then `QE_SPILL_JOIN_PARALLELISM`), in which case the override is only
+/// clamped to the spilled count.
+fn plan_phase_b(
+    spilled: &[Option<SpilledPartition>],
+    key_cols: usize,
+    memory_threshold: usize,
+    parallelism_override: Option<usize>,
+) -> PhaseBPlan {
+    let spilled_count = spilled.iter().filter(|s| s.is_some()).count();
+    let largest_rows = spilled
+        .iter()
+        .flatten()
+        .map(|s| s.build_rows)
+        .max()
+        .unwrap_or(0);
+    let largest_charge = predicted_hash_table_bytes(largest_rows, key_cols).max(1);
+    let k_hw = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, SPILL_JOIN_MAX_PARALLELISM);
+    let k_budget = (memory_threshold / largest_charge).max(1);
+    let k = parallelism_override
+        .unwrap_or_else(|| k_hw.min(k_budget))
+        .min(spilled_count.max(1))
+        .max(1);
+    PhaseBPlan {
+        spilled_count,
+        k,
+        chunk_budget: (memory_threshold / k).max(1),
+        k_hw,
+        k_budget,
+    }
+}
+
+/// One finished read-back job: (partition idx, rows sent, consumer still
+/// there).
+type PhaseBJobResult = Result<(usize, usize, bool)>;
+
+fn absorb_phase_b_result(
+    joined: std::result::Result<PhaseBJobResult, tokio::task::JoinError>,
+    spilled_matched: &mut usize,
+    alive: &mut bool,
+    first_err: &mut Option<QueryError>,
+) {
+    match joined {
+        Ok(Ok((_idx, sent, job_alive))) => {
+            *spilled_matched += sent;
+            if !job_alive {
+                *alive = false;
+            }
+        }
+        Ok(Err(e)) => {
+            if first_err.is_none() {
+                *first_err = Some(e);
+            }
+        }
+        Err(join_err) => {
+            if first_err.is_none() {
+                *first_err = Some(QueryError::Execution(format!(
+                    "join spill read-back task failed: {join_err}"
+                )));
+            }
+        }
+    }
+}
+
+/// Phase B driver (join-spill-streaming task 003): up to K spilled
+/// partitions at once, each on the blocking pool with a chunk budget of
+/// `threshold / K`, every partition's batches yielded as its job produces
+/// them (output order is irrelevant: set semantics). Returns the number of
+/// matched rows sent, or `None` if the consumer went away. On an error the
+/// first one is returned once the in-flight jobs have drained (a job
+/// cannot be aborted mid-run; each stops at its next send once the
+/// receiver is gone).
+async fn process_spilled_partitions(
+    state: &Arc<SpillState>,
+    ctx: &SpillJoinCtx,
+    phase_a: &ProbePhase,
+    tx: &SpillJoinOutputSender,
+) -> Result<Option<usize>> {
+    let plan = plan_phase_b(
+        &state.spilled,
+        ctx.build_keys.len(),
+        ctx.memory_threshold,
+        ctx.parallelism_override,
+    );
+    if plan.spilled_count == 0 {
+        return Ok(Some(0));
+    }
+    if ctx.sj_trace {
+        eprintln!(
+            "[sj-trace] execute_spill_path phase B: spilled_partitions={} parallelism K={} (hw={} budget={} override={:?}) chunk_table_budget={} threshold={} call_id={}",
+            plan.spilled_count,
+            plan.k,
+            plan.k_hw,
+            plan.k_budget,
+            ctx.parallelism_override,
+            plan.chunk_budget,
+            ctx.memory_threshold,
+            ctx.call_id
+        );
+    }
+    let mut jobs: tokio::task::JoinSet<PhaseBJobResult> = tokio::task::JoinSet::new();
+    let mut spilled_matched = 0usize;
+    let mut alive = true;
+    let mut first_err: Option<QueryError> = None;
+    for idx in 0..NUM_PARTITIONS {
+        if state.spilled[idx].is_none() {
+            continue;
+        }
+        while jobs.len() >= plan.k {
+            match jobs.join_next().await {
+                Some(j) => {
+                    absorb_phase_b_result(j, &mut spilled_matched, &mut alive, &mut first_err)
+                }
+                None => break,
+            }
+        }
+        if tx.is_closed() {
+            alive = false;
+        }
+        if !alive || first_err.is_some() {
+            break;
+        }
+        let state2 = Arc::clone(state);
+        let ctx2 = ctx.clone();
+        let tx2 = tx.clone();
+        let probe_file = phase_a.probe_spill_files[idx].clone();
+        let probe_key_checksum = phase_a.probe_key_checksums[idx];
+        let chunk_budget = plan.chunk_budget;
+        jobs.spawn_blocking(move || -> PhaseBJobResult {
+            let sp = state2.spilled[idx]
+                .as_ref()
+                .expect("spilled partition checked above");
+            let mut sent = 0usize;
+            let mut job_alive = true;
+            let result = {
+                let mut sink = |batch: RecordBatch| -> bool {
+                    sent += batch.num_rows();
+                    job_alive = tx2.blocking_send(Ok(batch)).is_ok();
+                    job_alive
+                };
+                process_spilled_partition(
+                    &ctx2,
+                    sp,
+                    probe_file.as_ref(),
+                    probe_key_checksum,
+                    idx,
+                    chunk_budget,
+                    &mut sink,
+                )
+            };
+            result.map(|()| (idx, sent, job_alive))
+        });
+    }
+    while let Some(j) = jobs.join_next().await {
+        absorb_phase_b_result(j, &mut spilled_matched, &mut alive, &mut first_err);
+    }
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+    if !alive {
+        return Ok(None);
+    }
+    Ok(Some(spilled_matched))
+}
+
+/// Probe rows gathered before phase A hands a group to the blocking pool
+/// (join-spill-streaming task 003): the group is re-sliced into
+/// `SPILL_READ_BATCH_ROWS`-row pieces and partitioned + probed with rayon,
+/// then written to the per-partition spill writers in parallel across
+/// partitions. Bounds phase A's transient at ~one group of probe rows plus
+/// its partitioned copy, whatever the upstream batch size is.
+const PHASE_A_GROUP_ROWS: usize = 262_144;
+/// Companion cap on batches per group (a source emitting tiny batches).
+const PHASE_A_GROUP_BATCHES: usize = 64;
+
+/// Upper bound on phase A's OWN rayon pool (join-spill-streaming task
+/// 003), and the budget each worker must be backed by. Measured on the
+/// 600M-row harness `semi-join` leg with a 1s RSS sampler, same code and
+/// data: on the global 32-thread pool phase A peaked at 583MB vs 207MB
+/// single-threaded and the excess PERSISTED into phase B; with
+/// `RAYON_NUM_THREADS=8` it was 279MB and with `MIMALLOC_PURGE_DELAY=0`
+/// 305MB — i.e. ~12MB per thread of freed memory the allocator keeps per
+/// thread that touched a group's short-lived allocations, not live data.
+/// So the pool is sized by the OPERATOR'S budget, not the machine: one
+/// worker per `PHASE_A_BYTES_PER_WORKER` of `memory_threshold`, at least
+/// 1, at most `SPILL_JOIN_PHASE_A_MAX_THREADS` (Q9 at 1G: 8; a 256MB
+/// budget: 3; 64M: 1), and it is created per call and dropped when phase
+/// A ends so its threads exit and release what they held before phase B
+/// runs. Eight threads keep phase A's wall time within ~2x of the
+/// 32-thread pool (well under 20s of Q9's ~225s at SF=100/1G).
+const SPILL_JOIN_PHASE_A_MAX_THREADS: usize = 8;
+const PHASE_A_BYTES_PER_WORKER: usize = 64 * 1024 * 1024;
+
+fn spill_join_phase_a_pool(memory_threshold: usize) -> Result<rayon::ThreadPool> {
+    let by_budget = (memory_threshold / PHASE_A_BYTES_PER_WORKER).max(1);
+    let by_machine = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let threads = by_budget
+        .min(by_machine)
+        .clamp(1, SPILL_JOIN_PHASE_A_MAX_THREADS);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("sj-phase-a-{i}"))
+        .build()
+        .map_err(|e| {
+            QueryError::Execution(format!(
+                "failed to build the join spill path's phase A thread pool: {e}"
+            ))
+        })
+}
+
+/// Phase A's mutable per-call state, moved into each group's blocking job
+/// and back (all of it is `Send`; `ArrowWriter<File>` was already carried
+/// across awaits before this task).
+struct PhaseAState {
+    /// This call's phase-A pool (see `spill_join_phase_a_pool`).
+    pool: rayon::ThreadPool,
+    spill_writers: Vec<Option<ArrowWriter<File>>>,
+    probe_spill_files: Vec<Option<PathBuf>>,
+    probe_key_checksums: Vec<Option<KeyChecksum>>,
+    /// `SpillJoinCtx::build_bitmap` joins only (build-side SEMI/ANTI, a
+    /// preserved build side): one bitmap per RESIDENT partition (per build
+    /// batch), marked from many probe pieces at once → `AtomicBool`.
+    build_matched: Vec<Option<Vec<Vec<std::sync::atomic::AtomicBool>>>>,
+}
+
+impl PhaseAState {
+    fn new(state: &SpillState, build_side_output: bool, memory_threshold: usize) -> Result<Self> {
+        use std::sync::atomic::AtomicBool;
+        let build_matched = (0..NUM_PARTITIONS)
+            .map(|idx| {
+                if !build_side_output || state.tables[idx].is_none() {
+                    return None;
+                }
+                state.partitions[idx].as_ref().map(|p| {
+                    p.batches
+                        .iter()
+                        .map(|b| (0..b.num_rows()).map(|_| AtomicBool::new(false)).collect())
+                        .collect()
+                })
+            })
+            .collect();
+        Ok(Self {
+            pool: spill_join_phase_a_pool(memory_threshold)?,
+            spill_writers: (0..NUM_PARTITIONS).map(|_| None).collect(),
+            probe_spill_files: (0..NUM_PARTITIONS).map(|_| None).collect(),
+            probe_key_checksums: (0..NUM_PARTITIONS).map(|_| None).collect(),
+            build_matched,
+        })
+    }
+}
+
+/// One phase-A group, on the blocking pool. (1) The group is concatenated
+/// into one batch; (2) rayon over `SPILL_READ_BATCH_ROWS`-row ranges
+/// computes every row's partition id (`partition_row_ids` — the same
+/// routing as `partition_batch_by_hash`, by construction); (3) rayon over
+/// PARTITIONS: each partition that received rows `take`s its rows (ONE
+/// gather of ~group/64 rows) and, on that same thread, either probes its
+/// resident table (INNER pairs and probe-side SEMI/ANTI rows become
+/// output batches; build-side SEMI/ANTI marks the partition's own atomic
+/// bitmap), appends to its own spill writer (one writer per partition, so
+/// partitions are independent), or — ANTI with no build rows at all —
+/// emits the rows whole. Returns the state and the output batches for
+/// the caller to send.
+///
+/// Why partition-major rather than piece-major: a first version ran
+/// `partition_batch_by_hash` per 8,192-row piece in parallel and then
+/// wrote the resulting 64 tiny slices per piece from another thread —
+/// ~2,300 sub-kilobyte batches per group allocated on rayon threads and
+/// freed elsewhere, which the process-wide allocator retained: the
+/// 600M-row harness `semi-join` leg went from 470MB to 858MB peak RSS
+/// with everything else equal (traced per phase with `QE_SPILL_DEBUG`
+/// + a 1s RSS sampler). This shape does one ~4k-row gather per partition
+/// per group, allocated and freed on the same thread, and probes resident
+/// tables in 4k-row batches instead of 128-row ones.
+fn phase_a_process_group(
+    state: &SpillState,
+    ctx: &SpillJoinCtx,
+    mut st: PhaseAState,
+    mut group: Vec<RecordBatch>,
+) -> Result<(PhaseAState, Vec<RecordBatch>)> {
+    use rayon::prelude::*;
+    let probe_keys = &ctx.probe_keys;
+    let probe_bitmap = ctx.probe_bitmap();
+    let probe_emit = ctx.probe_emit();
+
+    let merged = if group.len() == 1 {
+        group.pop().expect("one batch")
+    } else {
+        let schema = group[0].schema();
+        arrow::compute::concat_batches(&schema, group.iter())
+            .map_err(|e| QueryError::Execution(e.to_string()))?
+    };
+    drop(group);
+    let n = merged.num_rows();
+    if n == 0 {
+        return Ok((st, Vec::new()));
+    }
+
+    // (2) partition ids, parallel over row ranges.
+    let ranges: Vec<(usize, usize)> = (0..n)
+        .step_by(SPILL_READ_BATCH_ROWS)
+        .map(|s| (s, SPILL_READ_BATCH_ROWS.min(n - s)))
+        .collect();
+    let pool = &st.pool;
+    let ids_per_range: Vec<Vec<u32>> = pool.install(|| {
+        ranges
+            .par_iter()
+            .map(|&(s, len)| partition_row_ids(&merged.slice(s, len), probe_keys, NUM_PARTITIONS))
+            .collect::<Result<_>>()
+    })?;
+    let mut per_partition: Vec<Vec<u32>> = (0..NUM_PARTITIONS).map(|_| Vec::new()).collect();
+    for (&(s, _), ids) in ranges.iter().zip(&ids_per_range) {
+        for (i, p) in ids.iter().enumerate() {
+            per_partition[*p as usize].push((s + i) as u32);
+        }
+    }
+    drop(ids_per_range);
+
+    // (3) per partition, on one thread each.
+    let spill_dir = &state.spill_dir;
+    let sj_trace = ctx.sj_trace;
+    let spilled_bytes = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<(
+        usize,
+        Vec<u32>,
+        &mut Option<ArrowWriter<File>>,
+        &mut Option<PathBuf>,
+        &mut Option<KeyChecksum>,
+        Option<&Vec<Vec<std::sync::atomic::AtomicBool>>>,
+    )> = per_partition
+        .into_iter()
+        .zip(st.spill_writers.iter_mut())
+        .zip(st.probe_spill_files.iter_mut())
+        .zip(st.probe_key_checksums.iter_mut())
+        .zip(st.build_matched.iter())
+        .enumerate()
+        .filter(|(_, ((((rows, _), _), _), _))| !rows.is_empty())
+        .map(|(idx, ((((rows, w), f), cs), bm))| (idx, rows, w, f, cs, bm.as_ref()))
+        .collect();
+    let outputs_per_partition: Vec<Vec<RecordBatch>> = pool.install(|| {
+        slots
+            .into_par_iter()
+            .map(
+                |(idx, rows, writer, file, checksum, build_bm)| -> Result<Vec<RecordBatch>> {
+                    let indices = UInt32Array::from(rows);
+                    let columns: Result<Vec<ArrayRef>> = merged
+                        .columns()
+                        .iter()
+                        .map(|c| compute::take(c.as_ref(), &indices, None).map_err(Into::into))
+                        .collect();
+                    let pb = RecordBatch::try_new(merged.schema(), columns?)?;
+                    let mut outputs: Vec<RecordBatch> = Vec::new();
+                    if let Some(ref ht) = state.tables[idx] {
+                        // Probe in-memory partition: pairs out (INNER/outer),
+                        // the resident partition's build bitmap marked
+                        // (build-side SEMI/ANTI, preserved build side), and
+                        // — since a probe row's status is final against its
+                        // own resident partition — its probe-side emission
+                        // right away (probe-side SEMI/ANTI rows, or the
+                        // unmatched rows of a preserved probe side,
+                        // NULL-extended).
+                        let Some(build_part) = state.partitions[idx].as_ref() else {
+                            return Ok(outputs);
+                        };
+                        let mut flags = probe_bitmap.then(|| vec![false; pb.num_rows()]);
+                        outputs.extend(probe_batch_against_table(
+                            &build_part.batches,
+                            &pb,
+                            ht,
+                            ctx,
+                            build_bm.map(|v| v.as_slice()),
+                            flags.as_deref_mut(),
+                        )?);
+                        if let Some(flags) = flags {
+                            outputs.extend(emit_probe_rows(ctx, &pb, &flags)?);
                         }
-                    } else if spilled_partitions[idx].is_some() {
-                        // Spill probe batch for this partition
-                        self.memory_pool.record_spill(estimate_batch_size(&pb));
-                        let probe_path = probe_spill_files[idx].get_or_insert_with(|| {
-                            spill_dir.join(format!("probe_{}.parquet", idx))
-                        });
-                        append_batch_streaming(&mut spill_writers[idx], probe_path, &pb)?;
+                    } else if state.spilled[idx].is_some() {
+                        // Spill probe rows for this partition
+                        spilled_bytes.fetch_add(
+                            estimate_batch_size(&pb),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        let path = file.get_or_insert_with(|| ctx.probe_file(spill_dir, idx));
+                        append_batch_streaming(writer, path, &pb)?;
                         if sj_trace {
                             let cs = batch_key_checksum(&pb, probe_keys)?;
-                            probe_key_checksums[idx]
+                            checksum
                                 .get_or_insert_with(KeyChecksum::default)
                                 .accumulate(cs);
                         }
+                    } else if matches!(
+                        probe_emit,
+                        RowEmit::Unmatched | RowEmit::UnmatchedNullExtended
+                    ) {
+                        // task 004: this partition holds NO build row at all
+                        // (nothing was ever routed here, or it was emptied
+                        // before the table pass), so every probe row in it is
+                        // unmatched. INNER and SEMI correctly drop the batch;
+                        // ANTI must EMIT it whole — the previously silent
+                        // drop was exactly the wrong-result hazard for the
+                        // probe-side-output ANTI orientation — and a
+                        // preserved probe side (task 003) emits it whole,
+                        // NULL-extended.
+                        let all_false = vec![false; pb.num_rows()];
+                        outputs.extend(emit_probe_rows(ctx, &pb, &all_false)?);
                     }
+                    Ok(outputs)
+                },
+            )
+            .collect::<Result<_>>()
+    })?;
+    let spilled = spilled_bytes.into_inner();
+    if spilled > 0 {
+        ctx.memory_pool.record_spill(spilled);
+    }
+    Ok((st, outputs_per_partition.into_iter().flatten().collect()))
+}
+
+/// Phase A (+ A'): consume the probe stream. Probe batches are gathered
+/// into groups of ~`PHASE_A_GROUP_ROWS` rows and each group is processed
+/// on the blocking pool (`phase_a_process_group`: rayon-parallel
+/// partitioning + resident probing, parallel-across-partitions spill
+/// writes); the group's output batches are SENT as soon as the group is
+/// done, and probe rows routed to spilled partitions land in this call's
+/// probe spill files (one open writer per partition for the whole phase,
+/// closed exactly once at the end). Build-side SEMI/ANTI resident emission
+/// (A') happens after the stream ends. Never holds more than one group,
+/// its partitioned copy and the in-flight output.
+///
+/// join-spill-streaming task 003: before this, phase A ran single-threaded
+/// on the producer task — and once the output was streamed (task 002) it
+/// became the pace-setter of the whole pipeline (Q9 at SF=100/1G: the
+/// second join's read-back ran at ~1.7 cores of 32 because THIS loop, as
+/// its consumer, hashed 333M probe rows and fed 60 spill writers on one
+/// thread).
+async fn probe_with_spilling(
+    state: &Arc<SpillState>,
+    ctx: &SpillJoinCtx,
+    mut probe_stream: RecordBatchStream,
+    tx: &SpillJoinOutputSender,
+) -> Result<ProbePhase> {
+    // spill-join-correctness-3 task 004: SEMI/ANTI existence semantics
+    // on the spill path. Partition routing is the same fixed-seed hash
+    // of the join key for build and probe, and a build partition is
+    // wholly resident or wholly on disk (`evict_build_partition_to_disk`
+    // takes the whole partition), so EVERY build row a probe row could
+    // match lives in the probe row's own partition — no cross-partition
+    // state is ever needed. Two output orientations exist, decided by
+    // the planner (`build_right_for_left`):
+    //   swapped  (build = right, probe = LEFT = the output side): a
+    //     probe row's status is fully decided against its partition's
+    //     table, so resident partitions emit per probe piece right away
+    //     (`take_probe_rows`); rows routed to a spilled partition are
+    //     spilled and decided in `process_spilled_partition`.
+    //   !swapped (build = LEFT = the output side): a resident build row
+    //     can be matched by a probe row from ANY probe batch, so its
+    //     status is only known once the whole probe stream has been
+    //     consumed — one match bitmap per resident partition (per build
+    //     batch) is populated across the loop and emitted after it.
+    // spill-boundaries task 003: the outer joins reuse exactly these two
+    // bitmaps for their PRESERVED side(s) — LEFT with build = right /
+    // RIGHT with build = left / FULL keep the probe-side one, LEFT with
+    // build = left / RIGHT with build = right / FULL the build-side one —
+    // and emit the unmatched rows NULL-extended where SEMI/ANTI emit them
+    // bare (`SpillJoinCtx::probe_emit` / `build_emit`); matched pairs are
+    // emitted as INNER pairs alongside.
+    let build_bitmap = ctx.build_bitmap();
+    let mut st = PhaseAState::new(state, build_bitmap, ctx.memory_threshold)?;
+    let mut in_memory_matched = 0usize;
+    // join-spill-streaming task 001: probe rows counted as they flow
+    // (QE_SPILL_DEBUG trace), since the probe side is no longer a Vec.
+    let mut probe_rows_in: usize = 0;
+
+    // Abandonment (consumer dropped the stream): stop pulling probe
+    // batches and writing spill files for output nobody will read. The
+    // files written so far are removed by the caller.
+    let abandoned = |st: PhaseAState, probe_rows: usize, in_memory_matched: usize| {
+        Ok(ProbePhase {
+            phase_a_threads: st.pool.current_num_threads(),
+            probe_spill_files: st.probe_spill_files,
+            probe_key_checksums: st.probe_key_checksums,
+            probe_rows,
+            in_memory_matched,
+            abandoned: true,
+        })
+    };
+
+    let mut group: Vec<RecordBatch> = Vec::new();
+    let mut group_rows = 0usize;
+    loop {
+        let next = probe_stream.try_next().await?;
+        let end_of_stream = next.is_none();
+        if let Some(batch) = next {
+            if tx.is_closed() {
+                return abandoned(st, probe_rows_in, in_memory_matched);
+            }
+            probe_rows_in += batch.num_rows();
+            group_rows += batch.num_rows();
+            group.push(batch);
+        }
+        let flush = end_of_stream
+            || group_rows >= PHASE_A_GROUP_ROWS
+            || group.len() >= PHASE_A_GROUP_BATCHES;
+        if flush && !group.is_empty() {
+            let g = std::mem::take(&mut group);
+            group_rows = 0;
+            let state2 = Arc::clone(state);
+            let ctx2 = ctx.clone();
+            let (st2, outputs) =
+                tokio::task::spawn_blocking(move || phase_a_process_group(&state2, &ctx2, st, g))
+                    .await
+                    .map_err(|e| {
+                        QueryError::Execution(format!("join spill probe task failed: {e}"))
+                    })??;
+            st = st2;
+            for out in outputs {
+                if !emit_join_batch(tx, out, &mut in_memory_matched).await {
+                    return abandoned(st, probe_rows_in, in_memory_matched);
                 }
             }
         }
-
-        close_spill_writers(spill_writers)?;
-        Ok((results, probe_spill_files, probe_key_checksums))
+        if end_of_stream {
+            break;
+        }
     }
 
-    async fn process_spilled_partition(
-        &self,
-        build_file: &PathBuf,
-        build_key_checksum: Option<KeyChecksum>,
-        probe_file: Option<&PathBuf>,
-        probe_key_checksum: Option<KeyChecksum>,
-        build_keys: &[Expr],
-        probe_keys: &[Expr],
-        swapped: bool,
-        idx: usize,
-    ) -> Result<Vec<RecordBatch>> {
-        let sj_trace = std::env::var("QE_SPILL_DEBUG").is_ok();
-
-        // Read build side from disk
-        let build_batches = read_parquet(build_file)?;
-
-        // spill-join-correctness-2 epic, task 001: directly compare the
-        // join-key checksum recomputed from the data just read back off
-        // disk against the checksum recorded when those SAME rows were
-        // written to `build_file` (before the spill/unspill round
-        // trip). A mismatch here would be direct, in-the-act evidence of a
-        // Trino-PR#25892-shaped bug (spill-write and unspill-read
-        // disagreeing about a row's join key) rather than inference from
-        // reading the code.
-        if sj_trace {
-            if let Some(write_cs) = build_key_checksum {
-                let mut read_cs = KeyChecksum::default();
-                for b in &build_batches {
-                    read_cs.accumulate(batch_key_checksum(b, build_keys)?);
-                }
-                if read_cs.rows != write_cs.rows || read_cs.xor_hash != write_cs.xor_hash {
-                    eprintln!(
-                        "[sj-trace] HASH-MISMATCH build partition idx={} write_rows={} write_xor={:016x} read_rows={} read_xor={:016x} write_unhandled={} read_unhandled={}",
-                        idx,
-                        write_cs.rows,
-                        write_cs.xor_hash,
-                        read_cs.rows,
-                        read_cs.xor_hash,
-                        write_cs.unhandled_type_rows,
-                        read_cs.unhandled_type_rows
-                    );
-                } else {
-                    eprintln!(
-                        "[sj-trace] hash-check-ok build partition idx={} rows={} xor={:016x} unhandled={}",
-                        idx, read_cs.rows, read_cs.xor_hash, read_cs.unhandled_type_rows
-                    );
+    // Phase A' — task 004, build-side bitmap: emit once the ENTIRE probe
+    // stream is consumed. A resident partition no probe row ever reached
+    // keeps an all-false bitmap: all of its rows are unmatched, so ANTI
+    // (and a preserved build side, NULL-extended) emits every one of them
+    // and SEMI none — the mirror hazard of the dropped-probe-batch case
+    // above. Build rows with NULL keys are never in the table, so they
+    // stay unmatched too, matching the in-memory join's own
+    // null-never-matches rule.
+    if build_bitmap {
+        for idx in 0..NUM_PARTITIONS {
+            let Some(bm) = st.build_matched[idx].take() else {
+                continue;
+            };
+            let Some(build_part) = state.partitions[idx].as_ref() else {
+                continue;
+            };
+            let flags: Vec<Vec<bool>> = bm
+                .iter()
+                .map(|v| {
+                    v.iter()
+                        .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+                        .collect()
+                })
+                .collect();
+            for out in emit_build_rows(ctx, &build_part.batches, &flags)? {
+                if !emit_join_batch(tx, out, &mut in_memory_matched).await {
+                    return abandoned(st, probe_rows_in, in_memory_matched);
                 }
             }
         }
+    }
 
-        // Build hash table
-        let hash_table = build_hash_table(&build_batches, build_keys)?;
+    // Closed exactly once, between phases A and B — every probe file must
+    // be complete before `process_spilled_partition` opens it.
+    let phase_a_threads = st.pool.current_num_threads();
+    // The pool (and whatever its threads retained) goes away with `st`
+    // before phase B starts; the writers are closed exactly once here.
+    let PhaseAState {
+        pool,
+        spill_writers,
+        probe_spill_files,
+        probe_key_checksums,
+        ..
+    } = st;
+    drop(pool);
+    close_spill_writers(spill_writers)?;
+    Ok(ProbePhase {
+        phase_a_threads,
+        probe_spill_files,
+        probe_key_checksums,
+        probe_rows: probe_rows_in,
+        in_memory_matched,
+        abandoned: false,
+    })
+}
 
-        // Read probe side from disk (if exists)
-        let probe_batches = if let Some(probe_path) = probe_file {
-            read_parquet(probe_path)?
+/// Open a spill file for streaming read-back, one `SPILL_READ_BATCH_ROWS`
+/// batch at a time (join-spill-streaming task 003 — `read_parquet` pulls
+/// the whole file into memory, which for a spilled partition is the entire
+/// partition; the read-back below never holds more than one build chunk
+/// and one probe group).
+fn open_spill_reader(
+    path: &PathBuf,
+) -> Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader> {
+    let file = File::open(path).map_err(|e| {
+        QueryError::Execution(format!("Failed to open parquet file {:?}: {}", path, e))
+    })?;
+    Ok(ParquetRecordBatchReaderBuilder::try_new(file)?
+        .with_batch_size(SPILL_READ_BATCH_ROWS)
+        .build()?)
+}
+
+/// Phase B for ONE spilled partition: stream the memoized build file back
+/// in chunks whose (predicted table + batch) bytes fit `chunk_budget`, and
+/// for each chunk stream this call's probe file past the chunk's table,
+/// pushing every output batch into `sink` as soon as it exists (`false`
+/// from the sink = consumer gone, stop). Synchronous — runs on the
+/// blocking pool; the probe work inside a chunk is rayon-parallel over
+/// groups of `PROBE_GROUP_BATCHES` probe batches.
+///
+/// oom-safety-hardening task 007 bounded the read-back's transient hash
+/// table at one budget's worth by chunking the build side; task 003 of
+/// join-spill-streaming keeps that chunking (budget now `threshold / K`,
+/// see `plan_phase_b`) and additionally stops materializing the partition
+/// files themselves: the footprint of one job is one build chunk (batches
+/// + table ≤ `chunk_budget`), one probe group, the bitmaps, and the output
+/// batch in flight — whatever the partition's size. The probe file is
+/// re-read once per chunk (it was just written; the page cache serves it),
+/// which is the same per-chunk probe pass the previous in-memory
+/// `probe_batches` loop made, minus the resident copy.
+///
+/// Correctness, per join type (chunks partition the build rows
+/// DISJOINTLY in every case):
+///   INNER: each (build row, probe row) match pair is emitted exactly
+///     once and the union over chunks equals the single-table result.
+///     Probe routing and `probe_partition` itself are untouched; the
+///     parallel probe over a group's batches is per probe batch, so the
+///     concatenation of results is the sequential result in a different
+///     order.
+///   SEMI/ANTI, probe-side output (swapped) — spill-join-correctness-3
+///     task 004: a key's build rows may STRADDLE chunks, so per-chunk
+///     emission would double-emit a SEMI row (matched in two chunks) and
+///     prematurely emit an ANTI row (unmatched in chunk 1, matched in
+///     chunk 2). One match bitmap per probe batch (indexed by the batch's
+///     position in the file, identical across re-reads) is OR-accumulated
+///     across ALL chunks; the rows are emitted exactly once, in a final
+///     pass over the probe file after the last chunk. Parallel across
+///     probe batches (each batch owns its own bitmap).
+///   SEMI/ANTI, build-side output (!swapped): each build row lives in
+///     exactly one chunk and is probed against the FULL probe partition
+///     there, so its status is complete within its own chunk — per-chunk
+///     emission is exact, no cross-chunk state. The chunk's bitmap is
+///     `AtomicBool`s so probe batches mark it in parallel (stores of
+///     `true` commute). A partition with no probe file has no probe rows:
+///     ANTI emits every build row, SEMI none.
+///   LEFT/RIGHT/FULL (spill-boundaries task 003): INNER pair emission per
+///     chunk PLUS the bitmap(s) of the preserved side(s) exactly as above —
+///     a preserved probe side is emitted NULL-extended in the final pass
+///     after the last chunk (never earlier: a probe row unmatched in chunk
+///     1 may match in chunk 2), a preserved build side per chunk. Both
+///     bitmaps live with this partition's job; K-way phase B is
+///     unchanged.
+fn process_spilled_partition(
+    ctx: &SpillJoinCtx,
+    sp: &SpilledPartition,
+    probe_file: Option<&PathBuf>,
+    probe_key_checksum: Option<KeyChecksum>,
+    idx: usize,
+    chunk_budget: usize,
+    sink: &mut dyn FnMut(RecordBatch) -> bool,
+) -> Result<()> {
+    use rayon::prelude::*;
+    use std::sync::atomic::AtomicBool;
+
+    let sj_trace = ctx.sj_trace;
+    let t0 = std::time::Instant::now();
+    let build_keys = &ctx.build_keys;
+    let probe_keys = &ctx.probe_keys;
+    let key_cols = build_keys.len();
+    let probe_bitmap = ctx.probe_bitmap();
+    let build_bitmap = ctx.build_bitmap();
+
+    // spill-join-correctness-2 epic, task 001: recompute the join-key
+    // checksum from the data read back off disk and compare it against
+    // the checksum recorded when those SAME rows were written (before the
+    // spill/unspill round trip) — direct, in-the-act evidence of a
+    // Trino-PR#25892-shaped bug (spill-write and unspill-read disagreeing
+    // about a row's join key) rather than inference. The build file is
+    // read exactly once (chunk by chunk), the probe file's checksum is
+    // taken on its FIRST pass; both are reported only once the file has
+    // been fully consumed.
+    let mut build_read_cs = match (sj_trace, sp.build_key_checksum) {
+        (true, Some(_)) => Some(KeyChecksum::default()),
+        _ => None,
+    };
+    let mut probe_read_cs = match (sj_trace, probe_key_checksum, probe_file) {
+        (true, Some(_), Some(_)) => Some(KeyChecksum::default()),
+        _ => None,
+    };
+
+    let mut build_reader = open_spill_reader(&sp.build_file)?;
+    let mut pending: Option<RecordBatch> = None;
+    // Probe-side bitmap joins: one bitmap per probe batch, by file position.
+    let mut probe_matched: Vec<Vec<bool>> = Vec::new();
+    // First pass over the probe file done (row count, checksum, bitmaps).
+    let mut probe_seen = false;
+    let mut build_rows = 0usize;
+    let mut build_batches = 0usize;
+    let mut probe_rows = 0usize;
+    let mut chunks = 0usize;
+    let mut alive = true;
+
+    'chunks: loop {
+        // Assemble the next chunk: whole batches, at least one, stopping
+        // BEFORE (predicted table + batch bytes) would cross the budget.
+        let mut chunk: Vec<RecordBatch> = Vec::new();
+        let mut chunk_rows = 0usize;
+        let mut chunk_bytes = 0usize;
+        loop {
+            let next = match pending.take() {
+                Some(b) => Some(b),
+                None => match build_reader.next() {
+                    Some(r) => Some(r?),
+                    None => None,
+                },
+            };
+            let Some(b) = next else {
+                break;
+            };
+            if b.num_rows() == 0 {
+                continue;
+            }
+            let rows = chunk_rows + b.num_rows();
+            let bytes = chunk_bytes + estimate_batch_size(&b);
+            if !chunk.is_empty()
+                && predicted_hash_table_bytes(rows, key_cols) + bytes > chunk_budget
+            {
+                pending = Some(b);
+                break;
+            }
+            if let Some(cs) = build_read_cs.as_mut() {
+                cs.accumulate(batch_key_checksum(&b, build_keys)?);
+            }
+            chunk_rows = rows;
+            chunk_bytes = bytes;
+            chunk.push(b);
+        }
+        if chunk.is_empty() {
+            break 'chunks;
+        }
+        chunks += 1;
+        build_rows += chunk_rows;
+        build_batches += chunk.len();
+        let table = build_hash_table(&chunk, build_keys)?;
+        let build_bm: Vec<Vec<AtomicBool>> = if build_bitmap {
+            chunk
+                .iter()
+                .map(|b| (0..b.num_rows()).map(|_| AtomicBool::new(false)).collect())
+                .collect()
         } else {
             Vec::new()
         };
 
-        if sj_trace {
-            if let Some(write_cs) = probe_key_checksum {
-                let mut read_cs = KeyChecksum::default();
-                for b in &probe_batches {
-                    read_cs.accumulate(batch_key_checksum(b, probe_keys)?);
+        if let Some(pf) = probe_file {
+            let mut reader = open_spill_reader(pf)?;
+            let mut batch_pos = 0usize;
+            loop {
+                let mut group: Vec<RecordBatch> = Vec::with_capacity(PROBE_GROUP_BATCHES);
+                while group.len() < PROBE_GROUP_BATCHES {
+                    match reader.next() {
+                        Some(r) => group.push(r?),
+                        None => break,
+                    }
                 }
-                if read_cs.rows != write_cs.rows || read_cs.xor_hash != write_cs.xor_hash {
-                    eprintln!(
-                        "[sj-trace] HASH-MISMATCH probe partition idx={} write_rows={} write_xor={:016x} read_rows={} read_xor={:016x} write_unhandled={} read_unhandled={}",
-                        idx,
-                        write_cs.rows,
-                        write_cs.xor_hash,
-                        read_cs.rows,
-                        read_cs.xor_hash,
-                        write_cs.unhandled_type_rows,
-                        read_cs.unhandled_type_rows
-                    );
+                if group.is_empty() {
+                    break;
+                }
+                if !probe_seen {
+                    for b in &group {
+                        probe_rows += b.num_rows();
+                        if let Some(cs) = probe_read_cs.as_mut() {
+                            cs.accumulate(batch_key_checksum(b, probe_keys)?);
+                        }
+                        if probe_bitmap {
+                            probe_matched.push(vec![false; b.num_rows()]);
+                        }
+                    }
+                }
+                // One pass per probe batch does everything this join needs
+                // against the chunk's table: INNER pairs (sent below), the
+                // chunk's build bitmap, this batch's probe bitmap.
+                let build_bm_ref = build_bitmap.then(|| build_bm.as_slice());
+                let outs: Vec<Vec<RecordBatch>> = if probe_bitmap {
+                    let flags = &mut probe_matched[batch_pos..batch_pos + group.len()];
+                    group
+                        .par_iter()
+                        .zip(flags.par_iter_mut())
+                        .map(|(pb, f)| {
+                            probe_batch_against_table(
+                                &chunk,
+                                pb,
+                                &table,
+                                ctx,
+                                build_bm_ref,
+                                Some(f.as_mut_slice()),
+                            )
+                        })
+                        .collect::<Result<_>>()?
                 } else {
-                    eprintln!(
-                        "[sj-trace] hash-check-ok probe partition idx={} rows={} xor={:016x} unhandled={}",
-                        idx, read_cs.rows, read_cs.xor_hash, read_cs.unhandled_type_rows
-                    );
+                    group
+                        .par_iter()
+                        .map(|pb| {
+                            probe_batch_against_table(&chunk, pb, &table, ctx, build_bm_ref, None)
+                        })
+                        .collect::<Result<_>>()?
+                };
+                for out in outs.into_iter().flatten() {
+                    if !sink(out) {
+                        alive = false;
+                        break 'chunks;
+                    }
+                }
+                batch_pos += group.len();
+            }
+            probe_seen = true;
+        }
+        if build_bitmap {
+            let bm: Vec<Vec<bool>> = build_bm
+                .iter()
+                .map(|v| {
+                    v.iter()
+                        .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+                        .collect()
+                })
+                .collect();
+            for out in emit_build_rows(ctx, &chunk, &bm)? {
+                if !sink(out) {
+                    alive = false;
+                    break 'chunks;
                 }
             }
         }
-
-        // Probe
-        probe_partition(
-            &build_batches,
-            &probe_batches,
-            &hash_table,
-            probe_keys,
-            self.join_type,
-            swapped,
-            &self.schema,
-            self.retained.as_deref(),
-        )
     }
-}
 
-/// spill-join-correctness-2 epic, task 002: build-side spill files
-/// (`BuildDecision::Spill { spill_dir, .. }`) are now memoized ONCE, in
-/// `compute_build_decision`, and deliberately NOT removed at the end of
-/// every `execute_spill_path` call anymore — a repeat call (e.g. a
-/// fused-streaming aggregate aborting and re-executing this join as its
-/// input) must still be able to read them back. Clean up exactly once
-/// here, when this operator itself is finally dropped (typically at the
-/// end of the query that owns it). A join whose build side never spilled
-/// (`BuildDecision::InMemory`, or `build_decision` never even
-/// initialized, e.g. an unused partition) has nothing to clean up.
-impl Drop for SpillableHashJoinExec {
-    fn drop(&mut self) {
-        if let Some(BuildDecision::Spill { spill_dir, .. }) = self.build_decision.get() {
-            let _ = std::fs::remove_dir_all(spill_dir);
+    // Probe-side bitmap: the emission pass, after the last chunk. A probe
+    // batch with no bitmap (no build chunk ever ran — every probe row
+    // unmatched) is all-false: ANTI and a preserved probe side emit it
+    // whole (the latter NULL-extended), SEMI drops it.
+    if alive && probe_bitmap {
+        if let Some(pf) = probe_file {
+            for (i, r) in open_spill_reader(pf)?.enumerate() {
+                let pb = r?;
+                if !probe_seen {
+                    probe_rows += pb.num_rows();
+                    if let Some(cs) = probe_read_cs.as_mut() {
+                        cs.accumulate(batch_key_checksum(&pb, probe_keys)?);
+                    }
+                }
+                let all_false;
+                let flags: &[bool] = match probe_matched.get(i) {
+                    Some(f) => f,
+                    None => {
+                        all_false = vec![false; pb.num_rows()];
+                        &all_false
+                    }
+                };
+                for out in emit_probe_rows(ctx, &pb, flags)? {
+                    if !sink(out) {
+                        alive = false;
+                        break;
+                    }
+                }
+            }
+            probe_seen = true;
         }
     }
+
+    if sj_trace && alive {
+        if let (Some(write_cs), Some(read_cs)) = (sp.build_key_checksum, build_read_cs) {
+            report_key_checksum("build", idx, write_cs, read_cs);
+        }
+        if probe_seen {
+            if let (Some(write_cs), Some(read_cs)) = (probe_key_checksum, probe_read_cs) {
+                report_key_checksum("probe", idx, write_cs, read_cs);
+            }
+        }
+        eprintln!(
+            "[sj-trace] process_spilled_partition idx={} done: build_rows={} build_batches={} chunks={} probe_rows={} chunk_table_budget={} elapsed={:?} call_id={}",
+            idx,
+            build_rows,
+            build_batches,
+            chunks,
+            probe_rows,
+            chunk_budget,
+            t0.elapsed(),
+            ctx.call_id
+        );
+    }
+    Ok(())
 }
+
+/// `QE_SPILL_DEBUG` write-vs-read join-key checksum report for one side
+/// of one spilled partition (see `SpilledPartition::build_key_checksum`).
+fn report_key_checksum(side: &str, idx: usize, write_cs: KeyChecksum, read_cs: KeyChecksum) {
+    if read_cs.rows != write_cs.rows || read_cs.xor_hash != write_cs.xor_hash {
+        eprintln!(
+            "[sj-trace] HASH-MISMATCH {side} partition idx={} write_rows={} write_xor={:016x} read_rows={} read_xor={:016x} write_unhandled={} read_unhandled={}",
+            idx,
+            write_cs.rows,
+            write_cs.xor_hash,
+            read_cs.rows,
+            read_cs.xor_hash,
+            write_cs.unhandled_type_rows,
+            read_cs.unhandled_type_rows
+        );
+    } else {
+        eprintln!(
+            "[sj-trace] hash-check-ok {side} partition idx={} rows={} xor={:016x} unhandled={}",
+            idx, read_cs.rows, read_cs.xor_hash, read_cs.unhandled_type_rows
+        );
+    }
+}
+
+// spill-join-correctness-2 epic, task 002 / join-spill-streaming task 002:
+// build-side spill files are memoized ONCE (in `compute_build_decision`)
+// and deliberately NOT removed at the end of every `execute_spill_path`
+// call — a repeat call (e.g. a fused-streaming aggregate aborting and
+// re-executing this join as its input) must still be able to read them
+// back. Cleanup happens exactly once, in `SpillState::drop`, when the last
+// holder of the memoized state — this operator, or an output stream's
+// producer that outlived it — goes away. A join whose build side never
+// spilled (`BuildDecision::InMemory`, or `build_decision` never even
+// initialized, e.g. an unused partition) has nothing to clean up.
 
 impl fmt::Display for SpillableHashJoinExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1773,6 +3105,12 @@ impl SpillableHashAggregateExec {
 struct AggregatePartition {
     batches: Vec<RecordBatch>,
     memory_bytes: usize,
+    /// Total rows across `batches` — kept incrementally (mirroring
+    /// `BuildPartition::rows`, oom-safety-hardening task 007) so the
+    /// finalize step's aggregation-state accounting
+    /// (`predicted_agg_state_bytes`, task 002) never rescans batches to
+    /// price the state this partition's rows imply.
+    rows: usize,
 }
 
 impl AggregatePartition {
@@ -1780,18 +3118,37 @@ impl AggregatePartition {
         Self {
             batches: Vec::new(),
             memory_bytes: 0,
+            rows: 0,
         }
     }
 
     fn add_batch(&mut self, batch: RecordBatch) {
         self.memory_bytes += estimate_batch_size(&batch);
+        self.rows += batch.num_rows();
         self.batches.push(batch);
     }
 
     fn clear(&mut self) {
         self.batches.clear();
         self.memory_bytes = 0;
+        self.rows = 0;
     }
+}
+
+/// State for a spilled aggregate partition: the (single, incrementally
+/// appended) Parquet file plus running row/byte totals of what was written
+/// to it. The totals are what lets the finalize step price a partition's
+/// read-back + aggregation-state cost BEFORE materializing anything
+/// (oom-safety-hardening task 002, mirroring task 007's accounting
+/// discipline for the join spill path's hash tables).
+struct SpilledAggPartition {
+    file: PathBuf,
+    rows: usize,
+    /// Estimated IN-MEMORY bytes of the batches written to `file`
+    /// (accumulated `estimate_batch_size` at spill time — NOT the
+    /// compressed on-disk size, which under-counts what read-back will
+    /// actually materialize).
+    raw_bytes: usize,
 }
 
 #[async_trait]
@@ -1826,31 +3183,66 @@ impl PhysicalOperator for SpillableHashAggregateExec {
         // reaching here after `fused_eligible` was true means
         // `execute_fused_streaming` returned `Ok(None)` (see its own DONE/
         // ABORTED trace lines) and its input is about to be driven a SECOND
-        // time by `collect_input_partitions_concurrently` below — for a
-        // child like `SpillableHashJoinExec`'s spill path, which has no
-        // cache of its own output, this reruns the ENTIRE join computation
-        // from scratch. Not proof of duplication by itself (this second run
-        // is the one whose results are actually returned), but a query
-        // whose log shows this line is a query where the join's expensive
-        // work happened twice, and a wrong answer that also shows two
-        // `execute_spill_path` DONE lines is direct evidence they share a
-        // cause.
+        // time by the streaming reservation below — for a child like
+        // `SpillableHashJoinExec`'s spill path, which has no cache of its
+        // own output, this reruns the ENTIRE join computation from scratch.
+        // Not proof of duplication by itself (this second run is the one
+        // whose results are actually returned), but a query whose log shows
+        // this line is a query where the join's expensive work happened
+        // twice, and a wrong answer that also shows two `execute_spill_path`
+        // DONE lines is direct evidence they share a cause.
         if std::env::var("QE_SPILL_DEBUG").is_ok() {
             eprintln!(
                 "[sj-trace] agg fallback: fused_eligible={} -> (re-)executing input via \
-                 collect_input_partitions_concurrently",
+                 the streaming two-phase reservation (stream_merge_input_partitions)",
                 fused_eligible
             );
         }
 
-        // Drain all input partitions concurrently so a parallel scan/join beneath this
-        // aggregate is not serialized onto a single core.
+        // Phase 1: reserve, possibly spill (oom-safety-hardening task 002 —
+        // the same Photon-style streaming two-phase reservation
+        // `SpillableHashJoinExec::compute_build_decision` ships, mirrored
+        // rather than reinvented). The OLD code called
+        // `collect_input_partitions_concurrently`, which fully drained the
+        // ENTIRE input into one flat `Vec<RecordBatch>` and only THEN
+        // compared its total size against `memory_limit * spill_threshold`
+        // — so an oversized input could exhaust real memory during that
+        // initial collection, before the spill decision ever ran (the
+        // harness `agg` scenario: 250M rows / ~4GB streamed into a 256MB
+        // budget was kernel-OOM-killed here). Now the input streams in via
+        // `stream_merge_input_partitions` (same one-task-per-partition
+        // cross-core drain benefit, bounded channel instead of a growing
+        // Vec) with a running size total checked as each batch arrives —
+        // never buffering more than ~`memory_threshold` bytes of flat,
+        // unpartitioned input. The MOMENT the total would cross the
+        // threshold, everything collected so far plus the crossing batch
+        // plus the rest of the stream feeds `aggregate_with_spilling`'s
+        // hash-partition-and-spill-as-needed bookkeeping, entered
+        // mid-stream instead of only after a full prior collection.
         let memory_threshold =
             (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
-        let (all_batches, total_size) = collect_input_partitions_concurrently(&self.input).await?;
-        let exceeded = total_size > memory_threshold;
+        let mut input_stream = stream_merge_input_partitions(&self.input).await?;
+        let mut flat_batches: Vec<RecordBatch> = Vec::new();
+        let mut flat_size: usize = 0;
+        let mut crossing_batch: Option<RecordBatch> = None;
+        while let Some(batch) = input_stream.try_next().await? {
+            let batch_size = estimate_batch_size(&batch);
+            // The batch is already in memory when this decision is made: record it.
+            self.memory_pool.observe(flat_size + batch_size);
+            if flat_size + batch_size > memory_threshold {
+                crossing_batch = Some(batch);
+                break;
+            }
+            flat_size += batch_size;
+            self.memory_pool.observe(flat_size);
+            flat_batches.push(batch);
+        }
 
-        if !exceeded {
+        if crossing_batch.is_none() {
+            // Never crossed the threshold: the input genuinely fits — the
+            // ordinary in-memory case, reached without ever risking an
+            // unbounded collection to get here.
+            let all_batches = flat_batches;
             // Data fits in memory — delegate to the proven HashAggregateExec
             let hash_aggs: Vec<crate::physical::operators::hash_agg::AggregateExpr> = self
                 .aggregates
@@ -1886,7 +3278,7 @@ impl PhysicalOperator for SpillableHashAggregateExec {
             return Ok(stream);
         }
 
-        // Data exceeds memory — use spillable aggregation path
+        // Threshold crossed mid-stream — use the spillable aggregation path.
         self.config.ensure_spill_dir()?;
 
         let spill_id = SPILL_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1900,29 +3292,35 @@ impl PhysicalOperator for SpillableHashAggregateExec {
 
         if std::env::var("QE_SPILL_DEBUG").is_ok() {
             eprintln!(
-                "[spill-agg] collected {} batches, {} rows, {} bytes",
-                all_batches.len(),
-                all_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
-                total_size
+                "[spill-agg] threshold crossed mid-stream at {} buffered batches ({} bytes, \
+                 threshold {}) — entering streaming spill path",
+                flat_batches.len() + 1,
+                flat_size,
+                memory_threshold
             );
         }
-        let input_stream: RecordBatchStream =
-            Box::pin(stream::iter(all_batches.into_iter().map(Ok)));
+
+        // Phase 2: everything gathered so far (`flat_batches`), plus the
+        // crossing batch, plus whatever remains of the stream, feeds the
+        // bounded, spill-capable structure. Nothing collected in phase 1 is
+        // thrown away or re-pulled from the source (mirrors
+        // `SpillableHashJoinExec::finish_via_spill`).
+        let combined: RecordBatchStream = Box::pin(
+            stream::iter(flat_batches.into_iter().chain(crossing_batch).map(Ok))
+                .chain(input_stream),
+        );
 
         // Process with partitioning and spilling
-        let (in_memory_partitions, spilled_files) = self
-            .aggregate_with_spilling(input_stream, &spill_dir)
-            .await?;
+        let (mut in_memory_partitions, mut spilled_parts) =
+            self.aggregate_with_spilling(combined, &spill_dir).await?;
         if std::env::var("QE_SPILL_DEBUG").is_ok() {
-            let mem_rows: usize = in_memory_partitions
-                .iter()
-                .flatten()
-                .map(|p| p.batches.iter().map(|b| b.num_rows()).sum::<usize>())
-                .sum();
+            let mem_rows: usize = in_memory_partitions.iter().flatten().map(|p| p.rows).sum();
+            let spilled_rows: usize = spilled_parts.iter().flatten().map(|s| s.rows).sum();
             eprintln!(
-                "[spill-agg] in-memory rows {}, spilled files {}",
+                "[spill-agg] in-memory rows {}, spilled files {} (spilled rows {})",
                 mem_rows,
-                spilled_files.iter().flatten().count()
+                spilled_parts.iter().flatten().count(),
+                spilled_rows
             );
         }
 
@@ -1948,27 +3346,92 @@ impl PhysicalOperator for SpillableHashAggregateExec {
             })
             .collect();
 
+        // Finalize, one partition at a time, under the SAME accounting
+        // discipline task 007 established for the join spill path's hash
+        // tables: BEFORE materializing a partition's read-back + building
+        // its aggregation hash state, price both (raw batch bytes actually
+        // written/held for the partition + `predicted_agg_state_bytes`, the
+        // conservative worst-case-all-unique-groups analogue of
+        // `predicted_hash_table_bytes`) against the same
+        // `memory_limit * spill_threshold` threshold. A partition that
+        // provably cannot fit is aggregated via the chunked
+        // (sub-partitioned) read-back instead
+        // (`aggregate_partition_chunked`, the aggregate analogue of task
+        // 007's chunked read-back in `process_spilled_partition`) — groups
+        // stay whole because sub-partitioning re-hashes the SAME group key
+        // at a finer modulus, so the per-sub aggregation still sees every
+        // row of each of its groups.
+        //
+        // Documented residual constants on top of the threshold: the
+        // not-yet-processed partitions' resident batches (bounded at
+        // ~threshold total by the ingestion loop), one partition's (or
+        // sub-partition's) read-back + aggregation state (bounded at
+        // ~threshold by this gate), and the accumulated output batches
+        // (irreducible — the operator returns a materialized result).
+        let group_cols = self.group_by.len();
+        let n_aggs = self.aggregates.len();
+        let n_distinct = self
+            .aggregates
+            .iter()
+            .filter(|a| {
+                a.distinct || matches!(a.func, crate::planner::AggregateFunction::CountDistinct)
+            })
+            .count();
+
         let mut all_results = Vec::new();
-        for (idx, part) in in_memory_partitions.into_iter().enumerate() {
-            let mut batches: Vec<RecordBatch> = Vec::new();
-            if let Some(path) = &spilled_files[idx] {
-                batches.extend(read_parquet(path)?);
-            }
-            if let Some(part) = part {
-                batches.extend(part.batches);
-            }
-            if batches.is_empty() {
+        for idx in 0..NUM_PARTITIONS {
+            let resident = in_memory_partitions[idx].take();
+            let spilled = spilled_parts[idx].take();
+            let resident_rows = resident.as_ref().map(|p| p.rows).unwrap_or(0);
+            let resident_bytes = resident.as_ref().map(|p| p.memory_bytes).unwrap_or(0);
+            let spilled_rows = spilled.as_ref().map(|s| s.rows).unwrap_or(0);
+            let spilled_bytes = spilled.as_ref().map(|s| s.raw_bytes).unwrap_or(0);
+            let rows = resident_rows + spilled_rows;
+            if rows == 0 {
                 continue;
             }
-            let result = crate::physical::operators::hash_agg::aggregate_batches_external(
-                &batches,
-                &self.group_by,
-                &agg_exprs,
-                &self.schema,
-            )?;
-            if result.num_rows() > 0 {
-                all_results.push(result);
-            }
+            let raw_bytes = resident_bytes + spilled_bytes;
+            let predicted =
+                raw_bytes + predicted_agg_state_bytes(rows, group_cols, n_aggs, n_distinct);
+            // An empty GROUP BY cannot be sub-partitioned (one global group
+            // — every row hashes identically, so a finer modulus would put
+            // everything in one sub anyway); its state is O(1) except for
+            // DISTINCT's value set, which is irreducible without a sorted
+            // spill of the values themselves (documented residual).
+            let result_batches = if !self.group_by.is_empty() && predicted > memory_threshold {
+                self.aggregate_partition_chunked(
+                    idx,
+                    resident,
+                    spilled,
+                    predicted,
+                    memory_threshold,
+                    &spill_dir,
+                    &agg_exprs,
+                )?
+            } else {
+                let mut batches: Vec<RecordBatch> = Vec::new();
+                if let Some(sp) = &spilled {
+                    batches.extend(read_parquet(&sp.file)?);
+                }
+                if let Some(part) = resident {
+                    batches.extend(part.batches);
+                }
+                if batches.is_empty() {
+                    continue;
+                }
+                let result = crate::physical::operators::hash_agg::aggregate_batches_external(
+                    &batches,
+                    &self.group_by,
+                    &agg_exprs,
+                    &self.schema,
+                )?;
+                if result.num_rows() > 0 {
+                    vec![result]
+                } else {
+                    Vec::new()
+                }
+            };
+            all_results.extend(result_batches);
         }
 
         // Clean up spill directory
@@ -1994,17 +3457,78 @@ impl PhysicalOperator for SpillableHashAggregateExec {
 }
 
 impl SpillableHashAggregateExec {
-    /// Process input with hash partitioning and spilling when memory limit is reached
+    /// Evict one aggregate partition's resident batches to its (single,
+    /// incrementally appended) spill file, leaving the partition resident
+    /// and empty so it keeps accumulating in memory afterwards — an
+    /// aggregate re-reads spilled + resident rows TOGETHER at finalize, so
+    /// unlike the join's `evict_build_partition_to_disk` (which retires the
+    /// partition entirely) there is no resident-vs-spilled routing
+    /// dichotomy to maintain here.
+    ///
+    /// oom-safety-hardening task 002: this replaces the old
+    /// `write_batches_to_parquet` + `merge_parquet_files` (read the whole
+    /// existing file + rewrite + rename on EVERY eviction — the same
+    /// O(n²)-in-bytes pattern `append_batch_streaming`'s doc comment
+    /// records being fixed for the join in spill-join-correctness task
+    /// 002) with the join's own open-writer plumbing, reused byte-for-byte:
+    /// one `ArrowWriter` per partition, kept open across the whole
+    /// ingestion phase, each eviction appending O(batch) row groups.
+    fn evict_agg_partition_to_disk(
+        &self,
+        idx: usize,
+        partitions: &mut [Option<AggregatePartition>],
+        spilled: &mut [Option<SpilledAggPartition>],
+        spill_writers: &mut [Option<ArrowWriter<File>>],
+        spill_dir: &Path,
+    ) -> Result<usize> {
+        let Some(part) = partitions[idx].as_mut() else {
+            return Ok(0);
+        };
+        if part.batches.is_empty() {
+            return Ok(0);
+        }
+        let path = spill_dir.join(format!("agg_part_{}.parquet", idx));
+        for b in &part.batches {
+            append_batch_streaming(&mut spill_writers[idx], &path, b)?;
+        }
+        let freed = part.memory_bytes;
+        let rows = part.rows;
+        self.memory_pool.record_spill(freed);
+        let sp = spilled[idx].get_or_insert_with(|| SpilledAggPartition {
+            file: path,
+            rows: 0,
+            raw_bytes: 0,
+        });
+        sp.rows += rows;
+        sp.raw_bytes += freed;
+        part.clear();
+        Ok(freed)
+    }
+
+    /// Process input with hash partitioning and spilling when memory limit
+    /// is reached. Consumes `input_stream` batch by batch — combined with
+    /// `execute()`'s streaming phase-1 reservation this is what keeps the
+    /// spill path's ingestion memory bounded at ~`memory_threshold`
+    /// regardless of input size (oom-safety-hardening task 002).
     async fn aggregate_with_spilling(
         &self,
         mut input_stream: RecordBatchStream,
         spill_dir: &PathBuf,
-    ) -> Result<(Vec<Option<AggregatePartition>>, Vec<Option<PathBuf>>)> {
+    ) -> Result<(
+        Vec<Option<AggregatePartition>>,
+        Vec<Option<SpilledAggPartition>>,
+    )> {
         let mut partitions: Vec<Option<AggregatePartition>> = (0..NUM_PARTITIONS)
             .map(|_| Some(AggregatePartition::new()))
             .collect();
-        let mut spilled_files: Vec<Option<PathBuf>> = (0..NUM_PARTITIONS).map(|_| None).collect();
-        let mut spill_file_counts: Vec<usize> = vec![0; NUM_PARTITIONS];
+        let mut spilled: Vec<Option<SpilledAggPartition>> =
+            (0..NUM_PARTITIONS).map(|_| None).collect();
+        // One incrementally-written Parquet file per spilled partition,
+        // kept OPEN for the whole ingestion phase and closed exactly once
+        // at the end — the join's `build_with_partitioning` plumbing,
+        // reused (see `evict_agg_partition_to_disk`).
+        let mut spill_writers: Vec<Option<ArrowWriter<File>>> =
+            (0..NUM_PARTITIONS).map(|_| None).collect();
 
         let mut total_memory: usize = 0;
         let memory_threshold =
@@ -2017,11 +3541,10 @@ impl SpillableHashAggregateExec {
             // whole budget it could decide nothing — the answer stayed
             // correct but the budget became advisory.
             let mut chunks: Vec<RecordBatch> = Vec::new();
-            const CHUNK_ROWS: usize = 8_192;
-            if big.num_rows() > CHUNK_ROWS {
+            if big.num_rows() > AGG_CHUNK_ROWS {
                 let mut off = 0;
                 while off < big.num_rows() {
-                    let len = CHUNK_ROWS.min(big.num_rows() - off);
+                    let len = AGG_CHUNK_ROWS.min(big.num_rows() - off);
                     chunks.push(big.slice(off, len));
                     off += len;
                 }
@@ -2032,67 +3555,173 @@ impl SpillableHashAggregateExec {
             for batch in chunks {
                 let batch_size = estimate_batch_size(&batch);
 
-                // Check if we need to spill before adding more data
+                // Check if we need to spill before adding more data.
+                //
+                // Ingestion charges resident partitions their BATCH bytes
+                // only — deliberately NOT a predicted-state charge the way
+                // the join's streaming loop charges predicted table bytes
+                // (task 007): during aggregate ingestion no hash/accumulator
+                // state exists yet (partitions hold raw rows), and the
+                // state that eventually materializes at finalize covers
+                // SPILLED rows too, so charging it against residency here
+                // could not bound it. The state cost is priced where it
+                // actually materializes: `execute()`'s finalize gate
+                // (`predicted_agg_state_bytes` + `aggregate_partition_chunked`).
+                // The batch is already in memory when this decision is made: record it.
+                self.memory_pool.observe(total_memory + batch_size);
                 if total_memory + batch_size > memory_threshold {
-                    // Find the largest partition to spill
+                    // Spill the largest partition (largest-first, matching
+                    // the join: maximizes freed bytes per eviction).
                     if let Some(idx) = find_largest_agg_partition(&partitions) {
-                        if let Some(ref mut part) = partitions[idx] {
-                            if !part.batches.is_empty() {
-                                // Spill this partition
-                                let spill_path = spill_dir.join(format!(
-                                    "part_{}_{}.parquet",
-                                    idx, spill_file_counts[idx]
-                                ));
-                                spill_file_counts[idx] += 1;
-
-                                write_batches_to_parquet(&spill_path, &part.batches)?;
-                                self.memory_pool.record_spill(part.memory_bytes);
-                                total_memory -= part.memory_bytes;
-
-                                // If we already have a spill file for this partition, merge them
-                                if let Some(ref existing_path) = spilled_files[idx] {
-                                    // Append new file path to a list file or merge
-                                    // For simplicity, we'll just keep the latest and merge on read
-                                    merge_parquet_files(
-                                        existing_path,
-                                        &spill_path,
-                                        spill_dir,
-                                        idx,
-                                    )?;
-                                } else {
-                                    spilled_files[idx] = Some(spill_path);
-                                }
-
-                                part.clear();
-                            }
-                        }
+                        let freed = self.evict_agg_partition_to_disk(
+                            idx,
+                            &mut partitions,
+                            &mut spilled,
+                            &mut spill_writers,
+                            spill_dir,
+                        )?;
+                        total_memory = total_memory.saturating_sub(freed);
                     }
                 }
 
                 // Partition the batch by group key hash
-                let partitioned = partition_batch_by_hash(&batch, &self.group_by, NUM_PARTITIONS)?;
+                let partitioned =
+                    partition_batch_by_group_hash(&batch, &self.group_by, NUM_PARTITIONS)?;
 
                 for (idx, part_batch) in partitioned.into_iter().enumerate() {
                     if let Some(pb) = part_batch {
                         let pb_size = estimate_batch_size(&pb);
-
                         if let Some(ref mut part) = partitions[idx] {
                             part.add_batch(pb);
                             total_memory += pb_size;
-                        } else if let Some(ref spill_path) = spilled_files[idx] {
-                            // Partition was fully spilled, append to spill file
-                            let temp_path = spill_dir
-                                .join(format!("temp_{}_{}.parquet", idx, spill_file_counts[idx]));
-                            spill_file_counts[idx] += 1;
-                            write_batches_to_parquet(&temp_path, &[pb])?;
-                            merge_parquet_files(spill_path, &temp_path, spill_dir, idx)?;
+                            self.memory_pool.observe(total_memory);
                         }
                     }
                 }
             }
         }
 
-        Ok((partitions, spilled_files))
+        close_spill_writers(spill_writers)?;
+        Ok((partitions, spilled))
+    }
+
+    /// Chunked (sub-partitioned) read-back for one aggregate partition
+    /// whose priced finalize cost (raw batch bytes + predicted aggregation
+    /// state, see `execute()`'s finalize gate) exceeds the memory
+    /// threshold — the aggregate analogue of task 007's chunked read-back
+    /// in the join's `process_spilled_partition`.
+    ///
+    /// A join can chunk its build rows arbitrarily (probing is per-row);
+    /// an aggregate cannot — every row of a group must reach ONE hash
+    /// state. So chunking here is BY GROUP: the partition's rows (spill
+    /// file streamed in `AGG_CHUNK_ROWS` batches, then the resident
+    /// remainder) are re-routed with the SAME group-key hash at modulus
+    /// `NUM_PARTITIONS * fan`. Rows of top-level partition `idx` satisfy
+    /// `hash % NUM_PARTITIONS == idx`, so exactly `fan` residues
+    /// `{idx + NUM_PARTITIONS * j}` occur; sub-partition `j = i /
+    /// NUM_PARTITIONS` therefore holds a group-disjoint subset and each
+    /// sub-aggregation sees every row of each of its groups — the same
+    /// disjointness argument the top-level partitioning already relies on.
+    /// One level only: a sub-partition is aggregated directly (documented
+    /// residual: one sub's real state, targeted at ~threshold by `fan`).
+    #[allow(clippy::too_many_arguments)]
+    fn aggregate_partition_chunked(
+        &self,
+        idx: usize,
+        resident: Option<AggregatePartition>,
+        spilled: Option<SpilledAggPartition>,
+        predicted_bytes: usize,
+        memory_threshold: usize,
+        spill_dir: &Path,
+        agg_exprs: &[crate::physical::operators::hash_agg::AggregateExpr],
+    ) -> Result<Vec<RecordBatch>> {
+        let fan = predicted_bytes
+            .div_ceil(memory_threshold.max(1))
+            .clamp(2, NUM_PARTITIONS);
+        let sub_paths: Vec<PathBuf> = (0..fan)
+            .map(|j| spill_dir.join(format!("agg_sub_{}_{}.parquet", idx, j)))
+            .collect();
+        let mut sub_writers: Vec<Option<ArrowWriter<File>>> = (0..fan).map(|_| None).collect();
+        if std::env::var("QE_SPILL_DEBUG").is_ok() {
+            eprintln!(
+                "[spill-agg] partition {} finalize predicted {} bytes > threshold {} — \
+                 chunked read-back with fan {}",
+                idx, predicted_bytes, memory_threshold, fan
+            );
+        }
+
+        let group_by = &self.group_by;
+        let route =
+            |batch: &RecordBatch, sub_writers: &mut [Option<ArrowWriter<File>>]| -> Result<()> {
+                let pieces = partition_batch_by_group_hash(batch, group_by, NUM_PARTITIONS * fan)?;
+                for (i, pb) in pieces.into_iter().enumerate() {
+                    let Some(pb) = pb else { continue };
+                    if i % NUM_PARTITIONS != idx {
+                        // Would silently split a group across sub-partitions —
+                        // the group-hash must route identically at write time
+                        // and read-back time. Fail loudly instead of ever
+                        // returning wrong aggregates.
+                        return Err(QueryError::Execution(format!(
+                            "aggregate spill sub-partitioning routed rows of partition {} to \
+                         residue {} — group-hash routing diverged across the spill round trip",
+                            idx,
+                            i % NUM_PARTITIONS
+                        )));
+                    }
+                    let j = i / NUM_PARTITIONS;
+                    append_batch_streaming(&mut sub_writers[j], &sub_paths[j], &pb)?;
+                }
+                Ok(())
+            };
+
+        if let Some(sp) = &spilled {
+            // Stream the spill file back in bounded batches — never the
+            // whole partition at once (that materialization is exactly
+            // what this path exists to avoid).
+            let file = File::open(&sp.file).map_err(|e| {
+                QueryError::Execution(format!(
+                    "Failed to open agg spill file {:?}: {}",
+                    sp.file, e
+                ))
+            })?;
+            let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+                .with_batch_size(AGG_CHUNK_ROWS)
+                .build()?;
+            for batch in reader {
+                route(&batch?, &mut sub_writers)?;
+            }
+        }
+        if let Some(part) = resident {
+            for b in &part.batches {
+                route(b, &mut sub_writers)?;
+            }
+        }
+        if let Some(sp) = &spilled {
+            let _ = std::fs::remove_file(&sp.file);
+        }
+        close_spill_writers(sub_writers)?;
+
+        let mut results = Vec::new();
+        for path in &sub_paths {
+            if !path.exists() {
+                continue;
+            }
+            let batches = read_parquet(path)?;
+            let _ = std::fs::remove_file(path);
+            if batches.is_empty() {
+                continue;
+            }
+            let result = crate::physical::operators::hash_agg::aggregate_batches_external(
+                &batches,
+                &self.group_by,
+                agg_exprs,
+                &self.schema,
+            )?;
+            if result.num_rows() > 0 {
+                results.push(result);
+            }
+        }
+        Ok(results)
     }
 }
 
@@ -2177,24 +3806,55 @@ impl PhysicalOperator for ExternalSortExec {
         // Sort always produces a single partition
         crate::physical::check_partition(self, partition)?;
 
-        // Drain all input partitions concurrently so a parallel scan/join beneath this
-        // sort is not serialized onto a single core.
+        // Phase 1: reserve, possibly spill (oom-safety-hardening task 003 —
+        // the same Photon-style streaming two-phase reservation the join's
+        // `compute_build_decision` and the aggregate's `execute()` (task
+        // 002) already ship, mirrored rather than reinvented). The OLD code
+        // called `collect_input_partitions_concurrently`, which fully
+        // drained the ENTIRE input into one flat `Vec<RecordBatch>` and
+        // only THEN compared its total size against
+        // `memory_limit * spill_threshold` — so an oversized input could
+        // exhaust real memory during that initial collection, before the
+        // spill decision ever ran (the harness `sort` scenario: 250M rows /
+        // ~4GB streamed into a 256MB budget was kernel-OOM-killed under a
+        // 1G cgroup cap, and aborted at ~1.9GB under the rlimit lever).
+        // Now the input streams in via `stream_merge_input_partitions`
+        // (same one-task-per-partition cross-core drain benefit, bounded
+        // channel instead of a growing Vec) with a running size total
+        // checked as each batch arrives.
         let memory_threshold =
             (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
-        let (all_batches, total_size) = collect_input_partitions_concurrently(&self.input).await?;
-        let exceeded = total_size > memory_threshold;
-
-        if all_batches.is_empty() {
-            return Ok(Box::pin(stream::empty()));
+        let mut input_stream = stream_merge_input_partitions(&self.input).await?;
+        let mut flat_batches: Vec<RecordBatch> = Vec::new();
+        let mut flat_size: usize = 0;
+        let mut crossing_batch: Option<RecordBatch> = None;
+        while let Some(batch) = input_stream.try_next().await? {
+            let batch_size = estimate_batch_size(&batch);
+            // The batch is already in memory when this decision is made: record it.
+            self.memory_pool.observe(flat_size + batch_size);
+            if flat_size + batch_size > memory_threshold {
+                crossing_batch = Some(batch);
+                break;
+            }
+            flat_size += batch_size;
+            self.memory_pool.observe(flat_size);
+            flat_batches.push(batch);
         }
 
-        if !exceeded {
-            // Data fits in memory — use the regular SortExec path for correctness
-            // Create a temporary MemoryTableExec with our already-collected data
+        if crossing_batch.is_none() {
+            // Never crossed the threshold: the input genuinely fits — the
+            // ordinary in-memory case, reached without ever risking an
+            // unbounded collection to get here.
+            if flat_batches.is_empty() {
+                return Ok(Box::pin(stream::empty()));
+            }
+            // Data fits in memory — use the regular SortExec path for
+            // correctness. Create a temporary MemoryTableExec with our
+            // already-collected data.
             let mem = crate::physical::operators::MemoryTableExec::new(
                 "sort_input",
                 self.schema.clone(),
-                all_batches,
+                flat_batches,
                 None,
             );
             let sort = if let Some(fetch) = self.fetch {
@@ -2209,7 +3869,7 @@ impl PhysicalOperator for ExternalSortExec {
             return sort.execute(0).await;
         }
 
-        // Data exceeds memory — use external sort with spilling
+        // Threshold crossed mid-stream — external sort with spilling.
         self.config.ensure_spill_dir()?;
 
         let spill_id = SPILL_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -2221,45 +3881,113 @@ impl PhysicalOperator for ExternalSortExec {
             QueryError::Execution(format!("Failed to create spill directory: {}", e))
         })?;
 
-        let input_stream: RecordBatchStream =
-            Box::pin(stream::iter(all_batches.into_iter().map(Ok)));
+        if std::env::var("QE_SPILL_DEBUG").is_ok() {
+            eprintln!(
+                "[spill-sort] threshold crossed mid-stream at {} buffered batches ({} bytes, \
+                 threshold {}) — entering streaming run-generation path",
+                flat_batches.len() + 1,
+                flat_size,
+                memory_threshold
+            );
+        }
 
-        // Generate sorted runs
-        let runs = self.generate_runs(input_stream, &spill_dir).await?;
+        // Phase 2: everything gathered so far (`flat_batches`), plus the
+        // crossing batch, plus whatever remains of the stream, feeds
+        // `generate_runs`'s bounded buffer-to-threshold / cut-sorted-run
+        // ingestion loop. Nothing collected in phase 1 is thrown away or
+        // re-pulled from the source (mirrors the aggregate's phase 2).
+        let combined: RecordBatchStream = Box::pin(
+            stream::iter(flat_batches.into_iter().chain(crossing_batch).map(Ok))
+                .chain(input_stream),
+        );
 
-        // Merge runs
-        let result = if runs.is_empty() {
-            Vec::new()
-        } else if runs.len() == 1 {
-            if runs[0].is_file() {
-                read_parquet(&runs[0])?
-            } else {
-                Vec::new()
+        // Generate sorted runs, batch by batch.
+        let runs = self.generate_runs(combined, &spill_dir).await?;
+
+        if std::env::var("QE_SPILL_DEBUG").is_ok() {
+            eprintln!(
+                "[spill-sort] {} sorted run(s) generated in {:?}",
+                runs.len(),
+                spill_dir
+            );
+        }
+
+        if runs.is_empty() {
+            let _ = std::fs::remove_dir_all(&spill_dir);
+            return Ok(Box::pin(stream::empty()));
+        }
+
+        // Merge the runs on a blocking thread, delivering merged batches
+        // through a small bounded channel that IS this operator's output
+        // stream — the merged result is never re-materialized into one
+        // Vec (the full sorted output is the size of the entire input,
+        // exactly what this operator just spilled to AVOID holding). The
+        // merge machinery itself is unchanged (same multi-pass reduction,
+        // same k-way merge core, same carried-run bookkeeping and
+        // buffer-transition flush) — only the DELIVERY of already-built
+        // output batches changed from `Vec::push` to a channel send.
+        //
+        // The merge thread owns spill-dir cleanup: it removes the
+        // directory when the merge finishes, errors, OR aborts early
+        // because the receiver was dropped (query abandoned / LIMIT
+        // satisfied below — the next sink send fails and the merge
+        // returns).
+        let merger = self.merger();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(4);
+        let cleanup_dir = spill_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let batch_tx = tx.clone();
+            let mut sink = move |batch: RecordBatch| -> Result<bool> {
+                Ok(batch_tx.blocking_send(Ok(batch)).is_ok())
+            };
+            if let Err(e) = merger.merge_runs_into(&runs, &mut sink) {
+                let _ = tx.blocking_send(Err(e));
             }
-        } else {
-            self.merge_runs(&runs)?
-        };
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        });
+        let merged = tokio_stream::wrappers::ReceiverStream::new(rx);
 
-        // Apply the top-K `fetch` limit, mirroring the in-memory branch above
-        // (`SortExec::with_fetch`). The top-k fusion rule in `planner.rs`
-        // (`LogicalPlan::Limit` folding a `skip == 0` LIMIT directly into
-        // `ExternalSortExec::with_fetch` instead of wrapping a separate
-        // `LimitExec` around it) means THIS is the only place a spilled
-        // `ORDER BY ... LIMIT N` query's row count is ever truncated — before
-        // this fix, `self.fetch` was read by `with_fetch`/`new` but never
-        // consulted again anywhere in this spill branch, so `runs`/`result`
-        // (a correct, fully globally-sorted top-K PREFIX followed by every
-        // remaining row) was returned in full: correct values, wrong (too
-        // large) row count.
-        let result = match self.fetch {
-            Some(fetch) => truncate_batches_to_limit(result, fetch),
-            None => result,
-        };
-
-        // Clean up
-        let _ = std::fs::remove_dir_all(&spill_dir);
-
-        Ok(Box::pin(stream::iter(result.into_iter().map(Ok))))
+        // Apply the top-K `fetch` limit, mirroring the in-memory branch
+        // above (`SortExec::with_fetch`). The top-k fusion rule in
+        // `planner.rs` (`LogicalPlan::Limit` folding a `skip == 0` LIMIT
+        // directly into `ExternalSortExec::with_fetch` instead of wrapping
+        // a separate `LimitExec` around it) means THIS is the only place a
+        // spilled `ORDER BY ... LIMIT N` query's row count is ever
+        // truncated — the merge produces every row of the sort, not just
+        // the top-K prefix (spill-join-correctness-2 task 004's fix,
+        // preserved). Applied per arriving batch via the SAME
+        // `truncate_batches_to_limit` helper (one implementation of the
+        // slicing semantics, not two); once the limit is reached the
+        // stream ends, the receiver drops, and the merge thread aborts
+        // early instead of merging rows nobody will read.
+        match self.fetch {
+            Some(fetch) => {
+                let limited = merged.scan(fetch, |remaining, item| {
+                    futures::future::ready(match item {
+                        Err(e) => {
+                            *remaining = 0;
+                            Some(Err(e))
+                        }
+                        Ok(batch) => {
+                            if *remaining == 0 {
+                                None
+                            } else {
+                                let mut kept = truncate_batches_to_limit(vec![batch], *remaining);
+                                match kept.pop() {
+                                    Some(b) => {
+                                        *remaining -= b.num_rows();
+                                        Some(Ok(b))
+                                    }
+                                    None => None,
+                                }
+                            }
+                        }
+                    })
+                });
+                Ok(Box::pin(limited))
+            }
+            None => Ok(Box::pin(merged)),
+        }
     }
 
     fn name(&self) -> &str {
@@ -2282,6 +4010,8 @@ impl ExternalSortExec {
         while let Some(batch) = input_stream.try_next().await? {
             let batch_size = estimate_batch_size(&batch);
 
+            // The batch is already in memory when this decision is made: record it.
+            self.memory_pool.observe(buffer_size + batch_size);
             if buffer_size + batch_size > memory_threshold && !buffer.is_empty() {
                 // Sort buffer and write run
                 let run_path = spill_dir.join(format!("run_{}.parquet", runs.len()));
@@ -2295,6 +4025,7 @@ impl ExternalSortExec {
 
             buffer.push(batch);
             buffer_size += batch_size;
+            self.memory_pool.observe(buffer_size);
         }
 
         // Flush remaining buffer. This is still a spill — the run is written to
@@ -2367,32 +4098,132 @@ impl ExternalSortExec {
         Ok(())
     }
 
-    fn merge_runs(&self, runs: &[PathBuf]) -> Result<Vec<RecordBatch>> {
-        // Streaming k-way merge: process runs in batches to limit memory
-        // Maximum number of runs to merge at once
-        const MAX_MERGE_FANIN: usize = 8;
-        // Maximum rows to buffer per run during merge
-        const MERGE_BUFFER_ROWS: usize = 8192;
+    /// Build the owned, `'static` merge-machinery handle `execute()`'s
+    /// spill branch hands to its blocking merge thread. The merge methods
+    /// live on `SortRunMerger` (not `&self`) purely so they can be MOVED
+    /// onto that thread — every algorithm is byte-for-byte the code that
+    /// used to live on `ExternalSortExec` itself.
+    fn merger(&self) -> SortRunMerger {
+        SortRunMerger {
+            order_by: self.order_by.clone(),
+            schema: self.schema.clone(),
+        }
+    }
 
+    /// Test-only Vec-collecting entry point (regression tests
+    /// `external_sort_multi_pass_merge_survives_a_leftover_singleton_chunk`
+    /// etc. call this); production merging goes through
+    /// `SortRunMerger::merge_runs_into`'s sink form.
+    #[cfg(test)]
+    fn merge_runs(&self, runs: &[PathBuf]) -> Result<Vec<RecordBatch>> {
+        let merger = self.merger();
+        let mut out = Vec::new();
+        let mut sink = |batch: RecordBatch| -> Result<bool> {
+            out.push(batch);
+            Ok(true)
+        };
+        merger.merge_runs_into(runs, &mut sink)?;
+        Ok(out)
+    }
+
+    /// Test-only Vec-collecting entry point (regression test
+    /// `k_way_merge_survives_a_run_needing_more_than_one_buffer_load`
+    /// calls this).
+    #[cfg(test)]
+    fn streaming_k_way_merge(
+        &self,
+        runs: &[PathBuf],
+        buffer_rows: usize,
+    ) -> Result<Vec<RecordBatch>> {
+        let merger = self.merger();
+        let mut out = Vec::new();
+        let mut sink = |batch: RecordBatch| -> Result<bool> {
+            out.push(batch);
+            Ok(true)
+        };
+        merger.streaming_k_way_merge_into(runs, buffer_rows, &mut sink)?;
+        Ok(out)
+    }
+}
+
+/// The run-merge machinery of `ExternalSortExec`, factored onto an owned,
+/// `Send + 'static` value so `execute()`'s spill branch can run it on a
+/// `spawn_blocking` thread that streams merged batches out through a
+/// bounded channel instead of accumulating the ENTIRE sorted output into
+/// one `Vec<RecordBatch>` (which is the size of the whole input — exactly
+/// the materialization this operator spills to avoid;
+/// oom-safety-hardening task 003). The algorithms themselves — multi-pass
+/// reduction, carried-run bookkeeping, the k-way merge core with its
+/// buffer-transition flush, `batch_with_actual_types` reconciliation —
+/// are unchanged from when these methods lived on `ExternalSortExec`.
+///
+/// Every output-producing method takes a `sink: &mut dyn FnMut(RecordBatch)
+/// -> Result<bool>`; a sink returning `Ok(false)` means "stop producing"
+/// (the consumer is gone — query abandoned, or a fused `LIMIT` already
+/// satisfied) and the merge returns early and cleanly.
+struct SortRunMerger {
+    order_by: Vec<crate::planner::SortExpr>,
+    schema: SchemaRef,
+}
+
+impl SortRunMerger {
+    /// Maximum number of runs to merge at once.
+    const MAX_MERGE_FANIN: usize = 8;
+    /// Maximum rows to buffer per run during merge.
+    const MERGE_BUFFER_ROWS: usize = 8192;
+
+    /// Merge `runs` (already individually sorted) into globally-sorted
+    /// output batches, delivered through `sink`.
+    fn merge_runs_into(
+        &self,
+        runs: &[PathBuf],
+        sink: &mut dyn FnMut(RecordBatch) -> Result<bool>,
+    ) -> Result<()> {
         if runs.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         if runs.len() == 1 {
-            return read_parquet(&runs[0]);
+            // A single run is already globally sorted — stream it straight
+            // off disk in bounded reads (the old code's `read_parquet`
+            // one-shot load, made incremental).
+            if !runs[0].is_file() {
+                return Ok(());
+            }
+            let file = File::open(&runs[0]).map_err(|e| {
+                QueryError::Execution(format!("Failed to open run file {:?}: {}", runs[0], e))
+            })?;
+            let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+                .with_batch_size(Self::MERGE_BUFFER_ROWS)
+                .build()?;
+            for batch in reader {
+                if !sink(batch?)? {
+                    return Ok(());
+                }
+            }
+            return Ok(());
         }
 
-        // If we have too many runs, merge in multiple passes
-        if runs.len() > MAX_MERGE_FANIN {
-            return self.multi_pass_merge(runs, MAX_MERGE_FANIN);
+        // If we have too many runs, reduce in multiple passes first.
+        if runs.len() > Self::MAX_MERGE_FANIN {
+            let reduced = self.reduce_runs_to_fanin(runs, Self::MAX_MERGE_FANIN)?;
+            return self.streaming_k_way_merge_into(&reduced, Self::MERGE_BUFFER_ROWS, sink);
         }
 
-        // Single-pass k-way merge with bounded memory
-        self.streaming_k_way_merge(runs, MERGE_BUFFER_ROWS)
+        // Single-pass k-way merge with bounded memory.
+        self.streaming_k_way_merge_into(runs, Self::MERGE_BUFFER_ROWS, sink)
     }
 
-    /// Multi-pass merge for when there are too many runs
-    fn multi_pass_merge(&self, runs: &[PathBuf], fanin: usize) -> Result<Vec<RecordBatch>> {
+    /// Multi-pass reduction for when there are too many runs: repeatedly
+    /// merge `fanin`-sized chunks of runs into new on-disk runs until at
+    /// most `fanin` remain (the FINAL merge is the caller's, so it can
+    /// stream). Each chunk's merged output is sunk straight into an open
+    /// `ArrowWriter` (`append_batch_streaming`, the join/agg spill paths'
+    /// own open-writer plumbing) instead of the previous
+    /// collect-into-a-Vec-then-`write_batches_to_parquet` — a chunk of
+    /// `fanin` runs each ~`memory_threshold`-sized would otherwise
+    /// materialize `fanin * threshold` bytes per intermediate pass.
+    fn reduce_runs_to_fanin(&self, runs: &[PathBuf], fanin: usize) -> Result<Vec<PathBuf>> {
         let mut current_runs = runs.to_vec();
         let mut pass = 0;
 
@@ -2406,15 +4237,23 @@ impl ExternalSortExec {
                 if chunk.len() == 1 {
                     next_runs.push(chunk[0].clone());
                 } else {
-                    // Merge this chunk into a new run
-                    let merged = self.streaming_k_way_merge(chunk, 8192)?;
-                    if !merged.is_empty() {
-                        let output_path = spill_dir.join(format!(
-                            "merged_pass{}_{}.parquet",
-                            pass,
-                            next_runs.len()
-                        ));
-                        write_batches_to_parquet(&output_path, &merged)?;
+                    // Merge this chunk into a new run, streamed batch by
+                    // batch into an open writer (lazily created on the
+                    // first batch, so an empty chunk merge creates no file
+                    // and pushes no run — mirrors the old
+                    // `if !merged.is_empty()` guard).
+                    let output_path =
+                        spill_dir.join(format!("merged_pass{}_{}.parquet", pass, next_runs.len()));
+                    let mut writer_slot: Option<ArrowWriter<File>> = None;
+                    {
+                        let mut sink = |batch: RecordBatch| -> Result<bool> {
+                            append_batch_streaming(&mut writer_slot, &output_path, &batch)?;
+                            Ok(true)
+                        };
+                        self.streaming_k_way_merge_into(chunk, Self::MERGE_BUFFER_ROWS, &mut sink)?;
+                    }
+                    if let Some(writer) = writer_slot {
+                        writer.close()?;
                         next_runs.push(output_path);
                     }
                 }
@@ -2448,20 +4287,35 @@ impl ExternalSortExec {
             pass += 1;
         }
 
-        // Final merge
-        self.streaming_k_way_merge(&current_runs, 8192)
+        Ok(current_runs)
     }
 
-    /// Streaming k-way merge with bounded memory usage
-    fn streaming_k_way_merge(
+    /// Streaming k-way merge with bounded memory usage, delivering each
+    /// built output batch through `sink` as soon as it exists instead of
+    /// accumulating a `result_batches` Vec (whose total size is the whole
+    /// merged output). The merge ALGORITHM — row-by-row min-scan, the
+    /// buffer-transition flush, `build_merged_batch`(+`_final` fallback)
+    /// construction — is unchanged.
+    ///
+    /// One hoist, semantics-preserving (oom-safety-hardening task 003):
+    /// sort-key columns are evaluated ONCE per LOADED buffer
+    /// (`eval_key_cols`), not twice per row-COMPARISON as the old
+    /// `compare_rows` closure did — `evaluate_expr` is deterministic per
+    /// batch, so per-comparison re-evaluation only cost time (billions of
+    /// calls for a 250M-row merge: rows × fan-in × keys × 2), never
+    /// changed a result. A key expression that fails to evaluate is
+    /// skipped for the comparison (both sides), exactly as the old
+    /// `.ok()`-based closure did.
+    fn streaming_k_way_merge_into(
         &self,
         runs: &[PathBuf],
         buffer_rows: usize,
-    ) -> Result<Vec<RecordBatch>> {
+        sink: &mut dyn FnMut(RecordBatch) -> Result<bool>,
+    ) -> Result<()> {
         use std::cmp::Ordering;
 
         if runs.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         // Open iterators for each run
@@ -2470,6 +4324,18 @@ impl ExternalSortExec {
         > = Vec::new();
         let mut run_buffers: Vec<Option<RecordBatch>> = Vec::new();
         let mut run_indices: Vec<usize> = Vec::new(); // Current row index in each buffer
+                                                      // Hoisted sort-key columns for each run's CURRENT buffer, one
+                                                      // entry per `order_by` expression (None = that key failed to
+                                                      // evaluate against this buffer — skipped in comparisons, matching
+                                                      // the old per-comparison `.ok()` behavior).
+        let mut run_keys: Vec<Vec<Option<ArrayRef>>> = Vec::new();
+
+        let eval_key_cols = |batch: &RecordBatch| -> Vec<Option<ArrayRef>> {
+            self.order_by
+                .iter()
+                .map(|s| evaluate_expr(batch, &s.expr).ok())
+                .collect()
+        };
 
         for run in runs {
             let file = File::open(run).map_err(|e| {
@@ -2481,34 +4347,33 @@ impl ExternalSortExec {
             run_iterators.push(Box::new(reader));
             run_buffers.push(None);
             run_indices.push(0);
+            run_keys.push(Vec::new());
         }
 
         // Load initial batch from each run
         for (i, iter) in run_iterators.iter_mut().enumerate() {
             if let Some(batch_result) = iter.next() {
-                run_buffers[i] = Some(batch_result?);
+                let batch = batch_result?;
+                run_keys[i] = eval_key_cols(&batch);
+                run_buffers[i] = Some(batch);
                 run_indices[i] = 0;
             }
         }
 
         // Build output batches using a simple row-by-row merge
         // For better performance, we'd want to do vectorized merge, but this is memory-safe
-        let mut result_batches = Vec::new();
         let mut output_rows: Vec<(usize, usize)> = Vec::new(); // (run_idx, row_idx)
 
-        // Helper to compare rows
-        let compare_rows = |batch_a: &RecordBatch,
+        // Helper to compare rows via the hoisted key columns.
+        let compare_rows = |keys_a: &[Option<ArrayRef>],
                             row_a: usize,
-                            batch_b: &RecordBatch,
+                            keys_b: &[Option<ArrayRef>],
                             row_b: usize,
                             order_by: &[crate::planner::SortExpr]|
          -> std::cmp::Ordering {
-            for sort_expr in order_by {
-                let col_a = evaluate_expr(batch_a, &sort_expr.expr).ok();
-                let col_b = evaluate_expr(batch_b, &sort_expr.expr).ok();
-
-                if let (Some(a), Some(b)) = (col_a, col_b) {
-                    let cmp = compare_array_values(&a, row_a, &b, row_b);
+            for (key_idx, sort_expr) in order_by.iter().enumerate() {
+                if let (Some(a), Some(b)) = (&keys_a[key_idx], &keys_b[key_idx]) {
+                    let cmp = compare_array_values(a, row_a, b, row_b);
                     let cmp = if sort_expr.direction == crate::planner::SortDirection::Desc {
                         cmp.reverse()
                     } else {
@@ -2534,9 +4399,9 @@ impl ExternalSortExec {
                             None => Some(run_idx),
                             Some(current_min) => {
                                 let cmp = compare_rows(
-                                    batch,
+                                    &run_keys[run_idx],
                                     run_indices[run_idx],
-                                    run_buffers[current_min].as_ref().unwrap(),
+                                    &run_keys[current_min],
                                     run_indices[current_min],
                                     &self.order_by,
                                 );
@@ -2591,15 +4456,20 @@ impl ExternalSortExec {
                             // invariant `build_merged_batch` requires.
                             if !output_rows.is_empty() {
                                 let batch = self.build_merged_batch(&run_buffers, &output_rows)?;
-                                result_batches.push(batch);
                                 output_rows.clear();
+                                if !sink(batch)? {
+                                    return Ok(());
+                                }
                             }
                             // Try to load next batch from this run
                             if let Some(next_batch) = run_iterators[run_idx].next() {
-                                run_buffers[run_idx] = Some(next_batch?);
+                                let batch = next_batch?;
+                                run_keys[run_idx] = eval_key_cols(&batch);
+                                run_buffers[run_idx] = Some(batch);
                                 run_indices[run_idx] = 0;
                             } else {
                                 run_buffers[run_idx] = None;
+                                run_keys[run_idx] = Vec::new();
                             }
                         }
                     }
@@ -2607,8 +4477,10 @@ impl ExternalSortExec {
                     // Flush output when buffer is full
                     if output_rows.len() >= buffer_rows {
                         let batch = self.build_merged_batch(&run_buffers, &output_rows)?;
-                        result_batches.push(batch);
                         output_rows.clear();
+                        if !sink(batch)? {
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -2624,14 +4496,29 @@ impl ExternalSortExec {
         if !output_rows.is_empty() {
             // For the final batch, we need to reload any exhausted buffers
             // that are referenced in output_rows
-            let batch = self.build_merged_batch_final(&runs, &output_rows, buffer_rows)?;
-            result_batches.push(batch);
+            let batch = self.build_merged_batch_final(runs, &output_rows, buffer_rows)?;
+            if !sink(batch)? {
+                return Ok(());
+            }
         }
 
-        Ok(result_batches)
+        Ok(())
     }
 
-    /// Build a merged batch from the given row references
+    /// Build a merged batch from the given row references.
+    ///
+    /// Fast path (oom-safety-hardening task 003, semantics-preserving):
+    /// when every referenced run buffer is present, wide enough, and the
+    /// referenced buffers agree on column types, gather with ONE
+    /// `arrow::compute::interleave` call per column — the kernel built for
+    /// exactly this (row_idx, batch)-addressed k-way-merge output shape —
+    /// instead of the generic path below, which materializes a fresh
+    /// 1-ROW array per output row per column and then concatenates
+    /// thousands of them (the dominant merge cost at real spill scale:
+    /// 2 arrays/row/column). The generic path is KEPT verbatim as the
+    /// fallback for any shape the fast path can't prove safe (missing
+    /// buffer, short batch, cross-run type disagreement), and both paths
+    /// end in the same `batch_with_actual_types` reconciliation.
     fn build_merged_batch(
         &self,
         run_buffers: &[Option<RecordBatch>],
@@ -2640,6 +4527,53 @@ impl ExternalSortExec {
         if rows.is_empty() {
             return Ok(RecordBatch::new_empty(self.schema.clone()));
         }
+
+        let num_cols = self.schema.fields().len();
+
+        // ---- interleave fast path ------------------------------------
+        let mut referenced: Vec<usize> = rows.iter().map(|&(run_idx, _)| run_idx).collect();
+        referenced.sort_unstable();
+        referenced.dedup();
+
+        let mut fast_ok = referenced
+            .iter()
+            .all(|&r| matches!(&run_buffers[r], Some(b) if b.num_columns() >= num_cols));
+        if fast_ok {
+            if let Some((&first_ref, rest)) = referenced.split_first() {
+                let first = run_buffers[first_ref].as_ref().unwrap();
+                'cols: for col_idx in 0..num_cols {
+                    let dt = first.column(col_idx).data_type();
+                    for &r in rest {
+                        if run_buffers[r].as_ref().unwrap().column(col_idx).data_type() != dt {
+                            fast_ok = false;
+                            break 'cols;
+                        }
+                    }
+                }
+            }
+        }
+        if fast_ok {
+            // Dense position of each referenced run in the interleave
+            // input array list.
+            let mut dense_pos = vec![usize::MAX; run_buffers.len()];
+            for (pos, &r) in referenced.iter().enumerate() {
+                dense_pos[r] = pos;
+            }
+            let indices: Vec<(usize, usize)> = rows
+                .iter()
+                .map(|&(run_idx, row_idx)| (dense_pos[run_idx], row_idx))
+                .collect();
+            let mut final_columns: Vec<ArrayRef> = Vec::with_capacity(num_cols);
+            for col_idx in 0..num_cols {
+                let arrays: Vec<&dyn arrow::array::Array> = referenced
+                    .iter()
+                    .map(|&r| run_buffers[r].as_ref().unwrap().column(col_idx).as_ref())
+                    .collect();
+                final_columns.push(compute::interleave(&arrays, &indices)?);
+            }
+            return batch_with_actual_types(&self.schema, final_columns);
+        }
+        // ---- generic fallback (pre-existing path, unchanged) ---------
 
         // Group rows by run
         let mut run_row_groups: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
@@ -2651,7 +4585,6 @@ impl ExternalSortExec {
         }
 
         // Build output columns
-        let num_cols = self.schema.fields().len();
         let mut output_columns: Vec<Vec<(usize, ArrayRef)>> = vec![Vec::new(); num_cols];
 
         for (run_idx, row_list) in run_row_groups {
@@ -2849,10 +4782,64 @@ fn truncate_batches_to_limit(batches: Vec<RecordBatch>, limit: usize) -> Vec<Rec
 /// which for an array sliced out of a larger allocation — every batch an
 /// mmap-backed IPC read produces — counts the whole mapping per batch. Spill
 /// decisions made on that number spill everything unconditionally (and the
-/// spilled join's build-side estimate was off by ~50x). Offsets-based sizing
+/// spilled join's build-side estimate was off by ~50x, and by ~4,000x for a
+/// Dictionary-column-heavy build side — see below). Offsets-based sizing
 /// counts the rows the batch actually references; unknown types fall back to
-/// the capacity number, which over- rather than under-counts (the safe
-/// direction for a spill decision).
+/// a slice-aware generic computation (see below), which over- rather than
+/// under-counts (the safe direction for a spill decision) but never counts
+/// an mmap segment's whole on-disk size.
+///
+/// `spill-size-estimate-fix` epic, task 001 (2026-08-28): the generic
+/// fallback used to be `c.get_array_memory_size()`, which walks each
+/// `Buffer`'s `capacity()` — and for a `Buffer` built by
+/// `Buffer::from_custom_allocation` (every column read through
+/// `ipc_cache.rs`'s mmap path, i.e. every native-table and IPC-sidecar
+/// scan), `capacity()` unconditionally returns the FULL LENGTH PASSED AT
+/// MMAP TIME, forever, regardless of how small a slice/sub-buffer is later
+/// carved out of it (`Bytes::capacity()`'s `Deallocation::Custom(_, size)`
+/// arm returns the original `size`, not the current view's length — see
+/// arrow-buffer's `bytes.rs`). One mmap `Buffer` backs an ENTIRE segment
+/// file and is shared by every column's every sub-buffer in that segment,
+/// so ANY type reaching this fallback reported the whole segment file's
+/// on-disk size as its own — confirmed via `examples/
+/// spill_size_estimate_check.rs`: Q12's real ~42MB Dictionary-column-heavy
+/// build side estimated at ~167.7GB (~4,000x over), which crossed the spill
+/// threshold and forced an unnecessary spill.
+///
+/// Fix: fall back to `ArrayData::get_slice_memory_size()` (arrow-data)
+/// instead. It computes size purely from the array's own LOGICAL length and
+/// data-type layout — for `Dictionary(K, V)` specifically: `self.len *
+/// size_of::<K>()` for the keys (the type's own `layout()` delegates to the
+/// key type's fixed-width layout) PLUS the dictionary VALUES array's own
+/// real content bytes, computed by recursing into `child_data[0]` (arrow
+/// stores a `DictionaryArray`'s values as its first — and only — child
+/// `ArrayData`) — i.e. exactly `keys.len() * key_width +
+/// dictionary_values_actual_bytes`, this function's own target formula, but
+/// generalized by arrow itself to ANY key/value type combination rather
+/// than hand-rolled against one hard-coded `Int32Type`/`StringArray` shape.
+/// It NEVER reads `Buffer::capacity()`. This generalizes the SAME fix to
+/// every other type that previously reached this fallback and could carry
+/// the identical mmap-capacity-vs-logical-content problem — `LargeUtf8`/
+/// `LargeBinary` (content-aware via `typed_offsets::<i64>()`, the exact
+/// same offsets-delta approach this function's own Utf8/Binary branch
+/// above already uses by hand), `FixedSizeBinary`/`Union` (fixed-width,
+/// scaled by `self.len`, not by buffer capacity), and `List`/`LargeList`/
+/// `Struct`/`Map`/`FixedSizeList`/`RunEndEncoded` (offsets sized by
+/// `self.len`, recursing into child `ArrayData` the same way Dictionary's
+/// values do) — audited against this engine's actual mmap-backed write
+/// surface: `NativeManifest::ManifestDataType::from_arrow` (`src/storage/
+/// native_manifest.rs`) is the ONLY schema gate a native table (or an IPC
+/// sidecar, which mirrors the same coercion) can be written through, and it
+/// explicitly REJECTS every nested type (List/Struct/Map/Union/
+/// FixedSizeList/RunEndEncoded) at write time — so those are not reachable
+/// via this engine's own mmap-backed tables today, but are still fixed here
+/// defensively (never worse than the old behavior, no correctness/
+/// performance cost when unreached) rather than left as a live landmine for
+/// a future writer that adds them. `.unwrap_or_else(|_| c.
+/// get_array_memory_size())` is a defensive-only fallback for the
+/// `Result`'s error path (not expected to fire for any type this function
+/// can be called with) — if it ever does, it lands back on the OLD,
+/// over-counting-safe behavior, never a new failure mode.
 fn estimate_batch_size(batch: &RecordBatch) -> usize {
     use arrow::array::Array;
     batch
@@ -2880,7 +4867,10 @@ fn estimate_batch_size(batch: &RecordBatch) -> usize {
                     };
                     data + rows * 4 + null_bytes
                 }
-                _ => c.get_array_memory_size(),
+                _ => c
+                    .to_data()
+                    .get_slice_memory_size()
+                    .unwrap_or_else(|_| c.get_array_memory_size()),
             }
         })
         .sum()
@@ -2904,73 +4894,6 @@ fn find_largest_agg_partition(partitions: &[Option<AggregatePartition>]) -> Opti
         .filter_map(|(idx, p)| p.as_ref().map(|part| (idx, part.memory_bytes)))
         .max_by_key(|(_, size)| *size)
         .map(|(idx, _)| idx)
-}
-
-/// Merge two parquet files into one, using streaming to limit memory
-fn merge_parquet_files(
-    existing: &PathBuf,
-    new_file: &PathBuf,
-    spill_dir: &PathBuf,
-    partition_idx: usize,
-) -> Result<()> {
-    // Use a streaming approach: create a new merged file
-    let merged_path = spill_dir.join(format!("merged_{}.parquet", partition_idx));
-
-    // Open readers for both files
-    let file1 = File::open(existing)
-        .map_err(|e| QueryError::Execution(format!("Failed to open file {:?}: {}", existing, e)))?;
-    let file2 = File::open(new_file)
-        .map_err(|e| QueryError::Execution(format!("Failed to open file {:?}: {}", new_file, e)))?;
-
-    let reader1 = ParquetRecordBatchReaderBuilder::try_new(file1)?
-        .with_batch_size(8192)
-        .build()?;
-    let reader2 = ParquetRecordBatchReaderBuilder::try_new(file2)?
-        .with_batch_size(8192)
-        .build()?;
-
-    // Get schema from first file
-    let schema = {
-        let file = File::open(existing)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-        builder.schema().clone()
-    };
-
-    // Create output file
-    let output_file = File::create(&merged_path).map_err(|e| {
-        QueryError::Execution(format!(
-            "Failed to create merged file {:?}: {}",
-            merged_path, e
-        ))
-    })?;
-
-    let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .build();
-
-    let mut writer = ArrowWriter::try_new(output_file, schema, Some(props))?;
-
-    // Stream batches from both files
-    for batch_result in reader1 {
-        let batch = batch_result?;
-        writer.write(&batch)?;
-    }
-
-    for batch_result in reader2 {
-        let batch = batch_result?;
-        writer.write(&batch)?;
-    }
-
-    writer.close()?;
-
-    // Replace existing file with merged file
-    std::fs::rename(&merged_path, existing)
-        .map_err(|e| QueryError::Execution(format!("Failed to rename merged file: {}", e)))?;
-
-    // Remove the new file since it's been merged
-    let _ = std::fs::remove_file(new_file);
-
-    Ok(())
 }
 
 /// Compare two array values at given indices
@@ -3030,18 +4953,20 @@ fn compare_array_values(
 }
 
 /// Partition a batch by hash of key columns
-fn partition_batch_by_hash(
+/// The join spill path's ONE partition-routing definition (join-spill-
+/// streaming task 003): the partition id of every row of `batch`. Used by
+/// `partition_batch_by_hash` (build side, single-batch probe callers) and
+/// by phase A's grouped probe path (`phase_a_process_group`), so both
+/// route a key identically by construction.
+fn partition_row_ids(
     batch: &RecordBatch,
     key_exprs: &[Expr],
     num_partitions: usize,
-) -> Result<Vec<Option<RecordBatch>>> {
-    let key_arrays: Result<Vec<ArrayRef>> =
-        key_exprs.iter().map(|e| evaluate_expr(batch, e)).collect();
-    let key_arrays = key_arrays?;
-
-    // Compute partition for each row
-    let mut partition_indices: Vec<Vec<usize>> = (0..num_partitions).map(|_| Vec::new()).collect();
-
+) -> Result<Vec<u32>> {
+    // task 004: `join_key_arrays` (Dictionary keys decoded; everything
+    // else byte-identical to the previous inline evaluation).
+    let key_arrays = join_key_arrays(batch, key_exprs)?;
+    let mut ids: Vec<u32> = Vec::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
         let key = extract_join_key(&key_arrays, row);
         // EXPLICITLY seeded: partition routing must give the same answer for
@@ -3051,8 +4976,23 @@ fn partition_batch_by_hash(
         // groups across partitions. Never rely on a default for this.
         let mut hasher = xxhash_rust::xxh64::Xxh64::new(0x517c_c1b7_2722_0a95);
         key.hash(&mut hasher);
-        let partition = (hasher.finish() as usize) % num_partitions;
-        partition_indices[partition].push(row);
+        ids.push(((hasher.finish() as usize) % num_partitions) as u32);
+    }
+    Ok(ids)
+}
+
+fn partition_batch_by_hash(
+    batch: &RecordBatch,
+    key_exprs: &[Expr],
+    num_partitions: usize,
+) -> Result<Vec<Option<RecordBatch>>> {
+    // Compute partition for each row
+    let mut partition_indices: Vec<Vec<usize>> = (0..num_partitions).map(|_| Vec::new()).collect();
+    for (row, p) in partition_row_ids(batch, key_exprs, num_partitions)?
+        .into_iter()
+        .enumerate()
+    {
+        partition_indices[p as usize].push(row);
     }
 
     // Build batches for each partition
@@ -3074,6 +5014,80 @@ fn partition_batch_by_hash(
         }
     }
 
+    Ok(result)
+}
+
+/// `SpillableHashAggregateExec`'s partition routing (oom-safety-hardening
+/// task 002): the same fixed-seed `hash % num_partitions` loop as
+/// `partition_batch_by_hash`, with ONE aggregate-specific difference — a
+/// `Dictionary`-encoded group-key column is decoded to its value type
+/// before key extraction. `extract_join_key`'s downcast chain has no
+/// Dictionary arm (it falls through to `JoinValue::Null`), which for the
+/// JOIN is merely degenerate routing, but for an aggregate would (a) route
+/// EVERY row of a Dictionary-keyed GROUP BY into one partition (still
+/// correct — groups never split — but the memory bounding this operator
+/// exists for degenerates to nothing) and (b) make the finalize step's
+/// sub-partitioning (`aggregate_partition_chunked`) structurally unable to
+/// split such a partition. Decoding makes the routing value the SAME
+/// string `hash_agg::extract_group_value` resolves a Dictionary key to,
+/// and it is applied identically at ingestion time and read-back time
+/// (Parquet spill files preserve Dictionary via the embedded Arrow
+/// schema), so routing is stable across the spill round trip.
+///
+/// Deliberately a SEPARATE function rather than a change to
+/// `partition_batch_by_hash`: that function is part of the join's
+/// build/probe partition routing, which oom-safety-hardening task 002 is
+/// hard-bounded from touching (the open ~0.34% duplicate-counting bug
+/// lives somewhere in that logic; its routing must stay byte-identical).
+fn partition_batch_by_group_hash(
+    batch: &RecordBatch,
+    group_by: &[Expr],
+    num_partitions: usize,
+) -> Result<Vec<Option<RecordBatch>>> {
+    let key_arrays: Result<Vec<ArrayRef>> = group_by
+        .iter()
+        .map(|e| {
+            let arr = evaluate_expr(batch, e)?;
+            match arr.data_type() {
+                arrow::datatypes::DataType::Dictionary(_, value_type) => {
+                    compute::cast(arr.as_ref(), value_type).map_err(Into::into)
+                }
+                _ => Ok(arr),
+            }
+        })
+        .collect();
+    let key_arrays = key_arrays?;
+
+    let mut partition_indices: Vec<Vec<usize>> = (0..num_partitions).map(|_| Vec::new()).collect();
+    for row in 0..batch.num_rows() {
+        let key = extract_join_key(&key_arrays, row);
+        // Same EXPLICITLY seeded hasher as `partition_batch_by_hash` (see
+        // its comment): routing must give the same answer for the same key
+        // from every call site — including this function called at modulus
+        // `NUM_PARTITIONS` (ingestion) and `NUM_PARTITIONS * fan`
+        // (chunked read-back), whose residues must agree mod NUM_PARTITIONS.
+        let mut hasher = xxhash_rust::xxh64::Xxh64::new(0x517c_c1b7_2722_0a95);
+        key.hash(&mut hasher);
+        let partition = (hasher.finish() as usize) % num_partitions;
+        partition_indices[partition].push(row);
+    }
+
+    let mut result: Vec<Option<RecordBatch>> = Vec::with_capacity(num_partitions);
+    for indices in partition_indices {
+        if indices.is_empty() {
+            result.push(None);
+        } else {
+            let indices_arr =
+                UInt32Array::from(indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
+            let columns: Result<Vec<ArrayRef>> = batch
+                .columns()
+                .iter()
+                .map(|col| compute::take(col.as_ref(), &indices_arr, None).map_err(Into::into))
+                .collect();
+            let part_batch = RecordBatch::try_new(batch.schema(), columns?)?;
+            result.push(Some(part_batch));
+        }
+    }
     Ok(result)
 }
 
@@ -3123,20 +5137,95 @@ fn write_batches_to_parquet(path: &PathBuf, batches: &[RecordBatch]) -> Result<(
 /// disk, for a partition that never receives a batch) and reused for every
 /// subsequent one, so the cost of any single append no longer grows with
 /// how much has already been spilled for that partition. The on-disk
-/// SHAPE is unchanged (still exactly one Parquet file per partition, still
-/// one row group per appended batch) — `read_parquet`/
-/// `process_spilled_partition` need no changes.
+/// SHAPE is unchanged (still exactly one Parquet file per partition) —
+/// `read_parquet`/`process_spilled_partition` need no changes.
+///
+/// **`oom-safety-hardening` epic (2026-08-29): the "kept open for the
+/// whole build/probe phase" design above has a real, confirmed memory-
+/// accounting hole this fixes.** `ArrowWriter::write()` does NOT flush a
+/// batch to disk per call — it buffers into the CURRENT row group's
+/// in-progress column encoders until `parquet`'s own row-group limit is
+/// hit (this file previously relied on the crate's row-COUNT default,
+/// 1,048,576, via an unset `WriterProperties`) or `.close()` runs. With
+/// `NUM_PARTITIONS` = 64 spilled partitions and a real build side's rows
+/// hash-partitioned roughly evenly across them, MOST spilled partitions
+/// never individually accumulate 1M+ rows before the build/probe phase
+/// ends — so their data sits fully memory-resident inside the writer's
+/// own internal buffer for the ENTIRE phase, invisible to `total_memory`
+/// (which already decremented as if that data were freed the moment
+/// `evict_build_partition_to_disk` ran). Confirmed live, not just by
+/// reading the code: `examples/_control_int32_repro.rs` (a PLAIN Int32
+/// build side, no Dictionary column at all — ruling out any connection
+/// to this epic's own Dictionary-sizing fix) with a 500MB configured
+/// `memory_limit` was genuinely OOM-killed by the kernel at ~3.1GB RSS
+/// under a real `systemd-run -p MemoryMax=3G` cap (`journalctl -k`:
+/// "Memory cgroup out of memory: Killed process ... (_control_int32_)");
+/// `examples/spill_dictionary_oversized_build_repro.rs` at a 30MB limit
+/// survived under a 900M cap but peaked at 723MB RSS — 24x its own
+/// configured budget.
+///
+/// **First attempt (byte-based `set_max_row_group_bytes`) measured, and
+/// REJECTED — a second instance of the exact bug class this epic exists
+/// to fix.** `parquet`'s own doc comment on that setter says row groups
+/// "are flushed when their ESTIMATED ENCODED SIZE exceeds this
+/// threshold" — encoded/compressed, not raw. Both repros above use
+/// deliberately low-cardinality, highly repetitive keys (a 7-entry
+/// dictionary; `i % 7` for the control's plain Int32), so their
+/// COMPRESSED footprint stays tiny no matter how many raw rows are
+/// buffered — the estimate this setting flushes against can be
+/// arbitrarily smaller than the actual uncompressed memory being held,
+/// the identical "estimate vs. real content" failure mode
+/// `estimate_batch_size` was fixed for elsewhere in this file. Measured,
+/// not assumed: re-ran both repros with only that fix — peak RSS was
+/// UNCHANGED (723MB → 740MB for the dictionary case, within noise; the
+/// control case was STILL genuinely OOM-killed at the same ~3G cap).
+///
+/// Fix that actually measures bounded: `set_max_row_group_row_count`
+/// (in addition to, not instead of, the byte cap above as a secondary
+/// net for genuinely wide rows) — a ROW-count limit bounds RAW buffered
+/// rows directly, immune to how well those rows happen to compress.
+/// `SPILL_WRITER_ROW_GROUP_ROWS` (8,192) matches this same file's own
+/// `CHUNK_ROWS` precedent (`SpillableHashAggregateExec::
+/// aggregate_with_spilling`) rather than inventing a new magic number.
+///
+/// **CORRECTION (`oom-safety-hardening` task 001, 2026-08-29): the
+/// paragraph this one replaced claimed the row-count cap made the
+/// control repro "complete cleanly" — that was WRONG** (contradicted by
+/// `spill-size-estimate-fix` 001's own Outcome section, which is the
+/// honest record: peak RSS unchanged, control still OOM-killed at a 3G
+/// cap). This writer-flush fix is real and worth keeping, but it was
+/// never the dominant driver. The actual dominant driver, root-caused
+/// with the (fixed) `QE_ALLOC_PROFILE` diagnostic allocator: the
+/// UNBUDGETED `HashMap<JoinKey, Vec<HashEntry>>` hash tables
+/// `execute_spill_path` builds over the in-memory partitions (and each
+/// read-back spilled partition) cost ~120-200 bytes/row across three
+/// allocations per key — ~10-20x the raw batch bytes the spill decision
+/// budgeted — and are never checked against `memory_limit`. See
+/// `.claude/epics/oom-safety-hardening/updates/001/stream-A.md` for the
+/// full evidence (profiler call-site snapshots, cap-sweep numbers).
 fn append_batch_streaming(
     writer_slot: &mut Option<ArrowWriter<File>>,
     path: &PathBuf,
     batch: &RecordBatch,
 ) -> Result<()> {
+    /// Secondary net for genuinely wide rows whose compressed size tracks
+    /// their raw size reasonably closely. Matches `DEFAULT_PAGE_SIZE`
+    /// (1MB), already used elsewhere in this codebase as a natural unit.
+    const SPILL_WRITER_ROW_GROUP_BYTES: usize = 1024 * 1024;
+    /// The binding limit for narrow/repetitive rows (see this function's
+    /// own doc comment for why the byte-based cap alone measured as a
+    /// no-op): bounds RAW buffered rows directly, regardless of how well
+    /// they compress. Matches this file's own `CHUNK_ROWS` precedent.
+    const SPILL_WRITER_ROW_GROUP_ROWS: usize = 8_192;
+
     if writer_slot.is_none() {
         let file = File::create(path).map_err(|e| {
             QueryError::Execution(format!("Failed to create spill file {:?}: {}", path, e))
         })?;
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
+            .set_max_row_group_bytes(Some(SPILL_WRITER_ROW_GROUP_BYTES))
+            .set_max_row_group_row_count(Some(SPILL_WRITER_ROW_GROUP_ROWS))
             .build();
         *writer_slot = Some(ArrowWriter::try_new(file, batch.schema(), Some(props))?);
     }
@@ -3336,9 +5425,7 @@ impl KeyChecksum {
 /// evaluated against `batch`, then `extract_join_key` per row — the exact
 /// path `build_hash_table` and `partition_batch_by_hash` use).
 fn batch_key_checksum(batch: &RecordBatch, key_exprs: &[Expr]) -> Result<KeyChecksum> {
-    let key_arrays: Result<Vec<ArrayRef>> =
-        key_exprs.iter().map(|e| evaluate_expr(batch, e)).collect();
-    let key_arrays = key_arrays?;
+    let key_arrays = join_key_arrays(batch, key_exprs)?;
     let mut cs = KeyChecksum::default();
     for row in 0..batch.num_rows() {
         let key = extract_join_key(&key_arrays, row);
@@ -3359,6 +5446,126 @@ fn batch_key_checksum(batch: &RecordBatch, key_exprs: &[Expr]) -> Result<KeyChec
     Ok(cs)
 }
 
+/// Approximate per-heap-allocation bookkeeping overhead (allocator bin
+/// rounding + header amortization under mimalloc). Every 1-element
+/// `Vec<JoinValue>` / `Vec<HashEntry>` a join hash table holds is its own
+/// heap allocation, so at millions of keys this overhead is a first-order
+/// term, not noise — oom-safety-hardening task 001's profiler evidence
+/// measured ~300MB of exactly these untracked small allocations at the
+/// dict repro's 640MB peak.
+const HEAP_ALLOC_OVERHEAD_BYTES: usize = 16;
+
+/// Amortized hashbrown bucket cost per OCCUPIED entry for
+/// `HashMap<JoinKey, Vec<HashEntry>>`: `size_of::<(JoinKey,
+/// Vec<HashEntry>)>() = 48` plus 1 control byte, times hashbrown's 8/7
+/// inverse load factor ≈ 56 bytes. Used by the PREDICTED (pre-build)
+/// estimate; the post-build measurement uses the table's real `capacity()`
+/// instead.
+const HASH_TABLE_BUCKET_BYTES_AMORTIZED: usize =
+    (std::mem::size_of::<(JoinKey, Vec<HashEntry>)>() + 1) * 8 / 7;
+
+/// Conservative PREDICTED heap footprint of the `HashMap<JoinKey,
+/// Vec<HashEntry>>` that `build_hash_table` would produce over `rows` rows
+/// with `key_cols` join-key columns — the worst (all-unique-keys) case,
+/// which is exactly the shape both oom-safety-hardening repros (and any
+/// PK-keyed build side) hit. Per row:
+///   ~56B amortized hashbrown bucket
+/// + key-values `Vec<JoinValue>` heap buffer (`key_cols` × 32B + overhead)
+/// + entries `Vec<HashEntry>` heap buffer (16B + overhead)
+/// ≈ 136B/row for a single-column key — vs the ~12B/row of raw batch data
+/// `estimate_batch_size` accounts, i.e. the measured 10-20x amplification
+/// task 001 root-caused. Duplicate-heavy key sets cost LESS than this
+/// (shared buckets/entry vecs), so the prediction only ever errs toward
+/// spilling more readily — the safe direction. String keys' character
+/// bytes are NOT predicted here (unknowable pre-build); the post-build
+/// `hash_table_memory_bytes` measurement catches them, at the cost of one
+/// partition table's transient overshoot.
+fn predicted_hash_table_bytes(rows: usize, key_cols: usize) -> usize {
+    let per_row = HASH_TABLE_BUCKET_BYTES_AMORTIZED
+        + (std::mem::size_of::<JoinValue>() * key_cols.max(1) + HEAP_ALLOC_OVERHEAD_BYTES)
+        + (std::mem::size_of::<HashEntry>() + HEAP_ALLOC_OVERHEAD_BYTES);
+    rows.saturating_mul(per_row)
+}
+
+/// Documented approximation of `hash_agg::AccumulatorState`'s size (private
+/// to `hash_agg.rs`, so not `size_of`-able from here): ~30 fields — counts,
+/// power sums, per-type min/max `Option`s, two `Option<String>`s, an
+/// `Option<HashSet>`, correlation sums, a `Vec` header — land it in the
+/// 350-400B range; 384 is the conservative round-up.
+const AGG_ACCUMULATOR_STATE_BYTES: usize = 384;
+/// `hash_agg::GroupValue` (enum whose largest variant holds a `String`
+/// header): 8B discriminant + 24B String ≈ 32B.
+const AGG_GROUP_VALUE_BYTES: usize = 32;
+/// Amortized hashbrown SET entry for one `GroupValue` in a
+/// `distinct_set: HashSet<GroupValue>`: 32B value + 1 control byte, times
+/// the 8/7 inverse load factor, rounded up to 48 to cover growth slack.
+const AGG_DISTINCT_ENTRY_BYTES: usize = 48;
+
+/// Conservative PREDICTED heap footprint of the `HashMap<GroupKey,
+/// Vec<AccumulatorState>>` (plus DISTINCT value sets) that
+/// `aggregate_batches_external` would build over `rows` rows — the
+/// aggregate analogue of `predicted_hash_table_bytes`, priced the same
+/// worst-case way (task 007's discipline): every row is its own group.
+/// Duplicate-heavy group keys cost LESS than this (shared buckets/states),
+/// so the prediction only ever errs toward the chunked read-back
+/// (`aggregate_partition_chunked`) — the safe direction, whose cost is
+/// bounded extra I/O over one already-spilling partition, never a wrong
+/// answer or an unbudgeted allocation. DISTINCT aggregates additionally
+/// pay a real (not worst-case) per-row set entry — every row inserts into
+/// its group's `distinct_set` regardless of group cardinality — so
+/// `n_distinct` charges per row unconditionally. String contents
+/// (group-key bytes, distinct String values) are NOT predicted here
+/// (unknowable pre-build), mirroring `predicted_hash_table_bytes`'s own
+/// documented String gap.
+fn predicted_agg_state_bytes(
+    rows: usize,
+    group_cols: usize,
+    n_aggs: usize,
+    n_distinct: usize,
+) -> usize {
+    // (GroupKey, Vec<AccumulatorState>) is the same 48-byte
+    // (24B Vec-holding struct + 24B Vec header) map-entry shape as the
+    // join's (JoinKey, Vec<HashEntry>), so the amortized bucket constant
+    // is shared deliberately.
+    let per_group = HASH_TABLE_BUCKET_BYTES_AMORTIZED
+        + (AGG_GROUP_VALUE_BYTES * group_cols.max(1) + HEAP_ALLOC_OVERHEAD_BYTES)
+        + (AGG_ACCUMULATOR_STATE_BYTES * n_aggs.max(1) + HEAP_ALLOC_OVERHEAD_BYTES);
+    let per_row = per_group + n_distinct * AGG_DISTINCT_ENTRY_BYTES;
+    rows.saturating_mul(per_row)
+}
+
+/// DIRECT measurement of a built join hash table's heap footprint: the
+/// hashbrown bucket array at its REAL `capacity()`, plus every key's
+/// `Vec<JoinValue>` buffer (and any `String` key's character buffer), plus
+/// every entry list's `Vec<HashEntry>` buffer, each with
+/// `HEAP_ALLOC_OVERHEAD_BYTES` of allocator overhead. O(keys) walk —
+/// negligible next to the O(rows) build that produced the table. This is
+/// the number the spill path's memory accounting charges against the
+/// budget (oom-safety-hardening task 007); `estimate_batch_size` only ever
+/// covered the batches underneath.
+fn hash_table_memory_bytes(table: &HashMap<JoinKey, Vec<HashEntry>>) -> usize {
+    let bucket_bytes = std::mem::size_of::<(JoinKey, Vec<HashEntry>)>() + 1;
+    let mut total = table.capacity().saturating_mul(bucket_bytes);
+    for (key, entries) in table.iter() {
+        if key.values.capacity() > 0 {
+            total += key.values.capacity() * std::mem::size_of::<JoinValue>()
+                + HEAP_ALLOC_OVERHEAD_BYTES;
+        }
+        for v in &key.values {
+            if let JoinValue::String(s) = v {
+                if s.capacity() > 0 {
+                    total += s.capacity() + HEAP_ALLOC_OVERHEAD_BYTES;
+                }
+            }
+        }
+        if entries.capacity() > 0 {
+            total +=
+                entries.capacity() * std::mem::size_of::<HashEntry>() + HEAP_ALLOC_OVERHEAD_BYTES;
+        }
+    }
+    total
+}
+
 fn build_hash_table(
     batches: &[RecordBatch],
     key_exprs: &[Expr],
@@ -3366,9 +5573,7 @@ fn build_hash_table(
     let mut table: HashMap<JoinKey, Vec<HashEntry>> = HashMap::new();
 
     for (batch_idx, batch) in batches.iter().enumerate() {
-        let key_arrays: Result<Vec<ArrayRef>> =
-            key_exprs.iter().map(|e| evaluate_expr(batch, e)).collect();
-        let key_arrays = key_arrays?;
+        let key_arrays = join_key_arrays(batch, key_exprs)?;
 
         for row_idx in 0..batch.num_rows() {
             let key = extract_join_key(&key_arrays, row_idx);
@@ -3387,61 +5592,569 @@ fn build_hash_table(
     Ok(table)
 }
 
+/// spill-boundaries task 002: the ON-clause predicate of a spilling join,
+/// applied to the candidate (build row, probe row) pairs the hash lookup
+/// produces — INNER keeps the passing pairs, SEMI/ANTI count a probe/build
+/// row as matched only through a passing pair. Evaluated where the pair is
+/// formed (`visit_candidate_pairs`), never as a post-filter: a post-filter
+/// cannot see which probe row an SEMI/ANTI decision belonged to, and for
+/// the outer joins task 003 adds it would delete the NULL-extended rows.
+///
+/// Two evaluation paths, decided per batch:
+/// - `compiled`: hash_join's `CompiledFilter` (one build column compared
+///   with one probe column, Int64/Int32/Float64/Utf8) evaluated straight
+///   from the arrays per pair — no gather at all. Guarded here by the
+///   ACTUAL array types (a Dictionary-encoded column, or a Date, would
+///   make `CompiledFilter::evaluate` return `false` for every pair) and by
+///   NULL slots (SQL: a comparison with NULL is not TRUE).
+/// - otherwise: the candidate pairs are gathered into a combined-schema
+///   batch (build ++ probe, or probe ++ build when swapped — the same
+///   left ++ right order the planner's `filter_inside_join` expression was
+///   bound against) in chunks of `PAIR_FILTER_CHUNK_PAIRS`, the expression
+///   is evaluated ONCE per chunk with `evaluate_expr`, and a pair passes
+///   iff its mask slot is valid AND true.
+struct PairFilter {
+    expr: Expr,
+    compiled: Option<super::hash_join::CompiledFilter>,
+}
+
+/// Candidate pairs gathered per filter evaluation on the generic path —
+/// bounds the transient combined batch whatever the probe batch's fan-out.
+const PAIR_FILTER_CHUNK_PAIRS: usize = 65_536;
+
+impl PairFilter {
+    fn new(expr: Expr, build_schema: &Schema, probe_schema: &Schema, swapped: bool) -> Self {
+        let compiled = super::hash_join::CompiledFilter::try_compile(
+            &expr,
+            build_schema,
+            probe_schema,
+            swapped,
+        );
+        Self { expr, compiled }
+    }
+
+    /// The compiled fast path, if it applies to THESE batches' actual
+    /// column types.
+    fn compiled_for(
+        &self,
+        build_batches: &[RecordBatch],
+        probe_batch: &RecordBatch,
+    ) -> Option<&super::hash_join::CompiledFilter> {
+        use arrow::datatypes::DataType;
+        let cf = self.compiled.as_ref()?;
+        let (b, p) = cf.column_indices();
+        let ok = |dt: &DataType| {
+            matches!(
+                dt,
+                DataType::Int64 | DataType::Int32 | DataType::Float64 | DataType::Utf8
+            )
+        };
+        let first = build_batches.first()?;
+        if b >= first.num_columns() || p >= probe_batch.num_columns() {
+            return None;
+        }
+        (ok(first.column(b).data_type()) && ok(probe_batch.column(p).data_type())).then_some(cf)
+    }
+
+    /// Mask over `pairs` (parallel `build_indices`/`probe_indices`) on the
+    /// generic path: gather, evaluate once, `valid && value`.
+    fn evaluate_pairs(
+        &self,
+        build_batches: &[RecordBatch],
+        probe_batch: &RecordBatch,
+        build_indices: &[(usize, usize)],
+        probe_indices: &[usize],
+        swapped: bool,
+    ) -> Result<Vec<bool>> {
+        let combined_schema: SchemaRef = {
+            let build_fields: Vec<_> = build_batches
+                .first()
+                .map(|b| b.schema().fields().iter().cloned().collect())
+                .unwrap_or_default();
+            let probe_fields: Vec<_> = probe_batch.schema().fields().iter().cloned().collect();
+            let fields: Vec<_> = if swapped {
+                probe_fields.into_iter().chain(build_fields).collect()
+            } else {
+                build_fields.into_iter().chain(probe_fields).collect()
+            };
+            Arc::new(Schema::new(fields))
+        };
+        let combined = super::hash_join::create_combined_batch(
+            build_batches,
+            build_indices,
+            probe_batch,
+            probe_indices,
+            swapped,
+            &combined_schema,
+        )?;
+        let result = evaluate_expr(&combined, &self.expr)?;
+        use arrow::array::Array;
+        let mask = result
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .ok_or_else(|| {
+                QueryError::Execution(format!(
+                    "join spill path: ON-clause filter evaluated to {:?}, not Boolean",
+                    result.data_type()
+                ))
+            })?;
+        Ok((0..mask.len())
+            .map(|i| mask.is_valid(i) && mask.value(i))
+            .collect())
+    }
+}
+
+/// THE candidate-pair enumeration of the join spill path (spill-boundaries
+/// task 002): every (build row, probe row) pair of ONE probe batch against
+/// ONE hash table that shares a non-NULL key AND passes the ON filter (all
+/// key matches when there is none). `visit(build_batch_idx, build_row,
+/// probe_row)` is called per passing pair; `first_only` stops each probe
+/// row at its first passing pair (existence is all SEMI/ANTI need on the
+/// probe side); `skip(probe_row)` rows are not probed at all (a probe row
+/// already known to match in an earlier chunk). INNER pair emission, both
+/// SEMI/ANTI orientations and the outer joins all go through here, so the
+/// filter can never be applied in one place and forgotten in another.
 #[allow(clippy::too_many_arguments)]
-fn probe_partition(
+fn visit_candidate_pairs(
     build_batches: &[RecordBatch],
-    probe_batches: &[RecordBatch],
+    probe_batch: &RecordBatch,
     hash_table: &HashMap<JoinKey, Vec<HashEntry>>,
     probe_key_exprs: &[Expr],
-    _join_type: JoinType, // TODO: handle all join types
+    filter: Option<&PairFilter>,
     swapped: bool,
-    output_schema: &SchemaRef,
-    retained: Option<&[bool]>,
-) -> Result<Vec<RecordBatch>> {
-    // Simplified probe - for inner join only
-    // Full implementation would handle all join types
-    let mut results = Vec::new();
-
-    for probe_batch in probe_batches {
-        let probe_key_arrays: Result<Vec<ArrayRef>> = probe_key_exprs
-            .iter()
-            .map(|e| evaluate_expr(probe_batch, e))
-            .collect();
-        let probe_key_arrays = probe_key_arrays?;
-
-        let mut build_indices: Vec<(usize, usize)> = Vec::new();
-        let mut probe_indices: Vec<usize> = Vec::new();
-
-        for probe_row in 0..probe_batch.num_rows() {
-            let key = extract_join_key(&probe_key_arrays, probe_row);
-
-            if key.values.iter().any(|v| matches!(v, JoinValue::Null)) {
+    first_only: bool,
+    skip: &dyn Fn(usize) -> bool,
+    visit: &mut dyn FnMut(usize, usize, usize),
+) -> Result<()> {
+    let key_arrays = join_key_arrays(probe_batch, probe_key_exprs)?;
+    let n = probe_batch.num_rows();
+    let entries_of = |probe_row: usize| -> Option<&Vec<HashEntry>> {
+        let key = extract_join_key(&key_arrays, probe_row);
+        if key.values.iter().any(|v| matches!(v, JoinValue::Null)) {
+            return None;
+        }
+        hash_table.get(&key)
+    };
+    let Some(filter) = filter else {
+        for probe_row in 0..n {
+            if skip(probe_row) {
                 continue;
             }
-
-            if let Some(entries) = hash_table.get(&key) {
-                for entry in entries {
-                    build_indices.push((entry.batch_idx, entry.row_idx));
-                    probe_indices.push(probe_row);
+            if let Some(entries) = entries_of(probe_row) {
+                if first_only {
+                    if let Some(e) = entries.first() {
+                        visit(e.batch_idx, e.row_idx, probe_row);
+                    }
+                } else {
+                    for e in entries {
+                        visit(e.batch_idx, e.row_idx, probe_row);
+                    }
                 }
             }
         }
-
-        if !build_indices.is_empty() {
-            let batch = create_joined_batch(
-                build_batches,
-                probe_batch,
-                &build_indices,
-                &probe_indices,
-                swapped,
-                output_schema,
-                retained,
-            )?;
-            results.push(batch);
+        return Ok(());
+    };
+    if let Some(cf) = filter.compiled_for(build_batches, probe_batch) {
+        let (bcol, pcol) = cf.column_indices();
+        let probe_col = probe_batch.column(pcol);
+        for probe_row in 0..n {
+            if skip(probe_row) || probe_col.is_null(probe_row) {
+                continue;
+            }
+            let Some(entries) = entries_of(probe_row) else {
+                continue;
+            };
+            for e in entries {
+                let bb = &build_batches[e.batch_idx];
+                if bb.column(bcol).is_null(e.row_idx) {
+                    continue;
+                }
+                if cf.evaluate(bb, e.row_idx, probe_batch, probe_row) {
+                    visit(e.batch_idx, e.row_idx, probe_row);
+                    if first_only {
+                        break;
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+    // Generic path: gather the candidate pairs in bounded chunks (a probe
+    // row's pairs never straddle a chunk, so `first_only` de-duplication
+    // is local to the chunk) and evaluate the expression once per chunk.
+    let mut bi: Vec<(usize, usize)> = Vec::new();
+    let mut pi: Vec<usize> = Vec::new();
+    let flush = |bi: &mut Vec<(usize, usize)>,
+                 pi: &mut Vec<usize>,
+                 visit: &mut dyn FnMut(usize, usize, usize)|
+     -> Result<()> {
+        if bi.is_empty() {
+            return Ok(());
+        }
+        let mask = filter.evaluate_pairs(build_batches, probe_batch, bi, pi, swapped)?;
+        let mut decided_row = usize::MAX;
+        for i in 0..bi.len() {
+            if !mask[i] {
+                continue;
+            }
+            if first_only {
+                if pi[i] == decided_row {
+                    continue;
+                }
+                decided_row = pi[i];
+            }
+            visit(bi[i].0, bi[i].1, pi[i]);
+        }
+        bi.clear();
+        pi.clear();
+        Ok(())
+    };
+    for probe_row in 0..n {
+        if skip(probe_row) {
+            continue;
+        }
+        if let Some(entries) = entries_of(probe_row) {
+            for e in entries {
+                bi.push((e.batch_idx, e.row_idx));
+                pi.push(probe_row);
+            }
+        }
+        if bi.len() >= PAIR_FILTER_CHUNK_PAIRS {
+            flush(&mut bi, &mut pi, visit)?;
         }
     }
+    flush(&mut bi, &mut pi, visit)
+}
 
-    Ok(results)
+/// THE per-batch probe of the spill path: ONE probe batch against ONE
+/// hash table, doing everything the join needs in a single pass over the
+/// candidate pairs (`visit_candidate_pairs`, so key equality and the ON
+/// filter are applied exactly once, in one place):
+/// - the passing pairs become the returned joined batch when the join
+///   emits pairs (INNER and the outer joins);
+/// - `build_matched` (the table's build batches' bitmap — a resident
+///   partition's across the whole probe stream, a read-back chunk's) is
+///   marked for build-side SEMI/ANTI and a preserved build side;
+/// - `probe_matched` (this probe batch's bitmap — carried across chunks by
+///   the caller for a spilled partition) is marked for probe-side
+///   SEMI/ANTI and a preserved probe side.
+/// When only the probe bitmap is wanted, a probe row already flagged is
+/// skipped and the walk stops at its first passing pair (existence is all
+/// that is needed). NULL keys never match on either side.
+fn probe_batch_against_table(
+    build_batches: &[RecordBatch],
+    probe_batch: &RecordBatch,
+    hash_table: &HashMap<JoinKey, Vec<HashEntry>>,
+    ctx: &SpillJoinCtx,
+    build_matched: Option<&[Vec<std::sync::atomic::AtomicBool>]>,
+    probe_matched: Option<&mut [bool]>,
+) -> Result<Vec<RecordBatch>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let emit_pairs = ctx.emit_pairs();
+    let existence_only = !emit_pairs && build_matched.is_none();
+    let already: Option<Vec<bool>> = match (&probe_matched, existence_only) {
+        (Some(f), true) => Some(f.to_vec()),
+        _ => None,
+    };
+    let skip = |row: usize| already.as_ref().is_some_and(|a| a[row]);
+    let mut build_indices: Vec<(usize, usize)> = Vec::new();
+    let mut probe_indices: Vec<usize> = Vec::new();
+    let mut probe_hits: Vec<usize> = Vec::new();
+    let want_probe_hits = probe_matched.is_some();
+    visit_candidate_pairs(
+        build_batches,
+        probe_batch,
+        hash_table,
+        &ctx.probe_keys,
+        ctx.filter.as_deref(),
+        ctx.swapped,
+        existence_only,
+        &skip,
+        &mut |b, r, p| {
+            if emit_pairs {
+                build_indices.push((b, r));
+                probe_indices.push(p);
+            }
+            if let Some(bm) = build_matched {
+                bm[b][r].store(true, Relaxed);
+            }
+            if want_probe_hits {
+                probe_hits.push(p);
+            }
+        },
+    )?;
+    if let Some(flags) = probe_matched {
+        for p in probe_hits {
+            flags[p] = true;
+        }
+    }
+    if !emit_pairs || build_indices.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Pairs are emitted in bounded slices (duplicate keys can fan one probe
+    // batch out to far more pairs than rows).
+    let slice = spill_emit_rows();
+    build_indices
+        .chunks(slice)
+        .zip(probe_indices.chunks(slice))
+        .map(|(bi, pi)| {
+            create_joined_batch(
+                build_batches,
+                probe_batch,
+                bi,
+                pi,
+                ctx.swapped,
+                &ctx.schema,
+                ctx.retained.as_deref(),
+            )
+        })
+        .collect()
+}
+
+/// NULL arrays for the NON-preserved side of an outer-join emission, typed
+/// from the declared full output schema: `first` selects the leading
+/// (`swapped` = probe = left) or trailing block of `full_schema`.
+fn null_side_columns(
+    full_schema: &SchemaRef,
+    first: bool,
+    width: usize,
+    rows: usize,
+) -> Vec<ArrayRef> {
+    let total = full_schema.fields().len();
+    let offset = if first { 0 } else { total - width };
+    (0..width)
+        .map(|i| arrow::array::new_null_array(full_schema.field(offset + i).data_type(), rows))
+        .collect()
+}
+
+/// Apply the join-output retention mask (see `create_joined_batch`).
+fn apply_retained(columns: Vec<ArrayRef>, retained: Option<&[bool]>) -> Vec<ArrayRef> {
+    match retained {
+        Some(mask) if mask.len() == columns.len() => columns
+            .into_iter()
+            .zip(mask)
+            .filter(|(_, keep)| **keep)
+            .map(|(c, _)| c)
+            .collect(),
+        _ => columns,
+    }
+}
+
+/// Emit a probe batch's rows once its match bitmap is final, per
+/// `SpillJoinCtx::probe_emit`: SEMI's matched rows / ANTI's unmatched rows
+/// bare (`take_probe_rows`), or a preserved probe side's unmatched rows
+/// NULL-extended on the build side (spill-boundaries task 003).
+fn emit_probe_rows(
+    ctx: &SpillJoinCtx,
+    probe_batch: &RecordBatch,
+    flags: &[bool],
+) -> Result<Vec<RecordBatch>> {
+    match ctx.probe_emit() {
+        RowEmit::None => Ok(Vec::new()),
+        RowEmit::Matched => take_probe_rows(probe_batch, flags, true, &ctx.schema),
+        RowEmit::Unmatched => take_probe_rows(probe_batch, flags, false, &ctx.schema),
+        RowEmit::UnmatchedNullExtended => {
+            let keep: Vec<u32> = flags
+                .iter()
+                .enumerate()
+                .filter(|(_, &f)| !f)
+                .map(|(i, _)| i as u32)
+                .collect();
+            keep.chunks(spill_emit_rows())
+                .map(|slice| {
+                    let rows = slice.len();
+                    let idx = UInt32Array::from(slice.to_vec());
+                    let probe_columns: Vec<ArrayRef> = probe_batch
+                        .columns()
+                        .iter()
+                        .map(|c| compute::take(c.as_ref(), &idx, None).map_err(Into::into))
+                        .collect::<Result<_>>()?;
+                    let build_width = ctx.full_schema.fields().len() - probe_columns.len();
+                    // Probe = left when swapped: probe columns first, build
+                    // NULLs (the trailing block) after; else build NULLs
+                    // (leading block) first.
+                    let build_nulls =
+                        null_side_columns(&ctx.full_schema, !ctx.swapped, build_width, rows);
+                    let columns: Vec<ArrayRef> = if ctx.swapped {
+                        probe_columns.into_iter().chain(build_nulls).collect()
+                    } else {
+                        build_nulls.into_iter().chain(probe_columns).collect()
+                    };
+                    let columns = apply_retained(columns, ctx.retained.as_deref());
+                    batch_with_actual_types(&ctx.schema, columns)
+                })
+                .collect()
+        }
+    }
+}
+
+/// Emit a build partition's / chunk's rows once its match bitmap is final,
+/// per `SpillJoinCtx::build_emit`: SEMI's matched rows / ANTI's unmatched
+/// rows bare (`take_build_rows`), or a preserved build side's unmatched
+/// rows NULL-extended on the probe side (spill-boundaries task 003).
+fn emit_build_rows(
+    ctx: &SpillJoinCtx,
+    build_batches: &[RecordBatch],
+    flags: &[Vec<bool>],
+) -> Result<Vec<RecordBatch>> {
+    match ctx.build_emit() {
+        RowEmit::None => Ok(Vec::new()),
+        RowEmit::Matched => take_build_rows(build_batches, flags, true, &ctx.schema),
+        RowEmit::Unmatched => take_build_rows(build_batches, flags, false, &ctx.schema),
+        RowEmit::UnmatchedNullExtended => {
+            let indices = flagged_build_indices(flags, false);
+            if indices.is_empty() || build_batches.is_empty() {
+                return Ok(Vec::new());
+            }
+            indices
+                .chunks(spill_emit_rows())
+                .map(|slice| {
+                    let rows = slice.len();
+                    let build_columns: Vec<ArrayRef> = (0..build_batches[0].num_columns())
+                        .map(|c| gather_column(build_batches, c, slice))
+                        .collect::<Result<_>>()?;
+                    let probe_width = ctx.full_schema.fields().len() - build_columns.len();
+                    // Build = right when swapped: probe NULLs (the leading
+                    // block) first; else build first, probe NULLs
+                    // (trailing) after.
+                    let probe_nulls =
+                        null_side_columns(&ctx.full_schema, ctx.swapped, probe_width, rows);
+                    let columns: Vec<ArrayRef> = if ctx.swapped {
+                        probe_nulls.into_iter().chain(build_columns).collect()
+                    } else {
+                        build_columns.into_iter().chain(probe_nulls).collect()
+                    };
+                    let columns = apply_retained(columns, ctx.retained.as_deref());
+                    batch_with_actual_types(&ctx.schema, columns)
+                })
+                .collect()
+        }
+    }
+}
+
+/// spill-join-correctness-3 task 004: join-key arrays for one batch — THE
+/// single key-evaluation point of the join spill path (`build_hash_table`,
+/// `partition_batch_by_hash`, `probe_partition`, `batch_key_checksum` and
+/// every SEMI/ANTI probe below all go through it), so build, probe,
+/// routing and the write/read checksum can never disagree about a key's
+/// representation.
+///
+/// A `Dictionary`-encoded key column (what native tables give every
+/// low-cardinality string column) is decoded to its value type first, the
+/// same way `partition_batch_by_group_hash` already does for the
+/// aggregate: `extract_join_key`'s downcast chain has no Dictionary arm and
+/// fell through to `JoinValue::Null`, so before this every Dictionary-keyed
+/// row was routed to the NULL partition, never inserted into a table
+/// (`build_hash_table` skips NULL keys) and never matched — a spilling
+/// INNER/SEMI join on such a key returned ZERO rows (pinned by
+/// `semi_anti_spill_dictionary_keys_are_cell_exact`, which also covers
+/// INNER). Non-Dictionary keys are evaluated exactly as before, so
+/// partition routing for them is byte-identical to the routing task 001
+/// recalibrated (0 wrong / 6,041 trials).
+fn join_key_arrays(batch: &RecordBatch, key_exprs: &[Expr]) -> Result<Vec<ArrayRef>> {
+    key_exprs
+        .iter()
+        .map(|e| {
+            let arr = evaluate_expr(batch, e)?;
+            match arr.data_type() {
+                arrow::datatypes::DataType::Dictionary(_, value_type) => {
+                    compute::cast(arr.as_ref(), value_type).map_err(Into::into)
+                }
+                _ => Ok(arr),
+            }
+        })
+        .collect()
+}
+
+/// Rows per emitted batch for the GATHERED emissions of the spill path
+/// (spill-boundaries 003 follow-up): a preserved build side's unmatched rows
+/// of one read-back chunk (hundreds of thousands), a resident partition's
+/// SEMI/ANTI/outer emission (millions), or one probe batch's pairs under
+/// duplicate keys are emitted in slices of this many rows instead of one
+/// batch each. The output channel bounds batch COUNT
+/// (`SPILL_JOIN_OUTPUT_CHANNEL_CAPACITY`), so this is what bounds its
+/// BYTES. `QE_SPILL_EMIT_ROWS` overrides (diagnostic; 0 = unbounded).
+const SPILL_EMIT_ROWS: usize = 8_192;
+
+fn spill_emit_rows() -> usize {
+    match std::env::var("QE_SPILL_EMIT_ROWS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        Some(0) => usize::MAX,
+        Some(n) => n,
+        None => SPILL_EMIT_ROWS,
+    }
+}
+
+/// Emit the probe rows whose flag equals `want` (SEMI: matched; ANTI:
+/// unmatched) with probe-side columns only, against the declared SEMI/ANTI
+/// output schema (the LEFT schema — the probe side IS the left side in this
+/// orientation). `batch_with_actual_types` absorbs the same declared-vs-
+/// actual encoding drift (Dictionary vs Utf8 after a Parquet round trip)
+/// the INNER emitter already handles.
+fn take_probe_rows(
+    probe_batch: &RecordBatch,
+    flags: &[bool],
+    want: bool,
+    output_schema: &SchemaRef,
+) -> Result<Vec<RecordBatch>> {
+    let keep: Vec<u32> = flags
+        .iter()
+        .enumerate()
+        .filter(|(_, &f)| f == want)
+        .map(|(i, _)| i as u32)
+        .collect();
+    keep.chunks(spill_emit_rows())
+        .map(|slice| {
+            let idx = UInt32Array::from(slice.to_vec());
+            let columns: Result<Vec<ArrayRef>> = probe_batch
+                .columns()
+                .iter()
+                .map(|c| compute::take(c.as_ref(), &idx, None).map_err(Into::into))
+                .collect();
+            batch_with_actual_types(output_schema, columns?)
+        })
+        .collect()
+}
+
+/// Emit the build rows whose flag equals `want` (SEMI: matched; ANTI:
+/// unmatched) with build-side columns only — the build side IS the left
+/// (output) side in this orientation. Same gather as the in-memory join's
+/// `create_semi_anti_batch`.
+fn take_build_rows(
+    build_batches: &[RecordBatch],
+    flags: &[Vec<bool>],
+    want: bool,
+    output_schema: &SchemaRef,
+) -> Result<Vec<RecordBatch>> {
+    let indices = flagged_build_indices(flags, want);
+    if indices.is_empty() || build_batches.is_empty() {
+        return Ok(Vec::new());
+    }
+    indices
+        .chunks(spill_emit_rows())
+        .map(|slice| {
+            let columns: Result<Vec<ArrayRef>> = (0..build_batches[0].num_columns())
+                .map(|c| gather_column(build_batches, c, slice))
+                .collect();
+            batch_with_actual_types(output_schema, columns?)
+        })
+        .collect()
+}
+
+/// (batch_idx, row_idx) of every build row whose flag equals `want`.
+fn flagged_build_indices(flags: &[Vec<bool>], want: bool) -> Vec<(usize, usize)> {
+    flags
+        .iter()
+        .enumerate()
+        .flat_map(|(b, v)| {
+            v.iter()
+                .enumerate()
+                .filter(move |(_, &f)| f == want)
+                .map(move |(r, _)| (b, r))
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3505,7 +6218,46 @@ fn create_joined_batch(
     batch_with_actual_types(output_schema, columns)
 }
 
+/// Gather `indices` = (batch_idx, row_idx) of column `col_idx` across
+/// `batches` into ONE array. spill-boundaries 003 follow-up: one
+/// `compute::interleave` per column (a single `take` when every index comes
+/// from one batch). The previous shape — one 1-row `compute::take` per
+/// OUTPUT ROW, then `concat` of all of them — allocated an Arrow array per
+/// gathered row: for a phase-B read-back chunk's 590k unmatched build rows
+/// (a preserved build side) or a 16-batch probe group's pairs, that was
+/// millions of ~200-byte allocations per chunk, freed on the global rayon
+/// pool's threads and retained by the allocator — measured as the
+/// ~+700-900MB phase-B excess of the `left-join` / `filtered-join` harness
+/// legs over `semi-join` (see `updates/003/stream-A.md`).
+/// `QE_SPILL_GATHER=legacy` keeps the old shape for a controlled A/B.
 fn gather_column(
+    batches: &[RecordBatch],
+    col_idx: usize,
+    indices: &[(usize, usize)],
+) -> Result<ArrayRef> {
+    if matches!(std::env::var("QE_SPILL_GATHER").as_deref(), Ok("legacy")) {
+        return gather_column_legacy(batches, col_idx, indices);
+    }
+    let dt = batches[0].column(col_idx).data_type();
+    if indices.is_empty() {
+        return Ok(arrow::array::new_null_array(dt, 0));
+    }
+    let first_batch = indices[0].0;
+    if batches.len() == 1 || indices.iter().all(|&(b, _)| b == first_batch) {
+        let take_arr: UInt32Array = indices.iter().map(|&(_, r)| r as u32).collect();
+        return compute::take(
+            batches[first_batch].column(col_idx).as_ref(),
+            &take_arr,
+            None,
+        )
+        .map_err(Into::into);
+    }
+    let arrays: Vec<&dyn arrow::array::Array> =
+        batches.iter().map(|b| b.column(col_idx).as_ref()).collect();
+    compute::interleave(&arrays, indices).map_err(Into::into)
+}
+
+fn gather_column_legacy(
     batches: &[RecordBatch],
     col_idx: usize,
     indices: &[(usize, usize)],
@@ -3517,21 +6269,13 @@ fn gather_column(
             .or_default()
             .push((out_idx, row_idx as u32));
     }
-
     let total_len = indices.len();
     let dt = batches[0].column(col_idx).data_type();
-
     let mut builders_data: Vec<(usize, ArrayRef)> = Vec::new();
-
     for (batch_idx, idx_list) in batch_indices {
-        let batch = &batches[batch_idx];
-        let col = batch.column(col_idx);
-
+        let col = batches[batch_idx].column(col_idx);
         let take_indices: Vec<u32> = idx_list.iter().map(|(_, row)| *row).collect();
-        let take_arr = UInt32Array::from(take_indices);
-
-        let taken = compute::take(col.as_ref(), &take_arr, None)?;
-
+        let taken = compute::take(col.as_ref(), &UInt32Array::from(take_indices), None)?;
         for (i, (out_idx, _)) in idx_list.iter().enumerate() {
             builders_data.push((
                 *out_idx,
@@ -3539,21 +6283,13 @@ fn gather_column(
             ));
         }
     }
-
     builders_data.sort_by_key(|(idx, _)| *idx);
-
     if builders_data.is_empty() {
         return Ok(arrow::array::new_null_array(dt, total_len));
     }
-
     let arrays: Vec<&dyn arrow::array::Array> =
         builders_data.iter().map(|(_, arr)| arr.as_ref()).collect();
-
-    if arrays.is_empty() {
-        Ok(arrow::array::new_null_array(dt, total_len))
-    } else {
-        compute::concat(&arrays).map_err(Into::into)
-    }
+    compute::concat(&arrays).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -3574,6 +6310,96 @@ mod tests {
 
         let size = estimate_batch_size(&batch);
         assert!(size > 0);
+    }
+
+    /// Regression test for `spill-size-estimate-fix` epic, task 001: builds
+    /// a Dictionary column whose values array is sliced out of a single
+    /// oversized shared allocation via `Buffer::from_custom_allocation` --
+    /// exactly `ipc_cache.rs::read_row_group`'s own mmap mechanics, where
+    /// ONE `Buffer` backs an entire native-table segment file and every
+    /// column's sub-buffers are views into it. Before the fix,
+    /// `estimate_batch_size` fell through to `c.get_array_memory_size()`
+    /// for `Dictionary` columns, which sums `Buffer::capacity()` --
+    /// and a `Buffer` built by `from_custom_allocation` reports the FULL
+    /// length passed at construction time forever, regardless of how small
+    /// a slice is later carved out of it (this is `Deallocation::Custom`'s
+    /// documented behavior in arrow-buffer's `bytes.rs`). This test proves
+    /// two things: (1) the oversized-allocation setup below genuinely
+    /// reproduces the precondition (`get_array_memory_size()` on the raw
+    /// column is tens of MB for 5 logical rows), and (2)
+    /// `estimate_batch_size` on the very same batch is now content-aware --
+    /// on the order of the real ~50-ish logical bytes, not the shared
+    /// allocation's size.
+    #[test]
+    fn dictionary_column_estimate_is_content_aware_not_mmap_capacity() {
+        use arrow::array::{Array, ArrayData, DictionaryArray};
+        use arrow::buffer::Buffer;
+        use arrow::datatypes::{DataType, Field, Int32Type, Schema};
+
+        // A 32 MiB "mmap" standing in for one native-table segment file --
+        // `ipc_cache.rs::read_row_group`'s single `Buffer::from_custom_allocation`
+        // over the whole mapped file, which every column's every buffer in
+        // that segment is then sliced out of.
+        let oversized_len = 32 * 1024 * 1024;
+        let raw: Arc<Box<[u8]>> = Arc::new(vec![0u8; oversized_len].into_boxed_slice());
+        let ptr = std::ptr::NonNull::new(raw.as_ptr() as *mut u8).unwrap();
+        // SAFETY: `raw` (kept alive via the `Arc` passed as the allocation
+        // owner) is a `oversized_len`-byte heap allocation; `ptr`/`oversized_len`
+        // describe exactly that allocation.
+        let mmap_buffer = unsafe { Buffer::from_custom_allocation(ptr, oversized_len, raw) };
+
+        // Dictionary VALUES ("MAIL"/"SHIP"/"RAIL", Q12's own l_shipmode
+        // values): a small Utf8 array whose data buffer is a slice of the
+        // oversized shared allocation above -- the same shape
+        // `read_dictionary`'s `buffer.slice_with_length(...)` produces.
+        let values_bytes = b"MAILSHIPRAIL";
+        let values_data_buf = mmap_buffer.slice_with_length(0, values_bytes.len());
+        let offsets_buf = Buffer::from_slice_ref(&[0i32, 4, 8, 12]);
+        let values_data = ArrayData::builder(DataType::Utf8)
+            .len(3)
+            .add_buffer(offsets_buf)
+            .add_buffer(values_data_buf)
+            .build()
+            .unwrap();
+
+        // Keys: 5 rows referencing the 3 dictionary entries (a normal,
+        // non-oversized buffer -- only the values buffer needs to be
+        // mmap-backed to reproduce the bug, since the OLD fallback summed
+        // buffer capacities across the Dictionary array AND its child
+        // (values) data).
+        let keys_buf = Buffer::from_slice_ref(&[0i32, 1, 2, 0, 1]);
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let dict_data = ArrayData::builder(dict_type.clone())
+            .len(5)
+            .add_buffer(keys_buf)
+            .child_data(vec![values_data])
+            .build()
+            .unwrap();
+        let dict_array: DictionaryArray<Int32Type> = DictionaryArray::from(dict_data);
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "l_shipmode",
+            dict_type,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(dict_array) as ArrayRef]).unwrap();
+
+        let col = batch.column(0);
+        let old_buggy_size = col.get_array_memory_size();
+        assert!(
+            old_buggy_size > 16 * 1024 * 1024,
+            "test setup didn't reproduce the mmap-capacity precondition: \
+             get_array_memory_size()={old_buggy_size}"
+        );
+
+        let fixed_size = estimate_batch_size(&batch);
+        assert!(
+            fixed_size < 1024,
+            "estimate_batch_size should be content-aware (tens of bytes for \
+             5 rows over a 3-entry dictionary), got {fixed_size} bytes -- \
+             still reading the mmap-backed buffer's capacity instead of its \
+             logical content"
+        );
     }
 
     /// `append_batch_streaming` is the task 002 fix for `append_to_parquet`'s
@@ -4566,4 +7392,2253 @@ mod tests {
     // (thousands of trials; see that file's own module doc comment and
     // this task's Outcome in `003.md` for real run counts/results) than
     // any single unit test would exercise anyway.
+
+    // ------------------------------------------------------------------
+    // oom-safety-hardening task 007: join spill-path hash-table budgeting
+    // ------------------------------------------------------------------
+
+    fn int64_key_batch(schema: &SchemaRef, ids: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(ids))]).unwrap()
+    }
+
+    /// The sizing helpers must reflect the REAL ~10-20x table-over-batch
+    /// amplification task 001 measured (~120-200B/row for unique Int64
+    /// keys vs ~12B/row of batch data), or the budgeting they drive is
+    /// fiction. Bounds are deliberately loose (allocator/capacity
+    /// granularity varies) but strict enough that a regression to "tables
+    /// cost roughly what batches cost" fails loudly.
+    #[test]
+    fn hash_table_sizing_reflects_real_amplification() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let rows: usize = 10_000;
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = int64_key_batch(&schema, (0..rows as i64).collect());
+        let table = build_hash_table(&[batch.clone()], &[Expr::column("id")]).unwrap();
+        assert_eq!(table.len(), rows);
+
+        let measured = hash_table_memory_bytes(&table);
+        let predicted = predicted_hash_table_bytes(rows, 1);
+        let batch_bytes = estimate_batch_size(&batch);
+
+        // Real per-row cost band from task 001's profiler evidence.
+        assert!(
+            measured >= rows * 100 && measured <= rows * 300,
+            "measured {} bytes for {} unique keys ({}B/row) — outside the \
+             100-300B/row band the real allocations occupy",
+            measured,
+            rows,
+            measured / rows
+        );
+        assert!(
+            predicted >= rows * 100 && predicted <= rows * 200,
+            "predicted {}B/row outside 100-200B/row",
+            predicted / rows
+        );
+        // The amplification the budget must account for: table >= 8x the
+        // batch bytes the old accounting covered.
+        assert!(
+            measured >= batch_bytes * 8,
+            "measured table bytes ({measured}) should be many times the \
+             batch bytes ({batch_bytes})"
+        );
+    }
+
+    /// Duplicate-heavy keys must cost LESS than the all-unique prediction
+    /// (shared buckets/entry vecs) — the prediction only ever errs toward
+    /// spilling more readily, never toward under-budgeting.
+    #[test]
+    fn predicted_hash_table_bytes_is_conservative_for_duplicate_keys() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let rows: usize = 10_000;
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        // 100 distinct keys, 100 occurrences each.
+        let batch = int64_key_batch(&schema, (0..rows as i64).map(|i| i % 100).collect());
+        let table = build_hash_table(&[batch], &[Expr::column("id")]).unwrap();
+        assert_eq!(table.len(), 100);
+        let measured = hash_table_memory_bytes(&table);
+        let predicted = predicted_hash_table_bytes(rows, 1);
+        assert!(
+            measured < predicted,
+            "duplicate-heavy table ({measured}) should cost less than the \
+             all-unique prediction ({predicted})"
+        );
+        // Entries themselves (16B x 10_000) must still be counted.
+        assert!(measured >= rows * std::mem::size_of::<HashEntry>());
+    }
+
+    /// End-to-end: a spilling INNER join over many unique keys must (1)
+    /// stay cell-exact, and (2) hold the memoized resident set — batch
+    /// bytes PLUS measured hash-table bytes — under `memory_limit *
+    /// spill_threshold`. Before task 007 the tables were built with zero
+    /// accounting at ~10-20x the budgeted batch bytes (the 15-24x overshoot
+    /// of both oom repros); this asserts the budgeting invariant directly
+    /// on the build decision, not just survival.
+    #[tokio::test]
+    async fn spill_path_hash_tables_are_budgeted_and_join_stays_exact() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let build_schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let total_rows: i64 = 200_000;
+        let mut build_batches = Vec::new();
+        let mut start = 0i64;
+        while start < total_rows {
+            let end = (start + 8192).min(total_rows);
+            build_batches.push(int64_key_batch(&build_schema, (start..end).collect()));
+            start = end;
+        }
+        let build: Arc<dyn PhysicalOperator> =
+            Arc::new(crate::physical::operators::MemoryTableExec::new(
+                "build",
+                build_schema,
+                build_batches,
+                None,
+            ));
+
+        let probe_schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("pid", DataType::Int64, false)]));
+        // 4 existing keys (one duplicated → 2 output rows) + 1 missing key.
+        let probe_ids = vec![0i64, 12_345, 12_345, 199_999, 777_777_777];
+        let probe_batch = int64_key_batch(&probe_schema, probe_ids);
+        let probe: Arc<dyn PhysicalOperator> =
+            Arc::new(crate::physical::operators::MemoryTableExec::new(
+                "probe",
+                probe_schema,
+                vec![probe_batch],
+                None,
+            ));
+
+        // 256KB limit: the ~1.6MB of build batches must spill, and the
+        // ~27MB of worst-case table bytes must be budgeted, not built.
+        let limit = 256 * 1024;
+        let pool = crate::execution::create_memory_pool(limit);
+        let spill_dir =
+            std::env::temp_dir().join(format!("qe_join_table_budget_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&spill_dir);
+        let config = ExecutionConfig::new()
+            .with_memory_limit(limit)
+            .with_spill_path(spill_dir.clone());
+        let threshold = (limit as f64 * config.spill_threshold) as usize;
+
+        let join = SpillableHashJoinExec::new(
+            build,
+            probe,
+            vec![(Expr::column("id"), Expr::column("pid"))],
+            JoinType::Inner,
+            pool,
+            config,
+        );
+
+        let mut matched: Vec<i64> = Vec::new();
+        let mut stream = join.execute(0).await.unwrap();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                matched.push(ids.value(i));
+            }
+        }
+        matched.sort_unstable();
+        assert_eq!(
+            matched,
+            vec![0, 12_345, 12_345, 199_999],
+            "spilling join with budgeted tables must stay cell-exact"
+        );
+
+        // The budgeting invariant, asserted on the memoized decision.
+        match join.build_decision.get() {
+            Some(BuildDecision::Spill(state)) => {
+                let batch_bytes: usize = state
+                    .partitions
+                    .iter()
+                    .flatten()
+                    .map(|p| p.memory_bytes)
+                    .sum();
+                let table_bytes: usize = state
+                    .tables
+                    .iter()
+                    .flatten()
+                    .map(hash_table_memory_bytes)
+                    .sum();
+                assert!(
+                    batch_bytes + table_bytes <= threshold,
+                    "resident batches ({batch_bytes}) + measured tables \
+                     ({table_bytes}) exceed the budget ({threshold})"
+                );
+            }
+            _ => panic!("expected a memoized Spill decision"),
+        }
+        drop(join);
+        let _ = std::fs::remove_dir_all(&spill_dir);
+    }
+
+    /// Read-back (spilled-partition) processing must chunk its transient
+    /// hash table under the budget AND stay exact when a key's multiple
+    /// build rows straddle a chunk boundary — every (build,probe) pair
+    /// emitted exactly once, unioned across chunks. Build keys appear
+    /// TWICE (in two well-separated row ranges, so the two occurrences
+    /// land in different read-back batches/chunks); every probed key must
+    /// come back exactly twice.
+    #[tokio::test]
+    async fn spilled_partition_chunked_table_build_is_cell_exact() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let build_schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let distinct: i64 = 20_000;
+        let mut build_batches = Vec::new();
+        for _pass in 0..2 {
+            let mut start = 0i64;
+            while start < distinct {
+                let end = (start + 1024).min(distinct);
+                build_batches.push(int64_key_batch(&build_schema, (start..end).collect()));
+                start = end;
+            }
+        }
+        let build: Arc<dyn PhysicalOperator> =
+            Arc::new(crate::physical::operators::MemoryTableExec::new(
+                "build",
+                build_schema,
+                build_batches,
+                None,
+            ));
+
+        let probe_schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("pid", DataType::Int64, false)]));
+        let probe_ids: Vec<i64> = (0..distinct).step_by(7).collect();
+        let expected_rows = probe_ids.len() * 2;
+        let probe_batch = int64_key_batch(&probe_schema, probe_ids.clone());
+        let probe: Arc<dyn PhysicalOperator> =
+            Arc::new(crate::physical::operators::MemoryTableExec::new(
+                "probe",
+                probe_schema,
+                vec![probe_batch],
+                None,
+            ));
+
+        // 64KB limit → ~51KB threshold: every partition's predicted table
+        // (~625 rows x ~136B ≈ 85KB) exceeds it, so partitions evict to
+        // disk and read-back chunking engages (multiple chunks per
+        // partition).
+        let limit = 64 * 1024;
+        let pool = crate::execution::create_memory_pool(limit);
+        let spill_dir = std::env::temp_dir().join(format!(
+            "qe_join_chunked_readback_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&spill_dir);
+        let config = ExecutionConfig::new()
+            .with_memory_limit(limit)
+            .with_spill_path(spill_dir.clone());
+
+        let join = SpillableHashJoinExec::new(
+            build,
+            probe,
+            vec![(Expr::column("id"), Expr::column("pid"))],
+            JoinType::Inner,
+            pool,
+            config,
+        );
+
+        let mut matched: Vec<i64> = Vec::new();
+        let mut stream = join.execute(0).await.unwrap();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                matched.push(ids.value(i));
+            }
+        }
+        matched.sort_unstable();
+        let mut expected: Vec<i64> = probe_ids.iter().flat_map(|&k| [k, k]).collect();
+        expected.sort_unstable();
+        assert_eq!(matched.len(), expected_rows);
+        assert_eq!(
+            matched, expected,
+            "each probed key must match exactly its two build occurrences, \
+             even when they land in different read-back chunks"
+        );
+        drop(join);
+        let _ = std::fs::remove_dir_all(&spill_dir);
+    }
+    // ------------------------------------------------------------------
+    // spill-join-correctness-3 task 004: SEMI/ANTI on the join spill path.
+    // Every test below compares the SPILL path (tiny budget, memoized
+    // `BuildDecision::Spill`) against the same operator under an
+    // effectively unlimited budget, which lands on the `BuildDecision::
+    // InMemory` delegate — the ordinary `HashJoinExec` — so the reference
+    // is the real non-spill semantics, never the spill path itself.
+    // ------------------------------------------------------------------
+
+    /// Render every row of an output batch, decoding Dictionary columns to
+    /// their value type ONCE per batch so a Parquet round trip that changes
+    /// a column's physical encoding can never masquerade as (or hide) a
+    /// cell difference.
+    fn render_join_batch(batch: &RecordBatch, out: &mut Vec<Vec<String>>) {
+        let decoded: Vec<ArrayRef> = batch
+            .columns()
+            .iter()
+            .map(|c| match c.data_type() {
+                arrow::datatypes::DataType::Dictionary(_, v) => {
+                    compute::cast(c.as_ref(), v).unwrap()
+                }
+                _ => c.clone(),
+            })
+            .collect();
+        for row in 0..batch.num_rows() {
+            out.push(decoded.iter().map(|c| render_cell(c, row)).collect());
+        }
+    }
+
+    /// Render every row of `batches` (Dictionary decoded, NULL as "NULL").
+    fn naive_rows(batches: &[RecordBatch]) -> Vec<Vec<String>> {
+        let mut out = Vec::new();
+        for b in batches {
+            render_join_batch(b, &mut out);
+        }
+        out
+    }
+
+    /// Ground truth independent of BOTH join implementations (spill-
+    /// boundaries tasks 002/003 generalized the count-only oracle): plain
+    /// per-row key comparison on column 0 (Dictionary decoded, NULL never
+    /// matches), an optional ON-filter closure over the rendered
+    /// (left row, right row) pair, NULL-extension for LEFT/RIGHT/FULL, an
+    /// optional retained mask over the left ++ right columns. Output rows
+    /// are left ++ right (INNER/outer) or LEFT rows (SEMI/ANTI) whatever
+    /// the build orientation, sorted.
+    fn naive_join_rows(
+        left: &[RecordBatch],
+        right: &[RecordBatch],
+        join_type: JoinType,
+        filter: Option<&dyn Fn(&[String], &[String]) -> bool>,
+        retained: Option<&[bool]>,
+    ) -> Vec<Vec<String>> {
+        let l = naive_rows(left);
+        let r = naive_rows(right);
+        let lw = left.first().map(|b| b.num_columns()).unwrap_or(0);
+        let rw = right.first().map(|b| b.num_columns()).unwrap_or(0);
+        let mut by_key: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, rr) in r.iter().enumerate() {
+            if rr[0] != "NULL" {
+                by_key.entry(rr[0].as_str()).or_default().push(i);
+            }
+        }
+        let nulls = |n: usize| vec!["NULL".to_string(); n];
+        let pass = |lr: &[String], rr: &[String]| filter.is_none_or(|f| f(lr, rr));
+        let mut out: Vec<Vec<String>> = Vec::new();
+        let mut r_matched = vec![false; r.len()];
+        for lr in &l {
+            let mut matched = false;
+            if lr[0] != "NULL" {
+                if let Some(idxs) = by_key.get(lr[0].as_str()) {
+                    for &ri in idxs {
+                        let rr = &r[ri];
+                        if !pass(lr, rr) {
+                            continue;
+                        }
+                        matched = true;
+                        r_matched[ri] = true;
+                        match join_type {
+                            JoinType::Semi => {
+                                out.push(lr.clone());
+                                break;
+                            }
+                            JoinType::Anti => break,
+                            _ => out.push(lr.iter().chain(rr.iter()).cloned().collect()),
+                        }
+                    }
+                }
+            }
+            if !matched {
+                match join_type {
+                    JoinType::Anti => out.push(lr.clone()),
+                    JoinType::Left | JoinType::Full => {
+                        out.push(lr.iter().cloned().chain(nulls(rw)).collect())
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if matches!(join_type, JoinType::Right | JoinType::Full) {
+            for (ri, m) in r_matched.iter().enumerate() {
+                if !m {
+                    out.push(nulls(lw).into_iter().chain(r[ri].iter().cloned()).collect());
+                }
+            }
+        }
+        if let Some(mask) = retained {
+            if !matches!(join_type, JoinType::Semi | JoinType::Anti) {
+                out = out
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .zip(mask)
+                            .filter(|(_, k)| **k)
+                            .map(|(c, _)| c)
+                            .collect()
+                    })
+                    .collect();
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn naive_join_count(left: &[RecordBatch], right: &[RecordBatch], join_type: JoinType) -> usize {
+        naive_join_rows(left, right, join_type, None, None).len()
+    }
+
+    /// Outcome of one `SpillableHashJoinExec` run.
+    struct JoinRun {
+        rows: Vec<Vec<String>>,
+        spilled: bool,
+        spilled_partitions: usize,
+        max_spilled_build_rows: usize,
+        threshold: usize,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_spillable_join(
+        left: (SchemaRef, Vec<RecordBatch>),
+        right: (SchemaRef, Vec<RecordBatch>),
+        on: Vec<(Expr, Expr)>,
+        join_type: JoinType,
+        build_right: bool,
+        memory_limit: usize,
+        tag: &str,
+    ) -> JoinRun {
+        run_spillable_join_opts(
+            left,
+            right,
+            on,
+            join_type,
+            build_right,
+            memory_limit,
+            tag,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// `run_spillable_join` with an explicit phase-B parallelism K
+    /// (join-spill-streaming task 003; `None` = derived, which for these
+    /// tiny-budget fixtures is K=1 since every spilled partition's table
+    /// exceeds the whole threshold).
+    #[allow(clippy::too_many_arguments)]
+    async fn run_spillable_join_k(
+        left: (SchemaRef, Vec<RecordBatch>),
+        right: (SchemaRef, Vec<RecordBatch>),
+        on: Vec<(Expr, Expr)>,
+        join_type: JoinType,
+        build_right: bool,
+        memory_limit: usize,
+        tag: &str,
+        parallelism: Option<usize>,
+    ) -> JoinRun {
+        run_spillable_join_opts(
+            left,
+            right,
+            on,
+            join_type,
+            build_right,
+            memory_limit,
+            tag,
+            parallelism,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// The full runner: explicit K, an ON-clause `filter` (spill-boundaries
+    /// task 002) and a `retained` mask over left ++ right (task 003).
+    #[allow(clippy::too_many_arguments)]
+    async fn run_spillable_join_opts(
+        left: (SchemaRef, Vec<RecordBatch>),
+        right: (SchemaRef, Vec<RecordBatch>),
+        on: Vec<(Expr, Expr)>,
+        join_type: JoinType,
+        build_right: bool,
+        memory_limit: usize,
+        tag: &str,
+        parallelism: Option<usize>,
+        filter: Option<Expr>,
+        retained: Option<Vec<bool>>,
+    ) -> JoinRun {
+        let l: Arc<dyn PhysicalOperator> = Arc::new(
+            crate::physical::operators::MemoryTableExec::new("l", left.0, left.1, None),
+        );
+        let r: Arc<dyn PhysicalOperator> = Arc::new(
+            crate::physical::operators::MemoryTableExec::new("r", right.0, right.1, None),
+        );
+        let pool = crate::execution::create_memory_pool(memory_limit);
+        let spill_dir =
+            std::env::temp_dir().join(format!("qe_sa_join_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&spill_dir);
+        let config = ExecutionConfig::new()
+            .with_memory_limit(memory_limit)
+            .with_spill_path(spill_dir.clone());
+        let threshold = (memory_limit as f64 * config.spill_threshold) as usize;
+        let mut join = SpillableHashJoinExec::new(l, r, on, join_type, pool, config)
+            .with_build_right(build_right)
+            .with_spill_join_parallelism(parallelism)
+            .with_filter(filter);
+        join.set_retained(retained);
+        let width = join.schema().fields().len();
+        let mut rows = Vec::new();
+        // INNER output is spread over the probe side's partitions; SEMI/
+        // ANTI is single-partition; the spill path serves everything from
+        // partition 0 and returns empty streams for the rest.
+        for part in 0..join.output_partitions() {
+            let mut stream = join.execute(part).await.unwrap();
+            while let Some(b) = stream.try_next().await.unwrap() {
+                assert_eq!(
+                    b.num_columns(),
+                    width,
+                    "{tag}: output width must equal the declared output schema"
+                );
+                // spill-boundaries 003 follow-up: every batch the spill path
+                // emits is a bounded slice (the output channel bounds batch
+                // COUNT; this is what bounds its bytes).
+                if memory_limit < SA_UNLIMITED && std::env::var("QE_SPILL_EMIT_ROWS").is_err() {
+                    assert!(
+                        b.num_rows() <= SPILL_EMIT_ROWS,
+                        "{tag}: spill-path batch of {} rows exceeds SPILL_EMIT_ROWS={SPILL_EMIT_ROWS}",
+                        b.num_rows()
+                    );
+                }
+                render_join_batch(&b, &mut rows);
+            }
+        }
+        rows.sort();
+        let (spilled, spilled_partitions, max_spilled_build_rows) = match join.build_decision.get()
+        {
+            Some(BuildDecision::Spill(state)) => (
+                true,
+                state.spilled.iter().filter(|s| s.is_some()).count(),
+                state
+                    .spilled
+                    .iter()
+                    .flatten()
+                    .map(|s| s.build_rows)
+                    .max()
+                    .unwrap_or(0),
+            ),
+            _ => (false, 0, 0),
+        };
+        drop(join);
+        let _ = std::fs::remove_dir_all(&spill_dir);
+        JoinRun {
+            rows,
+            spilled,
+            spilled_partitions,
+            max_spilled_build_rows,
+            threshold,
+        }
+    }
+
+    /// (nullable Int64 key, Utf8 payload, Int64 value) — the value column
+    /// (`i % 7`, never NULL) is the non-key column the ON-filter tests
+    /// compare across sides (spill-boundaries task 002).
+    fn keyed_schema(key: &str, payload: &str, value: &str) -> SchemaRef {
+        use arrow::datatypes::{DataType, Field, Schema};
+        Arc::new(Schema::new(vec![
+            Field::new(key, DataType::Int64, true),
+            Field::new(payload, DataType::Utf8, false),
+            Field::new(value, DataType::Int64, false),
+        ]))
+    }
+
+    /// `n` rows of (nullable Int64 key, Utf8 payload, Int64 value = i % 7)
+    /// in batches of `rows_per_batch`; `key_of(i)` = None produces a NULL
+    /// key.
+    fn keyed_batches(
+        schema: &SchemaRef,
+        n: i64,
+        rows_per_batch: i64,
+        key_of: impl Fn(i64) -> Option<i64>,
+        tag: &str,
+    ) -> Vec<RecordBatch> {
+        let mut out = Vec::new();
+        let mut start = 0i64;
+        while start < n {
+            let end = (start + rows_per_batch).min(n);
+            let keys: Vec<Option<i64>> = (start..end).map(&key_of).collect();
+            let payload: Vec<String> = (start..end).map(|i| format!("{tag}{i}")).collect();
+            let values: Vec<i64> = (start..end).map(|i| i % 7).collect();
+            out.push(
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(keys)),
+                        Arc::new(StringArray::from(payload)),
+                        Arc::new(Int64Array::from(values)),
+                    ],
+                )
+                .unwrap(),
+            );
+            start = end;
+        }
+        out
+    }
+
+    const SA_LIMIT: usize = 64 * 1024;
+    const SA_UNLIMITED: usize = 1 << 40;
+
+    /// The two build-side shapes every orientation is exercised with:
+    ///   dense  — keys 0, 3, 6, ... (four passes over the same key set, so
+    ///            every key's copies land in far-apart batches → after
+    ///            eviction they straddle read-back CHUNKS), plus NULL keys;
+    ///   sparse — 40k rows over only THREE distinct keys 6/18/4002 (all in
+    ///            the dense set) plus NULLs: at most
+    ///            three partitions hold any build row, so ~61 partitions
+    ///            see probe rows with NO build rows at all (the ANTI
+    ///            dropped-batch hazard), and each populated partition has
+    ///            ~13k rows → many chunks with the same key in every one
+    ///            (the SEMI double-emit hazard, maximally).
+    fn build_dense(schema: &SchemaRef, tag: &str) -> Vec<RecordBatch> {
+        let mut b = Vec::new();
+        for pass in 0..4 {
+            b.extend(keyed_batches(
+                schema,
+                20_000,
+                1024,
+                |i| if i % 89 == 0 { None } else { Some(i * 3) },
+                &format!("{tag}p{pass}_"),
+            ));
+        }
+        b
+    }
+    fn build_sparse(schema: &SchemaRef, tag: &str) -> Vec<RecordBatch> {
+        keyed_batches(
+            schema,
+            40_000,
+            1024,
+            |i| {
+                if i % 89 == 0 {
+                    None
+                } else {
+                    Some([6i64, 18, 4_002][(i % 3) as usize])
+                }
+            },
+            tag,
+        )
+    }
+    /// The "other" side: keys 0..20000 with a NULL every 97th row.
+    fn other_side(schema: &SchemaRef, tag: &str) -> Vec<RecordBatch> {
+        keyed_batches(
+            schema,
+            20_000,
+            1024,
+            |i| if i % 97 == 0 { None } else { Some(i) },
+            tag,
+        )
+    }
+
+    async fn assert_semi_anti_spill_matches(
+        join_type: JoinType,
+        build_right: bool,
+        shape: &str,
+        tag: &str,
+    ) {
+        let ls = keyed_schema("lk", "lp", "lv");
+        let rs = keyed_schema("rk", "rp", "rv");
+        // The build side is the right side when `build_right`, else the left.
+        let (left, right) = match (build_right, shape) {
+            (true, "dense") => (other_side(&ls, "L"), build_dense(&rs, "R")),
+            (true, "sparse") => (other_side(&ls, "L"), build_sparse(&rs, "R")),
+            (false, "dense") => (build_dense(&ls, "L"), other_side(&rs, "R")),
+            (false, "sparse") => (build_dense(&ls, "L"), build_sparse(&rs, "R")),
+            _ => unreachable!(),
+        };
+        let on = vec![(Expr::column("lk"), Expr::column("rk"))];
+        let truth = naive_join_count(&left, &right, join_type);
+        let base = run_spillable_join(
+            (ls.clone(), left.clone()),
+            (rs.clone(), right.clone()),
+            on.clone(),
+            join_type,
+            build_right,
+            SA_UNLIMITED,
+            &format!("{tag}_base"),
+        )
+        .await;
+        assert!(
+            !base.spilled,
+            "{tag}: baseline must be the in-memory delegate"
+        );
+        let spill = run_spillable_join(
+            (ls, left),
+            (rs, right),
+            on,
+            join_type,
+            build_right,
+            SA_LIMIT,
+            &format!("{tag}_spill"),
+        )
+        .await;
+        assert!(
+            spill.spilled,
+            "{tag}: the {SA_LIMIT}-byte budget must force the spill path"
+        );
+        assert!(
+            spill.spilled_partitions > 0,
+            "{tag}: no partition was evicted to disk"
+        );
+        // Chunked read-back precondition: a spilled partition whose
+        // predicted table exceeds the budget is read back in >1 chunk
+        // (`process_spilled_partition` closes a chunk BEFORE the predicted
+        // cost would cross the threshold and each Parquet row group is its
+        // own batch here), which is exactly where the straddling hazards
+        // live.
+        assert!(
+            predicted_hash_table_bytes(spill.max_spilled_build_rows, 1) > spill.threshold,
+            "{tag}: largest spilled partition ({} rows) would not be chunked at threshold {}",
+            spill.max_spilled_build_rows,
+            spill.threshold
+        );
+        assert!(
+            truth > 0,
+            "{tag}: degenerate fixture, ground truth is empty"
+        );
+        assert_eq!(
+            spill.rows.len(),
+            truth,
+            "{tag}: spill-path row count differs from the naive ground truth"
+        );
+        if base.rows.len() == truth {
+            assert_eq!(
+                base.rows, spill.rows,
+                "{tag}: spill-path rows differ from in-memory"
+            );
+        } else {
+            // The in-memory delegate (HashJoinExec, not this task's code)
+            // disagrees with the ground truth — pinned as a hard assertion
+            // in `in_memory_hash_join_dictionary_build_side_semi_anti_is_exact`
+            // (fixed by hash-join-dictionary-semi-anti-fix task 001).
+            eprintln!(
+                "FINDING {tag}: in-memory HashJoinExec returned {} rows, ground truth {truth} (spill path: {})",
+                base.rows.len(),
+                spill.rows.len()
+            );
+        }
+    }
+
+    /// Probe-side output (`build_right = true`, build = right, probe = left
+    /// = the output side): SEMI and ANTI, dense and sparse builds.
+    #[tokio::test]
+    async fn semi_anti_spill_probe_side_output_is_cell_exact() {
+        assert_semi_anti_spill_matches(JoinType::Semi, true, "dense", "semi_ps_dense").await;
+        assert_semi_anti_spill_matches(JoinType::Anti, true, "dense", "anti_ps_dense").await;
+        assert_semi_anti_spill_matches(JoinType::Semi, true, "sparse", "semi_ps_sparse").await;
+        assert_semi_anti_spill_matches(JoinType::Anti, true, "sparse", "anti_ps_sparse").await;
+    }
+
+    /// Build-side output (`build_right = false`, build = left = the output
+    /// side): SEMI and ANTI. The "sparse" probe here sends probe rows to at
+    /// most three partitions, so almost every build partition — resident
+    /// or spilled — receives ZERO probe rows and must still be emitted in
+    /// full by ANTI (and not at all by SEMI).
+    #[tokio::test]
+    async fn semi_anti_spill_build_side_output_is_cell_exact() {
+        assert_semi_anti_spill_matches(JoinType::Semi, false, "dense", "semi_bs_dense").await;
+        assert_semi_anti_spill_matches(JoinType::Anti, false, "dense", "anti_bs_dense").await;
+        assert_semi_anti_spill_matches(JoinType::Semi, false, "sparse", "semi_bs_sparse").await;
+        assert_semi_anti_spill_matches(JoinType::Anti, false, "sparse", "anti_bs_sparse").await;
+    }
+
+    /// Dictionary(Int32, Utf8)-encoded join keys on BOTH sides (the
+    /// encoding native tables give every low-cardinality string column),
+    /// through the spill round trip, in both orientations, SEMI and ANTI —
+    /// and INNER, which shares the same key extraction.
+    #[tokio::test]
+    async fn semi_anti_spill_dictionary_keys_are_cell_exact() {
+        use arrow::array::DictionaryArray;
+        use arrow::datatypes::{DataType, Field, Int32Type, Schema};
+        let dict_ty = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let ls: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("lk", dict_ty.clone(), true),
+            Field::new("lp", DataType::Int64, false),
+        ]));
+        let rs: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("rk", dict_ty, true),
+            Field::new("rp", DataType::Int64, false),
+        ]));
+        // 40 distinct string keys; the wide side repeats them many times
+        // (so the build side is far above the budget) and the narrow side
+        // covers half of them plus NULLs.
+        fn dict_batches(
+            schema: &SchemaRef,
+            n: i64,
+            key_of: impl Fn(i64) -> Option<String>,
+        ) -> Vec<RecordBatch> {
+            let mut out = Vec::new();
+            let mut start = 0i64;
+            while start < n {
+                let end = (start + 1024).min(n);
+                let dict: DictionaryArray<Int32Type> = (start..end)
+                    .map(|i| key_of(i))
+                    .collect::<Vec<Option<String>>>()
+                    .iter()
+                    .map(|o| o.as_deref())
+                    .collect();
+                out.push(
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            Arc::new(dict),
+                            Arc::new(Int64Array::from((start..end).collect::<Vec<i64>>())),
+                        ],
+                    )
+                    .unwrap(),
+                );
+                start = end;
+            }
+            out
+        }
+        let wide = |s: &SchemaRef| {
+            dict_batches(s, 60_000, |i| {
+                if i % 89 == 0 {
+                    None
+                } else {
+                    Some(format!("key{:02}", i % 40))
+                }
+            })
+        };
+        let narrow = |s: &SchemaRef, n: i64| {
+            dict_batches(s, n, |i| {
+                if i % 97 == 0 {
+                    None
+                } else {
+                    Some(format!("key{:02}", i % 20))
+                }
+            })
+        };
+        for (jt, build_right, tag) in [
+            (JoinType::Semi, true, "dict_semi_ps"),
+            (JoinType::Anti, true, "dict_anti_ps"),
+            (JoinType::Semi, false, "dict_semi_bs"),
+            (JoinType::Anti, false, "dict_anti_bs"),
+            (JoinType::Inner, true, "dict_inner"),
+        ] {
+            // INNER emits one pair per (narrow row x 1,500 duplicates), so
+            // keep its narrow side small (200 rows -> ~300k pairs).
+            let n_narrow = if matches!(jt, JoinType::Inner) {
+                200
+            } else {
+                2_000
+            };
+            let (left, right) = if build_right {
+                (narrow(&ls, n_narrow), wide(&rs))
+            } else {
+                (wide(&ls), narrow(&rs, n_narrow))
+            };
+            let on = vec![(Expr::column("lk"), Expr::column("rk"))];
+            let truth = naive_join_count(&left, &right, jt);
+            let base = run_spillable_join(
+                (ls.clone(), left.clone()),
+                (rs.clone(), right.clone()),
+                on.clone(),
+                jt,
+                build_right,
+                SA_UNLIMITED,
+                &format!("{tag}_base"),
+            )
+            .await;
+            let spill = run_spillable_join(
+                (ls.clone(), left),
+                (rs.clone(), right),
+                on,
+                jt,
+                build_right,
+                SA_LIMIT,
+                &format!("{tag}_spill"),
+            )
+            .await;
+            assert!(
+                !base.spilled && spill.spilled,
+                "{tag}: wrong decision split"
+            );
+            assert!(truth > 0, "{tag}: degenerate fixture");
+            assert_eq!(
+                spill.rows.len(),
+                truth,
+                "{tag}: spill-path row count differs from the naive ground truth"
+            );
+            if base.rows.len() == truth {
+                assert_eq!(base.rows, spill.rows, "{tag}: rows differ");
+            } else {
+                eprintln!(
+                    "FINDING {tag}: in-memory HashJoinExec returned {} rows, ground truth {truth} (spill path: {})",
+                    base.rows.len(),
+                    spill.rows.len()
+                );
+            }
+        }
+    }
+
+    /// The ON-filter shapes the spill path is exercised with (spill-
+    /// boundaries task 002), each paired with the naive closure that
+    /// defines it over the rendered (left row, right row):
+    ///   None     — key equality alone;
+    ///   Compiled — `lv < rv`, one column per side → hash_join's
+    ///              `CompiledFilter` fast path (no gather);
+    ///   Gathered — `lv + 1 < rv`, an arithmetic left operand → the generic
+    ///              gather-and-`evaluate_expr` path.
+    #[derive(Clone, Copy, Debug)]
+    enum FilterKind {
+        None,
+        Compiled,
+        Gathered,
+    }
+
+    impl FilterKind {
+        fn expr(self) -> Option<Expr> {
+            match self {
+                FilterKind::None => None,
+                FilterKind::Compiled => Some(Expr::column("lv").lt(Expr::column("rv"))),
+                FilterKind::Gathered => Some(
+                    Expr::column("lv")
+                        .add(Expr::literal(crate::planner::ScalarValue::Int64(1)))
+                        .lt(Expr::column("rv")),
+                ),
+            }
+        }
+        fn naive(self) -> Option<Box<dyn Fn(&[String], &[String]) -> bool>> {
+            let v = |row: &[String]| row[2].parse::<i64>().expect("value column");
+            match self {
+                FilterKind::None => None,
+                FilterKind::Compiled => Some(Box::new(move |l, r| v(l) < v(r))),
+                FilterKind::Gathered => Some(Box::new(move |l, r| v(l) + 1 < v(r))),
+            }
+        }
+    }
+
+    /// One fixture through the in-memory delegate AND the spill path
+    /// (tiny budget, chunked read-back guaranteed, explicit K), both
+    /// compared ROW-FOR-ROW against `naive_join_rows`.
+    #[allow(clippy::too_many_arguments)]
+    async fn assert_join_spill_matches(
+        join_type: JoinType,
+        build_right: bool,
+        shape: &str,
+        filter: FilterKind,
+        retained: Option<Vec<bool>>,
+        k: Option<usize>,
+        tag: &str,
+    ) {
+        let ls = keyed_schema("lk", "lp", "lv");
+        let rs = keyed_schema("rk", "rp", "rv");
+        // The build side is the right side when `build_right`, else the left
+        // (RIGHT joins always build from the right, whatever the flag).
+        let build_is_right = build_right || matches!(join_type, JoinType::Right);
+        let (left, right) = match (build_is_right, shape) {
+            (true, "dense") => (other_side(&ls, "L"), build_dense(&rs, "R")),
+            (true, "sparse") => (other_side(&ls, "L"), build_sparse(&rs, "R")),
+            (false, "dense") => (build_dense(&ls, "L"), other_side(&rs, "R")),
+            (false, "sparse") => (build_dense(&ls, "L"), build_sparse(&rs, "R")),
+            _ => unreachable!(),
+        };
+        let on = vec![(Expr::column("lk"), Expr::column("rk"))];
+        let naive_filter = filter.naive();
+        let truth = naive_join_rows(
+            &left,
+            &right,
+            join_type,
+            naive_filter.as_deref(),
+            retained.as_deref(),
+        );
+        assert!(
+            !truth.is_empty(),
+            "{tag}: degenerate fixture, ground truth is empty"
+        );
+        let base = run_spillable_join_opts(
+            (ls.clone(), left.clone()),
+            (rs.clone(), right.clone()),
+            on.clone(),
+            join_type,
+            build_right,
+            SA_UNLIMITED,
+            &format!("{tag}_base"),
+            None,
+            filter.expr(),
+            retained.clone(),
+        )
+        .await;
+        assert!(
+            !base.spilled,
+            "{tag}: baseline must be the in-memory delegate"
+        );
+        let spill = run_spillable_join_opts(
+            (ls, left),
+            (rs, right),
+            on,
+            join_type,
+            build_right,
+            SA_LIMIT,
+            &format!("{tag}_spill"),
+            k,
+            filter.expr(),
+            retained,
+        )
+        .await;
+        assert!(
+            spill.spilled,
+            "{tag}: the {SA_LIMIT}-byte budget must force the spill path"
+        );
+        assert!(
+            spill.spilled_partitions > 0,
+            "{tag}: no partition was evicted to disk"
+        );
+        assert!(
+            predicted_hash_table_bytes(spill.max_spilled_build_rows, 1) > spill.threshold,
+            "{tag}: largest spilled partition ({} rows) would not be chunked at threshold {}",
+            spill.max_spilled_build_rows,
+            spill.threshold
+        );
+        assert_eq!(
+            spill.rows.len(),
+            truth.len(),
+            "{tag}: spill-path row count {} differs from the naive ground truth {}",
+            spill.rows.len(),
+            truth.len()
+        );
+        assert_eq!(
+            spill.rows, truth,
+            "{tag}: spill-path rows differ from the naive ground truth"
+        );
+        assert_eq!(
+            base.rows.len(),
+            truth.len(),
+            "{tag}: in-memory delegate row count {} differs from the naive ground truth {}",
+            base.rows.len(),
+            truth.len()
+        );
+        assert_eq!(
+            base.rows, truth,
+            "{tag}: in-memory delegate rows differ from the naive ground truth"
+        );
+    }
+
+    /// spill-boundaries task 002: INNER with an ON-clause filter through the
+    /// spill path — both build orientations, dense (chunk-straddling
+    /// duplicates) and sparse, the compiled and the gathered filter paths,
+    /// NULL keys on both sides.
+    #[tokio::test]
+    async fn filtered_inner_spill_is_cell_exact() {
+        for (build_right, shape, filter) in [
+            (false, "dense", FilterKind::Compiled),
+            (true, "dense", FilterKind::Compiled),
+            (false, "sparse", FilterKind::Compiled),
+            (true, "sparse", FilterKind::Compiled),
+            (false, "dense", FilterKind::Gathered),
+            (true, "dense", FilterKind::Gathered),
+            (true, "sparse", FilterKind::Gathered),
+        ] {
+            let tag = format!("finner_{build_right}_{shape}_{filter:?}");
+            assert_join_spill_matches(
+                JoinType::Inner,
+                build_right,
+                shape,
+                filter,
+                None,
+                None,
+                &tag,
+            )
+            .await;
+        }
+    }
+
+    /// spill-boundaries task 002: SEMI/ANTI with an ON-clause filter — a
+    /// candidate counts only through a pair that PASSES the filter, in both
+    /// orientations (probe-side bitmap OR-accumulated across chunks; build-
+    /// side per-partition / per-chunk bitmaps), dense and sparse, compiled
+    /// and gathered paths.
+    #[tokio::test]
+    async fn filtered_semi_anti_spill_is_cell_exact() {
+        for (jt, build_right, shape, filter) in [
+            (JoinType::Semi, true, "dense", FilterKind::Compiled),
+            (JoinType::Anti, true, "dense", FilterKind::Compiled),
+            (JoinType::Semi, false, "dense", FilterKind::Compiled),
+            (JoinType::Anti, false, "dense", FilterKind::Compiled),
+            (JoinType::Semi, true, "sparse", FilterKind::Compiled),
+            (JoinType::Anti, true, "sparse", FilterKind::Compiled),
+            (JoinType::Semi, false, "sparse", FilterKind::Compiled),
+            (JoinType::Anti, false, "sparse", FilterKind::Compiled),
+            (JoinType::Semi, true, "dense", FilterKind::Gathered),
+            (JoinType::Anti, true, "dense", FilterKind::Gathered),
+            (JoinType::Semi, false, "dense", FilterKind::Gathered),
+            (JoinType::Anti, false, "dense", FilterKind::Gathered),
+            (JoinType::Anti, true, "sparse", FilterKind::Gathered),
+            (JoinType::Anti, false, "sparse", FilterKind::Gathered),
+        ] {
+            let tag = format!("fsa_{jt:?}_{build_right}_{shape}_{filter:?}");
+            assert_join_spill_matches(jt, build_right, shape, filter, None, None, &tag).await;
+        }
+    }
+
+    /// Pre-existing spill-path bug found by this task's sparse fixtures
+    /// (not SEMI/ANTI-specific): with a build side whose FIRST batch
+    /// already exceeds the threshold, `build_with_partitioning` evicted
+    /// the "largest" partition while all were still empty, recording a
+    /// `SpilledPartition` whose file is never written when no build row
+    /// later routes there; sparse keys leave ~60 such partitions and the
+    /// read-back failed with "Failed to open parquet file". INNER, sparse
+    /// keys, tiny budget: must complete cell-exact vs the in-memory
+    /// delegate.
+    #[tokio::test]
+    async fn inner_spill_with_sparse_build_keys_survives_empty_partition_eviction() {
+        let ls = keyed_schema("lk", "lp", "lv");
+        let rs = keyed_schema("rk", "rp", "rv");
+        for build_right in [true, false] {
+            let (left, right) = if build_right {
+                (other_side(&ls, "L"), build_sparse(&rs, "R"))
+            } else {
+                (build_sparse(&ls, "L"), other_side(&rs, "R"))
+            };
+            let truth = naive_join_count(&left, &right, JoinType::Inner);
+            let on = vec![(Expr::column("lk"), Expr::column("rk"))];
+            let base = run_spillable_join(
+                (ls.clone(), left.clone()),
+                (rs.clone(), right.clone()),
+                on.clone(),
+                JoinType::Inner,
+                build_right,
+                SA_UNLIMITED,
+                &format!("inner_sparse_base_{build_right}"),
+            )
+            .await;
+            let spill = run_spillable_join(
+                (ls.clone(), left),
+                (rs.clone(), right),
+                on,
+                JoinType::Inner,
+                build_right,
+                SA_LIMIT,
+                &format!("inner_sparse_spill_{build_right}"),
+            )
+            .await;
+            assert!(!base.spilled && spill.spilled, "wrong decision split");
+            assert!(truth > 0, "degenerate fixture");
+            assert_eq!(
+                spill.rows.len(),
+                truth,
+                "build_right={build_right}: spill path INNER pair count differs from ground truth"
+            );
+            assert_eq!(
+                base.rows.len(),
+                truth,
+                "build_right={build_right}: in-memory INNER pair count differs from ground truth"
+            );
+            assert_eq!(base.rows, spill.rows, "rows differ");
+        }
+    }
+
+    /// join-spill-streaming task 002: build one spilling operator and
+    /// return it with its spill dir, the naive INNER ground truth and the
+    /// output width (fixture shared by the repeat-execution tests below).
+    fn spilling_inner_join_fixture(tag: &str) -> (SpillableHashJoinExec, PathBuf, usize) {
+        let ls = keyed_schema("lk", "lp", "lv");
+        let rs = keyed_schema("rk", "rp", "rv");
+        let (left, right) = (build_dense(&ls, "L"), other_side(&rs, "R"));
+        let truth = naive_join_count(&left, &right, JoinType::Inner);
+        assert!(truth > 0, "degenerate fixture");
+        let l: Arc<dyn PhysicalOperator> = Arc::new(
+            crate::physical::operators::MemoryTableExec::new("l", ls, left, None),
+        );
+        let r: Arc<dyn PhysicalOperator> = Arc::new(
+            crate::physical::operators::MemoryTableExec::new("r", rs, right, None),
+        );
+        let pool = crate::execution::create_memory_pool(SA_LIMIT);
+        let spill_dir = std::env::temp_dir().join(format!("qe_jss_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&spill_dir);
+        let config = ExecutionConfig::new()
+            .with_memory_limit(SA_LIMIT)
+            .with_spill_path(spill_dir.clone());
+        let join = SpillableHashJoinExec::new(
+            l,
+            r,
+            vec![(Expr::column("lk"), Expr::column("rk"))],
+            JoinType::Inner,
+            pool,
+            config,
+        );
+        (join, spill_dir, truth)
+    }
+
+    async fn drain_join(join: &SpillableHashJoinExec) -> Vec<Vec<String>> {
+        let mut rows = Vec::new();
+        for part in 0..join.output_partitions() {
+            let mut stream = join.execute(part).await.unwrap();
+            while let Some(b) = stream.try_next().await.unwrap() {
+                render_join_batch(&b, &mut rows);
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    fn memoized_spill_dir(join: &SpillableHashJoinExec) -> PathBuf {
+        match join.build_decision.get() {
+            Some(BuildDecision::Spill(state)) => state.spill_dir.clone(),
+            _ => panic!("expected a memoized Spill decision"),
+        }
+    }
+
+    fn probe_files_in(dir: &Path) -> Vec<String> {
+        let mut out: Vec<String> = std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with("probe_"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    /// The output is now a stream whose producer owns a handle to the
+    /// memoized build decision (join-spill-streaming task 002). An
+    /// operator above may execute this join MORE THAN ONCE (the fused
+    /// streaming aggregate drains, aborts, and re-executes its input):
+    /// the second execution must see the same memoized build side and
+    /// produce the identical result, the memoized spill directory must
+    /// survive between executions, each call's probe files must be gone
+    /// once its stream is fully drained, and the directory must be
+    /// removed exactly once — when the operator is dropped.
+    #[tokio::test]
+    async fn spill_path_repeat_execution_yields_identical_results() {
+        let (join, spill_dir, truth) = spilling_inner_join_fixture("repeat");
+        let first = drain_join(&join).await;
+        assert_eq!(
+            first.len(),
+            truth,
+            "first execution differs from ground truth"
+        );
+        let memo_dir = memoized_spill_dir(&join);
+        assert!(
+            memo_dir.exists(),
+            "memoized spill dir must survive between executions"
+        );
+        assert!(
+            probe_files_in(&memo_dir).is_empty(),
+            "a fully drained call must have removed its own probe files: {:?}",
+            probe_files_in(&memo_dir)
+        );
+        let second = drain_join(&join).await;
+        assert_eq!(first, second, "repeat execution must be identical");
+        assert!(
+            memo_dir.exists(),
+            "memoized spill dir must still exist after the second execution"
+        );
+        drop(join);
+        assert!(
+            !memo_dir.exists(),
+            "spill dir must be removed when the operator is dropped"
+        );
+        let _ = std::fs::remove_dir_all(&spill_dir);
+    }
+
+    /// A consumer that drops the output stream early (LIMIT satisfied, a
+    /// fused aggregate aborting its attempt, an error elsewhere) must not
+    /// disturb a later, full execution of the same operator: probe files
+    /// are per call, so the abandoned producer and the repeat call never
+    /// share a writer, and the abandoned call's files are cleaned up by
+    /// its own producer.
+    #[tokio::test]
+    async fn spill_path_abandoned_stream_does_not_disturb_a_repeat_execution() {
+        let (join, spill_dir, truth) = spilling_inner_join_fixture("abandon");
+        {
+            let mut stream = join.execute(0).await.unwrap();
+            let first = stream.try_next().await.unwrap();
+            assert!(first.is_some(), "the spilling join must produce output");
+            // Drop the stream after ONE batch, with the producer mid-flight.
+        }
+        let full = drain_join(&join).await;
+        assert_eq!(
+            full.len(),
+            truth,
+            "execution after an abandoned stream differs from ground truth"
+        );
+        let memo_dir = memoized_spill_dir(&join);
+        // The abandoned producer notices the closed channel at its next
+        // send / probe batch and removes its own probe files; bounded wait.
+        let mut leftover = probe_files_in(&memo_dir);
+        for _ in 0..200 {
+            if leftover.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            leftover = probe_files_in(&memo_dir);
+        }
+        assert!(
+            leftover.is_empty(),
+            "probe files of an abandoned or drained call must be removed: {leftover:?}"
+        );
+        drop(join);
+        assert!(!memo_dir.exists(), "spill dir removed on drop");
+        let _ = std::fs::remove_dir_all(&spill_dir);
+    }
+
+    /// join-spill-streaming task 003: spilled partitions processed K at a
+    /// time (K forced to 3 and 8 — the derived K is 1 for these fixtures,
+    /// whose every spilled partition out-sizes the whole budget), chunk
+    /// budget = threshold / K (so every partition is read back in MANY
+    /// chunks, with the probe file re-streamed per chunk and the probe
+    /// work rayon-parallel within each chunk). Every orientation and join
+    /// type against the naive ground truth: INNER pair multiset, probe-side
+    /// SEMI/ANTI (cross-chunk OR bitmap, final emission pass), build-side
+    /// SEMI/ANTI (per-chunk atomic bitmap), dense and sparse shapes (the
+    /// sparse one leaves most partitions with no probe file at all).
+    #[tokio::test]
+    async fn spilled_partitions_processed_in_parallel_are_cell_exact() {
+        let ls = keyed_schema("lk", "lp", "lv");
+        let rs = keyed_schema("rk", "rp", "rv");
+        for k in [3usize, 8] {
+            for (jt, build_right, shape) in [
+                (JoinType::Inner, true, "dense"),
+                (JoinType::Inner, false, "dense"),
+                (JoinType::Inner, false, "sparse"),
+                (JoinType::Semi, true, "dense"),
+                (JoinType::Anti, true, "dense"),
+                (JoinType::Semi, true, "sparse"),
+                (JoinType::Anti, true, "sparse"),
+                (JoinType::Semi, false, "dense"),
+                (JoinType::Anti, false, "dense"),
+                (JoinType::Semi, false, "sparse"),
+                (JoinType::Anti, false, "sparse"),
+            ] {
+                let tag = format!("par{k}_{jt:?}_{build_right}_{shape}");
+                let (left, right) = match (build_right, shape) {
+                    (true, "dense") => (other_side(&ls, "L"), build_dense(&rs, "R")),
+                    (true, "sparse") => (other_side(&ls, "L"), build_sparse(&rs, "R")),
+                    (false, "dense") => (build_dense(&ls, "L"), other_side(&rs, "R")),
+                    (false, "sparse") => (build_dense(&ls, "L"), build_sparse(&rs, "R")),
+                    _ => unreachable!(),
+                };
+                let on = vec![(Expr::column("lk"), Expr::column("rk"))];
+                let truth = naive_join_count(&left, &right, jt);
+                assert!(truth > 0, "{tag}: degenerate fixture");
+                let base = run_spillable_join(
+                    (ls.clone(), left.clone()),
+                    (rs.clone(), right.clone()),
+                    on.clone(),
+                    jt,
+                    build_right,
+                    SA_UNLIMITED,
+                    &format!("{tag}_base"),
+                )
+                .await;
+                let spill = run_spillable_join_k(
+                    (ls.clone(), left),
+                    (rs.clone(), right),
+                    on,
+                    jt,
+                    build_right,
+                    SA_LIMIT,
+                    &format!("{tag}_spill"),
+                    Some(k),
+                )
+                .await;
+                assert!(
+                    !base.spilled && spill.spilled,
+                    "{tag}: wrong decision split"
+                );
+                // Dense shapes spill dozens of partitions (K fully
+                // exercised); the sparse build has only 3 keys → ≤ 4
+                // spilled partitions, so K is clamped to them (still > 1).
+                let want_parallel = if shape == "dense" { k } else { 2 };
+                assert!(
+                    spill.spilled_partitions >= want_parallel,
+                    "{tag}: only {} spilled partitions, K={k} not exercised",
+                    spill.spilled_partitions
+                );
+                assert_eq!(
+                    spill.rows.len(),
+                    truth,
+                    "{tag}: K={k} spill-path row count differs from the naive ground truth"
+                );
+                assert_eq!(
+                    base.rows.len(),
+                    truth,
+                    "{tag}: in-memory delegate differs from the naive ground truth"
+                );
+                assert_eq!(base.rows, spill.rows, "{tag}: K={k} rows differ");
+            }
+        }
+    }
+
+    /// Regression pin (hash-join-dictionary-semi-anti-fix task 001) for a
+    /// defect the spill-join-correctness-3 task-004 fixtures surfaced in the
+    /// IN-MEMORY `HashJoinExec` delegate (hash_join.rs), exercised here
+    /// through the wrapper's in-memory path exactly as production reaches
+    /// it: SEMI/ANTI with build = LEFT (output) side, duplicate build keys
+    /// encoded as Dictionary(Int32, Utf8) (60k build rows over 40 values,
+    /// 2k probe rows over 20 of them). Before the fix the delegate marked
+    /// exactly ONE build row per distinct matched key — SEMI emitted 20
+    /// rows instead of 30,000; ANTI 59,980 (= 60,000 - 20) instead of
+    /// 30,000 — because Dictionary keys could not build a
+    /// `VectorizedHashTable` and the generic `probe_semi_anti_parallel`
+    /// loop `break`-ed after the first marked build entry. The same
+    /// fixture with plain Utf8 keys is the control (asserted too, so a
+    /// failure says whether a regression is Dictionary-specific).
+    /// Probe-side output (build = right) with the same Dictionary keys is
+    /// covered in `semi_anti_spill_dictionary_keys_are_cell_exact`.
+    /// Every count is a HARD assertion against `naive_join_count`.
+    ///
+    /// (An earlier draft of this test also reported an INNER
+    /// duplicate-key discrepancy; that was an artifact of the test helper
+    /// draining only output partition 0 of a multi-partition INNER
+    /// result, fixed in `run_spillable_join` — retracted, not a bug.)
+    #[tokio::test]
+    async fn in_memory_hash_join_dictionary_build_side_semi_anti_is_exact() {
+        use arrow::array::DictionaryArray;
+        use arrow::datatypes::{DataType, Field, Int32Type, Schema};
+        let mut failures: Vec<String> = Vec::new();
+        let mk = |schema: &SchemaRef, n: i64, modulo: i64, dict: bool| -> Vec<RecordBatch> {
+            let mut out = Vec::new();
+            let mut start = 0i64;
+            while start < n {
+                let end = (start + 1024).min(n);
+                let strings: Vec<String> = (start..end)
+                    .map(|i| format!("key{:02}", i % modulo))
+                    .collect();
+                let key_col: ArrayRef = if dict {
+                    let d: DictionaryArray<Int32Type> =
+                        strings.iter().map(|s| Some(s.as_str())).collect();
+                    Arc::new(d)
+                } else {
+                    Arc::new(StringArray::from(strings))
+                };
+                out.push(
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            key_col,
+                            Arc::new(Int64Array::from((start..end).collect::<Vec<i64>>())),
+                        ],
+                    )
+                    .unwrap(),
+                );
+                start = end;
+            }
+            out
+        };
+        for (dict, label) in [(true, "Dictionary(Int32,Utf8)"), (false, "Utf8")] {
+            let key_ty = if dict {
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+            } else {
+                DataType::Utf8
+            };
+            let dls: SchemaRef = Arc::new(Schema::new(vec![
+                Field::new("lk", key_ty.clone(), true),
+                Field::new("lp", DataType::Int64, false),
+            ]));
+            let drs: SchemaRef = Arc::new(Schema::new(vec![
+                Field::new("rk", key_ty, true),
+                Field::new("rp", DataType::Int64, false),
+            ]));
+            for jt in [JoinType::Semi, JoinType::Anti] {
+                let left = mk(&dls, 60_000, 40, dict);
+                let right = mk(&drs, 2_000, 20, dict);
+                let truth = naive_join_count(&left, &right, jt);
+                let base = run_spillable_join(
+                    (dls.clone(), left),
+                    (drs.clone(), right),
+                    vec![(Expr::column("lk"), Expr::column("rk"))],
+                    jt,
+                    false,
+                    SA_UNLIMITED,
+                    &format!("finding_{label}_{jt:?}"),
+                )
+                .await;
+                eprintln!(
+                    "FINDING-KEYS {label} {jt:?} build-side output: in-memory={} truth={truth}",
+                    base.rows.len()
+                );
+                if base.rows.len() != truth {
+                    failures.push(format!(
+                        "{jt:?} {label} build-side: in-memory {} vs truth {truth}",
+                        base.rows.len()
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "in-memory HashJoinExec build-side SEMI/ANTI wrong counts: {failures:#?}"
+        );
+    }
+
+    /// spill-boundaries task 003: LEFT/RIGHT/FULL now spill (see the
+    /// `outer_join_spill_*` tests); what remains refused, by name, is
+    /// CROSS/SINGLE/MARK — and the message says exactly what IS supported.
+    #[tokio::test]
+    async fn cross_single_mark_spill_refused_by_name() {
+        let ls = keyed_schema("lk", "lp", "lv");
+        let rs = keyed_schema("rk", "rp", "rv");
+        for jt in [JoinType::Cross, JoinType::Single] {
+            let l: Arc<dyn PhysicalOperator> =
+                Arc::new(crate::physical::operators::MemoryTableExec::new(
+                    "l",
+                    ls.clone(),
+                    build_dense(&ls, "L"),
+                    None,
+                ));
+            let r: Arc<dyn PhysicalOperator> =
+                Arc::new(crate::physical::operators::MemoryTableExec::new(
+                    "r",
+                    rs.clone(),
+                    build_dense(&rs, "R"),
+                    None,
+                ));
+            let pool = crate::execution::create_memory_pool(SA_LIMIT);
+            let spill_dir =
+                std::env::temp_dir().join(format!("qe_sa_refusal_{:?}_{}", jt, std::process::id()));
+            let config = ExecutionConfig::new()
+                .with_memory_limit(SA_LIMIT)
+                .with_spill_path(spill_dir.clone());
+            let join = SpillableHashJoinExec::new(
+                l,
+                r,
+                vec![(Expr::column("lk"), Expr::column("rk"))],
+                jt,
+                pool,
+                config,
+            );
+            let err = match join.execute(0).await {
+                Err(e) => e.to_string(),
+                Ok(mut s) => {
+                    let mut msg = None;
+                    while let Some(r) = s.next().await {
+                        if let Err(e) = r {
+                            msg = Some(e.to_string());
+                            break;
+                        }
+                    }
+                    msg.unwrap_or_else(|| {
+                        panic!("{jt:?} join over budget must refuse, not succeed")
+                    })
+                }
+            };
+            assert!(
+                err.contains("supports INNER, LEFT, RIGHT, FULL, SEMI and ANTI joins only"),
+                "{jt:?}: unexpected refusal message: {err}"
+            );
+            drop(join);
+            let _ = std::fs::remove_dir_all(&spill_dir);
+        }
+    }
+
+    /// spill-boundaries task 003: LEFT/RIGHT/FULL through the spill path,
+    /// row-for-row against the naive oracle — both build orientations
+    /// (preserved side = probe: LEFT with build = right, RIGHT; preserved
+    /// side = build: LEFT with build = left; FULL = both), dense (a key's
+    /// build rows straddle read-back chunks, so a probe row unmatched in
+    /// chunk 1 may match in chunk 2 and must NOT be NULL-extended early)
+    /// and sparse (most partitions hold no build rows at all — every probe
+    /// row there is NULL-extended; most build partitions receive no probe
+    /// rows — every build row there is NULL-extended), NULL keys on both
+    /// sides (never matched, always preserved).
+    #[tokio::test]
+    async fn outer_join_spill_is_cell_exact() {
+        for (jt, build_right, shape) in [
+            (JoinType::Left, false, "dense"),
+            (JoinType::Left, true, "dense"),
+            (JoinType::Left, false, "sparse"),
+            (JoinType::Left, true, "sparse"),
+            (JoinType::Right, false, "dense"),
+            (JoinType::Right, false, "sparse"),
+            (JoinType::Full, false, "dense"),
+            (JoinType::Full, true, "dense"),
+            (JoinType::Full, false, "sparse"),
+            (JoinType::Full, true, "sparse"),
+        ] {
+            let tag = format!("outer_{jt:?}_{build_right}_{shape}");
+            assert_join_spill_matches(jt, build_right, shape, FilterKind::None, None, None, &tag)
+                .await;
+        }
+    }
+
+    /// Task 003 + 002 together: an outer join whose ON clause carries a
+    /// filter — a pair that fails the filter is NOT a match, so its
+    /// preserved row is NULL-extended instead (the exact semantics a
+    /// post-filter would destroy). Compiled and gathered filter paths.
+    #[tokio::test]
+    async fn outer_join_spill_with_on_filter_is_cell_exact() {
+        for (jt, build_right, shape, filter) in [
+            (JoinType::Left, false, "dense", FilterKind::Compiled),
+            (JoinType::Left, true, "dense", FilterKind::Compiled),
+            (JoinType::Left, false, "sparse", FilterKind::Gathered),
+            (JoinType::Left, true, "sparse", FilterKind::Gathered),
+            (JoinType::Right, false, "dense", FilterKind::Compiled),
+            (JoinType::Right, false, "dense", FilterKind::Gathered),
+            (JoinType::Full, false, "dense", FilterKind::Compiled),
+            (JoinType::Full, true, "dense", FilterKind::Gathered),
+            (JoinType::Full, false, "sparse", FilterKind::Compiled),
+        ] {
+            let tag = format!("fouter_{jt:?}_{build_right}_{shape}_{filter:?}");
+            assert_join_spill_matches(jt, build_right, shape, filter, None, None, &tag).await;
+        }
+    }
+
+    /// Outer joins DO carry a `retained` mask (`set_retained`'s gate): the
+    /// NULL-extended rows must be pruned exactly like the matched pairs.
+    /// Masks over (lk, lp, lv, rk, rp, rv): the planner's usual case drops
+    /// both ON-only keys; the second mask drops the payloads too, keeping
+    /// only the value columns. A column the ON filter references is always
+    /// kept — `analyze_join_output_usage` force-keeps it, and the in-memory
+    /// delegate prunes its build batches by the mask BEFORE evaluating the
+    /// filter, so a mask dropping a filter column is unreachable by
+    /// construction (and rejected: `ColumnNotFound`).
+    #[tokio::test]
+    async fn outer_join_spill_with_retained_mask_is_cell_exact() {
+        let keys_dropped = vec![false, true, true, false, true, true];
+        let keys_and_payloads_dropped = vec![false, false, true, false, false, true];
+        for (jt, build_right, filter, mask) in [
+            (JoinType::Left, false, FilterKind::None, &keys_dropped),
+            (JoinType::Left, true, FilterKind::None, &keys_dropped),
+            (JoinType::Right, false, FilterKind::None, &keys_dropped),
+            (JoinType::Full, false, FilterKind::None, &keys_dropped),
+            (
+                JoinType::Left,
+                false,
+                FilterKind::Compiled,
+                &keys_and_payloads_dropped,
+            ),
+            (JoinType::Left, true, FilterKind::Compiled, &keys_dropped),
+            (
+                JoinType::Full,
+                true,
+                FilterKind::Gathered,
+                &keys_and_payloads_dropped,
+            ),
+        ] {
+            let tag = format!("router_{jt:?}_{build_right}_{filter:?}_{}", mask.len());
+            assert_join_spill_matches(
+                jt,
+                build_right,
+                "dense",
+                filter,
+                Some(mask.clone()),
+                None,
+                &tag,
+            )
+            .await;
+        }
+    }
+
+    /// K-way phase B (join-spill-streaming task 003) with the outer joins:
+    /// every preserved-side bitmap lives with its own partition's job.
+    #[tokio::test]
+    async fn outer_join_spill_processed_in_parallel_is_cell_exact() {
+        for (jt, build_right, shape) in [
+            (JoinType::Left, false, "dense"),
+            (JoinType::Left, true, "dense"),
+            (JoinType::Right, false, "dense"),
+            (JoinType::Full, false, "dense"),
+            (JoinType::Full, true, "sparse"),
+        ] {
+            let tag = format!("pouter_{jt:?}_{build_right}_{shape}");
+            assert_join_spill_matches(
+                jt,
+                build_right,
+                shape,
+                FilterKind::Compiled,
+                None,
+                Some(3),
+                &tag,
+            )
+            .await;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // oom-safety-hardening task 002: streaming two-phase reservation +
+    // accounted finalize for SpillableHashAggregateExec.
+    // ------------------------------------------------------------------
+
+    /// Run one SpillableHashAggregateExec over `batches` with the given
+    /// memory limit; returns (sorted rows, spilled bytes recorded by the
+    /// pool). Rows are (group rendered as String, per-agg i64 values).
+    async fn run_agg_collect(
+        batches: Vec<RecordBatch>,
+        schema: SchemaRef,
+        group_by: Vec<Expr>,
+        aggregates: Vec<AggregateExpr>,
+        out_schema: SchemaRef,
+        memory_limit: usize,
+        spill_tag: &str,
+    ) -> (Vec<Vec<String>>, usize) {
+        use futures::TryStreamExt;
+        let input: Arc<dyn PhysicalOperator> = Arc::new(
+            crate::physical::operators::MemoryTableExec::new("t", schema, batches, None),
+        );
+        let spill_path = std::env::temp_dir().join(format!(
+            "qe_spillable_agg_test_{}_{}",
+            spill_tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&spill_path);
+        let pool = crate::execution::create_memory_pool(memory_limit);
+        let config = ExecutionConfig::new()
+            .with_memory_limit(memory_limit)
+            .with_spill_path(spill_path.clone());
+        let agg = SpillableHashAggregateExec::new(
+            input,
+            group_by,
+            aggregates,
+            out_schema,
+            pool.clone(),
+            config,
+        );
+        let mut stream = agg.execute(0).await.unwrap();
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        while let Some(b) = stream.try_next().await.unwrap() {
+            for r in 0..b.num_rows() {
+                let mut row = Vec::with_capacity(b.num_columns());
+                for c in b.columns() {
+                    row.push(render_cell(c, r));
+                }
+                rows.push(row);
+            }
+        }
+        rows.sort();
+        let spilled = pool.spilled();
+        let _ = std::fs::remove_dir_all(&spill_path);
+        (rows, spilled)
+    }
+
+    fn render_cell(col: &ArrayRef, row: usize) -> String {
+        use arrow::array::Array;
+        if col.is_null(row) {
+            return "NULL".to_string();
+        }
+        if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+            return a.value(row).to_string();
+        }
+        if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+            return a.value(row).to_string();
+        }
+        if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
+            return format!("{:.6}", a.value(row));
+        }
+        panic!("render_cell: unhandled type {:?}", col.data_type());
+    }
+
+    /// Cell-exact: a Dictionary(Int32, Utf8)-keyed GROUP BY with a DISTINCT
+    /// aggregate (fused-streaming-INELIGIBLE by construction, so execution
+    /// takes the streaming two-phase reservation path) must return results
+    /// byte-identical to an unlimited-memory run when forced through the
+    /// spill path — including the chunked (sub-partitioned) finalize, which
+    /// the tiny limit's predicted-state gate necessarily trips. Covers the
+    /// Dictionary spill round trip (Parquet preserves the Dictionary type
+    /// via the embedded Arrow schema) and the dictionary-decoded group-hash
+    /// routing staying stable across write/read-back.
+    #[tokio::test]
+    async fn agg_spill_dictionary_group_by_cell_exact_vs_in_memory() {
+        use arrow::array::{DictionaryArray, Int32Array};
+        use arrow::datatypes::{DataType, Field, Int32Type, Schema};
+
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", dict_type, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let values = StringArray::from(
+            (0..40)
+                .map(|i| format!("group_{:02}", i))
+                .collect::<Vec<_>>(),
+        );
+        let mut batches = Vec::new();
+        let n_batches = 24usize;
+        let rows_per_batch = 8_192usize;
+        for b in 0..n_batches {
+            let start = (b * rows_per_batch) as i64;
+            let keys = Int32Array::from(
+                (0..rows_per_batch)
+                    .map(|i| (i % 40) as i32)
+                    .collect::<Vec<_>>(),
+            );
+            let dict: DictionaryArray<Int32Type> =
+                DictionaryArray::try_new(keys, Arc::new(values.clone())).unwrap();
+            let ids: Vec<i64> = (start..start + rows_per_batch as i64).collect();
+            let vals: Vec<i64> = ids.iter().map(|i| i % 91).collect();
+            batches.push(
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(dict),
+                        Arc::new(Int64Array::from(ids)),
+                        Arc::new(Int64Array::from(vals)),
+                    ],
+                )
+                .unwrap(),
+            );
+        }
+
+        let group_by = vec![Expr::column("g")];
+        let aggregates = vec![
+            AggregateExpr {
+                func: crate::planner::AggregateFunction::CountDistinct,
+                input: Expr::column("id"),
+                distinct: true,
+                second_arg: None,
+            },
+            AggregateExpr {
+                func: crate::planner::AggregateFunction::Sum,
+                input: Expr::column("v"),
+                distinct: false,
+                second_arg: None,
+            },
+        ];
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Utf8, false),
+            Field::new("cnt", DataType::Int64, true),
+            Field::new("sum_v", DataType::Int64, true),
+        ]));
+
+        let (baseline, base_spilled) = run_agg_collect(
+            batches.clone(),
+            schema.clone(),
+            group_by.clone(),
+            aggregates.clone(),
+            out_schema.clone(),
+            8 * 1024 * 1024 * 1024,
+            "dict_base",
+        )
+        .await;
+        let (spilled_rows, spilled_bytes) = run_agg_collect(
+            batches,
+            schema,
+            group_by,
+            aggregates,
+            out_schema,
+            256 * 1024,
+            "dict_spill",
+        )
+        .await;
+
+        assert_eq!(base_spilled, 0, "unlimited run must not spill");
+        assert!(
+            spilled_bytes > 0,
+            "256KB limit over ~4MB of input must force a spill"
+        );
+        assert_eq!(baseline.len(), 40, "expected exactly 40 groups");
+        assert_eq!(
+            baseline, spilled_rows,
+            "spilled Dictionary-keyed aggregate must be byte-identical to the in-memory run"
+        );
+    }
+
+    /// Cell-exact through the chunked (sub-partitioned) finalize with a
+    /// plain Int64 group key: high group cardinality + COUNT(DISTINCT)
+    /// makes the per-partition predicted state cross the tiny threshold,
+    /// so every partition takes `aggregate_partition_chunked`; groups whose
+    /// rows straddle the resident/spilled boundary AND multiple read-back
+    /// batches must still aggregate exactly once each (the aggregate
+    /// analogue of the join's chunk-straddling duplicate-key test).
+    #[tokio::test]
+    async fn agg_spill_chunked_finalize_high_cardinality_cell_exact() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Int64, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let mut batches = Vec::new();
+        let n_batches = 25usize;
+        let rows_per_batch = 8_192usize;
+        for b in 0..n_batches {
+            let start = (b * rows_per_batch) as i64;
+            let ids: Vec<i64> = (start..start + rows_per_batch as i64).collect();
+            let groups: Vec<i64> = ids.iter().map(|i| i % 997).collect();
+            let vals: Vec<i64> = ids.iter().map(|i| i % 13).collect();
+            batches.push(
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(groups)),
+                        Arc::new(Int64Array::from(ids)),
+                        Arc::new(Int64Array::from(vals)),
+                    ],
+                )
+                .unwrap(),
+            );
+        }
+        let total_rows = (n_batches * rows_per_batch) as i64;
+
+        let group_by = vec![Expr::column("g")];
+        let aggregates = vec![
+            AggregateExpr {
+                func: crate::planner::AggregateFunction::CountDistinct,
+                input: Expr::column("id"),
+                distinct: true,
+                second_arg: None,
+            },
+            AggregateExpr {
+                func: crate::planner::AggregateFunction::Sum,
+                input: Expr::column("v"),
+                distinct: false,
+                second_arg: None,
+            },
+        ];
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Int64, false),
+            Field::new("cnt", DataType::Int64, true),
+            Field::new("sum_v", DataType::Int64, true),
+        ]));
+
+        let (baseline, _) = run_agg_collect(
+            batches.clone(),
+            schema.clone(),
+            group_by.clone(),
+            aggregates.clone(),
+            out_schema.clone(),
+            8 * 1024 * 1024 * 1024,
+            "chunk_base",
+        )
+        .await;
+        let (spilled_rows, spilled_bytes) = run_agg_collect(
+            batches,
+            schema,
+            group_by,
+            aggregates,
+            out_schema,
+            256 * 1024,
+            "chunk_spill",
+        )
+        .await;
+
+        assert!(spilled_bytes > 0, "tiny limit must force a spill");
+        assert_eq!(baseline.len(), 997, "expected exactly 997 groups");
+        // Self-consistency: all ids are unique, so the distinct counts must
+        // sum to the total row count — a duplication or loss across the
+        // sub-partition boundary breaks this even if both runs drifted.
+        let count_sum: i64 = baseline.iter().map(|r| r[1].parse::<i64>().unwrap()).sum();
+        assert_eq!(count_sum, total_rows);
+        assert_eq!(
+            baseline, spilled_rows,
+            "chunked-finalize aggregate must be byte-identical to the in-memory run"
+        );
+    }
+
+    /// Q13 SF=100 "temp-file rename" lifecycle pin (spill-join-correctness-3
+    /// task 003). Until oom-safety-hardening task 002 rewrote it, the agg
+    /// spill path appended by read-rewrite-rename: `merge_parquet_files`
+    /// staged `temp_{idx}_{n}.parquet` / `merged_{idx}.parquet`
+    /// intermediates in the spill dir and `fs::rename`d the merged file over
+    /// the partition's existing spill file on EVERY repeat eviction (the
+    /// only `fs::rename` this file ever had — the join's own rename-per-
+    /// append died earlier, in spill-join-correctness task 002). Between
+    /// create and rename those intermediates were deletable by any other
+    /// process sharing the spill root — and the default spill path was
+    /// PID-less until spill-join-correctness-2 task 001, so concurrent
+    /// engine processes really did share it. A colliding process's
+    /// `remove_dir_all` cleanup landing inside that window produced
+    /// `Failed to rename merged file: No such file or directory` — the Q13
+    /// SF=100 failure the native-table-pruning epic recorded on 2026-08-27
+    /// (its binaries predate BOTH fixes). The open-writer rewrite
+    /// (`evict_agg_partition_to_disk` + `append_batch_streaming`) keeps one
+    /// ArrowWriter per partition open for the whole ingestion phase: no
+    /// merged_*/temp_* intermediate ever exists and there is no rename at
+    /// all. This test pins that shape: a forced-spill aggregate runs while
+    /// an adversary thread continuously deletes any `merged_*`/`temp_*`
+    /// file appearing anywhere under the spill root (simulating the
+    /// colliding process's cleanup); the spill must engage, the adversary
+    /// must observe ZERO rename-window intermediates, and the result must
+    /// be byte-identical to an unlimited-memory run.
+    #[tokio::test]
+    async fn agg_spill_has_no_rename_window_under_adversarial_intermediate_deletion() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use futures::TryStreamExt;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Mutex;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Int64, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let mut batches = Vec::new();
+        for b in 0..25usize {
+            let start = (b * 8_192) as i64;
+            let ids: Vec<i64> = (start..start + 8_192).collect();
+            let groups: Vec<i64> = ids.iter().map(|i| i % 331).collect();
+            let vals: Vec<i64> = ids.iter().map(|i| i % 17).collect();
+            batches.push(
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(groups)),
+                        Arc::new(Int64Array::from(ids)),
+                        Arc::new(Int64Array::from(vals)),
+                    ],
+                )
+                .unwrap(),
+            );
+        }
+        // COUNT(DISTINCT) keeps this fused-streaming-INELIGIBLE, so
+        // execution must take the spillable two-phase path (the same
+        // construction the dictionary/chunked-finalize tests above use).
+        let group_by = vec![Expr::column("g")];
+        let aggregates = vec![
+            AggregateExpr {
+                func: crate::planner::AggregateFunction::CountDistinct,
+                input: Expr::column("id"),
+                distinct: true,
+                second_arg: None,
+            },
+            AggregateExpr {
+                func: crate::planner::AggregateFunction::Sum,
+                input: Expr::column("v"),
+                distinct: false,
+                second_arg: None,
+            },
+        ];
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Int64, false),
+            Field::new("cnt", DataType::Int64, true),
+            Field::new("sum_v", DataType::Int64, true),
+        ]));
+
+        let (baseline, base_spilled) = run_agg_collect(
+            batches.clone(),
+            schema.clone(),
+            group_by.clone(),
+            aggregates.clone(),
+            out_schema.clone(),
+            8 * 1024 * 1024 * 1024,
+            "rename_window_base",
+        )
+        .await;
+        assert_eq!(base_spilled, 0, "unlimited run must not spill");
+        assert_eq!(baseline.len(), 331, "expected exactly 331 groups");
+
+        // Forced-spill run with the adversary watching the spill root.
+        let spill_path =
+            std::env::temp_dir().join(format!("qe_agg_rename_window_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&spill_path);
+        std::fs::create_dir_all(&spill_path).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let observed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let adversary = {
+            let root = spill_path.clone();
+            let stop = stop.clone();
+            let observed = observed.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let mut dirs = vec![root.clone()];
+                    while let Some(dir) = dirs.pop() {
+                        let Ok(entries) = std::fs::read_dir(&dir) else {
+                            continue;
+                        };
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.is_dir() {
+                                dirs.push(path);
+                                continue;
+                            }
+                            let name = entry.file_name();
+                            let name = name.to_string_lossy();
+                            if name.starts_with("merged_") || name.starts_with("temp_") {
+                                observed.lock().unwrap().push(name.into_owned());
+                                // The colliding process's cleanup: delete the
+                                // rename-window intermediate out from under
+                                // the (old) read-rewrite-rename append.
+                                let _ = std::fs::remove_file(&path);
+                            }
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+            })
+        };
+
+        let limit = 256 * 1024;
+        let input: Arc<dyn PhysicalOperator> = Arc::new(
+            crate::physical::operators::MemoryTableExec::new("t", schema, batches, None),
+        );
+        let pool = crate::execution::create_memory_pool(limit);
+        let config = ExecutionConfig::new()
+            .with_memory_limit(limit)
+            .with_spill_path(spill_path.clone());
+        let agg = SpillableHashAggregateExec::new(
+            input,
+            group_by,
+            aggregates,
+            out_schema,
+            pool.clone(),
+            config,
+        );
+        let mut stream = agg.execute(0).await.unwrap();
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        while let Some(b) = stream.try_next().await.unwrap() {
+            for r in 0..b.num_rows() {
+                let mut row = Vec::with_capacity(b.num_columns());
+                for c in b.columns() {
+                    row.push(render_cell(c, r));
+                }
+                rows.push(row);
+            }
+        }
+        rows.sort();
+        stop.store(true, Ordering::Relaxed);
+        adversary.join().unwrap();
+        let spilled = pool.spilled();
+        let _ = std::fs::remove_dir_all(&spill_path);
+
+        assert!(
+            spilled > 0,
+            "256KB limit over ~5MB of input must force a spill"
+        );
+        let seen = observed.lock().unwrap();
+        assert!(
+            seen.is_empty(),
+            "agg spill path produced rename-window intermediates (merged_*/temp_*): {:?} — \
+             the read-rewrite-rename append pattern may have returned",
+            &*seen
+        );
+        assert_eq!(
+            baseline, rows,
+            "adversarial deletion of merged_*/temp_* names must not affect a spilling aggregate"
+        );
+    }
+
+    /// The chunked finalize's group-disjointness rests on this invariant:
+    /// routing the same rows at modulus NUM_PARTITIONS (ingestion) and
+    /// NUM_PARTITIONS * fan (sub-partitioning) must agree mod
+    /// NUM_PARTITIONS for every row — same fixed-seed hash, coarser vs
+    /// finer modulus.
+    #[test]
+    fn group_hash_routing_consistent_across_fanout() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let keys: Vec<i64> = (0..10_000).map(|i| i * 2654435761i64 % 5_000).collect();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(keys))]).unwrap();
+        let exprs = vec![Expr::column("k")];
+
+        let coarse = partition_batch_by_group_hash(&batch, &exprs, NUM_PARTITIONS).unwrap();
+        let mut key_to_coarse: HashMap<i64, usize> = HashMap::new();
+        for (idx, piece) in coarse.iter().enumerate() {
+            let Some(piece) = piece else { continue };
+            let col = piece
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for r in 0..piece.num_rows() {
+                key_to_coarse.insert(col.value(r), idx);
+            }
+        }
+
+        let fan = 7usize;
+        let fine = partition_batch_by_group_hash(&batch, &exprs, NUM_PARTITIONS * fan).unwrap();
+        let mut nonempty_fine = 0usize;
+        for (i, piece) in fine.iter().enumerate() {
+            let Some(piece) = piece else { continue };
+            nonempty_fine += 1;
+            let col = piece
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for r in 0..piece.num_rows() {
+                assert_eq!(
+                    key_to_coarse[&col.value(r)],
+                    i % NUM_PARTITIONS,
+                    "fine residue must agree with coarse routing mod NUM_PARTITIONS"
+                );
+            }
+        }
+        assert!(nonempty_fine > NUM_PARTITIONS, "fanout must actually split");
+    }
+
+    /// A Dictionary-encoded group key must route by its decoded VALUE (and
+    /// therefore spread across partitions), identically to the same data as
+    /// plain Utf8 — not fall through `extract_join_key`'s downcast chain to
+    /// a constant Null key that lands every row in one partition.
+    #[test]
+    fn group_hash_routing_splits_dictionary_group_keys() {
+        use arrow::array::{DictionaryArray, Int32Array};
+        use arrow::datatypes::{DataType, Field, Int32Type, Schema};
+
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let schema = Arc::new(Schema::new(vec![Field::new("g", dict_type, false)]));
+        let values = StringArray::from(
+            (0..40)
+                .map(|i| format!("group_{:02}", i))
+                .collect::<Vec<_>>(),
+        );
+        let keys = Int32Array::from((0..4_000).map(|i| (i % 40) as i32).collect::<Vec<_>>());
+        let dict: DictionaryArray<Int32Type> =
+            DictionaryArray::try_new(keys, Arc::new(values)).unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(dict)]).unwrap();
+        let exprs = vec![Expr::column("g")];
+
+        let routed = partition_batch_by_group_hash(&batch, &exprs, NUM_PARTITIONS).unwrap();
+        let nonempty = routed.iter().flatten().count();
+        assert!(
+            nonempty > 1,
+            "40 distinct dictionary values must spread across partitions, got {}",
+            nonempty
+        );
+
+        // And identically to the decoded plain-Utf8 rendering of the same data.
+        let plain_schema = Arc::new(Schema::new(vec![Field::new("g", DataType::Utf8, false)]));
+        let plain = StringArray::from(
+            (0..4_000)
+                .map(|i| format!("group_{:02}", i % 40))
+                .collect::<Vec<_>>(),
+        );
+        let plain_batch = RecordBatch::try_new(plain_schema, vec![Arc::new(plain)]).unwrap();
+        let routed_plain =
+            partition_batch_by_group_hash(&plain_batch, &exprs, NUM_PARTITIONS).unwrap();
+        let counts: Vec<usize> = routed
+            .iter()
+            .map(|p| p.as_ref().map(|b| b.num_rows()).unwrap_or(0))
+            .collect();
+        let counts_plain: Vec<usize> = routed_plain
+            .iter()
+            .map(|p| p.as_ref().map(|b| b.num_rows()).unwrap_or(0))
+            .collect();
+        assert_eq!(
+            counts, counts_plain,
+            "dictionary and plain encodings of the same values must route identically"
+        );
+    }
+
+    /// The aggregate-state prediction must stay conservative (per-row cost
+    /// at least covers the map-entry shape) and monotonic in every input,
+    /// with DISTINCT charging strictly more — mirroring
+    /// `predicted_hash_table_bytes_is_conservative_for_duplicate_keys`'s
+    /// role for the join prediction.
+    #[test]
+    fn predicted_agg_state_bytes_is_conservative_and_monotonic() {
+        let base = predicted_agg_state_bytes(1_000, 1, 1, 0);
+        // At minimum the map-entry bucket + one accumulator per row.
+        assert!(base >= 1_000 * (HASH_TABLE_BUCKET_BYTES_AMORTIZED + AGG_ACCUMULATOR_STATE_BYTES));
+        assert!(predicted_agg_state_bytes(2_000, 1, 1, 0) > base);
+        assert!(predicted_agg_state_bytes(1_000, 2, 1, 0) > base);
+        assert!(predicted_agg_state_bytes(1_000, 1, 2, 0) > base);
+        assert!(
+            predicted_agg_state_bytes(1_000, 1, 1, 1) >= base + 1_000 * AGG_DISTINCT_ENTRY_BYTES
+        );
+        // Zero-arg floors: a global aggregate (0 group cols) still prices
+        // its single group's state per row (worst case).
+        assert!(predicted_agg_state_bytes(1_000, 0, 0, 0) > 0);
+    }
 }
