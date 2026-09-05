@@ -36,3 +36,18 @@ materializing it; repeat-execution semantics preserved.
 - Gates: `spillable::tests` 33/33; `spill_tests` 12/12;
   `native_dictionary_semi_anti` 4/4; fmt clean.
 - Harness-under-1G, Q9@1G/16G and chaos legs: pending the release build.
+
+## 2026-09-05T04:15:00Z — first 002 measurements
+
+- Chaos (002 binary, tpch-10mb, seed 20260905): **100/100 passed**, 89
+  genuine-disk trials, 0 disk-expected-but-missing, 25.7 ms/trial.
+- Harness @1G on the 002 binary, `semi-join` build_right=0, cgroup lever:
+  **FAIL — exit 143, memcg kill** (`harness_002_1G_br0/semi-join_cgroup.log`).
+  Output streaming alone is not enough for this shape: phase B still
+  `read_parquet`s the WHOLE build partition (600M/64 rows ≈ 150MB) and
+  probe partition (≈ 75MB) into memory on top of the resident set
+  (≤ 205MB) and the chunk table (≤ 205MB predicted) — task 003's
+  streaming read-back removes exactly that. Recorded honestly as a 002
+  miss; the 1G target is re-measured on the 003 binary. Remaining 002
+  legs (anti br0, semi/anti br1, both levers) left running for the
+  record.
