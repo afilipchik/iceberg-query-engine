@@ -359,6 +359,39 @@ async fn anti_join_not_in_spill_matches_in_memory() {
     .await;
 }
 
+/// spill-boundaries task 002: a SEMI join (EXISTS) and an ANTI join
+/// (NOT EXISTS) whose correlated subquery carries a NON-EQUI predicate over
+/// both sides — the ON-clause filter the spill path used to refuse
+/// ("cannot evaluate an ON-clause filter"). At 8KB whichever side the
+/// planner builds from is far above the budget, so a pass here means the
+/// filter was evaluated per candidate pair INSIDE the spill path.
+/// `l_suppkey <> o_custkey` is the compiled (two-column) shape;
+/// `l_extendedprice > o_totalprice / 4` needs the gathered
+/// `evaluate_expr` path.
+#[tokio::test]
+async fn filtered_semi_anti_join_spill_matches_in_memory() {
+    assert_spill_matches(
+        "SELECT o_orderpriority, COUNT(*) AS cnt FROM orders \
+         WHERE EXISTS (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey \
+         AND l_suppkey <> o_custkey) \
+         GROUP BY o_orderpriority ORDER BY o_orderpriority",
+        8 * 1024,
+        "filtered_semi_spill",
+        true,
+    )
+    .await;
+    assert_spill_matches(
+        "SELECT o_orderpriority, COUNT(*) AS cnt FROM orders \
+         WHERE NOT EXISTS (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey \
+         AND l_extendedprice > o_totalprice / 4) \
+         GROUP BY o_orderpriority ORDER BY o_orderpriority",
+        8 * 1024,
+        "filtered_anti_spill",
+        true,
+    )
+    .await;
+}
+
 /// A memory-limited context must still produce correct results for queries
 /// that DON'T need to spill (small inputs stay on the in-memory fast path).
 #[tokio::test]
