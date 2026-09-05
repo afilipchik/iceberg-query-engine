@@ -1,9 +1,9 @@
 ---
 name: join-spill-streaming
-status: in-progress
+status: completed
 created: 2026-09-05T01:38:00Z
-updated: 2026-09-05T08:45:00Z
-progress: 75%
+updated: 2026-09-05T06:36:01Z
+progress: 100%
 prd: .claude/prds/join-spill-streaming.md
 github: (will be set on sync)
 ---
@@ -79,9 +79,40 @@ PRD G1-G4.
 - [x] 001.md - Stream the probe side through the spill path (parallel: false)
 - [x] 002.md - Stream the join output (parallel: false, after 001)
 - [x] 003.md - Parallel spilled-partition processing under the shared budget (parallel: false, after 002)
-- [ ] 004.md - SF=100 certification re-run + docs + epic close-out (parallel: false, last)
+- [x] 004.md - SF=100 certification re-run + docs + epic close-out (parallel: false, last)
 
 Total tasks: 4
 Parallel tasks: 0
 Sequential tasks: 4
 Estimated total effort: 16 hours + SF=100 machine time
+
+## Close-out (2026-09-05)
+
+Commits: 5ea5e81 (start), c49b029 (001), 09d2ed1 (002), f3f42fb /
+f728df0 / 7a8f287 / 8cd02c1 / 24a3138 (003), 3b0631e (001-003 close),
+plus the 004 close-out. Evidence: `00N.md` Outcomes, `updates/00N/`,
+`.scratch/jss/`.
+
+- **G1 MET**: harness `semi-join`/`anti-join` with a 600M-row build
+  complete under the DEFAULT 1G cap on both levers and both orientations
+  (464-881MB; before 4.7-8.0GB under 12G); Q4 SF=100 native @64M
+  completes cell-exact under 8G at 2,889MB peak (before 6,185MB).
+- **G2 MET**: Q9 SF=100 parquet @1G **222.3s** cell-exact on a quiet
+  machine (target ≤300s; before ~1,650s), 246 hash-check-ok / 0
+  mismatch; the 1G sweep total fell from 1616s to 637s even with suite
+  builds sharing the machine; no query slower beyond noise except Q18
+  native @1G (327s vs 230s, aggregate spill under load — flagged, not a
+  join-path effect).
+- **G3 MET**: every SF=100 verdict reproduced (22/22 @1G parquet;
+  20/22 + 2 named refusals @256M; 22/22 native @100G; 17/22 + 5 @1G
+  native); chaos 300/300; suites green (pulsar: 1342/1/1 with --no-fail-fast — the one failure (`three_real_processes_serve_and_survive_a_sigterm`: a spawned server 'never became ready' within 60s while the 65GB native-100G sweep loaded concurrently) passes 2/2 in isolation, and the first run's only failure (the pre-existing rollup last-ULP flake) passes 3/3 in isolation, so 1343 tests are green individually); M1/M2 PASS.
+- **G4 MET**: CLAUDE.md updated (boundary closed, Memory Safety Rule
+  residual closed, certification refreshed).
+- Recorded honestly (from task 003): 002 alone missed the 1G target and
+  made Q9 slower until 003's parallel, streaming read-back; two
+  intermediate 003 binaries regressed memory by 300-400MB, root-caused
+  to mimalloc per-thread retention under rayon and fixed by sizing the
+  phase-A pool by the budget; Q4 @64M is 40s (14s with a fixed 8-thread
+  pool) — memory first at tiny budgets; Q9's whole-engine peak at a 1G
+  budget is 10.7GB (scan parallelism + channels), bounded but above the
+  budget — a candidate follow-up.
