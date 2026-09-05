@@ -281,32 +281,54 @@ async fn agg_spill_chunked_finalize_matches_in_memory() {
     .await;
 }
 
-/// Non-inner joins are not yet supported by the join spill path
-/// (probe_partition implements inner semantics only). They must FAIL LOUDLY
-/// when the build side exceeds the budget — silently returning inner-join
-/// results, which is what happened before the guard, is data corruption.
-/// When the streaming spill rewrite adds outer/semi/anti support, replace
-/// this with a results-match test like the ones above.
+/// spill-boundaries task 003: LEFT/RIGHT/FULL joins whose build side
+/// exceeds the budget now COMPLETE through the join spill path, cell-exact
+/// vs the in-memory run (until this task they failed loudly by name —
+/// `left_join_spill_fails_loudly_not_wrong`, replaced by this test).
+/// `COUNT(<other side's key>)` alongside `COUNT(*)` pins the NULL-extended
+/// rows: an inner-join-shaped answer would make the two counts equal.
+/// Shapes: build = LEFT = the preserved side (orders LEFT JOIN lineitem —
+/// the planner keeps the build on the left since 15k < 2 x 60k rows);
+/// build = RIGHT with the PROBE side preserved and an ON-clause filter
+/// (lineitem LEFT JOIN orders — 60k > 2 x 15k flips the build to the
+/// right); a RIGHT join; a FULL join with an ON-clause filter.
 #[tokio::test]
-async fn left_join_spill_fails_loudly_not_wrong() {
-    let ctx = spilling_ctx(256 * 1024, "left_join_spill");
-    let result = ctx
-        .sql(
-            "SELECT o_orderpriority, COUNT(*) AS cnt FROM orders \
-             LEFT JOIN lineitem ON o_orderkey = l_orderkey \
-             GROUP BY o_orderpriority ORDER BY o_orderpriority",
-        )
-        .await;
-    let err = result.expect_err(
-        "LEFT JOIN needing the spill path must error until the spill path \
-         implements non-inner join types — silent inner-join results are worse",
-    );
-    assert!(err.to_string().contains("INNER"), "unexpected error: {err}");
-    assert!(
-        err.to_string()
-            .contains("supports only INNER, SEMI and ANTI joins"),
-        "refusal must name exactly what the spill path supports: {err}"
-    );
+async fn outer_join_spill_matches_in_memory() {
+    assert_spill_matches(
+        "SELECT o_orderpriority, COUNT(*) AS cnt, COUNT(l_orderkey) AS matched FROM orders \
+         LEFT JOIN lineitem ON o_orderkey = l_orderkey \
+         GROUP BY o_orderpriority ORDER BY o_orderpriority",
+        256 * 1024,
+        "left_join_spill_build_preserved",
+        true,
+    )
+    .await;
+    assert_spill_matches(
+        "SELECT l_linestatus, COUNT(*) AS cnt, COUNT(o_orderkey) AS matched FROM lineitem \
+         LEFT JOIN orders ON l_orderkey = o_orderkey AND o_custkey <> l_suppkey \
+         GROUP BY l_linestatus ORDER BY l_linestatus",
+        8 * 1024,
+        "left_join_spill_probe_preserved_filtered",
+        true,
+    )
+    .await;
+    assert_spill_matches(
+        "SELECT o_orderpriority, COUNT(*) AS cnt, COUNT(l_orderkey) AS matched FROM lineitem \
+         RIGHT JOIN orders ON l_orderkey = o_orderkey \
+         GROUP BY o_orderpriority ORDER BY o_orderpriority",
+        8 * 1024,
+        "right_join_spill",
+        true,
+    )
+    .await;
+    assert_spill_matches(
+        "SELECT COUNT(*) AS cnt, COUNT(l_orderkey) AS l_rows, COUNT(o_orderkey) AS o_rows \
+         FROM lineitem FULL JOIN orders ON l_orderkey = o_orderkey AND l_quantity > 25.0",
+        8 * 1024,
+        "full_join_spill_filtered",
+        true,
+    )
+    .await;
 }
 
 /// spill-join-correctness-3 task 004: a Q4-shaped `EXISTS` (SEMI join)
