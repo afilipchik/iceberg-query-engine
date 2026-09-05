@@ -2074,20 +2074,16 @@ fn phase_a_process_group(
                             return Ok(outputs);
                         };
                         let mut flags = probe_bitmap.then(|| vec![false; pb.num_rows()]);
-                        if let Some(out) = probe_batch_against_table(
+                        outputs.extend(probe_batch_against_table(
                             &build_part.batches,
                             &pb,
                             ht,
                             ctx,
                             build_bm.map(|v| v.as_slice()),
                             flags.as_deref_mut(),
-                        )? {
-                            outputs.push(out);
-                        }
+                        )?);
                         if let Some(flags) = flags {
-                            if let Some(out) = emit_probe_rows(ctx, &pb, &flags)? {
-                                outputs.push(out);
-                            }
+                            outputs.extend(emit_probe_rows(ctx, &pb, &flags)?);
                         }
                     } else if state.spilled[idx].is_some() {
                         // Spill probe rows for this partition
@@ -2117,9 +2113,7 @@ fn phase_a_process_group(
                         // preserved probe side (task 003) emits it whole,
                         // NULL-extended.
                         let all_false = vec![false; pb.num_rows()];
-                        if let Some(out) = emit_probe_rows(ctx, &pb, &all_false)? {
-                            outputs.push(out);
-                        }
+                        outputs.extend(emit_probe_rows(ctx, &pb, &all_false)?);
                     }
                     Ok(outputs)
                 },
@@ -2265,7 +2259,7 @@ async fn probe_with_spilling(
                         .collect()
                 })
                 .collect();
-            if let Some(out) = emit_build_rows(ctx, &build_part.batches, &flags)? {
+            for out in emit_build_rows(ctx, &build_part.batches, &flags)? {
                 if !emit_join_batch(tx, out, &mut in_memory_matched).await {
                     return abandoned(st, probe_rows_in, in_memory_matched);
                 }
@@ -2493,7 +2487,7 @@ fn process_spilled_partition(
                 // against the chunk's table: INNER pairs (sent below), the
                 // chunk's build bitmap, this batch's probe bitmap.
                 let build_bm_ref = build_bitmap.then(|| build_bm.as_slice());
-                let outs: Vec<Option<RecordBatch>> = if probe_bitmap {
+                let outs: Vec<Vec<RecordBatch>> = if probe_bitmap {
                     let flags = &mut probe_matched[batch_pos..batch_pos + group.len()];
                     group
                         .par_iter()
@@ -2536,7 +2530,7 @@ fn process_spilled_partition(
                         .collect()
                 })
                 .collect();
-            if let Some(out) = emit_build_rows(ctx, &chunk, &bm)? {
+            for out in emit_build_rows(ctx, &chunk, &bm)? {
                 if !sink(out) {
                     alive = false;
                     break 'chunks;
@@ -2567,7 +2561,7 @@ fn process_spilled_partition(
                         &all_false
                     }
                 };
-                if let Some(out) = emit_probe_rows(ctx, &pb, flags)? {
+                for out in emit_probe_rows(ctx, &pb, flags)? {
                     if !sink(out) {
                         alive = false;
                         break;
@@ -5835,7 +5829,7 @@ fn probe_batch_against_table(
     ctx: &SpillJoinCtx,
     build_matched: Option<&[Vec<std::sync::atomic::AtomicBool>]>,
     probe_matched: Option<&mut [bool]>,
-) -> Result<Option<RecordBatch>> {
+) -> Result<Vec<RecordBatch>> {
     use std::sync::atomic::Ordering::Relaxed;
     let emit_pairs = ctx.emit_pairs();
     let existence_only = !emit_pairs && build_matched.is_none();
@@ -5876,17 +5870,26 @@ fn probe_batch_against_table(
         }
     }
     if !emit_pairs || build_indices.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
-    Ok(Some(create_joined_batch(
-        build_batches,
-        probe_batch,
-        &build_indices,
-        &probe_indices,
-        ctx.swapped,
-        &ctx.schema,
-        ctx.retained.as_deref(),
-    )?))
+    // Pairs are emitted in bounded slices (duplicate keys can fan one probe
+    // batch out to far more pairs than rows).
+    let slice = spill_emit_rows();
+    build_indices
+        .chunks(slice)
+        .zip(probe_indices.chunks(slice))
+        .map(|(bi, pi)| {
+            create_joined_batch(
+                build_batches,
+                probe_batch,
+                bi,
+                pi,
+                ctx.swapped,
+                &ctx.schema,
+                ctx.retained.as_deref(),
+            )
+        })
+        .collect()
 }
 
 /// NULL arrays for the NON-preserved side of an outer-join emission, typed
@@ -5926,9 +5929,9 @@ fn emit_probe_rows(
     ctx: &SpillJoinCtx,
     probe_batch: &RecordBatch,
     flags: &[bool],
-) -> Result<Option<RecordBatch>> {
+) -> Result<Vec<RecordBatch>> {
     match ctx.probe_emit() {
-        RowEmit::None => Ok(None),
+        RowEmit::None => Ok(Vec::new()),
         RowEmit::Matched => take_probe_rows(probe_batch, flags, true, &ctx.schema),
         RowEmit::Unmatched => take_probe_rows(probe_batch, flags, false, &ctx.schema),
         RowEmit::UnmatchedNullExtended => {
@@ -5938,28 +5941,30 @@ fn emit_probe_rows(
                 .filter(|(_, &f)| !f)
                 .map(|(i, _)| i as u32)
                 .collect();
-            if keep.is_empty() {
-                return Ok(None);
-            }
-            let rows = keep.len();
-            let idx = UInt32Array::from(keep);
-            let probe_columns: Vec<ArrayRef> = probe_batch
-                .columns()
-                .iter()
-                .map(|c| compute::take(c.as_ref(), &idx, None).map_err(Into::into))
-                .collect::<Result<_>>()?;
-            let build_width = ctx.full_schema.fields().len() - probe_columns.len();
-            // Probe = left when swapped: probe columns first, build NULLs
-            // (the trailing block) after; else build NULLs (leading block)
-            // first.
-            let build_nulls = null_side_columns(&ctx.full_schema, !ctx.swapped, build_width, rows);
-            let columns: Vec<ArrayRef> = if ctx.swapped {
-                probe_columns.into_iter().chain(build_nulls).collect()
-            } else {
-                build_nulls.into_iter().chain(probe_columns).collect()
-            };
-            let columns = apply_retained(columns, ctx.retained.as_deref());
-            Ok(Some(batch_with_actual_types(&ctx.schema, columns)?))
+            keep.chunks(spill_emit_rows())
+                .map(|slice| {
+                    let rows = slice.len();
+                    let idx = UInt32Array::from(slice.to_vec());
+                    let probe_columns: Vec<ArrayRef> = probe_batch
+                        .columns()
+                        .iter()
+                        .map(|c| compute::take(c.as_ref(), &idx, None).map_err(Into::into))
+                        .collect::<Result<_>>()?;
+                    let build_width = ctx.full_schema.fields().len() - probe_columns.len();
+                    // Probe = left when swapped: probe columns first, build
+                    // NULLs (the trailing block) after; else build NULLs
+                    // (leading block) first.
+                    let build_nulls =
+                        null_side_columns(&ctx.full_schema, !ctx.swapped, build_width, rows);
+                    let columns: Vec<ArrayRef> = if ctx.swapped {
+                        probe_columns.into_iter().chain(build_nulls).collect()
+                    } else {
+                        build_nulls.into_iter().chain(probe_columns).collect()
+                    };
+                    let columns = apply_retained(columns, ctx.retained.as_deref());
+                    batch_with_actual_types(&ctx.schema, columns)
+                })
+                .collect()
         }
     }
 }
@@ -5972,40 +5977,38 @@ fn emit_build_rows(
     ctx: &SpillJoinCtx,
     build_batches: &[RecordBatch],
     flags: &[Vec<bool>],
-) -> Result<Option<RecordBatch>> {
+) -> Result<Vec<RecordBatch>> {
     match ctx.build_emit() {
-        RowEmit::None => Ok(None),
+        RowEmit::None => Ok(Vec::new()),
         RowEmit::Matched => take_build_rows(build_batches, flags, true, &ctx.schema),
         RowEmit::Unmatched => take_build_rows(build_batches, flags, false, &ctx.schema),
         RowEmit::UnmatchedNullExtended => {
-            let indices: Vec<(usize, usize)> = flags
-                .iter()
-                .enumerate()
-                .flat_map(|(b, v)| {
-                    v.iter()
-                        .enumerate()
-                        .filter(|(_, &f)| !f)
-                        .map(move |(r, _)| (b, r))
-                })
-                .collect();
+            let indices = flagged_build_indices(flags, false);
             if indices.is_empty() || build_batches.is_empty() {
-                return Ok(None);
+                return Ok(Vec::new());
             }
-            let rows = indices.len();
-            let build_columns: Vec<ArrayRef> = (0..build_batches[0].num_columns())
-                .map(|c| gather_column(build_batches, c, &indices))
-                .collect::<Result<_>>()?;
-            let probe_width = ctx.full_schema.fields().len() - build_columns.len();
-            // Build = right when swapped: probe NULLs (the leading block)
-            // first; else build first, probe NULLs (trailing) after.
-            let probe_nulls = null_side_columns(&ctx.full_schema, ctx.swapped, probe_width, rows);
-            let columns: Vec<ArrayRef> = if ctx.swapped {
-                probe_nulls.into_iter().chain(build_columns).collect()
-            } else {
-                build_columns.into_iter().chain(probe_nulls).collect()
-            };
-            let columns = apply_retained(columns, ctx.retained.as_deref());
-            Ok(Some(batch_with_actual_types(&ctx.schema, columns)?))
+            indices
+                .chunks(spill_emit_rows())
+                .map(|slice| {
+                    let rows = slice.len();
+                    let build_columns: Vec<ArrayRef> = (0..build_batches[0].num_columns())
+                        .map(|c| gather_column(build_batches, c, slice))
+                        .collect::<Result<_>>()?;
+                    let probe_width = ctx.full_schema.fields().len() - build_columns.len();
+                    // Build = right when swapped: probe NULLs (the leading
+                    // block) first; else build first, probe NULLs
+                    // (trailing) after.
+                    let probe_nulls =
+                        null_side_columns(&ctx.full_schema, ctx.swapped, probe_width, rows);
+                    let columns: Vec<ArrayRef> = if ctx.swapped {
+                        probe_nulls.into_iter().chain(build_columns).collect()
+                    } else {
+                        build_columns.into_iter().chain(probe_nulls).collect()
+                    };
+                    let columns = apply_retained(columns, ctx.retained.as_deref());
+                    batch_with_actual_types(&ctx.schema, columns)
+                })
+                .collect()
         }
     }
 }
@@ -6044,6 +6047,27 @@ fn join_key_arrays(batch: &RecordBatch, key_exprs: &[Expr]) -> Result<Vec<ArrayR
         .collect()
 }
 
+/// Rows per emitted batch for the GATHERED emissions of the spill path
+/// (spill-boundaries 003 follow-up): a preserved build side's unmatched rows
+/// of one read-back chunk (hundreds of thousands), a resident partition's
+/// SEMI/ANTI/outer emission (millions), or one probe batch's pairs under
+/// duplicate keys are emitted in slices of this many rows instead of one
+/// batch each. The output channel bounds batch COUNT
+/// (`SPILL_JOIN_OUTPUT_CHANNEL_CAPACITY`), so this is what bounds its
+/// BYTES. `QE_SPILL_EMIT_ROWS` overrides (diagnostic; 0 = unbounded).
+const SPILL_EMIT_ROWS: usize = 8_192;
+
+fn spill_emit_rows() -> usize {
+    match std::env::var("QE_SPILL_EMIT_ROWS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        Some(0) => usize::MAX,
+        Some(n) => n,
+        None => SPILL_EMIT_ROWS,
+    }
+}
+
 /// Emit the probe rows whose flag equals `want` (SEMI: matched; ANTI:
 /// unmatched) with probe-side columns only, against the declared SEMI/ANTI
 /// output schema (the LEFT schema — the probe side IS the left side in this
@@ -6055,23 +6079,24 @@ fn take_probe_rows(
     flags: &[bool],
     want: bool,
     output_schema: &SchemaRef,
-) -> Result<Option<RecordBatch>> {
+) -> Result<Vec<RecordBatch>> {
     let keep: Vec<u32> = flags
         .iter()
         .enumerate()
         .filter(|(_, &f)| f == want)
         .map(|(i, _)| i as u32)
         .collect();
-    if keep.is_empty() {
-        return Ok(None);
-    }
-    let idx = UInt32Array::from(keep);
-    let columns: Result<Vec<ArrayRef>> = probe_batch
-        .columns()
-        .iter()
-        .map(|c| compute::take(c.as_ref(), &idx, None).map_err(Into::into))
-        .collect();
-    Ok(Some(batch_with_actual_types(output_schema, columns?)?))
+    keep.chunks(spill_emit_rows())
+        .map(|slice| {
+            let idx = UInt32Array::from(slice.to_vec());
+            let columns: Result<Vec<ArrayRef>> = probe_batch
+                .columns()
+                .iter()
+                .map(|c| compute::take(c.as_ref(), &idx, None).map_err(Into::into))
+                .collect();
+            batch_with_actual_types(output_schema, columns?)
+        })
+        .collect()
 }
 
 /// Emit the build rows whose flag equals `want` (SEMI: matched; ANTI:
@@ -6083,8 +6108,25 @@ fn take_build_rows(
     flags: &[Vec<bool>],
     want: bool,
     output_schema: &SchemaRef,
-) -> Result<Option<RecordBatch>> {
-    let indices: Vec<(usize, usize)> = flags
+) -> Result<Vec<RecordBatch>> {
+    let indices = flagged_build_indices(flags, want);
+    if indices.is_empty() || build_batches.is_empty() {
+        return Ok(Vec::new());
+    }
+    indices
+        .chunks(spill_emit_rows())
+        .map(|slice| {
+            let columns: Result<Vec<ArrayRef>> = (0..build_batches[0].num_columns())
+                .map(|c| gather_column(build_batches, c, slice))
+                .collect();
+            batch_with_actual_types(output_schema, columns?)
+        })
+        .collect()
+}
+
+/// (batch_idx, row_idx) of every build row whose flag equals `want`.
+fn flagged_build_indices(flags: &[Vec<bool>], want: bool) -> Vec<(usize, usize)> {
+    flags
         .iter()
         .enumerate()
         .flat_map(|(b, v)| {
@@ -6093,14 +6135,7 @@ fn take_build_rows(
                 .filter(move |(_, &f)| f == want)
                 .map(move |(r, _)| (b, r))
         })
-        .collect();
-    if indices.is_empty() || build_batches.is_empty() {
-        return Ok(None);
-    }
-    let columns: Result<Vec<ArrayRef>> = (0..build_batches[0].num_columns())
-        .map(|c| gather_column(build_batches, c, &indices))
-        .collect();
-    Ok(Some(batch_with_actual_types(output_schema, columns?)?))
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6164,7 +6199,46 @@ fn create_joined_batch(
     batch_with_actual_types(output_schema, columns)
 }
 
+/// Gather `indices` = (batch_idx, row_idx) of column `col_idx` across
+/// `batches` into ONE array. spill-boundaries 003 follow-up: one
+/// `compute::interleave` per column (a single `take` when every index comes
+/// from one batch). The previous shape — one 1-row `compute::take` per
+/// OUTPUT ROW, then `concat` of all of them — allocated an Arrow array per
+/// gathered row: for a phase-B read-back chunk's 590k unmatched build rows
+/// (a preserved build side) or a 16-batch probe group's pairs, that was
+/// millions of ~200-byte allocations per chunk, freed on the global rayon
+/// pool's threads and retained by the allocator — measured as the
+/// ~+700-900MB phase-B excess of the `left-join` / `filtered-join` harness
+/// legs over `semi-join` (see `updates/003/stream-A.md`).
+/// `QE_SPILL_GATHER=legacy` keeps the old shape for a controlled A/B.
 fn gather_column(
+    batches: &[RecordBatch],
+    col_idx: usize,
+    indices: &[(usize, usize)],
+) -> Result<ArrayRef> {
+    if matches!(std::env::var("QE_SPILL_GATHER").as_deref(), Ok("legacy")) {
+        return gather_column_legacy(batches, col_idx, indices);
+    }
+    let dt = batches[0].column(col_idx).data_type();
+    if indices.is_empty() {
+        return Ok(arrow::array::new_null_array(dt, 0));
+    }
+    let first_batch = indices[0].0;
+    if batches.len() == 1 || indices.iter().all(|&(b, _)| b == first_batch) {
+        let take_arr: UInt32Array = indices.iter().map(|&(_, r)| r as u32).collect();
+        return compute::take(
+            batches[first_batch].column(col_idx).as_ref(),
+            &take_arr,
+            None,
+        )
+        .map_err(Into::into);
+    }
+    let arrays: Vec<&dyn arrow::array::Array> =
+        batches.iter().map(|b| b.column(col_idx).as_ref()).collect();
+    compute::interleave(&arrays, indices).map_err(Into::into)
+}
+
+fn gather_column_legacy(
     batches: &[RecordBatch],
     col_idx: usize,
     indices: &[(usize, usize)],
@@ -6176,21 +6250,13 @@ fn gather_column(
             .or_default()
             .push((out_idx, row_idx as u32));
     }
-
     let total_len = indices.len();
     let dt = batches[0].column(col_idx).data_type();
-
     let mut builders_data: Vec<(usize, ArrayRef)> = Vec::new();
-
     for (batch_idx, idx_list) in batch_indices {
-        let batch = &batches[batch_idx];
-        let col = batch.column(col_idx);
-
+        let col = batches[batch_idx].column(col_idx);
         let take_indices: Vec<u32> = idx_list.iter().map(|(_, row)| *row).collect();
-        let take_arr = UInt32Array::from(take_indices);
-
-        let taken = compute::take(col.as_ref(), &take_arr, None)?;
-
+        let taken = compute::take(col.as_ref(), &UInt32Array::from(take_indices), None)?;
         for (i, (out_idx, _)) in idx_list.iter().enumerate() {
             builders_data.push((
                 *out_idx,
@@ -6198,21 +6264,13 @@ fn gather_column(
             ));
         }
     }
-
     builders_data.sort_by_key(|(idx, _)| *idx);
-
     if builders_data.is_empty() {
         return Ok(arrow::array::new_null_array(dt, total_len));
     }
-
     let arrays: Vec<&dyn arrow::array::Array> =
         builders_data.iter().map(|(_, arr)| arr.as_ref()).collect();
-
-    if arrays.is_empty() {
-        Ok(arrow::array::new_null_array(dt, total_len))
-    } else {
-        compute::concat(&arrays).map_err(Into::into)
-    }
+    compute::concat(&arrays).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -7829,6 +7887,16 @@ mod tests {
                     width,
                     "{tag}: output width must equal the declared output schema"
                 );
+                // spill-boundaries 003 follow-up: every batch the spill path
+                // emits is a bounded slice (the output channel bounds batch
+                // COUNT; this is what bounds its bytes).
+                if memory_limit < SA_UNLIMITED && std::env::var("QE_SPILL_EMIT_ROWS").is_err() {
+                    assert!(
+                        b.num_rows() <= SPILL_EMIT_ROWS,
+                        "{tag}: spill-path batch of {} rows exceeds SPILL_EMIT_ROWS={SPILL_EMIT_ROWS}",
+                        b.num_rows()
+                    );
+                }
                 render_join_batch(&b, &mut rows);
             }
         }

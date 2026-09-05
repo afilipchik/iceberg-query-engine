@@ -74,6 +74,12 @@
 //!                            [3B/4, 5B/4) so exactly half of it matches.
 //!   QE_HARNESS_JOIN_BUILD_RIGHT  1 (default) = build right / emit probe
 //!                            rows; 0 = build left / emit build rows.
+//!   QE_HARNESS_FILTER        `filtered-join` ON predicate: eq (default,
+//!                            keeps all B/4 matched pairs) or ne (keeps 0).
+//!   (spill-boundaries task 004 added `left-join` and `filtered-join`,
+//!   same fixture; pre-fix expectation: clean named refusal — outer-join
+//!   spill / ON-filter spill — post-fix: COMPLETED with the closed-form
+//!   counts documented at `scenario_join`.)
 
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -85,7 +91,7 @@ use query_engine::physical::operators::{
     ExternalSortExec, SpillableHashAggregateExec, SpillableHashJoinExec,
 };
 use query_engine::physical::{PhysicalOperator, RecordBatchStream};
-use query_engine::planner::{AggregateFunction, Expr, JoinType, SortExpr};
+use query_engine::planner::{AggregateFunction, BinaryOp, Expr, JoinType, SortExpr};
 use query_engine::{ExecutionConfig, ExecutionContext};
 use std::sync::Arc;
 
@@ -361,45 +367,88 @@ async fn scenario_insert() -> query_engine::Result<String> {
 ///       SEMI emits B/4 probe rows, ANTI emits B/4 probe rows.
 ///   build_right=0 (build = LEFT = output):
 ///       SEMI emits B/4 build rows, ANTI emits 3B/4 build rows.
+/// `spill-boundaries` task 004 extends the same fixture to LEFT (the
+/// preserved side is the LEFT input, whichever side builds) and to a
+/// filtered INNER join (`QE_HARNESS_FILTER=eq|ne`, default `eq`: the ON
+/// predicate `val = pval` compares the two sides' payloads, which are
+/// equal for every matched pair — `eq` keeps all B/4 pairs, `ne` keeps 0;
+/// both exercise the compiled-filter path on the spill path):
+///   left-join, build_right=1 (left = probe): every probe row is emitted,
+///       matched or NULL-extended → B/2 rows.
+///   left-join, build_right=0 (left = build): every build row → B rows.
+///   filtered-join (INNER, filter eq): B/4 rows; (ne): 0 rows.
+/// The probe side carries distinct column names (`pid`, `pval`) so the
+/// ON filter can name both sides unambiguously.
 async fn scenario_join(join_type: JoinType) -> query_engine::Result<String> {
     let build_rows = env_usize("QE_HARNESS_JOIN_BUILD_ROWS", 40_000_000) as i64;
     let build_right = env_str("QE_HARNESS_JOIN_BUILD_RIGHT", "1") != "0";
     let memory_limit = env_usize("QE_HARNESS_MEMORY_LIMIT", 256 * 1024 * 1024);
+    let filter_mode = env_str("QE_HARNESS_FILTER", "eq");
+    let filtered = matches!(join_type, JoinType::Inner);
     let probe_rows = build_rows / 2;
     let probe_offset = build_rows * 3 / 4;
+    let probe_schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("pid", DataType::Int64, false),
+        Field::new("pval", DataType::Int64, false),
+    ]));
     let build: Arc<dyn PhysicalOperator> = Arc::new(LazyGeneratorExec {
         schema: gen_schema(),
         total_rows: build_rows,
         id_offset: 0,
     });
     let probe: Arc<dyn PhysicalOperator> = Arc::new(LazyGeneratorExec {
-        schema: gen_schema(),
+        schema: probe_schema,
         total_rows: probe_rows,
         id_offset: probe_offset,
     });
-    let (left, right) = if build_right {
-        (probe, build)
+    let (left, right, on) = if build_right {
+        (
+            probe,
+            build,
+            vec![(Expr::column("pid"), Expr::column("id"))],
+        )
     } else {
-        (build, probe)
+        (
+            build,
+            probe,
+            vec![(Expr::column("id"), Expr::column("pid"))],
+        )
     };
-    let sd = spill_dir(if matches!(join_type, JoinType::Semi) {
-        "semi_join"
-    } else {
-        "anti_join"
-    });
+    let tag = match join_type {
+        JoinType::Semi => "semi_join",
+        JoinType::Anti => "anti_join",
+        JoinType::Left => "left_join",
+        _ => "filtered_join",
+    };
+    let sd = spill_dir(tag);
     let _ = std::fs::remove_dir_all(&sd);
     let config = ExecutionConfig::new()
         .with_memory_limit(memory_limit)
         .with_spill_path(sd.clone());
+    let filter = if filtered {
+        let op = if filter_mode == "ne" {
+            BinaryOp::NotEq
+        } else {
+            BinaryOp::Eq
+        };
+        Some(Expr::BinaryExpr {
+            left: Box::new(Expr::column("val")),
+            op,
+            right: Box::new(Expr::column("pval")),
+        })
+    } else {
+        None
+    };
     let join = SpillableHashJoinExec::new(
         left,
         right,
-        vec![(Expr::column("id"), Expr::column("id"))],
+        on,
         join_type,
         create_memory_pool(memory_limit),
         config,
     )
-    .with_build_right(build_right);
+    .with_build_right(build_right)
+    .with_filter(filter);
     let mut stream = join.execute(0).await?;
     let mut rows = 0usize;
     while let Some(batch) = stream.try_next().await? {
@@ -412,7 +461,16 @@ async fn scenario_join(join_type: JoinType) -> query_engine::Result<String> {
         (JoinType::Semi, _) => quarter,
         (JoinType::Anti, true) => quarter,
         (JoinType::Anti, false) => 3 * quarter,
-        _ => unreachable!("scenario_join only runs SEMI/ANTI"),
+        (JoinType::Left, true) => 2 * quarter,
+        (JoinType::Left, false) => 4 * quarter,
+        (JoinType::Inner, _) => {
+            if filter_mode == "ne" {
+                0
+            } else {
+                quarter
+            }
+        }
+        _ => unreachable!("scenario_join only runs SEMI/ANTI/LEFT/filtered INNER"),
     };
     if rows == expected {
         Ok(format!(
@@ -443,8 +501,10 @@ fn main() {
             "insert" => scenario_insert().await,
             "semi-join" => scenario_join(JoinType::Semi).await,
             "anti-join" => scenario_join(JoinType::Anti).await,
+            "left-join" => scenario_join(JoinType::Left).await,
+            "filtered-join" => scenario_join(JoinType::Inner).await,
             other => Err(query_engine::QueryError::InvalidArgument(format!(
-                "usage: oom_cap_harness <agg|sort|native-scan|insert|semi-join|anti-join> (got {other:?})"
+                "usage: oom_cap_harness <agg|sort|native-scan|insert|semi-join|anti-join|left-join|filtered-join> (got {other:?})"
             ))),
         }
     });

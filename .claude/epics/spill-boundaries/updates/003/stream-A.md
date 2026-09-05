@@ -77,3 +77,76 @@ LEFT/RIGHT/FULL outer-join spill (spillable.rs), on top of task 002's filter.
   Rewritten to the new contract: filter-only and LIMIT-only still refuse by
   name; ORDER BY-only and a bare join over an over-budget table now complete
   cell-exact (2 new tests, 9/9).
+
+## 2026-09-05 follow-up — harness left-join / filtered-join memory (coordinator's finding)
+- Coordinator's task-004 harness legs (40M-row build, 20M-row probe, 256MB
+  budget, default 1G cap): pre-fix 8/8 clean refusals; HEAD 8f38273 on the
+  cgroup lever: left-join build_right=0 killed (137, 1,024MB), filtered-join
+  eq killed both orientations, left-join build_right=1 1,006/1,041MB,
+  filtered ne 609/593MB.
+- BEFORE measurement (pinned `.scratch/sb/bin/oom_cap_harness_head`, 8G scope
+  so nothing is killed, QE_SPILL_DEBUG=1 + a 1s VmRSS sampler with
+  timestamped traces: `.scratch/sb/trace_legs.sh` → `.scratch/sb/harness_trace/
+  before_*.log`), same machine state, one leg at a time:
+  | leg | phase-A peak | phase-B peak | K / chunk budget |
+  |---|---|---|---|
+  | left-join br0 | 292MB | **1,180MB** | 2 / 107MB |
+  | left-join br1 | 309MB | **992MB** | 2 / 107MB |
+  | filtered-join eq br1 | 286MB | **1,045MB** | 2 / 107MB |
+  | filtered-join eq br0 | ~290MB | **1,046MB** | 2 / 107MB |
+  | semi-join br0 (control) | 286MB | 653MB | 2 / 107MB |
+  | semi-join br1 (control) | 268MB | 670MB | 2 / 107MB |
+  In every leg RSS jumps to its plateau within ~2s of the `phase B:` trace
+  line and stays there until DONE; phase A (pool of 3, per-call) is unchanged
+  vs SEMI. The +350..530MB is therefore in phase B's emissions, which SEMI/
+  ANTI do not have: `create_joined_batch` (pairs; 16 probe batches per group
+  probed in parallel on the GLOBAL rayon pool, K=2 jobs) and `emit_build_rows`
+  (a preserved build side's unmatched rows per chunk: ~790k-row chunks, 3/4
+  unmatched). Both go through `gather_column`, which allocated ONE 1-row
+  Arrow array PER OUTPUT ROW (`compute::take` of a single row, then a
+  `concat` of all of them): ~1.2M ~200-byte allocations per chunk per column
+  on rayon threads, freed elsewhere — the exact allocator-retention shape
+  join-spill-streaming 003 measured for phase A. The `ne` control (no pair
+  passes → no gather) staying at 609MB is the one-variable confirmation.
+- Fix (spillable.rs): `gather_column` = one `compute::interleave` (or one
+  `take` when all indices come from one batch) per column; every gathered
+  emission (pairs, NULL-extended build rows, SEMI/ANTI build rows, resident
+  phase-A' emission) sliced to `SPILL_EMIT_ROWS` = 8,192 rows per batch
+  (`QE_SPILL_EMIT_ROWS` override) so the output channel's 8-batch bound is a
+  byte bound too. `QE_SPILL_GATHER=legacy` keeps the old gather for the A/B.
+- Controlled A/B (fixed binary `.scratch/sb/bin/oom_cap_harness_fu`, built
+  from the fix into `.scratch/sb/target` — the shared release lock was held by
+  the task-004 suites — same sampler, 8G scope; `.scratch/sb/harness_trace/
+  {after,ab_legacygather,ab_noslice}_*.log`):
+  | leg | before | legacy gather + slicing | new gather, no slicing | fix (both) |
+  |---|---|---|---|---|
+  | left-join br0 | 1,180MB | 1,112MB | 798MB | **776MB** |
+  | left-join br1 | 992MB | — | — | **766MB** |
+  | filtered-join eq br1 | 1,045MB | 1,049MB | 805MB | **780MB** |
+  | filtered-join eq br0 | 1,046MB | — | — | **774MB** |
+  | semi-join br0 / br1 (control) | 653 / 670MB | — | — | 661 / 663MB |
+  Varying one thing at a time: slicing alone recovers ~70MB (the gather is
+  the cause), the gather alone recovers ~380-410MB, both together another
+  ~25MB. Phase A is untouched (per-call pool of 3 for a 256MB budget); K and
+  the chunk budget are unchanged (2 / 107MB).
+- Driver at the DEFAULT 1G caps, both levers (`scripts/oom_cap_harness.sh`,
+  `.scratch/sb/harness_fu/br{1,0,1_ne}_driver.log`): **18/18 PASS** —
+  left-join 763/791MB (br1), 807/816MB (br0); filtered-join eq 794/807MB
+  (br1), 774/825MB (br0); semi-join 662/674 (br1), 615/591 (br0); anti-join
+  679/717 (br1), 661/618 (br0); filtered ne 660/602. Before: 4 of the 8
+  left/filtered cgroup+rlimit legs completed only on the rlimit lever
+  (1,006-1,361MB), 3 were killed at 1G.
+- Chaos on the fixed harness: 120/120 @seed 20260906 tpch-10mb (108
+  genuine-disk, 9,968 hash-check-ok, 0 HASH-MISMATCH).
+- After the measurements the probe-side emissions (`take_probe_rows`,
+  `emit_probe_rows`) were sliced the same way (a skewed sparse phase-A piece
+  can exceed 8,192 rows) and `run_spillable_join_opts` now pins every
+  spill-path batch to `<= SPILL_EMIT_ROWS` rows; spillable+hash_join 55/55.
+- Re-verified on a harness built from the FINAL tree (`oom_cap_harness_fu2`,
+  incl. the probe-side slicing): the 8 target legs at the default 1G cap —
+  left-join 797/803MB (br1), 795/799MB (br0); filtered-join eq 785/802MB
+  (br1), 807/842MB (br0) — **8/8 PASS** on both levers
+  (`.scratch/sb/harness_fu2_br{1,0}_driver.log`); chaos 100/100 @seed
+  20260907 tpch-100mb (91 genuine-disk, 8,290 hash-check-ok, 0 mismatch).
+  Committed as the `003 follow-up` commit together with the coordinator's
+  `left-join` / `filtered-join` harness scenarios.

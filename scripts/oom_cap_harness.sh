@@ -59,7 +59,7 @@ cap_for() {
     agg | sort) echo "${OOM_HARNESS_CAP_AGG:-1G}" ;;
     native-scan) echo "${OOM_HARNESS_CAP_SCAN:-2G}" ;;
     insert) echo "${OOM_HARNESS_CAP_INSERT:-512M}" ;;
-    semi-join | anti-join) echo "${OOM_HARNESS_CAP_JOIN:-1G}" ;;
+    semi-join | anti-join | left-join | filtered-join) echo "${OOM_HARNESS_CAP_JOIN:-1G}" ;;
     *) echo "1G" ;;
   esac
 }
