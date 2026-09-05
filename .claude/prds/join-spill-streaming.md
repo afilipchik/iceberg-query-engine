@@ -1,7 +1,7 @@
 ---
 name: join-spill-streaming
 description: Make the join spill path stream its probe side and its output and process spilled partitions in parallel, so larger-than-memory joins are bounded by the budget and Q9 at SF=100/1G drops from ~1,400s to minutes
-status: active
+status: completed
 created: 2026-09-05T01:38:00Z
 ---
 

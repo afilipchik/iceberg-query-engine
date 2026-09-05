@@ -99,9 +99,11 @@ This ensures consistent code formatting across the codebase.
   native at `--memory-limit 64M` and `16M` (cell-exact, real spill
   activity, 0 checksum mismatches) and by the harness's new
   `semi-join`/`anti-join` scenarios (8/8 COMPLETED under a 1G cap on both
-  levers, pre-fix 4/4 clean refusals). Known residual on this path: the
-  probe side is still fully materialized before probing (see Current
-  limitations).
+  levers, pre-fix 4/4 clean refusals). **Residual closed 2026-09-04
+  (`join-spill-streaming`)**: the probe side and the output now stream
+  and spilled partitions are processed K-way under the same budget —
+  the same harness joins with a 600M-row build complete under the
+  default 1G cap (464-881MB peak), Q9 SF=100 @1G 222s (was ~1,650s).
 
 ### Sandboxed Build Rule
 
@@ -4486,16 +4488,45 @@ cluster_local.sh verify-m2 && scripts/cluster_local.sh stop` (M1/M2).
   (CTAS native lineitem from tpch-10mb, Semi/Anti on `l_shipmode`,
   build-left and build-right, cell-exact vs the parquet source). Evidence:
   `.claude/epics/archived/hash-join-dictionary-semi-anti-fix/`.
-- **Documented boundary (pre-existing, observed by task 004, unchanged):
-  the join spill path materializes the ENTIRE probe side in memory
-  before probing** (`execute_spill_path` collects all probe partitions
-  into a `Vec<RecordBatch>`, then routes/spills per partition). The build
-  side is bounded by the budget; the probe side is not. Q4 SF=100 at 64M
-  worked because its probe side (~452M filtered `lineitem` rows, key-only
-  projection) fit in the 32G cap of that run; a probe side larger than
-  physical memory would still OOM (or hit `QE_MEM_CAP`) on this path.
-  Streaming the probe side batch-by-batch through the same partition
-  writers is the obvious fix and is the natural next join-spill task.
+- **CLOSED (`join-spill-streaming` epic, 2026-09-04): the join spill path
+  no longer materializes its probe side or its output, and processes
+  spilled partitions in parallel under the operator's own budget.**
+  Before: `execute_spill_path` collected the ENTIRE probe side into a
+  `Vec<RecordBatch>` (Q9 SF=100 @1G: 333,333,330 rows) and then the
+  ENTIRE join output into another (1,333,333,320 rows — 1,396s of Q9's
+  ~1,650s), and read spilled partitions back one at a time on one
+  thread; the probe side and the output were unbounded by
+  `--memory-limit` (Q4 @64M needed a 32G cap; the SF=100-class harness
+  join needed 12G for a 256MB budget). Now: the probe side flows through
+  `stream_merge_input_partitions` (bounded channel); the memoized build
+  state lives in `BuildDecision::Spill(Arc<SpillState>)` and a spawned
+  producer streams matched batches through a bounded `mpsc(8)` channel
+  (phase A: resident partitions probed per incoming batch, partition-
+  major on a per-call rayon pool sized one worker per 64MB of threshold,
+  clamped 1..8 — sized by the budget because mimalloc's per-thread
+  retention (~12MB/thread) was measured, not guessed, to break the 1G
+  target with a fixed 8-thread pool; phase B: up to K spilled partitions
+  concurrently via `spawn_blocking`, K = min(available parallelism, 8,
+  spilled count, threshold / largest partition table), overridable with
+  `QE_SPILL_JOIN_PARALLELISM`, each chunk's table budget = threshold / K
+  so the total transient table memory is unchanged, spill files read
+  row-group by row-group so a job holds one chunk + one probe group,
+  never a partition file); per-call probe files
+  `probe_<call>_<idx>.parquet` cleaned by the producer, the spill dir in
+  `SpillState::drop`. Measured on the same machine: harness `semi-join`/
+  `anti-join` with a 600M-row build (9.6GB vs a 256MB budget) **8/8
+  COMPLETED under the DEFAULT 1G cap** on both levers and both
+  orientations (464-881MB peak; before: 4.7-8.0GB under a 12G cap);
+  **Q4 SF=100 native @64M: 2,889MB peak, 40.1s** (before 6,185MB, 71.1s);
+  **Q9 SF=100 parquet @1G: 222.3s cell-exact** (before ~1,650s), 246
+  hash-check-ok / 0 mismatch, whole-engine peak 10.7GB under a 16G cap
+  (scan parallelism + in-flight channels, not the join — bounded but
+  budget-exceeding, worth its own look); chaos 300/300 on the final
+  binary; SF=10 native 5,578ms in band. Honest cost line: at tiny
+  budgets the phase-A pool is small by design (Q4 @64M: 40s vs 14s with
+  a fixed 8-thread pool) — memory first. Evidence:
+  `.claude/epics/archived/join-spill-streaming/` (003.md carries the
+  controlled allocator-retention experiments).
 - **No compaction** (native-tables-mutation epic, confirmed OUT OF SCOPE
   by design — task 001's Decision 3, not merely deferred incidentally). A
   deletion vector is correctness-preserving indefinitely — reads always
@@ -4692,6 +4723,32 @@ join spill path is correct but slow at this scale (Q09 ~1,400s at both
 reasons — whole-probe-side materialization and one-thread
 spilled-partition processing. Full evidence:
 `.claude/epics/spill-join-correctness-3/005.md` + `updates/005/stream-A.md`.
+
+**Re-certified 2026-09-04 (`join-spill-streaming` task 004, HEAD of that
+epic; same drivers, same oracle, same caps or smaller).** Every verdict
+identical to 2026-09-03, every spilling premise much faster and under a
+smaller cap:
+
+| premise | cell-exact | 2026-09-03 total | 2026-09-04 total | cap |
+|---|---|---|---|---|
+| parquet, 1G | **22/22** (same 6 spilling; join spill on Q09 x2 + Q16; 366 hash-check-ok / 0 mismatch) | 1616s | **637s** (Q09 318s under load; 222s quiet) | 32G (was 80G) |
+| parquet, 256M | **20/22 + Q20/Q21 named refusals** (11 spilling, join spill on 8; 0 mismatch) | 2207s | **933s** | 32G (was 80G) |
+| native, 100G | **22/22** (Q4 1.39s, Q13 9.9s) | 91.8s | **79.0s** | 110G |
+| native, 1G | **17/22 + the same 5 native-scan admission refusals** (spilling Q03/Q09/Q13/Q16/Q18; 0 mismatch) | 1602s | **856s** (Q09 292s, was 1,255s) | 32G (was 80G) |
+
+Harness: SF=100-class core 8/8 (agg 473/494MB, sort 839/797MB @1G;
+native-scan 120/122MB @2G; insert 2x clean refusal @512M) and join
+scenarios 8/8 under the DEFAULT 1G cap (464-881MB, both levers, both
+orientations — previously needed 12G); SF=10 harness 8/8. No-regression
+legs: SF=10 native 5,578ms (band 5288-5667); parquet cache-off
+7.39s, 22/22 PASS (band 7.03-7.40s); INSERT RSS 1,665,924 KB (~1.59GB), 60M rows in 9.2s (~1.6-1.7GB
+band); chaos 300/300 on the final binary; M1/M2 PASS. Suites: default
+1340/0/1, lance 1405/0/2, gpu 1349/0/1, pulsar 1342/1/1 with --no-fail-fast — the one failure (`three_real_processes_serve_and_survive_a_sigterm`: a spawned server 'never became ready' within 60s while the 65GB native-100G sweep loaded concurrently) passes 2/2 in isolation, and the first run's only failure (the pre-existing rollup last-ULP flake) passes 3/3 in isolation, so 1343 tests are green individually (each =
+the 2026-09-03 counts + epic hash-join-dictionary-semi-anti-fix's 11 +
+this epic's 3). The sweep timings shared the machine with the suite
+builds; the task-003 quiet-machine numbers are the ones to quote for
+speed. Evidence: `.claude/epics/archived/join-spill-streaming/004.md` +
+`updates/004/stream-A.md`, `.scratch/jss/`.
 
 **CPU vs GPU split** (`--features gpu`, per this program's standing
 convention of reporting these as separate rows): see the "GPU Aggregate
