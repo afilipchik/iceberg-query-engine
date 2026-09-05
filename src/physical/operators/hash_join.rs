@@ -717,6 +717,7 @@ impl std::fmt::Debug for HashJoinExec {
             .field("join_type", &self.join_type)
             .field("schema", &self.schema)
             .field("filter", &self.filter)
+            .field("build_right", &self.build_right)
             .finish()
     }
 }
@@ -2275,19 +2276,31 @@ fn probe_semi_anti_parallel(
             && v.supports_i64_lookup()
             && (filter.is_none() || compiled_filter.is_some())
     });
+    let i64_ht_ref: Option<&HashMap<i64, Vec<HashEntry>>> = cached_i64_ht;
 
-    // Use cached i64 hash table if available, otherwise build one (skipped
-    // when the VHT serves lookups; the local build remains the safety net
-    // for probe shapes the VHT path can't take, e.g. non-Int64 probe keys).
-    let local_i64_ht: Option<HashMap<i64, Vec<HashEntry>>> =
-        if cached_i64_ht.is_some() || use_vht.is_some() {
-            None
-        } else if probe_key_exprs.len() == 1 {
-            build_i64_hash_table(build_batches, &probe_key_exprs[0])
-        } else {
-            None
-        };
-    let i64_ht_ref: Option<&HashMap<i64, Vec<HashEntry>>> = cached_i64_ht.or(local_i64_ht.as_ref());
+    // Candidate sources, in precedence order, per probe batch:
+    //   1. VHT i64 point lookup (`use_vht`)            — Int64 probe keys
+    //   2. cached i64 map (`i64_ht_ref`)               — Int64 probe keys
+    //   3. VHT generic `probe_batch` enumeration       — any VHT-able keys
+    //   4. generic `hash_table` (only built when NO VHT exists)
+    // Source 3 is the safety net for everything a VHT was built for but
+    // the i64 paths can't take (Utf8/Dictionary keys; Int64 keys whose ON
+    // filter is not compilable): `execute()` skips the generic map whenever
+    // a VHT exists, so before this task those shapes looked up an EMPTY
+    // map and matched nothing (task 001 audit: Semi 0 / Anti every row,
+    // both orientations). The former "local i64 map" safety net was built
+    // over the BUILD batches with the PROBE key expression and so silently
+    // evaluated to None whenever the two sides' key names differed.
+    //
+    // Match-marking stop rule (the task-001 defect): after a candidate
+    // pair PASSES, stop scanning that probe row's candidates ONLY when
+    // `swapped` — the probe row is the output and its Semi/Anti status is
+    // decided by one match. When `!swapped` the BUILD rows are the output,
+    // and every build row sharing the key is its own output row, so the
+    // walk must continue and mark them all. Breaking unconditionally
+    // emitted one build row per distinct matched key (Dictionary-keyed
+    // build-side Semi: 20 rows instead of 30,000; Anti: 59,980 instead of
+    // 30,000 on the pinned fixture).
 
     // Process probe BATCHES in parallel: 8K-row parquet batches are smaller
     // than any useful intra-batch chunk, so chunking within a batch left the
@@ -2314,17 +2327,20 @@ fn probe_semi_anti_parallel(
 
             let n_rows = probe_batch.num_rows();
 
-            // Fall back to full key extraction if no i64 fast path
-            let probe_key_arrays: Option<Vec<ArrayRef>> =
-                if i64_values.is_none() || (i64_ht_ref.is_none() && use_vht.is_none()) {
-                    let arrays: Result<Vec<ArrayRef>> = probe_key_exprs
-                        .iter()
-                        .map(|e| evaluate_expr(probe_batch, e))
-                        .collect();
-                    Some(arrays?)
-                } else {
-                    None
-                };
+            let i64_point = i64_values.is_some() && use_vht.is_some();
+            let i64_map = i64_values.is_some() && i64_ht_ref.is_some();
+
+            // Full key arrays when no i64 fast path serves this batch
+            // (sources 3 and 4).
+            let probe_key_arrays: Option<Vec<ArrayRef>> = if !i64_point && !i64_map {
+                let arrays: Result<Vec<ArrayRef>> = probe_key_exprs
+                    .iter()
+                    .map(|e| evaluate_expr(probe_batch, e))
+                    .collect();
+                Some(arrays?)
+            } else {
+                None
+            };
 
             // Track probe-side matches when swapped (build=right, probe=left=output)
             let probe_matched_batch: Vec<AtomicBool> = if swapped {
@@ -2333,12 +2349,58 @@ fn probe_semi_anti_parallel(
                 vec![]
             };
 
+            // Apply the ON filter (compiled, expression, or none) to one
+            // candidate pair and record the match on the output side.
+            // Returns whether the pair passed.
+            let consider = |bb: usize, br: usize, pr: usize| -> Result<bool> {
+                let pass = if let Some(cf) = &compiled_filter {
+                    cf.evaluate(&build_batches[bb], br, probe_batch, pr)
+                } else if let Some(filter_expr) = filter {
+                    let one = create_single_row_combined_batch(
+                        build_batches,
+                        bb,
+                        br,
+                        probe_batch,
+                        pr,
+                        swapped,
+                        combined_schema,
+                    )?;
+                    let res = evaluate_expr(&one, filter_expr)?;
+                    res.as_any()
+                        .downcast_ref::<arrow::array::BooleanArray>()
+                        .map(|b| b.len() > 0 && b.is_valid(0) && b.value(0))
+                        .unwrap_or(false)
+                } else {
+                    true
+                };
+                if pass {
+                    if swapped {
+                        probe_matched_batch[pr].store(true, Ordering::Relaxed);
+                    } else {
+                        build_matched[bb][br].store(true, Ordering::Relaxed);
+                    }
+                }
+                Ok(pass)
+            };
+
+            if let (false, false, Some(v), Some(keys)) =
+                (i64_point, i64_map, vht, probe_key_arrays.as_ref())
             {
+                // Source 3: every candidate pair of the batch from the VHT
+                // (null probe keys never produce candidates). Candidates
+                // come grouped by probe row in row order.
+                for (bb, br, pr) in v.probe_batch(keys, n_rows) {
+                    let (bb, br, pr) = (bb as usize, br as usize, pr as usize);
+                    if swapped && probe_matched_batch[pr].load(Ordering::Relaxed) {
+                        continue; // this probe row is already decided
+                    }
+                    consider(bb, br, pr)?;
+                }
+            } else {
                 for probe_row in 0..n_rows {
-                    // VHT point-lookup path: candidates straight from the
-                    // chained table, filter evaluated per candidate, stop at
-                    // the first pass (same semantics as the map path below).
-                    if let (Some(vals), Some(v)) = (i64_values, use_vht) {
+                    // Source 1: VHT point lookup; the filter is compiled or
+                    // absent here by construction of `use_vht`.
+                    if let (true, Some(vals), Some(v)) = (i64_point, i64_values, use_vht) {
                         if let Some(ref nb) = null_bitmap {
                             if !nb.is_valid(probe_row) {
                                 continue;
@@ -2362,75 +2424,34 @@ fn probe_semi_anti_parallel(
                                         .store(true, Ordering::Relaxed);
                                 }
                             }
-                            pass
+                            // Stop the walk only once the PROBE row is decided.
+                            pass && swapped
                         });
                         continue;
                     }
-                    // Fast i64 path: direct array access, no JoinKey allocation
-                    let entries_opt = if let (Some(vals), Some(ht)) = (i64_values, i64_ht_ref) {
-                        if let Some(ref nb) = null_bitmap {
-                            if !nb.is_valid(probe_row) {
+                    // Source 2: i64 map, direct array access, no JoinKey allocation.
+                    let entries_opt =
+                        if let (true, Some(vals), Some(ht)) = (i64_map, i64_values, i64_ht_ref) {
+                            if let Some(ref nb) = null_bitmap {
+                                if !nb.is_valid(probe_row) {
+                                    continue;
+                                }
+                            }
+                            ht.get(&vals[probe_row])
+                        } else if let Some(ref key_arrays) = probe_key_arrays {
+                            // Source 4: generic map (no VHT exists).
+                            let key = extract_join_key(key_arrays, probe_row);
+                            if key.values.iter().any(|v| matches!(v, JoinValue::Null)) {
                                 continue;
                             }
-                        }
-                        ht.get(&vals[probe_row])
-                    } else if let Some(ref key_arrays) = probe_key_arrays {
-                        let key = extract_join_key(key_arrays, probe_row);
-                        if key.values.iter().any(|v| matches!(v, JoinValue::Null)) {
-                            continue;
-                        }
-                        hash_table.get(&key)
-                    } else {
-                        None
-                    };
+                            hash_table.get(&key)
+                        } else {
+                            None
+                        };
 
                     if let Some(entries) = entries_opt {
                         for entry in entries {
-                            if let Some(ref cf) = compiled_filter {
-                                let build_batch = &build_batches[entry.batch_idx];
-                                if cf.evaluate(build_batch, entry.row_idx, probe_batch, probe_row) {
-                                    if swapped {
-                                        probe_matched_batch[probe_row]
-                                            .store(true, Ordering::Relaxed);
-                                    } else {
-                                        build_matched[entry.batch_idx][entry.row_idx]
-                                            .store(true, Ordering::Relaxed);
-                                    }
-                                    break;
-                                }
-                            } else if let Some(filter_expr) = filter {
-                                let build_row_batch = create_single_row_combined_batch(
-                                    build_batches,
-                                    entry.batch_idx,
-                                    entry.row_idx,
-                                    probe_batch,
-                                    probe_row,
-                                    swapped,
-                                    combined_schema,
-                                )?;
-                                let filter_result = evaluate_expr(&build_row_batch, filter_expr)?;
-                                if let Some(bool_arr) = filter_result
-                                    .as_any()
-                                    .downcast_ref::<arrow::array::BooleanArray>(
-                                ) {
-                                    if bool_arr.len() > 0 && bool_arr.value(0) {
-                                        if swapped {
-                                            probe_matched_batch[probe_row]
-                                                .store(true, Ordering::Relaxed);
-                                        } else {
-                                            build_matched[entry.batch_idx][entry.row_idx]
-                                                .store(true, Ordering::Relaxed);
-                                        }
-                                        break;
-                                    }
-                                }
-                            } else {
-                                if swapped {
-                                    probe_matched_batch[probe_row].store(true, Ordering::Relaxed);
-                                } else {
-                                    build_matched[entry.batch_idx][entry.row_idx]
-                                        .store(true, Ordering::Relaxed);
-                                }
+                            if consider(entry.batch_idx, entry.row_idx, probe_row)? && swapped {
                                 break;
                             }
                         }
@@ -2452,8 +2473,8 @@ fn probe_semi_anti_parallel(
                             .iter()
                             .map(|col| arrow::compute::take(col, &take_idx, None))
                             .collect();
-                    let batch = RecordBatch::try_new(
-                        output_schema.clone(),
+                    let batch = batch_with_actual_types(
+                        output_schema,
                         columns.map_err(|e| crate::error::QueryError::Execution(e.to_string()))?,
                     )?;
                     return Ok(Some(batch));
@@ -2647,8 +2668,8 @@ fn probe_vectorized(
                 .iter()
                 .map(|col| arrow::compute::take(col, &take_idx, None))
                 .collect();
-            let batch = RecordBatch::try_new(
-                output_schema.clone(),
+            let batch = batch_with_actual_types(
+                output_schema,
                 columns.map_err(|e| crate::error::QueryError::Execution(e.to_string()))?,
             )?;
             Ok(Some(batch))
@@ -3581,8 +3602,8 @@ fn probe_hash_table(
                                 .iter()
                                 .map(|col| arrow::compute::take(col, &take_idx, None))
                                 .collect();
-                        let batch = RecordBatch::try_new(
-                            output_schema.clone(),
+                        let batch = batch_with_actual_types(
+                            output_schema,
                             columns
                                 .map_err(|e| crate::error::QueryError::Execution(e.to_string()))?,
                         )?;
@@ -3755,7 +3776,11 @@ fn create_semi_anti_batch(
         .map(|col_idx| gather_column(build_batches, col_idx, indices))
         .collect();
 
-    RecordBatch::try_new(output_schema.clone(), columns?).map_err(Into::into)
+    // Semi/Anti output is the preserved side's rows verbatim; like every
+    // other emission here, the arrays may be Dictionary-encoded where the
+    // declared schema says Utf8 (IPC sidecar / native scans), so the batch
+    // is tagged with the ACTUAL types rather than failing `try_new`.
+    batch_with_actual_types(output_schema, columns?)
 }
 
 fn create_joined_batch(
@@ -4931,5 +4956,307 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // hash-join-dictionary-semi-anti-fix task 001: build-side-output
+    // SEMI/ANTI must mark EVERY build row sharing a matched key.
+    // ------------------------------------------------------------------
+
+    /// `n` rows in 1024-row batches; column 0 is the key `key{i % modulo}`
+    /// (Dictionary(Int32, Utf8) when `dict`, else plain Utf8), column 1 an
+    /// Int64 payload `i`. Ported from spillable.rs's task-004 findings
+    /// fixture so the operator-level pin and the wrapper-level pin agree
+    /// on the exact data.
+    fn keyed_string_batches(
+        schema: &SchemaRef,
+        n: i64,
+        modulo: i64,
+        dict: bool,
+    ) -> Vec<RecordBatch> {
+        use arrow::array::DictionaryArray;
+        use arrow::datatypes::Int32Type;
+        let mut out = Vec::new();
+        let mut start = 0i64;
+        while start < n {
+            let end = (start + 1024).min(n);
+            let strings: Vec<String> = (start..end)
+                .map(|i| format!("key{:02}", i % modulo))
+                .collect();
+            let key_col: ArrayRef = if dict {
+                let d: DictionaryArray<Int32Type> =
+                    strings.iter().map(|s| Some(s.as_str())).collect();
+                Arc::new(d)
+            } else {
+                Arc::new(StringArray::from(strings))
+            };
+            out.push(
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        key_col,
+                        Arc::new(Int64Array::from((start..end).collect::<Vec<i64>>())),
+                    ],
+                )
+                .unwrap(),
+            );
+            start = end;
+        }
+        out
+    }
+
+    fn string_key_schema(key: &str, payload: &str, dict: bool) -> SchemaRef {
+        let key_ty = if dict {
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+        } else {
+            DataType::Utf8
+        };
+        Arc::new(Schema::new(vec![
+            Field::new(key, key_ty, true),
+            Field::new(payload, DataType::Int64, false),
+        ]))
+    }
+
+    /// Column 0 of every batch rendered as an optional string (Dictionary
+    /// decoded to its value type; NULL -> None).
+    fn key_strings(batches: &[RecordBatch]) -> Vec<Option<String>> {
+        let mut out = Vec::new();
+        for b in batches {
+            let c = b.column(0);
+            let c: ArrayRef = match c.data_type() {
+                DataType::Dictionary(_, v) => compute::cast(c.as_ref(), v).unwrap(),
+                _ => c.clone(),
+            };
+            for i in 0..c.len() {
+                if c.is_null(i) {
+                    out.push(None);
+                } else if let Some(s) = c.as_any().downcast_ref::<StringArray>() {
+                    out.push(Some(s.value(i).to_string()));
+                } else if let Some(a) = c.as_any().downcast_ref::<Int64Array>() {
+                    out.push(Some(a.value(i).to_string()));
+                } else {
+                    panic!("key_strings: unhandled key type {:?}", c.data_type());
+                }
+            }
+        }
+        out
+    }
+
+    /// Ground truth independent of the join: SEMI = left rows whose key
+    /// occurs on the right, ANTI = left rows whose key does not (NULL keys
+    /// never match, so they count as ANTI). INNER = pair count.
+    fn naive_count(left: &[RecordBatch], right: &[RecordBatch], jt: JoinType) -> usize {
+        let l = key_strings(left);
+        let r = key_strings(right);
+        let mut rc: HashMap<String, usize> = HashMap::new();
+        for k in r.iter().flatten() {
+            *rc.entry(k.clone()).or_default() += 1;
+        }
+        match jt {
+            JoinType::Inner => l
+                .iter()
+                .flatten()
+                .map(|k| rc.get(k).copied().unwrap_or(0))
+                .sum(),
+            JoinType::Semi => l.iter().flatten().filter(|k| rc.contains_key(*k)).count(),
+            JoinType::Anti => l
+                .iter()
+                .filter(|k| match k {
+                    None => true,
+                    Some(k) => !rc.contains_key(k),
+                })
+                .count(),
+            _ => unreachable!("naive_count: INNER/SEMI/ANTI only"),
+        }
+    }
+
+    /// Drain EVERY output partition of the operator (Semi/Anti declare one,
+    /// Inner declares the probe side's count; draining only partition 0 of
+    /// a multi-partition result is the exact mistake retracted in the
+    /// task-004 findings note).
+    async fn drain_all_partitions(join: &HashJoinExec) -> Vec<RecordBatch> {
+        let mut out = Vec::new();
+        for p in 0..join.output_partitions() {
+            let stream = join.execute(p).await.unwrap();
+            let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+            out.extend(batches);
+        }
+        out
+    }
+
+    fn rows_in(batches: &[RecordBatch]) -> usize {
+        batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    /// THE pinned defect (spill-join-correctness-3 task 004 finding,
+    /// reproduced here directly against `HashJoinExec`, not the spillable
+    /// wrapper): SEMI/ANTI with the BUILD side as the output side
+    /// (`build_right=false`, `swapped=false`), keys `Dictionary(Int32,Utf8)`
+    /// with heavy duplication on the build side (60,000 rows over 40
+    /// values) probed by 2,000 rows over 20 of those values.
+    ///
+    /// Dictionary keys cannot build a `VectorizedHashTable` (task 002 fixes
+    /// that), so this shape runs `probe_semi_anti_parallel`'s generic-map
+    /// loop, which — before this task — `break`-ed after marking the FIRST
+    /// build entry of each probe key. Observed pre-fix: SEMI 20 (one per
+    /// distinct matched key) instead of 30,000; ANTI 59,980 instead of
+    /// 30,000. Plain Utf8 keys are the control (they take the vectorized
+    /// path, which marks every candidate) and pass both before and after.
+    /// The probe-side orientation (`build_right=true`) is asserted too: it
+    /// was never wrong and must stay that way.
+    #[tokio::test]
+    async fn semi_anti_build_side_output_dictionary_keys_marks_every_build_row() {
+        let mut failures: Vec<String> = Vec::new();
+        for (dict, label) in [(true, "Dictionary(Int32,Utf8)"), (false, "Utf8")] {
+            let ls = string_key_schema("lk", "lp", dict);
+            let rs = string_key_schema("rk", "rp", dict);
+            for jt in [JoinType::Semi, JoinType::Anti] {
+                for build_right in [false, true] {
+                    let left = keyed_string_batches(&ls, 60_000, 40, dict);
+                    let right = keyed_string_batches(&rs, 2_000, 20, dict);
+                    let truth = naive_count(&left, &right, jt);
+                    let join = HashJoinExec::new(
+                        Arc::new(MemoryTableExec::new("l", ls.clone(), left, None)),
+                        Arc::new(MemoryTableExec::new("r", rs.clone(), right, None)),
+                        vec![(Expr::column("lk"), Expr::column("rk"))],
+                        jt,
+                    )
+                    .with_build_right(build_right);
+                    let got = rows_in(&drain_all_partitions(&join).await);
+                    eprintln!(
+                        "[hjdict-001] {label} {jt:?} build_right={build_right}: got={got} truth={truth}"
+                    );
+                    if got != truth {
+                        failures.push(format!(
+                            "{label} {jt:?} build_right={build_right}: got {got}, truth {truth}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "wrong counts: {failures:#?}");
+    }
+
+    /// Audit sibling of the pin above, same function, different entry:
+    /// Int64 keys WITH an ON filter. A compiled column-vs-column filter
+    /// (`lp > rp`) routes through `for_each_i64_candidate`, whose callback
+    /// returned `pass` (= stop walking) — the same first-entry-only marking
+    /// when the build side is the output. A non-compilable filter (`lp >
+    /// -1`, literal on one side) takes the expression-evaluated entry loop,
+    /// whose marking site also `break`-ed. Both filters pass for every
+    /// candidate pair, so truth is the unfiltered count.
+    #[tokio::test]
+    async fn semi_anti_build_side_output_with_on_filter_marks_every_build_row() {
+        let ls: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("lk", DataType::Int64, true),
+            Field::new("lp", DataType::Int64, false),
+        ]));
+        let rs: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("rk", DataType::Int64, true),
+            Field::new("rp", DataType::Int64, false),
+        ]));
+        let mk = |schema: &SchemaRef, n: i64, modulo: i64, payload: i64| -> Vec<RecordBatch> {
+            let mut out = Vec::new();
+            let mut start = 0i64;
+            while start < n {
+                let end = (start + 1024).min(n);
+                out.push(
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            Arc::new(Int64Array::from(
+                                (start..end).map(|i| i % modulo).collect::<Vec<i64>>(),
+                            )),
+                            Arc::new(Int64Array::from(vec![payload; (end - start) as usize])),
+                        ],
+                    )
+                    .unwrap(),
+                );
+                start = end;
+            }
+            out
+        };
+        let filters: Vec<(&str, Expr)> = vec![
+            (
+                "compiled lp > rp",
+                Expr::column("lp").gt(Expr::column("rp")),
+            ),
+            (
+                "expression lp > -1",
+                Expr::column("lp").gt(Expr::literal(crate::planner::ScalarValue::Int64(-1))),
+            ),
+        ];
+        let mut failures: Vec<String> = Vec::new();
+        for (label, filter) in filters {
+            for jt in [JoinType::Semi, JoinType::Anti] {
+                for build_right in [false, true] {
+                    // lp = 1 on the left, rp = 0 on the right: `lp > rp` and
+                    // `lp > -1` both hold for every candidate pair.
+                    let left = mk(&ls, 60_000, 40, 1);
+                    let right = mk(&rs, 2_000, 20, 0);
+                    let truth = naive_count(&left, &right, jt);
+                    let join = HashJoinExec::with_filter(
+                        Arc::new(MemoryTableExec::new("l", ls.clone(), left, None)),
+                        Arc::new(MemoryTableExec::new("r", rs.clone(), right, None)),
+                        vec![(Expr::column("lk"), Expr::column("rk"))],
+                        jt,
+                        Some(filter.clone()),
+                    )
+                    .with_build_right(build_right);
+                    let got = rows_in(&drain_all_partitions(&join).await);
+                    eprintln!(
+                        "[hjdict-001] Int64+filter[{label}] {jt:?} build_right={build_right}: got={got} truth={truth}"
+                    );
+                    if got != truth {
+                        failures.push(format!(
+                            "Int64+filter[{label}] {jt:?} build_right={build_right}: got {got}, truth {truth}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "wrong counts: {failures:#?}");
+    }
+
+    /// Audit probe: Utf8 keys (vectorized table present) WITH an ON filter.
+    /// Semi/Anti with a filter bypass `probe_vectorized` and land in
+    /// `probe_semi_anti_parallel`, where — with a VHT present — the generic
+    /// map was never built and the i64 map does not exist for strings.
+    /// Truth: the filter passes for every pair, so counts equal the
+    /// unfiltered ones. Both orientations.
+    #[tokio::test]
+    async fn semi_anti_utf8_keys_with_on_filter_are_exact() {
+        let ls = string_key_schema("lk", "lp", false);
+        let rs = string_key_schema("rk", "rp", false);
+        let mut failures: Vec<String> = Vec::new();
+        for jt in [JoinType::Semi, JoinType::Anti] {
+            for build_right in [false, true] {
+                let left = keyed_string_batches(&ls, 60_000, 40, false);
+                let right = keyed_string_batches(&rs, 2_000, 20, false);
+                let truth = naive_count(&left, &right, jt);
+                // lp in 0..60000, rp in 0..2000: `lp >= 0` always holds.
+                let join = HashJoinExec::with_filter(
+                    Arc::new(MemoryTableExec::new("l", ls.clone(), left, None)),
+                    Arc::new(MemoryTableExec::new("r", rs.clone(), right, None)),
+                    vec![(Expr::column("lk"), Expr::column("rk"))],
+                    jt,
+                    Some(
+                        Expr::column("lp")
+                            .gt_eq(Expr::literal(crate::planner::ScalarValue::Int64(0))),
+                    ),
+                )
+                .with_build_right(build_right);
+                let got = rows_in(&drain_all_partitions(&join).await);
+                eprintln!(
+                    "[hjdict-001] Utf8+filter {jt:?} build_right={build_right}: got={got} truth={truth}"
+                );
+                if got != truth {
+                    failures.push(format!(
+                        "Utf8+filter {jt:?} build_right={build_right}: got {got}, truth {truth}"
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "wrong counts: {failures:#?}");
     }
 }

@@ -335,6 +335,7 @@ impl fmt::Debug for SpillableHashJoinExec {
         f.debug_struct("SpillableHashJoinExec")
             .field("join_type", &self.join_type)
             .field("on", &self.on)
+            .field("build_right", &self.build_right)
             .finish()
     }
 }
@@ -6683,8 +6684,9 @@ mod tests {
             );
         } else {
             // The in-memory delegate (HashJoinExec, not this task's code)
-            // disagrees with the ground truth — see the #[ignore]d
-            // `in_memory_hash_join_findings_from_task004_fixtures`.
+            // disagrees with the ground truth — pinned as a hard assertion
+            // in `in_memory_hash_join_dictionary_build_side_semi_anti_is_exact`
+            // (fixed by hash-join-dictionary-semi-anti-fix task 001).
             eprintln!(
                 "FINDING {tag}: in-memory HashJoinExec returned {} rows, ground truth {truth} (spill path: {})",
                 base.rows.len(),
@@ -6903,32 +6905,30 @@ mod tests {
         }
     }
 
-    /// FINDING against the IN-MEMORY `HashJoinExec` delegate (hash_join.rs
-    /// — NOT this task's file), surfaced by this task's fixtures while
-    /// validating the spill path against `naive_join_count`. Deliberately
-    /// `#[ignore]`d so the suite stays green on the spill-path claims this
-    /// task makes, while the discrepancy stays executable and visible
-    /// (run with `--ignored --nocapture`): the Dictionary assertions are
-    /// expected to FAIL until the in-memory join is fixed in its own task.
-    ///
-    /// SEMI/ANTI with build = LEFT (output) side, duplicate build keys
+    /// Regression pin (hash-join-dictionary-semi-anti-fix task 001) for a
+    /// defect the spill-join-correctness-3 task-004 fixtures surfaced in the
+    /// IN-MEMORY `HashJoinExec` delegate (hash_join.rs), exercised here
+    /// through the wrapper's in-memory path exactly as production reaches
+    /// it: SEMI/ANTI with build = LEFT (output) side, duplicate build keys
     /// encoded as Dictionary(Int32, Utf8) (60k build rows over 40 values,
-    /// 2k probe rows over 20 of them): the delegate marks exactly ONE
-    /// build row per distinct matched key — SEMI emits 20 rows instead of
-    /// 30,000; ANTI emits 59,980 (= 60,000 - 20) instead of 30,000. The
-    /// same fixture with plain Utf8 keys is the control (also asserted,
-    /// so the run says whether the defect is Dictionary-specific).
+    /// 2k probe rows over 20 of them). Before the fix the delegate marked
+    /// exactly ONE build row per distinct matched key — SEMI emitted 20
+    /// rows instead of 30,000; ANTI 59,980 (= 60,000 - 20) instead of
+    /// 30,000 — because Dictionary keys could not build a
+    /// `VectorizedHashTable` and the generic `probe_semi_anti_parallel`
+    /// loop `break`-ed after the first marked build entry. The same
+    /// fixture with plain Utf8 keys is the control (asserted too, so a
+    /// failure says whether a regression is Dictionary-specific).
     /// Probe-side output (build = right) with the same Dictionary keys is
-    /// correct in-memory (covered, green, in
-    /// `semi_anti_spill_dictionary_keys_are_cell_exact`).
+    /// covered in `semi_anti_spill_dictionary_keys_are_cell_exact`.
+    /// Every count is a HARD assertion against `naive_join_count`.
     ///
     /// (An earlier draft of this test also reported an INNER
     /// duplicate-key discrepancy; that was an artifact of the test helper
     /// draining only output partition 0 of a multi-partition INNER
     /// result, fixed in `run_spillable_join` — retracted, not a bug.)
     #[tokio::test]
-    #[ignore = "documents an in-memory HashJoinExec finding (hash_join.rs); see doc comment"]
-    async fn in_memory_hash_join_findings_from_task004_fixtures() {
+    async fn in_memory_hash_join_dictionary_build_side_semi_anti_is_exact() {
         use arrow::array::DictionaryArray;
         use arrow::datatypes::{DataType, Field, Int32Type, Schema};
         let mut failures: Vec<String> = Vec::new();
@@ -7003,7 +7003,7 @@ mod tests {
         }
         assert!(
             failures.is_empty(),
-            "in-memory HashJoinExec findings: {failures:#?}"
+            "in-memory HashJoinExec build-side SEMI/ANTI wrong counts: {failures:#?}"
         );
     }
 
