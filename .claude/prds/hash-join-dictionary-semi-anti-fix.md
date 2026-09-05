@@ -1,7 +1,7 @@
 ---
 name: hash-join-dictionary-semi-anti-fix
 description: Fix the in-memory HashJoinExec wrong answer for build-side-output SEMI/ANTI with Dictionary keys and repeated build keys; give Dictionary keys the vectorized fast path
-status: active
+status: completed
 created: 2026-09-05T01:36:45Z
 ---
 

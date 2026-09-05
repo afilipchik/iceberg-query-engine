@@ -4445,23 +4445,47 @@ cluster_local.sh verify-m2 && scripts/cluster_local.sh stop` (M1/M2).
   baseline + 8 new tests + 1 deliberately-ignored findings test). Full
   evidence: `.claude/epics/spill-join-correctness-3/004.md` and its
   `updates/004/stream-{A,B}.md`.
-- **OPEN (found by `spill-join-correctness-3` task 004, NOT fixed there —
-  it is in `hash_join.rs`, outside that task's scope): the IN-MEMORY
-  `HashJoinExec` returns wrong answers for build-side-output SEMI/ANTI
-  (build = LEFT = output) when the join key is `Dictionary(Int32, Utf8)`
-  and build keys repeat** — it marks exactly ONE build row per distinct
-  matched key: on a 60k-row build over 40 values probed by 2k rows over
-  20 of them, SEMI returns 20 rows (truth 30,000) and ANTI 59,980 (=
-  60,000 − 20; truth 30,000). The identical fixture with plain `Utf8`
-  keys is correct (30,000 / 30,000), so the defect is Dictionary-specific;
-  probe-side output (build = right) with Dictionary keys is correct; the
-  SPILL path is correct in all four cases. Executable pin, deliberately
-  `#[ignore]`d so the suite stays green on task 004's own claims:
-  `in_memory_hash_join_findings_from_task004_fixtures` (spillable.rs
-  tests; run with `--ignored --nocapture`). Planner-reachable when a
-  Semi/Anti's left side is not >2x its right and the key is a native
-  table's Dictionary column (e.g. `... WHERE l_shipmode IN (SELECT ...)`
-  with a comparably-sized subquery). Needs its own task.
+- **CLOSED (`hash-join-dictionary-semi-anti-fix` epic, 2026-09-04) — the
+  in-memory `HashJoinExec` wrong answer for build-side-output SEMI/ANTI
+  (build = LEFT = output) with `Dictionary(Int32, Utf8)` keys and
+  repeated build keys.** Root cause, confirmed with a failing test before
+  the change (SEMI 20 / ANTI 59,980 vs truth 30,000 / 30,000 on the
+  task-004 fixture): `VectorizedHashTable::build` rejected Dictionary
+  keys, so such joins fell to `probe_semi_anti_parallel`'s generic map
+  path, whose candidate loop `break`s after marking the FIRST build
+  entry — right when the probe row is the output, wrong when the build
+  rows are. Fixed by one shared `consider(bb, br, pr)` step per candidate
+  that stops only on `pass && swapped`. Three sibling defects in the same
+  function were found by the audit tests and fixed too: Int64 keys + a
+  compiled ON filter (build-side output) stopped on the first pass;
+  Utf8 keys + any filter, and Int64 keys + a non-compilable filter,
+  matched NOTHING in either orientation (the generic map was skipped when
+  a VHT existed and the "local i64 safety net" was keyed with the probe
+  expression over the build batches); and swapped Semi/Anti emission
+  over IPC-sidecar parquet failed `RecordBatch::try_new` (Dictionary
+  arrays under a Utf8 schema — now `batch_with_actual_types` at all four
+  emission sites). Dictionary keys now take the vectorized path
+  (`decode_dictionary_key`/`evaluate_join_keys` decode once per batch at
+  build and every probe entry point). The naive correctness fix was
+  quadratic under duplicated keys (7 ship modes over a 30.6M-row build:
+  the 001-only binary did not finish in 10 minutes) — build-side marking
+  is now O(probe + build) (`VectorizedHashTable::mark_build_matches`: a
+  walker whose first equal-key entry is already marked stops; bits are
+  monotonic and chains are walked in one order; gated to the no-filter
+  case). Measured SF=10 native, back to back: pre-fix best 2.60s with the
+  WRONG answer; fixed best 2.18s, correct, `vht=true`. Pinned by
+  `semi_anti_build_side_output_dictionary_keys_marks_every_build_row`,
+  `semi_anti_build_side_output_with_on_filter_marks_every_build_row`,
+  `semi_anti_utf8_keys_with_on_filter_are_exact`,
+  `dictionary_keys_build_a_vectorized_hash_table`,
+  `inner_semi_anti_left_over_dictionary_keys_are_cell_exact`,
+  `build_side_semi_anti_over_heavily_duplicated_keys_is_linear`
+  (hash_join.rs), the un-ignored
+  `in_memory_hash_join_dictionary_build_side_semi_anti_is_exact`
+  (spillable.rs) and the SQL-level `tests/native_dictionary_semi_anti.rs`
+  (CTAS native lineitem from tpch-10mb, Semi/Anti on `l_shipmode`,
+  build-left and build-right, cell-exact vs the parquet source). Evidence:
+  `.claude/epics/archived/hash-join-dictionary-semi-anti-fix/`.
 - **Documented boundary (pre-existing, observed by task 004, unchanged):
   the join spill path materializes the ENTIRE probe side in memory
   before probing** (`execute_spill_path` collects all probe partitions
