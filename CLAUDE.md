@@ -307,9 +307,12 @@ src/
 ├── metastore/
 │   └── mod.rs                # BranchingMetastoreClient REST API client
 │
-├── distributed/              # `query_engine serve` — MILESTONE 1 ONLY
+├── distributed/              # `query_engine serve`
 │   ├── mod.rs                # Module exports
-│   ├── server.rs             # hyper HTTP server: /healthz /readyz /cluster /sql
+│   ├── server.rs             # hyper HTTP server: /healthz /readyz /cluster /sql /queries /stats /tables /ui
+│   ├── query_log.rs          # Bounded in-memory query log + /queries, /stats views (query-ui epic)
+│   ├── ui/                   # Embedded web UI (index.html, app.js, style.css; include_str!)
+│   ├── flight.rs             # Arrow Flight endpoint
 │   ├── membership.rs         # Peer discovery (static + DNS), self-id, probes
 │   └── http_client.rs        # ~100-line HTTP client used for peer probes
 │
@@ -858,7 +861,7 @@ query_engine repl
 # Start REPL with TPC-H tables preloaded
 query_engine repl --tpch ./data/tpch-10mb
 
-# Run as a cluster node (MILESTONE 1: /sql executes LOCALLY, no fan-out yet)
+# Run as a cluster node (web UI at http://<node>:7777/ui; --query-log-size N)
 query_engine serve --bind 0.0.0.0:7777 --node-id 0 \
     --peers 10.0.0.1:7777,10.0.0.2:7777 --data ./data/tpch-10mb
 # ...or with Kubernetes-style DNS discovery against a headless Service:
@@ -881,6 +884,11 @@ fixed before M3 (shuffle).
 | `GET /splits` | `?table=<t>&nodes=<n>` — how a table divides, with imbalance. |
 | `POST /sql` | Body is the statement. `?format=arrow (default)|json|csv`; `?distributed=auto (default)|1|0`. Headers report `x-qe-distributed`, `x-qe-distribution` (full JSON), `x-qe-imbalance`, `x-qe-shards`. |
 | `POST /fragment` | One shard of a distributed query (internal). Digest-checked. |
+| `GET /queries` | The node's query log, newest first (query-ui epic, 2026-09-05). `?limit=N|all&state=running|finished|failed&door=http|flight|fragment&q=<substring>`. Summaries only (no plans). |
+| `GET /queries/{id}` | One statement in full: phases, rows/bytes, pool peak + limit + concurrency, spill, pruning, rollups, tables, optimized + physical plans, distribution record, error. 404 once evicted. |
+| `GET /stats` | Computed on request from the log: counts by state/door, p50/p95/p99, 60 one-minute buckets, rows/bytes/spill totals, errors by kind, tables by query count, slowest 5, pool used/peak/max, cluster counts. |
+| `GET /tables` | Registered tables with column names/types/nullability. Answers before readiness. |
+| `GET /ui` | The embedded web UI (`/ui/app.js`, `/ui/style.css`). |
 
 **Arrow Flight endpoint (2026-08-21, `src/distributed/flight.rs`).** `serve`
 also runs an Arrow Flight gRPC server: `--flight-bind <addr>` (default = HTTP
@@ -4701,6 +4709,70 @@ reachable for native tables (identity plumbing unit-tested end to end);
 task 008 measured whether it produces a full-query win at native-table
 scale.
 
+## Web UI and query log (query-ui epic, 2026-09-05)
+
+`.claude/prds/query-ui.md` (with the survey of Trino/Presto, ClickHouse,
+Snowflake, Spark, Dremio, Doris/StarRocks, Pinot, DuckDB/DataFusion that
+shaped it) and `.claude/epics/query-ui/`. What shipped:
+
+- **`src/distributed/query_log.rs`** — `QueryLog`, a `Mutex<VecDeque<
+  QueryRecord>>` ring (default 1,000, `--query-log-size` / `QE_QUERY_LOG_
+  SIZE`, floor 10). `begin()` inserts a `running` record BEFORE execution;
+  `finish()`/`fail()` complete it; eviction drops the oldest FINISHED
+  record, so a live query is never evicted (the ring can exceed capacity
+  only by the number of concurrently running statements). SQL kept up to
+  64KB, plans up to 64KB (`execution::cap_debug_text`). `list()` returns
+  `QuerySummary` (no plans/distribution, 200-char preview); `get()` the
+  full record; `stats()` computes percentiles (nearest rank), 60
+  one-minute buckets, totals and breakdowns on request — microseconds
+  at ring size, no background aggregator.
+- **Fed from ONE place**: `server::execute_statement` (HTTP and Flight)
+  now takes a `QueryOrigin` and returns `Executed { query_id, outcome }`;
+  `/fragment` records `fragment` entries with the initiator's address and
+  shard. HTTP adds `x-qe-query-id` (also on failures); Flight adds
+  `query_id` to the trailer and records the encoded byte count. The
+  initiator's own shard of a distributed query runs in-process, so only
+  WORKERS carry fragment records; the initiator's record carries the full
+  `Distribution`, its `tables` name the sharded table (never the internal
+  `qe_dist_partial`), and its plans are labelled as the merge stage.
+- **Engine facts added for it** (`execution/context.rs`, `memory.rs`):
+  `QueryMetrics::{batches, tables, optimized_plan, physical_plan}` are
+  rendered from the objects `sql()` already built (no re-planning);
+  `collect_scan_tables` unions bound + optimized plan scans. **`peak_
+  memory_bytes` is now a real high-water mark**: `MemoryPool` gained
+  `peak` (fetch_max), `reset_peak()` (called on `sql()` entry) and
+  `observe(bytes)`; the spillable join/aggregate/sort call `observe` at
+  every running-size/threshold check, so a spilling query reports the
+  footprint it crossed the budget with. Before this the field was
+  `pool.used()` read after every reservation was released — ~0 for any
+  spilling query. Caveats, stated in the record: in-memory operators that
+  never budget (plain `HashJoinExec`, morsel aggregates) still contribute
+  nothing, so a non-spilling query can report a small/zero peak; the pool
+  is shared, so `concurrent_at_start` says how many statements overlapped
+  the window. `QueryError::kind()` gives the variant name for
+  `errors_by_kind`.
+- **UI** (`src/distributed/ui/`, ~600 lines of vanilla ES modules, no
+  npm): hash-routed views Overview / Queries / Query detail / Statistics
+  / Cluster / Tables / SQL console; 2s polling that pauses when the tab is
+  hidden, auto-refresh is off, or a chart tooltip is open; light/dark via
+  `prefers-color-scheme`; inline-SVG charts (per-minute columns with the
+  failed subset, log-bucket latency histogram, per-query phase bar)
+  following the dataviz reference palette (validated light + dark).
+  Embedding rather than a React toolchain was a deliberate choice
+  (ClickHouse `play.html` precedent; Rust-only repo, no Node in CI).
+- **Gates**: `tests/ui_tests.rs` (6 tests: list/detail/stats/tables,
+  ring eviction + running visibility via a deterministic slow
+  `TableProvider`, 3-node distribution + worker fragments, static assets
+  + self-containment, HTTP-vs-Flight record equivalence modulo
+  identity/transport/timing, spill peak + spill facts at a 16KB budget);
+  `scripts/cluster_local.sh verify` step 5/6 hits `/queries`, `/stats`,
+  `/tables`, `/ui` on every node and checks the log lists the gate's own
+  queries with plans. Visual pass: headless Firefox screenshots of every
+  view against a real node over `data/tpch-100mb`.
+- **Not done (named)**: per-operator runtime metrics (rows/time per
+  operator — the plan tree is shown without them), cross-node aggregated
+  history, persistence of the log, cancellation, authentication.
+
 ## Recently Implemented Features
 
 - **Hardware Topology Awareness** (2026-08-09) — `src/execution/topology.rs`
@@ -4982,6 +5054,8 @@ scale.
 | Streaming Parquet reader | `src/storage/parquet.rs` (StreamingParquetReader) |
 | Async Parquet reader | `src/storage/parquet.rs` (AsyncParquetReader) |
 | Server mode (`serve`) | `src/distributed/server.rs` |
+| Query log (`/queries`, `/stats`) | `src/distributed/query_log.rs` |
+| Web UI (`/ui`) | `src/distributed/ui/` (embedded), tests in `tests/ui_tests.rs` |
 | Arrow Flight endpoint | `src/distributed/flight.rs` |
 | Flight integration tests | `tests/flight_tests.rs` |
 | Flight acceptance gate (pyarrow) | `scripts/flight_validate.py` |

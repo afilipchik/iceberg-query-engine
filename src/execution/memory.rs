@@ -269,6 +269,15 @@ impl MemoryPool {
         self.peak.load(Ordering::Relaxed)
     }
 
+    /// Raise the high-water mark to `bytes` if it is higher. For operators
+    /// that budget their own footprint against `memory_limit *
+    /// spill_threshold` without reserving from the pool (the spillable
+    /// join/aggregate/sort): they report their running size here so
+    /// `peak()` reflects the memory the query actually held.
+    pub fn observe(&self, bytes: usize) {
+        self.peak.fetch_max(bytes, Ordering::SeqCst);
+    }
+
     /// Start a new peak window at the current usage. `ExecutionContext::sql`
     /// calls this on entry so `QueryMetrics::peak_memory_bytes` describes
     /// THIS query's window instead of the process lifetime.

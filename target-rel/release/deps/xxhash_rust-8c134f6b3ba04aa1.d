@@ -1,0 +1,10 @@
+/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/qui/wt/target-rel/release/deps/xxhash_rust-8c134f6b3ba04aa1.d: /home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.15/src/lib.rs /home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.15/src/utils.rs /home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.15/src/xxh64_common.rs /home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.15/src/xxh64.rs
+
+/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/qui/wt/target-rel/release/deps/libxxhash_rust-8c134f6b3ba04aa1.rlib: /home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.15/src/lib.rs /home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.15/src/utils.rs /home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.15/src/xxh64_common.rs /home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.15/src/xxh64.rs
+
+/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/qui/wt/target-rel/release/deps/libxxhash_rust-8c134f6b3ba04aa1.rmeta: /home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.15/src/lib.rs /home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.15/src/utils.rs /home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.15/src/xxh64_common.rs /home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.15/src/xxh64.rs
+
+/home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.15/src/lib.rs:
+/home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.15/src/utils.rs:
+/home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.15/src/xxh64_common.rs:
+/home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.15/src/xxh64.rs:

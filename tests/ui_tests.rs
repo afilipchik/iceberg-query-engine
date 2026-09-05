@@ -6,8 +6,13 @@
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use arrow_flight::client::FlightClient;
+use arrow_flight::decode::DecodedPayload;
+use arrow_flight::FlightDescriptor;
+use futures::TryStreamExt;
 use query_engine::distributed::{http_client, spawn, ServeOptions, ServerHandle, TableLoader};
 use query_engine::physical::operators::TableProvider;
+use query_engine::ExecutionConfig;
 use query_engine::ExecutionContext;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -83,6 +88,54 @@ fn options(node_id: u64, query_log_size: usize) -> ServeOptions {
         query_log_size,
         ..Default::default()
     }
+}
+
+/// A loader whose context has a tiny memory budget, so joins spill.
+fn spilling_loader(limit_bytes: usize, name: &'static str) -> TableLoader {
+    Box::new(move || {
+        let spill_path = format!("{}/target/test_spill/ui_{name}", env!("CARGO_MANIFEST_DIR"));
+        let config = ExecutionConfig::new()
+            .with_memory_limit(limit_bytes)
+            .with_spill_path(spill_path.into());
+        let mut ctx = ExecutionContext::with_config(config);
+        for t in TABLES {
+            ctx.register_parquet(t, &format!("{}/{t}.parquet", data_dir()))?;
+        }
+        Ok(ctx)
+    })
+}
+
+async fn flight_client(h: &ServerHandle) -> FlightClient {
+    let addr = h.flight_addr().expect("flight enabled");
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .expect("uri")
+        .connect()
+        .await
+        .expect("flight connect");
+    FlightClient::new(channel)
+}
+
+/// SQL over Flight (GetFlightInfo -> DoGet): rows and the trailing metadata JSON.
+async fn flight_sql(client: &mut FlightClient, sql: &str) -> (usize, serde_json::Value) {
+    let info = client
+        .get_flight_info(FlightDescriptor::new_cmd(sql.as_bytes().to_vec()))
+        .await
+        .expect("get_flight_info");
+    let ticket = info.endpoint[0].ticket.clone().expect("ticket");
+    let mut decoder = client.do_get(ticket).await.expect("do_get").into_inner();
+    let mut rows = 0;
+    let mut meta = None;
+    while let Some(d) = decoder.try_next().await.expect("stream") {
+        if !d.inner.app_metadata.is_empty() {
+            meta = Some(
+                serde_json::from_slice::<serde_json::Value>(&d.inner.app_metadata).expect("json"),
+            );
+        }
+        if let DecodedPayload::RecordBatch(b) = d.payload {
+            rows += b.num_rows();
+        }
+    }
+    (rows, meta.expect("trailing metadata"))
 }
 
 async fn start_one(query_log_size: usize) -> ServerHandle {
@@ -536,4 +589,115 @@ async fn distributed_queries_record_the_distribution_and_workers_record_fragment
     for h in handles {
         h.shutdown().await;
     }
+}
+
+/// G3: the same statement through HTTP and through Flight produces records
+/// that differ only in identity, transport, timing and result encoding.
+#[tokio::test]
+async fn http_and_flight_records_agree_on_everything_but_transport() {
+    isolate_env();
+    let mut opts = options(0, 50);
+    opts.flight_bind = None; // derive an ephemeral Flight port
+    let h = spawn(opts, tpch_loader()).await.expect("bind");
+    assert!(wait_ready(h.address(), Duration::from_secs(30)).await);
+    let addr = h.address().to_string();
+    let sql_text = "SELECT o_orderpriority, COUNT(*) AS n FROM orders o JOIN lineitem l ON o.o_orderkey = l.l_orderkey GROUP BY o_orderpriority ORDER BY 1";
+
+    let r = sql(&addr, "format=csv", sql_text).await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let http_id = r.header("x-qe-query-id").unwrap().to_string();
+
+    let mut client = flight_client(&h).await;
+    let (flight_rows, meta) = flight_sql(&mut client, sql_text).await;
+    let flight_id = meta["query_id"]
+        .as_str()
+        .expect("flight trailer carries the query id")
+        .to_string();
+    assert_ne!(http_id, flight_id);
+
+    let a = get_json(&addr, &format!("/queries/{http_id}")).await;
+    let b = get_json(&addr, &format!("/queries/{flight_id}")).await;
+    assert_eq!(a["front_door"], "http");
+    assert_eq!(b["front_door"], "flight");
+    assert_eq!(a["result_format"], "csv");
+    assert_eq!(b["result_format"], "flight");
+    assert_eq!(b["rows"], flight_rows);
+    assert!(b["client_addr"].as_str().unwrap().starts_with("127.0.0.1:"));
+
+    let volatile = [
+        "query_id",
+        "seq",
+        "front_door",
+        "client_addr",
+        "submitted_at",
+        "submitted_unix_ms",
+        "finished_at",
+        "result_format",
+        "result_bytes",
+        "elapsed_ms",
+        "parse_ms",
+        "plan_ms",
+        "optimize_ms",
+        "execute_ms",
+        "peak_memory_bytes",
+        "concurrent_at_start",
+    ];
+    let strip = |v: &serde_json::Value| {
+        let mut m = v.as_object().unwrap().clone();
+        for k in volatile {
+            m.remove(k);
+        }
+        m
+    };
+    let (sa, sb) = (strip(&a), strip(&b));
+    assert_eq!(
+        sa, sb,
+        "records differ beyond identity/transport/timing:\n{a}\n{b}"
+    );
+    assert_eq!(sa["tables"], serde_json::json!(["lineitem", "orders"]));
+    assert!(sa["physical_plan"].as_str().unwrap().contains("Join"));
+
+    let list = get_json(&addr, "/queries?door=flight").await;
+    assert_eq!(list["matched"], 1);
+    h.shutdown().await;
+}
+
+/// G2: a query that spills reports a real pool high-water mark and spill facts.
+#[tokio::test]
+async fn a_spilling_query_reports_its_peak_and_spill_facts() {
+    isolate_env();
+    // 16KB budget: the ~30KB projected `orders` build side crosses
+    // `memory_limit * spill_threshold` (0.8) and the join must spill.
+    let limit = 16 * 1024;
+    let threshold = (limit as f64 * ExecutionConfig::new().spill_threshold) as u64;
+    let h = spawn(options(0, 50), spilling_loader(limit, "peak"))
+        .await
+        .expect("bind");
+    assert!(wait_ready(h.address(), Duration::from_secs(30)).await);
+    let addr = h.address().to_string();
+    let r = sql(
+        &addr,
+        "format=csv",
+        "SELECT o_orderpriority, COUNT(*) AS cnt, SUM(l_extendedprice) AS total FROM lineitem, orders WHERE l_orderkey = o_orderkey GROUP BY o_orderpriority ORDER BY o_orderpriority",
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let id = r.header("x-qe-query-id").unwrap();
+    let d = get_json(&addr, &format!("/queries/{id}")).await;
+    assert_eq!(d["memory_limit_bytes"], limit);
+    assert!(
+        d["spill"]["bytes"].as_u64().unwrap_or(0) > 0,
+        "spill facts recorded: {}",
+        d["spill"]
+    );
+    let peak = d["peak_memory_bytes"].as_u64().unwrap();
+    assert!(
+        peak >= threshold,
+        "peak {peak} must be at least the {threshold}-byte spill threshold the operator crossed, not the post-release residual"
+    );
+    let s = get_json(&addr, "/stats").await;
+    assert_eq!(s["spill_queries"], 1);
+    assert!(s["spilled_bytes_total"].as_u64().unwrap() > 0);
+    assert!(s["memory"]["peak"].as_u64().unwrap() >= peak / 2);
+    h.shutdown().await;
 }
