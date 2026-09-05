@@ -1,9 +1,9 @@
 ---
 name: hash-join-dictionary-semi-anti-fix
-status: backlog
+status: completed
 created: 2026-09-05T01:36:45Z
-updated: 2026-09-05T01:36:45Z
-progress: 0%
+updated: 2026-09-05T03:03:39Z
+progress: 100%
 prd: .claude/prds/hash-join-dictionary-semi-anti-fix.md
 github: (will be set on sync)
 ---
@@ -72,11 +72,34 @@ PRD G1-G3.
 3 tasks, ~6-8 focused hours.
 
 ## Tasks Created
-- [ ] 001.md - Confirm root cause, fix build-side SEMI/ANTI marking, pin at operator and SQL level (parallel: false)
-- [ ] 002.md - Dictionary keys on the vectorized hash-table path (parallel: false, after 001)
-- [ ] 003.md - Verification + CLAUDE.md + epic close-out (parallel: false, last)
+- [x] 001.md - Confirm root cause, fix build-side SEMI/ANTI marking, pin at operator and SQL level (parallel: false)
+- [x] 002.md - Dictionary keys on the vectorized hash-table path (parallel: false, after 001)
+- [x] 003.md - Verification + CLAUDE.md + epic close-out (parallel: false, last)
 
 Total tasks: 3
 Parallel tasks: 0
 Sequential tasks: 3
 Estimated total effort: 8 hours
+
+## Close-out (2026-09-05)
+
+Commits: 7fdc9a1 (start), bb6e557 (001), 0c04da9 (002), b13fecf (001/002
+close), plus this close-out. Evidence: `001.md`/`002.md`/`003.md`
+Outcomes, `updates/00N/stream-A.md`, `.scratch/hjdict/`.
+
+- **G1 MET**: the task-004 fixture passes un-ignored (SEMI 30,000 / ANTI
+  30,000 for Dictionary and Utf8); the SQL-level native-vs-parquet test
+  (`tests/native_dictionary_semi_anti.rs`, 4/4) is cell-exact in both
+  build orientations with the Dictionary encoding asserted on the join
+  input. Pre-fix failing numbers observed first: 20 / 59,980.
+- **G2 MET**: Dictionary keys build a `VectorizedHashTable` (asserted);
+  the SF=10 native Dictionary-keyed Semi join went from 2.60s (wrong
+  answer, generic path) to 2.18s (correct, `vht=true`), back to back.
+- **G3 MET**: suite 1337/0/1, spill_tests 12/12, SF=10 native 5,398ms in
+  band, M1/M2 PASS, CLAUDE.md updated.
+- **Beyond the PRD, fixed in the same function**: filtered Semi/Anti
+  over Utf8 keys (and Int64 with a non-compilable filter) matched
+  NOTHING; Int64 + compiled filter build-side stopped on the first pass;
+  swapped Semi/Anti emission over IPC-sidecar parquet errored on
+  Dictionary arrays; and the naive fix's quadratic build-side walk under
+  duplicated keys (replaced by an O(probe + build) marker).
