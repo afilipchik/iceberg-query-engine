@@ -11,7 +11,13 @@
 //!   - deletion vectors and segment pruning still apply on the streaming
 //!     path (mutated-table test is cell-exact with a non-empty vector);
 //!   - genuinely materializing shapes (raw `SELECT *`, filter-only,
-//!     ORDER BY-only) still refuse BY NAME (the pinning tests).
+//!     LIMIT-only) still refuse BY NAME (the pinning tests).
+//!
+//! spill-boundaries task 001 widened "aggregate-covered" to
+//! "spill-covered": a scan feeding a `SpillableHashJoinExec` (either side)
+//! or an `ExternalSortExec` streams too, so ORDER BY-only and bare-join
+//! shapes over an over-budget table now COMPLETE (cell-exact tests below)
+//! instead of refusing.
 
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -130,12 +136,56 @@ async fn other_materializing_shapes_still_refuse() {
     write_fixture(&dir).await;
 
     let ctx = small_ctx(&dir, &["t"]);
-    // Filter/project-only: no aggregate bounds the root materialization.
+    // Filter/project-only: nothing spill-capable sits between the scan and
+    // the root materialization.
     let err = ctx.sql("SELECT id FROM t WHERE grp = 3").await.unwrap_err();
     assert!(err.to_string().contains("memory safety budget"), "{err}");
-    // ORDER BY-only: ExternalSortExec is not a gate for this path (yet).
-    let err = ctx.sql("SELECT id FROM t ORDER BY id").await.unwrap_err();
+    // LIMIT-only: a LimitExec is not a pipeline breaker.
+    let err = ctx.sql("SELECT id FROM t LIMIT 10").await.unwrap_err();
     assert!(err.to_string().contains("memory safety budget"), "{err}");
+}
+
+/// spill-boundaries task 001: ORDER BY-only over an over-budget table now
+/// COMPLETES — `ExternalSortExec` spills its input, so the scan streams
+/// into it — cell-exact vs the unconstrained context (was a pinned refusal
+/// of oom-safety-hardening task 004).
+#[tokio::test(flavor = "multi_thread")]
+async fn sort_over_oversized_table_completes_and_is_cell_exact() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("t");
+    write_fixture(&dir).await;
+    assert_over_budget(&dir).await;
+
+    let sql = "SELECT id, grp FROM t ORDER BY id DESC LIMIT 7";
+    let small = small_ctx(&dir, &["t"])
+        .sql(sql)
+        .await
+        .expect("ORDER BY over an over-budget native table must COMPLETE via the streaming scan");
+    let big = big_ctx(&dir, &["t"]).sql(sql).await.unwrap();
+    assert_eq!(small.row_count, 7);
+    assert_eq!(fmt(&small), fmt(&big), "streaming path must be cell-exact");
+}
+
+/// spill-boundaries task 001: a join over an over-budget table streams
+/// on EITHER side (`SpillableHashJoinExec` spills its build side and
+/// streams its probe side), with no aggregate anywhere above it — the
+/// Q02/Q10/Q20 SF=100 native @1G shape.
+#[tokio::test(flavor = "multi_thread")]
+async fn join_over_oversized_table_completes_and_is_cell_exact() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("t");
+    write_fixture(&dir).await;
+    assert_over_budget(&dir).await;
+
+    let sql = "SELECT a.id, b.grp FROM t a JOIN t b ON a.id = b.id \
+               WHERE a.grp = 2 ORDER BY a.id LIMIT 9";
+    let small = small_ctx(&dir, &["t"])
+        .sql(sql)
+        .await
+        .expect("a join over an over-budget native table must COMPLETE via the streaming scan");
+    let big = big_ctx(&dir, &["t"]).sql(sql).await.unwrap();
+    assert_eq!(small.row_count, 9);
+    assert_eq!(fmt(&small), fmt(&big), "streaming path must be cell-exact");
 }
 
 #[tokio::test(flavor = "multi_thread")]
