@@ -2,7 +2,7 @@
 issue: 003
 stream: boundaries
 started: 2026-09-05T07:10:00Z
-status: in_progress
+status: completed
 ---
 ## Scope
 LEFT/RIGHT/FULL outer-join spill (spillable.rs), on top of task 002's filter.

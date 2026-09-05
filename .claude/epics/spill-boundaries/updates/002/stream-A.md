@@ -2,7 +2,7 @@
 issue: 002
 stream: boundaries
 started: 2026-09-05T06:40:00Z
-status: in_progress
+status: completed
 ---
 ## Scope
 ON-clause filter on the join spill path (spillable.rs), reusing hash_join's
