@@ -345,6 +345,60 @@ async fn queries_list_detail_stats_and_tables_describe_what_ran() {
 }
 
 #[tokio::test]
+async fn the_embedded_ui_is_served_with_the_right_content_types() {
+    let h = start_one(10).await;
+    let addr = h.address().to_string();
+    for (path, ctype, marker) in [
+        (
+            "/ui",
+            "text/html; charset=utf-8",
+            "<script type=\"module\" src=\"/ui/app.js\">",
+        ),
+        (
+            "/ui/",
+            "text/html; charset=utf-8",
+            "<title>query_engine</title>",
+        ),
+        (
+            "/ui/app.js",
+            "text/javascript; charset=utf-8",
+            "views.query = {",
+        ),
+        (
+            "/ui/style.css",
+            "text/css; charset=utf-8",
+            "prefers-color-scheme: dark",
+        ),
+    ] {
+        let r = http_client::get(&addr, path, HTTP_TIMEOUT).await.unwrap();
+        assert_eq!(r.status, 200, "{path}");
+        assert_eq!(r.header("content-type"), Some(ctype), "{path}");
+        assert_eq!(r.header("cache-control"), Some("no-cache"), "{path}");
+        assert!(r.text().contains(marker), "{path} lacks {marker:?}");
+    }
+    let r = http_client::get(&addr, "/ui/nope.js", HTTP_TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(r.status, 404);
+    // The UI never references anything outside the node.
+    let js = http_client::get(&addr, "/ui/app.js", HTTP_TIMEOUT)
+        .await
+        .unwrap()
+        .text();
+    let html = http_client::get(&addr, "/ui", HTTP_TIMEOUT)
+        .await
+        .unwrap()
+        .text();
+    for src in [&js, &html] {
+        assert!(
+            !src.contains("https://") && !src.contains("cdn."),
+            "UI must be self-contained"
+        );
+    }
+    h.shutdown().await;
+}
+
+#[tokio::test]
 async fn the_ring_evicts_oldest_finished_and_keeps_running_queries_visible() {
     let h = start_one(10).await;
     let addr = h.address().to_string();

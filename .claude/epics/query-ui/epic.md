@@ -2,8 +2,8 @@
 name: query-ui
 status: in-progress
 created: 2026-09-05T04:12:00Z
-updated: 2026-09-05T04:24:20Z
-progress: 33%
+updated: 2026-09-05T04:34:36Z
+progress: 83%
 prd: .claude/prds/query-ui.md
 github: (will be set on sync)
 ---
@@ -134,9 +134,9 @@ contention on the ring under concurrent load — held for a push only;
 ## Tasks Created
 - [x] 001.md - Engine debug facts: plans and statement facts in QueryMetrics, MemoryPool high-water mark (parallel: true)
 - [x] 002.md - Query log ring and JSON endpoints wired from HTTP, Flight and fragments (parallel: false)
-- [ ] 003.md - UI shell, embedded static serving, Overview + Queries list + Query detail views (parallel: false)
-- [ ] 004.md - Statistics view: tiles, sparkline, latency histogram, breakdowns (parallel: true)
-- [ ] 005.md - Cluster, Tables and SQL console views (parallel: true)
+- [x] 003.md - UI shell, embedded static serving, Overview + Queries list + Query detail views (parallel: false)
+- [x] 004.md - Statistics view: tiles, sparkline, latency histogram, breakdowns (parallel: true)
+- [x] 005.md - Cluster, Tables and SQL console views (parallel: true)
 - [ ] 006.md - Verification: integration suite, cluster gate step, docs, timing check (parallel: false)
 
 Total tasks: 6

@@ -731,6 +731,7 @@ async fn route(
         }
         (&Method::GET, "/stats") => stats(&state),
         (&Method::GET, "/tables") => tables(&state),
+        (&Method::GET, p) if p == "/ui" || p.starts_with("/ui/") => ui_asset(p),
         (&Method::POST, "/sql") => sql(req, &state, &query, peer).await,
         (&Method::POST, "/fragment") => fragment(req, &state, peer).await,
         (&Method::GET, "/") => index(&state),
@@ -777,7 +778,8 @@ fn index(state: &Arc<NodeState>) -> Response<Full<Bytes>> {
          GET  /queries/<id>  one statement in full: timings, memory, spill,\n\
                           pruning, plans, distribution, error\n\
          GET  /stats      throughput, latency percentiles, errors, memory (JSON)\n\
-         GET  /tables     registered tables and their schemas (JSON)\n\n\
+         GET  /tables     registered tables and their schemas (JSON)\n\
+         GET  /ui         the web UI over all of the above\n\n\
          Every /sql response carries x-qe-distributed: true|false, and when it\n\
          is true, x-qe-imbalance and x-qe-distribution describing exactly how\n\
          the work was divided. `distributed=1` NEVER falls back to local: exact\n\
@@ -1365,12 +1367,31 @@ pub(crate) async fn execute_statement(
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     let outcome = match joined {
         Ok(Ok((result, distribution))) => {
+            let mut metrics = metric_facts(&result.metrics);
+            if let Some(d) = &distribution {
+                // A distributed run's local metrics describe the initiator's
+                // MERGE stage over the internal partial table, not the user's
+                // query: name the real table and label the plans as such so
+                // the record never claims the merge plan was the query plan.
+                metrics
+                    .tables
+                    .retain(|t| t != crate::distributed::plan::PARTIAL_TABLE);
+                if !metrics.tables.contains(&d.table) {
+                    metrics.tables.push(d.table.clone());
+                    metrics.tables.sort();
+                }
+                let label = |p: Option<String>| {
+                    p.map(|p| format!("-- initiator merge stage (distributed run; worker fragments ran the partial query)\n{p}"))
+                };
+                metrics.optimized_plan = label(metrics.optimized_plan);
+                metrics.physical_plan = label(metrics.physical_plan);
+            }
             state.query_log.finish(
                 &query_id,
                 Completion {
                     elapsed_ms,
                     rows: result.row_count,
-                    metrics: metric_facts(&result.metrics),
+                    metrics,
                     memory_limit_bytes,
                     distribution: distribution
                         .as_ref()
@@ -1434,6 +1455,33 @@ fn metric_facts(m: &crate::execution::QueryMetrics) -> MetricFacts {
 // ---------------------------------------------------------------------------
 // Query log endpoints (query-ui epic)
 // ---------------------------------------------------------------------------
+
+/// The web UI, compiled into the binary so `cargo build` stays the only build
+/// step and the page works air-gapped (no external scripts, fonts or CDNs).
+const UI_INDEX_HTML: &str = include_str!("ui/index.html");
+const UI_APP_JS: &str = include_str!("ui/app.js");
+const UI_STYLE_CSS: &str = include_str!("ui/style.css");
+
+/// `GET /ui`, `/ui/`, `/ui/index.html`, `/ui/app.js`, `/ui/style.css`.
+/// `Cache-Control: no-cache` so a rebuilt binary is never shadowed by a stale
+/// browser cache (the assets are tiny; revalidation costs one round trip).
+fn ui_asset(path: &str) -> Response<Full<Bytes>> {
+    let (content_type, body) = match path {
+        "/ui" | "/ui/" | "/ui/index.html" => ("text/html; charset=utf-8", UI_INDEX_HTML),
+        "/ui/app.js" => ("text/javascript; charset=utf-8", UI_APP_JS),
+        "/ui/style.css" => ("text/css; charset=utf-8", UI_STYLE_CSS),
+        _ => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "no such UI asset; the UI is served at /ui (index.html, app.js, style.css)",
+            )
+        }
+    };
+    let mut resp = raw_response(StatusCode::OK, content_type, body.as_bytes().to_vec());
+    resp.headers_mut()
+        .insert("cache-control", "no-cache".parse().expect("ascii"));
+    resp
+}
 
 /// `GET /queries?limit=N|all&state=..&door=..&q=..` — newest first.
 fn queries(state: &Arc<NodeState>, query: &str) -> Response<Full<Bytes>> {
