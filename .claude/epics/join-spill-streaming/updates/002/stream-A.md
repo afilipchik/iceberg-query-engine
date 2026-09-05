@@ -51,3 +51,19 @@ materializing it; repeat-execution semantics preserved.
   miss; the 1G target is re-measured on the 003 binary. Remaining 002
   legs (anti br0, semi/anti br1, both levers) left running for the
   record.
+
+## 2026-09-05T05:20:00Z — 002 harness @1G complete; Q9 on the 002 binary still running
+
+- Harness @1G, 002 binary, 600M build / 256MB budget (cgroup / rlimit):
+  build_right=0 semi-join **memcg-killed / PASS 1,068MB**; anti-join
+  **memcg-killed / (see table in 002.md)**; build_right=1 semi-join
+  **682 / 707MB PASS**, anti-join **691MB PASS** (cgroup) — see logs
+  `harness_002_1G_br{0,1}/`. The build_right=0 (build = output) shape is
+  the one that reads the largest partition files back whole (SEMI:
+  150MB build + 75MB probe per partition on top of the resident set and
+  the chunk table) — closed by task 003's streaming read-back (003:
+  838/839MB PASS on the same legs).
+- Q9 SF=100 parquet @1G under 16G on the 002 binary: second join DONE in
+  665.7s (the streamed output is now consumed at the pace of the first
+  join's single-threaded phase A — the pipeline effect task 003 fixes);
+  first join still running; recorded in 002.md when it finishes.

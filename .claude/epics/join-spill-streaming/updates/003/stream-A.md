@@ -77,3 +77,47 @@ within a partition, K + per-partition elapsed traces.
 - Gates on the rewrite: `spillable::tests` 34/34, `spill_tests` 12/12,
   `native_dictionary_semi_anti` 4/4, fmt clean. Release build launched
   for the Q9 re-measurement.
+
+## 2026-09-05T05:20:00Z — Q9 target met on the phase-A-parallel binary (003b = f728df0)
+
+- Q9 SF=100 parquet @1G under MemoryMax=16G / QE_MEM_CAP=16G, sweep22.py
+  Q9-only: **257.95s, CELL-EXACT (175 rows), 2 spill-path joins, 246
+  hash-check-ok / 0 HASH-MISMATCH**, serve peak RSS 10.2GB (`/usr/bin/time
+  -v`). Second join 90.8s (was 428s on 003, 665s on 002); first join
+  237.4s (was 587s). Serve process ran at ~815% CPU during phase B (was
+  ~173% before the phase-A rewrite). Other legs (two 1G harness legs,
+  the 002 Q9 record) were still running on the machine — the number is
+  if anything pessimistic.
+- Chaos on 003b: **300/300** (179 + 92 genuine-disk), 0 mismatch.
+- Harness @1G on 003b (both orientations, both levers) launched; SF=10
+  native sweep queued for a quiet machine after them.
+
+## 2026-09-05T06:00:00Z — phase-A memory regression found by measurement, redesigned
+
+- Harness @1G on 003b (f728df0): semi-join build_right=0 **910 / 937MB**,
+  build_right=1 **858 / 867MB**, anti-join build_right=1 **921 / 858MB** —
+  all PASS but ~+400MB over 003 (838/839, 470/456, 477/467) — and
+  anti-join build_right=0 cgroup **memcg-KILLED**. A regression of the
+  first phase-A rewrite, not acceptable.
+- Localized with `.scratch/jss/rss_trace.py` (QE_SPILL_DEBUG lines
+  timestamped + VmRSS sampled every 1s, semi-join build_right=1 under
+  2G, 0 resident partitions): phase A peak **573MB on 003b vs 207MB on
+  003**, and phase B then sits ~+380MB higher on 003b (812 vs 432MB) —
+  memory retained from phase A. Shape of the first rewrite: per
+  8,192-row piece, `partition_batch_by_hash` produced 64 ~128-row `take`
+  outputs on a rayon thread, later freed on the blocking thread —
+  ~2,300 sub-KB cross-thread-freed allocations per group × 1,145 groups,
+  the pattern mimalloc's per-thread heaps retain. (Phase A wall: 40s →
+  7.3s, so the parallelism itself worked.)
+- Redesign (this commit): partition-MAJOR. Concatenate the group once;
+  rayon over 8,192-row ranges computes per-row partition ids via a new
+  shared `partition_row_ids` (the single routing definition —
+  `partition_batch_by_hash` is now a wrapper over it, so routing is
+  byte-identical by construction); then rayon over PARTITIONS: one
+  ~4k-row `take` per partition, probed / spilled / ANTI-emitted on the
+  same thread that allocated it. 32× fewer allocations per group, and
+  resident probing in 4k-row batches instead of 128-row ones.
+- Gates on the redesign: `spillable::tests` 34/34, `spill_tests` 12/12,
+  `native_dictionary_semi_anti` 4/4, fmt clean. Release build (003c)
+  launched; the whole 003 battery (RSS trace, harness @1G ×8, Q9, chaos
+  300, SF=10 sweep) is re-run on it — 003b's numbers are superseded.

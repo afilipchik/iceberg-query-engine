@@ -1821,53 +1821,107 @@ impl PhaseAState {
     }
 }
 
-/// One phase-A group, on the blocking pool: (1) re-slice the group into
-/// ≤ `SPILL_READ_BATCH_ROWS`-row pieces; (2) rayon over pieces — hash-
-/// partition each piece and probe the resident partitions (INNER pairs and
-/// probe-side SEMI/ANTI rows become output batches; build-side SEMI/ANTI
-/// marks the atomic bitmaps; ANTI's no-build-rows pieces are emitted
-/// whole); (3) rayon over PARTITIONS — append every piece's slice for a
-/// spilled partition to that partition's writer (one writer per
-/// partition, so partitions are independent; within a partition the
-/// pieces stay in group order). Returns the state and the output batches
-/// in piece order for the caller to send.
+/// One phase-A group, on the blocking pool. (1) The group is concatenated
+/// into one batch; (2) rayon over `SPILL_READ_BATCH_ROWS`-row ranges
+/// computes every row's partition id (`partition_row_ids` — the same
+/// routing as `partition_batch_by_hash`, by construction); (3) rayon over
+/// PARTITIONS: each partition that received rows `take`s its rows (ONE
+/// gather of ~group/64 rows) and, on that same thread, either probes its
+/// resident table (INNER pairs and probe-side SEMI/ANTI rows become
+/// output batches; build-side SEMI/ANTI marks the partition's own atomic
+/// bitmap), appends to its own spill writer (one writer per partition, so
+/// partitions are independent), or — ANTI with no build rows at all —
+/// emits the rows whole. Returns the state and the output batches for
+/// the caller to send.
+///
+/// Why partition-major rather than piece-major: a first version ran
+/// `partition_batch_by_hash` per 8,192-row piece in parallel and then
+/// wrote the resulting 64 tiny slices per piece from another thread —
+/// ~2,300 sub-kilobyte batches per group allocated on rayon threads and
+/// freed elsewhere, which the process-wide allocator retained: the
+/// 600M-row harness `semi-join` leg went from 470MB to 858MB peak RSS
+/// with everything else equal (traced per phase with `QE_SPILL_DEBUG`
+/// + a 1s RSS sampler). This shape does one ~4k-row gather per partition
+/// per group, allocated and freed on the same thread, and probes resident
+/// tables in 4k-row batches instead of 128-row ones.
 fn phase_a_process_group(
     state: &SpillState,
     ctx: &SpillJoinCtx,
     mut st: PhaseAState,
-    group: Vec<RecordBatch>,
+    mut group: Vec<RecordBatch>,
 ) -> Result<(PhaseAState, Vec<RecordBatch>)> {
     use rayon::prelude::*;
     let probe_keys = &ctx.probe_keys;
     let is_semi_anti = ctx.is_semi_anti();
     let is_semi = ctx.is_semi();
 
-    let mut pieces: Vec<RecordBatch> = Vec::new();
-    for b in &group {
-        let mut start = 0usize;
-        while start < b.num_rows() {
-            let len = SPILL_READ_BATCH_ROWS.min(b.num_rows() - start);
-            pieces.push(b.slice(start, len));
-            start += len;
-        }
+    let merged = if group.len() == 1 {
+        group.pop().expect("one batch")
+    } else {
+        let schema = group[0].schema();
+        arrow::compute::concat_batches(&schema, group.iter())
+            .map_err(|e| QueryError::Execution(e.to_string()))?
+    };
+    drop(group);
+    let n = merged.num_rows();
+    if n == 0 {
+        return Ok((st, Vec::new()));
     }
 
-    type PieceResult = (Vec<Option<RecordBatch>>, Vec<RecordBatch>);
-    let per_piece: Vec<PieceResult> = pieces
+    // (2) partition ids, parallel over row ranges.
+    let ranges: Vec<(usize, usize)> = (0..n)
+        .step_by(SPILL_READ_BATCH_ROWS)
+        .map(|s| (s, SPILL_READ_BATCH_ROWS.min(n - s)))
+        .collect();
+    let ids_per_range: Vec<Vec<u32>> = ranges
         .par_iter()
-        .map(|piece| -> Result<PieceResult> {
-            let partitioned = partition_batch_by_hash(piece, probe_keys, NUM_PARTITIONS)?;
-            let mut to_spill: Vec<Option<RecordBatch>> =
-                (0..NUM_PARTITIONS).map(|_| None).collect();
-            let mut outputs: Vec<RecordBatch> = Vec::new();
-            for (idx, part_batch) in partitioned.into_iter().enumerate() {
-                let Some(pb) = part_batch else {
-                    continue;
-                };
+        .map(|&(s, len)| partition_row_ids(&merged.slice(s, len), probe_keys, NUM_PARTITIONS))
+        .collect::<Result<_>>()?;
+    let mut per_partition: Vec<Vec<u32>> = (0..NUM_PARTITIONS).map(|_| Vec::new()).collect();
+    for (&(s, _), ids) in ranges.iter().zip(&ids_per_range) {
+        for (i, p) in ids.iter().enumerate() {
+            per_partition[*p as usize].push((s + i) as u32);
+        }
+    }
+    drop(ids_per_range);
+
+    // (3) per partition, on one thread each.
+    let spill_dir = &state.spill_dir;
+    let sj_trace = ctx.sj_trace;
+    let spilled_bytes = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<(
+        usize,
+        Vec<u32>,
+        &mut Option<ArrowWriter<File>>,
+        &mut Option<PathBuf>,
+        &mut Option<KeyChecksum>,
+        Option<&Vec<Vec<std::sync::atomic::AtomicBool>>>,
+    )> = per_partition
+        .into_iter()
+        .zip(st.spill_writers.iter_mut())
+        .zip(st.probe_spill_files.iter_mut())
+        .zip(st.probe_key_checksums.iter_mut())
+        .zip(st.build_matched.iter())
+        .enumerate()
+        .filter(|(_, ((((rows, _), _), _), _))| !rows.is_empty())
+        .map(|(idx, ((((rows, w), f), cs), bm))| (idx, rows, w, f, cs, bm.as_ref()))
+        .collect();
+    let outputs_per_partition: Vec<Vec<RecordBatch>> = slots
+        .into_par_iter()
+        .map(
+            |(idx, rows, writer, file, checksum, build_bm)| -> Result<Vec<RecordBatch>> {
+                let indices = UInt32Array::from(rows);
+                let columns: Result<Vec<ArrayRef>> = merged
+                    .columns()
+                    .iter()
+                    .map(|c| compute::take(c.as_ref(), &indices, None).map_err(Into::into))
+                    .collect();
+                let pb = RecordBatch::try_new(merged.schema(), columns?)?;
+                let mut outputs: Vec<RecordBatch> = Vec::new();
                 if let Some(ref ht) = state.tables[idx] {
                     // Probe in-memory partition
                     let Some(build_part) = state.partitions[idx].as_ref() else {
-                        continue;
+                        return Ok(outputs);
                     };
                     if !is_semi_anti {
                         outputs.extend(probe_partition(
@@ -1885,11 +1939,23 @@ fn phase_a_process_group(
                         if let Some(out) = take_probe_rows(&pb, &flags, is_semi, &ctx.schema)? {
                             outputs.push(out);
                         }
-                    } else if let Some(bm) = st.build_matched[idx].as_ref() {
+                    } else if let Some(bm) = build_bm {
                         mark_build_matches_atomic(&pb, ht, probe_keys, bm)?;
                     }
                 } else if state.spilled[idx].is_some() {
-                    to_spill[idx] = Some(pb);
+                    // Spill probe rows for this partition
+                    spilled_bytes.fetch_add(
+                        estimate_batch_size(&pb),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    let path = file.get_or_insert_with(|| ctx.probe_file(spill_dir, idx));
+                    append_batch_streaming(writer, path, &pb)?;
+                    if sj_trace {
+                        let cs = batch_key_checksum(&pb, probe_keys)?;
+                        checksum
+                            .get_or_insert_with(KeyChecksum::default)
+                            .accumulate(cs);
+                    }
                 } else if is_semi_anti && ctx.swapped && !is_semi {
                     // task 004: this partition holds NO build row at all
                     // (nothing was ever routed here, or it was emptied
@@ -1900,68 +1966,15 @@ fn phase_a_process_group(
                     // probe-side-output ANTI orientation.
                     outputs.push(batch_with_actual_types(&ctx.schema, pb.columns().to_vec())?);
                 }
-            }
-            Ok((to_spill, outputs))
-        })
+                Ok(outputs)
+            },
+        )
         .collect::<Result<_>>()?;
-
-    // Transpose: per spilled partition, its slices in piece order.
-    let mut by_partition: Vec<Vec<RecordBatch>> = (0..NUM_PARTITIONS).map(|_| Vec::new()).collect();
-    let mut outputs: Vec<RecordBatch> = Vec::new();
-    for (to_spill, outs) in per_piece {
-        for (idx, pb) in to_spill.into_iter().enumerate() {
-            if let Some(pb) = pb {
-                by_partition[idx].push(pb);
-            }
-        }
-        outputs.extend(outs);
-    }
-
-    // Writes: partitions are independent (one writer each) → parallel
-    // across partitions, sequential within one.
-    let spill_dir = &state.spill_dir;
-    let sj_trace = ctx.sj_trace;
-    let spilled_bytes = std::sync::atomic::AtomicUsize::new(0);
-    let slots: Vec<(
-        usize,
-        &mut Option<ArrowWriter<File>>,
-        &mut Option<PathBuf>,
-        &mut Option<KeyChecksum>,
-        Vec<RecordBatch>,
-    )> = st
-        .spill_writers
-        .iter_mut()
-        .zip(st.probe_spill_files.iter_mut())
-        .zip(st.probe_key_checksums.iter_mut())
-        .zip(by_partition)
-        .enumerate()
-        .map(|(idx, (((w, f), cs), slices))| (idx, w, f, cs, slices))
-        .filter(|(_, _, _, _, slices)| !slices.is_empty())
-        .collect();
-    slots
-        .into_par_iter()
-        .try_for_each(|(idx, writer, file, checksum, slices)| -> Result<()> {
-            let path = file.get_or_insert_with(|| ctx.probe_file(spill_dir, idx));
-            for pb in &slices {
-                spilled_bytes.fetch_add(
-                    estimate_batch_size(pb),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                append_batch_streaming(writer, path, pb)?;
-                if sj_trace {
-                    let cs = batch_key_checksum(pb, probe_keys)?;
-                    checksum
-                        .get_or_insert_with(KeyChecksum::default)
-                        .accumulate(cs);
-                }
-            }
-            Ok(())
-        })?;
     let spilled = spilled_bytes.into_inner();
     if spilled > 0 {
         ctx.memory_pool.record_spill(spilled);
     }
-    Ok((st, outputs))
+    Ok((st, outputs_per_partition.into_iter().flatten().collect()))
 }
 
 /// Phase A (+ A'): consume the probe stream. Probe batches are gathered
@@ -4752,18 +4765,20 @@ fn compare_array_values(
 }
 
 /// Partition a batch by hash of key columns
-fn partition_batch_by_hash(
+/// The join spill path's ONE partition-routing definition (join-spill-
+/// streaming task 003): the partition id of every row of `batch`. Used by
+/// `partition_batch_by_hash` (build side, single-batch probe callers) and
+/// by phase A's grouped probe path (`phase_a_process_group`), so both
+/// route a key identically by construction.
+fn partition_row_ids(
     batch: &RecordBatch,
     key_exprs: &[Expr],
     num_partitions: usize,
-) -> Result<Vec<Option<RecordBatch>>> {
+) -> Result<Vec<u32>> {
     // task 004: `join_key_arrays` (Dictionary keys decoded; everything
     // else byte-identical to the previous inline evaluation).
     let key_arrays = join_key_arrays(batch, key_exprs)?;
-
-    // Compute partition for each row
-    let mut partition_indices: Vec<Vec<usize>> = (0..num_partitions).map(|_| Vec::new()).collect();
-
+    let mut ids: Vec<u32> = Vec::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
         let key = extract_join_key(&key_arrays, row);
         // EXPLICITLY seeded: partition routing must give the same answer for
@@ -4773,8 +4788,23 @@ fn partition_batch_by_hash(
         // groups across partitions. Never rely on a default for this.
         let mut hasher = xxhash_rust::xxh64::Xxh64::new(0x517c_c1b7_2722_0a95);
         key.hash(&mut hasher);
-        let partition = (hasher.finish() as usize) % num_partitions;
-        partition_indices[partition].push(row);
+        ids.push(((hasher.finish() as usize) % num_partitions) as u32);
+    }
+    Ok(ids)
+}
+
+fn partition_batch_by_hash(
+    batch: &RecordBatch,
+    key_exprs: &[Expr],
+    num_partitions: usize,
+) -> Result<Vec<Option<RecordBatch>>> {
+    // Compute partition for each row
+    let mut partition_indices: Vec<Vec<usize>> = (0..num_partitions).map(|_| Vec::new()).collect();
+    for (row, p) in partition_row_ids(batch, key_exprs, num_partitions)?
+        .into_iter()
+        .enumerate()
+    {
+        partition_indices[p as usize].push(row);
     }
 
     // Build batches for each partition
