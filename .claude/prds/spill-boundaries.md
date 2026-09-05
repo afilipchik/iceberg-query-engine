@@ -1,7 +1,7 @@
 ---
 name: spill-boundaries
 description: Close the three remaining clean-refusal boundaries — native-table scans feeding joins, ON-clause-filter join spill, and LEFT/RIGHT/FULL outer-join spill — so every TPC-H query completes at every budget on parquet and native
-status: active
+status: completed
 created: 2026-09-05T01:39:08Z
 ---
 

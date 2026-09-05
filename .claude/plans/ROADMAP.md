@@ -98,3 +98,42 @@ suggested order):**
    out of `spill-join-correctness-3`).
 5. The phase-6/7 items above (Iceberg via iceberg-rust; SQL debt) remain
    as listed; check CLAUDE.md before assuming their status.
+
+## Addendum — 2026-09-05: the three certification follow-ups are closed
+
+All three items listed as "candidate next epics" above landed on `main`
+between 2026-09-04 and 2026-09-05 (each archived under
+`.claude/epics/archived/<name>/`; CLAUDE.md carries the mechanisms and
+numbers):
+
+1. **`hash-join-dictionary-semi-anti-fix`** — the in-memory
+   `HashJoinExec` wrong answer for build-side SEMI/ANTI over Dictionary
+   keys (one row per distinct key) is fixed at its confirmed mechanism
+   (the generic candidate loop `break`ing after the first build entry);
+   three sibling filtered-Semi/Anti defects in the same function were
+   found by the audit tests and fixed; Dictionary keys now take the
+   vectorized path; build-side marking is O(probe + build).
+2. **`join-spill-streaming`** — the join spill path streams its probe
+   side and its output and processes spilled partitions K-way under one
+   budget: Q9 SF=100 @1G 222s (was ~1,650s); 600M-row-build SEMI/ANTI
+   joins complete under the default 1G cap; every 2026-09-03 SF=100
+   verdict reproduced faster and under smaller caps.
+3. **`spill-boundaries`** — over-budget native scans stream into
+   spillable joins and sorts (planner "spill-covered" routing, pre-pass
+   before shared-CTE materialization); ON-clause filters are evaluated
+   per candidate pair on the spill path; LEFT/RIGHT/FULL spill via
+   preserved-side bitmaps + NULL-extended emission. **TPC-H SF=100 is
+   22/22 cell-exact on parquet at 64G/8G/1G/256M and on native at
+   100G/1G** — no named refusal remains on TPC-H at any tested budget;
+   the spill path's only refusals are CROSS/SINGLE/MARK.
+
+**Remaining known items (none are wrong answers or refusals on TPC-H):**
+- Q9's whole-engine peak at a 1G budget is ~10.7GB (scan parallelism +
+  in-flight channels, not the join) — bounded, but above the budget.
+- The rollup last-ULP float flake (aggregate merge order) still exists
+  as a rare test flake (documented since oom-safety-hardening 003).
+- Native-scan admission still refuses raw dumps / filter-only / LIMIT-
+  only shapes over an over-budget native table (by design; the result
+  would have to be materialized for the client).
+- Phase 6 (Iceberg via iceberg-rust) and phase 7 (SQL debt) above remain
+  the next roadmap phases; check CLAUDE.md for their current status.
