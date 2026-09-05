@@ -284,10 +284,49 @@ variant name.
   did"; out of scope is anything that needs new engine instrumentation
   beyond a peak tracker.
 
+## Phase 2: per-operator runtime metrics (added 2026-09-05, not yet built)
+
+Phase 1 (everything above, shipped) exposes facts the engine already
+computed. Phase 2 adds the one thing every surveyed engine has that this
+one lacks: what each operator did. Today `PhysicalOperator` exposes only
+`schema`, `children`, `execute` and `name`; nothing counts rows or time
+per operator, so `display_plan` prints a bare tree.
+
+### Requirements
+- Every operator instance in an executed plan reports: rows out, batches
+  out, wall time (first poll to end of stream), and, for the spillable
+  operators, bytes/partitions spilled. Scans additionally report rows
+  read, bytes read and row groups / files pruned; joins report build
+  rows and build time.
+- The physical plan in a query record becomes a tree with the metrics
+  attached per node (`physical_plan_tree: [{name, depth, rows, batches,
+  wall_ms, spill_bytes, ...}]`); the text rendering gains a suffix per
+  line (`SpillableHashJoin  rows=1,204,331  batches=37  12.4ms`).
+- The detail page renders the tree as an indented table with a bar per
+  node for time share and rows, like Trino's stage view / Snowflake's
+  profile; the slowest node is highlighted.
+- Cost: instrumentation is a counter add and an `Instant` read per batch
+  on the stream path. The morsel-driven aggregate and the parallel
+  parquet scan bypass that path and need explicit hooks. Gate: SF=1 and
+  SF=10 interleaved A/B flat within noise, same method as G7.
+
+### Approach (for the epic)
+1. `OperatorMetrics` (atomics) owned by a per-query `MetricsRegistry`;
+   the physical planner wraps each operator's `execute` stream in a
+   counting stream keyed by node id, so no operator changes for the
+   generic case. Explicit hooks in `MorselAggregateExec`,
+   `ParallelParquetSource` and the spillable operators' spill paths.
+2. `ExecutionContext::sql` snapshots the registry into `QueryMetrics`
+   after collection; the query log stores the tree; `/queries/{id}` and
+   the CLI's `--plan` output both render it.
+3. UI tree view + the timing A/B.
+
+About three tasks; sequenced after this epic merges.
+
 ## Out of Scope
 
-- Per-operator runtime metrics (rows/time per operator, EXPLAIN
-  ANALYZE) — separate epic; the plan tree is shown without them.
+- Per-operator runtime metrics — deferred to Phase 2 above, not built in
+  this epic; the plan tree is shown without them.
 - Cross-node aggregated history; persistence of the log; retention
   beyond the ring.
 - Query cancellation, user/session identity, authentication, RBAC.
