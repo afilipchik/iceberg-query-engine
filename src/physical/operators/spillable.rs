@@ -1500,6 +1500,8 @@ struct SpillJoinStats {
 /// mid-phase (in which case nothing more is produced, but the files still
 /// need removing).
 struct ProbePhase {
+    /// Diagnostic: size of this call's phase-A pool.
+    phase_a_threads: usize,
     probe_spill_files: Vec<Option<PathBuf>>,
     probe_key_checksums: Vec<Option<KeyChecksum>>,
     probe_rows: usize,
@@ -1545,8 +1547,8 @@ async fn run_spill_join_producer(
         // has been consumed (the count is accumulated as batches flow, not
         // from a materialized Vec).
         eprintln!(
-            "[sj-trace] execute_spill_path probe collected: probe_partitions={} probe_rows={} (streamed) call_id={}",
-            ctx.probe_partitions, phase_a.probe_rows, ctx.call_id
+            "[sj-trace] execute_spill_path probe collected: probe_partitions={} probe_rows={} (streamed, phase_a_threads={}) call_id={}",
+            ctx.probe_partitions, phase_a.probe_rows, phase_a.phase_a_threads, ctx.call_id
         );
     }
 
@@ -1784,37 +1786,49 @@ const PHASE_A_GROUP_ROWS: usize = 262_144;
 /// Companion cap on batches per group (a source emitting tiny batches).
 const PHASE_A_GROUP_BATCHES: usize = 64;
 
-/// Threads in phase A's OWN rayon pool (join-spill-streaming task 003).
-/// Measured on the 600M-row harness `semi-join` leg with a 1s RSS
-/// sampler, same code and data: on the global 32-thread pool phase A
-/// peaked at 583MB vs 207MB single-threaded and the excess PERSISTED into
-/// phase B; with `RAYON_NUM_THREADS=8` it was 279MB and with
-/// `MIMALLOC_PURGE_DELAY=0` 305MB. The cost is freed memory the
-/// allocator keeps per thread, proportional to how many threads touched
-/// a group's short-lived allocations — not live data. Eight threads keep
-/// phase A's wall time within ~2x of the 32-thread pool (well under 20s of
-/// Q9's ~240s at SF=100/1G) at roughly a quarter of the retention.
-const SPILL_JOIN_PHASE_A_THREADS: usize = 8;
+/// Upper bound on phase A's OWN rayon pool (join-spill-streaming task
+/// 003), and the budget each worker must be backed by. Measured on the
+/// 600M-row harness `semi-join` leg with a 1s RSS sampler, same code and
+/// data: on the global 32-thread pool phase A peaked at 583MB vs 207MB
+/// single-threaded and the excess PERSISTED into phase B; with
+/// `RAYON_NUM_THREADS=8` it was 279MB and with `MIMALLOC_PURGE_DELAY=0`
+/// 305MB — i.e. ~12MB per thread of freed memory the allocator keeps per
+/// thread that touched a group's short-lived allocations, not live data.
+/// So the pool is sized by the OPERATOR'S budget, not the machine: one
+/// worker per `PHASE_A_BYTES_PER_WORKER` of `memory_threshold`, at least
+/// 1, at most `SPILL_JOIN_PHASE_A_MAX_THREADS` (Q9 at 1G: 8; a 256MB
+/// budget: 3; 64M: 1), and it is created per call and dropped when phase
+/// A ends so its threads exit and release what they held before phase B
+/// runs. Eight threads keep phase A's wall time within ~2x of the
+/// 32-thread pool (well under 20s of Q9's ~225s at SF=100/1G).
+const SPILL_JOIN_PHASE_A_MAX_THREADS: usize = 8;
+const PHASE_A_BYTES_PER_WORKER: usize = 64 * 1024 * 1024;
 
-fn spill_join_phase_a_pool() -> &'static rayon::ThreadPool {
-    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
-    POOL.get_or_init(|| {
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .clamp(1, SPILL_JOIN_PHASE_A_THREADS);
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .thread_name(|i| format!("sj-phase-a-{i}"))
-            .build()
-            .expect("build the join spill path's phase A thread pool")
-    })
+fn spill_join_phase_a_pool(memory_threshold: usize) -> Result<rayon::ThreadPool> {
+    let by_budget = (memory_threshold / PHASE_A_BYTES_PER_WORKER).max(1);
+    let by_machine = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let threads = by_budget
+        .min(by_machine)
+        .clamp(1, SPILL_JOIN_PHASE_A_MAX_THREADS);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("sj-phase-a-{i}"))
+        .build()
+        .map_err(|e| {
+            QueryError::Execution(format!(
+                "failed to build the join spill path's phase A thread pool: {e}"
+            ))
+        })
 }
 
 /// Phase A's mutable per-call state, moved into each group's blocking job
 /// and back (all of it is `Send`; `ArrowWriter<File>` was already carried
 /// across awaits before this task).
 struct PhaseAState {
+    /// This call's phase-A pool (see `spill_join_phase_a_pool`).
+    pool: rayon::ThreadPool,
     spill_writers: Vec<Option<ArrowWriter<File>>>,
     probe_spill_files: Vec<Option<PathBuf>>,
     probe_key_checksums: Vec<Option<KeyChecksum>>,
@@ -1824,7 +1838,7 @@ struct PhaseAState {
 }
 
 impl PhaseAState {
-    fn new(state: &SpillState, build_side_output: bool) -> Self {
+    fn new(state: &SpillState, build_side_output: bool, memory_threshold: usize) -> Result<Self> {
         use std::sync::atomic::AtomicBool;
         let build_matched = (0..NUM_PARTITIONS)
             .map(|idx| {
@@ -1839,12 +1853,13 @@ impl PhaseAState {
                 })
             })
             .collect();
-        Self {
+        Ok(Self {
+            pool: spill_join_phase_a_pool(memory_threshold)?,
             spill_writers: (0..NUM_PARTITIONS).map(|_| None).collect(),
             probe_spill_files: (0..NUM_PARTITIONS).map(|_| None).collect(),
             probe_key_checksums: (0..NUM_PARTITIONS).map(|_| None).collect(),
             build_matched,
-        }
+        })
     }
 }
 
@@ -1900,7 +1915,7 @@ fn phase_a_process_group(
         .step_by(SPILL_READ_BATCH_ROWS)
         .map(|s| (s, SPILL_READ_BATCH_ROWS.min(n - s)))
         .collect();
-    let pool = spill_join_phase_a_pool();
+    let pool = &st.pool;
     let ids_per_range: Vec<Vec<u32>> = pool.install(|| {
         ranges
             .par_iter()
@@ -2053,7 +2068,7 @@ async fn probe_with_spilling(
     let is_semi_anti = ctx.is_semi_anti();
     let is_semi = ctx.is_semi();
     let build_side_output = is_semi_anti && !ctx.swapped;
-    let mut st = PhaseAState::new(state, build_side_output);
+    let mut st = PhaseAState::new(state, build_side_output, ctx.memory_threshold)?;
     let mut in_memory_matched = 0usize;
     // join-spill-streaming task 001: probe rows counted as they flow
     // (QE_SPILL_DEBUG trace), since the probe side is no longer a Vec.
@@ -2064,6 +2079,7 @@ async fn probe_with_spilling(
     // files written so far are removed by the caller.
     let abandoned = |st: PhaseAState, probe_rows: usize, in_memory_matched: usize| {
         Ok(ProbePhase {
+            phase_a_threads: st.pool.current_num_threads(),
             probe_spill_files: st.probe_spill_files,
             probe_key_checksums: st.probe_key_checksums,
             probe_rows,
@@ -2144,10 +2160,22 @@ async fn probe_with_spilling(
 
     // Closed exactly once, between phases A and B — every probe file must
     // be complete before `process_spilled_partition` opens it.
-    close_spill_writers(st.spill_writers)?;
+    let phase_a_threads = st.pool.current_num_threads();
+    // The pool (and whatever its threads retained) goes away with `st`
+    // before phase B starts; the writers are closed exactly once here.
+    let PhaseAState {
+        pool,
+        spill_writers,
+        probe_spill_files,
+        probe_key_checksums,
+        ..
+    } = st;
+    drop(pool);
+    close_spill_writers(spill_writers)?;
     Ok(ProbePhase {
-        probe_spill_files: st.probe_spill_files,
-        probe_key_checksums: st.probe_key_checksums,
+        phase_a_threads,
+        probe_spill_files,
+        probe_key_checksums,
         probe_rows: probe_rows_in,
         in_memory_matched,
         abandoned: false,

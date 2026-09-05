@@ -140,3 +140,30 @@ within a partition, K + per-partition elapsed traces.
   `OnceLock`), phase B stays on the global pool (its 003 peak of 432MB on
   this leg was the accepted baseline). Gates green (34/34, 12/12, 4/4,
   fmt). Release 003d building; RSS trace + full battery re-run on it.
+
+## 2026-09-05T07:05:00Z — 003d (8cd02c1) battery: Q9 224s, phase A 284MB, chaos 300/300
+
+- RSS trace, semi-join build_right=1, 600M build, 2G scope: phase-A peak
+  **284MB** (003c 583MB; single-threaded 003 207MB); whole-run peak 562MB
+  at 228s (003: 432MB, 003c: 814MB).
+- Q9 SF=100 parquet @1G under 16G, quiet machine, 003d: **224.3s,
+  CELL-EXACT, 246 hash-check-ok / 0 mismatch**, serve peak RSS 11.0GB;
+  second join 77.4s (K=2), first join 207.9s (K=5).
+- Chaos 003d: **300/300** (179 + 92 genuine-disk), 0 mismatch.
+- Launched: harness @1G ×8 on 003d, Q4 SF=100 native @64M under 8G on
+  003d. SF=10 native sweep queued behind the harness (quiet machine).
+
+## 2026-09-05T07:40:00Z — 003d harness margins too thin; pool sized by the budget, per call
+
+- Harness @1G on 003d: semi-join build_right=0 **952 / 962MB** (003:
+  838/839), build_right=1 **625 / 589MB** (003: 470/456), anti-join
+  build_right=1 cgroup 624MB — all PASS, but ~+120-150MB over 003 and
+  the build_right=0 anti leg (003: 872MB) still to come. Not a margin to
+  certify a 1G cap against.
+- Change (this commit): phase A's pool is sized by the OPERATOR'S budget,
+  not the machine — one worker per 64MB of `memory_threshold`, clamped
+  to [1, 8] (Q9 @1G: 8; the harness's 256MB budget: 3; Q4 @64M: 1) — and
+  created per call, dropped before phase B so its threads exit and
+  release what they retained. "probe collected" trace gains
+  `phase_a_threads=`. Gates green (34/34, 12/12, 4/4, fmt). Release 003e
+  building; the whole battery re-runs on it.
