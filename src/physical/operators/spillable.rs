@@ -947,24 +947,18 @@ impl SpillableHashJoinExec {
             );
         }
 
-        // Collect ALL probe-side partitions into a single stream
+        // join-spill-streaming task 001: the probe side is STREAMED through
+        // the partition writers, never collected. Before this the whole
+        // probe side was drained into one `Vec<RecordBatch>` first (Q9 at
+        // SF=100/1G: 333M rows; the SF=100-class harness join peaked at
+        // 5.3-8.0GB against a 256MB budget — the probe side, not the
+        // build side, set the peak). `stream_merge_input_partitions` is the
+        // same bounded-channel merge the build side already uses: every
+        // probe input partition is drained concurrently, a handful of
+        // batches can be in flight at once, never the whole side.
         let probe_partitions = probe_side.output_partitions().max(1);
-        let mut probe_batches = Vec::new();
-        for p in 0..probe_partitions {
-            let probe_stream = probe_side.execute(p).await?;
-            let batches: Vec<RecordBatch> = probe_stream.try_collect().await?;
-            probe_batches.extend(batches);
-        }
-        let probe_rows_in: usize = probe_batches.iter().map(|b| b.num_rows()).sum();
-        if sj_trace {
-            eprintln!(
-                "[sj-trace] execute_spill_path probe collected: probe_partitions={} probe_rows={}",
-                probe_partitions, probe_rows_in
-            );
-        }
-        let probe_stream: RecordBatchStream =
-            Box::pin(stream::iter(probe_batches.into_iter().map(Ok)));
-        let (results, probe_spill_files, probe_key_checksums) = self
+        let probe_stream = stream_merge_input_partitions(probe_side).await?;
+        let (results, probe_spill_files, probe_key_checksums, probe_rows_in) = self
             .probe_with_spilling(
                 probe_stream,
                 probe_keys,
@@ -975,6 +969,15 @@ impl SpillableHashJoinExec {
                 swapped,
             )
             .await?;
+        if sj_trace {
+            // Same line as before task 001, now printed once the probe
+            // stream has been consumed (the count is accumulated as
+            // batches flow, not from a materialized Vec).
+            eprintln!(
+                "[sj-trace] execute_spill_path probe collected: probe_partitions={} probe_rows={} (streamed)",
+                probe_partitions, probe_rows_in
+            );
+        }
         let in_memory_matched_rows: usize = results.iter().map(|b| b.num_rows()).sum();
 
         // Process spilled partitions — this call's own freshly-written
@@ -1373,9 +1376,13 @@ impl SpillableHashJoinExec {
         Vec<RecordBatch>,
         Vec<Option<PathBuf>>,
         Vec<Option<KeyChecksum>>,
+        usize,
     )> {
         let sj_trace = std::env::var("QE_SPILL_DEBUG").is_ok();
         let mut results = Vec::new();
+        // join-spill-streaming task 001: probe rows counted as they flow
+        // (QE_SPILL_DEBUG trace), since the probe side is no longer a Vec.
+        let mut probe_rows_in: usize = 0;
         let mut probe_spill_files: Vec<Option<PathBuf>> =
             (0..NUM_PARTITIONS).map(|_| None).collect();
         // spill-join-correctness-2 epic, task 001: write-time checksum of
@@ -1413,6 +1420,7 @@ impl SpillableHashJoinExec {
             (0..NUM_PARTITIONS).map(|_| None).collect();
 
         while let Some(batch) = probe_stream.try_next().await? {
+            probe_rows_in += batch.num_rows();
             // Partition probe batch
             let partitioned = partition_batch_by_hash(&batch, probe_keys, NUM_PARTITIONS)?;
 
@@ -1511,7 +1519,12 @@ impl SpillableHashJoinExec {
         }
 
         close_spill_writers(spill_writers)?;
-        Ok((results, probe_spill_files, probe_key_checksums))
+        Ok((
+            results,
+            probe_spill_files,
+            probe_key_checksums,
+            probe_rows_in,
+        ))
     }
 
     async fn process_spilled_partition(
