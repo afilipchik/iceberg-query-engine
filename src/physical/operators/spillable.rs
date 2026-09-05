@@ -1265,6 +1265,12 @@ impl SpillableHashJoinExec {
                         // in the already-open writer — O(batch), never
                         // re-reads or rewrites this partition's prior data.
                         append_batch_streaming(&mut spill_writers[idx], &sp.build_file, &pb)?;
+                        // join-spill-streaming task 003: keep `build_rows`
+                        // exact across appends (before, it froze at the
+                        // eviction-time count — a diagnostic-only field
+                        // until `plan_phase_b` started sizing K from the
+                        // largest spilled partition).
+                        sp.build_rows += pb.num_rows();
                         if sj_trace {
                             let cs = batch_key_checksum(&pb, build_keys)?;
                             sp.build_key_checksum
@@ -1768,41 +1774,219 @@ async fn process_spilled_partitions(
     Ok(Some(spilled_matched))
 }
 
-/// Phase A (+ A'): consume the probe stream batch by batch. Resident
-/// partitions are probed at once and their output SENT at once; probe
-/// rows routed to spilled partitions are appended to this call's probe
-/// spill files (one open writer per partition for the whole phase, closed
-/// exactly once at the end); build-side SEMI/ANTI resident emission (A')
-/// happens after the stream ends. Never holds more than the current probe
-/// batch, its per-partition slices and the in-flight output.
-async fn probe_with_spilling(
+/// Probe rows gathered before phase A hands a group to the blocking pool
+/// (join-spill-streaming task 003): the group is re-sliced into
+/// `SPILL_READ_BATCH_ROWS`-row pieces and partitioned + probed with rayon,
+/// then written to the per-partition spill writers in parallel across
+/// partitions. Bounds phase A's transient at ~one group of probe rows plus
+/// its partitioned copy, whatever the upstream batch size is.
+const PHASE_A_GROUP_ROWS: usize = 262_144;
+/// Companion cap on batches per group (a source emitting tiny batches).
+const PHASE_A_GROUP_BATCHES: usize = 64;
+
+/// Phase A's mutable per-call state, moved into each group's blocking job
+/// and back (all of it is `Send`; `ArrowWriter<File>` was already carried
+/// across awaits before this task).
+struct PhaseAState {
+    spill_writers: Vec<Option<ArrowWriter<File>>>,
+    probe_spill_files: Vec<Option<PathBuf>>,
+    probe_key_checksums: Vec<Option<KeyChecksum>>,
+    /// Build-side SEMI/ANTI only: one bitmap per RESIDENT partition (per
+    /// build batch), marked from many probe pieces at once → `AtomicBool`.
+    build_matched: Vec<Option<Vec<Vec<std::sync::atomic::AtomicBool>>>>,
+}
+
+impl PhaseAState {
+    fn new(state: &SpillState, build_side_output: bool) -> Self {
+        use std::sync::atomic::AtomicBool;
+        let build_matched = (0..NUM_PARTITIONS)
+            .map(|idx| {
+                if !build_side_output || state.tables[idx].is_none() {
+                    return None;
+                }
+                state.partitions[idx].as_ref().map(|p| {
+                    p.batches
+                        .iter()
+                        .map(|b| (0..b.num_rows()).map(|_| AtomicBool::new(false)).collect())
+                        .collect()
+                })
+            })
+            .collect();
+        Self {
+            spill_writers: (0..NUM_PARTITIONS).map(|_| None).collect(),
+            probe_spill_files: (0..NUM_PARTITIONS).map(|_| None).collect(),
+            probe_key_checksums: (0..NUM_PARTITIONS).map(|_| None).collect(),
+            build_matched,
+        }
+    }
+}
+
+/// One phase-A group, on the blocking pool: (1) re-slice the group into
+/// ≤ `SPILL_READ_BATCH_ROWS`-row pieces; (2) rayon over pieces — hash-
+/// partition each piece and probe the resident partitions (INNER pairs and
+/// probe-side SEMI/ANTI rows become output batches; build-side SEMI/ANTI
+/// marks the atomic bitmaps; ANTI's no-build-rows pieces are emitted
+/// whole); (3) rayon over PARTITIONS — append every piece's slice for a
+/// spilled partition to that partition's writer (one writer per
+/// partition, so partitions are independent; within a partition the
+/// pieces stay in group order). Returns the state and the output batches
+/// in piece order for the caller to send.
+fn phase_a_process_group(
     state: &SpillState,
+    ctx: &SpillJoinCtx,
+    mut st: PhaseAState,
+    group: Vec<RecordBatch>,
+) -> Result<(PhaseAState, Vec<RecordBatch>)> {
+    use rayon::prelude::*;
+    let probe_keys = &ctx.probe_keys;
+    let is_semi_anti = ctx.is_semi_anti();
+    let is_semi = ctx.is_semi();
+
+    let mut pieces: Vec<RecordBatch> = Vec::new();
+    for b in &group {
+        let mut start = 0usize;
+        while start < b.num_rows() {
+            let len = SPILL_READ_BATCH_ROWS.min(b.num_rows() - start);
+            pieces.push(b.slice(start, len));
+            start += len;
+        }
+    }
+
+    type PieceResult = (Vec<Option<RecordBatch>>, Vec<RecordBatch>);
+    let per_piece: Vec<PieceResult> = pieces
+        .par_iter()
+        .map(|piece| -> Result<PieceResult> {
+            let partitioned = partition_batch_by_hash(piece, probe_keys, NUM_PARTITIONS)?;
+            let mut to_spill: Vec<Option<RecordBatch>> =
+                (0..NUM_PARTITIONS).map(|_| None).collect();
+            let mut outputs: Vec<RecordBatch> = Vec::new();
+            for (idx, part_batch) in partitioned.into_iter().enumerate() {
+                let Some(pb) = part_batch else {
+                    continue;
+                };
+                if let Some(ref ht) = state.tables[idx] {
+                    // Probe in-memory partition
+                    let Some(build_part) = state.partitions[idx].as_ref() else {
+                        continue;
+                    };
+                    if !is_semi_anti {
+                        outputs.extend(probe_partition(
+                            &build_part.batches,
+                            std::slice::from_ref(&pb),
+                            ht,
+                            probe_keys,
+                            ctx.join_type,
+                            ctx.swapped,
+                            &ctx.schema,
+                            ctx.retained.as_deref(),
+                        )?);
+                    } else if ctx.swapped {
+                        let flags = probe_match_flags(&pb, ht, probe_keys)?;
+                        if let Some(out) = take_probe_rows(&pb, &flags, is_semi, &ctx.schema)? {
+                            outputs.push(out);
+                        }
+                    } else if let Some(bm) = st.build_matched[idx].as_ref() {
+                        mark_build_matches_atomic(&pb, ht, probe_keys, bm)?;
+                    }
+                } else if state.spilled[idx].is_some() {
+                    to_spill[idx] = Some(pb);
+                } else if is_semi_anti && ctx.swapped && !is_semi {
+                    // task 004: this partition holds NO build row at all
+                    // (nothing was ever routed here, or it was emptied
+                    // before the table pass), so every probe row in it is
+                    // unmatched. INNER and SEMI correctly drop the batch;
+                    // ANTI must EMIT it whole — the previously silent
+                    // drop was exactly the wrong-result hazard for the
+                    // probe-side-output ANTI orientation.
+                    outputs.push(batch_with_actual_types(&ctx.schema, pb.columns().to_vec())?);
+                }
+            }
+            Ok((to_spill, outputs))
+        })
+        .collect::<Result<_>>()?;
+
+    // Transpose: per spilled partition, its slices in piece order.
+    let mut by_partition: Vec<Vec<RecordBatch>> = (0..NUM_PARTITIONS).map(|_| Vec::new()).collect();
+    let mut outputs: Vec<RecordBatch> = Vec::new();
+    for (to_spill, outs) in per_piece {
+        for (idx, pb) in to_spill.into_iter().enumerate() {
+            if let Some(pb) = pb {
+                by_partition[idx].push(pb);
+            }
+        }
+        outputs.extend(outs);
+    }
+
+    // Writes: partitions are independent (one writer each) → parallel
+    // across partitions, sequential within one.
+    let spill_dir = &state.spill_dir;
+    let sj_trace = ctx.sj_trace;
+    let spilled_bytes = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<(
+        usize,
+        &mut Option<ArrowWriter<File>>,
+        &mut Option<PathBuf>,
+        &mut Option<KeyChecksum>,
+        Vec<RecordBatch>,
+    )> = st
+        .spill_writers
+        .iter_mut()
+        .zip(st.probe_spill_files.iter_mut())
+        .zip(st.probe_key_checksums.iter_mut())
+        .zip(by_partition)
+        .enumerate()
+        .map(|(idx, (((w, f), cs), slices))| (idx, w, f, cs, slices))
+        .filter(|(_, _, _, _, slices)| !slices.is_empty())
+        .collect();
+    slots
+        .into_par_iter()
+        .try_for_each(|(idx, writer, file, checksum, slices)| -> Result<()> {
+            let path = file.get_or_insert_with(|| ctx.probe_file(spill_dir, idx));
+            for pb in &slices {
+                spilled_bytes.fetch_add(
+                    estimate_batch_size(pb),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                append_batch_streaming(writer, path, pb)?;
+                if sj_trace {
+                    let cs = batch_key_checksum(pb, probe_keys)?;
+                    checksum
+                        .get_or_insert_with(KeyChecksum::default)
+                        .accumulate(cs);
+                }
+            }
+            Ok(())
+        })?;
+    let spilled = spilled_bytes.into_inner();
+    if spilled > 0 {
+        ctx.memory_pool.record_spill(spilled);
+    }
+    Ok((st, outputs))
+}
+
+/// Phase A (+ A'): consume the probe stream. Probe batches are gathered
+/// into groups of ~`PHASE_A_GROUP_ROWS` rows and each group is processed
+/// on the blocking pool (`phase_a_process_group`: rayon-parallel
+/// partitioning + resident probing, parallel-across-partitions spill
+/// writes); the group's output batches are SENT as soon as the group is
+/// done, and probe rows routed to spilled partitions land in this call's
+/// probe spill files (one open writer per partition for the whole phase,
+/// closed exactly once at the end). Build-side SEMI/ANTI resident emission
+/// (A') happens after the stream ends. Never holds more than one group,
+/// its partitioned copy and the in-flight output.
+///
+/// join-spill-streaming task 003: before this, phase A ran single-threaded
+/// on the producer task — and once the output was streamed (task 002) it
+/// became the pace-setter of the whole pipeline (Q9 at SF=100/1G: the
+/// second join's read-back ran at ~1.7 cores of 32 because THIS loop, as
+/// its consumer, hashed 333M probe rows and fed 60 spill writers on one
+/// thread).
+async fn probe_with_spilling(
+    state: &Arc<SpillState>,
     ctx: &SpillJoinCtx,
     mut probe_stream: RecordBatchStream,
     tx: &SpillJoinOutputSender,
 ) -> Result<ProbePhase> {
-    let sj_trace = ctx.sj_trace;
-    let spill_dir = &state.spill_dir;
-    let in_memory_partitions = &state.partitions;
-    let hash_tables = &state.tables;
-    let spilled_partitions = &state.spilled;
-    let probe_keys = &ctx.probe_keys;
-    let mut in_memory_matched = 0usize;
-    // join-spill-streaming task 001: probe rows counted as they flow
-    // (QE_SPILL_DEBUG trace), since the probe side is no longer a Vec.
-    let mut probe_rows_in: usize = 0;
-    let mut probe_spill_files: Vec<Option<PathBuf>> = (0..NUM_PARTITIONS).map(|_| None).collect();
-    // spill-join-correctness-2 epic, task 001: write-time checksum of
-    // each spilled partition's PROBE-side join keys, compared against
-    // the read-back recomputation in `process_spilled_partition`.
-    let mut probe_key_checksums: Vec<Option<KeyChecksum>> =
-        (0..NUM_PARTITIONS).map(|_| None).collect();
-    // Same fix as `build_with_partitioning`: one writer per partition,
-    // kept open for the whole probe phase, instead of a read-rewrite
-    // per appended batch.
-    let mut spill_writers: Vec<Option<ArrowWriter<File>>> =
-        (0..NUM_PARTITIONS).map(|_| None).collect();
-
     // spill-join-correctness-3 task 004: SEMI/ANTI existence semantics
     // on the spill path. Partition routing is the same fixed-seed hash
     // of the join key for build and probe, and a build partition is
@@ -1813,7 +1997,7 @@ async fn probe_with_spilling(
     // the planner (`build_right_for_left`):
     //   swapped  (build = right, probe = LEFT = the output side): a
     //     probe row's status is fully decided against its partition's
-    //     table, so resident partitions emit per probe batch right here
+    //     table, so resident partitions emit per probe piece right away
     //     (`take_probe_rows`); rows routed to a spilled partition are
     //     spilled and decided in `process_spilled_partition`.
     //   !swapped (build = LEFT = the output side): a resident build row
@@ -1823,150 +2007,91 @@ async fn probe_with_spilling(
     //     batch) is populated across the loop and emitted after it.
     let is_semi_anti = ctx.is_semi_anti();
     let is_semi = ctx.is_semi();
-    let mut build_matched: Vec<Option<Vec<Vec<bool>>>> =
-        (0..NUM_PARTITIONS).map(|_| None).collect();
+    let build_side_output = is_semi_anti && !ctx.swapped;
+    let mut st = PhaseAState::new(state, build_side_output);
+    let mut in_memory_matched = 0usize;
+    // join-spill-streaming task 001: probe rows counted as they flow
+    // (QE_SPILL_DEBUG trace), since the probe side is no longer a Vec.
+    let mut probe_rows_in: usize = 0;
 
     // Abandonment (consumer dropped the stream): stop pulling probe
     // batches and writing spill files for output nobody will read. The
     // files written so far are removed by the caller.
-    let abandoned = |probe_spill_files, probe_key_checksums, probe_rows, in_memory_matched| {
+    let abandoned = |st: PhaseAState, probe_rows: usize, in_memory_matched: usize| {
         Ok(ProbePhase {
-            probe_spill_files,
-            probe_key_checksums,
+            probe_spill_files: st.probe_spill_files,
+            probe_key_checksums: st.probe_key_checksums,
             probe_rows,
             in_memory_matched,
             abandoned: true,
         })
     };
 
-    while let Some(batch) = probe_stream.try_next().await? {
-        if tx.is_closed() {
-            return abandoned(
-                probe_spill_files,
-                probe_key_checksums,
-                probe_rows_in,
-                in_memory_matched,
-            );
+    let mut group: Vec<RecordBatch> = Vec::new();
+    let mut group_rows = 0usize;
+    loop {
+        let next = probe_stream.try_next().await?;
+        let end_of_stream = next.is_none();
+        if let Some(batch) = next {
+            if tx.is_closed() {
+                return abandoned(st, probe_rows_in, in_memory_matched);
+            }
+            probe_rows_in += batch.num_rows();
+            group_rows += batch.num_rows();
+            group.push(batch);
         }
-        probe_rows_in += batch.num_rows();
-        // Partition probe batch
-        let partitioned = partition_batch_by_hash(&batch, probe_keys, NUM_PARTITIONS)?;
-
-        for (idx, part_batch) in partitioned.into_iter().enumerate() {
-            let Some(pb) = part_batch else {
-                continue;
-            };
-            if let Some(ref ht) = hash_tables[idx] {
-                // Probe in-memory partition
-                let Some(build_part) = in_memory_partitions[idx].as_ref() else {
-                    continue;
-                };
-                if !is_semi_anti {
-                    let matched = probe_partition(
-                        &build_part.batches,
-                        &[pb],
-                        ht,
-                        probe_keys,
-                        ctx.join_type,
-                        ctx.swapped,
-                        &ctx.schema,
-                        ctx.retained.as_deref(),
-                    )?;
-                    for out in matched {
-                        if !emit_join_batch(tx, out, &mut in_memory_matched).await {
-                            return abandoned(
-                                probe_spill_files,
-                                probe_key_checksums,
-                                probe_rows_in,
-                                in_memory_matched,
-                            );
-                        }
-                    }
-                } else if ctx.swapped {
-                    let flags = probe_match_flags(&pb, ht, probe_keys)?;
-                    if let Some(out) = take_probe_rows(&pb, &flags, is_semi, &ctx.schema)? {
-                        if !emit_join_batch(tx, out, &mut in_memory_matched).await {
-                            return abandoned(
-                                probe_spill_files,
-                                probe_key_checksums,
-                                probe_rows_in,
-                                in_memory_matched,
-                            );
-                        }
-                    }
-                } else {
-                    let bm = build_matched[idx].get_or_insert_with(|| {
-                        build_part
-                            .batches
-                            .iter()
-                            .map(|b| vec![false; b.num_rows()])
-                            .collect()
-                    });
-                    mark_build_matches(std::slice::from_ref(&pb), ht, probe_keys, bm)?;
-                }
-            } else if spilled_partitions[idx].is_some() {
-                // Spill probe batch for this partition
-                ctx.memory_pool.record_spill(estimate_batch_size(&pb));
-                let probe_path =
-                    probe_spill_files[idx].get_or_insert_with(|| ctx.probe_file(spill_dir, idx));
-                append_batch_streaming(&mut spill_writers[idx], probe_path, &pb)?;
-                if sj_trace {
-                    let cs = batch_key_checksum(&pb, probe_keys)?;
-                    probe_key_checksums[idx]
-                        .get_or_insert_with(KeyChecksum::default)
-                        .accumulate(cs);
-                }
-            } else if is_semi_anti && ctx.swapped && !is_semi {
-                // task 004: this partition holds NO build row at all
-                // (nothing was ever routed here, or it was emptied
-                // before the table pass), so every probe row in it is
-                // unmatched. INNER and SEMI correctly drop the batch;
-                // ANTI must EMIT it whole — the previously silent
-                // drop was exactly the wrong-result hazard for the
-                // probe-side-output ANTI orientation.
-                let out = batch_with_actual_types(&ctx.schema, pb.columns().to_vec())?;
+        let flush = end_of_stream
+            || group_rows >= PHASE_A_GROUP_ROWS
+            || group.len() >= PHASE_A_GROUP_BATCHES;
+        if flush && !group.is_empty() {
+            let g = std::mem::take(&mut group);
+            group_rows = 0;
+            let state2 = Arc::clone(state);
+            let ctx2 = ctx.clone();
+            let (st2, outputs) =
+                tokio::task::spawn_blocking(move || phase_a_process_group(&state2, &ctx2, st, g))
+                    .await
+                    .map_err(|e| {
+                        QueryError::Execution(format!("join spill probe task failed: {e}"))
+                    })??;
+            st = st2;
+            for out in outputs {
                 if !emit_join_batch(tx, out, &mut in_memory_matched).await {
-                    return abandoned(
-                        probe_spill_files,
-                        probe_key_checksums,
-                        probe_rows_in,
-                        in_memory_matched,
-                    );
+                    return abandoned(st, probe_rows_in, in_memory_matched);
                 }
             }
+        }
+        if end_of_stream {
+            break;
         }
     }
 
     // Phase A' — task 004, build-side output: emit once the ENTIRE probe
     // stream is consumed. A resident partition no probe row ever reached
-    // keeps an all-false bitmap (created here): all of its rows are
-    // unmatched, so ANTI emits every one of them and SEMI none — the
-    // mirror hazard of the dropped-probe-batch case above. Build rows
-    // with NULL keys are never in the table, so they stay unmatched too,
-    // matching the in-memory join's own null-never-matches rule.
-    if is_semi_anti && !ctx.swapped {
+    // keeps an all-false bitmap: all of its rows are unmatched, so ANTI
+    // emits every one of them and SEMI none — the mirror hazard of the
+    // dropped-probe-batch case above. Build rows with NULL keys are never
+    // in the table, so they stay unmatched too, matching the in-memory
+    // join's own null-never-matches rule.
+    if build_side_output {
         for idx in 0..NUM_PARTITIONS {
-            if hash_tables[idx].is_none() {
-                continue;
-            }
-            let Some(build_part) = in_memory_partitions[idx].as_ref() else {
+            let Some(bm) = st.build_matched[idx].take() else {
                 continue;
             };
-            let bm = build_matched[idx].take().unwrap_or_else(|| {
-                build_part
-                    .batches
-                    .iter()
-                    .map(|b| vec![false; b.num_rows()])
-                    .collect()
-            });
-            if let Some(out) = take_build_rows(&build_part.batches, &bm, is_semi, &ctx.schema)? {
+            let Some(build_part) = state.partitions[idx].as_ref() else {
+                continue;
+            };
+            let flags: Vec<Vec<bool>> = bm
+                .iter()
+                .map(|v| {
+                    v.iter()
+                        .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+                        .collect()
+                })
+                .collect();
+            if let Some(out) = take_build_rows(&build_part.batches, &flags, is_semi, &ctx.schema)? {
                 if !emit_join_batch(tx, out, &mut in_memory_matched).await {
-                    return abandoned(
-                        probe_spill_files,
-                        probe_key_checksums,
-                        probe_rows_in,
-                        in_memory_matched,
-                    );
+                    return abandoned(st, probe_rows_in, in_memory_matched);
                 }
             }
         }
@@ -1974,10 +2099,10 @@ async fn probe_with_spilling(
 
     // Closed exactly once, between phases A and B — every probe file must
     // be complete before `process_spilled_partition` opens it.
-    close_spill_writers(spill_writers)?;
+    close_spill_writers(st.spill_writers)?;
     Ok(ProbePhase {
-        probe_spill_files,
-        probe_key_checksums,
+        probe_spill_files: st.probe_spill_files,
+        probe_key_checksums: st.probe_key_checksums,
         probe_rows: probe_rows_in,
         in_memory_matched,
         abandoned: false,
