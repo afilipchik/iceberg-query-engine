@@ -1,8 +1,8 @@
 ---
 name: join-spill-streaming
-status: backlog
+status: in-progress
 created: 2026-09-05T01:38:00Z
-updated: 2026-09-05T01:38:00Z
+updated: 2026-09-05T03:03:56Z
 progress: 0%
 prd: .claude/prds/join-spill-streaming.md
 github: (will be set on sync)
