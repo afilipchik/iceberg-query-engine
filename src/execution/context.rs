@@ -47,8 +47,26 @@ pub struct QueryMetrics {
     pub execute_time: Duration,
     /// Total time
     pub total_time: Duration,
-    /// Peak memory usage during execution (bytes)
+    /// Peak memory usage during execution (bytes): the memory pool's
+    /// high-water mark between this query's start and end (query-ui epic,
+    /// task 001 — before that this was `pool.used()` read AFTER every
+    /// reservation had been released, i.e. ~0 for any query that spilled).
+    /// Pool-wide: concurrent queries sharing the context's pool all see the
+    /// peak of their sum.
     pub peak_memory_bytes: usize,
+    /// Number of result batches (before dictionary decoding, which is 1:1).
+    pub batches: usize,
+    /// Base tables the bound plan scans, sorted and deduplicated; when a
+    /// rollup answered the query its name is included too, because it is
+    /// what was actually read. Debugging surface for the query log
+    /// (query-ui epic, task 001).
+    pub tables: Vec<String>,
+    /// `Display` of the optimized logical plan, capped at
+    /// [`DEBUG_TEXT_CAP`] bytes. Rendered from the plan `sql()` already
+    /// built — no second planning pass.
+    pub optimized_plan: Option<String>,
+    /// `display_plan` of the physical operator tree, same cap.
+    pub physical_plan: Option<String>,
     /// Spill metrics if any spilling occurred
     pub spill_metrics: Option<SpillMetrics>,
     /// Number of files pruned by Iceberg statistics
@@ -1218,6 +1236,8 @@ impl ExecutionContext {
     pub async fn sql(&self, query: &str) -> Result<QueryResult> {
         let start = Instant::now();
         let mut metrics = QueryMetrics::default();
+        // Open this query's peak-memory window (see `QueryMetrics::peak_memory_bytes`).
+        self.memory_pool.reset_peak();
 
         // Parse
         let parse_start = Instant::now();
@@ -1345,6 +1365,7 @@ impl ExecutionContext {
         let mut binder = Binder::new(&self.catalog);
         let logical = binder.bind(&stmt)?;
         metrics.plan_time = plan_start.elapsed();
+        metrics.tables = collect_scan_tables(&logical);
 
         // Rollup substitution (native-tables-rollups epic, task 001):
         // given real registry access this method has and a plain
@@ -1372,6 +1393,16 @@ impl ExecutionContext {
         if std::env::var("PLAN_DEBUG").is_ok() {
             eprintln!("[plan]\n{}", optimized);
         }
+        // Decorrelation and rollup substitution can introduce scans the
+        // bound plan did not have (DelimJoin sides, the rollup itself):
+        // union them in so `tables` names everything actually read.
+        for t in collect_scan_tables(&optimized) {
+            if !metrics.tables.contains(&t) {
+                metrics.tables.push(t);
+            }
+        }
+        metrics.tables.sort();
+        metrics.optimized_plan = Some(cap_debug_text(optimized.to_string()));
 
         // Physical planning with spillable operators for memory safety
         let physical_start = Instant::now();
@@ -1384,6 +1415,10 @@ impl ExecutionContext {
         planner.enable_subquery_execution();
         let physical = planner.create_physical_plan(&optimized)?;
         metrics.plan_time += physical_start.elapsed();
+        metrics.physical_plan = Some(cap_debug_text(crate::physical::display_plan(
+            physical.as_ref(),
+            0,
+        )));
 
         // Execute
         let execute_start = Instant::now();
@@ -1427,8 +1462,9 @@ impl ExecutionContext {
 
         metrics.total_time = start.elapsed();
 
-        // Capture memory metrics
-        metrics.peak_memory_bytes = self.memory_pool.used();
+        // Capture memory metrics: the pool's high-water mark over this
+        // query's window, not the post-release residual.
+        metrics.peak_memory_bytes = self.memory_pool.peak();
         let spilled = self.memory_pool.spilled();
         if spilled > 0 {
             metrics.spill_metrics = Some(SpillMetrics {
@@ -1439,6 +1475,7 @@ impl ExecutionContext {
 
         let schema = physical.schema();
         let row_count: usize = all_batches.iter().map(|b| b.num_rows()).sum();
+        metrics.batches = all_batches.len();
 
         // Dictionary-encoded columns (small-build join gathers) are an
         // internal representation; results hand plain arrays to formatters,
@@ -2463,11 +2500,104 @@ fn format_bytes(bytes: usize) -> String {
     }
 }
 
+/// Upper bound on a plan rendering kept in `QueryMetrics` (and therefore in
+/// the `serve` query log): a pathological plan is truncated with a marker
+/// rather than allowed to make the bounded ring unbounded.
+pub const DEBUG_TEXT_CAP: usize = 64 * 1024;
+
+/// Truncate `s` to [`DEBUG_TEXT_CAP`] bytes on a char boundary, marking the cut.
+pub fn cap_debug_text(mut s: String) -> String {
+    if s.len() <= DEBUG_TEXT_CAP {
+        return s;
+    }
+    let mut cut = DEBUG_TEXT_CAP;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
+    s.push_str("\n…[truncated]");
+    s
+}
+
+/// Every table a plan tree scans (including through `VectorSearch`, whose
+/// scan sits inside its `input`), sorted and deduplicated. Walks plan
+/// children only; a subquery still folded inside an expression is picked up
+/// once the optimizer has decorrelated it into the tree.
+pub fn collect_scan_tables(plan: &LogicalPlan) -> Vec<String> {
+    fn walk(plan: &LogicalPlan, out: &mut Vec<String>) {
+        if let LogicalPlan::Scan(node) = plan {
+            if !out.contains(&node.table_name) {
+                out.push(node.table_name.clone());
+            }
+        }
+        for child in plan.children() {
+            walk(child, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(plan, &mut out);
+    out.sort();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field};
+
+    // query-ui epic, task 001: the debugging facts `sql()` now records.
+    #[tokio::test]
+    async fn sql_records_plans_tables_and_batches() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+        let mut ctx = ExecutionContext::new();
+        ctx.register_batch("people", batch.clone());
+        ctx.register_batch("other", batch);
+
+        let r = ctx
+            .sql("SELECT p.id FROM people p JOIN other o ON p.id = o.id WHERE p.id > 1")
+            .await
+            .unwrap();
+        assert_eq!(r.row_count, 2);
+        assert_eq!(
+            r.metrics.tables,
+            vec!["other".to_string(), "people".to_string()]
+        );
+        let opt = r
+            .metrics
+            .optimized_plan
+            .as_deref()
+            .expect("optimized plan captured");
+        assert!(opt.contains("people") && opt.contains("other"), "{opt}");
+        let phys = r
+            .metrics
+            .physical_plan
+            .as_deref()
+            .expect("physical plan captured");
+        assert!(phys.contains("Join") || phys.contains("join"), "{phys}");
+        assert_eq!(r.metrics.batches, r.batches.len());
+        assert!(r.metrics.total_time >= r.metrics.execute_time);
+    }
+
+    #[test]
+    fn cap_debug_text_truncates_on_a_char_boundary() {
+        let s = "é".repeat(DEBUG_TEXT_CAP); // 2 bytes each
+        let out = cap_debug_text(s);
+        assert!(out.ends_with("…[truncated]"));
+        assert!(out.len() <= DEBUG_TEXT_CAP + "\n…[truncated]".len());
+        assert_eq!(cap_debug_text("short".into()), "short");
+    }
 
     // ------------------------------------------------------------------
     // native-tables-mutation epic, task 005: bounded partition-merge

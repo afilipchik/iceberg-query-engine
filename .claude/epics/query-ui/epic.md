@@ -1,9 +1,9 @@
 ---
 name: query-ui
-status: backlog
+status: in-progress
 created: 2026-09-05T04:12:00Z
-updated: 2026-09-05T04:12:00Z
-progress: 0%
+updated: 2026-09-05T04:24:20Z
+progress: 33%
 prd: .claude/prds/query-ui.md
 github: (will be set on sync)
 ---
@@ -132,8 +132,8 @@ contention on the ring under concurrent load — held for a push only;
 - Total ≈ 34h; critical path 001→002→003→(004|005)→006 ≈ 30h.
 
 ## Tasks Created
-- [ ] 001.md - Engine debug facts: plans and statement facts in QueryMetrics, MemoryPool high-water mark (parallel: true)
-- [ ] 002.md - Query log ring and JSON endpoints wired from HTTP, Flight and fragments (parallel: false)
+- [x] 001.md - Engine debug facts: plans and statement facts in QueryMetrics, MemoryPool high-water mark (parallel: true)
+- [x] 002.md - Query log ring and JSON endpoints wired from HTTP, Flight and fragments (parallel: false)
 - [ ] 003.md - UI shell, embedded static serving, Overview + Queries list + Query detail views (parallel: false)
 - [ ] 004.md - Statistics view: tiles, sparkline, latency histogram, breakdowns (parallel: true)
 - [ ] 005.md - Cluster, Tables and SQL console views (parallel: true)

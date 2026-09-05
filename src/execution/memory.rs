@@ -189,6 +189,11 @@ pub struct MemoryPool {
     max_memory: usize,
     /// Current memory usage
     used: AtomicUsize,
+    /// High-water mark of `used` since construction or the last
+    /// [`MemoryPool::reset_peak`] (query-ui epic, task 001). Updated with a
+    /// `fetch_max` on every growth, so it is a true peak rather than the
+    /// residual `used()` reads after reservations are released.
+    peak: AtomicUsize,
     /// Total bytes that have been spilled to disk
     spilled: AtomicUsize,
 }
@@ -198,6 +203,7 @@ impl MemoryPool {
         Self {
             max_memory,
             used: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
             spilled: AtomicUsize::new(0),
         }
     }
@@ -233,6 +239,7 @@ impl MemoryPool {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
+                    self.peak.fetch_max(new_usage, Ordering::SeqCst);
                     return Some(MemoryReservation { pool: self, size });
                 }
                 Err(actual) => current = actual,
@@ -242,13 +249,31 @@ impl MemoryPool {
 
     /// Force allocate memory (may exceed limit)
     pub fn allocate(&self, size: usize) -> MemoryReservation<'_> {
-        self.used.fetch_add(size, Ordering::SeqCst);
+        let prev = self.used.fetch_add(size, Ordering::SeqCst);
+        self.peak
+            .fetch_max(prev.saturating_add(size), Ordering::SeqCst);
         MemoryReservation { pool: self, size }
     }
 
     /// Current memory usage
     pub fn used(&self) -> usize {
         self.used.load(Ordering::Relaxed)
+    }
+
+    /// High-water mark of [`MemoryPool::used`] since construction or the
+    /// last [`MemoryPool::reset_peak`]. Pool-wide: with concurrent queries
+    /// sharing one pool this is the peak of their sum, not of any one of
+    /// them (the query log reports how many were running so overlap is
+    /// visible rather than hidden).
+    pub fn peak(&self) -> usize {
+        self.peak.load(Ordering::Relaxed)
+    }
+
+    /// Start a new peak window at the current usage. `ExecutionContext::sql`
+    /// calls this on entry so `QueryMetrics::peak_memory_bytes` describes
+    /// THIS query's window instead of the process lifetime.
+    pub fn reset_peak(&self) {
+        self.peak.store(self.used(), Ordering::SeqCst);
     }
 
     /// Maximum memory
@@ -282,7 +307,10 @@ impl<'a> MemoryReservation<'a> {
     pub fn resize(&mut self, new_size: usize) {
         if new_size > self.size {
             let diff = new_size - self.size;
-            self.pool.used.fetch_add(diff, Ordering::SeqCst);
+            let prev = self.pool.used.fetch_add(diff, Ordering::SeqCst);
+            self.pool
+                .peak
+                .fetch_max(prev.saturating_add(diff), Ordering::SeqCst);
         } else {
             let diff = self.size - new_size;
             self.pool.used.fetch_sub(diff, Ordering::SeqCst);
@@ -630,6 +658,30 @@ fn parse_memory_size(s: &str) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peak_is_a_high_water_mark_not_the_residual() {
+        let pool = MemoryPool::new(1000);
+        assert_eq!(pool.peak(), 0);
+        {
+            let mut a = pool.try_allocate(300).expect("fits");
+            assert_eq!(pool.peak(), 300);
+            let _b = pool.allocate(500);
+            assert_eq!(pool.peak(), 800);
+            a.resize(400);
+            assert_eq!(pool.peak(), 900);
+            a.resize(100);
+            assert_eq!(pool.used(), 600);
+            assert_eq!(pool.peak(), 900, "shrinking never lowers the peak");
+        }
+        assert_eq!(pool.used(), 0);
+        assert_eq!(pool.peak(), 900, "release never lowers the peak");
+        pool.reset_peak();
+        assert_eq!(pool.peak(), 0, "reset starts a new window at used()");
+        let _c = pool.allocate(50);
+        pool.reset_peak();
+        assert_eq!(pool.peak(), 50);
+    }
 
     #[test]
     fn test_memory_pool() {

@@ -389,6 +389,12 @@ enum Commands {
         #[arg(long)]
         flight_bind: Option<String>,
 
+        /// Capacity of the in-memory query log behind `/queries`, `/stats`
+        /// and the web UI at `/ui` (default 1000, floor 10; env
+        /// QE_QUERY_LOG_SIZE).
+        #[arg(long)]
+        query_log_size: Option<usize>,
+
         /// Pulsar broker web-service URL (`http://host:8080`): every
         /// schema'd topic of --pulsar-namespace registers as a table
         /// (requires --features pulsar).
@@ -1436,6 +1442,7 @@ async fn main() {
             drain_ms,
             shutdown_grace_ms,
             flight_bind,
+            query_log_size,
             pulsar_admin,
             pulsar_namespace,
         } => {
@@ -1457,6 +1464,14 @@ async fn main() {
                     schema: metastore_schema,
                 });
 
+            let query_log_size = query_log_size
+                .or_else(|| {
+                    std::env::var("QE_QUERY_LOG_SIZE")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                })
+                .unwrap_or(query_engine::distributed::DEFAULT_QUERY_LOG_SIZE)
+                .max(query_engine::distributed::MIN_QUERY_LOG_SIZE);
             let opts = ServeOptions {
                 bind,
                 advertise,
@@ -1469,6 +1484,7 @@ async fn main() {
                 drain: Duration::from_millis(drain_ms),
                 shutdown_grace: Duration::from_millis(shutdown_grace_ms),
                 flight_bind,
+                query_log_size,
             };
 
             let loader = Box::new(move || {

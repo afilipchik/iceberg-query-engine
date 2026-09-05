@@ -40,6 +40,10 @@
 
 use crate::distributed::http_client;
 use crate::distributed::membership::{Discovery, Member, Membership, MembershipChange, NodeId};
+use crate::distributed::query_log::{
+    ClusterCounts, Completion, FrontDoor, ListFilter, MemoryView, MetricFacts, QueryLog,
+    QueryOrigin, ShardFacts, SpillFacts, StatsInputs, DEFAULT_QUERY_LOG_SIZE,
+};
 use crate::error::{QueryError, Result};
 use crate::execution::{ExecutionContext, QueryResult};
 use http_body_util::{BodyExt, Full, Limited};
@@ -103,6 +107,9 @@ pub struct ServeOptions {
     /// port was ephemeral, so tests binding `:0` stay collision-free. The
     /// literal `"none"` disables the Flight endpoint entirely.
     pub flight_bind: Option<String>,
+    /// Capacity of the in-memory query log behind `/queries` and `/stats`
+    /// (query-ui epic). Floor [`MIN_QUERY_LOG_SIZE`](crate::distributed::MIN_QUERY_LOG_SIZE).
+    pub query_log_size: usize,
 }
 
 impl Default for ServeOptions {
@@ -119,6 +126,7 @@ impl Default for ServeOptions {
             drain: Duration::ZERO,
             shutdown_grace: Duration::from_secs(10),
             flight_bind: None,
+            query_log_size: DEFAULT_QUERY_LOG_SIZE,
         }
     }
 }
@@ -158,6 +166,9 @@ pub struct NodeState {
     started: Instant,
     /// Kicks the discovery loop out of its sleep after a reconfiguration.
     discovery_kick: Notify,
+    /// Bounded history of every statement this node ran (query-ui epic):
+    /// the source of `/queries`, `/queries/{id}` and `/stats`.
+    pub query_log: QueryLog,
 }
 
 impl NodeState {
@@ -166,8 +177,10 @@ impl NodeState {
         address: String,
         flight_address: Option<String>,
         membership: Arc<Membership>,
+        query_log_size: usize,
     ) -> Self {
         Self {
+            query_log: QueryLog::new(node_id, query_log_size),
             node_id,
             address,
             flight_address,
@@ -342,7 +355,13 @@ pub async fn spawn(opts: ServeOptions, loader: TableLoader) -> Result<ServerHand
 
     let membership = Arc::new(Membership::new(node_id, address.clone(), discovery));
     membership.set_self_flight(flight_address.clone());
-    let state = Arc::new(NodeState::new(node_id, address, flight_address, membership));
+    let state = Arc::new(NodeState::new(
+        node_id,
+        address,
+        flight_address,
+        membership,
+        opts.query_log_size,
+    ));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     // Arrow Flight server, sharing the shutdown signal with the HTTP side.
@@ -495,7 +514,7 @@ fn spawn_connection(
         let _guard = inflight;
         let service = service_fn(move |req| {
             let state = state.clone();
-            async move { Ok::<_, std::convert::Infallible>(route(req, state).await) }
+            async move { Ok::<_, std::convert::Infallible>(route(req, state, peer).await) }
         });
         let conn = http1::Builder::new()
             .keep_alive(true)
@@ -692,7 +711,11 @@ async fn probe_once(state: &Arc<NodeState>, timeout: Duration) {
 // Routing
 // ---------------------------------------------------------------------------
 
-async fn route(req: Request<Incoming>, state: Arc<NodeState>) -> Response<Full<Bytes>> {
+async fn route(
+    req: Request<Incoming>,
+    state: Arc<NodeState>,
+    peer: SocketAddr,
+) -> Response<Full<Bytes>> {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
     let query = req.uri().query().unwrap_or("").to_string();
@@ -702,12 +725,23 @@ async fn route(req: Request<Incoming>, state: Arc<NodeState>) -> Response<Full<B
         (&Method::GET, "/readyz") => readyz(&state),
         (&Method::GET, "/cluster") => cluster(&state),
         (&Method::GET, "/splits") => splits(&state, &query),
-        (&Method::POST, "/sql") => sql(req, &state, &query).await,
-        (&Method::POST, "/fragment") => fragment(req, &state).await,
-        (&Method::GET, "/") => index(&state),
-        (_, "/healthz") | (_, "/readyz") | (_, "/cluster") | (_, "/splits") | (_, "/") => {
-            error_response(StatusCode::METHOD_NOT_ALLOWED, "use GET")
+        (&Method::GET, "/queries") => queries(&state, &query),
+        (&Method::GET, p) if p.starts_with("/queries/") => {
+            query_detail(&state, &p["/queries/".len()..])
         }
+        (&Method::GET, "/stats") => stats(&state),
+        (&Method::GET, "/tables") => tables(&state),
+        (&Method::POST, "/sql") => sql(req, &state, &query, peer).await,
+        (&Method::POST, "/fragment") => fragment(req, &state, peer).await,
+        (&Method::GET, "/") => index(&state),
+        (_, "/healthz")
+        | (_, "/readyz")
+        | (_, "/cluster")
+        | (_, "/splits")
+        | (_, "/")
+        | (_, "/queries")
+        | (_, "/stats")
+        | (_, "/tables") => error_response(StatusCode::METHOD_NOT_ALLOWED, "use GET"),
         (_, "/sql") => error_response(StatusCode::METHOD_NOT_ALLOWED, "use POST /sql"),
         (_, "/fragment") => error_response(StatusCode::METHOD_NOT_ALLOWED, "use POST /fragment"),
         _ => error_response(
@@ -736,7 +770,14 @@ fn index(state: &Arc<NodeState>) -> Response<Full<Bytes>> {
          POST /sql        execute SQL; body is the statement.\n\
                           ?format=arrow (default) | json | csv\n\
                           ?distributed=auto (default) | 1 | 0\n\
-         POST /fragment   execute one shard of a distributed query (internal)\n\n\
+         POST /fragment   execute one shard of a distributed query (internal)\n\
+         GET  /queries    the last N statements this node ran (JSON)\n\
+                          ?limit=<N|all>&state=running|finished|failed\n\
+                          &door=http|flight|fragment&q=<substring>\n\
+         GET  /queries/<id>  one statement in full: timings, memory, spill,\n\
+                          pruning, plans, distribution, error\n\
+         GET  /stats      throughput, latency percentiles, errors, memory (JSON)\n\
+         GET  /tables     registered tables and their schemas (JSON)\n\n\
          Every /sql response carries x-qe-distributed: true|false, and when it\n\
          is true, x-qe-imbalance and x-qe-distribution describing exactly how\n\
          the work was divided. `distributed=1` NEVER falls back to local: exact\n\
@@ -789,6 +830,16 @@ impl DistMode {
             };
         }
         Ok(DistMode::Auto)
+    }
+}
+
+impl DistMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            DistMode::Auto => "auto",
+            DistMode::Force => "force",
+            DistMode::Off => "off",
+        }
     }
 }
 
@@ -858,7 +909,11 @@ impl crate::distributed::FragmentTransport for HttpTransport {
 }
 
 /// `POST /fragment` — run one shard. Internal to the cluster.
-async fn fragment(req: Request<Incoming>, state: &Arc<NodeState>) -> Response<Full<Bytes>> {
+async fn fragment(
+    req: Request<Incoming>,
+    state: &Arc<NodeState>,
+    peer: SocketAddr,
+) -> Response<Full<Bytes>> {
     let Some(ctx) = state.context() else {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -892,19 +947,41 @@ async fn fragment(req: Request<Incoming>, state: &Arc<NodeState>) -> Response<Fu
     };
 
     state.queries_total.fetch_add(1, Ordering::Relaxed);
+    let query_id = state.query_log.begin_fragment(
+        &request.sql,
+        Some(peer.to_string()),
+        ShardFacts {
+            table: request.table.clone(),
+            index: request.shard_index,
+            count: request.shard_count,
+        },
+    );
+    let memory_limit_bytes = Some(ctx.memory_pool().max()).filter(|m| *m != usize::MAX);
     let started = Instant::now();
     let joined = query_runtime()
         .spawn(async move {
             let (result, stats) = crate::distributed::execute_fragment(&ctx, &request).await?;
             let bytes =
                 crate::distributed::coordinator::encode_ipc(&result.schema, &result.batches)?;
-            Ok::<_, QueryError>((bytes, result.row_count, stats))
+            Ok::<_, QueryError>((bytes, result.row_count, stats, result.metrics))
         })
         .await;
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
 
     match joined {
-        Ok(Ok((bytes, rows, stats))) => {
+        Ok(Ok((bytes, rows, stats, metrics))) => {
+            state.query_log.finish(
+                &query_id,
+                Completion {
+                    elapsed_ms,
+                    rows,
+                    metrics: metric_facts(&metrics),
+                    memory_limit_bytes,
+                    distribution: None,
+                    fallback_reason: None,
+                },
+            );
+            state.query_log.set_result(&query_id, bytes.len(), "arrow");
             let mut resp =
                 raw_response(StatusCode::OK, "application/vnd.apache.arrow.stream", bytes);
             let h = resp.headers_mut();
@@ -929,10 +1006,16 @@ async fn fragment(req: Request<Incoming>, state: &Arc<NodeState>) -> Response<Fu
         }
         Ok(Err(e)) => {
             state.queries_failed.fetch_add(1, Ordering::Relaxed);
+            state
+                .query_log
+                .fail(&query_id, elapsed_ms, e.kind(), &e.to_string());
             error_response(StatusCode::BAD_REQUEST, &e.to_string())
         }
         Err(e) => {
             state.queries_failed.fetch_add(1, Ordering::Relaxed);
+            state
+                .query_log
+                .fail(&query_id, elapsed_ms, "TaskFailed", &e.to_string());
             error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("fragment task failed: {e}"),
@@ -1166,6 +1249,14 @@ impl ResultFormat {
         Ok(ResultFormat::Arrow)
     }
 
+    fn as_str(self) -> &'static str {
+        match self {
+            ResultFormat::Arrow => "arrow",
+            ResultFormat::Json => "json",
+            ResultFormat::Csv => "csv",
+        }
+    }
+
     fn content_type(&self) -> &'static str {
         match self {
             ResultFormat::Arrow => "application/vnd.apache.arrow.stream",
@@ -1183,6 +1274,15 @@ pub(crate) struct ExecOutcome {
     pub(crate) distribution: Option<crate::distributed::Distribution>,
     pub(crate) fallback_reason: Option<String>,
     pub(crate) elapsed_ms: f64,
+}
+
+/// What `execute_statement` hands back: the query-log id it recorded the
+/// statement under (`None` only when the node was not ready, which records
+/// nothing) plus the outcome. Front doors surface the id (`x-qe-query-id`,
+/// the Flight trailer) so a caller can find its own record in `/queries/{id}`.
+pub(crate) struct Executed {
+    pub(crate) query_id: Option<String>,
+    pub(crate) outcome: std::result::Result<ExecOutcome, ExecError>,
 }
 
 /// Why a statement did not produce a result, separated from `QueryError` so
@@ -1204,16 +1304,22 @@ pub(crate) async fn execute_statement(
     state: &Arc<NodeState>,
     statement: &str,
     mode: DistMode,
-) -> std::result::Result<ExecOutcome, ExecError> {
+    origin: QueryOrigin,
+) -> Executed {
     let Some(ctx) = state.context() else {
         let reason = state
             .load_error()
             .map(|e| format!("tables failed to load: {e}"))
             .unwrap_or_else(|| "tables are still loading".to_string());
-        return Err(ExecError::NotReady(reason));
+        return Executed {
+            query_id: None,
+            outcome: Err(ExecError::NotReady(reason)),
+        };
     };
 
     state.queries_total.fetch_add(1, Ordering::Relaxed);
+    let query_id = state.query_log.begin(statement, &origin, mode.as_str());
+    let memory_limit_bytes = Some(ctx.memory_pool().max()).filter(|m| *m != usize::MAX);
     let started = Instant::now();
 
     // Decide local vs distributed BEFORE any fan-out, and only ever fall back
@@ -1257,25 +1363,200 @@ pub(crate) async fn execute_statement(
         .await;
 
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-    match joined {
-        Ok(Ok((result, distribution))) => Ok(ExecOutcome {
-            result,
-            distribution,
-            fallback_reason,
-            elapsed_ms,
-        }),
+    let outcome = match joined {
+        Ok(Ok((result, distribution))) => {
+            state.query_log.finish(
+                &query_id,
+                Completion {
+                    elapsed_ms,
+                    rows: result.row_count,
+                    metrics: metric_facts(&result.metrics),
+                    memory_limit_bytes,
+                    distribution: distribution
+                        .as_ref()
+                        .and_then(|d| serde_json::to_value(d).ok()),
+                    fallback_reason: fallback_reason.clone(),
+                },
+            );
+            Ok(ExecOutcome {
+                result,
+                distribution,
+                fallback_reason,
+                elapsed_ms,
+            })
+        }
         Ok(Err(e)) => {
             state.queries_failed.fetch_add(1, Ordering::Relaxed);
+            state
+                .query_log
+                .fail(&query_id, elapsed_ms, e.kind(), &e.to_string());
             Err(ExecError::Query(e))
         }
         Err(e) => {
             state.queries_failed.fetch_add(1, Ordering::Relaxed);
+            state
+                .query_log
+                .fail(&query_id, elapsed_ms, "TaskFailed", &e.to_string());
             Err(ExecError::TaskFailed(e.to_string()))
         }
+    };
+    Executed {
+        query_id: Some(query_id),
+        outcome,
     }
 }
 
-async fn sql(req: Request<Incoming>, state: &Arc<NodeState>, query: &str) -> Response<Full<Bytes>> {
+/// Copy the engine's `QueryMetrics` into the log's transport-free shape.
+fn metric_facts(m: &crate::execution::QueryMetrics) -> MetricFacts {
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    MetricFacts {
+        parse_ms: ms(m.parse_time),
+        plan_ms: ms(m.plan_time),
+        optimize_ms: ms(m.optimize_time),
+        execute_ms: ms(m.execute_time),
+        batches: m.batches,
+        peak_memory_bytes: m.peak_memory_bytes,
+        spill: m.spill_metrics.as_ref().map(|s| SpillFacts {
+            bytes: s.bytes_spilled,
+            partitions: s.partitions_spilled,
+            files: s.spill_files_created,
+            read_back_ms: s.read_back_time_ms as f64,
+        }),
+        files_pruned_by_stats: m.files_pruned_by_stats,
+        files_pruned_by_partition: m.files_pruned_by_partition,
+        rollup_answered: m.rollup_answered.clone(),
+        tables: m.tables.clone(),
+        optimized_plan: m.optimized_plan.clone(),
+        physical_plan: m.physical_plan.clone(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Query log endpoints (query-ui epic)
+// ---------------------------------------------------------------------------
+
+/// `GET /queries?limit=N|all&state=..&door=..&q=..` — newest first.
+fn queries(state: &Arc<NodeState>, query: &str) -> Response<Full<Bytes>> {
+    let filter = match ListFilter::parse(query) {
+        Ok(f) => f,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
+    };
+    let view = state.query_log.list(&filter);
+    match serde_json::to_value(&view) {
+        Ok(v) => json_response(StatusCode::OK, &v),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// `GET /queries/{id}` — one record in full.
+fn query_detail(state: &Arc<NodeState>, id: &str) -> Response<Full<Bytes>> {
+    let id = id.trim_end_matches('/');
+    match state.query_log.get(id) {
+        Some(record) => match serde_json::to_value(&record) {
+            Ok(v) => json_response(StatusCode::OK, &v),
+            Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        },
+        None => error_response(
+            StatusCode::NOT_FOUND,
+            &format!(
+                "no query {id:?} in this node's log (capacity {}; it may have been evicted \
+                 or run on another node)",
+                state.query_log.capacity()
+            ),
+        ),
+    }
+}
+
+/// `GET /stats` — computed on request from the log and the node's counters.
+fn stats(state: &Arc<NodeState>) -> Response<Full<Bytes>> {
+    let members = state.membership.members();
+    let up = members
+        .iter()
+        .filter(|m| m.is_self || m.status == crate::distributed::PeerStatus::Up)
+        .count();
+    let memory = state
+        .context()
+        .map(|ctx| {
+            let pool = ctx.memory_pool();
+            MemoryView {
+                used: pool.used(),
+                peak: pool.peak(),
+                // 0 = unlimited, so the JSON stays a sane number.
+                max: if pool.max() == usize::MAX {
+                    0
+                } else {
+                    pool.max()
+                },
+                spilled_total: pool.spilled(),
+            }
+        })
+        .unwrap_or_default();
+    let view = state.query_log.stats(StatsInputs {
+        uptime_s: state.uptime().as_secs_f64(),
+        lifetime_total: state.queries_total.load(Ordering::Relaxed),
+        lifetime_failed: state.queries_failed.load(Ordering::Relaxed),
+        memory,
+        cluster: ClusterCounts {
+            members: members.len(),
+            up,
+            ready: state.ready(),
+        },
+    });
+    match serde_json::to_value(&view) {
+        Ok(v) => json_response(StatusCode::OK, &v),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// `GET /tables` — registered tables with their schemas. Answers before
+/// readiness with an empty list and the load state, so the UI can render.
+fn tables(state: &Arc<NodeState>) -> Response<Full<Bytes>> {
+    let ctx = state.context();
+    let mut out = Vec::new();
+    if let Some(ctx) = &ctx {
+        let mut names = ctx.table_names();
+        names.sort();
+        for name in names {
+            let columns: Vec<serde_json::Value> = ctx
+                .table_schema(&name)
+                .map(|s| {
+                    s.fields()
+                        .iter()
+                        .map(|f| {
+                            serde_json::json!({
+                                "name": f.name(),
+                                "data_type": f.data_type().to_string(),
+                                "nullable": f.is_nullable(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push(serde_json::json!({
+                "name": name,
+                "column_count": columns.len(),
+                "columns": columns,
+            }));
+        }
+    }
+    json_response(
+        StatusCode::OK,
+        &serde_json::json!({
+            "node_id": state.node_id,
+            "ready": ctx.is_some(),
+            "load_error": state.load_error(),
+            "table_count": out.len(),
+            "tables": out,
+        }),
+    )
+}
+
+async fn sql(
+    req: Request<Incoming>,
+    state: &Arc<NodeState>,
+    query: &str,
+    peer: SocketAddr,
+) -> Response<Full<Bytes>> {
     let format = match ResultFormat::parse(query) {
         Ok(f) => f,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
@@ -1316,9 +1597,14 @@ async fn sql(req: Request<Incoming>, state: &Arc<NodeState>, query: &str) -> Res
         return error_response(StatusCode::BAD_REQUEST, "empty SQL body");
     }
 
-    let outcome = execute_statement(state, &statement, mode).await;
+    let origin = QueryOrigin {
+        front_door: FrontDoor::Http,
+        client_addr: Some(peer.to_string()),
+    };
+    let Executed { query_id, outcome } = execute_statement(state, &statement, mode, origin).await;
+    let id_header = query_id.as_deref().and_then(|id| header_value(id).ok());
 
-    match outcome {
+    let mut resp = match outcome {
         Ok(ExecOutcome {
             result,
             distribution,
@@ -1330,6 +1616,11 @@ async fn sql(req: Request<Incoming>, state: &Arc<NodeState>, query: &str) -> Res
                 Ok(b) => b,
                 Err(e) => {
                     state.queries_failed.fetch_add(1, Ordering::Relaxed);
+                    if let Some(id) = &query_id {
+                        state
+                            .query_log
+                            .fail(id, elapsed_ms, e.kind(), &format!("encoding: {e}"));
+                    }
                     let status = if matches!(e, QueryError::NotImplemented(_)) {
                         StatusCode::NOT_IMPLEMENTED
                     } else {
@@ -1338,9 +1629,15 @@ async fn sql(req: Request<Incoming>, state: &Arc<NodeState>, query: &str) -> Res
                     let mut resp = error_response(status, &e.to_string());
                     resp.headers_mut()
                         .insert("x-qe-distributed", "false".parse().expect("ascii"));
+                    if let Some(v) = id_header {
+                        resp.headers_mut().insert("x-qe-query-id", v);
+                    }
                     return resp;
                 }
             };
+            if let Some(id) = &query_id {
+                state.query_log.set_result(id, bytes.len(), format.as_str());
+            }
             let mut resp = raw_response(StatusCode::OK, format.content_type(), bytes);
             let h = resp.headers_mut();
             h.insert("x-qe-rows", rows.to_string().parse().expect("numeric"));
@@ -1406,7 +1703,11 @@ async fn sql(req: Request<Incoming>, state: &Arc<NodeState>, query: &str) -> Res
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("query task failed: {e}"),
         ),
+    };
+    if let Some(v) = id_header {
+        resp.headers_mut().insert("x-qe-query-id", v);
     }
+    resp
 }
 
 /// A header value with control characters and non-ASCII stripped, since an
