@@ -320,6 +320,12 @@ pub struct SpillableHashJoinExec {
     on: Vec<(Expr, Expr)>,
     join_type: JoinType,
     schema: SchemaRef,
+    /// The FULL (left ++ right, nullability-adjusted) output schema, kept
+    /// unpruned even after `set_retained` narrows `schema` — the spill
+    /// path's outer-join emission (spill-boundaries task 003) needs the
+    /// declared type of every column, including the pruned ones, to
+    /// NULL-extend the non-preserved side before applying the mask.
+    full_schema: SchemaRef,
     memory_pool: SharedMemoryPool,
     config: ExecutionConfig,
     /// When true, build hash table from right side (smaller) for Left joins.
@@ -461,6 +467,7 @@ impl SpillableHashJoinExec {
             right,
             on,
             join_type,
+            full_schema: schema.clone(),
             schema,
             memory_pool,
             config,
@@ -709,8 +716,8 @@ impl SpillableHashJoinExec {
     /// without ever crossing the threshold, this is the ordinary "fits in
     /// memory" case — nothing about that path's cost or shape changes
     /// versus before.
-    /// Enter the disk-spill branch: validate join shape (INNER/SEMI/ANTI,
-    /// no filter), create the spill directory, and hand `prefix` (already
+    /// Enter the disk-spill branch: validate join shape (INNER/SEMI/ANTI),
+    /// create the spill directory, and hand `prefix` (already
     /// flat-collected batches) chained with `rest` (whatever remains of the
     /// build stream — empty if the stream was already exhausted) to
     /// `build_with_partitioning`. Factored out of `compute_build_decision`
@@ -728,33 +735,33 @@ impl SpillableHashJoinExec {
         build_keys: &[Expr],
         sj_trace: bool,
     ) -> Result<BuildDecision> {
-        // spill-join-correctness-3 task 004: SEMI and ANTI now take the
-        // spill path too (existence semantics survive hash partitioning —
-        // see `probe_with_spilling` / `process_spilled_partition`).
-        // LEFT/RIGHT/FULL stay refused: an outer join must NULL-extend
-        // every unmatched row of its preserved side, which needs match
-        // tracking across the WHOLE build side (every spilled partition
-        // included) plus NULL-extended emission — a materially bigger
-        // design, explicitly out of this epic's scope.
+        // spill-join-correctness-3 task 004: SEMI and ANTI take the spill
+        // path (existence semantics survive hash partitioning — see
+        // `probe_with_spilling` / `process_spilled_partition`).
+        // spill-boundaries task 002: an ON-clause filter no longer refuses
+        // — it is applied to every candidate pair where the pair is formed
+        // (`visit_candidate_pairs`). Task 003: LEFT/RIGHT/FULL spill too —
+        // the SEMI/ANTI match bitmaps, per preserved side, plus
+        // NULL-extended emission of the unmatched rows (see
+        // `SpillJoinCtx::probe_emit` / `build_emit`). What remains refused,
+        // by name: CROSS (no key to partition on), SINGLE and MARK (the
+        // DelimJoin-only types).
         if !matches!(
             self.join_type,
-            JoinType::Inner | JoinType::Semi | JoinType::Anti
+            JoinType::Inner
+                | JoinType::Left
+                | JoinType::Right
+                | JoinType::Full
+                | JoinType::Semi
+                | JoinType::Anti
         ) {
             return Err(QueryError::Execution(format!(
                 "{} join build side exceeds the memory budget, but the join spill \
-                 path supports only INNER, SEMI and ANTI joins (LEFT/RIGHT/FULL \
-                 outer joins are not spillable). Raise the memory limit for this \
-                 query.",
+                 path supports INNER, LEFT, RIGHT, FULL, SEMI and ANTI joins only \
+                 (CROSS/SINGLE/MARK are not spillable). Raise the memory limit for \
+                 this query.",
                 self.join_type
             )));
-        }
-        if self.filter.is_some() {
-            return Err(QueryError::Execution(
-                "join build side exceeds the memory budget, but the join spill \
-                 path cannot evaluate an ON-clause filter. Raise the memory \
-                 limit for this query."
-                    .to_string(),
-            ));
         }
 
         self.config.ensure_spill_dir()?;
@@ -1024,13 +1031,28 @@ impl SpillableHashJoinExec {
         let probe_partitions = probe_side.output_partitions().max(1);
         let probe_stream = stream_merge_input_partitions(probe_side).await?;
 
+        let (build_side, _) = if swapped {
+            (&self.right, &self.left)
+        } else {
+            (&self.left, &self.right)
+        };
+        let filter = self.filter.as_ref().map(|f| {
+            Arc::new(PairFilter::new(
+                f.clone(),
+                &build_side.schema(),
+                &probe_side.schema(),
+                swapped,
+            ))
+        });
         let ctx = SpillJoinCtx {
             build_keys,
             probe_keys,
             join_type: self.join_type,
             swapped,
             schema: self.schema.clone(),
+            full_schema: self.full_schema.clone(),
             retained: self.retained.clone(),
+            filter,
             memory_threshold: (self.config.memory_limit as f64 * self.config.spill_threshold)
                 as usize,
             memory_pool: self.memory_pool.clone(),
@@ -1458,7 +1480,14 @@ struct SpillJoinCtx {
     join_type: JoinType,
     swapped: bool,
     schema: SchemaRef,
+    /// The unpruned left ++ right output schema (see
+    /// `SpillableHashJoinExec::full_schema`).
+    full_schema: SchemaRef,
     retained: Option<Vec<bool>>,
+    /// spill-boundaries task 002: the ON-clause predicate (compiled once
+    /// per call), applied to every candidate pair. `None` = key equality
+    /// alone decides.
+    filter: Option<Arc<PairFilter>>,
     memory_threshold: usize,
     memory_pool: SharedMemoryPool,
     sj_trace: bool,
@@ -1472,12 +1501,79 @@ struct SpillJoinCtx {
     parallelism_override: Option<usize>,
 }
 
+/// What the spill path emits for the rows of one side once their match
+/// status is final (spill-boundaries task 003, generalizing the SEMI/ANTI
+/// `want` flag): nothing (the side is not an output side on its own),
+/// the matched rows alone (SEMI), the unmatched rows alone (ANTI), or the
+/// unmatched rows NULL-extended with the other side's columns (the
+/// preserved side of an outer join).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowEmit {
+    None,
+    Matched,
+    Unmatched,
+    UnmatchedNullExtended,
+}
+
 impl SpillJoinCtx {
-    fn is_semi_anti(&self) -> bool {
-        matches!(self.join_type, JoinType::Semi | JoinType::Anti)
+    /// Matched (build row, probe row) pairs are output rows: INNER and the
+    /// outer joins. SEMI/ANTI emit one side's rows by match status only.
+    fn emit_pairs(&self) -> bool {
+        matches!(
+            self.join_type,
+            JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full
+        )
     }
-    fn is_semi(&self) -> bool {
-        matches!(self.join_type, JoinType::Semi)
+    /// The PROBE side is preserved (its unmatched rows are output,
+    /// NULL-extended): LEFT with build = right, RIGHT with build = left,
+    /// FULL either way.
+    fn preserve_probe(&self) -> bool {
+        match self.join_type {
+            JoinType::Left => self.swapped,
+            JoinType::Right => !self.swapped,
+            JoinType::Full => true,
+            _ => false,
+        }
+    }
+    /// The BUILD side is preserved: LEFT with build = left, RIGHT with
+    /// build = right, FULL either way.
+    fn preserve_build(&self) -> bool {
+        match self.join_type {
+            JoinType::Left => !self.swapped,
+            JoinType::Right => self.swapped,
+            JoinType::Full => true,
+            _ => false,
+        }
+    }
+    /// A per-probe-row match bitmap is needed: probe-side-output SEMI/ANTI
+    /// (spill-join-correctness-3 task 004) or a preserved probe side.
+    fn probe_bitmap(&self) -> bool {
+        (matches!(self.join_type, JoinType::Semi | JoinType::Anti) && self.swapped)
+            || self.preserve_probe()
+    }
+    /// A per-build-row match bitmap is needed: build-side-output SEMI/ANTI
+    /// or a preserved build side.
+    fn build_bitmap(&self) -> bool {
+        (matches!(self.join_type, JoinType::Semi | JoinType::Anti) && !self.swapped)
+            || self.preserve_build()
+    }
+    /// What to emit for a probe batch once its bitmap is final.
+    fn probe_emit(&self) -> RowEmit {
+        match (self.join_type, self.swapped) {
+            (JoinType::Semi, true) => RowEmit::Matched,
+            (JoinType::Anti, true) => RowEmit::Unmatched,
+            _ if self.preserve_probe() => RowEmit::UnmatchedNullExtended,
+            _ => RowEmit::None,
+        }
+    }
+    /// What to emit for a build partition / chunk once its bitmap is final.
+    fn build_emit(&self) -> RowEmit {
+        match (self.join_type, self.swapped) {
+            (JoinType::Semi, false) => RowEmit::Matched,
+            (JoinType::Anti, false) => RowEmit::Unmatched,
+            _ if self.preserve_build() => RowEmit::UnmatchedNullExtended,
+            _ => RowEmit::None,
+        }
     }
     /// This call's probe spill file for partition `idx` — PER CALL (the
     /// probe side is re-executed and re-partitioned on every call, and an
@@ -1832,8 +1928,9 @@ struct PhaseAState {
     spill_writers: Vec<Option<ArrowWriter<File>>>,
     probe_spill_files: Vec<Option<PathBuf>>,
     probe_key_checksums: Vec<Option<KeyChecksum>>,
-    /// Build-side SEMI/ANTI only: one bitmap per RESIDENT partition (per
-    /// build batch), marked from many probe pieces at once → `AtomicBool`.
+    /// `SpillJoinCtx::build_bitmap` joins only (build-side SEMI/ANTI, a
+    /// preserved build side): one bitmap per RESIDENT partition (per build
+    /// batch), marked from many probe pieces at once → `AtomicBool`.
     build_matched: Vec<Option<Vec<Vec<std::sync::atomic::AtomicBool>>>>,
 }
 
@@ -1894,8 +1991,8 @@ fn phase_a_process_group(
 ) -> Result<(PhaseAState, Vec<RecordBatch>)> {
     use rayon::prelude::*;
     let probe_keys = &ctx.probe_keys;
-    let is_semi_anti = ctx.is_semi_anti();
-    let is_semi = ctx.is_semi();
+    let probe_bitmap = ctx.probe_bitmap();
+    let probe_emit = ctx.probe_emit();
 
     let merged = if group.len() == 1 {
         group.pop().expect("one batch")
@@ -1965,28 +2062,28 @@ fn phase_a_process_group(
                     let pb = RecordBatch::try_new(merged.schema(), columns?)?;
                     let mut outputs: Vec<RecordBatch> = Vec::new();
                     if let Some(ref ht) = state.tables[idx] {
-                        // Probe in-memory partition
+                        // Probe in-memory partition: pairs out (INNER/outer),
+                        // the resident partition's build bitmap marked
+                        // (build-side SEMI/ANTI, preserved build side), and
+                        // — since a probe row's status is final against its
+                        // own resident partition — its probe-side emission
+                        // right away (probe-side SEMI/ANTI rows, or the
+                        // unmatched rows of a preserved probe side,
+                        // NULL-extended).
                         let Some(build_part) = state.partitions[idx].as_ref() else {
                             return Ok(outputs);
                         };
-                        if !is_semi_anti {
-                            outputs.extend(probe_partition(
-                                &build_part.batches,
-                                std::slice::from_ref(&pb),
-                                ht,
-                                probe_keys,
-                                ctx.join_type,
-                                ctx.swapped,
-                                &ctx.schema,
-                                ctx.retained.as_deref(),
-                            )?);
-                        } else if ctx.swapped {
-                            let flags = probe_match_flags(&pb, ht, probe_keys)?;
-                            if let Some(out) = take_probe_rows(&pb, &flags, is_semi, &ctx.schema)? {
-                                outputs.push(out);
-                            }
-                        } else if let Some(bm) = build_bm {
-                            mark_build_matches_atomic(&pb, ht, probe_keys, bm)?;
+                        let mut flags = probe_bitmap.then(|| vec![false; pb.num_rows()]);
+                        outputs.extend(probe_batch_against_table(
+                            &build_part.batches,
+                            &pb,
+                            ht,
+                            ctx,
+                            build_bm.map(|v| v.as_slice()),
+                            flags.as_deref_mut(),
+                        )?);
+                        if let Some(flags) = flags {
+                            outputs.extend(emit_probe_rows(ctx, &pb, &flags)?);
                         }
                     } else if state.spilled[idx].is_some() {
                         // Spill probe rows for this partition
@@ -2002,15 +2099,21 @@ fn phase_a_process_group(
                                 .get_or_insert_with(KeyChecksum::default)
                                 .accumulate(cs);
                         }
-                    } else if is_semi_anti && ctx.swapped && !is_semi {
+                    } else if matches!(
+                        probe_emit,
+                        RowEmit::Unmatched | RowEmit::UnmatchedNullExtended
+                    ) {
                         // task 004: this partition holds NO build row at all
                         // (nothing was ever routed here, or it was emptied
                         // before the table pass), so every probe row in it is
                         // unmatched. INNER and SEMI correctly drop the batch;
                         // ANTI must EMIT it whole — the previously silent
                         // drop was exactly the wrong-result hazard for the
-                        // probe-side-output ANTI orientation.
-                        outputs.push(batch_with_actual_types(&ctx.schema, pb.columns().to_vec())?);
+                        // probe-side-output ANTI orientation — and a
+                        // preserved probe side (task 003) emits it whole,
+                        // NULL-extended.
+                        let all_false = vec![false; pb.num_rows()];
+                        outputs.extend(emit_probe_rows(ctx, &pb, &all_false)?);
                     }
                     Ok(outputs)
                 },
@@ -2065,10 +2168,15 @@ async fn probe_with_spilling(
     //     status is only known once the whole probe stream has been
     //     consumed — one match bitmap per resident partition (per build
     //     batch) is populated across the loop and emitted after it.
-    let is_semi_anti = ctx.is_semi_anti();
-    let is_semi = ctx.is_semi();
-    let build_side_output = is_semi_anti && !ctx.swapped;
-    let mut st = PhaseAState::new(state, build_side_output, ctx.memory_threshold)?;
+    // spill-boundaries task 003: the outer joins reuse exactly these two
+    // bitmaps for their PRESERVED side(s) — LEFT with build = right /
+    // RIGHT with build = left / FULL keep the probe-side one, LEFT with
+    // build = left / RIGHT with build = right / FULL the build-side one —
+    // and emit the unmatched rows NULL-extended where SEMI/ANTI emit them
+    // bare (`SpillJoinCtx::probe_emit` / `build_emit`); matched pairs are
+    // emitted as INNER pairs alongside.
+    let build_bitmap = ctx.build_bitmap();
+    let mut st = PhaseAState::new(state, build_bitmap, ctx.memory_threshold)?;
     let mut in_memory_matched = 0usize;
     // join-spill-streaming task 001: probe rows counted as they flow
     // (QE_SPILL_DEBUG trace), since the probe side is no longer a Vec.
@@ -2127,14 +2235,15 @@ async fn probe_with_spilling(
         }
     }
 
-    // Phase A' — task 004, build-side output: emit once the ENTIRE probe
+    // Phase A' — task 004, build-side bitmap: emit once the ENTIRE probe
     // stream is consumed. A resident partition no probe row ever reached
     // keeps an all-false bitmap: all of its rows are unmatched, so ANTI
-    // emits every one of them and SEMI none — the mirror hazard of the
-    // dropped-probe-batch case above. Build rows with NULL keys are never
-    // in the table, so they stay unmatched too, matching the in-memory
-    // join's own null-never-matches rule.
-    if build_side_output {
+    // (and a preserved build side, NULL-extended) emits every one of them
+    // and SEMI none — the mirror hazard of the dropped-probe-batch case
+    // above. Build rows with NULL keys are never in the table, so they
+    // stay unmatched too, matching the in-memory join's own
+    // null-never-matches rule.
+    if build_bitmap {
         for idx in 0..NUM_PARTITIONS {
             let Some(bm) = st.build_matched[idx].take() else {
                 continue;
@@ -2150,7 +2259,7 @@ async fn probe_with_spilling(
                         .collect()
                 })
                 .collect();
-            if let Some(out) = take_build_rows(&build_part.batches, &flags, is_semi, &ctx.schema)? {
+            for out in emit_build_rows(ctx, &build_part.batches, &flags)? {
                 if !emit_join_batch(tx, out, &mut in_memory_matched).await {
                     return abandoned(st, probe_rows_in, in_memory_matched);
                 }
@@ -2241,6 +2350,13 @@ fn open_spill_reader(
 ///     `AtomicBool`s so probe batches mark it in parallel (stores of
 ///     `true` commute). A partition with no probe file has no probe rows:
 ///     ANTI emits every build row, SEMI none.
+///   LEFT/RIGHT/FULL (spill-boundaries task 003): INNER pair emission per
+///     chunk PLUS the bitmap(s) of the preserved side(s) exactly as above —
+///     a preserved probe side is emitted NULL-extended in the final pass
+///     after the last chunk (never earlier: a probe row unmatched in chunk
+///     1 may match in chunk 2), a preserved build side per chunk. Both
+///     bitmaps live with this partition's job; K-way phase B is
+///     unchanged.
 fn process_spilled_partition(
     ctx: &SpillJoinCtx,
     sp: &SpilledPartition,
@@ -2258,10 +2374,8 @@ fn process_spilled_partition(
     let build_keys = &ctx.build_keys;
     let probe_keys = &ctx.probe_keys;
     let key_cols = build_keys.len();
-    let is_semi_anti = ctx.is_semi_anti();
-    let is_semi = ctx.is_semi();
-    let probe_side_output = is_semi_anti && ctx.swapped;
-    let build_side_output = is_semi_anti && !ctx.swapped;
+    let probe_bitmap = ctx.probe_bitmap();
+    let build_bitmap = ctx.build_bitmap();
 
     // spill-join-correctness-2 epic, task 001: recompute the join-key
     // checksum from the data read back off disk and compare it against
@@ -2283,7 +2397,7 @@ fn process_spilled_partition(
 
     let mut build_reader = open_spill_reader(&sp.build_file)?;
     let mut pending: Option<RecordBatch> = None;
-    // Probe-side SEMI/ANTI: one bitmap per probe batch, by file position.
+    // Probe-side bitmap joins: one bitmap per probe batch, by file position.
     let mut probe_matched: Vec<Vec<bool>> = Vec::new();
     // First pass over the probe file done (row count, checksum, bitmaps).
     let mut probe_seen = false;
@@ -2335,7 +2449,7 @@ fn process_spilled_partition(
         build_rows += chunk_rows;
         build_batches += chunk.len();
         let table = build_hash_table(&chunk, build_keys)?;
-        let build_bm: Vec<Vec<AtomicBool>> = if build_side_output {
+        let build_bm: Vec<Vec<AtomicBool>> = if build_bitmap {
             chunk
                 .iter()
                 .map(|b| (0..b.num_rows()).map(|_| AtomicBool::new(false)).collect())
@@ -2364,56 +2478,50 @@ fn process_spilled_partition(
                         if let Some(cs) = probe_read_cs.as_mut() {
                             cs.accumulate(batch_key_checksum(b, probe_keys)?);
                         }
-                        if probe_side_output {
+                        if probe_bitmap {
                             probe_matched.push(vec![false; b.num_rows()]);
                         }
                     }
                 }
-                if !is_semi_anti {
-                    let outs: Vec<Vec<RecordBatch>> = group
-                        .par_iter()
-                        .map(|pb| {
-                            probe_partition(
-                                &chunk,
-                                std::slice::from_ref(pb),
-                                &table,
-                                probe_keys,
-                                ctx.join_type,
-                                ctx.swapped,
-                                &ctx.schema,
-                                ctx.retained.as_deref(),
-                            )
-                        })
-                        .collect::<Result<_>>()?;
-                    for out in outs.into_iter().flatten() {
-                        if !sink(out) {
-                            alive = false;
-                            break 'chunks;
-                        }
-                    }
-                } else if probe_side_output {
+                // One pass per probe batch does everything this join needs
+                // against the chunk's table: INNER pairs (sent below), the
+                // chunk's build bitmap, this batch's probe bitmap.
+                let build_bm_ref = build_bitmap.then(|| build_bm.as_slice());
+                let outs: Vec<Vec<RecordBatch>> = if probe_bitmap {
                     let flags = &mut probe_matched[batch_pos..batch_pos + group.len()];
                     group
                         .par_iter()
                         .zip(flags.par_iter_mut())
-                        .try_for_each(|(pb, f)| {
-                            accumulate_probe_matches(
-                                std::slice::from_ref(pb),
+                        .map(|(pb, f)| {
+                            probe_batch_against_table(
+                                &chunk,
+                                pb,
                                 &table,
-                                probe_keys,
-                                std::slice::from_mut(f),
+                                ctx,
+                                build_bm_ref,
+                                Some(f.as_mut_slice()),
                             )
-                        })?;
+                        })
+                        .collect::<Result<_>>()?
                 } else {
-                    group.par_iter().try_for_each(|pb| {
-                        mark_build_matches_atomic(pb, &table, probe_keys, &build_bm)
-                    })?;
+                    group
+                        .par_iter()
+                        .map(|pb| {
+                            probe_batch_against_table(&chunk, pb, &table, ctx, build_bm_ref, None)
+                        })
+                        .collect::<Result<_>>()?
+                };
+                for out in outs.into_iter().flatten() {
+                    if !sink(out) {
+                        alive = false;
+                        break 'chunks;
+                    }
                 }
                 batch_pos += group.len();
             }
             probe_seen = true;
         }
-        if build_side_output {
+        if build_bitmap {
             let bm: Vec<Vec<bool>> = build_bm
                 .iter()
                 .map(|v| {
@@ -2422,7 +2530,7 @@ fn process_spilled_partition(
                         .collect()
                 })
                 .collect();
-            if let Some(out) = take_build_rows(&chunk, &bm, is_semi, &ctx.schema)? {
+            for out in emit_build_rows(ctx, &chunk, &bm)? {
                 if !sink(out) {
                     alive = false;
                     break 'chunks;
@@ -2431,10 +2539,11 @@ fn process_spilled_partition(
         }
     }
 
-    // Probe-side SEMI/ANTI: the emission pass, after the last chunk. A
-    // probe batch with no bitmap (no build chunk ever ran — every probe
-    // row unmatched) is all-false: ANTI emits it whole, SEMI drops it.
-    if alive && probe_side_output {
+    // Probe-side bitmap: the emission pass, after the last chunk. A probe
+    // batch with no bitmap (no build chunk ever ran — every probe row
+    // unmatched) is all-false: ANTI and a preserved probe side emit it
+    // whole (the latter NULL-extended), SEMI drops it.
+    if alive && probe_bitmap {
         if let Some(pf) = probe_file {
             for (i, r) in open_spill_reader(pf)?.enumerate() {
                 let pb = r?;
@@ -2452,7 +2561,7 @@ fn process_spilled_partition(
                         &all_false
                     }
                 };
-                if let Some(out) = take_probe_rows(&pb, flags, is_semi, &ctx.schema)? {
+                for out in emit_probe_rows(ctx, &pb, flags)? {
                     if !sink(out) {
                         alive = false;
                         break;
@@ -5464,61 +5573,444 @@ fn build_hash_table(
     Ok(table)
 }
 
+/// spill-boundaries task 002: the ON-clause predicate of a spilling join,
+/// applied to the candidate (build row, probe row) pairs the hash lookup
+/// produces — INNER keeps the passing pairs, SEMI/ANTI count a probe/build
+/// row as matched only through a passing pair. Evaluated where the pair is
+/// formed (`visit_candidate_pairs`), never as a post-filter: a post-filter
+/// cannot see which probe row an SEMI/ANTI decision belonged to, and for
+/// the outer joins task 003 adds it would delete the NULL-extended rows.
+///
+/// Two evaluation paths, decided per batch:
+/// - `compiled`: hash_join's `CompiledFilter` (one build column compared
+///   with one probe column, Int64/Int32/Float64/Utf8) evaluated straight
+///   from the arrays per pair — no gather at all. Guarded here by the
+///   ACTUAL array types (a Dictionary-encoded column, or a Date, would
+///   make `CompiledFilter::evaluate` return `false` for every pair) and by
+///   NULL slots (SQL: a comparison with NULL is not TRUE).
+/// - otherwise: the candidate pairs are gathered into a combined-schema
+///   batch (build ++ probe, or probe ++ build when swapped — the same
+///   left ++ right order the planner's `filter_inside_join` expression was
+///   bound against) in chunks of `PAIR_FILTER_CHUNK_PAIRS`, the expression
+///   is evaluated ONCE per chunk with `evaluate_expr`, and a pair passes
+///   iff its mask slot is valid AND true.
+struct PairFilter {
+    expr: Expr,
+    compiled: Option<super::hash_join::CompiledFilter>,
+}
+
+/// Candidate pairs gathered per filter evaluation on the generic path —
+/// bounds the transient combined batch whatever the probe batch's fan-out.
+const PAIR_FILTER_CHUNK_PAIRS: usize = 65_536;
+
+impl PairFilter {
+    fn new(expr: Expr, build_schema: &Schema, probe_schema: &Schema, swapped: bool) -> Self {
+        let compiled = super::hash_join::CompiledFilter::try_compile(
+            &expr,
+            build_schema,
+            probe_schema,
+            swapped,
+        );
+        Self { expr, compiled }
+    }
+
+    /// The compiled fast path, if it applies to THESE batches' actual
+    /// column types.
+    fn compiled_for(
+        &self,
+        build_batches: &[RecordBatch],
+        probe_batch: &RecordBatch,
+    ) -> Option<&super::hash_join::CompiledFilter> {
+        use arrow::datatypes::DataType;
+        let cf = self.compiled.as_ref()?;
+        let (b, p) = cf.column_indices();
+        let ok = |dt: &DataType| {
+            matches!(
+                dt,
+                DataType::Int64 | DataType::Int32 | DataType::Float64 | DataType::Utf8
+            )
+        };
+        let first = build_batches.first()?;
+        if b >= first.num_columns() || p >= probe_batch.num_columns() {
+            return None;
+        }
+        (ok(first.column(b).data_type()) && ok(probe_batch.column(p).data_type())).then_some(cf)
+    }
+
+    /// Mask over `pairs` (parallel `build_indices`/`probe_indices`) on the
+    /// generic path: gather, evaluate once, `valid && value`.
+    fn evaluate_pairs(
+        &self,
+        build_batches: &[RecordBatch],
+        probe_batch: &RecordBatch,
+        build_indices: &[(usize, usize)],
+        probe_indices: &[usize],
+        swapped: bool,
+    ) -> Result<Vec<bool>> {
+        let combined_schema: SchemaRef = {
+            let build_fields: Vec<_> = build_batches
+                .first()
+                .map(|b| b.schema().fields().iter().cloned().collect())
+                .unwrap_or_default();
+            let probe_fields: Vec<_> = probe_batch.schema().fields().iter().cloned().collect();
+            let fields: Vec<_> = if swapped {
+                probe_fields.into_iter().chain(build_fields).collect()
+            } else {
+                build_fields.into_iter().chain(probe_fields).collect()
+            };
+            Arc::new(Schema::new(fields))
+        };
+        let combined = super::hash_join::create_combined_batch(
+            build_batches,
+            build_indices,
+            probe_batch,
+            probe_indices,
+            swapped,
+            &combined_schema,
+        )?;
+        let result = evaluate_expr(&combined, &self.expr)?;
+        use arrow::array::Array;
+        let mask = result
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .ok_or_else(|| {
+                QueryError::Execution(format!(
+                    "join spill path: ON-clause filter evaluated to {:?}, not Boolean",
+                    result.data_type()
+                ))
+            })?;
+        Ok((0..mask.len())
+            .map(|i| mask.is_valid(i) && mask.value(i))
+            .collect())
+    }
+}
+
+/// THE candidate-pair enumeration of the join spill path (spill-boundaries
+/// task 002): every (build row, probe row) pair of ONE probe batch against
+/// ONE hash table that shares a non-NULL key AND passes the ON filter (all
+/// key matches when there is none). `visit(build_batch_idx, build_row,
+/// probe_row)` is called per passing pair; `first_only` stops each probe
+/// row at its first passing pair (existence is all SEMI/ANTI need on the
+/// probe side); `skip(probe_row)` rows are not probed at all (a probe row
+/// already known to match in an earlier chunk). INNER pair emission, both
+/// SEMI/ANTI orientations and the outer joins all go through here, so the
+/// filter can never be applied in one place and forgotten in another.
 #[allow(clippy::too_many_arguments)]
-fn probe_partition(
+fn visit_candidate_pairs(
     build_batches: &[RecordBatch],
-    probe_batches: &[RecordBatch],
+    probe_batch: &RecordBatch,
     hash_table: &HashMap<JoinKey, Vec<HashEntry>>,
     probe_key_exprs: &[Expr],
-    _join_type: JoinType,
+    filter: Option<&PairFilter>,
     swapped: bool,
-    output_schema: &SchemaRef,
-    retained: Option<&[bool]>,
-) -> Result<Vec<RecordBatch>> {
-    // INNER-only pair emission. SEMI/ANTI never reach this function on the
-    // spill path: they go through `probe_match_flags` /
-    // `accumulate_probe_matches` / `mark_build_matches` and the
-    // `take_probe_rows` / `take_build_rows` emitters below
-    // (spill-join-correctness-3 task 004). Outer joins are refused before
-    // the spill path is entered (`finish_via_spill`).
-    let mut results = Vec::new();
-
-    for probe_batch in probe_batches {
-        let probe_key_arrays = join_key_arrays(probe_batch, probe_key_exprs)?;
-
-        let mut build_indices: Vec<(usize, usize)> = Vec::new();
-        let mut probe_indices: Vec<usize> = Vec::new();
-
-        for probe_row in 0..probe_batch.num_rows() {
-            let key = extract_join_key(&probe_key_arrays, probe_row);
-
-            if key.values.iter().any(|v| matches!(v, JoinValue::Null)) {
+    first_only: bool,
+    skip: &dyn Fn(usize) -> bool,
+    visit: &mut dyn FnMut(usize, usize, usize),
+) -> Result<()> {
+    let key_arrays = join_key_arrays(probe_batch, probe_key_exprs)?;
+    let n = probe_batch.num_rows();
+    let entries_of = |probe_row: usize| -> Option<&Vec<HashEntry>> {
+        let key = extract_join_key(&key_arrays, probe_row);
+        if key.values.iter().any(|v| matches!(v, JoinValue::Null)) {
+            return None;
+        }
+        hash_table.get(&key)
+    };
+    let Some(filter) = filter else {
+        for probe_row in 0..n {
+            if skip(probe_row) {
                 continue;
             }
-
-            if let Some(entries) = hash_table.get(&key) {
-                for entry in entries {
-                    build_indices.push((entry.batch_idx, entry.row_idx));
-                    probe_indices.push(probe_row);
+            if let Some(entries) = entries_of(probe_row) {
+                if first_only {
+                    if let Some(e) = entries.first() {
+                        visit(e.batch_idx, e.row_idx, probe_row);
+                    }
+                } else {
+                    for e in entries {
+                        visit(e.batch_idx, e.row_idx, probe_row);
+                    }
                 }
             }
         }
-
-        if !build_indices.is_empty() {
-            let batch = create_joined_batch(
-                build_batches,
-                probe_batch,
-                &build_indices,
-                &probe_indices,
-                swapped,
-                output_schema,
-                retained,
-            )?;
-            results.push(batch);
+        return Ok(());
+    };
+    if let Some(cf) = filter.compiled_for(build_batches, probe_batch) {
+        let (bcol, pcol) = cf.column_indices();
+        let probe_col = probe_batch.column(pcol);
+        for probe_row in 0..n {
+            if skip(probe_row) || probe_col.is_null(probe_row) {
+                continue;
+            }
+            let Some(entries) = entries_of(probe_row) else {
+                continue;
+            };
+            for e in entries {
+                let bb = &build_batches[e.batch_idx];
+                if bb.column(bcol).is_null(e.row_idx) {
+                    continue;
+                }
+                if cf.evaluate(bb, e.row_idx, probe_batch, probe_row) {
+                    visit(e.batch_idx, e.row_idx, probe_row);
+                    if first_only {
+                        break;
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+    // Generic path: gather the candidate pairs in bounded chunks (a probe
+    // row's pairs never straddle a chunk, so `first_only` de-duplication
+    // is local to the chunk) and evaluate the expression once per chunk.
+    let mut bi: Vec<(usize, usize)> = Vec::new();
+    let mut pi: Vec<usize> = Vec::new();
+    let flush = |bi: &mut Vec<(usize, usize)>,
+                 pi: &mut Vec<usize>,
+                 visit: &mut dyn FnMut(usize, usize, usize)|
+     -> Result<()> {
+        if bi.is_empty() {
+            return Ok(());
+        }
+        let mask = filter.evaluate_pairs(build_batches, probe_batch, bi, pi, swapped)?;
+        let mut decided_row = usize::MAX;
+        for i in 0..bi.len() {
+            if !mask[i] {
+                continue;
+            }
+            if first_only {
+                if pi[i] == decided_row {
+                    continue;
+                }
+                decided_row = pi[i];
+            }
+            visit(bi[i].0, bi[i].1, pi[i]);
+        }
+        bi.clear();
+        pi.clear();
+        Ok(())
+    };
+    for probe_row in 0..n {
+        if skip(probe_row) {
+            continue;
+        }
+        if let Some(entries) = entries_of(probe_row) {
+            for e in entries {
+                bi.push((e.batch_idx, e.row_idx));
+                pi.push(probe_row);
+            }
+        }
+        if bi.len() >= PAIR_FILTER_CHUNK_PAIRS {
+            flush(&mut bi, &mut pi, visit)?;
         }
     }
+    flush(&mut bi, &mut pi, visit)
+}
 
-    Ok(results)
+/// THE per-batch probe of the spill path: ONE probe batch against ONE
+/// hash table, doing everything the join needs in a single pass over the
+/// candidate pairs (`visit_candidate_pairs`, so key equality and the ON
+/// filter are applied exactly once, in one place):
+/// - the passing pairs become the returned joined batch when the join
+///   emits pairs (INNER and the outer joins);
+/// - `build_matched` (the table's build batches' bitmap — a resident
+///   partition's across the whole probe stream, a read-back chunk's) is
+///   marked for build-side SEMI/ANTI and a preserved build side;
+/// - `probe_matched` (this probe batch's bitmap — carried across chunks by
+///   the caller for a spilled partition) is marked for probe-side
+///   SEMI/ANTI and a preserved probe side.
+/// When only the probe bitmap is wanted, a probe row already flagged is
+/// skipped and the walk stops at its first passing pair (existence is all
+/// that is needed). NULL keys never match on either side.
+fn probe_batch_against_table(
+    build_batches: &[RecordBatch],
+    probe_batch: &RecordBatch,
+    hash_table: &HashMap<JoinKey, Vec<HashEntry>>,
+    ctx: &SpillJoinCtx,
+    build_matched: Option<&[Vec<std::sync::atomic::AtomicBool>]>,
+    probe_matched: Option<&mut [bool]>,
+) -> Result<Vec<RecordBatch>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let emit_pairs = ctx.emit_pairs();
+    let existence_only = !emit_pairs && build_matched.is_none();
+    let already: Option<Vec<bool>> = match (&probe_matched, existence_only) {
+        (Some(f), true) => Some(f.to_vec()),
+        _ => None,
+    };
+    let skip = |row: usize| already.as_ref().is_some_and(|a| a[row]);
+    let mut build_indices: Vec<(usize, usize)> = Vec::new();
+    let mut probe_indices: Vec<usize> = Vec::new();
+    let mut probe_hits: Vec<usize> = Vec::new();
+    let want_probe_hits = probe_matched.is_some();
+    visit_candidate_pairs(
+        build_batches,
+        probe_batch,
+        hash_table,
+        &ctx.probe_keys,
+        ctx.filter.as_deref(),
+        ctx.swapped,
+        existence_only,
+        &skip,
+        &mut |b, r, p| {
+            if emit_pairs {
+                build_indices.push((b, r));
+                probe_indices.push(p);
+            }
+            if let Some(bm) = build_matched {
+                bm[b][r].store(true, Relaxed);
+            }
+            if want_probe_hits {
+                probe_hits.push(p);
+            }
+        },
+    )?;
+    if let Some(flags) = probe_matched {
+        for p in probe_hits {
+            flags[p] = true;
+        }
+    }
+    if !emit_pairs || build_indices.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Pairs are emitted in bounded slices (duplicate keys can fan one probe
+    // batch out to far more pairs than rows).
+    let slice = spill_emit_rows();
+    build_indices
+        .chunks(slice)
+        .zip(probe_indices.chunks(slice))
+        .map(|(bi, pi)| {
+            create_joined_batch(
+                build_batches,
+                probe_batch,
+                bi,
+                pi,
+                ctx.swapped,
+                &ctx.schema,
+                ctx.retained.as_deref(),
+            )
+        })
+        .collect()
+}
+
+/// NULL arrays for the NON-preserved side of an outer-join emission, typed
+/// from the declared full output schema: `first` selects the leading
+/// (`swapped` = probe = left) or trailing block of `full_schema`.
+fn null_side_columns(
+    full_schema: &SchemaRef,
+    first: bool,
+    width: usize,
+    rows: usize,
+) -> Vec<ArrayRef> {
+    let total = full_schema.fields().len();
+    let offset = if first { 0 } else { total - width };
+    (0..width)
+        .map(|i| arrow::array::new_null_array(full_schema.field(offset + i).data_type(), rows))
+        .collect()
+}
+
+/// Apply the join-output retention mask (see `create_joined_batch`).
+fn apply_retained(columns: Vec<ArrayRef>, retained: Option<&[bool]>) -> Vec<ArrayRef> {
+    match retained {
+        Some(mask) if mask.len() == columns.len() => columns
+            .into_iter()
+            .zip(mask)
+            .filter(|(_, keep)| **keep)
+            .map(|(c, _)| c)
+            .collect(),
+        _ => columns,
+    }
+}
+
+/// Emit a probe batch's rows once its match bitmap is final, per
+/// `SpillJoinCtx::probe_emit`: SEMI's matched rows / ANTI's unmatched rows
+/// bare (`take_probe_rows`), or a preserved probe side's unmatched rows
+/// NULL-extended on the build side (spill-boundaries task 003).
+fn emit_probe_rows(
+    ctx: &SpillJoinCtx,
+    probe_batch: &RecordBatch,
+    flags: &[bool],
+) -> Result<Vec<RecordBatch>> {
+    match ctx.probe_emit() {
+        RowEmit::None => Ok(Vec::new()),
+        RowEmit::Matched => take_probe_rows(probe_batch, flags, true, &ctx.schema),
+        RowEmit::Unmatched => take_probe_rows(probe_batch, flags, false, &ctx.schema),
+        RowEmit::UnmatchedNullExtended => {
+            let keep: Vec<u32> = flags
+                .iter()
+                .enumerate()
+                .filter(|(_, &f)| !f)
+                .map(|(i, _)| i as u32)
+                .collect();
+            keep.chunks(spill_emit_rows())
+                .map(|slice| {
+                    let rows = slice.len();
+                    let idx = UInt32Array::from(slice.to_vec());
+                    let probe_columns: Vec<ArrayRef> = probe_batch
+                        .columns()
+                        .iter()
+                        .map(|c| compute::take(c.as_ref(), &idx, None).map_err(Into::into))
+                        .collect::<Result<_>>()?;
+                    let build_width = ctx.full_schema.fields().len() - probe_columns.len();
+                    // Probe = left when swapped: probe columns first, build
+                    // NULLs (the trailing block) after; else build NULLs
+                    // (leading block) first.
+                    let build_nulls =
+                        null_side_columns(&ctx.full_schema, !ctx.swapped, build_width, rows);
+                    let columns: Vec<ArrayRef> = if ctx.swapped {
+                        probe_columns.into_iter().chain(build_nulls).collect()
+                    } else {
+                        build_nulls.into_iter().chain(probe_columns).collect()
+                    };
+                    let columns = apply_retained(columns, ctx.retained.as_deref());
+                    batch_with_actual_types(&ctx.schema, columns)
+                })
+                .collect()
+        }
+    }
+}
+
+/// Emit a build partition's / chunk's rows once its match bitmap is final,
+/// per `SpillJoinCtx::build_emit`: SEMI's matched rows / ANTI's unmatched
+/// rows bare (`take_build_rows`), or a preserved build side's unmatched
+/// rows NULL-extended on the probe side (spill-boundaries task 003).
+fn emit_build_rows(
+    ctx: &SpillJoinCtx,
+    build_batches: &[RecordBatch],
+    flags: &[Vec<bool>],
+) -> Result<Vec<RecordBatch>> {
+    match ctx.build_emit() {
+        RowEmit::None => Ok(Vec::new()),
+        RowEmit::Matched => take_build_rows(build_batches, flags, true, &ctx.schema),
+        RowEmit::Unmatched => take_build_rows(build_batches, flags, false, &ctx.schema),
+        RowEmit::UnmatchedNullExtended => {
+            let indices = flagged_build_indices(flags, false);
+            if indices.is_empty() || build_batches.is_empty() {
+                return Ok(Vec::new());
+            }
+            indices
+                .chunks(spill_emit_rows())
+                .map(|slice| {
+                    let rows = slice.len();
+                    let build_columns: Vec<ArrayRef> = (0..build_batches[0].num_columns())
+                        .map(|c| gather_column(build_batches, c, slice))
+                        .collect::<Result<_>>()?;
+                    let probe_width = ctx.full_schema.fields().len() - build_columns.len();
+                    // Build = right when swapped: probe NULLs (the leading
+                    // block) first; else build first, probe NULLs
+                    // (trailing) after.
+                    let probe_nulls =
+                        null_side_columns(&ctx.full_schema, ctx.swapped, probe_width, rows);
+                    let columns: Vec<ArrayRef> = if ctx.swapped {
+                        probe_nulls.into_iter().chain(build_columns).collect()
+                    } else {
+                        build_columns.into_iter().chain(probe_nulls).collect()
+                    };
+                    let columns = apply_retained(columns, ctx.retained.as_deref());
+                    batch_with_actual_types(&ctx.schema, columns)
+                })
+                .collect()
+        }
+    }
 }
 
 /// spill-join-correctness-3 task 004: join-key arrays for one batch — THE
@@ -5555,111 +6047,25 @@ fn join_key_arrays(batch: &RecordBatch, key_exprs: &[Expr]) -> Result<Vec<ArrayR
         .collect()
 }
 
-/// SEMI/ANTI existence probe for ONE probe batch against ONE table: does
-/// any build row in `hash_table` share the probe row's key? NULL keys never
-/// match (same `JoinValue::Null` rule as `build_hash_table`, which never
-/// inserts them, and `probe_partition`, which skips them) — so a NULL-keyed
-/// probe row is dropped by SEMI and kept by ANTI, exactly as the in-memory
-/// join's `probe_batch_semi`/`has_null` path decides.
-fn probe_match_flags(
-    probe_batch: &RecordBatch,
-    hash_table: &HashMap<JoinKey, Vec<HashEntry>>,
-    probe_key_exprs: &[Expr],
-) -> Result<Vec<bool>> {
-    let mut flags = vec![false; probe_batch.num_rows()];
-    accumulate_probe_matches(
-        std::slice::from_ref(probe_batch),
-        hash_table,
-        probe_key_exprs,
-        std::slice::from_mut(&mut flags),
-    )?;
-    Ok(flags)
-}
+/// Rows per emitted batch for the GATHERED emissions of the spill path
+/// (spill-boundaries 003 follow-up): a preserved build side's unmatched rows
+/// of one read-back chunk (hundreds of thousands), a resident partition's
+/// SEMI/ANTI/outer emission (millions), or one probe batch's pairs under
+/// duplicate keys are emitted in slices of this many rows instead of one
+/// batch each. The output channel bounds batch COUNT
+/// (`SPILL_JOIN_OUTPUT_CHANNEL_CAPACITY`), so this is what bounds its
+/// BYTES. `QE_SPILL_EMIT_ROWS` overrides (diagnostic; 0 = unbounded).
+const SPILL_EMIT_ROWS: usize = 8_192;
 
-/// Probe-side-output SEMI/ANTI across CHUNKED read-back: OR each probe
-/// row's match status into `matched` (one bitmap per probe batch, carried
-/// across every chunk of the same spilled partition). Monotonic — a row
-/// already matched by an earlier chunk is never re-probed, and never
-/// cleared — so the final bitmap is "matched in ANY chunk", which is
-/// exactly the single-table answer.
-fn accumulate_probe_matches(
-    probe_batches: &[RecordBatch],
-    hash_table: &HashMap<JoinKey, Vec<HashEntry>>,
-    probe_key_exprs: &[Expr],
-    matched: &mut [Vec<bool>],
-) -> Result<()> {
-    for (probe_batch, flags) in probe_batches.iter().zip(matched.iter_mut()) {
-        let key_arrays = join_key_arrays(probe_batch, probe_key_exprs)?;
-        for probe_row in 0..probe_batch.num_rows() {
-            if flags[probe_row] {
-                continue;
-            }
-            let key = extract_join_key(&key_arrays, probe_row);
-            if key.values.iter().any(|v| matches!(v, JoinValue::Null)) {
-                continue;
-            }
-            if hash_table.contains_key(&key) {
-                flags[probe_row] = true;
-            }
-        }
+fn spill_emit_rows() -> usize {
+    match std::env::var("QE_SPILL_EMIT_ROWS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        Some(0) => usize::MAX,
+        Some(n) => n,
+        None => SPILL_EMIT_ROWS,
     }
-    Ok(())
-}
-
-/// Build-side-output SEMI/ANTI: mark every build row (batch_idx, row_idx)
-/// of `hash_table` that at least one probe row's key hits. `build_matched`
-/// is indexed like the table's `HashEntry`s (per build batch of the table's
-/// own batch slice). Build rows with NULL keys are not in the table and so
-/// stay unmarked: ANTI emits them, SEMI does not — matching the in-memory
-/// join's build-side emission.
-fn mark_build_matches(
-    probe_batches: &[RecordBatch],
-    hash_table: &HashMap<JoinKey, Vec<HashEntry>>,
-    probe_key_exprs: &[Expr],
-    build_matched: &mut [Vec<bool>],
-) -> Result<()> {
-    for probe_batch in probe_batches {
-        let key_arrays = join_key_arrays(probe_batch, probe_key_exprs)?;
-        for probe_row in 0..probe_batch.num_rows() {
-            let key = extract_join_key(&key_arrays, probe_row);
-            if key.values.iter().any(|v| matches!(v, JoinValue::Null)) {
-                continue;
-            }
-            if let Some(entries) = hash_table.get(&key) {
-                for e in entries {
-                    build_matched[e.batch_idx][e.row_idx] = true;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// `mark_build_matches` for the parallel read-back (join-spill-streaming
-/// task 003): several probe batches mark the same chunk's bitmap at once,
-/// so its cells are `AtomicBool`s — every store is `true`, so they commute
-/// and `Relaxed` is enough (the bitmap is only read after the rayon scope
-/// joins).
-fn mark_build_matches_atomic(
-    probe_batch: &RecordBatch,
-    hash_table: &HashMap<JoinKey, Vec<HashEntry>>,
-    probe_key_exprs: &[Expr],
-    build_matched: &[Vec<std::sync::atomic::AtomicBool>],
-) -> Result<()> {
-    use std::sync::atomic::Ordering::Relaxed;
-    let key_arrays = join_key_arrays(probe_batch, probe_key_exprs)?;
-    for probe_row in 0..probe_batch.num_rows() {
-        let key = extract_join_key(&key_arrays, probe_row);
-        if key.values.iter().any(|v| matches!(v, JoinValue::Null)) {
-            continue;
-        }
-        if let Some(entries) = hash_table.get(&key) {
-            for e in entries {
-                build_matched[e.batch_idx][e.row_idx].store(true, Relaxed);
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Emit the probe rows whose flag equals `want` (SEMI: matched; ANTI:
@@ -5673,23 +6079,24 @@ fn take_probe_rows(
     flags: &[bool],
     want: bool,
     output_schema: &SchemaRef,
-) -> Result<Option<RecordBatch>> {
+) -> Result<Vec<RecordBatch>> {
     let keep: Vec<u32> = flags
         .iter()
         .enumerate()
         .filter(|(_, &f)| f == want)
         .map(|(i, _)| i as u32)
         .collect();
-    if keep.is_empty() {
-        return Ok(None);
-    }
-    let idx = UInt32Array::from(keep);
-    let columns: Result<Vec<ArrayRef>> = probe_batch
-        .columns()
-        .iter()
-        .map(|c| compute::take(c.as_ref(), &idx, None).map_err(Into::into))
-        .collect();
-    Ok(Some(batch_with_actual_types(output_schema, columns?)?))
+    keep.chunks(spill_emit_rows())
+        .map(|slice| {
+            let idx = UInt32Array::from(slice.to_vec());
+            let columns: Result<Vec<ArrayRef>> = probe_batch
+                .columns()
+                .iter()
+                .map(|c| compute::take(c.as_ref(), &idx, None).map_err(Into::into))
+                .collect();
+            batch_with_actual_types(output_schema, columns?)
+        })
+        .collect()
 }
 
 /// Emit the build rows whose flag equals `want` (SEMI: matched; ANTI:
@@ -5701,8 +6108,25 @@ fn take_build_rows(
     flags: &[Vec<bool>],
     want: bool,
     output_schema: &SchemaRef,
-) -> Result<Option<RecordBatch>> {
-    let indices: Vec<(usize, usize)> = flags
+) -> Result<Vec<RecordBatch>> {
+    let indices = flagged_build_indices(flags, want);
+    if indices.is_empty() || build_batches.is_empty() {
+        return Ok(Vec::new());
+    }
+    indices
+        .chunks(spill_emit_rows())
+        .map(|slice| {
+            let columns: Result<Vec<ArrayRef>> = (0..build_batches[0].num_columns())
+                .map(|c| gather_column(build_batches, c, slice))
+                .collect();
+            batch_with_actual_types(output_schema, columns?)
+        })
+        .collect()
+}
+
+/// (batch_idx, row_idx) of every build row whose flag equals `want`.
+fn flagged_build_indices(flags: &[Vec<bool>], want: bool) -> Vec<(usize, usize)> {
+    flags
         .iter()
         .enumerate()
         .flat_map(|(b, v)| {
@@ -5711,14 +6135,7 @@ fn take_build_rows(
                 .filter(move |(_, &f)| f == want)
                 .map(move |(r, _)| (b, r))
         })
-        .collect();
-    if indices.is_empty() || build_batches.is_empty() {
-        return Ok(None);
-    }
-    let columns: Result<Vec<ArrayRef>> = (0..build_batches[0].num_columns())
-        .map(|c| gather_column(build_batches, c, &indices))
-        .collect();
-    Ok(Some(batch_with_actual_types(output_schema, columns?)?))
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5782,7 +6199,46 @@ fn create_joined_batch(
     batch_with_actual_types(output_schema, columns)
 }
 
+/// Gather `indices` = (batch_idx, row_idx) of column `col_idx` across
+/// `batches` into ONE array. spill-boundaries 003 follow-up: one
+/// `compute::interleave` per column (a single `take` when every index comes
+/// from one batch). The previous shape — one 1-row `compute::take` per
+/// OUTPUT ROW, then `concat` of all of them — allocated an Arrow array per
+/// gathered row: for a phase-B read-back chunk's 590k unmatched build rows
+/// (a preserved build side) or a 16-batch probe group's pairs, that was
+/// millions of ~200-byte allocations per chunk, freed on the global rayon
+/// pool's threads and retained by the allocator — measured as the
+/// ~+700-900MB phase-B excess of the `left-join` / `filtered-join` harness
+/// legs over `semi-join` (see `updates/003/stream-A.md`).
+/// `QE_SPILL_GATHER=legacy` keeps the old shape for a controlled A/B.
 fn gather_column(
+    batches: &[RecordBatch],
+    col_idx: usize,
+    indices: &[(usize, usize)],
+) -> Result<ArrayRef> {
+    if matches!(std::env::var("QE_SPILL_GATHER").as_deref(), Ok("legacy")) {
+        return gather_column_legacy(batches, col_idx, indices);
+    }
+    let dt = batches[0].column(col_idx).data_type();
+    if indices.is_empty() {
+        return Ok(arrow::array::new_null_array(dt, 0));
+    }
+    let first_batch = indices[0].0;
+    if batches.len() == 1 || indices.iter().all(|&(b, _)| b == first_batch) {
+        let take_arr: UInt32Array = indices.iter().map(|&(_, r)| r as u32).collect();
+        return compute::take(
+            batches[first_batch].column(col_idx).as_ref(),
+            &take_arr,
+            None,
+        )
+        .map_err(Into::into);
+    }
+    let arrays: Vec<&dyn arrow::array::Array> =
+        batches.iter().map(|b| b.column(col_idx).as_ref()).collect();
+    compute::interleave(&arrays, indices).map_err(Into::into)
+}
+
+fn gather_column_legacy(
     batches: &[RecordBatch],
     col_idx: usize,
     indices: &[(usize, usize)],
@@ -5794,21 +6250,13 @@ fn gather_column(
             .or_default()
             .push((out_idx, row_idx as u32));
     }
-
     let total_len = indices.len();
     let dt = batches[0].column(col_idx).data_type();
-
     let mut builders_data: Vec<(usize, ArrayRef)> = Vec::new();
-
     for (batch_idx, idx_list) in batch_indices {
-        let batch = &batches[batch_idx];
-        let col = batch.column(col_idx);
-
+        let col = batches[batch_idx].column(col_idx);
         let take_indices: Vec<u32> = idx_list.iter().map(|(_, row)| *row).collect();
-        let take_arr = UInt32Array::from(take_indices);
-
-        let taken = compute::take(col.as_ref(), &take_arr, None)?;
-
+        let taken = compute::take(col.as_ref(), &UInt32Array::from(take_indices), None)?;
         for (i, (out_idx, _)) in idx_list.iter().enumerate() {
             builders_data.push((
                 *out_idx,
@@ -5816,21 +6264,13 @@ fn gather_column(
             ));
         }
     }
-
     builders_data.sort_by_key(|(idx, _)| *idx);
-
     if builders_data.is_empty() {
         return Ok(arrow::array::new_null_array(dt, total_len));
     }
-
     let arrays: Vec<&dyn arrow::array::Array> =
         builders_data.iter().map(|(_, arr)| arr.as_ref()).collect();
-
-    if arrays.is_empty() {
-        Ok(arrow::array::new_null_array(dt, total_len))
-    } else {
-        compute::concat(&arrays).map_err(Into::into)
-    }
+    compute::concat(&arrays).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -7237,54 +7677,103 @@ mod tests {
         }
     }
 
-    /// Ground truth independent of BOTH join implementations: plain
-    /// per-row key comparison (Dictionary decoded to its value, NULL never
-    /// matches). Column 0 of every fixture below is the join key. SEMI/ANTI
-    /// output = LEFT rows whatever the build orientation.
-    fn naive_join_count(left: &[RecordBatch], right: &[RecordBatch], join_type: JoinType) -> usize {
-        use arrow::array::Array;
-        fn keys(batches: &[RecordBatch]) -> Vec<Option<String>> {
-            let mut out = Vec::new();
-            for b in batches {
-                let c = b.column(0);
-                let c: ArrayRef = match c.data_type() {
-                    arrow::datatypes::DataType::Dictionary(_, v) => {
-                        compute::cast(c.as_ref(), v).unwrap()
+    /// Render every row of `batches` (Dictionary decoded, NULL as "NULL").
+    fn naive_rows(batches: &[RecordBatch]) -> Vec<Vec<String>> {
+        let mut out = Vec::new();
+        for b in batches {
+            render_join_batch(b, &mut out);
+        }
+        out
+    }
+
+    /// Ground truth independent of BOTH join implementations (spill-
+    /// boundaries tasks 002/003 generalized the count-only oracle): plain
+    /// per-row key comparison on column 0 (Dictionary decoded, NULL never
+    /// matches), an optional ON-filter closure over the rendered
+    /// (left row, right row) pair, NULL-extension for LEFT/RIGHT/FULL, an
+    /// optional retained mask over the left ++ right columns. Output rows
+    /// are left ++ right (INNER/outer) or LEFT rows (SEMI/ANTI) whatever
+    /// the build orientation, sorted.
+    fn naive_join_rows(
+        left: &[RecordBatch],
+        right: &[RecordBatch],
+        join_type: JoinType,
+        filter: Option<&dyn Fn(&[String], &[String]) -> bool>,
+        retained: Option<&[bool]>,
+    ) -> Vec<Vec<String>> {
+        let l = naive_rows(left);
+        let r = naive_rows(right);
+        let lw = left.first().map(|b| b.num_columns()).unwrap_or(0);
+        let rw = right.first().map(|b| b.num_columns()).unwrap_or(0);
+        let mut by_key: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, rr) in r.iter().enumerate() {
+            if rr[0] != "NULL" {
+                by_key.entry(rr[0].as_str()).or_default().push(i);
+            }
+        }
+        let nulls = |n: usize| vec!["NULL".to_string(); n];
+        let pass = |lr: &[String], rr: &[String]| filter.is_none_or(|f| f(lr, rr));
+        let mut out: Vec<Vec<String>> = Vec::new();
+        let mut r_matched = vec![false; r.len()];
+        for lr in &l {
+            let mut matched = false;
+            if lr[0] != "NULL" {
+                if let Some(idxs) = by_key.get(lr[0].as_str()) {
+                    for &ri in idxs {
+                        let rr = &r[ri];
+                        if !pass(lr, rr) {
+                            continue;
+                        }
+                        matched = true;
+                        r_matched[ri] = true;
+                        match join_type {
+                            JoinType::Semi => {
+                                out.push(lr.clone());
+                                break;
+                            }
+                            JoinType::Anti => break,
+                            _ => out.push(lr.iter().chain(rr.iter()).cloned().collect()),
+                        }
                     }
-                    _ => c.clone(),
-                };
-                for i in 0..c.len() {
-                    out.push(if c.is_null(i) {
-                        None
-                    } else {
-                        Some(render_cell(&c, i))
-                    });
                 }
             }
-            out
+            if !matched {
+                match join_type {
+                    JoinType::Anti => out.push(lr.clone()),
+                    JoinType::Left | JoinType::Full => {
+                        out.push(lr.iter().cloned().chain(nulls(rw)).collect())
+                    }
+                    _ => {}
+                }
+            }
         }
-        let l = keys(left);
-        let r = keys(right);
-        let mut rc: HashMap<String, usize> = HashMap::new();
-        for k in r.iter().flatten() {
-            *rc.entry(k.clone()).or_default() += 1;
+        if matches!(join_type, JoinType::Right | JoinType::Full) {
+            for (ri, m) in r_matched.iter().enumerate() {
+                if !m {
+                    out.push(nulls(lw).into_iter().chain(r[ri].iter().cloned()).collect());
+                }
+            }
         }
-        match join_type {
-            JoinType::Inner => l
-                .iter()
-                .flatten()
-                .map(|k| rc.get(k).copied().unwrap_or(0))
-                .sum(),
-            JoinType::Semi => l.iter().flatten().filter(|k| rc.contains_key(*k)).count(),
-            JoinType::Anti => l
-                .iter()
-                .filter(|k| match k {
-                    None => true,
-                    Some(k) => !rc.contains_key(k),
-                })
-                .count(),
-            _ => unreachable!("naive_join_count: INNER/SEMI/ANTI only"),
+        if let Some(mask) = retained {
+            if !matches!(join_type, JoinType::Semi | JoinType::Anti) {
+                out = out
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .zip(mask)
+                            .filter(|(_, k)| **k)
+                            .map(|(c, _)| c)
+                            .collect()
+                    })
+                    .collect();
+            }
         }
+        out.sort();
+        out
+    }
+
+    fn naive_join_count(left: &[RecordBatch], right: &[RecordBatch], join_type: JoinType) -> usize {
+        naive_join_rows(left, right, join_type, None, None).len()
     }
 
     /// Outcome of one `SpillableHashJoinExec` run.
@@ -7306,7 +7795,7 @@ mod tests {
         memory_limit: usize,
         tag: &str,
     ) -> JoinRun {
-        run_spillable_join_k(
+        run_spillable_join_opts(
             left,
             right,
             on,
@@ -7314,6 +7803,8 @@ mod tests {
             build_right,
             memory_limit,
             tag,
+            None,
+            None,
             None,
         )
         .await
@@ -7334,6 +7825,36 @@ mod tests {
         tag: &str,
         parallelism: Option<usize>,
     ) -> JoinRun {
+        run_spillable_join_opts(
+            left,
+            right,
+            on,
+            join_type,
+            build_right,
+            memory_limit,
+            tag,
+            parallelism,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// The full runner: explicit K, an ON-clause `filter` (spill-boundaries
+    /// task 002) and a `retained` mask over left ++ right (task 003).
+    #[allow(clippy::too_many_arguments)]
+    async fn run_spillable_join_opts(
+        left: (SchemaRef, Vec<RecordBatch>),
+        right: (SchemaRef, Vec<RecordBatch>),
+        on: Vec<(Expr, Expr)>,
+        join_type: JoinType,
+        build_right: bool,
+        memory_limit: usize,
+        tag: &str,
+        parallelism: Option<usize>,
+        filter: Option<Expr>,
+        retained: Option<Vec<bool>>,
+    ) -> JoinRun {
         let l: Arc<dyn PhysicalOperator> = Arc::new(
             crate::physical::operators::MemoryTableExec::new("l", left.0, left.1, None),
         );
@@ -7348,9 +7869,11 @@ mod tests {
             .with_memory_limit(memory_limit)
             .with_spill_path(spill_dir.clone());
         let threshold = (memory_limit as f64 * config.spill_threshold) as usize;
-        let join = SpillableHashJoinExec::new(l, r, on, join_type, pool, config)
+        let mut join = SpillableHashJoinExec::new(l, r, on, join_type, pool, config)
             .with_build_right(build_right)
-            .with_spill_join_parallelism(parallelism);
+            .with_spill_join_parallelism(parallelism)
+            .with_filter(filter);
+        join.set_retained(retained);
         let width = join.schema().fields().len();
         let mut rows = Vec::new();
         // INNER output is spread over the probe side's partitions; SEMI/
@@ -7364,6 +7887,16 @@ mod tests {
                     width,
                     "{tag}: output width must equal the declared output schema"
                 );
+                // spill-boundaries 003 follow-up: every batch the spill path
+                // emits is a bounded slice (the output channel bounds batch
+                // COUNT; this is what bounds its bytes).
+                if memory_limit < SA_UNLIMITED && std::env::var("QE_SPILL_EMIT_ROWS").is_err() {
+                    assert!(
+                        b.num_rows() <= SPILL_EMIT_ROWS,
+                        "{tag}: spill-path batch of {} rows exceeds SPILL_EMIT_ROWS={SPILL_EMIT_ROWS}",
+                        b.num_rows()
+                    );
+                }
                 render_join_batch(&b, &mut rows);
             }
         }
@@ -7394,16 +7927,21 @@ mod tests {
         }
     }
 
-    fn keyed_schema(key: &str, payload: &str) -> SchemaRef {
+    /// (nullable Int64 key, Utf8 payload, Int64 value) — the value column
+    /// (`i % 7`, never NULL) is the non-key column the ON-filter tests
+    /// compare across sides (spill-boundaries task 002).
+    fn keyed_schema(key: &str, payload: &str, value: &str) -> SchemaRef {
         use arrow::datatypes::{DataType, Field, Schema};
         Arc::new(Schema::new(vec![
             Field::new(key, DataType::Int64, true),
             Field::new(payload, DataType::Utf8, false),
+            Field::new(value, DataType::Int64, false),
         ]))
     }
 
-    /// `n` rows of (nullable Int64 key, Utf8 payload) in batches of
-    /// `rows_per_batch`; `key_of(i)` = None produces a NULL key.
+    /// `n` rows of (nullable Int64 key, Utf8 payload, Int64 value = i % 7)
+    /// in batches of `rows_per_batch`; `key_of(i)` = None produces a NULL
+    /// key.
     fn keyed_batches(
         schema: &SchemaRef,
         n: i64,
@@ -7417,12 +7955,14 @@ mod tests {
             let end = (start + rows_per_batch).min(n);
             let keys: Vec<Option<i64>> = (start..end).map(&key_of).collect();
             let payload: Vec<String> = (start..end).map(|i| format!("{tag}{i}")).collect();
+            let values: Vec<i64> = (start..end).map(|i| i % 7).collect();
             out.push(
                 RecordBatch::try_new(
                     schema.clone(),
                     vec![
                         Arc::new(Int64Array::from(keys)),
                         Arc::new(StringArray::from(payload)),
+                        Arc::new(Int64Array::from(values)),
                     ],
                 )
                 .unwrap(),
@@ -7491,8 +8031,8 @@ mod tests {
         shape: &str,
         tag: &str,
     ) {
-        let ls = keyed_schema("lk", "lp");
-        let rs = keyed_schema("rk", "rp");
+        let ls = keyed_schema("lk", "lp", "lv");
+        let rs = keyed_schema("rk", "rp", "rv");
         // The build side is the right side when `build_right`, else the left.
         let (left, right) = match (build_right, shape) {
             (true, "dense") => (other_side(&ls, "L"), build_dense(&rs, "R")),
@@ -7727,6 +8267,206 @@ mod tests {
         }
     }
 
+    /// The ON-filter shapes the spill path is exercised with (spill-
+    /// boundaries task 002), each paired with the naive closure that
+    /// defines it over the rendered (left row, right row):
+    ///   None     — key equality alone;
+    ///   Compiled — `lv < rv`, one column per side → hash_join's
+    ///              `CompiledFilter` fast path (no gather);
+    ///   Gathered — `lv + 1 < rv`, an arithmetic left operand → the generic
+    ///              gather-and-`evaluate_expr` path.
+    #[derive(Clone, Copy, Debug)]
+    enum FilterKind {
+        None,
+        Compiled,
+        Gathered,
+    }
+
+    impl FilterKind {
+        fn expr(self) -> Option<Expr> {
+            match self {
+                FilterKind::None => None,
+                FilterKind::Compiled => Some(Expr::column("lv").lt(Expr::column("rv"))),
+                FilterKind::Gathered => Some(
+                    Expr::column("lv")
+                        .add(Expr::literal(crate::planner::ScalarValue::Int64(1)))
+                        .lt(Expr::column("rv")),
+                ),
+            }
+        }
+        fn naive(self) -> Option<Box<dyn Fn(&[String], &[String]) -> bool>> {
+            let v = |row: &[String]| row[2].parse::<i64>().expect("value column");
+            match self {
+                FilterKind::None => None,
+                FilterKind::Compiled => Some(Box::new(move |l, r| v(l) < v(r))),
+                FilterKind::Gathered => Some(Box::new(move |l, r| v(l) + 1 < v(r))),
+            }
+        }
+    }
+
+    /// One fixture through the in-memory delegate AND the spill path
+    /// (tiny budget, chunked read-back guaranteed, explicit K), both
+    /// compared ROW-FOR-ROW against `naive_join_rows`.
+    #[allow(clippy::too_many_arguments)]
+    async fn assert_join_spill_matches(
+        join_type: JoinType,
+        build_right: bool,
+        shape: &str,
+        filter: FilterKind,
+        retained: Option<Vec<bool>>,
+        k: Option<usize>,
+        tag: &str,
+    ) {
+        let ls = keyed_schema("lk", "lp", "lv");
+        let rs = keyed_schema("rk", "rp", "rv");
+        // The build side is the right side when `build_right`, else the left
+        // (RIGHT joins always build from the right, whatever the flag).
+        let build_is_right = build_right || matches!(join_type, JoinType::Right);
+        let (left, right) = match (build_is_right, shape) {
+            (true, "dense") => (other_side(&ls, "L"), build_dense(&rs, "R")),
+            (true, "sparse") => (other_side(&ls, "L"), build_sparse(&rs, "R")),
+            (false, "dense") => (build_dense(&ls, "L"), other_side(&rs, "R")),
+            (false, "sparse") => (build_dense(&ls, "L"), build_sparse(&rs, "R")),
+            _ => unreachable!(),
+        };
+        let on = vec![(Expr::column("lk"), Expr::column("rk"))];
+        let naive_filter = filter.naive();
+        let truth = naive_join_rows(
+            &left,
+            &right,
+            join_type,
+            naive_filter.as_deref(),
+            retained.as_deref(),
+        );
+        assert!(
+            !truth.is_empty(),
+            "{tag}: degenerate fixture, ground truth is empty"
+        );
+        let base = run_spillable_join_opts(
+            (ls.clone(), left.clone()),
+            (rs.clone(), right.clone()),
+            on.clone(),
+            join_type,
+            build_right,
+            SA_UNLIMITED,
+            &format!("{tag}_base"),
+            None,
+            filter.expr(),
+            retained.clone(),
+        )
+        .await;
+        assert!(
+            !base.spilled,
+            "{tag}: baseline must be the in-memory delegate"
+        );
+        let spill = run_spillable_join_opts(
+            (ls, left),
+            (rs, right),
+            on,
+            join_type,
+            build_right,
+            SA_LIMIT,
+            &format!("{tag}_spill"),
+            k,
+            filter.expr(),
+            retained,
+        )
+        .await;
+        assert!(
+            spill.spilled,
+            "{tag}: the {SA_LIMIT}-byte budget must force the spill path"
+        );
+        assert!(
+            spill.spilled_partitions > 0,
+            "{tag}: no partition was evicted to disk"
+        );
+        assert!(
+            predicted_hash_table_bytes(spill.max_spilled_build_rows, 1) > spill.threshold,
+            "{tag}: largest spilled partition ({} rows) would not be chunked at threshold {}",
+            spill.max_spilled_build_rows,
+            spill.threshold
+        );
+        assert_eq!(
+            spill.rows.len(),
+            truth.len(),
+            "{tag}: spill-path row count {} differs from the naive ground truth {}",
+            spill.rows.len(),
+            truth.len()
+        );
+        assert_eq!(
+            spill.rows, truth,
+            "{tag}: spill-path rows differ from the naive ground truth"
+        );
+        assert_eq!(
+            base.rows.len(),
+            truth.len(),
+            "{tag}: in-memory delegate row count {} differs from the naive ground truth {}",
+            base.rows.len(),
+            truth.len()
+        );
+        assert_eq!(
+            base.rows, truth,
+            "{tag}: in-memory delegate rows differ from the naive ground truth"
+        );
+    }
+
+    /// spill-boundaries task 002: INNER with an ON-clause filter through the
+    /// spill path — both build orientations, dense (chunk-straddling
+    /// duplicates) and sparse, the compiled and the gathered filter paths,
+    /// NULL keys on both sides.
+    #[tokio::test]
+    async fn filtered_inner_spill_is_cell_exact() {
+        for (build_right, shape, filter) in [
+            (false, "dense", FilterKind::Compiled),
+            (true, "dense", FilterKind::Compiled),
+            (false, "sparse", FilterKind::Compiled),
+            (true, "sparse", FilterKind::Compiled),
+            (false, "dense", FilterKind::Gathered),
+            (true, "dense", FilterKind::Gathered),
+            (true, "sparse", FilterKind::Gathered),
+        ] {
+            let tag = format!("finner_{build_right}_{shape}_{filter:?}");
+            assert_join_spill_matches(
+                JoinType::Inner,
+                build_right,
+                shape,
+                filter,
+                None,
+                None,
+                &tag,
+            )
+            .await;
+        }
+    }
+
+    /// spill-boundaries task 002: SEMI/ANTI with an ON-clause filter — a
+    /// candidate counts only through a pair that PASSES the filter, in both
+    /// orientations (probe-side bitmap OR-accumulated across chunks; build-
+    /// side per-partition / per-chunk bitmaps), dense and sparse, compiled
+    /// and gathered paths.
+    #[tokio::test]
+    async fn filtered_semi_anti_spill_is_cell_exact() {
+        for (jt, build_right, shape, filter) in [
+            (JoinType::Semi, true, "dense", FilterKind::Compiled),
+            (JoinType::Anti, true, "dense", FilterKind::Compiled),
+            (JoinType::Semi, false, "dense", FilterKind::Compiled),
+            (JoinType::Anti, false, "dense", FilterKind::Compiled),
+            (JoinType::Semi, true, "sparse", FilterKind::Compiled),
+            (JoinType::Anti, true, "sparse", FilterKind::Compiled),
+            (JoinType::Semi, false, "sparse", FilterKind::Compiled),
+            (JoinType::Anti, false, "sparse", FilterKind::Compiled),
+            (JoinType::Semi, true, "dense", FilterKind::Gathered),
+            (JoinType::Anti, true, "dense", FilterKind::Gathered),
+            (JoinType::Semi, false, "dense", FilterKind::Gathered),
+            (JoinType::Anti, false, "dense", FilterKind::Gathered),
+            (JoinType::Anti, true, "sparse", FilterKind::Gathered),
+            (JoinType::Anti, false, "sparse", FilterKind::Gathered),
+        ] {
+            let tag = format!("fsa_{jt:?}_{build_right}_{shape}_{filter:?}");
+            assert_join_spill_matches(jt, build_right, shape, filter, None, None, &tag).await;
+        }
+    }
+
     /// Pre-existing spill-path bug found by this task's sparse fixtures
     /// (not SEMI/ANTI-specific): with a build side whose FIRST batch
     /// already exceeds the threshold, `build_with_partitioning` evicted
@@ -7738,8 +8478,8 @@ mod tests {
     /// delegate.
     #[tokio::test]
     async fn inner_spill_with_sparse_build_keys_survives_empty_partition_eviction() {
-        let ls = keyed_schema("lk", "lp");
-        let rs = keyed_schema("rk", "rp");
+        let ls = keyed_schema("lk", "lp", "lv");
+        let rs = keyed_schema("rk", "rp", "rv");
         for build_right in [true, false] {
             let (left, right) = if build_right {
                 (other_side(&ls, "L"), build_sparse(&rs, "R"))
@@ -7788,8 +8528,8 @@ mod tests {
     /// return it with its spill dir, the naive INNER ground truth and the
     /// output width (fixture shared by the repeat-execution tests below).
     fn spilling_inner_join_fixture(tag: &str) -> (SpillableHashJoinExec, PathBuf, usize) {
-        let ls = keyed_schema("lk", "lp");
-        let rs = keyed_schema("rk", "rp");
+        let ls = keyed_schema("lk", "lp", "lv");
+        let rs = keyed_schema("rk", "rp", "rv");
         let (left, right) = (build_dense(&ls, "L"), other_side(&rs, "R"));
         let truth = naive_join_count(&left, &right, JoinType::Inner);
         assert!(truth > 0, "degenerate fixture");
@@ -7943,8 +8683,8 @@ mod tests {
     /// sparse one leaves most partitions with no probe file at all).
     #[tokio::test]
     async fn spilled_partitions_processed_in_parallel_are_cell_exact() {
-        let ls = keyed_schema("lk", "lp");
-        let rs = keyed_schema("rk", "rp");
+        let ls = keyed_schema("lk", "lp", "lv");
+        let rs = keyed_schema("rk", "rp", "rv");
         for k in [3usize, 8] {
             for (jt, build_right, shape) in [
                 (JoinType::Inner, true, "dense"),
@@ -8121,18 +8861,14 @@ mod tests {
         );
     }
 
-    /// LEFT/RIGHT/FULL stay refused by name on the spill path, and the
-    /// message says exactly what IS supported.
+    /// spill-boundaries task 003: LEFT/RIGHT/FULL now spill (see the
+    /// `outer_join_spill_*` tests); what remains refused, by name, is
+    /// CROSS/SINGLE/MARK — and the message says exactly what IS supported.
     #[tokio::test]
-    async fn outer_join_spill_is_still_refused_by_name() {
-        let ls = keyed_schema("lk", "lp");
-        let rs = keyed_schema("rk", "rp");
-        for (jt, build_right) in [
-            (JoinType::Left, false),
-            (JoinType::Left, true),
-            (JoinType::Right, false),
-            (JoinType::Full, false),
-        ] {
+    async fn cross_single_mark_spill_refused_by_name() {
+        let ls = keyed_schema("lk", "lp", "lv");
+        let rs = keyed_schema("rk", "rp", "rv");
+        for jt in [JoinType::Cross, JoinType::Single] {
             let l: Arc<dyn PhysicalOperator> =
                 Arc::new(crate::physical::operators::MemoryTableExec::new(
                     "l",
@@ -8148,12 +8884,8 @@ mod tests {
                     None,
                 ));
             let pool = crate::execution::create_memory_pool(SA_LIMIT);
-            let spill_dir = std::env::temp_dir().join(format!(
-                "qe_sa_outer_refusal_{:?}_{}_{}",
-                jt,
-                build_right,
-                std::process::id()
-            ));
+            let spill_dir =
+                std::env::temp_dir().join(format!("qe_sa_refusal_{:?}_{}", jt, std::process::id()));
             let config = ExecutionConfig::new()
                 .with_memory_limit(SA_LIMIT)
                 .with_spill_path(spill_dir.clone());
@@ -8164,8 +8896,7 @@ mod tests {
                 jt,
                 pool,
                 config,
-            )
-            .with_build_right(build_right);
+            );
             let err = match join.execute(0).await {
                 Err(e) => e.to_string(),
                 Ok(mut s) => {
@@ -8182,11 +8913,134 @@ mod tests {
                 }
             };
             assert!(
-                err.contains("supports only INNER, SEMI and ANTI joins"),
+                err.contains("supports INNER, LEFT, RIGHT, FULL, SEMI and ANTI joins only"),
                 "{jt:?}: unexpected refusal message: {err}"
             );
             drop(join);
             let _ = std::fs::remove_dir_all(&spill_dir);
+        }
+    }
+
+    /// spill-boundaries task 003: LEFT/RIGHT/FULL through the spill path,
+    /// row-for-row against the naive oracle — both build orientations
+    /// (preserved side = probe: LEFT with build = right, RIGHT; preserved
+    /// side = build: LEFT with build = left; FULL = both), dense (a key's
+    /// build rows straddle read-back chunks, so a probe row unmatched in
+    /// chunk 1 may match in chunk 2 and must NOT be NULL-extended early)
+    /// and sparse (most partitions hold no build rows at all — every probe
+    /// row there is NULL-extended; most build partitions receive no probe
+    /// rows — every build row there is NULL-extended), NULL keys on both
+    /// sides (never matched, always preserved).
+    #[tokio::test]
+    async fn outer_join_spill_is_cell_exact() {
+        for (jt, build_right, shape) in [
+            (JoinType::Left, false, "dense"),
+            (JoinType::Left, true, "dense"),
+            (JoinType::Left, false, "sparse"),
+            (JoinType::Left, true, "sparse"),
+            (JoinType::Right, false, "dense"),
+            (JoinType::Right, false, "sparse"),
+            (JoinType::Full, false, "dense"),
+            (JoinType::Full, true, "dense"),
+            (JoinType::Full, false, "sparse"),
+            (JoinType::Full, true, "sparse"),
+        ] {
+            let tag = format!("outer_{jt:?}_{build_right}_{shape}");
+            assert_join_spill_matches(jt, build_right, shape, FilterKind::None, None, None, &tag)
+                .await;
+        }
+    }
+
+    /// Task 003 + 002 together: an outer join whose ON clause carries a
+    /// filter — a pair that fails the filter is NOT a match, so its
+    /// preserved row is NULL-extended instead (the exact semantics a
+    /// post-filter would destroy). Compiled and gathered filter paths.
+    #[tokio::test]
+    async fn outer_join_spill_with_on_filter_is_cell_exact() {
+        for (jt, build_right, shape, filter) in [
+            (JoinType::Left, false, "dense", FilterKind::Compiled),
+            (JoinType::Left, true, "dense", FilterKind::Compiled),
+            (JoinType::Left, false, "sparse", FilterKind::Gathered),
+            (JoinType::Left, true, "sparse", FilterKind::Gathered),
+            (JoinType::Right, false, "dense", FilterKind::Compiled),
+            (JoinType::Right, false, "dense", FilterKind::Gathered),
+            (JoinType::Full, false, "dense", FilterKind::Compiled),
+            (JoinType::Full, true, "dense", FilterKind::Gathered),
+            (JoinType::Full, false, "sparse", FilterKind::Compiled),
+        ] {
+            let tag = format!("fouter_{jt:?}_{build_right}_{shape}_{filter:?}");
+            assert_join_spill_matches(jt, build_right, shape, filter, None, None, &tag).await;
+        }
+    }
+
+    /// Outer joins DO carry a `retained` mask (`set_retained`'s gate): the
+    /// NULL-extended rows must be pruned exactly like the matched pairs.
+    /// Masks over (lk, lp, lv, rk, rp, rv): the planner's usual case drops
+    /// both ON-only keys; the second mask drops the payloads too, keeping
+    /// only the value columns. A column the ON filter references is always
+    /// kept — `analyze_join_output_usage` force-keeps it, and the in-memory
+    /// delegate prunes its build batches by the mask BEFORE evaluating the
+    /// filter, so a mask dropping a filter column is unreachable by
+    /// construction (and rejected: `ColumnNotFound`).
+    #[tokio::test]
+    async fn outer_join_spill_with_retained_mask_is_cell_exact() {
+        let keys_dropped = vec![false, true, true, false, true, true];
+        let keys_and_payloads_dropped = vec![false, false, true, false, false, true];
+        for (jt, build_right, filter, mask) in [
+            (JoinType::Left, false, FilterKind::None, &keys_dropped),
+            (JoinType::Left, true, FilterKind::None, &keys_dropped),
+            (JoinType::Right, false, FilterKind::None, &keys_dropped),
+            (JoinType::Full, false, FilterKind::None, &keys_dropped),
+            (
+                JoinType::Left,
+                false,
+                FilterKind::Compiled,
+                &keys_and_payloads_dropped,
+            ),
+            (JoinType::Left, true, FilterKind::Compiled, &keys_dropped),
+            (
+                JoinType::Full,
+                true,
+                FilterKind::Gathered,
+                &keys_and_payloads_dropped,
+            ),
+        ] {
+            let tag = format!("router_{jt:?}_{build_right}_{filter:?}_{}", mask.len());
+            assert_join_spill_matches(
+                jt,
+                build_right,
+                "dense",
+                filter,
+                Some(mask.clone()),
+                None,
+                &tag,
+            )
+            .await;
+        }
+    }
+
+    /// K-way phase B (join-spill-streaming task 003) with the outer joins:
+    /// every preserved-side bitmap lives with its own partition's job.
+    #[tokio::test]
+    async fn outer_join_spill_processed_in_parallel_is_cell_exact() {
+        for (jt, build_right, shape) in [
+            (JoinType::Left, false, "dense"),
+            (JoinType::Left, true, "dense"),
+            (JoinType::Right, false, "dense"),
+            (JoinType::Full, false, "dense"),
+            (JoinType::Full, true, "sparse"),
+        ] {
+            let tag = format!("pouter_{jt:?}_{build_right}_{shape}");
+            assert_join_spill_matches(
+                jt,
+                build_right,
+                shape,
+                FilterKind::Compiled,
+                None,
+                Some(3),
+                &tag,
+            )
+            .await;
         }
     }
 

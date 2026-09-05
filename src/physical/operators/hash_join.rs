@@ -1872,7 +1872,7 @@ fn extract_join_key(arrays: &[ArrayRef], row: usize) -> JoinKey {
 }
 
 /// Create a combined batch from multiple build/probe row pairs for batch filter evaluation
-fn create_combined_batch(
+pub(crate) fn create_combined_batch(
     build_batches: &[RecordBatch],
     build_indices: &[(usize, usize)], // (batch_idx, row_idx)
     probe_batch: &RecordBatch,
@@ -1996,17 +1996,30 @@ fn filter_candidate_pairs(
 
 /// A pre-compiled filter for fast evaluation without per-row batch creation.
 /// Recognizes patterns like `col_a != col_b` and evaluates directly from arrays.
-struct CompiledFilter {
+///
+/// `pub(crate)` (spill-boundaries task 002): the join spill path
+/// (`spillable.rs`) reuses it as its own fast path for the same shapes.
+#[derive(Clone, Debug)]
+pub(crate) struct CompiledFilter {
     build_col_idx: usize,
     probe_col_idx: usize,
     op: BinaryOp,
 }
 
 impl CompiledFilter {
+    /// The (build-side, probe-side) column indices this filter compares —
+    /// so a caller can check the ACTUAL array types / null slots before
+    /// trusting `evaluate` (which returns `false` for any type it does not
+    /// handle and reads a NULL slot's placeholder value as if it were
+    /// data).
+    pub(crate) fn column_indices(&self) -> (usize, usize) {
+        (self.build_col_idx, self.probe_col_idx)
+    }
+
     /// Try to compile a filter expression into a direct column comparison.
     /// Uses the combined schema (build columns first, then probe columns) to resolve indices.
     /// Returns None if the filter is too complex.
-    fn try_compile(
+    pub(crate) fn try_compile(
         filter: &Expr,
         build_schema: &Schema,
         probe_schema: &Schema,
@@ -2106,7 +2119,7 @@ impl CompiledFilter {
 
     /// Evaluate the filter for a single (build_row, probe_row) pair directly from arrays.
     #[inline(always)]
-    fn evaluate(
+    pub(crate) fn evaluate(
         &self,
         build_batch: &RecordBatch,
         build_row: usize,

@@ -4527,6 +4527,41 @@ cluster_local.sh verify-m2 && scripts/cluster_local.sh stop` (M1/M2).
   a fixed 8-thread pool) — memory first. Evidence:
   `.claude/epics/archived/join-spill-streaming/` (003.md carries the
   controlled allocator-retention experiments).
+- **CLOSED (`spill-boundaries` epic, 2026-09-05): the three remaining
+  clean-refusal boundaries — over-budget NATIVE scans feeding joins,
+  ON-clause-filter join spill, and LEFT/RIGHT/FULL outer-join spill.**
+  (1) Planner: `collect_agg_covered_scans` became
+  `collect_spill_covered_scans` — a Scan streams (`NativeStreamingScanExec`)
+  when every pipeline breaker between it and the root is spill-capable
+  (aggregate/DISTINCT; `SpillableHashJoinExec` on EITHER side; `ExternalSortExec`);
+  Window/DelimJoin/VectorSearch block, raw dumps / filter-only / LIMIT-only
+  still refuse by name; the pre-pass now runs BEFORE shared-CTE
+  materialization (Q11's HAVING subquery and Q15's `revenue` CTE are
+  twice-referenced CTEs that were being lowered first). Native SF=100 @1G:
+  Q02 0.32s, Q10 1.9s, Q11 0.21s, Q15 0.89s, Q20 17.6s — all cell-exact
+  (all refused on 2026-09-04). (2) Spill path: `PairFilter` compiled once
+  per call; `visit_candidate_pairs` is the single pair enumeration for
+  INNER/SEMI/ANTI/outer in phase A and the chunked phase B; `CompiledFilter`
+  fast path gated per batch on actual types and NULL slots, else 65,536-pair
+  gathered `evaluate_expr` chunks ("NULL is not TRUE"). Q21 SF=100 parquet
+  @256M: 74.5s cell-exact, 3 `execute_spill_path`, 334 hash-check-ok / 0
+  mismatch. (3) Outer joins reuse the SEMI/ANTI bitmaps: preserved-side
+  match bitmaps (`preserve_probe`/`preserve_build`), one
+  `probe_batch_against_table` pass emits pairs and marks both bitmaps,
+  NULL-extended emission via the full schema + retained mask; probe-
+  preserved emits after the last chunk, build-preserved per partition/chunk;
+  K-way phase B and the budget discipline unchanged. Q20 SF=100 parquet
+  @256M: 33.1s cell-exact, 118 hash-check-ok / 0 mismatch. The spill path's
+  refusal is now CROSS/SINGLE/MARK only. Tests: 21 filtered fixtures + 31
+  outer-join fixtures vs a row-level naive oracle (both orientations,
+  dense/sparse, NULL keys, filter, retained mask, K=3), planner cover/
+  uncover unit tests, `native_streaming_scan_tests` moved to the widened
+  rule, `spill_tests::outer_join_spill_matches_in_memory`; chaos 300/300
+  (26,054 hash-check-ok / 0 mismatch); SF=10 native 5,113ms. Certification
+  after this epic: SF=100 parquet 22/22 at 1G AND 256M, native 22/22 at
+  100G AND 1G on the final binary, 0 checksum mismatches — see the
+  re-certification table in the SF=100 section. Evidence:
+  `.claude/epics/archived/spill-boundaries/`.
 - **No compaction** (native-tables-mutation epic, confirmed OUT OF SCOPE
   by design — task 001's Decision 3, not merely deferred incidentally). A
   deletion vector is correctness-preserving indefinitely — reads always
@@ -4749,6 +4784,32 @@ this epic's 3). The sweep timings shared the machine with the suite
 builds; the task-003 quiet-machine numbers are the ones to quote for
 speed. Evidence: `.claude/epics/archived/join-spill-streaming/004.md` +
 `updates/004/stream-A.md`, `.scratch/jss/`.
+
+**Re-certified 2026-09-05 (`spill-boundaries` task 004).** Every SF=100 premise
+re-run on the final binary (ec1839f; same drivers, oracle and caps as
+2026-09-04; the sweeps shared the machine with suite builds, so totals
+are upper bounds):
+
+| premise | 2026-09-04 | 2026-09-05 (final binary) |
+|---|---|---|
+| parquet, 1G | 22/22, 637s | **22/22, 566s**; spilling Q03/Q09/Q13/Q16/Q18/Q20; 0 mismatch |
+| parquet, 256M | 20/22 + Q20/Q21 named refusals, 933s | **22/22, 1,004s** — Q20 54.9s via the LEFT-join spill path, Q21 117.6s via the filtered spill path; 0 mismatch on all 22 |
+| native, 100G | 22/22, 79s | **22/22, 178s** (Q4 3.5s, Q13 13.1s; under load) |
+| native, 1G | 17/22 + 5 native-scan admission refusals, 856s | **22/22, 918s** — Q02 1.1s, Q10 10.3s, Q11 0.73s, Q15 10.2s, Q20 42.9s now stream into their joins; 0 mismatch |
+
+No named refusal remains on TPC-H at any tested budget on either
+provider. Harness: join scenarios `semi-join`/`anti-join`/`left-join`/
+`filtered-join` **18/18 PASS under the DEFAULT 1G cap** (both orientations,
+both levers; left 795-803MB, filtered eq 785-842MB, semi 591-674MB, anti
+618-717MB — the 003 follow-up replaced a per-row take+concat gather with
+one interleave per column and sliced every emission to 8,192 rows, after
+a 1s-RSS-sampler root cause showed the LEFT/filtered phase-B plateau at
+992-1,180MB); SF=10 harness core 8/8; SF=100-class harness core
+**8/8 PASS** (agg 483/489MB, sort 852/816MB at 600M rows under 1G; native-scan 116/119MB over the 100GB lineitem native table under 2G; insert from the 100GB lineitem parquet 2x clean admission refusal under 512M); chaos 300/300 on the final binary (24,250 hash-check-ok / 0
+mismatch); M1/M2 PASS. Suites at the final binary: default 1353/0/1,
+lance **1418/0/2**, gpu **1362/0/1**, pulsar **1356/0/1** (all `--no-fail-fast`, exit 0; identical to the pre-follow-up counts — the follow-up added no tests). No-regression legs: SF=10 native **5,891 / 6,610ms** (22/22 OK) and parquet cache-off **7.52s then 7.24s** (22/22 PASS) on a machine under interactive load (load average 11-21 from the desktop shell, a browser and a peer session; the same native sweep measured 5,113ms at 8f38273 when the load was ~2.7) — an alternating A/B under identical load, pre-follow-up binary vs final binary, gave 6,163/6,113ms vs 6,226/5,916ms (within 2%, final not slower), so the band miss is load, not the code; INSERT RSS 1.57GB in band; chaos 300/300; M1/M2 PASS. Evidence:
+`.claude/epics/archived/spill-boundaries/004.md` + `updates/004/stream-A.md`,
+`.scratch/sb/`.
 
 **CPU vs GPU split** (`--features gpu`, per this program's standing
 convention of reporting these as separate rows): see the "GPU Aggregate
