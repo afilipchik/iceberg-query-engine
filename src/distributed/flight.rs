@@ -42,7 +42,8 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::error::QueryError;
 
-use super::server::{execute_statement, DistMode, ExecError, ExecOutcome, NodeState};
+use super::query_log::{FrontDoor, QueryOrigin};
+use super::server::{execute_statement, DistMode, ExecError, ExecOutcome, Executed, NodeState};
 
 /// SQL statements and tickets share the HTTP body cap: a ticket is a statement
 /// plus a few fixed fields, and an unbounded ticket is an unbounded allocation.
@@ -366,6 +367,7 @@ impl FlightService for QeFlightService {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
+        let peer = request.remote_addr().map(|a| a.to_string());
         let ticket = request.into_inner().ticket;
         if ticket.len() > MAX_TICKET_BYTES {
             return Err(Status::invalid_argument(format!(
@@ -382,11 +384,19 @@ impl FlightService for QeFlightService {
         }
         let mode = parse_mode(&ticket.mode)?;
 
-        let outcome = execute_statement(&self.state, &ticket.sql, mode)
-            .await
-            .map_err(exec_error_status)?;
+        let origin = QueryOrigin {
+            front_door: FrontDoor::Flight,
+            client_addr: peer,
+        };
+        let Executed { query_id, outcome } =
+            execute_statement(&self.state, &ticket.sql, mode, origin).await;
+        let outcome = outcome.map_err(exec_error_status)?;
 
-        let metadata = Bytes::from(outcome_metadata(&outcome).to_string());
+        let mut meta = outcome_metadata(&outcome);
+        if let Some(id) = &query_id {
+            meta["query_id"] = serde_json::json!(id);
+        }
+        let metadata = Bytes::from(meta.to_string());
 
         // Same schema convention as the HTTP encoder: be governed by the data
         // when there is any, by the plan's description only when there is none.
@@ -399,6 +409,13 @@ impl FlightService for QeFlightService {
         let batches = outcome.result.batches;
 
         let messages = encode_flight_stream(batches, schema, metadata)?;
+        if let Some(id) = &query_id {
+            let bytes: usize = messages
+                .iter()
+                .map(|m| m.data_header.len() + m.data_body.len())
+                .sum();
+            self.state.query_log.set_result(id, bytes, "flight");
+        }
         Ok(Response::new(
             futures::stream::iter(messages.into_iter().map(Ok)).boxed(),
         ))

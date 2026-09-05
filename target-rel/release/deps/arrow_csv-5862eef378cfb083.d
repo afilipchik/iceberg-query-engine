@@ -1,0 +1,10 @@
+/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/qui/wt/target-rel/release/deps/arrow_csv-5862eef378cfb083.d: /home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-csv-58.4.0/src/lib.rs /home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-csv-58.4.0/src/reader/mod.rs /home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-csv-58.4.0/src/reader/records.rs /home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-csv-58.4.0/src/writer.rs
+
+/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/qui/wt/target-rel/release/deps/libarrow_csv-5862eef378cfb083.rlib: /home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-csv-58.4.0/src/lib.rs /home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-csv-58.4.0/src/reader/mod.rs /home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-csv-58.4.0/src/reader/records.rs /home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-csv-58.4.0/src/writer.rs
+
+/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/qui/wt/target-rel/release/deps/libarrow_csv-5862eef378cfb083.rmeta: /home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-csv-58.4.0/src/lib.rs /home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-csv-58.4.0/src/reader/mod.rs /home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-csv-58.4.0/src/reader/records.rs /home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-csv-58.4.0/src/writer.rs
+
+/home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-csv-58.4.0/src/lib.rs:
+/home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-csv-58.4.0/src/reader/mod.rs:
+/home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-csv-58.4.0/src/reader/records.rs:
+/home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-csv-58.4.0/src/writer.rs:

@@ -51,6 +51,30 @@ pub enum QueryError {
     Internal(String),
 }
 
+impl QueryError {
+    /// The variant name, for structured error reporting (the `serve` query
+    /// log groups failures by it). Stable strings: they are part of the
+    /// `/queries` JSON contract.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            QueryError::Parse(_) => "Parse",
+            QueryError::Plan(_) => "Plan",
+            QueryError::Bind(_) => "Bind",
+            QueryError::Type(_) => "Type",
+            QueryError::Execution(_) => "Execution",
+            QueryError::Storage(_) => "Storage",
+            QueryError::Io(_) => "Io",
+            QueryError::Arrow(_) => "Arrow",
+            QueryError::Parquet(_) => "Parquet",
+            QueryError::TableNotFound(_) => "TableNotFound",
+            QueryError::ColumnNotFound(_) => "ColumnNotFound",
+            QueryError::InvalidArgument(_) => "InvalidArgument",
+            QueryError::NotImplemented(_) => "NotImplemented",
+            QueryError::Internal(_) => "Internal",
+        }
+    }
+}
+
 impl From<arrow::error::ArrowError> for QueryError {
     fn from(e: arrow::error::ArrowError) -> Self {
         // QE_ERR_BT=1: print where an arrow error entered the engine —

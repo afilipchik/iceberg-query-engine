@@ -830,6 +830,8 @@ impl SpillableHashJoinExec {
             let chaos_crossing = chaos_after_batches
                 .map(|n| flat_batches.len() >= n)
                 .unwrap_or(false);
+            // The batch is already in memory when this decision is made: record it.
+            self.memory_pool.observe(flat_size + batch_size);
             if flat_size + batch_size > memory_threshold || chaos_crossing {
                 if chaos_crossing && sj_trace {
                     eprintln!(
@@ -853,6 +855,7 @@ impl SpillableHashJoinExec {
                     .await;
             }
             flat_size += batch_size;
+            self.memory_pool.observe(flat_size);
             flat_batches.push(batch);
         }
 
@@ -1228,6 +1231,8 @@ impl SpillableHashJoinExec {
                 + predicted_hash_table_bytes(batch.num_rows(), key_cols);
 
             // Check if we need to spill
+            // The batch is already in memory when this decision is made: record it.
+            self.memory_pool.observe(total_memory + batch_charge);
             if total_memory + batch_charge > memory_threshold {
                 // Find the largest partition to spill
                 if let Some(idx) = find_largest_partition(&partitions) {
@@ -1261,6 +1266,7 @@ impl SpillableHashJoinExec {
                     if let Some(ref mut part) = partitions[idx] {
                         part.add_batch(pb);
                         total_memory += pb_charge;
+                        self.memory_pool.observe(total_memory);
                         // spill-join-correctness-2 epic, task 003: force
                         // this partition to disk right now if a fault-
                         // injection trial chose it, regardless of memory
@@ -1434,6 +1440,7 @@ impl SpillableHashJoinExec {
             }
             running += actual;
             table_bytes_total += actual;
+            self.memory_pool.observe(table_bytes_total);
             tables[idx] = Some(table);
         }
 
@@ -3220,11 +3227,14 @@ impl PhysicalOperator for SpillableHashAggregateExec {
         let mut crossing_batch: Option<RecordBatch> = None;
         while let Some(batch) = input_stream.try_next().await? {
             let batch_size = estimate_batch_size(&batch);
+            // The batch is already in memory when this decision is made: record it.
+            self.memory_pool.observe(flat_size + batch_size);
             if flat_size + batch_size > memory_threshold {
                 crossing_batch = Some(batch);
                 break;
             }
             flat_size += batch_size;
+            self.memory_pool.observe(flat_size);
             flat_batches.push(batch);
         }
 
@@ -3557,6 +3567,8 @@ impl SpillableHashAggregateExec {
                 // could not bound it. The state cost is priced where it
                 // actually materializes: `execute()`'s finalize gate
                 // (`predicted_agg_state_bytes` + `aggregate_partition_chunked`).
+                // The batch is already in memory when this decision is made: record it.
+                self.memory_pool.observe(total_memory + batch_size);
                 if total_memory + batch_size > memory_threshold {
                     // Spill the largest partition (largest-first, matching
                     // the join: maximizes freed bytes per eviction).
@@ -3582,6 +3594,7 @@ impl SpillableHashAggregateExec {
                         if let Some(ref mut part) = partitions[idx] {
                             part.add_batch(pb);
                             total_memory += pb_size;
+                            self.memory_pool.observe(total_memory);
                         }
                     }
                 }
@@ -3817,11 +3830,14 @@ impl PhysicalOperator for ExternalSortExec {
         let mut crossing_batch: Option<RecordBatch> = None;
         while let Some(batch) = input_stream.try_next().await? {
             let batch_size = estimate_batch_size(&batch);
+            // The batch is already in memory when this decision is made: record it.
+            self.memory_pool.observe(flat_size + batch_size);
             if flat_size + batch_size > memory_threshold {
                 crossing_batch = Some(batch);
                 break;
             }
             flat_size += batch_size;
+            self.memory_pool.observe(flat_size);
             flat_batches.push(batch);
         }
 
@@ -3994,6 +4010,8 @@ impl ExternalSortExec {
         while let Some(batch) = input_stream.try_next().await? {
             let batch_size = estimate_batch_size(&batch);
 
+            // The batch is already in memory when this decision is made: record it.
+            self.memory_pool.observe(buffer_size + batch_size);
             if buffer_size + batch_size > memory_threshold && !buffer.is_empty() {
                 // Sort buffer and write run
                 let run_path = spill_dir.join(format!("run_{}.parquet", runs.len()));
@@ -4007,6 +4025,7 @@ impl ExternalSortExec {
 
             buffer.push(batch);
             buffer_size += batch_size;
+            self.memory_pool.observe(buffer_size);
         }
 
         // Flush remaining buffer. This is still a spill — the run is written to
