@@ -1,0 +1,51 @@
+{
+  "binary_sha256": "9ba109ec7f66277fdc65f7263dfc61fb36a4548fc08291fa7b297967b89ad24e",
+  "setup_source_sha256": "cac2975285f215c49078ffe87cd4dd5898030ee4e9e046e238df2d2bb9bdf62f",
+  "request_source_sha256": "8600675281e98b0ee77e35ea3f0ca032a7aae23c82d7a8bd3fbddecb3f7274b2",
+  "driver_sha256": "6f574a679750296299deccc1ced48ce3069c873883d5dd4ce2ed5be466a727bf",
+  "ready": {
+    "features": {
+      "gpu": true,
+      "lance": true
+    },
+    "gpu_enabled": false,
+    "gpu_residency_required": false,
+    "gpu_snapshot": null,
+    "ipc_cache": "off",
+    "residency": "warm_host_files",
+    "setup_ms": 1063.500786,
+    "status": "ready",
+    "threads": 16,
+    "track": "lance"
+  },
+  "ready_process": {
+    "VmSize": "19386600 kB",
+    "VmRSS": "2902136 kB",
+    "RssAnon": "2868896 kB",
+    "RssFile": "33240 kB",
+    "VmData": "4685320 kB",
+    "Threads": "224",
+    "thread_names": {
+      "lance_fragment_": 1,
+      "qe-worker-0": 1,
+      "qe-worker-1": 1,
+      "qe-worker-2": 1,
+      "qe-worker-3": 1,
+      "qe-worker-4": 1,
+      "qe-worker-5": 1,
+      "qe-worker-6": 1,
+      "qe-worker-7": 1,
+      "qe-worker-8": 1,
+      "qe-worker-9": 1,
+      "qe-worker-10": 1,
+      "qe-worker-11": 1,
+      "qe-worker-12": 1,
+      "qe-worker-13": 1,
+      "qe-worker-14": 1,
+      "qe-worker-15": 1,
+      "tokio-rt-worker": 16,
+      "lance-io": 191
+    }
+  },
+  "qualification": "Diagnostic sequence omits reference interleaving and idle delays;180s per-request ceiling, not performance acceptance."
+}

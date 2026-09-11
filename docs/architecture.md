@@ -1778,8 +1778,10 @@ rejected to prevent unrecorded configuration. This does not change production
 engine scheduling or memory limits. See
 [reference diagnostics and SF10 checkpoint](reference-worker-initialization-follow-up-2026-09-11.md).
 
-Lance fragment collection now owns JoinHandles through `FragmentTasks`. Ordered
-collection aborts and drains siblings on errors/panics; dropping the collector
-requests cooperative cancellation even before its first poll. This changes task
-lifetime, not fragment fanout, provider admission or collected-output budgeting.
-See [reproduction and validation](lance-fragment-task-ownership-2026-09-11.md).
+Lance scans now use one ordered multi-fragment scanner, sharing Lance's internal
+read/decode scheduling across selected fragments. Explicit empty subsets return
+no rows; nonempty subsets retain dataset order. The former provider-level tasks
+and `FragmentTasks` guard are removed together. Collected output, internal Lance
+cancellation and query-wide admission remain open resource contracts. See the
+[scanner candidate](ordered-lance-scanner-2026-09-11.md) and the historical
+[task ownership repair](lance-fragment-task-ownership-2026-09-11.md).

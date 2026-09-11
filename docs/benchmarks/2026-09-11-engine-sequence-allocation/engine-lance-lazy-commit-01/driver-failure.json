@@ -1,0 +1,8 @@
+{
+  "driver_exit": 1,
+  "exception": "KeyError: 'output'",
+  "boundary": "after completed s1-q09-warmup; next original request was NOTRUN without output field",
+  "worker_closed_in_finally": true,
+  "cgroup_after_captured": false,
+  "corrected_driver": "engine_lance_full_sequence_probe.py"
+}

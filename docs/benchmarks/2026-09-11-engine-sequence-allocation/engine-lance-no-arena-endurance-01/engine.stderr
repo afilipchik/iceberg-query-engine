@@ -1,0 +1,3 @@
+[mem-cap] process hard-capped at 12.0G anonymous memory (RLIMIT_DATA; the engine aborts if exceeded, the terminal survives; size with QE_MEM_CAP)
+memory allocation of 8388608 bytes failed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

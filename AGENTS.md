@@ -6,104 +6,71 @@ linked reports and the existing epic rather than prepending another status block
 
 ## Current checkpoint — 2026-09-11
 
-Current candidate `7ddbf9ce` (531 verified source inputs, Lance/GPU) builds on pushed
-checkpoint `de7605f`. Admitted readers prepare missing columns' page state before
-output trials. Query-pool-admitted decoder checkpoints allow typed memory denials
-to discard provisional arrays and retry a smaller common row target. Existing
-pending prefixes and final output leases remain owned. Trials never read source
-pages; provisional dictionary IDs may be decoded again after a refusal. Non-memory
-errors stay terminal. No dependency, default-ownership or budget change.
+Frozen candidate `835ae7ad` (531 verified source inputs, Lance/GPU features) uses
+one ordered Lance scanner across selected fragments. This shares Lance's internal
+I/O/decode scheduling instead of spawning a scanner per fragment. Explicit empty
+subsets return no rows; provider subsets preserve dataset order. Projection,
+filters and AllLate materialization remain. The obsolete outer tasks and their
+cancellation guard are removed together. Collected output and internal blocking
+work remain resource-accounting boundaries. No allocator, budget, dependency or
+default-ownership change. See [scanner evidence](docs/ordered-lance-scanner-2026-09-11.md).
 
-The fixed-budget reproduction now completes all 4,096 independently expected rows
-at 160 KiB for both one-row and larger targets; larger output retains useful
-batching. Plain/dictionary SNAPPY fault tests cover cursor rollback, source-read
-counts, NULLs, duplicates, unequal prefixes, output lifetime and terminal errors.
-See [implementation and evidence](docs/coordinated-reader-output-2026-09-11.md).
+Independent multi-fragment/deletion fixture38877 passes. Production library76256
+passes28 and SQLintegration52325 passes31 with fixtures. Broad39700 is terminal1:
+each ownership mode1132library passes/11ignored,125contracts; native/IPC63passes
+disjoint and62partial plus the known numeric failure; spill/numeric28passes plus
+the same six failures each. Complete inventory comparison verifies no new failures
+and exactly four retired outer-task tests, replaced by one fixture. Validation
+archive25files verifies531source inputs; compile/test peak43.907GB under48GiB,
+zeroOOM/max,swap0. Pinned Lance/Lance-IO/Lance-Core sources match364crate files.
 
-Final validation38419 is terminal1: each ownership mode passes 1,131 library tests
-(11 ignored), 125 contracts and 28 spill/numeric checks. Native/IPC passes 63 in
-disjoint mode and 62 with one failure in partial mode. The same six spill failures
-remain in each mode; complete executable/count/exit comparison finds no added or
-removed failures. The 25-file archive verifies 531 inputs. The combined build/test
-scope reached 48 GiB with 103 max events, zero OOM and swap disabled. This is not
-query-only memory telemetry or complete resource acceptance.
+Release44289 completed0 in8m48s; provider screen is terminal1. Independent audit1801
+validates341outputs/255of264measured pairs: raw66, native60, Iceberg63, Lance66.
+Raw and Lance complete all22queries; raw geomean2.435505/suite2.634762 (0wins),
+Lance2.219364/3.310772 (1win) versus DuckDB. NativeQ1warmup/Q6measured1 timeout;
+DuckDB IcebergQ9calibration1 crashes withSIGSEGV, so engineQ9 is not run. The
+1,275-file SF10 archive verifies source/binary/harness; combined scopepeak25.843GB,
+zeroOOM/max. The21common Lance queries are14.6%slower in an unpaired historical
+comparison, especiallyQ12/Q19. Preserve this tradeoff; no speedup is certified.
 
-Diagnostic18068 is terminal0 with one expected failing test (inferior101). The
-remaining COUNT(DISTINCT) refusal requests 23,043 bytes for whole-page decompression
-with 248,058 used against 262,144, before output trials. The reader already requests
-one row and the join has collected zero batches. The fixture uses SNAPPY and
-dictionary encoding. Ten archived files verify 531 inputs and eight fixtures;
-probe peak is 1,722,372,096 bytes, zero OOM/max. A complete ownership ledger is still
-needed; this is not proof that every viable working-space policy fails.
+Repeated default-allocator Lance37426 completes176requests; independent35908
+validates all176outputs. Observed I/O threads peak46; end-of-sequence VmData grows
+only64KiB between sequences. Scopepeak7.944GB under16GiB,zeroOOM/max. Archive190files
+verifies after correcting a worker/archive manifest filename collision. This
+clears the reproduced two-sequence failure, not general query-wide admission or
+unbounded-duration acceptance. All jobs are terminal. Checkpoint commit/push is
+next, then paired generic scan attribution across multiple workload shapes.
+Last pushed checkpoint is `97cea5c`; current candidate is provisional pending
+performance work. No new decoded IPC/GPU or concurrency acceptance.
 
-Release5788 is terminal0 in 8m49s, freezing `7ddbf9ce`. Checkpoint98921 is
-terminal1; independent evidence72426 is terminal0. All jobs are terminal. Archives
-verify 452 diagnostic, 1,425 provider and 1,097 residency files and all 531 inputs.
-The cycle is committed and pushed as `bf88b95`; the remote branch hash is verified.
+Earlier completed evidence belongs to its frozen binary:
 
-Latest completed SF10 candidate `7ddbf9ce`:
-
-- Paired diagnostic: 42 typed-correct outputs, 792 join traces, 14 equal plan groups.
-  Generic raw Q6 ratio1.030694 versus previous `1bba20b3`, native Q9 1.018964 and
-  resident4 Q9 1.020718 regress in both blocks. Native Q6 improves to0.875128 in
-  both, but no broad gain or neutrality is certified. Generic Q6 remains1.779016
-  versus pre-coercion `13210a20`. Retain provisionally as a memory-progress repair.
-- Providers: 337 correct outputs, 252/264 valid pairs (raw66/native60/Iceberg63/
-  Lance63). Raw geometric mean2.373308/suite2.528335 versus DuckDB, zero wins.
-  Native Q1 warmup and Q6 measured1 timeouts remain. Iceberg Q13/Lance Q9 reference
-  calibration0 refuses32MiB/128MiB; dependent requests are not run. The earlier
-  engine Lance Q9 join-index failure is not cleared by missing execution.
-- Residency: 256 correct outputs, 209/278 planned valid pairs (212 emitted).
-  Decoded IPC completes, geometric mean0.839134/suite1.393701, 14 wins. Its engine
-  suite time is nearly unchanged across separate screens; the reference time
-  changes substantially. CPU-control Q1 timeout blocks all canonical mixed-GPU
-  requests. Custom required GPU validates 40 measured device requests. Canonical
-  32/48GiB with preload excluded does not clear16GiB preload admission.
-- Diagnostic/screen scope peak39,497,113,600 bytes under48GiB, swap0, zero OOM/max.
-  This is distinct from the compile/test scope's103max events. All completed
-  outputs pass independent typed validation; failed and missing pairs remain open.
-
-See the [completed checkpoint](docs/coordinated-output-checkpoint-2026-09-11.md).
-Previous pushed checkpoint `de7605f` and its baseline are retained in the
-[bounded-output report](docs/admitted-coalesce-checkpoint-2026-09-11.md).
+- `9ba109ec`:340typed-correctoutputs/255of264provider pairs. Raw completes at
+  geomean2.433312/suite2.639173 versus DuckDB,0wins. NativeQ1timeout, Iceberg
+  referenceQ9allocation refusal and LanceengineQ9join-index refusal remain.
+- Same binary: seven allocator/sequence controls preserve500typed outputs in a
+  559-file archive. FreshQ9passes; persistent default fails after80requests.
+  Lazycommit fails after82; no-arena completes88 then aborts on the next sequence.
+  Neither allocator control is a production fix. Q19's retained writable mapping
+  growth continues even with fixed thread count. See [allocation investigation](docs/join-index-allocation-follow-up-2026-09-11.md).
+- `7ddbf9ce`: coordinated admitted reader trials repair fixed-budget progress and
+  preserve useful batching. RawQ6 still regresses versus pre-coercion13210a20.
+  The decoded IPC screen uses32/48GiB capacity and excludes preload; it does not
+  clear16GiB preload refusal. Canonical GPU has no successful device execution;
+  custom required-GPU40measured requests have device evidence. See the
+  [completed checkpoint](docs/coordinated-output-checkpoint-2026-09-11.md).
 
 No DuckDB leadership is certified. Native prepared admission, shared CPU throughput,
 whole-page and legacy join/result allocation boundaries, full provider/resource/
 concurrency acceptance and short-query precision remain open. Default ownership
-stays disjoint; partial-mode gains do not clear its numeric/resource failures or
-historical four-thread Q18 regression. Preserve the failed identical-binary custom
-Q6 precision control (upper95%1.130588) and its dependent comparison NOTRUN.
-
-Same-cap fresh reference controls pass8typed outputs. Persistent sequence49356
-completes Iceberg121/121 but reproduces LanceQ9cal0 128MiB refusal after183
-completed requests;431threads and VmData near12GiB cap, zero cgroupOOM/max.
-Five boundary outputs are typed-verified; earlier replay outputs only hashed.
-Mapping13207 repeats Lance refusal with349Tokio-named threads. I/O quota16
-control1762 completes184requests with123Tokio-named threads and five Q9 outputs
-across both runs typed-verified; one pair only, no harness change or rebaseline.
-Reverse quota39397 completes184; default2125 refuses all three Q9 requests
-(181complete). Harness adds explicit reference-only quota with27tests/no skips.
-Full matched LanceSF10 screen75607 terminal1: referenceQ9 completes, engineQ9
-warmup join-index allocation fails, three measured requests NOTRUN;21other
-queries typed-correct.531source/binary/harness hashes verify. Checkpoint `864e645` committed/pushed, exact remote hash verified. Continue
-systemic native/page ownership and shared CPU work. See
-[reference diagnostics](docs/reference-worker-initialization-follow-up-2026-09-11.md). Detailed prior experiments and active-state
-snapshots are preserved in the [September11 history](docs/agent-checkpoint-history-2026-09-11.md)
-and linked reports; historical results certify only their frozen candidates.
-
-Current source repairs detached Lance fragment tasks: error/panic collection
-abort/drains siblings; collector drop requests cooperative cancellation. Red71040
-reproduces retention; focused4/Lance library31/integration31pass. Broad89208
-retains known failures with1135library passes each,531inputs verified. Release
-9ba109ec and pipeline99427 are terminal; audit86235 verifies340typed outputs and
-255/264pairs. Raw completes (geomean2.433312/suite2.639173,0wins); nativeQ1timeout,
-Iceberg referenceQ9warmup256KiB refusal, LanceengineQ9join-index refusal remain.
-1271-file archive verifies; combined release/screenpeak27.743GB,zeroOOM/max.
-No new residency/concurrency acceptance. Commit/push this cycle then engine
-sequence allocation diagnostic. See [Lance task ownership](docs/lance-fragment-task-ownership-2026-09-11.md).
+stays disjoint. Preserve the failed identical-binary customQ6 precision control
+(upper95%1.130588) and its dependent comparison NOTRUN. Chronological detail is in
+[September11 history](docs/agent-checkpoint-history-2026-09-11.md), linked reports
+and the existing epic; historical active states are not current certification.
 
 ## Start here
 
+- [Current Lance scanner candidate](docs/ordered-lance-scanner-2026-09-11.md)
 - [Current completed checkpoint](docs/coordinated-output-checkpoint-2026-09-11.md)
 - [Coordinated reader implementation](docs/coordinated-reader-output-2026-09-11.md)
 - [Previous pushed SF10 checkpoint](docs/admitted-coalesce-checkpoint-2026-09-11.md)

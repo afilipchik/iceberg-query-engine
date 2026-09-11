@@ -1,0 +1,10 @@
+{
+  "environment": {
+    "MIMALLOC_SHOW_STATS": "1",
+    "MIMALLOC_ARENA_EAGER_COMMIT": "0"
+  },
+  "query_cap_bytes": 4294967296,
+  "process_cap_bytes": 12884901888,
+  "cgroup_cap_bytes": 17179869184,
+  "qualification": "No SQL/source/cap change; allocator setting control, not performance acceptance."
+}

@@ -1,0 +1,36 @@
+[mem-cap] process hard-capped at 12.0G anonymous memory (RLIMIT_DATA; the engine aborts if exceeded, the terminal survives; size with QE_MEM_CAP)
+subproc 0
+ pages           peak       total     current       block      total#   
+  touched   :     0           0           0                                ok
+  pages     :     0         194.8 K     -30.4 K  
+  abandoned :     0         588.5 K     -31.9 K  
+  reclaima  :    91.8 K  
+  reclaimf  :   398.2 K  
+  reabandon :   146.3 K  
+  waits     :     0      
+  extended  :     0      
+  retire    :     0      
+  searches  :     1.8 avg
+
+ arenas          peak       total     current       block      total#   
+  reserved  :    11.2 GiB    11.8 GiB    10.8 GiB                          
+  committed :    10.9 GiB    11.5 GiB    10.6 GiB                          
+  reset     :     0      
+  purged    :    55.7 GiB
+  arenas    :    16      
+  rollback  :     0      
+  mmaps     :   158      
+  commits   :     0      
+  resets    :     0      
+  purges    :   128.4 K  
+  guarded   :     0      
+  theaps    :   378         402         362      
+  heaps     :     1           1           1      
+  heap waits:     0      
+
+ process         peak       total     current       block      total#   
+  threads   :   379         403         363      
+  numa nodes:     1
+  elapsed   :    80.356 s
+  process   : user: 301.345 s, system: 156.235 s, faults: 0, peak rss: 8.1 GiB, peak commit: 10.9 GiB
+

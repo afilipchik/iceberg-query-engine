@@ -1,0 +1,5 @@
+{
+  "initial_archive_verification": "failed: worker manifest was copied to the archive manifest filename, then overwritten",
+  "correction": "worker manifest preserved as worker-manifest.json; archive manifest rebuilt excluding itself; all files rehashed",
+  "engine_rerun": false
+}

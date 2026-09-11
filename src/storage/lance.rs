@@ -58,11 +58,8 @@ const LANCE_BATCH_SIZE: usize = 8192;
 /// context, and scans run inside the engine's async execution. A single shared
 /// runtime, reached through a bounded reply channel (see `block_on_lance`), avoids both.
 ///
-/// Sized to `num_cpus`, not a small constant: a scan fans out one task per
-/// fragment (58 for SF=10 lineitem), and a narrow pool would serialize the
-/// decode that fragment parallelism exists to overlap. This mirrors the
-/// reasoning in `physical::operators::subquery::subquery_runtime`, which was
-/// widened from 2 workers to `num_cpus` for exactly this class of problem.
+/// Sized to `num_cpus` to support Lance's concurrent reads and decode work.
+/// Each provider scan uses one scanner across its selected fragments.
 pub(super) fn lance_runtime() -> &'static tokio::runtime::Runtime {
     use std::sync::OnceLock;
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -791,7 +788,7 @@ impl LanceTable {
     ///   is fragment-parallel.
     ///
     /// Fixed on both counts (SF=10 `lineitem`, 32 threads, best of 3), the sign
-    /// flips. `scan_one` now always asks for `AllLate`:
+    /// flips. `scan_ordered_fragments` always asks for `AllLate`:
     ///
     /// | shape | no filter | filter, Heuristic | filter, **AllLate** |
     /// |---|---|---|---|
@@ -931,10 +928,8 @@ impl LanceTable {
     }
 }
 
-/// Scan every fragment concurrently, preserving fragment order in the output.
-///
-/// One task per fragment: Lance decode is CPU-bound per fragment, so this is
-/// the format's natural parallel unit (58 fragments for SF=10 `lineitem`).
+/// Scan selected fragments through one concurrent Lance scheduler, preserving
+/// fragment order in the output.
 /// `QE_LANCE_TIMING=1` reports every scan's wall time, width and row count.
 ///
 /// Attribution before optimization: this is what showed that the Lance path's
@@ -980,181 +975,27 @@ async fn scan_fragments_inner(
         }
     }
 
-    // Single fragment: no point paying for task spawn + join. When a subset
-    // is active the fragment must still be named explicitly — an unfragmented
-    // scan would read the whole dataset.
-    if fragments.len() <= 1 {
-        let meta = if subset.is_some() {
-            fragments.first().map(|f| f.metadata().clone())
-        } else {
-            None
-        };
-        return scan_one(ds, names, meta, filter).await;
-    }
-
-    let mut tasks = Vec::with_capacity(fragments.len());
-    for fragment in fragments {
-        let ds = Arc::clone(&ds);
-        let names = names.clone();
-        let filter = filter.clone();
-        let meta = fragment.metadata().clone();
-        tasks.push(tokio::spawn(async move {
-            scan_one(ds, names, Some(meta), filter).await
-        }));
-    }
-
-    collect_fragment_tasks(tasks).await
+    // Lance already schedules fragment reads and batch decoding concurrently.
+    // One ordered scanner shares that scheduler across the selected fragments
+    // instead of multiplying its prefetch/decode windows by fragment count.
+    let selected = subset.map(|_| fragments.iter().map(|f| f.metadata().clone()).collect());
+    scan_ordered_fragments(ds, names, selected, filter).await
 }
 
-struct FragmentTasks(Vec<tokio::task::JoinHandle<Result<Vec<RecordBatch>>>>);
-
-impl Drop for FragmentTasks {
-    fn drop(&mut self) {
-        for task in &self.0 {
-            task.abort();
-        }
-    }
-}
-
-fn collect_fragment_tasks(
-    tasks: Vec<tokio::task::JoinHandle<Result<Vec<RecordBatch>>>>,
-) -> impl std::future::Future<Output = Result<Vec<RecordBatch>>> {
-    // Establish ownership before polling, so dropping even an unpolled
-    // collector cancels its tasks instead of detaching their resources.
-    let mut tasks = FragmentTasks(tasks);
-    async move {
-        let mut out = Vec::new();
-        for index in 0..tasks.0.len() {
-            let result = (&mut tasks.0[index])
-                .await
-                .map_err(|e| QueryError::Execution(format!("Lance fragment task failed: {e}")));
-            match result.and_then(|batches| batches) {
-                Ok(batches) => out.extend(batches),
-                Err(error) => {
-                    for task in &tasks.0[index + 1..] {
-                        task.abort();
-                    }
-                    // Cancellation is cooperative. Drain before returning an
-                    // error, retaining the original cause if a sibling fails.
-                    for task in &mut tasks.0[index + 1..] {
-                        let _ = task.await;
-                    }
-                    return Err(error);
-                }
-            }
-        }
-        Ok(out)
-    }
-}
-
-#[cfg(test)]
-mod fragment_task_tests {
-    use super::*;
-
-    struct Released(Option<tokio::sync::oneshot::Sender<()>>);
-    impl Drop for Released {
-        fn drop(&mut self) {
-            let _ = self.0.take().unwrap().send(());
-        }
-    }
-
-    #[tokio::test]
-    async fn failed_fragment_releases_pending_sibling_before_return() {
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (released_tx, mut released_rx) = tokio::sync::oneshot::channel();
-        let pending = tokio::spawn(async move {
-            let _owned = Released(Some(released_tx));
-            started_tx.send(()).unwrap();
-            std::future::pending::<Result<Vec<RecordBatch>>>().await
-        });
-        started_rx.await.unwrap();
-        let failed = tokio::spawn(async { Err(QueryError::Execution("fragment failure".into())) });
-        let result = collect_fragment_tasks(vec![failed, pending]).await;
-        assert!(result.unwrap_err().to_string().contains("fragment failure"));
-        assert!(
-            released_rx.try_recv().is_ok(),
-            "failed scan retained a sibling task"
-        );
-    }
-
-    #[tokio::test]
-    async fn dropping_unpolled_fragment_collection_cancels_tasks() {
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (released_tx, released_rx) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            let _owned = Released(Some(released_tx));
-            started_tx.send(()).unwrap();
-            std::future::pending::<Result<Vec<RecordBatch>>>().await
-        });
-        started_rx.await.unwrap();
-        drop(collect_fragment_tasks(vec![task]));
-        tokio::time::timeout(std::time::Duration::from_secs(1), released_rx)
-            .await
-            .unwrap()
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn panicked_fragment_drains_siblings() {
-        let (released_tx, mut released_rx) = tokio::sync::oneshot::channel();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let sibling = tokio::spawn(async move {
-            let _owned = Released(Some(released_tx));
-            started_tx.send(()).unwrap();
-            std::future::pending::<Result<Vec<RecordBatch>>>().await
-        });
-        started_rx.await.unwrap();
-        let failed = tokio::spawn(async {
-            panic!("fragment panic");
-        });
-        let result = collect_fragment_tasks(vec![failed, sibling]).await;
-        assert!(result.unwrap_err().to_string().contains("fragment panic"));
-        assert!(released_rx.try_recv().is_ok());
-    }
-
-    #[tokio::test]
-    async fn fragment_collection_preserves_order_and_empty_batches() {
-        let schema = Arc::new(ArrowSchema::new(vec![arrow::datatypes::Field::new(
-            "key",
-            DataType::Int64,
-            true,
-        )]));
-        let first = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int64Array::from(vec![Some(2), None, Some(2)]))],
-        )
-        .unwrap();
-        let empty = RecordBatch::new_empty(schema.clone());
-        let last =
-            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![Some(1)]))]).unwrap();
-        let expected = vec![first.clone(), empty.clone(), last.clone()];
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let slow = tokio::spawn(async move {
-            ready_rx.await.unwrap();
-            Ok(vec![first, empty])
-        });
-        let fast = tokio::spawn(async move {
-            ready_tx.send(()).unwrap();
-            Ok(vec![last])
-        });
-        assert_eq!(
-            collect_fragment_tasks(vec![slow, fast]).await.unwrap(),
-            expected
-        );
-        assert!(collect_fragment_tasks(Vec::new()).await.unwrap().is_empty());
-    }
-}
-
-async fn scan_one(
+async fn scan_ordered_fragments(
     ds: Arc<Dataset>,
     names: Vec<String>,
-    fragment: Option<lance::table::format::Fragment>,
+    fragments: Option<Vec<lance::table::format::Fragment>>,
     filter: Option<String>,
 ) -> Result<Vec<RecordBatch>> {
-    let mut scanner = ds.scan();
-    if let Some(meta) = fragment {
-        scanner.with_fragments(vec![meta]);
+    if fragments.as_ref().is_some_and(Vec::is_empty) {
+        return Ok(Vec::new());
     }
+    let mut scanner = ds.scan();
+    if let Some(fragments) = fragments {
+        scanner.with_fragments(fragments);
+    }
+    scanner.scan_in_order(true);
     let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     // THE point of the integration: Lance reads only these columns off disk.
     scanner
@@ -2494,5 +2335,144 @@ mod runtime_bridge_contract {
                 .unwrap(),
             23
         );
+    }
+}
+
+#[cfg(test)]
+mod ordered_scanner_tests {
+    use super::*;
+    use arrow::record_batch::RecordBatchIterator;
+    use lance::dataset::{WriteMode, WriteParams};
+
+    #[tokio::test]
+    async fn ordered_scanner_preserves_fragment_selection_and_deleted_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("ordered.lance");
+        let uri = uri.to_str().unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int64, false),
+            arrow::datatypes::Field::new("value", DataType::Int64, true),
+        ]));
+        // Independent row oracle: three appended fragments, each larger than
+        // one output batch, with duplicates and NULLs in the projected value.
+        let n = LANCE_BATCH_SIZE + 17;
+        let mut ds = None;
+        for fragment in 0..3 {
+            let ids: Vec<i64> = (fragment * n..(fragment + 1) * n)
+                .map(|v| v as i64)
+                .collect();
+            let values: Vec<Option<i64>> = ids
+                .iter()
+                .map(|id| if id % 7 == 0 { None } else { Some(id % 5) })
+                .collect();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(Int64Array::from(values)),
+                ],
+            )
+            .unwrap();
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            ds = Some(
+                Dataset::write(
+                    reader,
+                    uri,
+                    Some(WriteParams {
+                        mode: if fragment == 0 {
+                            WriteMode::Create
+                        } else {
+                            WriteMode::Append
+                        },
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let mut ds = ds.unwrap();
+        ds.delete("id % 11 = 0").await.unwrap();
+        let ds = Arc::new(ds);
+        let metas: Vec<_> = ds
+            .get_fragments()
+            .iter()
+            .map(|f| f.metadata().clone())
+            .collect();
+        assert_eq!(metas.len(), 3);
+        for selected in [vec![0, 1, 2], vec![2, 0], vec![1], vec![]] {
+            for filtered in [false, true] {
+                let batches = scan_ordered_fragments(
+                    ds.clone(),
+                    vec!["value".into(), "id".into()],
+                    Some(selected.iter().map(|&i| metas[i].clone()).collect()),
+                    filtered.then(|| "id % 3 = 1".into()),
+                )
+                .await
+                .unwrap();
+                let mut actual = Vec::new();
+                for batch in &batches {
+                    assert_eq!(batch.schema().field(0).name(), "value");
+                    assert_eq!(batch.schema().field(1).name(), "id");
+                    let values = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap();
+                    let ids = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap();
+                    for row in 0..batch.num_rows() {
+                        actual.push((
+                            ids.value(row),
+                            (!values.is_null(row)).then(|| values.value(row)),
+                        ));
+                    }
+                }
+                let expected: Vec<_> = selected
+                    .iter()
+                    .flat_map(|&f| f * n..(f + 1) * n)
+                    .map(|id| id as i64)
+                    .filter(|id| id % 11 != 0 && (!filtered || id % 3 == 1))
+                    .map(|id| (id, if id % 7 == 0 { None } else { Some(id % 5) }))
+                    .collect();
+                // The provider's public subset contract follows dataset order,
+                // independent of the caller's subset insertion order.
+                let subset = selected.iter().map(|&i| metas[i].id).collect();
+                let routed = scan_fragments_inner(
+                    ds.clone(),
+                    vec!["value".into(), "id".into()],
+                    filtered.then(|| "id % 3 = 1".into()),
+                    Some(subset),
+                )
+                .await
+                .unwrap();
+                let mut routed_ids = Vec::new();
+                for batch in routed {
+                    let ids = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap();
+                    routed_ids.extend(ids.values().iter().copied());
+                }
+                let mut expected_ids: Vec<_> = expected.iter().map(|(id, _)| *id).collect();
+                expected_ids.sort_unstable();
+                assert_eq!(routed_ids, expected_ids);
+                assert_eq!(
+                    actual, expected,
+                    "selected={selected:?}, filtered={filtered}"
+                );
+                if selected.len() == 3 && !filtered {
+                    assert!(batches.len() > 1);
+                }
+            }
+        }
+        let batches = scan_ordered_fragments(ds, vec!["value".into()], None, Some("id < 0".into()))
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
     }
 }

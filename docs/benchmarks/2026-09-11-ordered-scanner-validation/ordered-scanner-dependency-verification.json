@@ -1,0 +1,20 @@
+{
+  "lance-10.0.0": {
+    "package_checksum": "830548f9fc92ae74b848a504282d4da06f016f2ee94b663773c2738b9cb61c42",
+    "package_matches_lock": true,
+    "files": 265,
+    "changed": []
+  },
+  "lance-io-10.0.0": {
+    "package_checksum": "4b8a6872b9bff95e75e223e04011feebd990d8784878eaf5df73c86d6acebb47",
+    "package_matches_lock": true,
+    "files": 51,
+    "changed": []
+  },
+  "lance-core-10.0.0": {
+    "package_checksum": "21f4fd872bfe948150a6878d983327c4f150dc1b629e94ae7677310fa6a3f35f",
+    "package_matches_lock": true,
+    "files": 48,
+    "changed": []
+  }
+}

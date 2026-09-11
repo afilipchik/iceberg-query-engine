@@ -1,0 +1,25 @@
+{
+  "parent_commit": "97cea5cf2b0c7d3830fb97ae2367e2f39611c26d",
+  "fixture": {
+    "session": 38877,
+    "exit": 0,
+    "passed": 1
+  },
+  "library": {
+    "session": 76256,
+    "exit": 0,
+    "passed": 28
+  },
+  "integration": {
+    "session": 52325,
+    "exit": 0,
+    "passed": 31
+  },
+  "broad_session": 39700,
+  "next": [
+    "Finish broad gates and compare known failures, allowing exactly four retired fragment-task tests and one replacement",
+    "Freeze release and run raw/native/Iceberg/Lance SF10 at4/12GiB defaultdisjoint16threads",
+    "Repeated default-allocator SF10 Lance sequence and independent typed oracle audit",
+    "Archive results, commit exact cycle paths, push authorized GitHub branch, continue goal"
+  ]
+}
