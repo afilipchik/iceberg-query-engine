@@ -1,0 +1,1088 @@
+[
+  {
+    "query": "q08",
+    "iteration": 1,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "o_year: int32\n  -- field metadata --\n  query_engine.bound_column.name: 'o_year'\nmkt_share: double\n  -- field metadata --\n  query_engine.bound_column.name: 'mkt_share'",
+      "expected_schema": "o_year: int64\nmkt_share: double",
+      "actual_rows": 2,
+      "expected_rows": 2
+    },
+    "elapsed_ms": 393.614446,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q08",
+    "iteration": 2,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "o_year: int32\n  -- field metadata --\n  query_engine.bound_column.name: 'o_year'\nmkt_share: double\n  -- field metadata --\n  query_engine.bound_column.name: 'mkt_share'",
+      "expected_schema": "o_year: int64\nmkt_share: double",
+      "actual_rows": 2,
+      "expected_rows": 2
+    },
+    "elapsed_ms": 414.37753399999997,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q08",
+    "iteration": 3,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "o_year: int32\n  -- field metadata --\n  query_engine.bound_column.name: 'o_year'\nmkt_share: double\n  -- field metadata --\n  query_engine.bound_column.name: 'mkt_share'",
+      "expected_schema": "o_year: int64\nmkt_share: double",
+      "actual_rows": 2,
+      "expected_rows": 2
+    },
+    "elapsed_ms": 539.745671,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q20",
+    "iteration": 1,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "s_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_name'\ns_address: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_address'",
+      "expected_schema": "s_name: string\ns_address: string",
+      "actual_rows": 1804,
+      "expected_rows": 1804
+    },
+    "elapsed_ms": 254.903681,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q20",
+    "iteration": 2,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "s_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_name'\ns_address: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_address'",
+      "expected_schema": "s_name: string\ns_address: string",
+      "actual_rows": 1804,
+      "expected_rows": 1804
+    },
+    "elapsed_ms": 254.16161100000002,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q20",
+    "iteration": 3,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "s_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_name'\ns_address: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_address'",
+      "expected_schema": "s_name: string\ns_address: string",
+      "actual_rows": 1804,
+      "expected_rows": 1804
+    },
+    "elapsed_ms": 250.75333799999999,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q06",
+    "iteration": 1,
+    "comparison": {
+      "ok": true,
+      "policy": "bag",
+      "status": "validated",
+      "actual_schema": "revenue: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'revenue'",
+      "expected_schema": "revenue: decimal128(38, 4)",
+      "actual_rows": 1,
+      "expected_rows": 1
+    },
+    "elapsed_ms": 174.418127,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q06",
+    "iteration": 2,
+    "comparison": {
+      "ok": true,
+      "policy": "bag",
+      "status": "validated",
+      "actual_schema": "revenue: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'revenue'",
+      "expected_schema": "revenue: decimal128(38, 4)",
+      "actual_rows": 1,
+      "expected_rows": 1
+    },
+    "elapsed_ms": 181.360898,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q06",
+    "iteration": 3,
+    "comparison": {
+      "ok": true,
+      "policy": "bag",
+      "status": "validated",
+      "actual_schema": "revenue: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'revenue'",
+      "expected_schema": "revenue: decimal128(38, 4)",
+      "actual_rows": 1,
+      "expected_rows": 1
+    },
+    "elapsed_ms": 184.369486,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q07",
+    "iteration": 1,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "supp_nation: string\n  -- field metadata --\n  query_engine.bound_column.name: 'supp_nation'\ncust_nation: string\n  -- field metadata --\n  query_engine.bound_column.name: 'cust_nation'\nl_year: int32\n  -- field metadata --\n  query_engine.bound_column.name: 'l_year'\nrevenue: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'revenue'",
+      "expected_schema": "supp_nation: string\ncust_nation: string\nl_year: int64\nrevenue: decimal128(38, 4)",
+      "actual_rows": 4,
+      "expected_rows": 4
+    },
+    "elapsed_ms": 467.15375,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q07",
+    "iteration": 2,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "supp_nation: string\n  -- field metadata --\n  query_engine.bound_column.name: 'supp_nation'\ncust_nation: string\n  -- field metadata --\n  query_engine.bound_column.name: 'cust_nation'\nl_year: int32\n  -- field metadata --\n  query_engine.bound_column.name: 'l_year'\nrevenue: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'revenue'",
+      "expected_schema": "supp_nation: string\ncust_nation: string\nl_year: int64\nrevenue: decimal128(38, 4)",
+      "actual_rows": 4,
+      "expected_rows": 4
+    },
+    "elapsed_ms": 438.155441,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q07",
+    "iteration": 3,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "supp_nation: string\n  -- field metadata --\n  query_engine.bound_column.name: 'supp_nation'\ncust_nation: string\n  -- field metadata --\n  query_engine.bound_column.name: 'cust_nation'\nl_year: int32\n  -- field metadata --\n  query_engine.bound_column.name: 'l_year'\nrevenue: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'revenue'",
+      "expected_schema": "supp_nation: string\ncust_nation: string\nl_year: int64\nrevenue: decimal128(38, 4)",
+      "actual_rows": 4,
+      "expected_rows": 4
+    },
+    "elapsed_ms": 459.60377200000005,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q21",
+    "iteration": 1,
+    "comparison": {
+      "ok": true,
+      "policy": "limit_ties",
+      "status": "validated",
+      "actual_schema": "s_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_name'\nnumwait: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'numwait'",
+      "expected_schema": "s_name: string\nnumwait: int64",
+      "oracle_rows": 4009,
+      "limit_rows": 100,
+      "actual_rows": 100,
+      "expected_rows": 100
+    },
+    "elapsed_ms": 940.020984,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q21",
+    "iteration": 2,
+    "comparison": {
+      "ok": true,
+      "policy": "limit_ties",
+      "status": "validated",
+      "actual_schema": "s_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_name'\nnumwait: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'numwait'",
+      "expected_schema": "s_name: string\nnumwait: int64",
+      "oracle_rows": 4009,
+      "limit_rows": 100,
+      "actual_rows": 100,
+      "expected_rows": 100
+    },
+    "elapsed_ms": 917.756564,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q21",
+    "iteration": 3,
+    "comparison": {
+      "ok": true,
+      "policy": "limit_ties",
+      "status": "validated",
+      "actual_schema": "s_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_name'\nnumwait: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'numwait'",
+      "expected_schema": "s_name: string\nnumwait: int64",
+      "oracle_rows": 4009,
+      "limit_rows": 100,
+      "actual_rows": 100,
+      "expected_rows": 100
+    },
+    "elapsed_ms": 819.154814,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q10",
+    "iteration": 1,
+    "comparison": {
+      "ok": true,
+      "policy": "limit_ties",
+      "status": "validated",
+      "actual_schema": "c_custkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'c_custkey'\nc_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 'c_name'\nrevenue: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'revenue'\nc_acctbal: decimal128(15, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'c_acctbal'\nn_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 'n_name'\nc_address: string\n  -- field metadata --\n  query_engine.bound_column.name: 'c_address'\nc_phone: string\n  -- field metadata --\n  query_engine.bound_column.name: 'c_phone'\nc_comment: string\n  -- field metadata --\n  query_engine.bound_column.name: 'c_comment'",
+      "expected_schema": "c_custkey: int64\nc_name: string\nrevenue: decimal128(38, 4)\nc_acctbal: decimal128(15, 2)\nn_name: string\nc_address: string\nc_phone: string\nc_comment: string",
+      "oracle_rows": 381105,
+      "limit_rows": 20,
+      "actual_rows": 20,
+      "expected_rows": 20
+    },
+    "elapsed_ms": 895.2140240000001,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q10",
+    "iteration": 2,
+    "comparison": {
+      "ok": true,
+      "policy": "limit_ties",
+      "status": "validated",
+      "actual_schema": "c_custkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'c_custkey'\nc_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 'c_name'\nrevenue: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'revenue'\nc_acctbal: decimal128(15, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'c_acctbal'\nn_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 'n_name'\nc_address: string\n  -- field metadata --\n  query_engine.bound_column.name: 'c_address'\nc_phone: string\n  -- field metadata --\n  query_engine.bound_column.name: 'c_phone'\nc_comment: string\n  -- field metadata --\n  query_engine.bound_column.name: 'c_comment'",
+      "expected_schema": "c_custkey: int64\nc_name: string\nrevenue: decimal128(38, 4)\nc_acctbal: decimal128(15, 2)\nn_name: string\nc_address: string\nc_phone: string\nc_comment: string",
+      "oracle_rows": 381105,
+      "limit_rows": 20,
+      "actual_rows": 20,
+      "expected_rows": 20
+    },
+    "elapsed_ms": 872.405563,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q10",
+    "iteration": 3,
+    "comparison": {
+      "ok": true,
+      "policy": "limit_ties",
+      "status": "validated",
+      "actual_schema": "c_custkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'c_custkey'\nc_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 'c_name'\nrevenue: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'revenue'\nc_acctbal: decimal128(15, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'c_acctbal'\nn_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 'n_name'\nc_address: string\n  -- field metadata --\n  query_engine.bound_column.name: 'c_address'\nc_phone: string\n  -- field metadata --\n  query_engine.bound_column.name: 'c_phone'\nc_comment: string\n  -- field metadata --\n  query_engine.bound_column.name: 'c_comment'",
+      "expected_schema": "c_custkey: int64\nc_name: string\nrevenue: decimal128(38, 4)\nc_acctbal: decimal128(15, 2)\nn_name: string\nc_address: string\nc_phone: string\nc_comment: string",
+      "oracle_rows": 381105,
+      "limit_rows": 20,
+      "actual_rows": 20,
+      "expected_rows": 20
+    },
+    "elapsed_ms": 846.538107,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q15",
+    "iteration": 1,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "s_suppkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 's_suppkey'\ns_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_name'\ns_address: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_address'\ns_phone: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_phone'\ntotal_revenue: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'total_revenue'",
+      "expected_schema": "s_suppkey: int64\ns_name: string\ns_address: string\ns_phone: string\ntotal_revenue: decimal128(38, 4)",
+      "actual_rows": 1,
+      "expected_rows": 1
+    },
+    "elapsed_ms": 240.74875300000002,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q15",
+    "iteration": 2,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "s_suppkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 's_suppkey'\ns_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_name'\ns_address: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_address'\ns_phone: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_phone'\ntotal_revenue: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'total_revenue'",
+      "expected_schema": "s_suppkey: int64\ns_name: string\ns_address: string\ns_phone: string\ntotal_revenue: decimal128(38, 4)",
+      "actual_rows": 1,
+      "expected_rows": 1
+    },
+    "elapsed_ms": 252.98078299999997,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q15",
+    "iteration": 3,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "s_suppkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 's_suppkey'\ns_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_name'\ns_address: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_address'\ns_phone: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_phone'\ntotal_revenue: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'total_revenue'",
+      "expected_schema": "s_suppkey: int64\ns_name: string\ns_address: string\ns_phone: string\ntotal_revenue: decimal128(38, 4)",
+      "actual_rows": 1,
+      "expected_rows": 1
+    },
+    "elapsed_ms": 248.281912,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q14",
+    "iteration": 1,
+    "comparison": {
+      "ok": true,
+      "policy": "bag",
+      "status": "validated",
+      "actual_schema": "promo_revenue: double\n  -- field metadata --\n  query_engine.bound_column.name: 'promo_revenue'",
+      "expected_schema": "promo_revenue: double",
+      "actual_rows": 1,
+      "expected_rows": 1
+    },
+    "elapsed_ms": 379.176626,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q14",
+    "iteration": 2,
+    "comparison": {
+      "ok": true,
+      "policy": "bag",
+      "status": "validated",
+      "actual_schema": "promo_revenue: double\n  -- field metadata --\n  query_engine.bound_column.name: 'promo_revenue'",
+      "expected_schema": "promo_revenue: double",
+      "actual_rows": 1,
+      "expected_rows": 1
+    },
+    "elapsed_ms": 371.2743,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q14",
+    "iteration": 3,
+    "comparison": {
+      "ok": true,
+      "policy": "bag",
+      "status": "validated",
+      "actual_schema": "promo_revenue: double\n  -- field metadata --\n  query_engine.bound_column.name: 'promo_revenue'",
+      "expected_schema": "promo_revenue: double",
+      "actual_rows": 1,
+      "expected_rows": 1
+    },
+    "elapsed_ms": 334.362143,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q05",
+    "iteration": 1,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "n_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 'n_name'\nrevenue: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'revenue'",
+      "expected_schema": "n_name: string\nrevenue: decimal128(38, 4)",
+      "actual_rows": 5,
+      "expected_rows": 5
+    },
+    "elapsed_ms": 408.64585,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q05",
+    "iteration": 2,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "n_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 'n_name'\nrevenue: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'revenue'",
+      "expected_schema": "n_name: string\nrevenue: decimal128(38, 4)",
+      "actual_rows": 5,
+      "expected_rows": 5
+    },
+    "elapsed_ms": 396.425067,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q05",
+    "iteration": 3,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "n_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 'n_name'\nrevenue: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'revenue'",
+      "expected_schema": "n_name: string\nrevenue: decimal128(38, 4)",
+      "actual_rows": 5,
+      "expected_rows": 5
+    },
+    "elapsed_ms": 439.89565899999997,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q01",
+    "iteration": 1,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "l_returnflag: string\n  -- field metadata --\n  query_engine.bound_column.name: 'l_returnflag'\nl_linestatus: string\n  -- field metadata --\n  query_engine.bound_column.name: 'l_linestatus'\nsum_qty: decimal128(38, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_qty'\nsum_base_price: decimal128(38, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_base_price'\nsum_disc_price: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_disc_price'\nsum_charge: decimal128(38, 6)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_charge'\navg_qty: double\n  -- field metadata --\n  query_engine.bound_column.name: 'avg_qty'\navg_price: double\n  -- field metadata --\n  query_engine.bound_column.name: 'avg_price'\navg_disc: double\n  -- field metadata --\n  query_engine.bound_column.name: 'avg_disc'\ncount_order: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'count_order'",
+      "expected_schema": "l_returnflag: string\nl_linestatus: string\nsum_qty: decimal128(38, 2)\nsum_base_price: decimal128(38, 2)\nsum_disc_price: decimal128(38, 4)\nsum_charge: decimal128(38, 6)\navg_qty: double\navg_price: double\navg_disc: double\ncount_order: int64",
+      "actual_rows": 4,
+      "expected_rows": 4
+    },
+    "elapsed_ms": 636.5788180000001,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q01",
+    "iteration": 2,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "l_returnflag: string\n  -- field metadata --\n  query_engine.bound_column.name: 'l_returnflag'\nl_linestatus: string\n  -- field metadata --\n  query_engine.bound_column.name: 'l_linestatus'\nsum_qty: decimal128(38, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_qty'\nsum_base_price: decimal128(38, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_base_price'\nsum_disc_price: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_disc_price'\nsum_charge: decimal128(38, 6)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_charge'\navg_qty: double\n  -- field metadata --\n  query_engine.bound_column.name: 'avg_qty'\navg_price: double\n  -- field metadata --\n  query_engine.bound_column.name: 'avg_price'\navg_disc: double\n  -- field metadata --\n  query_engine.bound_column.name: 'avg_disc'\ncount_order: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'count_order'",
+      "expected_schema": "l_returnflag: string\nl_linestatus: string\nsum_qty: decimal128(38, 2)\nsum_base_price: decimal128(38, 2)\nsum_disc_price: decimal128(38, 4)\nsum_charge: decimal128(38, 6)\navg_qty: double\navg_price: double\navg_disc: double\ncount_order: int64",
+      "actual_rows": 4,
+      "expected_rows": 4
+    },
+    "elapsed_ms": 622.248305,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q01",
+    "iteration": 3,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "l_returnflag: string\n  -- field metadata --\n  query_engine.bound_column.name: 'l_returnflag'\nl_linestatus: string\n  -- field metadata --\n  query_engine.bound_column.name: 'l_linestatus'\nsum_qty: decimal128(38, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_qty'\nsum_base_price: decimal128(38, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_base_price'\nsum_disc_price: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_disc_price'\nsum_charge: decimal128(38, 6)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_charge'\navg_qty: double\n  -- field metadata --\n  query_engine.bound_column.name: 'avg_qty'\navg_price: double\n  -- field metadata --\n  query_engine.bound_column.name: 'avg_price'\navg_disc: double\n  -- field metadata --\n  query_engine.bound_column.name: 'avg_disc'\ncount_order: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'count_order'",
+      "expected_schema": "l_returnflag: string\nl_linestatus: string\nsum_qty: decimal128(38, 2)\nsum_base_price: decimal128(38, 2)\nsum_disc_price: decimal128(38, 4)\nsum_charge: decimal128(38, 6)\navg_qty: double\navg_price: double\navg_disc: double\ncount_order: int64",
+      "actual_rows": 4,
+      "expected_rows": 4
+    },
+    "elapsed_ms": 642.869464,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q04",
+    "iteration": 1,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "o_orderpriority: string\n  -- field metadata --\n  query_engine.bound_column.name: 'o_orderpriority'\norder_count: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'order_count'",
+      "expected_schema": "o_orderpriority: string\norder_count: int64",
+      "actual_rows": 5,
+      "expected_rows": 5
+    },
+    "elapsed_ms": 211.106444,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q04",
+    "iteration": 2,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "o_orderpriority: string\n  -- field metadata --\n  query_engine.bound_column.name: 'o_orderpriority'\norder_count: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'order_count'",
+      "expected_schema": "o_orderpriority: string\norder_count: int64",
+      "actual_rows": 5,
+      "expected_rows": 5
+    },
+    "elapsed_ms": 217.86732,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q04",
+    "iteration": 3,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "o_orderpriority: string\n  -- field metadata --\n  query_engine.bound_column.name: 'o_orderpriority'\norder_count: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'order_count'",
+      "expected_schema": "o_orderpriority: string\norder_count: int64",
+      "actual_rows": 5,
+      "expected_rows": 5
+    },
+    "elapsed_ms": 235.46374600000001,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q18",
+    "iteration": 1,
+    "comparison": {
+      "ok": true,
+      "policy": "limit_ties",
+      "status": "validated",
+      "actual_schema": "c_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 'c_name'\nc_custkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'c_custkey'\no_orderkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'o_orderkey'\no_orderdate: date32[day]\n  -- field metadata --\n  query_engine.bound_column.name: 'o_orderdate'\no_totalprice: decimal128(15, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'o_totalprice'\nSUM(l_quantity): decimal128(38, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'SUM(l_quantity)'",
+      "expected_schema": "c_name: string\nc_custkey: int64\no_orderkey: int64\no_orderdate: date32[day]\no_totalprice: decimal128(15, 2)\nsum(l_quantity): decimal128(38, 2)",
+      "oracle_rows": 624,
+      "limit_rows": 100,
+      "actual_rows": 100,
+      "expected_rows": 100
+    },
+    "elapsed_ms": 957.016925,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q18",
+    "iteration": 2,
+    "comparison": {
+      "ok": true,
+      "policy": "limit_ties",
+      "status": "validated",
+      "actual_schema": "c_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 'c_name'\nc_custkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'c_custkey'\no_orderkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'o_orderkey'\no_orderdate: date32[day]\n  -- field metadata --\n  query_engine.bound_column.name: 'o_orderdate'\no_totalprice: decimal128(15, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'o_totalprice'\nSUM(l_quantity): decimal128(38, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'SUM(l_quantity)'",
+      "expected_schema": "c_name: string\nc_custkey: int64\no_orderkey: int64\no_orderdate: date32[day]\no_totalprice: decimal128(15, 2)\nsum(l_quantity): decimal128(38, 2)",
+      "oracle_rows": 624,
+      "limit_rows": 100,
+      "actual_rows": 100,
+      "expected_rows": 100
+    },
+    "elapsed_ms": 1072.97394,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q18",
+    "iteration": 3,
+    "comparison": {
+      "ok": true,
+      "policy": "limit_ties",
+      "status": "validated",
+      "actual_schema": "c_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 'c_name'\nc_custkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'c_custkey'\no_orderkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'o_orderkey'\no_orderdate: date32[day]\n  -- field metadata --\n  query_engine.bound_column.name: 'o_orderdate'\no_totalprice: decimal128(15, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'o_totalprice'\nSUM(l_quantity): decimal128(38, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'SUM(l_quantity)'",
+      "expected_schema": "c_name: string\nc_custkey: int64\no_orderkey: int64\no_orderdate: date32[day]\no_totalprice: decimal128(15, 2)\nsum(l_quantity): decimal128(38, 2)",
+      "oracle_rows": 624,
+      "limit_rows": 100,
+      "actual_rows": 100,
+      "expected_rows": 100
+    },
+    "elapsed_ms": 987.349001,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q12",
+    "iteration": 1,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "l_shipmode: string\n  -- field metadata --\n  query_engine.bound_column.name: 'l_shipmode'\nhigh_line_count: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'high_line_count'\nlow_line_count: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'low_line_count'",
+      "expected_schema": "l_shipmode: string\nhigh_line_count: decimal128(38, 0)\nlow_line_count: decimal128(38, 0)",
+      "actual_rows": 2,
+      "expected_rows": 2
+    },
+    "elapsed_ms": 560.553423,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q12",
+    "iteration": 2,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "l_shipmode: string\n  -- field metadata --\n  query_engine.bound_column.name: 'l_shipmode'\nhigh_line_count: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'high_line_count'\nlow_line_count: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'low_line_count'",
+      "expected_schema": "l_shipmode: string\nhigh_line_count: decimal128(38, 0)\nlow_line_count: decimal128(38, 0)",
+      "actual_rows": 2,
+      "expected_rows": 2
+    },
+    "elapsed_ms": 547.181357,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q12",
+    "iteration": 3,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "l_shipmode: string\n  -- field metadata --\n  query_engine.bound_column.name: 'l_shipmode'\nhigh_line_count: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'high_line_count'\nlow_line_count: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'low_line_count'",
+      "expected_schema": "l_shipmode: string\nhigh_line_count: decimal128(38, 0)\nlow_line_count: decimal128(38, 0)",
+      "actual_rows": 2,
+      "expected_rows": 2
+    },
+    "elapsed_ms": 556.22507,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q13",
+    "iteration": 1,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "c_count: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'c_count'\ncustdist: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'custdist'",
+      "expected_schema": "c_count: int64\ncustdist: int64",
+      "actual_rows": 45,
+      "expected_rows": 45
+    },
+    "elapsed_ms": 674.76437,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q13",
+    "iteration": 2,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "c_count: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'c_count'\ncustdist: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'custdist'",
+      "expected_schema": "c_count: int64\ncustdist: int64",
+      "actual_rows": 45,
+      "expected_rows": 45
+    },
+    "elapsed_ms": 639.080744,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q13",
+    "iteration": 3,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "c_count: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'c_count'\ncustdist: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'custdist'",
+      "expected_schema": "c_count: int64\ncustdist: int64",
+      "actual_rows": 45,
+      "expected_rows": 45
+    },
+    "elapsed_ms": 635.529708,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q02",
+    "iteration": 1,
+    "comparison": {
+      "ok": true,
+      "policy": "limit_ties",
+      "status": "validated",
+      "actual_schema": "s_acctbal: decimal128(15, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 's_acctbal'\ns_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_name'\nn_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 'n_name'\np_partkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'p_partkey'\np_mfgr: string\n  -- field metadata --\n  query_engine.bound_column.name: 'p_mfgr'\ns_address: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_address'\ns_phone: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_phone'\ns_comment: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_comment'",
+      "expected_schema": "s_acctbal: decimal128(15, 2)\ns_name: string\nn_name: string\np_partkey: int64\np_mfgr: string\ns_address: string\ns_phone: string\ns_comment: string",
+      "oracle_rows": 4667,
+      "limit_rows": 100,
+      "actual_rows": 100,
+      "expected_rows": 100
+    },
+    "elapsed_ms": 80.80482699999999,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q02",
+    "iteration": 2,
+    "comparison": {
+      "ok": true,
+      "policy": "limit_ties",
+      "status": "validated",
+      "actual_schema": "s_acctbal: decimal128(15, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 's_acctbal'\ns_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_name'\nn_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 'n_name'\np_partkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'p_partkey'\np_mfgr: string\n  -- field metadata --\n  query_engine.bound_column.name: 'p_mfgr'\ns_address: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_address'\ns_phone: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_phone'\ns_comment: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_comment'",
+      "expected_schema": "s_acctbal: decimal128(15, 2)\ns_name: string\nn_name: string\np_partkey: int64\np_mfgr: string\ns_address: string\ns_phone: string\ns_comment: string",
+      "oracle_rows": 4667,
+      "limit_rows": 100,
+      "actual_rows": 100,
+      "expected_rows": 100
+    },
+    "elapsed_ms": 84.338324,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q02",
+    "iteration": 3,
+    "comparison": {
+      "ok": true,
+      "policy": "limit_ties",
+      "status": "validated",
+      "actual_schema": "s_acctbal: decimal128(15, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 's_acctbal'\ns_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_name'\nn_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 'n_name'\np_partkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'p_partkey'\np_mfgr: string\n  -- field metadata --\n  query_engine.bound_column.name: 'p_mfgr'\ns_address: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_address'\ns_phone: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_phone'\ns_comment: string\n  -- field metadata --\n  query_engine.bound_column.name: 's_comment'",
+      "expected_schema": "s_acctbal: decimal128(15, 2)\ns_name: string\nn_name: string\np_partkey: int64\np_mfgr: string\ns_address: string\ns_phone: string\ns_comment: string",
+      "oracle_rows": 4667,
+      "limit_rows": 100,
+      "actual_rows": 100,
+      "expected_rows": 100
+    },
+    "elapsed_ms": 77.62192800000001,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q16",
+    "iteration": 1,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "p_brand: string\n  -- field metadata --\n  query_engine.bound_column.name: 'p_brand'\np_type: string\n  -- field metadata --\n  query_engine.bound_column.name: 'p_type'\np_size: int32\n  -- field metadata --\n  query_engine.bound_column.name: 'p_size'\nsupplier_cnt: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'supplier_cnt'",
+      "expected_schema": "p_brand: string\np_type: string\np_size: int32\nsupplier_cnt: int64",
+      "actual_rows": 27840,
+      "expected_rows": 27840
+    },
+    "elapsed_ms": 520.562814,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q16",
+    "iteration": 2,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "p_brand: string\n  -- field metadata --\n  query_engine.bound_column.name: 'p_brand'\np_type: string\n  -- field metadata --\n  query_engine.bound_column.name: 'p_type'\np_size: int32\n  -- field metadata --\n  query_engine.bound_column.name: 'p_size'\nsupplier_cnt: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'supplier_cnt'",
+      "expected_schema": "p_brand: string\np_type: string\np_size: int32\nsupplier_cnt: int64",
+      "actual_rows": 27840,
+      "expected_rows": 27840
+    },
+    "elapsed_ms": 523.203713,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q16",
+    "iteration": 3,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "p_brand: string\n  -- field metadata --\n  query_engine.bound_column.name: 'p_brand'\np_type: string\n  -- field metadata --\n  query_engine.bound_column.name: 'p_type'\np_size: int32\n  -- field metadata --\n  query_engine.bound_column.name: 'p_size'\nsupplier_cnt: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'supplier_cnt'",
+      "expected_schema": "p_brand: string\np_type: string\np_size: int32\nsupplier_cnt: int64",
+      "actual_rows": 27840,
+      "expected_rows": 27840
+    },
+    "elapsed_ms": 577.881943,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q11",
+    "iteration": 1,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "ps_partkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'ps_partkey'\nvalue: decimal128(38, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'value'",
+      "expected_schema": "ps_partkey: int64\nvalue: decimal128(38, 2)",
+      "actual_rows": 8685,
+      "expected_rows": 8685
+    },
+    "elapsed_ms": 87.669479,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q11",
+    "iteration": 2,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "ps_partkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'ps_partkey'\nvalue: decimal128(38, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'value'",
+      "expected_schema": "ps_partkey: int64\nvalue: decimal128(38, 2)",
+      "actual_rows": 8685,
+      "expected_rows": 8685
+    },
+    "elapsed_ms": 99.11932800000001,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q11",
+    "iteration": 3,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "ps_partkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'ps_partkey'\nvalue: decimal128(38, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'value'",
+      "expected_schema": "ps_partkey: int64\nvalue: decimal128(38, 2)",
+      "actual_rows": 8685,
+      "expected_rows": 8685
+    },
+    "elapsed_ms": 92.93190299999999,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q17",
+    "iteration": 1,
+    "comparison": {
+      "ok": true,
+      "policy": "bag",
+      "status": "validated",
+      "actual_schema": "avg_yearly: double\n  -- field metadata --\n  query_engine.bound_column.name: 'avg_yearly'",
+      "expected_schema": "avg_yearly: double",
+      "actual_rows": 1,
+      "expected_rows": 1
+    },
+    "elapsed_ms": 1721.9820000000002,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q17",
+    "iteration": 2,
+    "comparison": {
+      "ok": true,
+      "policy": "bag",
+      "status": "validated",
+      "actual_schema": "avg_yearly: double\n  -- field metadata --\n  query_engine.bound_column.name: 'avg_yearly'",
+      "expected_schema": "avg_yearly: double",
+      "actual_rows": 1,
+      "expected_rows": 1
+    },
+    "elapsed_ms": 1782.3766640000001,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q17",
+    "iteration": 3,
+    "comparison": {
+      "ok": true,
+      "policy": "bag",
+      "status": "validated",
+      "actual_schema": "avg_yearly: double\n  -- field metadata --\n  query_engine.bound_column.name: 'avg_yearly'",
+      "expected_schema": "avg_yearly: double",
+      "actual_rows": 1,
+      "expected_rows": 1
+    },
+    "elapsed_ms": 1736.8909700000002,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q22",
+    "iteration": 1,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "cntrycode: string\n  -- field metadata --\n  query_engine.bound_column.name: 'cntrycode'\nnumcust: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'numcust'\ntotacctbal: decimal128(38, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'totacctbal'",
+      "expected_schema": "cntrycode: string\nnumcust: int64\ntotacctbal: decimal128(38, 2)",
+      "actual_rows": 7,
+      "expected_rows": 7
+    },
+    "elapsed_ms": 104.728824,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q22",
+    "iteration": 2,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "cntrycode: string\n  -- field metadata --\n  query_engine.bound_column.name: 'cntrycode'\nnumcust: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'numcust'\ntotacctbal: decimal128(38, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'totacctbal'",
+      "expected_schema": "cntrycode: string\nnumcust: int64\ntotacctbal: decimal128(38, 2)",
+      "actual_rows": 7,
+      "expected_rows": 7
+    },
+    "elapsed_ms": 102.068003,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q22",
+    "iteration": 3,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "cntrycode: string\n  -- field metadata --\n  query_engine.bound_column.name: 'cntrycode'\nnumcust: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'numcust'\ntotacctbal: decimal128(38, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'totacctbal'",
+      "expected_schema": "cntrycode: string\nnumcust: int64\ntotacctbal: decimal128(38, 2)",
+      "actual_rows": 7,
+      "expected_rows": 7
+    },
+    "elapsed_ms": 108.381272,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q03",
+    "iteration": 1,
+    "comparison": {
+      "ok": true,
+      "policy": "limit_ties",
+      "status": "validated",
+      "actual_schema": "l_orderkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'l_orderkey'\nrevenue: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'revenue'\no_orderdate: date32[day]\n  -- field metadata --\n  query_engine.bound_column.name: 'o_orderdate'\no_shippriority: int32\n  -- field metadata --\n  query_engine.bound_column.name: 'o_shippriority'",
+      "expected_schema": "l_orderkey: int64\nrevenue: decimal128(38, 4)\no_orderdate: date32[day]\no_shippriority: int32",
+      "oracle_rows": 114003,
+      "limit_rows": 10,
+      "actual_rows": 10,
+      "expected_rows": 10
+    },
+    "elapsed_ms": 433.512787,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q03",
+    "iteration": 2,
+    "comparison": {
+      "ok": true,
+      "policy": "limit_ties",
+      "status": "validated",
+      "actual_schema": "l_orderkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'l_orderkey'\nrevenue: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'revenue'\no_orderdate: date32[day]\n  -- field metadata --\n  query_engine.bound_column.name: 'o_orderdate'\no_shippriority: int32\n  -- field metadata --\n  query_engine.bound_column.name: 'o_shippriority'",
+      "expected_schema": "l_orderkey: int64\nrevenue: decimal128(38, 4)\no_orderdate: date32[day]\no_shippriority: int32",
+      "oracle_rows": 114003,
+      "limit_rows": 10,
+      "actual_rows": 10,
+      "expected_rows": 10
+    },
+    "elapsed_ms": 433.636821,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q03",
+    "iteration": 3,
+    "comparison": {
+      "ok": true,
+      "policy": "limit_ties",
+      "status": "validated",
+      "actual_schema": "l_orderkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'l_orderkey'\nrevenue: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'revenue'\no_orderdate: date32[day]\n  -- field metadata --\n  query_engine.bound_column.name: 'o_orderdate'\no_shippriority: int32\n  -- field metadata --\n  query_engine.bound_column.name: 'o_shippriority'",
+      "expected_schema": "l_orderkey: int64\nrevenue: decimal128(38, 4)\no_orderdate: date32[day]\no_shippriority: int32",
+      "oracle_rows": 114003,
+      "limit_rows": 10,
+      "actual_rows": 10,
+      "expected_rows": 10
+    },
+    "elapsed_ms": 435.778991,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q09",
+    "iteration": 1,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "nation: string\n  -- field metadata --\n  query_engine.bound_column.name: 'nation'\no_year: int32\n  -- field metadata --\n  query_engine.bound_column.name: 'o_year'\nsum_profit: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_profit'",
+      "expected_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "actual_rows": 175,
+      "expected_rows": 175
+    },
+    "elapsed_ms": 1247.920012,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q09",
+    "iteration": 2,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "nation: string\n  -- field metadata --\n  query_engine.bound_column.name: 'nation'\no_year: int32\n  -- field metadata --\n  query_engine.bound_column.name: 'o_year'\nsum_profit: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_profit'",
+      "expected_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "actual_rows": 175,
+      "expected_rows": 175
+    },
+    "elapsed_ms": 1369.484879,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q09",
+    "iteration": 3,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "nation: string\n  -- field metadata --\n  query_engine.bound_column.name: 'nation'\no_year: int32\n  -- field metadata --\n  query_engine.bound_column.name: 'o_year'\nsum_profit: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_profit'",
+      "expected_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "actual_rows": 175,
+      "expected_rows": 175
+    },
+    "elapsed_ms": 1232.0322409999999,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q19",
+    "iteration": 1,
+    "comparison": {
+      "ok": true,
+      "policy": "bag",
+      "status": "validated",
+      "actual_schema": "revenue: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'revenue'",
+      "expected_schema": "revenue: decimal128(38, 4)",
+      "actual_rows": 1,
+      "expected_rows": 1
+    },
+    "elapsed_ms": 778.689712,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q19",
+    "iteration": 2,
+    "comparison": {
+      "ok": true,
+      "policy": "bag",
+      "status": "validated",
+      "actual_schema": "revenue: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'revenue'",
+      "expected_schema": "revenue: decimal128(38, 4)",
+      "actual_rows": 1,
+      "expected_rows": 1
+    },
+    "elapsed_ms": 645.155662,
+    "time_gate_pass": true,
+    "pair_valid": true
+  },
+  {
+    "query": "q19",
+    "iteration": 3,
+    "comparison": {
+      "ok": true,
+      "policy": "bag",
+      "status": "validated",
+      "actual_schema": "revenue: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'revenue'",
+      "expected_schema": "revenue: decimal128(38, 4)",
+      "actual_rows": 1,
+      "expected_rows": 1
+    },
+    "elapsed_ms": 646.6241590000001,
+    "time_gate_pass": true,
+    "pair_valid": true
+  }
+]

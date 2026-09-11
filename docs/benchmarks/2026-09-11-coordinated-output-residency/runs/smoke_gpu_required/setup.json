@@ -1,0 +1,15 @@
+{
+  "track": "gpu",
+  "threads": 4,
+  "memory_limit": "4294967296B",
+  "process_cap_bytes": 8589934592,
+  "temp_directory": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/coordinated-output-residency-32g-01/smoke_gpu_required/scratch/duckdb-temp",
+  "tables": [
+    {
+      "name": "lineitem",
+      "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/custom-gpu-float-ipc-01/lineitem/data.arrow"
+    }
+  ],
+  "host_arrow_preloaded": true,
+  "gpu_residency_required": true
+}

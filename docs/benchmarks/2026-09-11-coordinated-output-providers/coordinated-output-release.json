@@ -1,0 +1,28 @@
+{
+  "binary_sha256": "7ddbf9cee70d3355e1866bed91103f36ad280e99ed127bf55f056d31db3e439f",
+  "source_hashes_sha256": "5ac1273455cb759474367b282b880d66dfc80eadd1f4cd4856774ff4138e7855",
+  "source_count": 531,
+  "build_exit": 0,
+  "features": [
+    "lance",
+    "gpu"
+  ],
+  "SAFE_BUILD_MEM": "48G",
+  "SAFE_BUILD_JOBS": 1,
+  "locked": true,
+  "offline": true,
+  "revision": "de7605f2b7b4cf89282bcc6b0d539538de6eaa45",
+  "dirty_tree": true,
+  "frozen_at": "2026-09-11T17:37:18.307105+00:00",
+  "command": [
+    "cargo",
+    "build",
+    "--locked",
+    "--offline",
+    "--release",
+    "--features",
+    "lance,gpu",
+    "--example",
+    "benchmark_embedded"
+  ]
+}

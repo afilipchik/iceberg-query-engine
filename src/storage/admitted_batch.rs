@@ -15,9 +15,48 @@ fn invalid(message: &str) -> QueryError {
     QueryError::Storage(format!("admitted batch: {message}"))
 }
 pub(crate) trait ColumnSource {
+    type Checkpoint: Clone;
+    const COORDINATED: bool = false;
+    fn prepare_output(&mut self, _pool: &MemoryPool) -> Result<bool> {
+        unreachable!("uncoordinated source")
+    }
+    fn checkpoint(&self) -> Self::Checkpoint {
+        unreachable!("uncoordinated source")
+    }
+    fn restore(&mut self, _checkpoint: &Self::Checkpoint) {
+        unreachable!("uncoordinated source")
+    }
+    fn next_prepared(
+        &mut self,
+        _rows: usize,
+        _bytes: usize,
+        _pool: &MemoryPool,
+    ) -> Result<Option<ArrayRef>> {
+        unreachable!("uncoordinated source")
+    }
     fn next(&mut self, rows: usize, bytes: usize, pool: &MemoryPool) -> Result<Option<ArrayRef>>;
 }
 impl<S: PageSource> ColumnSource for AdmittedFlatColumn<S> {
+    type Checkpoint = super::admitted_flat_column::OutputCheckpoint;
+    const COORDINATED: bool = true;
+    fn prepare_output(&mut self, pool: &MemoryPool) -> Result<bool> {
+        AdmittedFlatColumn::prepare_output(self, pool)
+    }
+    fn checkpoint(&self) -> Self::Checkpoint {
+        AdmittedFlatColumn::checkpoint(self)
+    }
+    fn restore(&mut self, checkpoint: &Self::Checkpoint) {
+        AdmittedFlatColumn::restore(self, checkpoint)
+    }
+    fn next_prepared(
+        &mut self,
+        rows: usize,
+        bytes: usize,
+        pool: &MemoryPool,
+    ) -> Result<Option<ArrayRef>> {
+        AdmittedFlatColumn::next_prepared(self, rows, bytes, pool)
+    }
+
     fn next(&mut self, rows: usize, bytes: usize, pool: &MemoryPool) -> Result<Option<ArrayRef>> {
         AdmittedFlatColumn::next(self, rows, bytes, pool)
     }
@@ -171,6 +210,83 @@ impl<C: ColumnSource> AdmittedBatchReader<C> {
         }
         result
     }
+    /// Page preparation may perform source I/O, but output trials never do.
+    /// Checkpoints and provisional arrays stay reserved until all columns agree.
+    fn fill_coordinated(&mut self, max_rows: usize, bytes: usize, pool: &MemoryPool) -> Result<()> {
+        let missing = self
+            .pending
+            .as_slice()
+            .iter()
+            .filter(|p| p.array.is_none() && !p.ended)
+            .count();
+        if missing == 0 {
+            return Ok(());
+        }
+        let mut checkpoints = ReservedVec::with_capacity(pool, missing)?;
+        for (index, (column, pending)) in self
+            .columns
+            .as_mut_slice()
+            .iter_mut()
+            .zip(self.pending.as_mut_slice())
+            .enumerate()
+        {
+            if pending.array.is_none() && !pending.ended {
+                if column.prepare_output(pool)? {
+                    checkpoints.extend_reserved(1, [(index, column.checkpoint())])?;
+                } else {
+                    pending.ended = true;
+                }
+            }
+        }
+        let mut rows = max_rows;
+        loop {
+            let mut failure = None;
+            for (index, _) in checkpoints.as_slice() {
+                let index = *index;
+                let column = &mut self.columns.as_mut_slice()[index];
+                let pending = &mut self.pending.as_mut_slice()[index];
+                match column.next_prepared(rows, bytes, pool) {
+                    Ok(Some(array)) => {
+                        if array.is_empty()
+                            || array.data_type() != self.schema.field(index).data_type()
+                            || (!self.schema.field(index).is_nullable() && array.null_count() != 0)
+                        {
+                            return Err(invalid(
+                                "prepared output type, nullability or extent differs",
+                            ));
+                        }
+                        pending.array = Some(array);
+                        pending.offset = 0;
+                    }
+                    Ok(None) => return Err(invalid("prepared column ended without output")),
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            let Some(error) = failure else {
+                return Ok(());
+            };
+            if !error.is_memory_limit() {
+                return Err(error);
+            }
+            // Restore decoder cursors from retained pages and discard only this
+            // trial's arrays. Existing pending prefixes are untouched. Dictionary
+            // IDs decoded by this trial are provisional too; no source is replayed.
+            for (index, checkpoint) in checkpoints.as_slice() {
+                let pending = &mut self.pending.as_mut_slice()[*index];
+                pending.array = None;
+                pending.offset = 0;
+                self.columns.as_mut_slice()[*index].restore(checkpoint);
+            }
+            if rows == 1 {
+                return Err(error);
+            }
+            rows = (rows / 2).max(1);
+        }
+    }
+
     fn next_batch(
         &mut self,
         max_rows: usize,
@@ -196,29 +312,33 @@ impl<C: ColumnSource> AdmittedBatchReader<C> {
         } else {
             None
         };
-        for (index, (column, pending)) in self
-            .columns
-            .as_mut_slice()
-            .iter_mut()
-            .zip(self.pending.as_mut_slice())
-            .enumerate()
-        {
-            if pending.array.is_none() && !pending.ended {
-                match column.next(max_rows, value_bytes, pool)? {
-                    Some(array) => {
-                        if array.is_empty() {
-                            return Err(invalid("column returned an empty nonterminal chunk"));
+        if C::COORDINATED {
+            self.fill_coordinated(max_rows, value_bytes, pool)?;
+        } else {
+            for (index, (column, pending)) in self
+                .columns
+                .as_mut_slice()
+                .iter_mut()
+                .zip(self.pending.as_mut_slice())
+                .enumerate()
+            {
+                if pending.array.is_none() && !pending.ended {
+                    match column.next(max_rows, value_bytes, pool)? {
+                        Some(array) => {
+                            if array.is_empty() {
+                                return Err(invalid("column returned an empty nonterminal chunk"));
+                            }
+                            if array.data_type() != self.schema.field(index).data_type() {
+                                return Err(invalid("column type differs from schema"));
+                            }
+                            if !self.schema.field(index).is_nullable() && array.null_count() != 0 {
+                                return Err(invalid("NULLs in required column"));
+                            }
+                            pending.array = Some(array);
+                            pending.offset = 0;
                         }
-                        if array.data_type() != self.schema.field(index).data_type() {
-                            return Err(invalid("column type differs from schema"));
-                        }
-                        if !self.schema.field(index).is_nullable() && array.null_count() != 0 {
-                            return Err(invalid("NULLs in required column"));
-                        }
-                        pending.array = Some(array);
-                        pending.offset = 0;
+                        None => pending.ended = true,
                     }
-                    None => pending.ended = true,
                 }
             }
         }
@@ -290,6 +410,7 @@ mod tests {
         fail_once: bool,
     }
     impl ColumnSource for Mock {
+        type Checkpoint = ();
         fn next(&mut self, _: usize, _: usize, pool: &MemoryPool) -> Result<Option<ArrayRef>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail_once {

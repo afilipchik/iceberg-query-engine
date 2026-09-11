@@ -176,6 +176,10 @@ pub(crate) fn open(
 type FileColumn = AdmittedFlatColumn<File>;
 
 #[cfg(test)]
+#[path = "admitted_row_group_working_space_tests.rs"]
+mod working_space_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use parquet::schema::types::{ColumnPath, Type as SchemaType};

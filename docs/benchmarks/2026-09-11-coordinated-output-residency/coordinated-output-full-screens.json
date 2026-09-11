@@ -1,0 +1,69 @@
+{
+  "status": "terminal",
+  "steps": [
+    {
+      "name": "providers",
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/run_coordinated_output_providers.py"
+      ],
+      "status": "terminal",
+      "started_unix": 1789148399.4185405,
+      "resources_before": {
+        "path": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/safe-build-3445297-16385.scope",
+        "memory.max": "51539607552\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "21759344640\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      },
+      "exit_code": 1,
+      "finished_unix": 1789149216.295518,
+      "resources_after": {
+        "path": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/safe-build-3445297-16385.scope",
+        "memory.max": "51539607552\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "31459160064\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      }
+    },
+    {
+      "name": "residency",
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/run_coordinated_output_residency.py"
+      ],
+      "status": "terminal",
+      "started_unix": 1789149216.3050723,
+      "resources_before": {
+        "path": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/safe-build-3445297-16385.scope",
+        "memory.max": "51539607552\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "31459160064\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      },
+      "exit_code": 1,
+      "finished_unix": 1789149815.8464308,
+      "resources_after": {
+        "path": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/safe-build-3445297-16385.scope",
+        "memory.max": "51539607552\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "39497113600\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      }
+    }
+  ],
+  "resources_before": {
+    "path": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/safe-build-3445297-16385.scope",
+    "memory.max": "51539607552\n",
+    "memory.swap.max": "0\n",
+    "memory.peak": "21759344640\n",
+    "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+  },
+  "resources_after": {
+    "path": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/safe-build-3445297-16385.scope",
+    "memory.max": "51539607552\n",
+    "memory.swap.max": "0\n",
+    "memory.peak": "39497113600\n",
+    "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "files": {
+    "coordinated-output-checkpoint-evidence.json": "bcc6d84cd49e118c00bc20f6d22f91939f3d77609fc6281d5607a5fa060c1b27",
+    "coordinated-output-checkpoint.json": "8766d3e3cdcb217f94cb78b9435eab63df7e394aaad35ebd49d81e798d4b6688",
+    "coordinated-output-full-evidence.json": "f7293ff5769eb6e5e9edb6cb0f8bcedf372c2eb1649f8a0fa606272d4524deba",
+    "residency-ratios.json": "8707bbcfd45ff5f5e9f28d4f5246ea6a723674e7dde94be4aa33a524bdd2aa8a",
+    "run_coordinated_output_checkpoint.py": "795e9cb02e910a782c9716501982cebb8d18395de6afb47eb7f338ffe3c35f9c",
+    "run_coordinated_output_checkpoint_evidence.py": "7461db488e65c921c46adc2b43f580afcb060deeeca2e86f2132bb7420c06b17",
+    "supplement_coordinated_output_checkpoint.py": "3760c4e8575a30151665d1b31576c86e9021a319dd59139ab4ee1ef9f9ac1265"
+  },
+  "source_count": 531,
+  "release_sha256": "7ddbf9cee70d3355e1866bed91103f36ad280e99ed127bf55f056d31db3e439f",
+  "note": "Supplement to immutable triage/provider/residency archives; all ratios use complete independently validated measured pairs."
+}

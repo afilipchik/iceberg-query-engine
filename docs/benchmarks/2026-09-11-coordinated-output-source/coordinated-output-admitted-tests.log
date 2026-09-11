@@ -1,0 +1,560 @@
+warning: unused doc comment
+  --> src/execution/alloc_profile.rs:68:1
+   |
+68 | / /// Guards against re-entrant backtrace capture (backtrace capture itself
+69 | | /// allocates) causing infinite recursion/deadlock.
+   | |_--------------------------------------------------^
+   |   |
+   |   rustdoc does not generate documentation for macro invocations
+   |
+   = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+   = note: `#[warn(unused_doc_comments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `AtomicBool`
+  --> src/execution/alloc_profile.rs:25:25
+   |
+25 | use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+   |                         ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `ScalarValue`
+   --> src/optimizer/rules/flatten_dependent_join.rs:908:46
+    |
+908 |     use crate::planner::{LogicalPlanBuilder, ScalarValue};
+    |                                              ^^^^^^^^^^^
+
+warning: unused import: `crate::physical::operators::MemoryTableExec`
+   --> src/physical/operators/delim_join.rs:686:9
+    |
+686 |     use crate::physical::operators::MemoryTableExec;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Int32Array`
+   --> src/physical/operators/scan.rs:817:45
+    |
+817 |         use arrow::array::{DictionaryArray, Int32Array};
+    |                                             ^^^^^^^^^^
+
+warning: unused import: `ordered_float::OrderedFloat`
+   --> src/storage/row_group_pruning.rs:466:9
+    |
+466 |     use ordered_float::OrderedFloat;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated unit variant `parquet::basic::Encoding::BIT_PACKED`: Please see documentation for compatibility issues and use the RLE/bit-packing hybrid encoding instead
+   --> src/storage/admitted_row_group.rs:125:49
+    |
+125 |                     | parquet::basic::Encoding::BIT_PACKED
+    |                                                 ^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated unit variant `parquet::basic::Encoding::BIT_PACKED`: Please see documentation for compatibility issues and use the RLE/bit-packing hybrid encoding instead
+  --> src/storage/bounded_page_header.rs:56:14
+   |
+56 |         4 => BIT_PACKED,
+   |              ^^^^^^^^^^
+
+warning: use of deprecated unit variant `parquet::basic::Encoding::BIT_PACKED`: Please see documentation for compatibility issues and use the RLE/bit-packing hybrid encoding instead
+   --> src/storage/bounded_page_header.rs:459:79
+    |
+459 |                     parquet::basic::Encoding::RLE | parquet::basic::Encoding::BIT_PACKED
+    |                                                                               ^^^^^^^^^^
+
+warning: use of deprecated unit variant `parquet::basic::Encoding::BIT_PACKED`: Please see documentation for compatibility issues and use the RLE/bit-packing hybrid encoding instead
+   --> src/storage/bounded_page_header.rs:462:79
+    |
+462 |                     parquet::basic::Encoding::RLE | parquet::basic::Encoding::BIT_PACKED
+    |                                                                               ^^^^^^^^^^
+
+warning: use of deprecated method `arrow::arrow_ipc::writer::IpcDataGenerator::encoded_batch`: Use `encode` instead
+   --> src/distributed/flight.rs:186:18
+    |
+186 |                 .encoded_batch(&slice, &mut tracker, &opts)
+    |                  ^^^^^^^^^^^^^
+
+warning: use of deprecated method `parquet::file::properties::WriterPropertiesBuilder::set_max_row_group_size`: Use `set_max_row_group_row_count` instead
+   --> src/physical/morsel_agg/input_frontier/tests.rs:322:10
+    |
+322 |         .set_max_row_group_size(128)
+    |          ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `parquet::file::properties::WriterPropertiesBuilder::set_max_row_group_size`: Use `set_max_row_group_row_count` instead
+   --> src/physical/operators/spillable/admitted_queue_tests.rs:297:10
+    |
+297 |         .set_max_row_group_size(2)
+    |          ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `parquet::file::properties::WriterPropertiesBuilder::set_max_row_group_size`: Use `set_max_row_group_row_count` instead
+   --> src/physical/operators/streaming_parquet_scan/admitted.rs:454:14
+    |
+454 |             .set_max_row_group_size(3)
+    |              ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `parquet::file::properties::WriterPropertiesBuilder::set_max_row_group_size`: Use `set_max_row_group_row_count` instead
+   --> src/physical/operators/streaming_parquet_scan.rs:805:26
+    |
+805 |                         .set_max_row_group_size(2)
+    |                          ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `parquet::file::properties::WriterPropertiesBuilder::set_max_row_group_size`: Use `set_max_row_group_row_count` instead
+    --> src/physical/operators/streaming_parquet_scan.rs:1182:14
+     |
+1182 |             .set_max_row_group_size(200)
+     |              ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: value assigned to `result_plan` is never read
+   --> src/optimizer/rules/join_reorder.rs:550:52
+    |
+550 |         let mut result_plan: Option<LogicalPlan> = None;
+    |                                                    ^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `result_plan` is never read
+    --> src/optimizer/rules/join_reorder.rs:1422:52
+     |
+1422 |         let mut result_plan: Option<LogicalPlan> = None;
+     |                                                    ^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: value assigned to `result_columns` is never read
+    --> src/optimizer/rules/join_reorder.rs:1423:51
+     |
+1423 |         let mut result_columns: HashSet<String> = HashSet::new();
+     |                                                   ^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: variable `total` is assigned to, but never used
+   --> src/physical/vectorized_agg.rs:232:13
+    |
+232 |         let mut total = 0;
+    |             ^^^^^^^^^
+    |
+    = note: consider using `_total` instead
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `total` is never read
+   --> src/physical/vectorized_agg.rs:241:17
+    |
+241 |                 total += 1;
+    |                 ^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: variable does not need to be mutable
+    --> src/planner/binder.rs:2077:13
+     |
+2077 |         let mut out_items: Vec<(Expr, String)> = Vec::new(); // shape of final projection
+     |             ----^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: type `RawRows` is more private than the item `physical::morsel_agg::AggregationState::into_range_shards`
+    --> src/physical/morsel_agg.rs:2727:5
+     |
+2727 |     pub(crate) fn into_range_shards(mut self, p: usize, min: i64, w: u64) -> Result<Vec<RawRows>> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method `physical::morsel_agg::AggregationState::into_range_shards` is reachable at visibility `pub(crate)`
+     |
+note: but type `RawRows` is only usable at visibility `pub(in crate::physical::morsel_agg)`
+    --> src/physical/morsel_agg/raw_state.rs:14:1
+     |
+  14 | pub(super) struct RawRows {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^
+     = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `RawRows` is more private than the item `physical::morsel_agg::AggregationState::into_raw_shards`
+    --> src/physical/morsel_agg.rs:2735:5
+     |
+2735 |     pub(crate) fn into_raw_shards(mut self, p: usize) -> Result<Vec<RawRows>> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method `physical::morsel_agg::AggregationState::into_raw_shards` is reachable at visibility `pub(crate)`
+     |
+note: but type `RawRows` is only usable at visibility `pub(in crate::physical::morsel_agg)`
+    --> src/physical/morsel_agg/raw_state.rs:14:1
+     |
+  14 | pub(super) struct RawRows {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `flatten_plan` is never used
+  --> src/optimizer/rules/flatten_dependent_join.rs:46:4
+   |
+46 | fn flatten_plan(plan: &LogicalPlan) -> Result<LogicalPlan> {
+   |    ^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `try_flatten_filter` is never used
+   --> src/optimizer/rules/flatten_dependent_join.rs:150:4
+    |
+150 | fn try_flatten_filter(node: &FilterNode) -> Result<Option<LogicalPlan>> {
+    |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `flatten_exists` is never used
+   --> src/optimizer/rules/flatten_dependent_join.rs:190:4
+    |
+190 | fn flatten_exists(
+    |    ^^^^^^^^^^^^^^
+
+warning: function `extract_subquery_predicates` is never used
+   --> src/optimizer/rules/flatten_dependent_join.rs:844:4
+    |
+844 | fn extract_subquery_predicates(predicate: &Expr) -> (Vec<Expr>, Vec<Expr>) {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `extract_predicates_recursive` is never used
+   --> src/optimizer/rules/flatten_dependent_join.rs:851:4
+    |
+851 | fn extract_predicates_recursive(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `combine_predicates` is never used
+   --> src/optimizer/rules/flatten_dependent_join.rs:878:4
+    |
+878 | fn combine_predicates(predicates: Vec<Expr>) -> Expr {
+    |    ^^^^^^^^^^^^^^^^^^
+
+warning: method `update_count` is never used
+    --> src/physical/morsel_agg.rs:1118:8
+     |
+ 847 | impl AccumulatorState {
+     | --------------------- method in this implementation
+...
+1118 |     fn update_count(&mut self) {
+     |        ^^^^^^^^^^^^
+
+warning: method `scalar_to_raw` is never used
+    --> src/physical/morsel_agg.rs:2511:8
+     |
+1854 | impl AggregationState {
+     | --------------------- method in this implementation
+...
+2511 |     fn scalar_to_raw(&self, key: &GroupKey) -> Option<RawKey> {
+     |        ^^^^^^^^^^^^^
+
+warning: fields `join_type`, `delim_columns`, and `on` are never read
+  --> src/physical/operators/delim_join.rs:76:5
+   |
+70 | pub struct DelimJoinExec {
+   |            ------------- fields in this struct
+...
+76 |     join_type: JoinType,
+   |     ^^^^^^^^^
+77 |     /// Expressions for correlation columns (from outer)
+78 |     delim_columns: Vec<Expr>,
+   |     ^^^^^^^^^^^^^
+79 |     /// Join conditions (outer_col, inner_col)
+80 |     on: Vec<(Expr, Expr)>,
+   |     ^^
+   |
+   = note: `DelimJoinExec` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `extract_distinct_values` is never used
+   --> src/physical/operators/delim_join.rs:218:4
+    |
+218 | fn extract_distinct_values(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `evaluate_expr_to_array` is never used
+   --> src/physical/operators/delim_join.rs:279:4
+    |
+279 | fn evaluate_expr_to_array(expr: &Expr, batch: &RecordBatch) -> Result<ArrayRef> {
+    |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `scalar_to_array` is never used
+   --> src/physical/operators/delim_join.rs:314:4
+    |
+314 | fn scalar_to_array(scalar: &ScalarValue, num_rows: usize) -> Result<ArrayRef> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: struct `InnerEntry` is never constructed
+   --> src/physical/operators/delim_join.rs:404:8
+    |
+404 | struct InnerEntry {
+    |        ^^^^^^^^^^
+
+warning: function `build_hash_table` is never used
+   --> src/physical/operators/delim_join.rs:410:4
+    |
+410 | fn build_hash_table(
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `hash_join_key` is never used
+   --> src/physical/operators/delim_join.rs:430:4
+    |
+430 | fn hash_join_key(
+    |    ^^^^^^^^^^^^^
+
+warning: function `produce_semi_output` is never used
+   --> src/physical/operators/delim_join.rs:462:4
+    |
+462 | fn produce_semi_output(
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `produce_anti_output` is never used
+   --> src/physical/operators/delim_join.rs:503:4
+    |
+503 | fn produce_anti_output(
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `produce_single_output` is never used
+   --> src/physical/operators/delim_join.rs:545:4
+    |
+545 | fn produce_single_output(
+    |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `produce_mark_output` is never used
+   --> src/physical/operators/delim_join.rs:655:4
+    |
+655 | fn produce_mark_output(
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `evaluate_filter` is never used
+   --> src/physical/operators/filter.rs:208:4
+    |
+208 | fn evaluate_filter(
+    |    ^^^^^^^^^^^^^^^
+
+warning: multiple fields are never read
+   --> src/physical/operators/hash_agg.rs:369:5
+    |
+341 | struct AccumulatorState {
+    |        ---------------- fields in this struct
+...
+369 |     sum_x: f64,         // For correlation
+    |     ^^^^^
+370 |     sum_y: f64,         // For correlation
+    |     ^^^^^
+371 |     sum_xy: f64,        // For correlation
+    |     ^^^^^^
+372 |     sum_x_squares: f64, // For correlation
+    |     ^^^^^^^^^^^^^
+373 |     sum_y_squares: f64, // For correlation
+    |     ^^^^^^^^^^^^^
+...
+378 |     max_by_value: Option<f64>,         // The max value of the second arg
+    |     ^^^^^^^^^^^^
+379 |     max_by_result: Option<GroupValue>, // The value to return
+    |     ^^^^^^^^^^^^^
+380 |     min_by_value: Option<f64>,         // The min value of the second arg
+    |     ^^^^^^^^^^^^
+381 |     min_by_result: Option<GroupValue>, // The value to return
+    |     ^^^^^^^^^^^^^
+
+warning: function `without_distance_column` is never used
+   --> src/physical/operators/vector_search.rs:250:15
+    |
+250 | pub(crate) fn without_distance_column(schema: &ArrowSchema) -> Vec<usize> {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `row_group_filter` is never read
+   --> src/storage/parquet.rs:887:5
+    |
+881 | pub struct StreamingParquetScanBuilder {
+    |            --------------------------- field in this struct
+...
+887 |     row_group_filter: Option<Box<dyn Fn(usize, &ParquetFileInfo) -> bool + Send + Sync>>,
+    |     ^^^^^^^^^^^^^^^^
+
+warning: struct `AsyncParquetReader` is never constructed
+   --> src/storage/parquet.rs:929:12
+    |
+929 | pub struct AsyncParquetReader {
+    |            ^^^^^^^^^^^^^^^^^^
+
+warning: associated items `new`, `from_table`, `schema`, `into_stream`, and `read_all_parallel` are never used
+    --> src/storage/parquet.rs:951:12
+     |
+ 949 | impl AsyncParquetReader {
+     | ----------------------- associated items in this implementation
+ 950 |     /// Create a new async reader for a list of Parquet files
+ 951 |     pub fn new(
+     |            ^^^
+...
+ 966 |     pub fn from_table(
+     |            ^^^^^^^^^^
+...
+ 980 |     pub fn schema(&self) -> SchemaRef {
+     |            ^^^^^^
+...
+ 985 |     pub fn into_stream(self) -> BoxStream<'static, Result<RecordBatch>> {
+     |            ^^^^^^^^^^^
+...
+1096 |     pub async fn read_all_parallel(&self, max_concurrent: usize) -> Result<Vec<RecordBatch>> {
+     |                  ^^^^^^^^^^^^^^^^^
+
+warning: struct `AsyncParquetScanBuilder` is never constructed
+    --> src/storage/parquet.rs:1153:12
+     |
+1153 | pub struct AsyncParquetScanBuilder {
+     |            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `new`, `with_projection`, `with_batch_size`, `build`, and `build_stream` are never used
+    --> src/storage/parquet.rs:1162:12
+     |
+1160 | impl AsyncParquetScanBuilder {
+     | ---------------------------- associated items in this implementation
+1161 |     /// Create a new builder from a ParquetTable
+1162 |     pub fn new(table: &ParquetTable) -> Self {
+     |            ^^^
+...
+1172 |     pub fn with_projection(mut self, projection: Vec<usize>) -> Self {
+     |            ^^^^^^^^^^^^^^^
+...
+1178 |     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+     |            ^^^^^^^^^^^^^^^
+...
+1184 |     pub fn build(self) -> AsyncParquetReader {
+     |            ^^^^^
+...
+1189 |     pub fn build_stream(self) -> BoxStream<'static, Result<RecordBatch>> {
+     |            ^^^^^^^^^^^^
+
+warning: `query_engine` (lib test) generated 51 warnings (run `cargo fix --lib -p query_engine --tests` to apply 6 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running unittests src/lib.rs (target/debug/deps/query_engine-5cdbba27f0d1e23b)
+
+running 135 tests
+test physical::compiled_expr::decimal::tests::admitted_decimal_predicates_preserve_mixed_scales_nulls_and_slices ... ok
+test physical::compiled_expr::tests::admitted_boolean_truth_tables_and_survivors_are_exact ... ok
+test physical::compiled_expr::tests::admitted_like_reuses_allocation_free_matching_with_unicode_null_semantics ... ok
+test physical::compiled_expr::tests::admitted_masks_refuse_cleanly_and_retain_extracted_owners ... ok
+test physical::compiled_expr::tests::admitted_null_list_and_mixed_boolean_survivors_are_exact ... ok
+test physical::compiled_expr::tests::admitted_schema_decline_is_distinct_from_memory_refusal ... ok
+test physical::compiled_expr::tests::admitted_string_comparisons_membership_and_nulls_match_oracles ... ok
+test physical::morsel_agg::admitted_output::optional_validity_regressions::actual_all_valid_output_needs_no_bitmap_admission ... ok
+test physical::morsel_agg::admitted_output::optional_validity_regressions::empty_all_valid_payload_keeps_extracted_buffer_owner ... ok
+test physical::morsel_agg::admitted_output::optional_validity_regressions::optional_validity_preserves_values_nested_nulls_and_extracted_ownership ... ok
+test physical::morsel_agg::admitted_output::tests::borrowed_strings_preserve_values_ownership_and_denial_cleanup ... ok
+test physical::morsel_agg::admitted_output::tests::controller_emits_empty_global_and_exact_unsigned_spill_results ... ok
+test physical::morsel_agg::admitted_output::tests::null_boolean_and_float_outputs_preserve_logical_nulls_and_selected_bits ... ok
+test physical::morsel_agg::admitted_output::tests::output_denial_and_invalid_schema_preserve_groups_and_release_partial_buffers ... ok
+test physical::morsel_agg::admitted_output::tests::output_survives_state_drop_and_arrow_data_clones_with_exact_values ... ok
+test physical::morsel_agg::admitted_output::tests::unsigned_sum_preserves_values_above_float_precision_and_checks_output_overflow ... ok
+test physical::morsel_agg::input_frontier::tests::admitted_frontier_overlaps_and_preserves_empty_prefixes_and_owners ... ok
+test physical::morsel_agg::input_frontier::tests::computed_projection_preserves_admitted_parallel_pulls_and_exact_rows ... ok
+test physical::morsel_agg::input_frontier::tests::late_error_shutdown_reaps_admitted_streams_without_replay ... ok
+test physical::morsel_agg::key_rows::arrow_input::tests::inline_dictionary_values_and_admitted_fallbacks_stay_distinct ... ok
+test physical::morsel_agg::state_codec::tests::admitted_workspace_operates_with_no_remaining_pool_capacity ... ok
+test physical::operators::hash_join::outer_probe::tests::admitted_factory_is_lazy_and_all_partitions_keep_exact_output ... ok
+test physical::operators::hash_join::outer_probe::tests::admitted_inner_build_orientations_empty_sides_and_multibatch_keys ... ok
+test physical::operators::hash_join::outer_probe::tests::admitted_inner_composes_computed_probe_without_outer_match_state ... ok
+test physical::operators::hash_join::outer_probe::tests::memory_filter_project_outer_pipeline_is_transitively_admitted ... ok
+test physical::operators::morsel_agg::dense_memory_tests::dense_layout_is_admitted_before_allocation_and_released_after_drop ... ok
+test physical::operators::project::admitted::tests::admitted_projection_has_independent_decimal_temporal_and_try_cast_results ... ok
+test physical::operators::project::admitted::tests::computed_projection_errors_poison_without_a_second_source_pull ... ok
+test physical::operators::project::admitted::tests::unsupported_or_unadmitted_programs_decline_before_preparing_the_child ... ok
+test physical::operators::scan::admitted_memory::contiguous_tests::contiguous_source_fits_without_row_index_staging ... ok
+test physical::operators::scan::admitted_memory::quantum_tests::byte_budget_preserves_a_fitting_source_batch_and_splits_under_pressure ... ok
+test physical::operators::scan::admitted_memory::quantum_tests::retained_outputs_can_grow_beyond_input_progress_credit ... ok
+test physical::operators::scan::admitted_memory::tests::exhausted_input_budget_refuses_without_waiting_for_retained_output ... ok
+test physical::operators::scan::admitted_memory::tests::retained_outputs_do_not_block_source_completion ... ok
+test physical::operators::spillable::admitted_queue_tests::admitted_cancellation_releases_producers_but_preserves_held_output ... ok
+test physical::operators::spillable::admitted_queue_tests::admitted_late_error_joins_other_producers_without_replay ... ok
+test physical::operators::spillable::admitted_queue_tests::admitted_pulls_overlap_and_output_retains_its_lease ... ok
+test physical::operators::spillable::admitted_queue_tests::admitted_queue_metadata_refusal_starts_no_producers ... ok
+test physical::operators::spillable::admitted_queue_tests::admitted_raw_scan_project_preserves_nulls_duplicates_and_partitions ... ok
+test physical::operators::spillable::admitted_queue_tests::admitted_wrong_pool_is_rejected_before_polling ... ok
+test physical::operators::spillable::admitted_queue_tests::materialized_build_encoding_does_not_replace_declared_join_schema ... ok
+test physical::operators::spillable::admitted_queue_tests::queue_error_waits_for_running_producer_cleanup ... ok
+test physical::operators::spillable::admitted_queue_tests::spillable_inner_wrapper_preserves_admitted_partition_contract ... ok
+test physical::operators::spillable::input_queue_memory_tests::admitted_parallel_slots_overlap_upstream_polls_and_bound_queued_copies ... ok
+test physical::operators::streaming_parquet_scan::admitted::filter_quantum_tests::fixed_dense_post_filter_quantum ... ok
+test physical::operators::streaming_parquet_scan::admitted::filter_quantum_tests::fixed_empty_post_filter_quantum ... ok
+test physical::operators::streaming_parquet_scan::admitted::filter_quantum_tests::fixed_sparse_post_filter_quantum ... ok
+test physical::operators::streaming_parquet_scan::admitted::filter_quantum_tests::packing_byte_boundaries_and_oversized_values_preserve_order_and_progress ... ok
+test physical::operators::streaming_parquet_scan::admitted::filter_quantum_tests::packing_refusal_bypasses_only_a_whole_unconsumed_admitted_chunk ... ok
+test physical::operators::streaming_parquet_scan::admitted::filter_quantum_tests::source_failure_after_buffered_prefix_remains_terminal ... ok
+test physical::operators::streaming_parquet_scan::admitted::filter_quantum_tests::string_dense_post_filter_quantum ... ok
+test physical::operators::streaming_parquet_scan::admitted::filter_quantum_tests::string_empty_post_filter_quantum ... ok
+test physical::operators::streaming_parquet_scan::admitted::filter_quantum_tests::string_sparse_post_filter_quantum ... ok
+test physical::operators::streaming_parquet_scan::admitted::quantum_tests::prepared_scan_honors_large_planned_quantum ... ok
+test physical::operators::streaming_parquet_scan::admitted::quantum_tests::prepared_scan_honors_small_planned_quantum ... ok
+test physical::operators::streaming_parquet_scan::admitted::tests::duckdb_padded_blocks_preserve_exact_nullable_rows ... ok
+test physical::operators::streaming_parquet_scan::admitted::tests::fixed_scan_preparation_and_late_errors_preserve_fallback_boundary ... ok
+test physical::operators::streaming_parquet_scan::admitted::tests::fixed_width_admitted_scan_preserves_decimal_nulls_and_partitions ... ok
+test physical::operators::streaming_parquet_scan::admitted::tests::live_pressure_denial_terminates_without_legacy_replay ... ok
+test physical::operators::streaming_parquet_scan::admitted::tests::live_pressure_projection_filters_partitions_and_owners_are_exact ... ok
+test physical::operators::streaming_parquet_scan::admitted::tests::live_pressure_unsupported_codec_refuses_without_legacy_replay ... ok
+test physical::operators::streaming_parquet_scan::admitted::tests::schema_metadata_clone_is_admitted_before_reader_construction ... ok
+test planner::reserved_literal::tests::admitted_expansion_preserves_all_flat_scalar_types_and_empty_batches ... ok
+test storage::admitted_batch::tests::provider_type_and_required_null_mismatches_refuse_before_handoff ... ok
+test storage::admitted_batch::tests::unequal_chunks_and_denials_preserve_alignment_and_buffer_owners ... ok
+test storage::admitted_batch::tests::unequal_lengths_poison_without_replay ... ok
+test storage::admitted_batch::tests::zero_column_projection_keeps_declared_rows ... ok
+test storage::admitted_coalesce::tests::refusal_and_invalid_input_leave_ownership_and_cursor_intact ... ok
+test storage::admitted_coalesce::tests::typed_sliced_chunks_preserve_values_and_pre_reserved_finish ... ok
+test storage::admitted_coalesce::tests::utf8_byte_boundary_preserves_exact_unconsumed_prefix ... ok
+test storage::admitted_coalesce::tests::zero_column_rows_and_zero_length_finish_are_exact ... ok
+test storage::admitted_column_pages::tests::admission_retry_after_prefix_preserves_cursor_and_page_owner ... ok
+test storage::admitted_column_pages::tests::count_mismatch_and_corruption_poison_without_advancing ... ok
+test storage::admitted_column_pages::tests::decoded_page_does_not_retain_consumed_header_window ... ok
+test storage::admitted_column_pages::tests::dictionary_repetition_or_dictionary_after_data_is_rejected ... ok
+test storage::admitted_column_pages::tests::refusal_after_encoded_reads_releases_temporaries_before_retry ... ok
+test storage::admitted_dictionary_utf8::tests::all_null_empty_dictionary_and_sliced_inputs_are_exact ... ok
+test storage::admitted_dictionary_utf8::tests::byte_target_nulls_duplicates_and_denial_preserve_prefix ... ok
+test storage::admitted_dictionary_utf8::tests::invalid_ids_and_counts_refuse_before_output_allocation ... ok
+test storage::admitted_flat_column::dictionary_page::tests::later_invalid_id_is_rejected_without_committing_the_bad_prefix ... ok
+test storage::admitted_flat_column::dictionary_page::tests::prepared_ids_survive_output_refusal_and_resume_exactly ... ok
+test storage::admitted_flat_column::tests::fixed_columns_match_typed_oracle_across_plain_dictionary_and_v2_pages ... ok
+test storage::admitted_flat_column::tests::large_dictionary_pages_emit_bounded_ids_with_exact_values ... ok
+test storage::admitted_flat_column::tests::real_flat_columns_resume_across_pages_encodings_and_budget_denial ... ok
+test storage::admitted_flat_column::tests::unsupported_encoding_poison_does_not_replay_source ... ok
+test storage::admitted_gather::tests::denial_after_partial_columns_releases_all_output_and_retry_is_exact ... ok
+test storage::admitted_gather::tests::empty_output_and_invalid_masks_or_ids_have_explicit_results ... ok
+test storage::admitted_gather::tests::projected_filter_preserves_typed_values_and_does_not_copy_unused_payloads ... ok
+test storage::admitted_gather::tests::projected_filter_validates_shape_and_supports_zero_column_results ... ok
+test storage::admitted_gather::tests::typed_duplicate_gather_and_sql_null_masks_match_independent_arrow_oracle ... ok
+test storage::admitted_hybrid::tests::final_packed_block_padding_does_not_extend_logical_values ... ok
+test storage::admitted_hybrid::tests::malformed_runs_and_domain_errors_poison_without_leaks ... ok
+test storage::admitted_hybrid::tests::mixed_runs_cross_chunks_and_final_padding_is_not_a_value ... ok
+test storage::admitted_hybrid::tests::owned_page_survives_caller_and_cursor_chunks ... ok
+test storage::admitted_hybrid::tests::packed_all_widths_offsets_chunks_and_domain_checks_are_exact ... ok
+test storage::admitted_hybrid::tests::refusal_preserves_consumed_prefix_and_slices_hold_charges ... ok
+test storage::admitted_hybrid::tests::validity_bitmap_retry_and_slice_ownership_are_exact ... ok
+test storage::admitted_hybrid::tests::validity_bulk_prefix_errors_are_terminal_and_unpublished ... ok
+test storage::admitted_hybrid::tests::validity_repeated_spans_cross_bitmap_and_output_boundaries ... ok
+test storage::admitted_hybrid::tests::writer_dictionary_ids_and_nullable_levels_reconstruct_exact_strings ... ok
+test storage::admitted_hybrid::tests::zero_width_and_u32_width_have_exact_values ... ok
+test storage::admitted_page_body::tests::decoded_page_and_plain_output_hold_separate_charges ... ok
+test storage::admitted_page_body::tests::denial_and_uncompressed_empty_body_are_clean ... ok
+test storage::admitted_page_body::tests::length_checks_precede_admission_and_bad_payload_releases_it ... ok
+test storage::admitted_page_body::tests::level_only_pages_and_unsupported_codecs_are_explicit ... ok
+test storage::admitted_page_body::tests::snappy_prefix_and_slice_owners_are_exact ... ok
+test storage::admitted_page_body::tests::zstd_denial_and_corruption_release_every_reservation ... ok
+test storage::admitted_page_body::tests::zstd_static_workspace_and_destination_are_admitted_and_exact ... ok
+test storage::admitted_page_read::tests::admission_and_extent_errors_precede_payload_reads ... ok
+test storage::admitted_page_read::tests::failed_partial_read_releases_all_provisional_storage ... ok
+test storage::admitted_page_read::tests::file_to_decoded_page_to_strings_retains_separate_owners ... ok
+test storage::admitted_page_read::tests::short_reads_interruptions_and_retained_slices_are_exact ... ok
+test storage::admitted_page_read::tests::truncation_after_extent_check_releases_provisional_storage ... ok
+test storage::admitted_plain_fixed::tests::decimals_preserve_wide_signed_coefficients_and_reject_precision_overflow ... ok
+test storage::admitted_plain_fixed::tests::dictionary_ids_preserve_nulls_duplicates_and_retry_prefix ... ok
+test storage::admitted_plain_fixed::tests::dictionary_output_shrinks_to_budget_without_losing_rows ... ok
+test storage::admitted_plain_fixed::tests::floats_and_booleans_keep_bits_nulls_and_dense_positions ... ok
+test storage::admitted_plain_fixed::tests::invalid_extents_types_and_empty_nullable_inputs ... ok
+test storage::admitted_plain_fixed::tests::nullable_unaligned_integer_chunks_refuse_without_losing_prefix ... ok
+test storage::admitted_plain_utf8::tests::byte_chunks_preserve_nulls_duplicates_empty_unicode_and_sliced_validity ... ok
+test storage::admitted_plain_utf8::tests::denial_preserves_cursor_and_output_slices_retain_admission ... ok
+test storage::admitted_plain_utf8::tests::malformed_pages_and_empty_inputs_do_not_allocate_output ... ok
+test storage::admitted_plain_utf8::tests::owned_page_and_validity_survive_caller_handles ... ok
+test storage::admitted_plain_utf8::tests::writer_produced_plain_pages_decode_with_admitted_output ... ok
+test storage::admitted_row_group::tests::temporal_units_and_decimal_scale_cannot_be_reinterpreted ... ok
+test storage::admitted_row_group::working_space_tests::fresh_small_target_progresses_at_same_budget_as_large_target ... ok
+test storage::admitted_row_group::working_space_tests::genuinely_oversized_page_refuses_even_with_one_row_target ... ok
+test storage::admitted_selection::bound_tests::bound_sources_preserve_mixed_encodings_and_wide_decimal_coefficients ... ok
+test storage::admitted_selection::range::tests::contiguous_typed_values_nulls_and_buffer_ownership ... ok
+test storage::admitted_selection::range::tests::dictionary_range_and_refusal_leave_no_reservations ... ok
+test storage::admitted_selection::range::tests::packed_ranges_preserve_sliced_bits_and_empty_extents ... ok
+test storage::admitted_selection::tests::decimal_float_bits_and_dictionary_nulls_survive_nullable_selection ... ok
+test storage::admitted_selection::tests::malformed_selection_and_all_null_wrong_types_fail_cleanly ... ok
+test storage::admitted_selection::tests::utf8_growth_refuses_before_allocation_and_output_owns_its_lease ... ok
+test storage::bounded_page_header::tests::admitted_header_and_body_validate_crc_and_keep_independent_owners ... ok
+
+test result: ok. 135 passed; 0 failed; 0 ignored; 0 measured; 933 filtered out; finished in 1.02s
+

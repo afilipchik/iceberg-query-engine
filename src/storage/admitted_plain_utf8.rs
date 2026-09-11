@@ -34,6 +34,7 @@ fn value(data: &[u8], offset: usize) -> Result<(&[u8], usize)> {
     ))
 }
 
+#[derive(Clone)]
 enum PlainInput<'a> {
     Borrowed(&'a [u8]),
     Owned(Buffer),
@@ -47,6 +48,7 @@ impl std::ops::Deref for PlainInput<'_> {
         }
     }
 }
+#[derive(Clone)]
 pub(crate) struct PlainUtf8Decoder<'a> {
     data: PlainInput<'a>,
     validity: Option<NullBuffer>,
@@ -102,6 +104,10 @@ impl<'a> PlainUtf8Decoder<'a> {
     /// A denial leaves both row and encoded cursor unchanged. One oversized
     /// value can exceed the preferred byte target only if its actual buffers
     /// obtain pool admission. An Arrow i32 offset overflow refuses explicitly.
+    pub(crate) fn remaining(&self) -> usize {
+        self.rows - self.row
+    }
+
     pub(crate) fn next(
         &mut self,
         max_rows: usize,

@@ -1,0 +1,12 @@
+{
+  "parent_commit": "de7605f2b7b4cf89282bcc6b0d539538de6eaa45",
+  "source_inputs": 531,
+  "scope": "Current source includes the subsequent missing-column-only checkpoint reservation optimization. Included initial logs predate that last change; complete Lance/GPU both-mode validation is running separately on this frozen source. No current release or SF10 performance claim.",
+  "initial_tests": {
+    "progress": 2,
+    "admitted": 135,
+    "default_library": 1069,
+    "default_ignored": 3,
+    "count_distinct_spill": "remains failing"
+  }
+}

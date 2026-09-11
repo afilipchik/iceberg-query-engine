@@ -73,3 +73,37 @@ encoded/decoded pages, ID scratch and output buffers separately. A coordinated
 page-preparation phase and common output budget should be evaluated only after
 the feasible one-row versus large-target case is reproduced. No such new experiment
 has run while the current SF10 timing is active.
+
+## Same-budget reproduction after pushed checkpoint de7605f
+
+Focused89920 is terminal101: one expected failure and one passing refusal control.
+The new fixture has three nullable Int64 columns, 4,096 rows, duplicate values,
+PLAIN encoding, no compression and one data page per column. At an unchanged
+163,840-byte pool, a fresh reader with a one-row target returns every value in
+order against an independently constructed oracle and releases all owners.
+A fresh reader with a4,096-row target refuses before its first output. Its retained
+state uses137,944bytes; during the failed call, provisional handoff storage brings
+usage to151,432 and the next request needs32,320bytes. Retrying that retained
+reader with a one-row target reaches the same refusal. Dropping it returns pool
+usage to zero. This is a reproduced allocation-order/progress bug: the budget can
+complete the workload at a smaller initial target. It is not a join spill issue.
+
+The separate8,192-row single-column fixture at32KiB refuses even with a one-row
+target: it requests64,123bytes with7,512used and releases all retained owners on
+drop. That passing test preserves the genuine whole-page working-space floor.
+No metadata or output reservation was reduced to produce either result.
+
+Production source remains identical to pushedde7605f. Only the row-group test
+module and declaration changed. Source531 and four evidence files verify in the
+[red archive](benchmarks/2026-09-11-first-batch-working-space-red/manifest.json).
+The run used the48GiB/no-swap wrapper, one compile job, repository TMPDIR, locked
+offline default features and one test thread. Separate terminal cgroup telemetry
+was not captured, so this report makes no exact peak/event-count claim.
+
+Next separate required page/dictionary/validity preparation from output allocation,
+then coordinate output sizing across all selected columns. Cover uneven page ends,
+dictionary ID prefixes, NULLs, UTF8 byte limits and retained outputs; preserve
+terminal source errors and exact cursors. Preparing pages alone is insufficient
+if the first output can still consume every byte needed by later columns. A new
+policy must prove minimum progress without reserving guessed semantic guarantees
+or forcing all output into one-row batches.

@@ -1,0 +1,17 @@
+{
+  "files": {
+    "coordinated-output-ledger-driver.log": "4f66b63b2240c3b31c239f0ef262716e4dddde511eb81f459a1f1c71601e7f8b",
+    "coordinated-output-ledger-refusal-trace-job.json": "652dee7b20818967691182f60cacadca124193e885d8eeddc8e08058d651c062",
+    "refusal_ownership_ledger_gdb.py": "938a2663198731ef8835e9948859571d909d55cbf77f365fdd33c371120af10e",
+    "trace_coordinated_output_refusal_ledger.py": "6470648946d56cfb35a4327d2959607f0d512e4cc837a141c992d425949b60ef",
+    "run/count_distinct_spill_matches_in_memory.log": "6f22c6e72dd494ecd779472b311f1f03be9d5b1924afbb041a8dffc333fdb014",
+    "run/manifest.json": "4fdfce22197920d6f4acfa72a6910ca39baf8853f3e685fec56d16ac9f09347e",
+    "run/refusal.gdb": "9ceccfb83e294e0a421a14f4ccbc1e7231f046f555dd572f1d6d487a845e6b4c",
+    "run/resources-after.json": "b6f22205f67fc2ad94420d4e0e74c541c3653b3d0c124cb5d23cd5a3fbf600f4",
+    "run/resources-before.json": "8ace07e6d8c55e5d015564825d8355ed951075cac0074580ed8780fa6267dbc6",
+    "run/verified-after.json": "cb06d6d6d834aeb8992057cd49a1d17f5d10479c72514abd808f128f6d47c19d"
+  },
+  "source_count": 531,
+  "source_archive": "../2026-09-11-coordinated-output-source/source.tar.gz",
+  "qualification": "One owned regression-test debugger run; inferior101 is expected failure, not passing resource acceptance."
+}

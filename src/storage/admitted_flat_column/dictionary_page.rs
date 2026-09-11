@@ -2,6 +2,7 @@
 //! prefix survives output admission refusal; no page source is reread.
 use super::*;
 
+#[derive(Clone)]
 pub(super) struct DictionaryPage {
     dictionary: Dictionary,
     fixed: Option<(Type, usize, DataType)>,
@@ -94,6 +95,10 @@ impl DictionaryPage {
             }
         };
         Ok((working, output))
+    }
+
+    pub(super) fn has_remaining(&self) -> bool {
+        self.row < self.rows || self.output.as_ref().is_some_and(|o| o.remaining() > 0)
     }
 
     pub(super) fn next(

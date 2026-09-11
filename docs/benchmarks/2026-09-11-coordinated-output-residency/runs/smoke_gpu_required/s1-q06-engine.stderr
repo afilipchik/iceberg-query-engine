@@ -1,0 +1,5 @@
+[mem-cap] process hard-capped at 8.0G anonymous memory (RLIMIT_DATA; the engine aborts if exceeded, the terminal survives; size with QE_MEM_CAP)
+[gpu-trace] upload OK pid=452438712fed51d9 col=l_shipdate bytes=4800000
+[gpu-trace] upload OK pid=452438712fed51d9 col=l_discount bytes=4800000
+[gpu-trace] upload OK pid=452438712fed51d9 col=l_quantity bytes=4800000
+[gpu-trace] upload OK pid=452438712fed51d9 col=l_extendedprice bytes=4800000

@@ -1,9 +1,12 @@
 # Project documentation
 
-- [Current bounded-output checkpoint and SF10 results](admitted-coalesce-checkpoint-2026-09-11.md)
+- [Current coordinated reader checkpoint and SF10 results](coordinated-output-checkpoint-2026-09-11.md)
+- [Coordinated reader implementation and validation](coordinated-reader-output-2026-09-11.md)
+
+- [Previous bounded-output checkpoint and SF10 results](admitted-coalesce-checkpoint-2026-09-11.md)
 - [Bounded output implementation and tests](admitted-filter-batching-2026-09-11.md)
-- [Current provider screen](admitted-coalesce-providers-screen-2026-09-11.md)
-- [Current IPC/GPU screen](admitted-coalesce-residency-screen-2026-09-11.md)
+- [Previous provider screen](admitted-coalesce-providers-screen-2026-09-11.md)
+- [Previous IPC/GPU screen](admitted-coalesce-residency-screen-2026-09-11.md)
 - [First-batch working-space investigation](first-batch-refusal-ledger-2026-09-11.md)
 - [Native admission follow-up](native-admission-follow-up-2026-09-11.md)
 

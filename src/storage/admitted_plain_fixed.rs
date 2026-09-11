@@ -19,6 +19,7 @@ use std::sync::Arc;
 fn invalid(message: &str) -> QueryError {
     QueryError::Storage(format!("PLAIN fixed page: {message}"))
 }
+#[derive(Clone)]
 pub(crate) struct PlainFixedDecoder {
     data: Buffer,
     validity: Option<NullBuffer>,
@@ -148,6 +149,10 @@ impl PlainFixedDecoder {
                 .with_data_type(self.data_type.clone()),
         ))
     }
+    pub(crate) fn remaining(&self) -> usize {
+        self.rows - self.row
+    }
+
     pub(crate) fn next(&mut self, max_rows: usize, pool: &MemoryPool) -> Result<Option<ArrayRef>> {
         if self.failed {
             return Err(invalid("decoder is poisoned"));

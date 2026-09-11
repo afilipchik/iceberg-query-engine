@@ -1,0 +1,1 @@
+{"ok": false, "complete": false, "latency_leadership": false, "status": "invalid_evidence", "reason": "GPU CPU control must complete correctly"}

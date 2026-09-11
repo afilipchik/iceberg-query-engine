@@ -1,0 +1,7 @@
+{
+  "path": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/safe-build-3445297-16385.scope",
+  "memory.max": "51539607552\n",
+  "memory.swap.max": "0\n",
+  "memory.peak": "21759344640\n",
+  "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+}

@@ -1,0 +1,12 @@
+{
+  "files": {
+    "coordinated-output-admitted-tests.log": "c43578d2f3ef25d0f203d8448b47b2bb0970feffe850814172ddb593dae614f8",
+    "coordinated-output-count-distinct.log": "5d51d94f1273c5a9623cf83edf0b7e6473ca67bd14d45c208ca99b38affecc4d",
+    "coordinated-output-library.log": "e456228fc4d3433b4187180827e729defccc51bf9995e19c87c7e59f8caa7c5a",
+    "first-batch-working-space-initial-green.log": "2541756c6619914ce1e4650fd0e5e1aab601e488910ec2ed14401b2bd7d7c61c",
+    "qualification.json": "1f03018aefabab951292bc376ec020884d3d8c989e8884117cdac69a2a388bd0",
+    "source-inputs.json": "d216d64b43890984e1f2b56bf499dea88fd214a4c9ac6dfa96a48028ab37f762",
+    "source.tar.gz": "49c6cc50128e5b0aa661dffcd815fc8fbfcb5fb6046d4ceb3fa49537bdfa88c2"
+  },
+  "source_count": 531
+}

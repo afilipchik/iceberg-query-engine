@@ -1,0 +1,13 @@
+{
+  "parent_commit": "de7605f2b7b4cf89282bcc6b0d539538de6eaa45",
+  "session": 89920,
+  "exit_code": 101,
+  "command": "TMPDIR=\"$PWD/.scratch\" SAFE_BUILD_MEM=48G SAFE_BUILD_JOBS=1 scripts/claude-safe-build.sh cargo test --locked --offline --lib working_space_tests -- --nocapture --test-threads=1",
+  "features": "default",
+  "tests": {
+    "passed": 1,
+    "failed": 1,
+    "ignored": 0
+  },
+  "qualification": "Expected red test; one-row full independent oracle passes before larger-target failure. No production change. Scope limits were set by wrapper; no separate terminal cgroup telemetry snapshot was captured."
+}

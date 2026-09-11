@@ -1757,3 +1757,15 @@ of batch owners. Whole unconsumed chunks may bypass optional packing allocation;
 partly consumed chunks cannot. Decoder errors remain terminal after any buffered
 prefix. Full first-batch page working-space coordination is still separate and open.
 See [candidate contracts and validation](admitted-filter-batching-2026-09-11.md).
+
+## Coordinated admitted reader output candidate (September 11)
+
+AdmittedFlatColumn now separates page preparation from output trials. The batch
+reader admits a vector of decoder checkpoints, prepares missing columns before
+allocating their output, and retries typed memory refusals at a smaller common
+row target. Trials use only retained pages; they cannot perform source reads.
+Only provisional arrays and decoder/ID cursor changes roll back. Existing pending
+prefixes, page ownership, source-error termination and final handoff leases remain.
+Dictionary ID decoding can repeat within a refused trial; no file read is replayed.
+This is a candidate resource-progress repair, not full spill or performance
+acceptance. See [contracts and evidence](coordinated-reader-output-2026-09-11.md).

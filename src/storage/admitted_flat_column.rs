@@ -24,12 +24,21 @@ use dictionary_page::DictionaryPage;
 fn invalid(message: &str) -> QueryError {
     QueryError::Storage(format!("admitted flat column: {message}"))
 }
+#[derive(Clone)]
 enum Output {
     Plain(PlainUtf8Decoder<'static>),
     Dictionary(DictionaryUtf8Decoder),
     Fixed(PlainFixedDecoder),
 }
 impl Output {
+    fn remaining(&self) -> usize {
+        match self {
+            Self::Plain(c) => c.remaining(),
+            Self::Dictionary(c) => c.remaining(),
+            Self::Fixed(c) => c.remaining(),
+        }
+    }
+
     fn next(&mut self, rows: usize, bytes: usize, pool: &MemoryPool) -> Result<Option<ArrayRef>> {
         match self {
             Output::Plain(cursor) => cursor
@@ -54,6 +63,12 @@ impl Dictionary {
             Self::Fixed(_, n) => *n,
         }
     }
+}
+/// Only reversible decoder state; never contains or clones a page source.
+#[derive(Clone)]
+pub(crate) struct OutputCheckpoint {
+    output: Option<Output>,
+    dictionary_page: Option<DictionaryPage>,
 }
 pub(crate) struct AdmittedFlatColumn<S> {
     pages: AdmittedColumnPages<S>,
@@ -121,25 +136,65 @@ impl<S: PageSource> AdmittedFlatColumn<S> {
         bytes: usize,
         pool: &MemoryPool,
     ) -> Result<Option<ArrayRef>> {
+        if !self.prepare_output(pool)? {
+            return Ok(None);
+        }
+        self.next_prepared(rows, bytes, pool)
+    }
+    pub(crate) fn checkpoint(&self) -> OutputCheckpoint {
+        OutputCheckpoint {
+            output: self.output.clone(),
+            dictionary_page: self.dictionary_page.clone(),
+        }
+    }
+    pub(crate) fn restore(&mut self, checkpoint: &OutputCheckpoint) {
+        self.output = checkpoint.output.clone();
+        self.dictionary_page = checkpoint.dictionary_page.clone();
+    }
+    /// Decode only from a retained, prepared page. Never fetch another page.
+    pub(crate) fn next_prepared(
+        &mut self,
+        rows: usize,
+        bytes: usize,
+        pool: &MemoryPool,
+    ) -> Result<Option<ArrayRef>> {
+        if let Some(output) = self.output.as_mut() {
+            return output.next(rows, bytes, pool);
+        }
+        if let Some(page) = self.dictionary_page.as_mut() {
+            return page.next(rows, bytes, pool);
+        }
+        Ok(None)
+    }
+    pub(crate) fn prepare_output(&mut self, pool: &MemoryPool) -> Result<bool> {
+        if self.failed {
+            return Err(invalid("column is poisoned"));
+        }
+        let result = self.prepare_page(pool);
+        if result.as_ref().is_err_and(|e| !e.is_memory_limit()) {
+            self.failed = true;
+        }
+        result
+    }
+    fn prepare_page(&mut self, pool: &MemoryPool) -> Result<bool> {
         loop {
-            if let Some(output) = self.output.as_mut() {
-                let result = output.next(rows, bytes, pool)?;
-                if result.is_some() {
-                    return Ok(result);
-                }
-                self.output = None;
+            if self.output.as_ref().is_some_and(|o| o.remaining() > 0) {
+                return Ok(true);
             }
-            if let Some(page) = self.dictionary_page.as_mut() {
-                if let Some(array) = page.next(rows, bytes, pool)? {
-                    return Ok(Some(array));
-                }
-                self.dictionary_page = None;
+            self.output = None;
+            if self
+                .dictionary_page
+                .as_ref()
+                .is_some_and(DictionaryPage::has_remaining)
+            {
+                return Ok(true);
             }
+            self.dictionary_page = None;
             if self.pending.is_none() {
                 self.pending = self.pages.next(pool)?;
             }
             let Some(page) = self.pending.as_ref() else {
-                return Ok(None);
+                return Ok(false);
             };
             // Retain a handed-off page until all downstream admission succeeds.
             // A refusal can rebuild provisional state, but cannot reread this page.

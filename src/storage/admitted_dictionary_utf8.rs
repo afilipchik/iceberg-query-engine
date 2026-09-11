@@ -13,6 +13,7 @@ use arrow::{
 fn invalid(message: &str) -> QueryError {
     QueryError::Storage(format!("dictionary UTF8 output: {message}"))
 }
+#[derive(Clone)]
 pub(crate) struct DictionaryUtf8Decoder {
     dictionary: StringArray,
     ids: UInt32Array,
@@ -50,6 +51,10 @@ impl DictionaryUtf8Decoder {
             id: 0,
         })
     }
+    pub(crate) fn remaining(&self) -> usize {
+        self.rows - self.row
+    }
+
     pub(crate) fn next(
         &mut self,
         max_rows: usize,

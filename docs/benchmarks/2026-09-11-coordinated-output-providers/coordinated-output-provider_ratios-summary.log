@@ -1,0 +1,778 @@
+{
+  "raw_parquet": {
+    "queries": {
+      "q01": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 636.5788180000001,
+        "duckdb_median_ms": 204.43272916600108,
+        "ratio": 3.1138791748120367
+      },
+      "q02": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 80.80482699999999,
+        "duckdb_median_ms": 72.16115901246667,
+        "ratio": 1.1197828320085605
+      },
+      "q03": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 433.636821,
+        "duckdb_median_ms": 193.60776711255312,
+        "ratio": 2.2397697544226465
+      },
+      "q04": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 217.86732,
+        "duckdb_median_ms": 129.23172628507018,
+        "ratio": 1.6858655862834333
+      },
+      "q05": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 408.64585,
+        "duckdb_median_ms": 230.24609731510282,
+        "ratio": 1.7748220480833974
+      },
+      "q06": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 181.360898,
+        "duckdb_median_ms": 88.02535478025675,
+        "ratio": 2.060325669265891
+      },
+      "q07": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 459.60377200000005,
+        "duckdb_median_ms": 231.28139320760965,
+        "ratio": 1.9872059988303379
+      },
+      "q08": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 414.37753399999997,
+        "duckdb_median_ms": 309.9054410122335,
+        "ratio": 1.3371095797690187
+      },
+      "q09": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 1247.920012,
+        "duckdb_median_ms": 503.14455572515726,
+        "ratio": 2.480241508727914
+      },
+      "q10": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 872.405563,
+        "duckdb_median_ms": 236.6330730728805,
+        "ratio": 3.686744002734175
+      },
+      "q11": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 92.93190299999999,
+        "duckdb_median_ms": 43.50958811119199,
+        "ratio": 2.1358948000727014
+      },
+      "q12": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 556.22507,
+        "duckdb_median_ms": 111.15875095129013,
+        "ratio": 5.003880173534321
+      },
+      "q13": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 639.080744,
+        "duckdb_median_ms": 294.950729701668,
+        "ratio": 2.1667372874324027
+      },
+      "q14": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 371.2743,
+        "duckdb_median_ms": 166.51191329583526,
+        "ratio": 2.22971613652875
+      },
+      "q15": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 248.281912,
+        "duckdb_median_ms": 146.62509271875024,
+        "ratio": 1.6933112020344525
+      },
+      "q16": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 523.203713,
+        "duckdb_median_ms": 76.55618106946349,
+        "ratio": 6.834245199943679
+      },
+      "q17": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 1736.8909700000002,
+        "duckdb_median_ms": 205.0869702361524,
+        "ratio": 8.469045927198664
+      },
+      "q18": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 987.349001,
+        "duckdb_median_ms": 302.1006169728935,
+        "ratio": 3.2682786645503334
+      },
+      "q19": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 646.6241590000001,
+        "duckdb_median_ms": 192.36409105360508,
+        "ratio": 3.3614597997908495
+      },
+      "q20": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 254.16161100000002,
+        "duckdb_median_ms": 168.2696919888258,
+        "ratio": 1.5104420053070402
+      },
+      "q21": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 917.756564,
+        "duckdb_median_ms": 786.6505989804864,
+        "ratio": 1.1666635291315222
+      },
+      "q22": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 104.728824,
+        "duckdb_median_ms": 66.29413226619363,
+        "ratio": 1.579760084640341
+      }
+    },
+    "complete": true,
+    "geometric_mean_ratio": 2.373308342508801,
+    "suite_total_ratio": 2.5283354068578165,
+    "completed_queries_slower_than_2x": [
+      "q01",
+      "q03",
+      "q06",
+      "q09",
+      "q10",
+      "q11",
+      "q12",
+      "q13",
+      "q14",
+      "q16",
+      "q17",
+      "q18",
+      "q19"
+    ]
+  },
+  "native": {
+    "queries": {
+      "q01": {
+        "valid_pairs": 0,
+        "requested_pairs": 3,
+        "complete": false,
+        "engine_median_ms": null,
+        "duckdb_median_ms": null,
+        "ratio": null
+      },
+      "q02": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 55.600364,
+        "duckdb_median_ms": 23.531857877969742,
+        "ratio": 2.362769836887908
+      },
+      "q03": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 792.408685,
+        "duckdb_median_ms": 260.70782309398055,
+        "ratio": 3.0394511203998307
+      },
+      "q04": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 219.36738499999998,
+        "duckdb_median_ms": 121.08608381822705,
+        "ratio": 1.811664710614571
+      },
+      "q05": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 1088.144493,
+        "duckdb_median_ms": 145.3436017036438,
+        "ratio": 7.486703784998607
+      },
+      "q06": {
+        "valid_pairs": 0,
+        "requested_pairs": 3,
+        "complete": false,
+        "engine_median_ms": null,
+        "duckdb_median_ms": null,
+        "ratio": null
+      },
+      "q07": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 830.627884,
+        "duckdb_median_ms": 170.73496989905834,
+        "ratio": 4.865013210188179
+      },
+      "q08": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 1000.7795829999999,
+        "duckdb_median_ms": 340.5943959951401,
+        "ratio": 2.938332499793332
+      },
+      "q09": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 2462.609102,
+        "duckdb_median_ms": 604.9020988866687,
+        "ratio": 4.0710870511649215
+      },
+      "q10": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 1703.99021,
+        "duckdb_median_ms": 356.4497046172619,
+        "ratio": 4.780450615970241
+      },
+      "q11": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 73.69928900000001,
+        "duckdb_median_ms": 17.566891852766275,
+        "ratio": 4.195351665946216
+      },
+      "q12": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 1057.956856,
+        "duckdb_median_ms": 163.68651576340199,
+        "ratio": 6.463310988482439
+      },
+      "q13": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 1678.6049859999998,
+        "duckdb_median_ms": 259.3205808661878,
+        "ratio": 6.473088176777523
+      },
+      "q14": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 552.740631,
+        "duckdb_median_ms": 101.7954908311367,
+        "ratio": 5.429912724885948
+      },
+      "q15": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 358.18849600000004,
+        "duckdb_median_ms": 141.2853980436921,
+        "ratio": 2.535212420813871
+      },
+      "q16": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 411.987614,
+        "duckdb_median_ms": 59.22011798247695,
+        "ratio": 6.9568860724307555
+      },
+      "q17": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 934.237701,
+        "duckdb_median_ms": 158.6741697974503,
+        "ratio": 5.887774312558666
+      },
+      "q18": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 4282.382084,
+        "duckdb_median_ms": 432.28549184277654,
+        "ratio": 9.906374756517422
+      },
+      "q19": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 1975.135557,
+        "duckdb_median_ms": 294.5128860883415,
+        "ratio": 6.706448682885619
+      },
+      "q20": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 182.87689400000002,
+        "duckdb_median_ms": 153.64006161689758,
+        "ratio": 1.1902943286758414
+      },
+      "q21": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 1715.3049760000001,
+        "duckdb_median_ms": 659.3398777768016,
+        "ratio": 2.6015489640695777
+      },
+      "q22": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 69.10028,
+        "duckdb_median_ms": 43.598099146038294,
+        "ratio": 1.5849379067775036
+      }
+    },
+    "complete": false,
+    "geometric_mean_ratio": null,
+    "suite_total_ratio": null,
+    "completed_queries_slower_than_2x": [
+      "q02",
+      "q03",
+      "q05",
+      "q07",
+      "q08",
+      "q09",
+      "q10",
+      "q11",
+      "q12",
+      "q13",
+      "q14",
+      "q15",
+      "q16",
+      "q17",
+      "q18",
+      "q19",
+      "q21"
+    ]
+  },
+  "iceberg": {
+    "queries": {
+      "q01": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 620.0235670000001,
+        "duckdb_median_ms": 1805.1715223118663,
+        "ratio": 0.3434707224972958
+      },
+      "q02": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 75.740297,
+        "duckdb_median_ms": 322.1903368830681,
+        "ratio": 0.23507935629828736
+      },
+      "q03": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 419.754354,
+        "duckdb_median_ms": 1495.566476136446,
+        "ratio": 0.28066579499987687
+      },
+      "q04": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 226.180785,
+        "duckdb_median_ms": 962.3497109860182,
+        "ratio": 0.23502972195861774
+      },
+      "q05": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 437.558346,
+        "duckdb_median_ms": 1799.396835733205,
+        "ratio": 0.24316945395855766
+      },
+      "q06": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 178.932907,
+        "duckdb_median_ms": 779.6433991752565,
+        "ratio": 0.22950608853904703
+      },
+      "q07": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 470.151042,
+        "duckdb_median_ms": 1831.5153759904206,
+        "ratio": 0.25670057055664003
+      },
+      "q08": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 404.496095,
+        "duckdb_median_ms": 2377.8593479655683,
+        "ratio": 0.1701093445018419
+      },
+      "q09": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 1352.026582,
+        "duckdb_median_ms": 3263.1518892012537,
+        "ratio": 0.41433148928012226
+      },
+      "q10": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 868.14258,
+        "duckdb_median_ms": 1738.0028539337218,
+        "ratio": 0.49950584260266484
+      },
+      "q11": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 98.139559,
+        "duckdb_median_ms": 289.87492388114333,
+        "ratio": 0.3385582915762659
+      },
+      "q12": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 546.495313,
+        "duckdb_median_ms": 881.9841821677983,
+        "ratio": 0.6196203107144033
+      },
+      "q13": {
+        "valid_pairs": 0,
+        "requested_pairs": 3,
+        "complete": false,
+        "engine_median_ms": null,
+        "duckdb_median_ms": null,
+        "ratio": null
+      },
+      "q14": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 351.860255,
+        "duckdb_median_ms": 1164.6538148634136,
+        "ratio": 0.30211574504760874
+      },
+      "q15": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 255.200822,
+        "duckdb_median_ms": 1104.5276639051735,
+        "ratio": 0.23104973314811392
+      },
+      "q16": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 522.290897,
+        "duckdb_median_ms": 285.5875138193369,
+        "ratio": 1.8288295941761725
+      },
+      "q17": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 1773.692764,
+        "duckdb_median_ms": 1736.4571089856327,
+        "ratio": 1.021443463717983
+      },
+      "q18": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 1058.382781,
+        "duckdb_median_ms": 2014.1059760935605,
+        "ratio": 0.5254851500181614
+      },
+      "q19": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 664.618114,
+        "duckdb_median_ms": 1529.8058781772852,
+        "ratio": 0.4344460453975188
+      },
+      "q20": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 263.170847,
+        "duckdb_median_ms": 1337.826155591756,
+        "ratio": 0.1967152801580505
+      },
+      "q21": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 864.3972140000001,
+        "duckdb_median_ms": 4295.025414321572,
+        "ratio": 0.20125543637476648
+      },
+      "q22": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 111.87058800000001,
+        "duckdb_median_ms": 447.8934742510319,
+        "ratio": 0.24977052453615264
+      }
+    },
+    "complete": false,
+    "geometric_mean_ratio": null,
+    "suite_total_ratio": null,
+    "completed_queries_slower_than_2x": []
+  },
+  "lance": {
+    "queries": {
+      "q01": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 6100.8038,
+        "duckdb_median_ms": 667.7669025957584,
+        "ratio": 9.136127855820375
+      },
+      "q02": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 79.99457,
+        "duckdb_median_ms": 74.36540490016341,
+        "ratio": 1.0756960189673386
+      },
+      "q03": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 642.134407,
+        "duckdb_median_ms": 396.3947081938386,
+        "ratio": 1.6199368804035439
+      },
+      "q04": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 219.753785,
+        "duckdb_median_ms": 158.7533219717443,
+        "ratio": 1.3842468445423326
+      },
+      "q05": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 585.2518249999999,
+        "duckdb_median_ms": 326.06702018529177,
+        "ratio": 1.794881999005674
+      },
+      "q06": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 285.462486,
+        "duckdb_median_ms": 194.03456011787057,
+        "ratio": 1.4711940276339923
+      },
+      "q07": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 576.121186,
+        "duckdb_median_ms": 345.6418765708804,
+        "ratio": 1.6668153515300552
+      },
+      "q08": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 821.329904,
+        "duckdb_median_ms": 443.27793503180146,
+        "ratio": 1.8528553737759959
+      },
+      "q09": {
+        "valid_pairs": 0,
+        "requested_pairs": 3,
+        "complete": false,
+        "engine_median_ms": null,
+        "duckdb_median_ms": null,
+        "ratio": null
+      },
+      "q10": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 1265.941491,
+        "duckdb_median_ms": 508.63309763371944,
+        "ratio": 2.4889089933184785
+      },
+      "q11": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 102.24705900000001,
+        "duckdb_median_ms": 63.70344525203109,
+        "ratio": 1.605047554264579
+      },
+      "q12": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 305.063081,
+        "duckdb_median_ms": 235.5672251433134,
+        "ratio": 1.2950149615015714
+      },
+      "q13": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 1639.831963,
+        "duckdb_median_ms": 287.61322796344757,
+        "ratio": 5.7015178843179095
+      },
+      "q14": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 309.55583199999995,
+        "duckdb_median_ms": 299.6558593586087,
+        "ratio": 1.0330378076456819
+      },
+      "q15": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 446.408746,
+        "duckdb_median_ms": 174.18861482292414,
+        "ratio": 2.5627894593100025
+      },
+      "q16": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 454.11257700000004,
+        "duckdb_median_ms": 102.78762225061655,
+        "ratio": 4.417969470028052
+      },
+      "q17": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 1114.875213,
+        "duckdb_median_ms": 497.3542629741132,
+        "ratio": 2.241611856975333
+      },
+      "q18": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 4010.928624,
+        "duckdb_median_ms": 479.61463825777173,
+        "ratio": 8.362815277219088
+      },
+      "q19": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 432.755886,
+        "duckdb_median_ms": 386.348192114383,
+        "ratio": 1.1201188327856273
+      },
+      "q20": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 247.66333500000002,
+        "duckdb_median_ms": 214.68699490651488,
+        "ratio": 1.153601945510694
+      },
+      "q21": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 872.3752219999999,
+        "duckdb_median_ms": 660.4374251328409,
+        "ratio": 1.320905189200218
+      },
+      "q22": {
+        "valid_pairs": 3,
+        "requested_pairs": 3,
+        "complete": true,
+        "engine_median_ms": 69.32356300000001,
+        "duckdb_median_ms": 121.30156205967069,
+        "ratio": 0.5714976940354515
+      }
+    },
+    "complete": false,
+    "geometric_mean_ratio": null,
+    "suite_total_ratio": null,
+    "completed_queries_slower_than_2x": [
+      "q01",
+      "q10",
+      "q13",
+      "q15",
+      "q16",
+      "q17",
+      "q18"
+    ]
+  }
+}

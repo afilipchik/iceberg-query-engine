@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "complete": false,
+  "issues": [
+    "row 28 ('tpch_sf10', 'q01', 'gpu_control', 's1')/1: answer not validated; engine: not_run",
+    "row 29 ('tpch_sf10', 'q01', 'gpu_control', 's1')/2: answer not validated; engine: not_run",
+    "row 30 ('tpch_sf10', 'q01', 'gpu_control', 's1')/3: answer not validated; engine: not_run"
+  ],
+  "groups": [],
+  "latency_leadership": false,
+  "certification": "incomplete: resource, concurrency and regression gates are separate"
+}
