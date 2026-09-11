@@ -1,0 +1,26 @@
+{
+  "binary_sha256": {
+    "parent": "8c4936d83a3249bc930e2f55383e1097a6d78762fff9d44295c51637791da2de",
+    "candidate": "59619bde34755086d5da0f469413755722b83b4f7e876f9de403f572e7d6d3cf"
+  },
+  "driver_sha256": "4983d2543be8dba18d79927d672321f70ad19499e90e47e57ac03f927c459b84",
+  "setup_source_sha256": "809053c9485dddbee5853f7d5f23db444fe93700a6377cedce68c45e24199361",
+  "request_source_sha256": "80aa00cd958e2d7eda4fd0e449e601a99cdf4548ca4a5259046f54f5b97928ab",
+  "queries": [
+    "q12"
+  ],
+  "blocks": [
+    [
+      "parent",
+      "candidate"
+    ],
+    [
+      "candidate",
+      "parent"
+    ]
+  ],
+  "samples": 3,
+  "warmups": 1,
+  "fresh_worker_per_query": true,
+  "qualification": "Two reversed blocks, native Q12 fresh workers, no phase instrumentation,180s diagnostic watchdog; compare outcomes against the recorded current10x reference ceiling without reclassifying the original SF10 timeout. Not acceptance and does not reproduce persistent-query history."
+}

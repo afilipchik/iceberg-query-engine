@@ -1,0 +1,8 @@
+{
+  "status": "waiting_existing_cycle",
+  "cycle_session": 42123,
+  "started": 1789163070.5655303,
+  "driver_sha256": "1e0f9d15970d8de6531e39b2492a1aed0473064544310d7271aa182002282387",
+  "stages": {},
+  "qualification": "One sequential16GiB postcheck scope; cumulative peak, not per-query RSS."
+}

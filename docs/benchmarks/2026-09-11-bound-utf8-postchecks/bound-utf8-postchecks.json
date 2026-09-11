@@ -1,0 +1,126 @@
+{
+  "status": "terminal",
+  "cycle_session": 42123,
+  "started": 1789163070.5655303,
+  "driver_sha256": "1e0f9d15970d8de6531e39b2492a1aed0473064544310d7271aa182002282387",
+  "stages": {
+    "sf10_audit": {
+      "status": "terminal",
+      "started": 1789164410.603117,
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/audit_bound_utf8_sf10.py"
+      ],
+      "driver_sha256": "95c988310131485d0dfb72309c86078419ce18a5cfe599c97d658765aa6acbe0",
+      "before": {
+        "memory.max": "17179869184\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "7815168\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      },
+      "exit_code": 0,
+      "finished": 1789164434.921845,
+      "after": {
+        "memory.max": "17179869184\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "168189952\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      }
+    },
+    "paired": {
+      "status": "terminal",
+      "started": 1789164434.9220836,
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/paired_bound_utf8_attribution.py"
+      ],
+      "driver_sha256": "132b318fd82e739f4ac5157041658606b31d8ae059a23d489c2a90d5e2e39f45",
+      "before": {
+        "memory.max": "17179869184\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "168189952\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      },
+      "exit_code": 0,
+      "finished": 1789164652.2253928,
+      "after": {
+        "memory.max": "17179869184\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "7076593664\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      }
+    },
+    "paired_audit": {
+      "status": "terminal",
+      "started": 1789164652.225641,
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/audit_paired_bound_utf8_attribution.py"
+      ],
+      "driver_sha256": "7ebfb860dc0b14dbfa1626475c565587b02bd4d8faefead1ebff2c302e6ee971",
+      "before": {
+        "memory.max": "17179869184\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "7076593664\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      },
+      "exit_code": 0,
+      "finished": 1789164652.7782154,
+      "after": {
+        "memory.max": "17179869184\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "7076593664\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      }
+    },
+    "sf10_archive": {
+      "status": "terminal",
+      "started": 1789164652.7784595,
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/archive_bound_utf8_sf10.py"
+      ],
+      "driver_sha256": "b240ed997c778d3583dd586893dded8f6691377b05205e8c2610578d23dde47b",
+      "before": {
+        "memory.max": "17179869184\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "7076593664\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      },
+      "exit_code": 0,
+      "finished": 1789164653.4401531,
+      "after": {
+        "memory.max": "17179869184\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "7076593664\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      }
+    },
+    "paired_archive": {
+      "status": "terminal",
+      "started": 1789164653.440473,
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/archive_bound_utf8_attribution.py"
+      ],
+      "driver_sha256": "a3748cd66123e4a67c5832e9882fc2543815d3d3222a503f93e788730e98c158",
+      "before": {
+        "memory.max": "17179869184\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "7076593664\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      },
+      "exit_code": 0,
+      "finished": 1789164653.4762056,
+      "after": {
+        "memory.max": "17179869184\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "7076593664\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      }
+    }
+  },
+  "qualification": "One sequential16GiB postcheck scope; cumulative peak, not per-query RSS.",
+  "exit_code": 0,
+  "source_inputs_verified": 800
+}

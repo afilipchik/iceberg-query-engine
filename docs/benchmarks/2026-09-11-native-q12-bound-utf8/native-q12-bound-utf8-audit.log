@@ -1,0 +1,29 @@
+typed outputs 16
+[
+  {
+    "block": 1,
+    "query": "q12",
+    "query_ratio": 0.9586210620915867,
+    "parent_ms": 987.495573,
+    "candidate_ms": 946.634055,
+    "parent_plan_ms": 9.0679,
+    "candidate_plan_ms": 9.182084,
+    "parent_execute_ms": 971.9601570000001,
+    "candidate_execute_ms": 931.360137,
+    "optimized_plan_equal": true,
+    "physical_plan_equal": true
+  },
+  {
+    "block": 2,
+    "query": "q12",
+    "query_ratio": 1.3515155916461787,
+    "parent_ms": 731.228529,
+    "candidate_ms": 988.266758,
+    "parent_plan_ms": 9.121334,
+    "candidate_plan_ms": 9.15964,
+    "parent_execute_ms": 715.730281,
+    "candidate_execute_ms": 972.938238,
+    "optimized_plan_equal": true,
+    "physical_plan_equal": true
+  }
+]

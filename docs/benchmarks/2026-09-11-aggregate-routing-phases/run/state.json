@@ -1,0 +1,194 @@
+{
+  "lance-t16-q01": {
+    "status": "terminal",
+    "completed": 3,
+    "measurements": [
+      {
+        "ms": 6322.006402999999,
+        "metrics": {
+          "execute_ms": 6063.6914959999995,
+          "local_memory_high_water_bytes": 538654531,
+          "observed_peak_memory_bytes": 454,
+          "optimize_ms": 0.206068,
+          "parse_ms": 0.27769999999999995,
+          "plan_ms": 250.063384,
+          "query_id": 1,
+          "reserved_peak_memory_bytes": 538654531
+        },
+        "physical_plan": "ExternalSort\n  Project\n    SpillableHashAggregate\n      Project\n        Filter\n          MemoryTableScan\n"
+      },
+      {
+        "ms": 6350.015979,
+        "metrics": {
+          "execute_ms": 6110.263888,
+          "local_memory_high_water_bytes": 538654531,
+          "observed_peak_memory_bytes": 454,
+          "optimize_ms": 0.165817,
+          "parse_ms": 0.07624,
+          "plan_ms": 230.644859,
+          "query_id": 2,
+          "reserved_peak_memory_bytes": 538654531
+        },
+        "physical_plan": "ExternalSort\n  Project\n    SpillableHashAggregate\n      Project\n        Filter\n          MemoryTableScan\n"
+      },
+      {
+        "ms": 6259.472402,
+        "metrics": {
+          "execute_ms": 5980.064880999999,
+          "local_memory_high_water_bytes": 538654531,
+          "observed_peak_memory_bytes": 454,
+          "optimize_ms": 0.166404,
+          "parse_ms": 0.086255,
+          "plan_ms": 269.943679,
+          "query_id": 3,
+          "reserved_peak_memory_bytes": 538654531
+        },
+        "physical_plan": "ExternalSort\n  Project\n    SpillableHashAggregate\n      Project\n        Filter\n          MemoryTableScan\n"
+      }
+    ]
+  },
+  "lance-t16-q18": {
+    "status": "terminal",
+    "completed": 3,
+    "measurements": [
+      {
+        "ms": 4078.7772980000004,
+        "metrics": {
+          "execute_ms": 3904.681568,
+          "local_memory_high_water_bytes": 2001585361,
+          "observed_peak_memory_bytes": 46650,
+          "optimize_ms": 0.53662,
+          "parse_ms": 0.29524100000000003,
+          "plan_ms": 167.967107,
+          "query_id": 1,
+          "reserved_peak_memory_bytes": 2001585361
+        },
+        "physical_plan": "ExternalSort\n  Project\n    SpillableHashAggregate\n      SpillableHashJoin\n        SpillableHashJoin\n          SpillableHashJoin\n            MemoryTableScan\n            Project\n              SpillableHashAggregate\n                MemoryTableScan\n          MemoryTableScan\n        MemoryTableScan\n"
+      },
+      {
+        "ms": 4067.1256930000004,
+        "metrics": {
+          "execute_ms": 3881.779434,
+          "local_memory_high_water_bytes": 2001585361,
+          "observed_peak_memory_bytes": 46650,
+          "optimize_ms": 0.444302,
+          "parse_ms": 0.080429,
+          "plan_ms": 178.42548399999998,
+          "query_id": 2,
+          "reserved_peak_memory_bytes": 2001585361
+        },
+        "physical_plan": "ExternalSort\n  Project\n    SpillableHashAggregate\n      SpillableHashJoin\n        SpillableHashJoin\n          SpillableHashJoin\n            MemoryTableScan\n            Project\n              SpillableHashAggregate\n                MemoryTableScan\n          MemoryTableScan\n        MemoryTableScan\n"
+      },
+      {
+        "ms": 4030.4056649999998,
+        "metrics": {
+          "execute_ms": 3824.287026,
+          "local_memory_high_water_bytes": 2001585361,
+          "observed_peak_memory_bytes": 46650,
+          "optimize_ms": 0.421066,
+          "parse_ms": 0.148303,
+          "plan_ms": 200.028815,
+          "query_id": 3,
+          "reserved_peak_memory_bytes": 2001585361
+        },
+        "physical_plan": "ExternalSort\n  Project\n    SpillableHashAggregate\n      SpillableHashJoin\n        SpillableHashJoin\n          SpillableHashJoin\n            MemoryTableScan\n            Project\n              SpillableHashAggregate\n                MemoryTableScan\n          MemoryTableScan\n        MemoryTableScan\n"
+      }
+    ]
+  },
+  "lance-t4-q01": {
+    "status": "terminal",
+    "completed": 3,
+    "measurements": [
+      {
+        "ms": 6060.034182,
+        "metrics": {
+          "execute_ms": 5799.252681000001,
+          "local_memory_high_water_bytes": 538133630,
+          "observed_peak_memory_bytes": 454,
+          "optimize_ms": 0.21737800000000002,
+          "parse_ms": 0.233353,
+          "plan_ms": 252.058008,
+          "query_id": 1,
+          "reserved_peak_memory_bytes": 538133630
+        },
+        "physical_plan": "ExternalSort\n  Project\n    SpillableHashAggregate\n      Project\n        Filter\n          MemoryTableScan\n"
+      },
+      {
+        "ms": 6230.917444,
+        "metrics": {
+          "execute_ms": 5991.121268,
+          "local_memory_high_water_bytes": 538133630,
+          "observed_peak_memory_bytes": 454,
+          "optimize_ms": 0.17058399999999999,
+          "parse_ms": 0.087565,
+          "plan_ms": 230.35100599999998,
+          "query_id": 2,
+          "reserved_peak_memory_bytes": 538133630
+        },
+        "physical_plan": "ExternalSort\n  Project\n    SpillableHashAggregate\n      Project\n        Filter\n          MemoryTableScan\n"
+      },
+      {
+        "ms": 6285.615774,
+        "metrics": {
+          "execute_ms": 5922.704519,
+          "local_memory_high_water_bytes": 538133630,
+          "observed_peak_memory_bytes": 454,
+          "optimize_ms": 0.17010899999999998,
+          "parse_ms": 0.081869,
+          "plan_ms": 353.652583,
+          "query_id": 3,
+          "reserved_peak_memory_bytes": 538133630
+        },
+        "physical_plan": "ExternalSort\n  Project\n    SpillableHashAggregate\n      Project\n        Filter\n          MemoryTableScan\n"
+      }
+    ]
+  },
+  "lance-t4-q18": {
+    "status": "terminal",
+    "completed": 3,
+    "measurements": [
+      {
+        "ms": 4053.466285,
+        "metrics": {
+          "execute_ms": 3883.405725,
+          "local_memory_high_water_bytes": 2001381163,
+          "observed_peak_memory_bytes": 46650,
+          "optimize_ms": 0.46738599999999997,
+          "parse_ms": 0.24645500000000004,
+          "plan_ms": 163.745094,
+          "query_id": 1,
+          "reserved_peak_memory_bytes": 2001381163
+        },
+        "physical_plan": "ExternalSort\n  Project\n    SpillableHashAggregate\n      SpillableHashJoin\n        SpillableHashJoin\n          SpillableHashJoin\n            MemoryTableScan\n            Project\n              SpillableHashAggregate\n                MemoryTableScan\n          MemoryTableScan\n        MemoryTableScan\n"
+      },
+      {
+        "ms": 3951.610074,
+        "metrics": {
+          "execute_ms": 3786.101397,
+          "local_memory_high_water_bytes": 2001381163,
+          "observed_peak_memory_bytes": 46650,
+          "optimize_ms": 0.441129,
+          "parse_ms": 0.080193,
+          "plan_ms": 158.80924499999998,
+          "query_id": 2,
+          "reserved_peak_memory_bytes": 2001381163
+        },
+        "physical_plan": "ExternalSort\n  Project\n    SpillableHashAggregate\n      SpillableHashJoin\n        SpillableHashJoin\n          SpillableHashJoin\n            MemoryTableScan\n            Project\n              SpillableHashAggregate\n                MemoryTableScan\n          MemoryTableScan\n        MemoryTableScan\n"
+      },
+      {
+        "ms": 3984.37136,
+        "metrics": {
+          "execute_ms": 3823.871087,
+          "local_memory_high_water_bytes": 2001381163,
+          "observed_peak_memory_bytes": 46650,
+          "optimize_ms": 0.42286599999999996,
+          "parse_ms": 0.08082700000000001,
+          "plan_ms": 153.838459,
+          "query_id": 3,
+          "reserved_peak_memory_bytes": 2001381163
+        },
+        "physical_plan": "ExternalSort\n  Project\n    SpillableHashAggregate\n      SpillableHashJoin\n        SpillableHashJoin\n          SpillableHashJoin\n            MemoryTableScan\n            Project\n              SpillableHashAggregate\n                MemoryTableScan\n          MemoryTableScan\n        MemoryTableScan\n"
+      }
+    ]
+  }
+}

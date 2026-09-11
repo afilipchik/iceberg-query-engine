@@ -86,11 +86,13 @@ retained float bits. Live controller/output integration remains open.
 [101 focused passes and scope](arrow-state-input-2026-09-07.md).
 
 Current prepared-key chunks use `key_rows/bound_arrays.rs` to bind primitive
-Arrow downcasts and validity buffers once against the exact retained batch.
+Arrow downcasts/validity and plain UTF-8 arrays once against the exact retained batch.
 Binding metadata is reserved within the existing optional preparation child pool;
-reservation refusal releases preparation before ordinary routing. Variable and
-dictionary keys retain checked canonical traversal. Hashing, full equality, row
-identity and spill retry are unchanged. Frozen0f30c946 passes1,036 library tests and36 feature-enabled integrations;
+reservation refusal releases preparation before ordinary routing. UTF-8 retains
+the canonical validity marker, u64 byte length and exact bytes; dictionaries and
+other variable domains retain checked canonical traversal. Hashing, full equality, row
+identity and spill retry are unchanged. Current UTF-8 validation is tracked in
+[borrowed string binding](bound-utf8-aggregate-keys-2026-09-11.md). Historical frozen0f30c946 passes1,036 library tests and36 feature-enabled integrations;
 seven pre-existing full spill failures remain. Completed protected/provider/residency
 measurements remain incomplete for overall acceptance; see [key-binding audit](aggregate-key-binding-audit-2026-09-09.md).
 

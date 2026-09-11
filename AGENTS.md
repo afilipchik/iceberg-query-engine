@@ -6,30 +6,41 @@ linked reports and the existing epic rather than prepending another status block
 
 ## Current checkpoint — 2026-09-11
 
-Frozen candidate `8c4936d8` adds a local patch to pinned Lance10 in `vendor/lance`: refinement
-runs in an owned task within the existing decode window. Registry files and
-dependency versions are unchanged; UPSTREAM.json preserves all265original hashes.
-The benchmark source manifest now hashes vendor content as well as engine code.
-Red91654 reproduces serialized refinement with correct filtered rows. Initial
-patched rebuild fails only because protoc is absent from PATH; corrected24871
-passes with the existing `.scratch/tools/protoc/bin/protoc`. Strengthened11512
-passes3refinement contracts and31Lance integrations; provenance unit1passes.
-Broad36475 terminal1 retains unchanged failures,800source inputs:1132library
-passes/11ignored and128contracts each; source archive32files verifies. Scopepeak
-37.346GB,zeroOOM/max. Release3743 completed0 in11m28s; its SF10 provider
-screen is terminal1. Independent audit validates343outputs/257of264pairs: raw66,
-native62, Iceberg63, Lance66. Raw geomean2.422912/suite2.630356 (0wins), Lance
-2.021921/3.104834 (1win). NativeQ1warmup/Q6measured3 timeout; DuckDB IcebergQ9warmup
-refuses128MiB and engineQ9 is not run. Source/binary/harness verified; combined
-scopepeak25.882GB,zeroOOM/max. Sequential postchecks50101 terminal0:80paired typed
-outputs, unchanged plans, Q12 ratios0.358/0.242 and Q19 0.514/0.488 in reversed
-blocks (diagnostic only). Default-allocator endurance176/176typed-correct; maximum
-observed48I/Othreads/97total, sequence-end VmData growth11004KiB. Cumulative16GiB
-scopepeak8.284GB,zeroOOM/max. Binary and800source hashes verify. Archives32validation,
-1282SF10,173paired,197endurance plus174prior attribution verify. This intermediary
-cycle is ready for commit/push; next CPU target is shared aggregate execution,
-which still dominates Q1. See [refinement evidence](docs/lance-refinement-concurrency-2026-09-11.md).
-No leadership or full provider/resource/residency/concurrency acceptance is certified.
+Current candidate `59619bde` binds plain UTF-8 aggregate key arrays once per batch,
+retaining canonical validity/length/bytes, admission and error contracts. Numeric
+bindings and checked dictionary/nested traversal remain. No default-ownership,
+dependency, hash format or query-budget change. Red36734 reproduces820downcasts
+for512rows with correct canonical bytes; green54503 passes20key-row tests/1ignored
+(the ignored historical microbenchmark bypasses this binding). New opt-in routing
+telemetry separates key preparation/dispatch while preserving existing totals.
+
+Cycle42123 is terminal: both modes1133library passes/11ignored and128contracts;
+native/IPC63default/62partial plus its known numeric failure, spill/numeric28passes
+and the same6failures each. Strict executable/count/name comparison passes; archive27
+verifies800source inputs. Release59619bde completes0 in8m49s. Canonical SF10 validates
+337outputs/252of264pairs: raw66/native57/Iceberg63/Lance66. Rawgeomean2.409209/suite
+2.599317 (0wins), Lance2.019243/2.985002 (1win). NativeQ1/Q6warmups and additional
+Q12measured1 timeout; Iceberg DuckDBQ9oracle refuses256MiB. Cumulative validation/
+build/screenpeak40.571GB under48GiB,zeroOOM/max. Preserve all failures.
+
+Postcheck50559 terminal0:80typed paired outputs, unchanged plans; Q1 ratios0.8518/
+0.8486, with key preparation1.74–1.79s to0.88–0.90s. Q6 ratios1.0118/1.0721; no
+blanket regression-free claim. Scopepeak7.077GB under16GiB,zeroOOM/max. NativeQ12
+91767 terminal0 validates16outputs, but both binaries exceed the current1.176s
+recorded ceiling on some requests. Ratios0.9586/1.3515 leave variability unresolved;
+the SF10timeout remains a failure. Archives65profile/46phase/27validation/1276SF10/
+173paired/47native verify. See [current cycle](docs/bound-utf8-aggregate-keys-2026-09-11.md)
+and [aggregate attribution](docs/shared-aggregate-profile-2026-09-11.md).
+Intermediary commit/push is next, then prepared decoded IPC/GPU residency on the
+same binary. No DuckDB leadership or full resource/concurrency acceptance is certified.
+
+Pushed parent `bb38784` freezes Lance refinement candidate8c4936d8. The pinned
+Lance10 vendor patch runs refinement in owned tasks within its decode window;
+UPSTREAM.json preserves265original hashes, and benchmark manifests hash vendor
+content. Its SF10 validates343outputs/257pairs, Lancegeomean2.021921. Two reversed
+blocks establish Q12/Q19 improvements; default-allocator endurance176/176typed-correct,
+48max observed I/Othreads/97total, sequence-end VmData growth11004KiB,zeroOOM/max.
+See [Lance refinement evidence](docs/lance-refinement-concurrency-2026-09-11.md).
 
 Frozen parent `835ae7ad` (531 verified source inputs, Lance/GPU features) uses
 one ordered Lance scanner across selected fragments. This shares Lance's internal

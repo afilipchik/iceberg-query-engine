@@ -1,0 +1,37 @@
+[mem-cap] process hard-capped at 12.0G anonymous memory (RLIMIT_DATA; the engine aborts if exceeded, the terminal survives; size with QE_MEM_CAP)
+[lance-scan]     1.2ms           5 rows 1 cols ["r_regionkey"]
+[lance-scan]     0.3ms           5 rows 2 cols ["r_name", "r_comment"]
+[lance-scan]     0.2ms          25 rows 2 cols ["n_nationkey", "n_regionkey"]
+[lance-scan]     0.1ms          25 rows 2 cols ["n_name", "n_comment"]
+[lance-scan]     0.5ms      100000 rows 2 cols ["s_suppkey", "s_nationkey"]
+[lance-scan]     3.8ms      100000 rows 4 cols ["s_name", "s_address", "s_phone", "s_comment"]
+[lance-scan]     2.4ms     1500000 rows 2 cols ["c_custkey", "c_nationkey"]
+[lance-scan]    28.9ms     1048576 rows 5 cols ["c_name", "c_address", "c_phone", "c_mktsegment", "c_comment"]
+[lance-scan]     2.7ms     2000000 rows 2 cols ["p_partkey", "p_size"]
+[lance-scan]    15.1ms     1048576 rows 6 cols ["p_name", "p_mfgr", "p_brand", "p_type", "p_container", "p_comment"]
+[lance-scan]    10.7ms     8000000 rows 3 cols ["ps_partkey", "ps_suppkey", "ps_availqty"]
+[lance-scan]    25.2ms     1048576 rows 1 cols ["ps_comment"]
+[lance-scan]    17.7ms    15000000 rows 4 cols ["o_orderkey", "o_custkey", "o_orderdate", "o_shippriority"]
+[lance-scan]    20.7ms     1048576 rows 4 cols ["o_orderstatus", "o_orderpriority", "o_clerk", "o_comment"]
+[lance-scan]   142.6ms    59986052 rows 7 cols ["l_orderkey", "l_partkey", "l_suppkey", "l_linenumber", "l_shipdate", "l_commitdate", "l_receiptdate"]
+[lance-scan]    18.7ms     1048576 rows 5 cols ["l_returnflag", "l_linestatus", "l_shipinstruct", "l_shipmode", "l_comment"]
+[lance-scan]   242.8ms    59986052 rows 7 cols ["l_quantity", "l_extendedprice", "l_discount", "l_tax", "l_returnflag", "l_linestatus", "l_shipdate"]
+[aggregate-frontier] {"admitted_buffers":true,"copy_bound":null,"envelope_bytes":null,"operator":"Project","partitions":16,"slots":16}
+live_aggregate_routing key_preparation_ms=1871.518 row_dispatch_ms=358.813 prepared_batches=7323 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=2230.633 processing_wall_ms=2459.306 serial_batches=0 parallel_batches=7323
+live_aggregate_profile input_rows=59142609 input_batches=7323 evaluation_ms=1519.523 ingestion_ms=4696.647 finish_ms=0.117 output_ms=0.024 output_rows=4 output_batches=3 spilled_bytes=0
+[lance-scan]   242.4ms    59986052 rows 7 cols ["l_quantity", "l_extendedprice", "l_discount", "l_tax", "l_returnflag", "l_linestatus", "l_shipdate"]
+[aggregate-frontier] {"admitted_buffers":true,"copy_bound":null,"envelope_bytes":null,"operator":"Project","partitions":16,"slots":16}
+live_aggregate_routing key_preparation_ms=1738.474 row_dispatch_ms=349.698 prepared_batches=7323 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=2088.464 processing_wall_ms=2495.228 serial_batches=0 parallel_batches=7323
+live_aggregate_profile input_rows=59142609 input_batches=7323 evaluation_ms=1444.649 ingestion_ms=4590.341 finish_ms=0.111 output_ms=0.021 output_rows=4 output_batches=3 spilled_bytes=0
+[lance-scan]   242.3ms    59986052 rows 7 cols ["l_quantity", "l_extendedprice", "l_discount", "l_tax", "l_returnflag", "l_linestatus", "l_shipdate"]
+[aggregate-frontier] {"admitted_buffers":true,"copy_bound":null,"envelope_bytes":null,"operator":"Project","partitions":16,"slots":16}
+live_aggregate_routing key_preparation_ms=1797.969 row_dispatch_ms=351.690 prepared_batches=7323 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=2149.958 processing_wall_ms=2471.931 serial_batches=0 parallel_batches=7323
+live_aggregate_profile input_rows=59142609 input_batches=7323 evaluation_ms=1469.290 ingestion_ms=4628.683 finish_ms=0.125 output_ms=0.022 output_rows=4 output_batches=3 spilled_bytes=0
+[lance-scan]   237.1ms    59986052 rows 7 cols ["l_quantity", "l_extendedprice", "l_discount", "l_tax", "l_returnflag", "l_linestatus", "l_shipdate"]
+[aggregate-frontier] {"admitted_buffers":true,"copy_bound":null,"envelope_bytes":null,"operator":"Project","partitions":16,"slots":16}
+live_aggregate_routing key_preparation_ms=1737.687 row_dispatch_ms=363.958 prepared_batches=7323 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=2101.930 processing_wall_ms=2439.998 serial_batches=0 parallel_batches=7323
+live_aggregate_profile input_rows=59142609 input_batches=7323 evaluation_ms=1427.112 ingestion_ms=4549.182 finish_ms=0.129 output_ms=0.021 output_rows=4 output_batches=3 spilled_bytes=0

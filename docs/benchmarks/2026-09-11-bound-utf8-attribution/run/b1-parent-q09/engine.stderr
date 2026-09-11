@@ -1,0 +1,57 @@
+[mem-cap] process hard-capped at 12.0G anonymous memory (RLIMIT_DATA; the engine aborts if exceeded, the terminal survives; size with QE_MEM_CAP)
+[lance-scan]     0.9ms           5 rows 1 cols ["r_regionkey"]
+[lance-scan]     0.2ms           5 rows 2 cols ["r_name", "r_comment"]
+[lance-scan]     0.2ms          25 rows 2 cols ["n_nationkey", "n_regionkey"]
+[lance-scan]     0.2ms          25 rows 2 cols ["n_name", "n_comment"]
+[lance-scan]     0.5ms      100000 rows 2 cols ["s_suppkey", "s_nationkey"]
+[lance-scan]     3.7ms      100000 rows 4 cols ["s_name", "s_address", "s_phone", "s_comment"]
+[lance-scan]     3.5ms     1500000 rows 2 cols ["c_custkey", "c_nationkey"]
+[lance-scan]    26.2ms     1048576 rows 5 cols ["c_name", "c_address", "c_phone", "c_mktsegment", "c_comment"]
+[lance-scan]     2.5ms     2000000 rows 2 cols ["p_partkey", "p_size"]
+[lance-scan]    15.8ms     1048576 rows 6 cols ["p_name", "p_mfgr", "p_brand", "p_type", "p_container", "p_comment"]
+[lance-scan]    11.3ms     8000000 rows 3 cols ["ps_partkey", "ps_suppkey", "ps_availqty"]
+[lance-scan]    25.1ms     1048576 rows 1 cols ["ps_comment"]
+[lance-scan]    17.8ms    15000000 rows 4 cols ["o_orderkey", "o_custkey", "o_orderdate", "o_shippriority"]
+[lance-scan]    17.9ms     1048576 rows 4 cols ["o_orderstatus", "o_orderpriority", "o_clerk", "o_comment"]
+[lance-scan]   151.2ms    59986052 rows 7 cols ["l_orderkey", "l_partkey", "l_suppkey", "l_linenumber", "l_shipdate", "l_commitdate", "l_receiptdate"]
+[lance-scan]    18.8ms     1048576 rows 5 cols ["l_returnflag", "l_linestatus", "l_shipinstruct", "l_shipmode", "l_comment"]
+[lance-scan]    12.5ms     8000000 rows 3 cols ["ps_partkey", "ps_suppkey", "ps_supplycost"]
+[lance-scan]     0.4ms          25 rows 2 cols ["n_nationkey", "n_name"]
+[lance-scan]     0.6ms      100000 rows 2 cols ["s_suppkey", "s_nationkey"]
+[lance-scan]    10.9ms    15000000 rows 2 cols ["o_orderkey", "o_orderdate"]
+[lance-scan]    11.5ms     2000000 rows 2 cols ["p_partkey", "p_name"]
+[lance-scan]   210.2ms    59986052 rows 6 cols ["l_orderkey", "l_partkey", "l_suppkey", "l_quantity", "l_extendedprice", "l_discount"]
+[aggregate-frontier] {"admitted_buffers":true,"copy_bound":null,"envelope_bytes":null,"operator":"Project","partitions":16,"slots":16}
+live_aggregate_routing key_preparation_ms=410.205 row_dispatch_ms=109.707 prepared_batches=7323 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=520.171 processing_wall_ms=120.325 serial_batches=7323 parallel_batches=0
+live_aggregate_profile input_rows=3261613 input_batches=7323 evaluation_ms=6.676 ingestion_ms=652.237 finish_ms=0.123 output_ms=0.035 output_rows=175 output_batches=4 spilled_bytes=0
+[lance-scan]    11.9ms     8000000 rows 3 cols ["ps_partkey", "ps_suppkey", "ps_supplycost"]
+[lance-scan]     0.3ms          25 rows 2 cols ["n_nationkey", "n_name"]
+[lance-scan]     0.3ms      100000 rows 2 cols ["s_suppkey", "s_nationkey"]
+[lance-scan]     9.9ms    15000000 rows 2 cols ["o_orderkey", "o_orderdate"]
+[lance-scan]    11.8ms     2000000 rows 2 cols ["p_partkey", "p_name"]
+[lance-scan]   286.0ms    59986052 rows 6 cols ["l_orderkey", "l_partkey", "l_suppkey", "l_quantity", "l_extendedprice", "l_discount"]
+[aggregate-frontier] {"admitted_buffers":true,"copy_bound":null,"envelope_bytes":null,"operator":"Project","partitions":16,"slots":16}
+live_aggregate_routing key_preparation_ms=406.405 row_dispatch_ms=106.011 prepared_batches=7323 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=512.663 processing_wall_ms=119.632 serial_batches=7323 parallel_batches=0
+live_aggregate_profile input_rows=3261613 input_batches=7323 evaluation_ms=6.725 ingestion_ms=643.861 finish_ms=0.123 output_ms=0.032 output_rows=175 output_batches=4 spilled_bytes=0
+[lance-scan]    12.1ms     8000000 rows 3 cols ["ps_partkey", "ps_suppkey", "ps_supplycost"]
+[lance-scan]     0.4ms          25 rows 2 cols ["n_nationkey", "n_name"]
+[lance-scan]     0.5ms      100000 rows 2 cols ["s_suppkey", "s_nationkey"]
+[lance-scan]    10.4ms    15000000 rows 2 cols ["o_orderkey", "o_orderdate"]
+[lance-scan]    12.5ms     2000000 rows 2 cols ["p_partkey", "p_name"]
+[lance-scan]   176.1ms    59986052 rows 6 cols ["l_orderkey", "l_partkey", "l_suppkey", "l_quantity", "l_extendedprice", "l_discount"]
+[aggregate-frontier] {"admitted_buffers":true,"copy_bound":null,"envelope_bytes":null,"operator":"Project","partitions":16,"slots":16}
+live_aggregate_routing key_preparation_ms=429.333 row_dispatch_ms=100.204 prepared_batches=7323 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=529.824 processing_wall_ms=130.103 serial_batches=7323 parallel_batches=0
+live_aggregate_profile input_rows=3261613 input_batches=7323 evaluation_ms=8.143 ingestion_ms=670.691 finish_ms=0.123 output_ms=0.032 output_rows=175 output_batches=4 spilled_bytes=0
+[lance-scan]    12.1ms     8000000 rows 3 cols ["ps_partkey", "ps_suppkey", "ps_supplycost"]
+[lance-scan]     0.3ms          25 rows 2 cols ["n_nationkey", "n_name"]
+[lance-scan]     0.4ms      100000 rows 2 cols ["s_suppkey", "s_nationkey"]
+[lance-scan]    10.3ms    15000000 rows 2 cols ["o_orderkey", "o_orderdate"]
+[lance-scan]    12.9ms     2000000 rows 2 cols ["p_partkey", "p_name"]
+[lance-scan]   180.5ms    59986052 rows 6 cols ["l_orderkey", "l_partkey", "l_suppkey", "l_quantity", "l_extendedprice", "l_discount"]
+[aggregate-frontier] {"admitted_buffers":true,"copy_bound":null,"envelope_bytes":null,"operator":"Project","partitions":16,"slots":16}
+live_aggregate_routing key_preparation_ms=438.599 row_dispatch_ms=97.975 prepared_batches=7323 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=536.881 processing_wall_ms=140.971 serial_batches=7323 parallel_batches=0
+live_aggregate_profile input_rows=3261613 input_batches=7323 evaluation_ms=8.995 ingestion_ms=688.045 finish_ms=0.186 output_ms=0.033 output_rows=175 output_batches=4 spilled_bytes=0

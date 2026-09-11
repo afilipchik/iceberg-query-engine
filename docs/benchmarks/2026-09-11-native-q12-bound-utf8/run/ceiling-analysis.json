@@ -1,0 +1,121 @@
+{
+  "calibrations": {
+    "parent": {
+      "samples_ms": [
+        271.23104920610785,
+        243.3977578766644,
+        315.11337822303176
+      ],
+      "ceiling_ms": 2712.3104920610785,
+      "execution_sha256": "ebb413e8002962a63370014d5331e4a627f05151fae7ab008764df0909a9ae50"
+    },
+    "candidate": {
+      "samples_ms": [
+        117.62906610965729,
+        122.43809830397367,
+        110.8224499039352
+      ],
+      "ceiling_ms": 1176.2906610965729,
+      "execution_sha256": "80aa00cd958e2d7eda4fd0e449e601a99cdf4548ca4a5259046f54f5b97928ab"
+    }
+  },
+  "checks": [
+    {
+      "id": "b1-parent-q12-warmup",
+      "status": "completed",
+      "ms": 1710.363968,
+      "within_current_recorded_ceiling": false
+    },
+    {
+      "id": "b1-parent-q12-1-engine",
+      "status": "completed",
+      "ms": 1526.78519,
+      "within_current_recorded_ceiling": false
+    },
+    {
+      "id": "b1-parent-q12-2-engine",
+      "status": "completed",
+      "ms": 971.1477590000001,
+      "within_current_recorded_ceiling": true
+    },
+    {
+      "id": "b1-parent-q12-3-engine",
+      "status": "completed",
+      "ms": 987.495573,
+      "within_current_recorded_ceiling": true
+    },
+    {
+      "id": "b1-candidate-q12-warmup",
+      "status": "completed",
+      "ms": 602.4998780000001,
+      "within_current_recorded_ceiling": true
+    },
+    {
+      "id": "b1-candidate-q12-1-engine",
+      "status": "completed",
+      "ms": 1120.9884729999999,
+      "within_current_recorded_ceiling": true
+    },
+    {
+      "id": "b1-candidate-q12-2-engine",
+      "status": "completed",
+      "ms": 946.634055,
+      "within_current_recorded_ceiling": true
+    },
+    {
+      "id": "b1-candidate-q12-3-engine",
+      "status": "completed",
+      "ms": 795.0687509999999,
+      "within_current_recorded_ceiling": true
+    },
+    {
+      "id": "b2-candidate-q12-warmup",
+      "status": "completed",
+      "ms": 567.708301,
+      "within_current_recorded_ceiling": true
+    },
+    {
+      "id": "b2-candidate-q12-1-engine",
+      "status": "completed",
+      "ms": 1283.882995,
+      "within_current_recorded_ceiling": false
+    },
+    {
+      "id": "b2-candidate-q12-2-engine",
+      "status": "completed",
+      "ms": 988.266758,
+      "within_current_recorded_ceiling": true
+    },
+    {
+      "id": "b2-candidate-q12-3-engine",
+      "status": "completed",
+      "ms": 602.58767,
+      "within_current_recorded_ceiling": true
+    },
+    {
+      "id": "b2-parent-q12-warmup",
+      "status": "completed",
+      "ms": 784.586089,
+      "within_current_recorded_ceiling": true
+    },
+    {
+      "id": "b2-parent-q12-1-engine",
+      "status": "completed",
+      "ms": 1368.533476,
+      "within_current_recorded_ceiling": false
+    },
+    {
+      "id": "b2-parent-q12-2-engine",
+      "status": "completed",
+      "ms": 731.228529,
+      "within_current_recorded_ceiling": true
+    },
+    {
+      "id": "b2-parent-q12-3-engine",
+      "status": "completed",
+      "ms": 713.2941950000001,
+      "within_current_recorded_ceiling": true
+    }
+  ],
+  "qualification": "Fresh-worker diagnostic; original SF10 timeout remains a failure. No proof of persistent-query-history equivalence or performance acceptance."
+}

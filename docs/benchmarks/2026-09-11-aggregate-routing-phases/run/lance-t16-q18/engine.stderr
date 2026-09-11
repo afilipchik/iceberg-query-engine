@@ -1,0 +1,53 @@
+[mem-cap] process hard-capped at 12.0G anonymous memory (RLIMIT_DATA; the engine aborts if exceeded, the terminal survives; size with QE_MEM_CAP)
+[lance-scan]     1.8ms           5 rows 1 cols ["r_regionkey"]
+[lance-scan]     0.3ms           5 rows 2 cols ["r_name", "r_comment"]
+[lance-scan]     0.2ms          25 rows 2 cols ["n_nationkey", "n_regionkey"]
+[lance-scan]     0.1ms          25 rows 2 cols ["n_name", "n_comment"]
+[lance-scan]     0.6ms      100000 rows 2 cols ["s_suppkey", "s_nationkey"]
+[lance-scan]     5.8ms      100000 rows 4 cols ["s_name", "s_address", "s_phone", "s_comment"]
+[lance-scan]     5.5ms     1500000 rows 2 cols ["c_custkey", "c_nationkey"]
+[lance-scan]    33.2ms     1048576 rows 5 cols ["c_name", "c_address", "c_phone", "c_mktsegment", "c_comment"]
+[lance-scan]     2.5ms     2000000 rows 2 cols ["p_partkey", "p_size"]
+[lance-scan]    15.0ms     1048576 rows 6 cols ["p_name", "p_mfgr", "p_brand", "p_type", "p_container", "p_comment"]
+[lance-scan]    12.0ms     8000000 rows 3 cols ["ps_partkey", "ps_suppkey", "ps_availqty"]
+[lance-scan]    24.0ms     1048576 rows 1 cols ["ps_comment"]
+[lance-scan]    17.7ms    15000000 rows 4 cols ["o_orderkey", "o_custkey", "o_orderdate", "o_shippriority"]
+[lance-scan]    15.0ms     1048576 rows 4 cols ["o_orderstatus", "o_orderpriority", "o_clerk", "o_comment"]
+[lance-scan]   147.0ms    59986052 rows 7 cols ["l_orderkey", "l_partkey", "l_suppkey", "l_linenumber", "l_shipdate", "l_commitdate", "l_receiptdate"]
+[lance-scan]    19.5ms     1048576 rows 5 cols ["l_returnflag", "l_linestatus", "l_shipinstruct", "l_shipmode", "l_comment"]
+[lance-scan]    23.4ms    15000000 rows 4 cols ["o_orderkey", "o_custkey", "o_totalprice", "o_orderdate"]
+[lance-scan]    60.2ms    59986052 rows 2 cols ["l_orderkey", "l_quantity"]
+[lance-scan]     6.1ms     1500000 rows 2 cols ["c_custkey", "c_name"]
+[lance-scan]    77.9ms    59986052 rows 2 cols ["l_orderkey", "l_quantity"]
+[aggregate-frontier] {"admitted_buffers":true,"copy_bound":null,"envelope_bytes":null,"operator":"MemoryTableScan","partitions":16,"slots":16}
+live_aggregate_routing key_preparation_ms=741.068 row_dispatch_ms=366.065 prepared_batches=7323 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=1107.452 processing_wall_ms=1589.849 serial_batches=0 parallel_batches=7323
+live_aggregate_profile input_rows=59986052 input_batches=7323 evaluation_ms=6.506 ingestion_ms=2704.641 finish_ms=1016.014 output_ms=1015.793 output_rows=624 output_batches=610 spilled_bytes=0
+[aggregate-frontier] {"admitted_buffers":true,"copy_bound":null,"envelope_bytes":null,"operator":"SpillableHashJoin","partitions":16,"slots":16}
+live_aggregate_routing key_preparation_ms=3.667 row_dispatch_ms=0.794 prepared_batches=603 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=4.488 processing_wall_ms=1.073 serial_batches=603 parallel_batches=0
+live_aggregate_profile input_rows=4368 input_batches=603 evaluation_ms=2.974 ingestion_ms=5.983 finish_ms=0.240 output_ms=0.162 output_rows=624 output_batches=4 spilled_bytes=0
+[lance-scan]    26.6ms    15000000 rows 4 cols ["o_orderkey", "o_custkey", "o_totalprice", "o_orderdate"]
+[lance-scan]    79.2ms    59986052 rows 2 cols ["l_orderkey", "l_quantity"]
+[lance-scan]     8.5ms     1500000 rows 2 cols ["c_custkey", "c_name"]
+[lance-scan]    63.8ms    59986052 rows 2 cols ["l_orderkey", "l_quantity"]
+[aggregate-frontier] {"admitted_buffers":true,"copy_bound":null,"envelope_bytes":null,"operator":"MemoryTableScan","partitions":16,"slots":16}
+live_aggregate_routing key_preparation_ms=774.503 row_dispatch_ms=358.048 prepared_batches=7323 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=1132.848 processing_wall_ms=1589.710 serial_batches=0 parallel_batches=7323
+live_aggregate_profile input_rows=59986052 input_batches=7323 evaluation_ms=7.009 ingestion_ms=2730.093 finish_ms=982.174 output_ms=981.962 output_rows=624 output_batches=614 spilled_bytes=0
+[aggregate-frontier] {"admitted_buffers":true,"copy_bound":null,"envelope_bytes":null,"operator":"SpillableHashJoin","partitions":16,"slots":16}
+live_aggregate_routing key_preparation_ms=2.798 row_dispatch_ms=2.105 prepared_batches=603 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=4.930 processing_wall_ms=1.049 serial_batches=603 parallel_batches=0
+live_aggregate_profile input_rows=4368 input_batches=603 evaluation_ms=1.735 ingestion_ms=6.440 finish_ms=0.250 output_ms=0.162 output_rows=624 output_batches=4 spilled_bytes=0
+[lance-scan]    25.1ms    15000000 rows 4 cols ["o_orderkey", "o_custkey", "o_totalprice", "o_orderdate"]
+[lance-scan]    63.2ms    59986052 rows 2 cols ["l_orderkey", "l_quantity"]
+[lance-scan]     6.9ms     1500000 rows 2 cols ["c_custkey", "c_name"]
+[lance-scan]   104.5ms    59986052 rows 2 cols ["l_orderkey", "l_quantity"]
+[aggregate-frontier] {"admitted_buffers":true,"copy_bound":null,"envelope_bytes":null,"operator":"MemoryTableScan","partitions":16,"slots":16}
+live_aggregate_routing key_preparation_ms=743.020 row_dispatch_ms=358.697 prepared_batches=7323 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=1102.005 processing_wall_ms=1584.227 serial_batches=0 parallel_batches=7323
+live_aggregate_profile input_rows=59986052 input_batches=7323 evaluation_ms=6.372 ingestion_ms=2693.449 finish_ms=966.695 output_ms=966.494 output_rows=624 output_batches=614 spilled_bytes=0
+[aggregate-frontier] {"admitted_buffers":true,"copy_bound":null,"envelope_bytes":null,"operator":"SpillableHashJoin","partitions":16,"slots":16}
+live_aggregate_routing key_preparation_ms=2.740 row_dispatch_ms=0.860 prepared_batches=603 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=3.627 processing_wall_ms=1.080 serial_batches=603 parallel_batches=0
+live_aggregate_profile input_rows=4368 input_batches=603 evaluation_ms=1.709 ingestion_ms=5.153 finish_ms=0.252 output_ms=0.168 output_rows=624 output_batches=4 spilled_bytes=0

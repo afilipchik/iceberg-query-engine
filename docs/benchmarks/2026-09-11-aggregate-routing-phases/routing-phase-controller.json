@@ -1,0 +1,30 @@
+{
+  "status": "terminal",
+  "build_session": 74760,
+  "started": 1789162151.992005,
+  "driver_sha256": "4fa1bb6719d86265246737d1c167e8734b41b0813f55ea49d258c8e09dbd4a08",
+  "build": {
+    "status": "completed",
+    "exit": 0,
+    "command": [
+      "cargo",
+      "build",
+      "--locked",
+      "--offline",
+      "--release",
+      "--features",
+      "lance,gpu",
+      "--example",
+      "benchmark_embedded"
+    ],
+    "started": "2026-09-11T21:27:54.325600+00:00",
+    "binary_sha256": "99e1c0dd890c76d23eff4375ea6b168611f3e679ab68e1f4e05c76a0b0c71dc1"
+  },
+  "exit_code": 0,
+  "finished": 1789162679.2248695,
+  "command": [
+    "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+    ".scratch/parallel-aggregate-input/profile_routing_phases.py"
+  ],
+  "source_inputs_verified": 800
+}

@@ -1,0 +1,30 @@
+{
+  "binary_sha256": {
+    "parent": "99e1c0dd890c76d23eff4375ea6b168611f3e679ab68e1f4e05c76a0b0c71dc1",
+    "candidate": "59619bde34755086d5da0f469413755722b83b4f7e876f9de403f572e7d6d3cf"
+  },
+  "driver_sha256": "132b318fd82e739f4ac5157041658606b31d8ae059a23d489c2a90d5e2e39f45",
+  "setup_source_sha256": "cac2975285f215c49078ffe87cd4dd5898030ee4e9e046e238df2d2bb9bdf62f",
+  "request_source_sha256": "8600675281e98b0ee77e35ea3f0ca032a7aae23c82d7a8bd3fbddecb3f7274b2",
+  "queries": [
+    "q01",
+    "q06",
+    "q12",
+    "q18",
+    "q09"
+  ],
+  "blocks": [
+    [
+      "parent",
+      "candidate"
+    ],
+    [
+      "candidate",
+      "parent"
+    ]
+  ],
+  "samples": 3,
+  "warmups": 1,
+  "fresh_worker_per_query": true,
+  "qualification": "Two reversed blocks with QE_LANCE_TIMING=1 and QE_AGG_PROF=1, fresh worker per query, 180s diagnostic ceiling; not normal performance acceptance. Dataset/setup work excluded equally; scan timings include setup scans before readiness."
+}

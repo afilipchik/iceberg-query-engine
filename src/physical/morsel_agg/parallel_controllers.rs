@@ -27,6 +27,10 @@ pub(super) struct ParallelControllers {
     poisoned: bool,
     profile: bool,
     routing_time: Duration,
+    key_preparation_time: Duration,
+    row_dispatch_time: Duration,
+    prepared_batches: usize,
+    unprepared_batches: usize,
     processing_time: Duration,
     serial_batches: usize,
     parallel_batches: usize,
@@ -748,6 +752,10 @@ impl ParallelControllers {
             poisoned: false,
             profile: std::env::var_os("QE_AGG_PROF").is_some(),
             routing_time: Duration::ZERO,
+            key_preparation_time: Duration::ZERO,
+            row_dispatch_time: Duration::ZERO,
+            prepared_batches: 0,
+            unprepared_batches: 0,
             processing_time: Duration::ZERO,
             serial_batches: 0,
             parallel_batches: 0,
@@ -870,6 +878,15 @@ impl ParallelControllers {
             let routing_start = self.profile.then(Instant::now);
             let prepared =
                 super::prepared_keys::PreparedKeys::try_new(&self.layout, batch, group_count)?;
+            if let Some(start) = routing_start {
+                self.key_preparation_time += start.elapsed();
+                if prepared.is_some() {
+                    self.prepared_batches += 1;
+                } else {
+                    self.unprepared_batches += 1;
+                }
+            }
+            let dispatch_start = self.profile.then(Instant::now);
             let routes = match self.route(batch, group_count, prepared.as_ref()) {
                 Err(error) if error.is_memory_limit() => {
                     if !self.release_for_input()? {
@@ -879,6 +896,9 @@ impl ParallelControllers {
                 }
                 result => result?,
             };
+            if let Some(start) = dispatch_start {
+                self.row_dispatch_time += start.elapsed();
+            }
             // Routing has not applied any rows. Until it succeeds, startup
             // admission may still reclaim unused owners using these same arrays.
             // Once workers can apply rows, the ownership map is irreversible.
@@ -1000,6 +1020,16 @@ impl ParallelControllers {
             ));
         }
         if self.profile {
+            // Subintervals of routing_ms; do not add them again to the total.
+            // Dispatch includes admission recovery/retry when needed. These
+            // successful-stream diagnostics are not exclusive CPU samples.
+            eprintln!(
+                "live_aggregate_routing key_preparation_ms={:.3} row_dispatch_ms={:.3} prepared_batches={} unprepared_batches={}",
+                self.key_preparation_time.as_secs_f64() * 1000.0,
+                self.row_dispatch_time.as_secs_f64() * 1000.0,
+                self.prepared_batches,
+                self.unprepared_batches,
+            );
             eprintln!(
                 "live_aggregate_workers workers={} ownership={} routing_ms={:.3} processing_wall_ms={:.3} serial_batches={} parallel_batches={}",
                 self.controllers.as_slice().len(),

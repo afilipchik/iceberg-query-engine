@@ -1,0 +1,21 @@
+{
+  "files": {
+    "bound-utf8-cycle-archive_validation.log": "0e859c89e9b32b08d19118b7edb9780c63e48f8e0d4206dc5cf430d4d83e77bd",
+    "bound-utf8-cycle-comparison.log": "bb67b4042505b1be8b3235a1f79873b5ab05a65eda8466affc2263c5344ea0ae",
+    "bound-utf8-cycle-driver.log": "64220b9972af88d802f5027f6f441288dcf706a2a865bf9d1154a43b909e563a",
+    "bound-utf8-cycle-release_screen.log": "2bb3b2ec5b95b8667cdf5f2c98db76be943a692b755b256aaaa79d43079b25f1",
+    "bound-utf8-cycle-validation.log": "f03787fcfc54d1e01323dcdb13c5af53b9a1507a9700310241df998288455245",
+    "bound-utf8-cycle.json": "0af310a327e4dccfaee48721cf27c5caebfdd4fb6a79898670f6c60be2a92c49",
+    "bound-utf8-post-paired.log": "0db89725100ced0f468570d60d3768bbfa3eed470b001c4263f52b23e1006a0b",
+    "bound-utf8-post-paired_archive.log": "0f11912516913d5d84bf5d75db48c73b87f2ffe91f3336d1dc974aacf011295e",
+    "bound-utf8-post-paired_audit.log": "893b305e31b8bb832012b218830ef5871041249ceff0ce3ed6baaf233ce17cc7",
+    "bound-utf8-post-sf10_archive.log": "59d29ec00e87d4d3e85f61b69f835299aeab6977429d666c4bb53977772b6855",
+    "bound-utf8-post-sf10_audit.log": "7c78cc30d4913bef326f81c176a29d9c052bc807b16f22001cb7daddcff414ea",
+    "bound-utf8-postchecks-driver.log": "8577949c254c7e9c28ed07401a9eba14fe17ae12411c58122db56aa5adb1c449",
+    "bound-utf8-postchecks.json": "8a8bccf64e84b518754b22292ac6edc21f2a26aaf1903633b33b6c14b24132a9",
+    "prepare_bound_utf8_checkpoint.py": "22bd0743011d86140f34f2ac07b2448e692fc10bbecaf00657c9bc361de4203f",
+    "run_bound_utf8_cycle.py": "e6911000e547e33920de9829d96b89479d1db6b23313999b729469f36894f7ba",
+    "run_bound_utf8_postchecks.py": "1e0f9d15970d8de6531e39b2492a1aed0473064544310d7271aa182002282387"
+  },
+  "qualification": "Terminal cycle/postcheck controller provenance; cumulative cgroup peaks, not per-query memory."
+}

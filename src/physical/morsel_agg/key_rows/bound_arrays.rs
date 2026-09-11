@@ -45,6 +45,7 @@ enum Column<'a> {
         value: Fixed<'a>,
         nulls: Option<&'a NullBuffer>,
     },
+    Utf8(&'a StringArray),
     Checked(&'a dyn Array),
 }
 impl<'a> Column<'a> {
@@ -60,6 +61,7 @@ impl<'a> Column<'a> {
             };
         }
         let value = match array.data_type() {
+            DataType::Utf8 => return Ok(Self::Utf8(cast::<StringArray>(array)?)),
             DataType::Null => Fixed::Null,
             DataType::Boolean => bind!(Boolean, BooleanArray),
             DataType::Int8 => bind!(Int8, Int8Array),
@@ -93,6 +95,15 @@ impl<'a> Column<'a> {
     }
     fn size(&self, row: usize) -> Result<usize> {
         match self {
+            Self::Utf8(array) => {
+                if array.is_null(row) {
+                    Ok(1)
+                } else {
+                    // The same validity marker and u64 byte length used by
+                    // the canonical checked encoder, including empty strings.
+                    add(9, array.value(row).len())
+                }
+            }
             Self::Fixed { value, nulls } => Ok(if Self::is_null(value, *nulls, row) {
                 1
             } else {
@@ -110,6 +121,15 @@ impl<'a> Column<'a> {
     }
     fn put(&self, row: usize, put: &mut impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
         match self {
+            Self::Utf8(array) => {
+                if array.is_null(row) {
+                    return put(&[0]);
+                }
+                let value = array.value(row);
+                put(&[1])?;
+                put(&(value.len() as u64).to_le_bytes())?;
+                put(value.as_bytes())
+            }
             Self::Fixed { value, nulls } => {
                 if Self::is_null(value, *nulls, row) {
                     return put(&[0]);
@@ -190,6 +210,103 @@ impl<'a> BoundKeyArrays<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[derive(Debug)]
+    struct CountedArray {
+        inner: ArrayRef,
+        downcasts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    // SAFETY: The wrapper delegates every Arrow representation, extent, null and
+    // slicing operation to the same valid inner array; the counter observes only.
+    unsafe impl Array for CountedArray {
+        fn as_any(&self) -> &dyn std::any::Any {
+            {
+                self.downcasts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.inner.as_any()
+            }
+        }
+        fn to_data(&self) -> arrow::array::ArrayData {
+            self.inner.to_data()
+        }
+        fn into_data(self) -> arrow::array::ArrayData {
+            self.inner.to_data()
+        }
+        fn data_type(&self) -> &DataType {
+            self.inner.data_type()
+        }
+        fn slice(&self, offset: usize, length: usize) -> ArrayRef {
+            Arc::new(Self {
+                inner: self.inner.slice(offset, length),
+                downcasts: self.downcasts.clone(),
+            })
+        }
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+        fn is_empty(&self) -> bool {
+            self.inner.is_empty()
+        }
+        fn offset(&self) -> usize {
+            self.inner.offset()
+        }
+        fn nulls(&self) -> Option<&NullBuffer> {
+            self.inner.nulls()
+        }
+        fn logical_nulls(&self) -> Option<NullBuffer> {
+            self.inner.logical_nulls()
+        }
+        fn is_nullable(&self) -> bool {
+            self.inner.is_nullable()
+        }
+        fn get_buffer_memory_size(&self) -> usize {
+            self.inner.get_buffer_memory_size()
+        }
+        fn get_array_memory_size(&self) -> usize {
+            self.inner.get_array_memory_size() + std::mem::size_of::<Self>()
+        }
+    }
+
+    #[test]
+    fn bound_utf8_representation_checks_are_per_batch_not_per_row() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let pool = MemoryPool::new(1024 * 1024);
+        let count = Arc::new(AtomicUsize::new(0));
+        let cells = [
+            None,
+            Some(""),
+            Some("é\0雪"),
+            Some("repeated"),
+            Some("repeated"),
+        ];
+        let strings = StringArray::from_iter((0..514).map(|i| cells[i % cells.len()]));
+        let arrays: Vec<ArrayRef> = vec![Arc::new(CountedArray {
+            inner: Arc::new(strings.slice(1, 512)),
+            downcasts: count.clone(),
+        })];
+        let layout = KeyLayout::bind(&pool, &[DataType::Utf8]).unwrap().unwrap();
+        let bound = BoundKeyArrays::bind(layout.clone(), &arrays, 512, &pool).unwrap();
+        let mut key = KeyWorkspace::new(layout.clone()).unwrap();
+        for row in 0..512 {
+            let expected = match cells[(row + 1) % cells.len()] {
+                None => vec![0],
+                Some(value) => {
+                    let mut bytes = vec![1];
+                    bytes.extend((value.len() as u64).to_le_bytes());
+                    bytes.extend(value.as_bytes());
+                    bytes
+                }
+            };
+            bound.encode(&mut key, row).unwrap();
+            assert_eq!(key.key().unwrap().bytes(), expected);
+        }
+        let observed = count.load(Ordering::Relaxed);
+        drop((bound, key, layout));
+        assert_eq!(pool.used(), 0);
+        assert!(
+            observed <= 1,
+            "bound UTF8 representation was downcast {observed} times"
+        );
+    }
 
     #[test]
     fn bound_primitive_keys_preserve_independent_bytes_and_sliced_nulls() {

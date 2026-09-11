@@ -1,0 +1,6 @@
+{
+  "binary_sha256": "99e1c0dd890c76d23eff4375ea6b168611f3e679ab68e1f4e05c76a0b0c71dc1",
+  "driver_sha256": "211e2b3af875dd0717ad805418f5f60822dfda70e0a88f2dbe115b5f8b63cfd4",
+  "parent_commit": "bb38784aba074c288bedf17722e32d2f8c8cc500",
+  "qualification": "Aggregate instrumentation, fresh worker per shape, one warmup/two samples, 4/16 threads within the same 16 CPU affinity. Not performance acceptance; query/process budgets unchanged."
+}

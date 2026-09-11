@@ -1,0 +1,86 @@
+{
+  "b1-parent-q12": {
+    "status": "terminal",
+    "started": 1789164659.9462614,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.444419,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789164665.1588259
+  },
+  "b1-candidate-q12": {
+    "status": "terminal",
+    "started": 1789164665.1631873,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.457956,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789164668.6450512
+  },
+  "b2-candidate-q12": {
+    "status": "terminal",
+    "started": 1789164668.6494567,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.43919400000000003,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789164672.1084723
+  },
+  "b2-parent-q12": {
+    "status": "terminal",
+    "started": 1789164672.1130538,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.561222,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789164675.72728
+  }
+}

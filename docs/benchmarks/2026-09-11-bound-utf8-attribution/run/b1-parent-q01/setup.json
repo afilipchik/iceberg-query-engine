@@ -1,0 +1,50 @@
+{
+  "track": "lance",
+  "threads": 16,
+  "memory_limit": "4294967296B",
+  "process_cap_bytes": 12884901888,
+  "temp_directory": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/paired-bound-utf8-attribution-01/b1-parent-q01/temp",
+  "tables": [
+    {
+      "name": "region",
+      "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-02/lance/region.lance",
+      "version": 1
+    },
+    {
+      "name": "nation",
+      "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-02/lance/nation.lance",
+      "version": 1
+    },
+    {
+      "name": "supplier",
+      "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-02/lance/supplier.lance",
+      "version": 1
+    },
+    {
+      "name": "customer",
+      "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-02/lance/customer.lance",
+      "version": 1
+    },
+    {
+      "name": "part",
+      "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-02/lance/part.lance",
+      "version": 1
+    },
+    {
+      "name": "partsupp",
+      "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-02/lance/partsupp.lance",
+      "version": 1
+    },
+    {
+      "name": "orders",
+      "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-02/lance/orders.lance",
+      "version": 1
+    },
+    {
+      "name": "lineitem",
+      "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-02/lance/lineitem.lance",
+      "version": 1
+    }
+  ],
+  "reference_lance_io_limit": 16
+}
