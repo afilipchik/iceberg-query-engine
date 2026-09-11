@@ -31,8 +31,13 @@ recorded ceiling on some requests. Ratios0.9586/1.3515 leave variability unresol
 the SF10timeout remains a failure. Archives65profile/46phase/27validation/1276SF10/
 173paired/47native verify. See [current cycle](docs/bound-utf8-aggregate-keys-2026-09-11.md)
 and [aggregate attribution](docs/shared-aggregate-profile-2026-09-11.md).
-Intermediary commit/push is next, then prepared decoded IPC/GPU residency on the
-same binary. No DuckDB leadership or full resource/concurrency acceptance is certified.
+Intermediary8c89899 is pushed and remote-verified. Residency55937 terminal0 on59619bde validates348outputs/278pairs: allfive cases
+complete. Canonical decoded geomean0.753197/suite1.175861, GPUcontrol0.771589/1.194102,
+mixed0.795073/1.254514,14wins each. Canonical records no successfuldevice execution;
+custom required float smoke has40/40measured device proofs. These32/48GiB capacity
+results do not clear16GiB preload. Scopepeak20.442GB under64GiB,zeroOOM/max;
+1317-file archive verifies800inputs. Evidence checkpoint commit/push next, then
+same-binary state-detail profiling. See [residency](docs/bound-utf8-residency-2026-09-11.md). No DuckDB leadership or full resource/concurrency acceptance is certified.
 
 Pushed parent `bb38784` freezes Lance refinement candidate8c4936d8. The pinned
 Lance10 vendor patch runs refinement in owned tasks within its decode window;

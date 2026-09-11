@@ -1,0 +1,10 @@
+{
+  "LD_LIBRARY_PATH": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.venv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib:/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.venv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib",
+  "libraries": {
+    "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.venv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib/libnvrtc-builtins.alt.so.12.8": "9e971f2dcced2628f327ddb037d02c41b834f2c3dbfbff03c9d2c3177f1b9b6d",
+    "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.venv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib/libnvrtc-builtins.so.12.8": "eccaa824230ee7858a94a3055cb01f1cb634df05d313880d0bdcf195161fcb4e",
+    "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.venv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib/libnvrtc.alt.so.12": "d8260dbfdba5820d0e710dd00f4370285d5ebe18c7d98ba2a6737deedf48d3eb",
+    "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.venv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib/libnvrtc.so.12": "43731e24cd89e3749826304f304e8aa11fbecf1188715271b1f5018d6212b5e6"
+  },
+  "reason": "use the existing verified NVRTC runtime through a process-local loader path"
+}

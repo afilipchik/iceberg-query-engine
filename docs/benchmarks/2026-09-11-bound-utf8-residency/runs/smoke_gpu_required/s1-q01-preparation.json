@@ -1,0 +1,32 @@
+{
+  "id": "s1-q01-prepare",
+  "preparation": {
+    "codes_bytes": 600000,
+    "codes_key": "e6425121282f06e:[\"l_returnflag\", \"l_linestatus\"]",
+    "column_bytes": 24000000,
+    "columns": [
+      "l_shipdate",
+      "l_quantity",
+      "l_extendedprice",
+      "l_discount",
+      "l_tax"
+    ],
+    "groups": 6,
+    "preparation_ms": 40.94688300000001,
+    "rows": 600000,
+    "session_id": 1
+  },
+  "preparation_ms": 40.987975000000006,
+  "status": "prepared",
+  "gpu_execution": {
+    "successful_device_runs": 0,
+    "trace_successful_device_runs": 0,
+    "upload_requests": 0,
+    "evidence_source": "legacy_trace",
+    "residency": "unobserved",
+    "trace_start": 145,
+    "trace_end": 596
+  },
+  "sql_sha256": "581ebbc51ce68ed6e2dbc6fa07d3a7ddaf91a1af7bedc0a8dfa3402740cf6188",
+  "worker_id": "s1-q01-fresh-engine"
+}

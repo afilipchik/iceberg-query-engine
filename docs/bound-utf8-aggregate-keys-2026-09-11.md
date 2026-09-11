@@ -111,3 +111,11 @@ Verified archives (counts exclude top-level manifests): shared profile65,
 routing phases46,validation27,SF101276,paired173,nativeQ1247. The checkpoint also
 includes terminal controller logs. This is an intermediary candidate with known
 resource/performance failures; further native stability and residency gates remain.
+
+Intermediary commit8c8989965d242b0a9728993b16f177392bab5ad3 is pushed and its remote
+branch hash verified. The1664-file allowlist includes all listed evidence and the
+16-file terminal-controller archive (plus its manifest); source formatting passes, seven archived raw
+log whitespace warnings are preserved. No unrelated untracked files were staged.
+Residency follow-up55937 completed on the same59619bde binary:348typed outputs,
+278valid pairs, with custom40required-device measurements separate from canonical
+zero recorded device executions; see bound-utf8-residency-2026-09-11.md.

@@ -1,0 +1,54 @@
+{
+  "pushed_checkpoint": "8c8989965d242b0a9728993b16f177392bab5ad3",
+  "stages": {
+    "screen": {
+      "status": "terminal",
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/run_bound_utf8_residency.py"
+      ],
+      "started": 1789164918.4549124,
+      "before": {
+        "memory.max": "68719476736\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "8028160\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      },
+      "driver_sha256": "8f59d49108fe134a5e01658f4029e41bc7cae28b6e2cb026720449456e3db63d",
+      "exit_code": 0,
+      "finished": 1789165920.4518743,
+      "after": {
+        "memory.max": "68719476736\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "20442001408\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      }
+    },
+    "audit": {
+      "status": "terminal",
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/summarize_bound_utf8_residency.py"
+      ],
+      "started": 1789165920.452116,
+      "before": {
+        "memory.max": "68719476736\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "20442001408\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      },
+      "driver_sha256": "29ed3aa10cdfa1e3afba603466e609f6d8c275e8d0962f48b3ffc2493d165854",
+      "exit_code": 0,
+      "finished": 1789165939.2774708,
+      "after": {
+        "memory.max": "68719476736\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "20442001408\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      }
+    }
+  },
+  "qualification": "Sequential64GiB scope. Canonical32/48GiB capacity experiment does not clear16GiB preload; custom required GPU smoke is not SF10.",
+  "status": "terminal",
+  "exit_code": 0
+}
