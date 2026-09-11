@@ -4,7 +4,7 @@
 //! row groups that cannot contain matching rows.
 
 use crate::planner::{BinaryOp, Expr, ScalarValue, UnaryOp};
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, SchemaRef};
 use parquet::file::metadata::RowGroupMetaData;
 use parquet::file::statistics::Statistics as ParquetStatistics;
 
@@ -162,10 +162,13 @@ fn definite_comparison(
         Some(idx) => idx,
         None => return false,
     };
-    if col_idx >= row_group.num_columns() {
+    if schema.fields().len() != row_group.num_columns() || col_idx >= row_group.num_columns() {
         return false;
     }
     let col_meta = row_group.column(col_idx);
+    if col_meta.column_path().parts() != [col_name] {
+        return false;
+    }
     let stats = match col_meta.statistics() {
         Some(s) => s,
         None => return false,
@@ -175,27 +178,26 @@ fn definite_comparison(
         return false;
     }
     let effective_op = if flipped { flip_op(op) } else { *op };
-    let (min, max): (f64, f64) = match stats {
+    // Statistics are physical values; only use a proof when their logical type
+    // matches the literal. Decimal integers, timestamps and unsigned integers
+    // must not be interpreted as ordinary signed whole numbers.
+    if !stats_type_matches(schema.field(col_idx).data_type(), literal) {
+        return false;
+    }
+    let (min, max): (i128, i128) = match stats {
         ParquetStatistics::Int64(s) => match (s.min_opt(), s.max_opt()) {
-            (Some(a), Some(b)) => (*a as f64, *b as f64),
+            (Some(a), Some(b)) => (i128::from(*a), i128::from(*b)),
             _ => return false,
         },
         ParquetStatistics::Int32(s) => match (s.min_opt(), s.max_opt()) {
-            (Some(a), Some(b)) => (*a as f64, *b as f64),
-            _ => return false,
-        },
-        ParquetStatistics::Double(s) => match (s.min_opt(), s.max_opt()) {
-            (Some(a), Some(b)) => (*a, *b),
+            (Some(a), Some(b)) => (i128::from(*a), i128::from(*b)),
             _ => return false,
         },
         _ => return false,
     };
-    let val: f64 = match literal {
-        ScalarValue::Int64(v) => *v as f64,
-        ScalarValue::Int32(v) => *v as f64,
-        ScalarValue::Date32(v) => *v as f64,
-        ScalarValue::Float64(v) => v.into_inner(),
-        ScalarValue::Timestamp(v) => *v as f64,
+    let val = match literal {
+        ScalarValue::Int64(v) => i128::from(*v),
+        ScalarValue::Int32(v) | ScalarValue::Date32(v) => i128::from(*v),
         _ => return false,
     };
     match effective_op {
@@ -207,6 +209,19 @@ fn definite_comparison(
         BinaryOp::NotEq => val < min || val > max,
         _ => false,
     }
+}
+
+// Unsupported logical encodings retain the row group. This is deliberately
+// shared by may-match and all-match proofs (the latter is used underneath NOT).
+fn stats_type_matches(data_type: &DataType, literal: &ScalarValue) -> bool {
+    matches!(
+        (data_type, literal),
+        (
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64,
+            ScalarValue::Int32(_) | ScalarValue::Int64(_)
+        ) | (DataType::Date32, ScalarValue::Date32(_))
+            | (DataType::Utf8, ScalarValue::Utf8(_))
+    )
 }
 
 /// Check a comparison predicate (col op literal) against row group statistics
@@ -230,8 +245,14 @@ fn check_comparison(
         None => return true, // Column not found, conservative
     };
 
+    if !stats_type_matches(schema.field(col_idx).data_type(), literal) {
+        return true;
+    }
     // Get statistics for this column in the row group
-    if col_idx >= row_group.num_columns() {
+    if schema.fields().len() != row_group.num_columns() || col_idx >= row_group.num_columns() {
+        return true;
+    }
+    if row_group.column(col_idx).column_path().parts() != [col_name] {
         return true;
     }
     let stats = match row_group.column(col_idx).statistics() {
@@ -249,7 +270,7 @@ fn check_comparison(
         ScalarValue::Float32(val) => check_f64_stats(stats, effective_op, val.into_inner() as f64),
         ScalarValue::Date32(val) => check_i32_stats(stats, effective_op, *val),
         ScalarValue::Utf8(val) => check_utf8_stats(stats, effective_op, val.as_str()),
-        ScalarValue::Timestamp(val) => check_i64_stats(stats, effective_op, *val),
+        ScalarValue::Timestamp(val) => check_i64_stats(stats, effective_op, val.ticks),
         _ => true, // Unsupported type, conservative
     }
 }
@@ -308,9 +329,12 @@ fn check_i32_stats(stats: &ParquetStatistics, op: BinaryOp, val: i32) -> bool {
             if s.min_opt().is_none() || s.max_opt().is_none() {
                 return true;
             }
-            let min = *s.min_opt().unwrap() as i32;
-            let max = *s.max_opt().unwrap() as i32;
-            eval_range_i32(op, val, min, max)
+            eval_range(
+                op,
+                i64::from(val),
+                *s.min_opt().unwrap(),
+                *s.max_opt().unwrap(),
+            )
         }
         _ => true,
     }

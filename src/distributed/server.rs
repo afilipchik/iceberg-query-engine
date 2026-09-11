@@ -1669,7 +1669,7 @@ async fn sql(
                             .query_log
                             .fail(id, elapsed_ms, e.kind(), &format!("encoding: {e}"));
                     }
-                    let status = if matches!(e, QueryError::NotImplemented(_)) {
+                    let status = if matches!(e.root(), QueryError::NotImplemented(_)) {
                         StatusCode::NOT_IMPLEMENTED
                     } else {
                         StatusCode::BAD_REQUEST
@@ -1737,7 +1737,7 @@ async fn sql(
             error_response(StatusCode::SERVICE_UNAVAILABLE, &reason)
         }
         Err(ExecError::Query(e)) => {
-            let status = if matches!(e, QueryError::NotImplemented(_)) {
+            let status = if matches!(e.root(), QueryError::NotImplemented(_)) {
                 StatusCode::NOT_IMPLEMENTED
             } else {
                 StatusCode::BAD_REQUEST

@@ -138,11 +138,13 @@ impl JoinReorder {
             Expr::Cast {
                 expr: inner,
                 data_type,
+                mode,
             } => {
                 let new_inner = self.reorder_expr(inner)?;
                 Ok(Expr::Cast {
                     expr: Box::new(new_inner),
                     data_type: data_type.clone(),
+                    mode: *mode,
                 })
             }
             Expr::Case {

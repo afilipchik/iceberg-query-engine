@@ -1,0 +1,8 @@
+{
+  "writer": "DuckDB1.4.4",
+  "sql": "SELECT i::BIGINT AS id, CASE WHEN i % 5 = 0 THEN NULL ELSE ('group-' || (i % 3)::VARCHAR) END AS text FROM range(37) t(i)",
+  "compression": "ZSTD",
+  "rows": 37,
+  "sha256": "65f7f74bed685130dd26b712cf80f865b90920fbd35b5104087c4b52320f37f7",
+  "purpose": "Final 256-value packed blocks with fewer logical dictionary IDs and definition levels; independent expected values come from the row-index formula."
+}

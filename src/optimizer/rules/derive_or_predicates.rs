@@ -12,7 +12,7 @@
 
 use crate::error::Result;
 use crate::optimizer::OptimizerRule;
-use crate::planner::{BinaryOp, Expr, FilterNode, LogicalPlan};
+use crate::planner::{BinaryOp, Column, Expr, FilterNode, LogicalPlan};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -58,14 +58,12 @@ fn augment_predicate(predicate: &Expr) -> Option<Expr> {
     let mut conjuncts = Vec::new();
     flatten_and(predicate, &mut conjuncts);
 
-    let existing: Vec<String> = conjuncts.iter().map(|e| e.to_string()).collect();
     let mut derived: Vec<Expr> = Vec::new();
 
     for c in &conjuncts {
         if is_or(c) {
             for d in derive_from_or(c) {
-                let repr = d.to_string();
-                if !existing.contains(&repr) && !derived.iter().any(|e| e.to_string() == repr) {
+                if !conjuncts.iter().any(|existing| *existing == &d) && !derived.contains(&d) {
                     derived.push(d);
                 }
             }
@@ -134,10 +132,12 @@ fn derive_from_or(or_expr: &Expr) -> Vec<Expr> {
         return vec![];
     }
 
-    // Per disjunct: column display name -> (representative column expr, literal values)
-    let mut per_disjunct: Vec<HashMap<String, (Expr, Vec<Expr>)>> = Vec::new();
-    for d in &disjuncts {
-        let mut cols: HashMap<String, (Expr, Vec<Expr>)> = HashMap::new();
+    // Semantic column identity determines implication. Preserve first occurrence
+    // order explicitly; HashMap iteration is not a stable rewrite order.
+    let mut per_disjunct: Vec<HashMap<Column, (Expr, Vec<Expr>)>> = Vec::new();
+    let mut first_order = Vec::new();
+    for (index, d) in disjuncts.iter().enumerate() {
+        let mut cols: HashMap<Column, (Expr, Vec<Expr>)> = HashMap::new();
         let mut parts = Vec::new();
         flatten_and(d, &mut parts);
         for p in parts {
@@ -147,13 +147,19 @@ fn derive_from_or(or_expr: &Expr) -> Vec<Expr> {
                     op: BinaryOp::Eq,
                     right,
                 } => {
-                    if let (Expr::Column(_), Expr::Literal(_)) = (&**left, &**right) {
-                        cols.entry(left.to_string())
+                    if let (Expr::Column(column), Expr::Literal(_)) = (&**left, &**right) {
+                        if index == 0 && !cols.contains_key(column) {
+                            first_order.push(column.clone());
+                        }
+                        cols.entry(column.clone())
                             .or_insert_with(|| ((**left).clone(), Vec::new()))
                             .1
                             .push((**right).clone());
-                    } else if let (Expr::Literal(_), Expr::Column(_)) = (&**left, &**right) {
-                        cols.entry(right.to_string())
+                    } else if let (Expr::Literal(_), Expr::Column(column)) = (&**left, &**right) {
+                        if index == 0 && !cols.contains_key(column) {
+                            first_order.push(column.clone());
+                        }
+                        cols.entry(column.clone())
                             .or_insert_with(|| ((**right).clone(), Vec::new()))
                             .1
                             .push((**left).clone());
@@ -164,10 +170,14 @@ fn derive_from_or(or_expr: &Expr) -> Vec<Expr> {
                     list,
                     negated: false,
                 } => {
-                    if matches!(&**expr, Expr::Column(_))
-                        && list.iter().all(|v| matches!(v, Expr::Literal(_)))
-                    {
-                        cols.entry(expr.to_string())
+                    if let Expr::Column(column) = &**expr {
+                        if !list.iter().all(|v| matches!(v, Expr::Literal(_))) {
+                            continue;
+                        }
+                        if index == 0 && !cols.contains_key(column) {
+                            first_order.push(column.clone());
+                        }
+                        cols.entry(column.clone())
                             .or_insert_with(|| ((**expr).clone(), Vec::new()))
                             .1
                             .extend(list.iter().cloned());
@@ -182,13 +192,14 @@ fn derive_from_or(or_expr: &Expr) -> Vec<Expr> {
     // Columns constrained in every disjunct → union of values
     let first = &per_disjunct[0];
     let mut derived = Vec::new();
-    for (name, (col_expr, _)) in first {
-        if !per_disjunct.iter().all(|m| m.contains_key(name)) {
+    for name in first_order {
+        let (col_expr, _) = &first[&name];
+        if !per_disjunct.iter().all(|m| m.contains_key(&name)) {
             continue;
         }
         let mut values: Vec<Expr> = Vec::new();
         for m in &per_disjunct {
-            for v in &m[name].1 {
+            for v in &m[&name].1 {
                 if !values.contains(v) {
                     values.push(v.clone());
                 }
@@ -204,4 +215,208 @@ fn derive_from_or(or_expr: &Expr) -> Vec<Expr> {
         });
     }
     derived
+}
+
+// Uses the private rule helper and an independent three-valued evaluator.
+#[cfg(test)]
+mod structural_or_identity_contract {
+    use super::*;
+    use crate::planner::{Column, ScalarValue};
+    fn eq(column: &Column, value: i64) -> Expr {
+        Expr::BinaryExpr {
+            left: Box::new(Expr::Column(column.clone())),
+            op: BinaryOp::Eq,
+            right: Box::new(Expr::Literal(ScalarValue::Int64(value))),
+        }
+    }
+    fn or(left: Expr, right: Expr) -> Expr {
+        Expr::BinaryExpr {
+            left: Box::new(left),
+            op: BinaryOp::Or,
+            right: Box::new(right),
+        }
+    }
+    fn scalar(expr: &Expr, row: &[(Column, Option<i64>)]) -> Option<i64> {
+        match expr {
+            Expr::Column(c) => row.iter().find(|(key, _)| key == c).unwrap().1,
+            Expr::Literal(ScalarValue::Int64(v)) => Some(*v),
+            Expr::Literal(ScalarValue::Null) => None,
+            _ => panic!("fixture contains an unexpected scalar"),
+        }
+    }
+    fn and(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+        match (a, b) {
+            (Some(false), _) | (_, Some(false)) => Some(false),
+            (Some(true), Some(true)) => Some(true),
+            _ => None,
+        }
+    }
+    fn union(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+        match (a, b) {
+            (Some(true), _) | (_, Some(true)) => Some(true),
+            (Some(false), Some(false)) => Some(false),
+            _ => None,
+        }
+    }
+    fn evaluate(expr: &Expr, row: &[(Column, Option<i64>)]) -> Option<bool> {
+        match expr {
+            Expr::BinaryExpr {
+                left,
+                op: BinaryOp::Eq,
+                right,
+            } => scalar(left, row)
+                .zip(scalar(right, row))
+                .map(|(a, b)| a == b),
+            Expr::BinaryExpr {
+                left,
+                op: BinaryOp::And,
+                right,
+            } => and(evaluate(left, row), evaluate(right, row)),
+            Expr::BinaryExpr {
+                left,
+                op: BinaryOp::Or,
+                right,
+            } => union(evaluate(left, row), evaluate(right, row)),
+            Expr::InList {
+                expr,
+                list,
+                negated: false,
+            } => {
+                let v = scalar(expr, row);
+                list.iter().fold(Some(false), |state, item| {
+                    union(state, v.zip(scalar(item, row)).map(|(a, b)| a == b))
+                })
+            }
+            _ => panic!("fixture contains an unexpected Boolean expression"),
+        }
+    }
+    #[test]
+    fn distinct_columns_with_equal_display_do_not_create_false_implication() {
+        let a = Column::new_qualified("a", "b.c");
+        let b = Column::new_qualified("a.b", "c");
+        assert_ne!(a, b);
+        assert_eq!(a.to_string(), b.to_string());
+        let original = or(eq(&a, 1), eq(&b, 2));
+        let augmented = augment_predicate(&original).unwrap_or_else(|| original.clone());
+        for av in [None, Some(1), Some(2), Some(3)] {
+            for bv in [None, Some(1), Some(2), Some(3)] {
+                let row = [(a.clone(), av), (b.clone(), bv)];
+                assert_eq!(
+                    evaluate(&original, &row) == Some(true),
+                    evaluate(&augmented, &row) == Some(true),
+                    "row={row:?}"
+                );
+            }
+        }
+        assert!(augment_predicate(&original).is_none());
+    }
+    #[test]
+    fn one_structural_column_in_every_branch_still_derives() {
+        let a = Column::new_qualified("a", "b.c");
+        let original = or(eq(&a, 1), eq(&a, 2));
+        let augmented = augment_predicate(&original).expect("positive control must derive");
+        for value in [None, Some(1), Some(2), Some(3)] {
+            let row = [(a.clone(), value)];
+            assert_eq!(evaluate(&original, &row), evaluate(&augmented, &row));
+        }
+    }
+
+    fn constraint(column: &Column, value: i64, shape: usize) -> Expr {
+        match shape {
+            0 => eq(column, value),
+            1 => Expr::BinaryExpr {
+                left: Box::new(Expr::Literal(ScalarValue::Int64(value))),
+                op: BinaryOp::Eq,
+                right: Box::new(Expr::Column(column.clone())),
+            },
+            _ => Expr::InList {
+                expr: Box::new(Expr::Column(column.clone())),
+                list: vec![
+                    Expr::Literal(ScalarValue::Int64(value)),
+                    Expr::Literal(ScalarValue::Null),
+                    Expr::Literal(ScalarValue::Int64(value)),
+                ],
+                negated: false,
+            },
+        }
+    }
+    fn conjunction(left: Expr, right: Expr) -> Expr {
+        Expr::BinaryExpr {
+            left: Box::new(left),
+            op: BinaryOp::And,
+            right: Box::new(right),
+        }
+    }
+    #[test]
+    fn implication_preserves_filter_truth_across_constraint_shapes_and_nulls() {
+        let a = Column::new_qualified("a", "b.c");
+        let b = Column::new_qualified("a.b", "c");
+        for left_shape in 0..3 {
+            for right_shape in 0..3 {
+                let left = constraint(&a, 1, left_shape);
+                let right = constraint(&b, 2, right_shape);
+                for original in [
+                    or(left.clone(), right.clone()),
+                    or(right.clone(), left.clone()),
+                    or(conjunction(left, eq(&b, 3)), conjunction(right, eq(&a, 3))),
+                ] {
+                    let augmented =
+                        augment_predicate(&original).unwrap_or_else(|| original.clone());
+                    for av in [None, Some(1), Some(2), Some(3)] {
+                        for bv in [None, Some(1), Some(2), Some(3)] {
+                            let row = [(a.clone(), av), (b.clone(), bv)];
+                            assert_eq!(
+                                evaluate(&original, &row) == Some(true),
+                                evaluate(&augmented, &row) == Some(true),
+                                "original={original:?}; row={row:?}"
+                            );
+                        }
+                    }
+                    assert!(
+                        augment_predicate(&augmented).is_none(),
+                        "second augmentation must be idempotent"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn displayed_existing_conjunct_does_not_hide_another_columns_derivation() {
+        let a = Column::new_qualified("a", "b.c");
+        let b = Column::new_qualified("a.b", "c");
+        let existing = Expr::InList {
+            expr: Box::new(Expr::Column(a)),
+            list: vec![
+                Expr::Literal(ScalarValue::Int64(1)),
+                Expr::Literal(ScalarValue::Int64(2)),
+            ],
+            negated: false,
+        };
+        let original = conjunction(existing, or(eq(&b, 1), eq(&b, 2)));
+        let augmented = augment_predicate(&original).expect("different column must still derive");
+        assert!(augment_predicate(&augmented).is_none());
+    }
+    #[test]
+    fn first_occurrence_order_is_stable_across_repeated_rewrites() {
+        let a = Column::new_qualified("z", "second_lexically");
+        let b = Column::new_qualified("a", "first_lexically");
+        let original = or(
+            conjunction(eq(&a, 1), eq(&b, 2)),
+            conjunction(eq(&b, 3), eq(&a, 2)),
+        );
+        for _ in 0..64 {
+            let derived = derive_from_or(&original);
+            let columns: Vec<_> = derived
+                .iter()
+                .map(|e| match e {
+                    Expr::InList { expr, .. } => &**expr,
+                    _ => panic!("expected derived IN"),
+                })
+                .collect();
+            assert_eq!(
+                columns,
+                vec![&Expr::Column(a.clone()), &Expr::Column(b.clone())]
+            );
+        }
+    }
 }

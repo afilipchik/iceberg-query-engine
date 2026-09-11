@@ -56,6 +56,10 @@ num-traits = "0.2"
 itertools = "0.15"
 rand = "0.8"  # HELD BACK: rand 0.9+ changed sampling algorithms; the TPC-H generator must stay byte-deterministic (data<->CSV/fixture coupling)
 bytes = "1"
+# Already pinned transitively by Parquet; slice decoding avoids an unadmitted Vec.
+snap = "=1.1.1"
+# Pinned existing Parquet dependency; static caller-owned decompression workspace.
+zstd-sys = { version = "=2.0.13", default-features = false, features = ["experimental"] }
 regex = "1"
 base64 = "0.23"
 data-encoding = "2"

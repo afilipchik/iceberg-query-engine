@@ -5,13 +5,50 @@
 //! - Each thread maintains its own hash table
 //! - Final merge combines all thread-local hash tables
 
+mod admitted_output;
+mod fixed_cell;
+#[cfg(test)]
+mod float_extrema_tests;
+mod group_rows;
+mod ingestion_controller;
+#[cfg(test)]
+mod ingestion_cursor_tests;
+mod input_frontier;
+mod key_rows;
+pub(crate) mod live_spill;
+#[cfg(test)]
+mod migration_admission_tests;
+mod output_quantum;
+mod parallel_controllers;
+mod parallel_merge;
+mod partial_merge;
+mod partition_scheduler;
+#[cfg(test)]
+mod prepared_input_tests;
+mod prepared_keys;
+mod raw_state;
+mod repartition;
+mod row_router;
+mod row_selection;
+mod run_merge;
+mod scalar_state_codec;
+mod selected_state;
+mod spill_files;
+mod spill_frames;
+mod spill_io;
+mod state_codec;
+mod state_rows;
+use crate::execution::reserved_vec::ReservedVec;
+use raw_state::{RawRows, RawStateMap};
+
 use crate::error::{QueryError, Result};
+use crate::execution::{process_memory_pool, MemoryPool, ReservedBufferBuilder};
 use crate::physical::morsel::{ParallelParquetSource, DEFAULT_MORSEL_SIZE};
 use crate::physical::operators::evaluate_expr;
-use crate::planner::{AggregateFunction, Expr, ScalarValue};
+use crate::planner::{AggregateFunction, DecimalValue, Expr, ScalarValue};
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Decimal128Builder, Float64Array,
-    Float64Builder, Int32Builder, Int64Array, Int64Builder, StringArray, StringBuilder,
+    Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Float64Array, Float64Builder,
+    Int32Builder, Int64Array, Int64Builder, StringArray, StringBuilder,
 };
 use arrow::compute;
 use arrow::datatypes::{DataType, SchemaRef};
@@ -54,14 +91,45 @@ pub(crate) fn merge_entries_into_map(
 /// QE_AGG_PROF=1 section timers (ns), printed by the fused-agg driver.
 pub static AGG_PROF_GROUP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static AGG_PROF_AGGEVAL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static AGG_PROF_PROCESS_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static AGG_PROF_SCAN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Opt-in worker-time accounting. These process-global counters are suitable
+/// for serialized diagnostic queries, not concurrent per-query attribution.
+pub(crate) struct AggProfileTimer {
+    started: std::time::Instant,
+    counter: &'static std::sync::atomic::AtomicU64,
+}
+
+impl AggProfileTimer {
+    pub(crate) fn start(
+        enabled: bool,
+        counter: &'static std::sync::atomic::AtomicU64,
+    ) -> Option<Self> {
+        enabled.then(|| Self {
+            started: std::time::Instant::now(),
+            counter,
+        })
+    }
+}
+
+impl Drop for AggProfileTimer {
+    fn drop(&mut self) {
+        self.counter.fetch_add(
+            self.started.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
 
 pub(crate) fn merge_states_to_batches(
     states: Vec<AggregationState>,
     agg_funcs: &[AggregateFunction],
     input_types: &[DataType],
     schema: &SchemaRef,
+    pool: &MemoryPool,
 ) -> Result<Vec<RecordBatch>> {
-    merge_states_to_batches_filtered(states, agg_funcs, input_types, schema, None)
+    merge_states_to_batches_filtered(states, agg_funcs, input_types, schema, None, pool)
 }
 
 /// Like `merge_states_to_batches`, but applies a HAVING-style predicate to
@@ -75,6 +143,7 @@ pub(crate) fn merge_states_to_batches_filtered(
     input_types: &[DataType],
     schema: &SchemaRef,
     post_filter: Option<&Expr>,
+    pool: &MemoryPool,
 ) -> Result<Vec<RecordBatch>> {
     const PARALLEL_MERGE_MIN_GROUPS: usize = 65_536;
     let total_groups: usize = states.iter().map(|s| s.group_count()).sum();
@@ -100,8 +169,8 @@ pub(crate) fn merge_states_to_batches_filtered(
     // that took the bare-sum ingest fast path.
     if states.len() == 1 {
         let mut state = states.into_iter().next().unwrap();
-        state.demote_raw_sums();
-        return Ok(build_filtered_output(&state, schema, post_filter)?
+        state.demote_raw_sums()?;
+        return Ok(build_filtered_output(&state, schema, post_filter, pool)?
             .into_iter()
             .collect());
     }
@@ -128,7 +197,7 @@ pub(crate) fn merge_states_to_batches_filtered(
         for mut st in states {
             st.raw_type = Some(dt.clone());
             st.drain_perfect_to_hashmap();
-            st.normalize_raw();
+            st.normalize_raw()?;
             if !st.groups.is_empty() {
                 all_raw = false;
             }
@@ -154,6 +223,7 @@ pub(crate) fn merge_states_to_batches_filtered(
                     &dt,
                     schema,
                     post_filter,
+                    pool,
                 );
             }
             return merge_raw_states_to_batches(
@@ -163,21 +233,23 @@ pub(crate) fn merge_states_to_batches_filtered(
                 &dt,
                 schema,
                 post_filter,
+                pool,
             );
         }
         // Fall through: into_shards handles mixed raw/GroupKey states.
-        return merge_states_groupkey(prepared, agg_funcs, input_types, schema, post_filter);
+        return merge_states_groupkey(prepared, agg_funcs, input_types, schema, post_filter, pool);
     }
 
     if states.len() > 1 && total_groups > PARALLEL_MERGE_MIN_GROUPS {
-        return merge_states_groupkey(states, agg_funcs, input_types, schema, post_filter);
+        return merge_states_groupkey(states, agg_funcs, input_types, schema, post_filter, pool);
     }
 
-    let mut final_state = AggregationState::new(agg_funcs.to_vec(), input_types.to_vec());
+    let mut final_state =
+        AggregationState::new_with_pool(agg_funcs.to_vec(), input_types.to_vec(), pool);
     for state in states {
-        final_state.merge(&state);
+        final_state.merge(&state)?;
     }
-    let batches = vec![final_state.build_output(schema)?];
+    let batches = vec![final_state.build_output_with_pool(schema, pool)?];
     match post_filter {
         Some(pred) => crate::physical::operators::filter_batches(batches, pred),
         None => Ok(batches),
@@ -196,6 +268,7 @@ pub(crate) fn finalize_disjoint_states(
     input_types: &[DataType],
     schema: &SchemaRef,
     post_filter: Option<&Expr>,
+    pool: &MemoryPool,
 ) -> Result<Vec<RecordBatch>> {
     use rayon::prelude::*;
     // Each state runs the SAME single-state pipeline the shared merge uses —
@@ -215,6 +288,7 @@ pub(crate) fn finalize_disjoint_states(
                 input_types,
                 schema,
                 post_filter,
+                pool,
             )
         })
         .collect();
@@ -231,8 +305,9 @@ fn build_filtered_output(
     state: &AggregationState,
     schema: &SchemaRef,
     post_filter: Option<&Expr>,
+    pool: &MemoryPool,
 ) -> Result<Option<RecordBatch>> {
-    let batch = state.build_output(schema)?;
+    let batch = state.build_output_with_pool(schema, pool)?;
     match post_filter {
         Some(pred) => {
             let mut filtered = crate::physical::operators::filter_batches(vec![batch], pred)?;
@@ -265,12 +340,13 @@ fn merge_states_groupkey(
     input_types: &[DataType],
     schema: &SchemaRef,
     post_filter: Option<&Expr>,
+    pool: &MemoryPool,
 ) -> Result<Vec<RecordBatch>> {
     let p = merge_shard_count(states.iter().map(|s| s.approx_group_count()).sum());
     let per_state_shards: Vec<_> = states
         .into_par_iter()
         .map(|s| s.into_shards(p))
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
 
     let mut shard_major: Vec<Vec<_>> = (0..p).map(|_| Vec::new()).collect();
     for state_shards in per_state_shards {
@@ -288,7 +364,7 @@ fn merge_states_groupkey(
             }
             let state =
                 AggregationState::from_groups(agg_funcs.to_vec(), input_types.to_vec(), map);
-            build_filtered_output(&state, schema, post_filter)
+            build_filtered_output(&state, schema, post_filter, pool)
         })
         .collect::<Result<Vec<Option<RecordBatch>>>>()?
         .into_iter()
@@ -305,6 +381,7 @@ fn merge_raw_states_to_batches(
     raw_type: &DataType,
     schema: &SchemaRef,
     post_filter: Option<&Expr>,
+    pool: &MemoryPool,
 ) -> Result<Vec<RecordBatch>> {
     let timing = std::env::var("AGG_TIMING").is_ok();
     let t0 = std::time::Instant::now();
@@ -317,7 +394,7 @@ fn merge_raw_states_to_batches(
     let mut total = 0usize;
     let mut prepared: Vec<AggregationState> = Vec::with_capacity(states.len());
     for mut st in states {
-        st.demote_raw_sums();
+        st.demote_raw_sums()?;
         if let Some(n) = st.raw_null.take() {
             match &mut raw_null {
                 Some(existing) => {
@@ -344,21 +421,25 @@ fn merge_raw_states_to_batches(
     // entries and merge each shard with a direct-address table — the
     // hash-shard merge re-inserts every group into a fresh HashMap even
     // though almost no keys span threads.
-    let range = (gmax as i128 - gmin as i128 + 1).max(1) as u64;
-    let dense =
-        total > 0 && range <= 512_000_000 && (range as u128) <= 6 * total as u128 && gmax > gmin;
+    let candidate_range = crate::physical::dense_domain::bounded_i64_width(gmin, gmax, 512_000_000);
+    let dense = total > 0
+        && gmax > gmin
+        && candidate_range.is_some_and(|range| (range as u128) <= 6 * total as u128);
+    // The value is used for range routing only when dense is true. Invalid or
+    // oversized domains must take the hash route, never narrow modulo 2^64.
+    let range = candidate_range.unwrap_or(1) as u64;
 
-    let sharded_states: Vec<Vec<Vec<(u64, Vec<AccumulatorState>)>>> = if dense {
+    let sharded_states: Vec<Vec<RawRows>> = if dense {
         let w = range.div_ceil(p as u64).max(1);
         prepared
             .into_iter()
             .map(|st| st.into_range_shards(p, gmin, w))
-            .collect()
+            .collect::<Result<_>>()?
     } else {
         prepared
             .into_iter()
             .map(|st| st.into_raw_shards(p))
-            .collect()
+            .collect::<Result<_>>()?
     };
 
     let mut shard_major: Vec<Vec<_>> = (0..p).map(|_| Vec::new()).collect();
@@ -378,69 +459,55 @@ fn merge_raw_states_to_batches(
             if cap == 0 {
                 return Ok(None);
             }
+            let mut rows = RawRows::new(pool, agg_funcs.len());
             if dense {
-                // Direct-address merge: slot index -> dense entry position
                 let lo = gmin + (pi as u64 * w) as i64;
-                let hi_w = if pi == lists.len().max(1) - 1 {
-                    u64::MAX
-                } else {
-                    w
-                };
-                let width = if hi_w == u64::MAX {
+                let width = if pi == p - 1 {
                     (gmax - lo + 1).max(1) as usize
                 } else {
                     w as usize
                 };
-                let mut slots: Vec<u32> = vec![u32::MAX; width];
-                let mut dense_entries: Vec<(u64, Vec<AccumulatorState>)> = Vec::with_capacity(cap);
+                let mut slots = ReservedVec::<u32>::with_capacity(pool, width)?;
+                slots.extend_reserved(width, std::iter::repeat_n(u32::MAX, width))?;
                 for list in lists {
-                    for (key, accs) in list {
-                        let idx = ((key as i64).wrapping_sub(lo)) as usize;
-                        let slot = slots[idx];
-                        if slot == u32::MAX {
-                            slots[idx] = dense_entries.len() as u32;
-                            dense_entries.push((key, accs));
+                    for (key, accs) in list.iter() {
+                        let idx = ((*key as i64).wrapping_sub(lo)) as usize;
+                        let slot = slots.as_mut_slice().get_mut(idx).ok_or_else(|| {
+                            QueryError::Execution("aggregate dense key outside shard".into())
+                        })?;
+                        if *slot == u32::MAX {
+                            *slot = u32::try_from(rows.push(*key, accs.iter().cloned())?).map_err(
+                                |_| QueryError::Execution("aggregate dense index overflow".into()),
+                            )?;
                         } else {
-                            let target = &mut dense_entries[slot as usize].1;
-                            for (a, b) in target.iter_mut().zip(accs.iter()) {
+                            for (a, b) in rows.row_mut(*slot as usize).iter_mut().zip(accs) {
                                 a.merge(b);
                             }
                         }
                     }
                 }
-                let refs: Vec<(u64, &Vec<AccumulatorState>)> =
-                    dense_entries.iter().map(|(k, v)| (*k, v)).collect();
-                let batch = build_output_raw_entries(&refs, None, agg_funcs, schema)?;
-                return match post_filter {
-                    Some(pred) => {
-                        Ok(crate::physical::operators::filter_batches(vec![batch], pred)?.pop())
-                    }
-                    None => Ok(Some(batch)),
-                };
-            }
-            let mut map: HashMap<u64, Vec<AccumulatorState>> = HashMap::with_capacity(cap);
-            for list in lists {
-                for (key, accs) in list {
-                    match map.entry(key) {
-                        hashbrown::hash_map::Entry::Occupied(mut e) => {
-                            for (a, b) in e.get_mut().iter_mut().zip(accs.iter()) {
-                                a.merge(b);
-                            }
-                        }
-                        hashbrown::hash_map::Entry::Vacant(v) => {
-                            v.insert(accs);
-                        }
+            } else {
+                let mut map = RawStateMap::new(pool, agg_funcs.len());
+                for list in lists {
+                    for (key, accs) in list.iter() {
+                        map.insert_or_merge(*key, accs)?;
                     }
                 }
+                rows = map.take_rows();
             }
-            let state = AggregationState::from_raw_groups(
-                agg_funcs.to_vec(),
-                input_types.to_vec(),
-                raw_type.clone(),
-                map,
+            let batch = build_output_raw_entries(
+                rows.iter().map(|(key, values)| (*key, values)),
                 None,
-            );
-            build_filtered_output(&state, schema, post_filter)
+                agg_funcs,
+                schema,
+                pool,
+            )?;
+            match post_filter {
+                Some(pred) => {
+                    Ok(crate::physical::operators::filter_batches(vec![batch], pred)?.pop())
+                }
+                None => Ok(Some(batch)),
+            }
         })
         .collect::<Result<Vec<Option<RecordBatch>>>>()?
         .into_iter()
@@ -464,8 +531,9 @@ fn merge_raw_states_to_batches(
             raw_type.clone(),
             HashMap::new(),
             Some(null_accs),
-        );
-        if let Some(b) = build_filtered_output(&state, schema, post_filter)? {
+            pool,
+        )?;
+        if let Some(b) = build_filtered_output(&state, schema, post_filter, pool)? {
             batches.push(b);
         }
     }
@@ -482,6 +550,7 @@ fn merge_raw_sum_states_to_batches(
     raw_type: &DataType,
     schema: &SchemaRef,
     post_filter: Option<&Expr>,
+    pool: &MemoryPool,
 ) -> Result<Vec<RecordBatch>> {
     let timing = std::env::var("AGG_TIMING").is_ok();
     let t0 = std::time::Instant::now();
@@ -533,9 +602,13 @@ fn merge_raw_sum_states_to_batches(
         .unwrap_or(i64::MIN);
 
     let p = merge_shard_count(total);
-    let range = (gmax as i128 - gmin as i128 + 1).max(1) as u64;
-    let dense =
-        total > 0 && range <= 512_000_000 && (range as u128) <= 6 * total as u128 && gmax > gmin;
+    let candidate_range = crate::physical::dense_domain::bounded_i64_width(gmin, gmax, 512_000_000);
+    let dense = total > 0
+        && gmax > gmin
+        && candidate_range.is_some_and(|range| (range as u128) <= 6 * total as u128);
+    // The value is used for range routing only when dense is true. Invalid or
+    // oversized domains must take the hash route, never narrow modulo 2^64.
+    let range = candidate_range.unwrap_or(1) as u64;
     let w = range.div_ceil(p as u64).max(1);
 
     let sharded: Vec<Vec<Vec<(u64, f64)>>> = if dense {
@@ -614,6 +687,13 @@ fn merge_raw_sum_states_to_batches(
                 DataType::Date32 => Arc::new(arrow::array::Date32Array::from(
                     keys.iter().map(|&k| k as i64 as i32).collect::<Vec<_>>(),
                 )),
+                DataType::Date64 | DataType::Timestamp(_, _) => {
+                    let values = keys
+                        .iter()
+                        .map(|&key| ScalarValue::Int64(key as i64))
+                        .collect::<Vec<_>>();
+                    build_scalar_array(&values, schema.field(0).data_type())?
+                }
                 _ => Arc::new(arrow::array::Int64Array::from(
                     keys.iter().map(|&k| k as i64).collect::<Vec<_>>(),
                 )),
@@ -653,8 +733,9 @@ fn merge_raw_sum_states_to_batches(
             raw_type.clone(),
             HashMap::new(),
             Some(null_accs),
-        );
-        if let Some(b) = build_filtered_output(&state, schema, post_filter)? {
+            pool,
+        )?;
+        if let Some(b) = build_filtered_output(&state, schema, post_filter, pool)? {
             batches.push(b);
         }
     }
@@ -738,6 +819,12 @@ pub(crate) enum AccumulatorState {
     Sum(f64, bool),
     /// SUM over an integer input; same NULL semantics as `Sum`.
     SumInt(i64, bool),
+    /// Exact coefficient, with sticky overflow carried through every merge.
+    SumDecimal {
+        coefficient: Option<i128>,
+        scale: i8,
+        seen: bool,
+    },
     Avg {
         sum: f64,
         count: i64,
@@ -758,7 +845,7 @@ pub(crate) enum AccumulatorState {
 }
 
 impl AccumulatorState {
-    fn new(func: &AggregateFunction, input_type: &DataType) -> Self {
+    pub(crate) fn new(func: &AggregateFunction, input_type: &DataType) -> Self {
         match func {
             AggregateFunction::Count | AggregateFunction::CountDistinct => {
                 AccumulatorState::Count(0)
@@ -767,6 +854,11 @@ impl AccumulatorState {
                 DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
                     AccumulatorState::SumInt(0, false)
                 }
+                DataType::Decimal128(_, scale) => AccumulatorState::SumDecimal {
+                    coefficient: Some(0),
+                    scale: *scale,
+                    seen: false,
+                },
                 _ => AccumulatorState::Sum(0.0, false),
             },
             AggregateFunction::Avg => AccumulatorState::Avg { sum: 0.0, count: 0 },
@@ -792,8 +884,18 @@ impl AccumulatorState {
     }
 
     /// Update with a ScalarValue (slow path, used for MIN/MAX with non-numeric types)
-    fn update(&mut self, value: &ScalarValue) {
+    pub(crate) fn update(&mut self, value: &ScalarValue) {
         match self {
+            AccumulatorState::SumDecimal {
+                coefficient,
+                scale,
+                seen,
+            } => {
+                if !matches!(value, ScalarValue::Null) {
+                    *seen = true;
+                    *coefficient = add_decimal_value(*coefficient, *scale, value);
+                }
+            }
             AccumulatorState::Count(c) => {
                 if !matches!(value, ScalarValue::Null) {
                     *c += 1;
@@ -813,8 +915,7 @@ impl AccumulatorState {
             }
             AccumulatorState::Avg { sum, count } => {
                 if let Some(v) = scalar_to_f64(value) {
-                    *sum += v;
-                    *count += 1;
+                    update_average(sum, count, v);
                 }
             }
             AccumulatorState::First(v) => {
@@ -859,11 +960,7 @@ impl AccumulatorState {
             }
             AccumulatorState::Variance { count, mean, m2 } => {
                 if let Some(x) = scalar_to_f64(value) {
-                    *count += 1;
-                    let delta = x - *mean;
-                    *mean += delta / *count as f64;
-                    let delta2 = x - *mean;
-                    *m2 += delta * delta2;
+                    update_variance(count, mean, m2, x);
                 }
             }
         }
@@ -873,6 +970,13 @@ impl AccumulatorState {
     #[inline]
     fn update_f64(&mut self, value: f64) {
         match self {
+            AccumulatorState::SumDecimal {
+                coefficient, seen, ..
+            } => {
+                // Typed dispatch reaching this branch is a planner/type error.
+                *coefficient = None;
+                *seen = true;
+            }
             AccumulatorState::Count(c) => *c += 1,
             AccumulatorState::Sum(s, seen) => {
                 *s += value;
@@ -896,7 +1000,11 @@ impl AccumulatorState {
                 match min {
                     None => *min = Some(new_val),
                     Some(ScalarValue::Float64(current)) => {
-                        if value < current.into_inner() {
+                        if crate::planner::numeric::sql_float_compare(
+                            value,
+                            crate::planner::BinaryOp::Lt,
+                            current.into_inner(),
+                        ) {
                             *min = Some(new_val);
                         }
                     }
@@ -908,7 +1016,11 @@ impl AccumulatorState {
                 match max {
                     None => *max = Some(new_val),
                     Some(ScalarValue::Float64(current)) => {
-                        if value > current.into_inner() {
+                        if crate::planner::numeric::sql_float_compare(
+                            value,
+                            crate::planner::BinaryOp::Gt,
+                            current.into_inner(),
+                        ) {
                             *max = Some(new_val);
                         }
                     }
@@ -935,6 +1047,13 @@ impl AccumulatorState {
     #[inline]
     fn update_i64(&mut self, value: i64) {
         match self {
+            AccumulatorState::SumDecimal {
+                coefficient, seen, ..
+            } => {
+                // Typed dispatch reaching this branch is a planner/type error.
+                *coefficient = None;
+                *seen = true;
+            }
             AccumulatorState::Count(c) => *c += 1,
             AccumulatorState::Sum(s, seen) => {
                 *s += value as f64;
@@ -1002,8 +1121,28 @@ impl AccumulatorState {
         }
     }
 
-    fn merge(&mut self, other: &AccumulatorState) {
+    pub(crate) fn merge(&mut self, other: &AccumulatorState) {
         match (self, other) {
+            (
+                AccumulatorState::SumDecimal {
+                    coefficient: a,
+                    scale: sa,
+                    seen: va,
+                },
+                AccumulatorState::SumDecimal {
+                    coefficient: b,
+                    scale: sb,
+                    seen: vb,
+                },
+            ) => {
+                *a = a.zip(*b).and_then(|(x, y)| {
+                    DecimalValue::new(y, *sb)
+                        .rescale(*sa)
+                        .ok()
+                        .and_then(|y| x.checked_add(y))
+                });
+                *va |= *vb;
+            }
             (AccumulatorState::Count(a), AccumulatorState::Count(b)) => *a += b,
             (AccumulatorState::Sum(a, sa), AccumulatorState::Sum(b, sb)) => {
                 *a += b;
@@ -1089,8 +1228,23 @@ impl AccumulatorState {
         }
     }
 
-    fn finalize(&self, func: &AggregateFunction) -> ScalarValue {
-        match self {
+    pub(crate) fn finalize(&self, func: &AggregateFunction) -> Result<ScalarValue> {
+        Ok(match self {
+            AccumulatorState::SumDecimal {
+                coefficient,
+                scale,
+                seen,
+            } => {
+                let value = coefficient.ok_or_else(|| {
+                    QueryError::Execution("decimal SUM overflow or invalid input type".into())
+                })?;
+                if *seen {
+                    DecimalValue::validate_precision(value, 38)?;
+                    ScalarValue::Decimal128(DecimalValue::new(value, *scale))
+                } else {
+                    ScalarValue::Null
+                }
+            }
             AccumulatorState::Count(c) => ScalarValue::Int64(*c),
             // SUM over zero non-NULL inputs is NULL (SQL:2016 10.9 / DuckDB).
             AccumulatorState::Sum(s, seen) => {
@@ -1127,20 +1281,20 @@ impl AccumulatorState {
             },
             AccumulatorState::Variance { count, m2, .. } => {
                 if *count == 0 {
-                    return ScalarValue::Null;
+                    return Ok(ScalarValue::Null);
                 }
                 let result = match func {
                     AggregateFunction::VarPop => *m2 / *count as f64,
                     AggregateFunction::Variance | AggregateFunction::VarSamp => {
                         if *count < 2 {
-                            return ScalarValue::Null;
+                            return Ok(ScalarValue::Null);
                         }
                         *m2 / (*count - 1) as f64
                     }
                     AggregateFunction::StddevPop => (*m2 / *count as f64).sqrt(),
                     AggregateFunction::Stddev | AggregateFunction::StddevSamp => {
                         if *count < 2 {
-                            return ScalarValue::Null;
+                            return Ok(ScalarValue::Null);
                         }
                         (*m2 / (*count - 1) as f64).sqrt()
                     }
@@ -1148,7 +1302,7 @@ impl AccumulatorState {
                 };
                 ScalarValue::Float64(ordered_float::OrderedFloat(result))
             }
-        }
+        })
     }
 }
 
@@ -1167,6 +1321,7 @@ fn compare_scalar_values(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering
         (ScalarValue::UInt16(a), ScalarValue::UInt16(b)) => a.cmp(b),
         (ScalarValue::UInt32(a), ScalarValue::UInt32(b)) => a.cmp(b),
         (ScalarValue::UInt64(a), ScalarValue::UInt64(b)) => a.cmp(b),
+        (ScalarValue::Boolean(a), ScalarValue::Boolean(b)) => a.cmp(b),
         (ScalarValue::Float32(a), ScalarValue::Float32(b)) => a.cmp(b),
         (ScalarValue::Float64(a), ScalarValue::Float64(b)) => a.cmp(b),
         (ScalarValue::Utf8(a), ScalarValue::Utf8(b)) => a.cmp(b),
@@ -1176,6 +1331,31 @@ fn compare_scalar_values(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering
         (ScalarValue::Decimal128(a), ScalarValue::Decimal128(b)) => a.cmp(b),
         _ => Ordering::Equal,
     }
+}
+
+// Shared arithmetic keeps compact live rows and general accumulators in the
+// same operation order. Live callers check count overflow before entering.
+#[inline]
+fn add_decimal_value(sum: Option<i128>, scale: i8, value: &ScalarValue) -> Option<i128> {
+    sum.and_then(|sum| match value {
+        ScalarValue::Decimal128(v) => v.rescale(scale).ok().and_then(|v| sum.checked_add(v)),
+        _ => None,
+    })
+}
+
+#[inline]
+fn update_average(sum: &mut f64, count: &mut i64, value: f64) {
+    *sum += value;
+    *count += 1;
+}
+
+#[inline]
+fn update_variance(count: &mut i64, mean: &mut f64, m2: &mut f64, value: f64) {
+    *count += 1;
+    let delta = value - *mean;
+    *mean += delta / *count as f64;
+    let delta2 = value - *mean;
+    *m2 += delta * delta2;
 }
 
 fn scalar_to_f64(value: &ScalarValue) -> Option<f64> {
@@ -1190,10 +1370,7 @@ fn scalar_to_f64(value: &ScalarValue) -> Option<f64> {
         ScalarValue::UInt64(v) => Some(*v as f64),
         ScalarValue::Float32(v) => Some(v.into_inner() as f64),
         ScalarValue::Float64(v) => Some(v.into_inner()),
-        ScalarValue::Decimal128(v) => {
-            use rust_decimal::prelude::ToPrimitive;
-            v.to_f64()
-        }
+        ScalarValue::Decimal128(v) => Some(v.to_f64()),
         _ => None,
     }
 }
@@ -1204,7 +1381,7 @@ fn scalar_to_raw_key(value: &ScalarValue) -> u64 {
         ScalarValue::Null => u64::MAX,
         ScalarValue::Int64(v) => *v as u64,
         ScalarValue::Int32(v) => *v as u64,
-        ScalarValue::Float64(v) => v.into_inner().to_bits(),
+        ScalarValue::Float64(v) => crate::planner::numeric::sql_float_key(v.into_inner()),
         ScalarValue::Date32(v) => *v as u64,
         ScalarValue::Utf8(s) => {
             let bytes = s.as_bytes();
@@ -1238,6 +1415,7 @@ enum TypedArrayAccessor<'a> {
     Int64(&'a Int64Array),
     Int32(&'a arrow::array::Int32Array),
     Float64(&'a Float64Array),
+    Decimal128(&'a arrow::array::Decimal128Array, i8, f64),
     String(&'a StringArray),
     Date32(&'a Date32Array),
     /// Dictionary-encoded strings: group keys use the dictionary INDEX
@@ -1261,6 +1439,14 @@ impl<'a> TypedArrayAccessor<'a> {
             DataType::Float64 => {
                 TypedArrayAccessor::Float64(array.as_any().downcast_ref::<Float64Array>().unwrap())
             }
+            DataType::Decimal128(_, scale) => TypedArrayAccessor::Decimal128(
+                array
+                    .as_any()
+                    .downcast_ref::<arrow::array::Decimal128Array>()
+                    .unwrap(),
+                *scale,
+                10_f64.powi(-(*scale as i32)),
+            ),
             DataType::Utf8 => {
                 TypedArrayAccessor::String(array.as_any().downcast_ref::<StringArray>().unwrap())
             }
@@ -1295,6 +1481,26 @@ impl<'a> TypedArrayAccessor<'a> {
             return;
         }
         match self {
+            TypedArrayAccessor::Decimal128(arr, scale, factor) => {
+                if !arr.is_null(row) {
+                    let value = arr.value(row);
+                    match acc {
+                        AccumulatorState::SumDecimal {
+                            coefficient,
+                            scale: target,
+                            seen,
+                        } if target == scale => {
+                            *seen = true;
+                            *coefficient = coefficient.and_then(|sum| sum.checked_add(value));
+                        }
+                        AccumulatorState::Count(count) => *count += 1,
+                        AccumulatorState::Avg { .. }
+                        | AccumulatorState::Variance { .. }
+                        | AccumulatorState::Sum(..) => acc.update_f64(value as f64 * factor),
+                        _ => acc.update(&ScalarValue::Decimal128(DecimalValue::new(value, *scale))),
+                    }
+                }
+            }
             TypedArrayAccessor::Float64(arr) => {
                 if !arr.is_null(row) {
                     acc.update_f64(arr.value(row));
@@ -1325,7 +1531,7 @@ impl<'a> TypedArrayAccessor<'a> {
     }
 
     /// Extract a u64 key for perfect hash indexing (no allocation).
-    /// Different values map to different u64 values.
+    /// Encodings may collide, including the NULL sentinel and signed -1.
     /// For strings, we hash the first 8 bytes plus length for a fast key.
     #[inline]
     fn raw_key(&self, row: usize) -> u64 {
@@ -1343,7 +1549,11 @@ impl<'a> TypedArrayAccessor<'a> {
                     // caught as a distributed-Q9 wrong answer when join
                     // gathers started emitting dictionaries).
                     let values = arr.values().as_any().downcast_ref::<StringArray>().unwrap();
-                    let s = values.value(arr.key(row).unwrap_or(0));
+                    let key_index = arr.key(row).unwrap();
+                    if values.is_null(key_index) {
+                        return u64::MAX;
+                    }
+                    let s = values.value(key_index);
                     let bytes = s.as_bytes();
                     let len = bytes.len().min(8);
                     let mut key = 0u64;
@@ -1364,7 +1574,7 @@ impl<'a> TypedArrayAccessor<'a> {
                 if arr.is_null(row) {
                     u64::MAX
                 } else {
-                    arr.value(row).to_bits()
+                    crate::planner::numeric::sql_float_key(arr.value(row))
                 }
             }
             TypedArrayAccessor::String(arr) => {
@@ -1397,6 +1607,12 @@ impl<'a> TypedArrayAccessor<'a> {
                     arr.value(row) as i64 as u64
                 }
             }
+            TypedArrayAccessor::Decimal128(..) => {
+                let val = self.extract_scalar(row);
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                hash_scalar_value(&val, &mut hasher);
+                std::hash::Hasher::finish(&hasher)
+            }
             TypedArrayAccessor::Other(arr) => {
                 // Fallback: use hash of ScalarValue
                 let val = extract_scalar(arr, row);
@@ -1422,12 +1638,24 @@ impl<'a> TypedArrayAccessor<'a> {
     /// Extract ScalarValue (slow path, needed for group keys)
     fn extract_scalar(&self, row: usize) -> ScalarValue {
         match self {
+            TypedArrayAccessor::Decimal128(arr, scale, _) => {
+                if arr.is_null(row) {
+                    ScalarValue::Null
+                } else {
+                    ScalarValue::Decimal128(DecimalValue::new(arr.value(row), *scale))
+                }
+            }
             TypedArrayAccessor::DictString(arr) => {
                 if arr.is_null(row) {
                     ScalarValue::Null
                 } else {
                     let values = arr.values().as_any().downcast_ref::<StringArray>().unwrap();
-                    ScalarValue::Utf8(values.value(arr.key(row).unwrap_or(0)).to_string())
+                    let key_index = arr.key(row).unwrap();
+                    if values.is_null(key_index) {
+                        ScalarValue::Null
+                    } else {
+                        ScalarValue::Utf8(values.value(key_index).to_string())
+                    }
                 }
             }
             TypedArrayAccessor::Int64(arr) => {
@@ -1474,13 +1702,84 @@ impl<'a> TypedArrayAccessor<'a> {
 /// If groups exceed this, falls back to HashMap.
 const PERFECT_HASH_MAX_GROUPS: usize = 256;
 
+/// Evaluate the input once, retaining normalized grouping and aggregate arrays.
+/// The internal schema is positional: group columns, then aggregate inputs.
+/// Routing, slicing and updates must preserve these arrays instead of evaluating
+/// the source expressions again. This is not an aggregate-state spill format.
+pub(crate) fn prepare_aggregate_batch(
+    batch: &RecordBatch,
+    group_by_exprs: &[Expr],
+    agg_input_exprs: &[Expr],
+) -> Result<RecordBatch> {
+    let prof = std::env::var("QE_AGG_PROF").is_ok();
+    let _process_timer = AggProfileTimer::start(prof, &AGG_PROF_PROCESS_NS);
+    let t0 = prof.then(std::time::Instant::now);
+    // Evaluate expressions once per batch
+    let group_arrays: Vec<ArrayRef> = group_by_exprs
+        .iter()
+        .map(|expr| evaluate_expr(batch, expr).and_then(normalize_morsel_group_array))
+        .collect::<Result<Vec<_>>>()?;
+    if let Some(t) = t0 {
+        AGG_PROF_GROUP_NS.fetch_add(
+            t.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    let t1 = prof.then(std::time::Instant::now);
+    let agg_arrays = crate::physical::operators::evaluate_aggregate_inputs(
+        batch,
+        agg_input_exprs.len(),
+        |i| &agg_input_exprs[i],
+        normalize_aggregate_array,
+    )?;
+    if let Some(t) = t1 {
+        AGG_PROF_AGGEVAL_NS.fetch_add(
+            t.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    let fields: Vec<arrow::datatypes::Field> = group_arrays
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            arrow::datatypes::Field::new(format!("group_{i}"), a.data_type().clone(), true)
+        })
+        .chain(agg_arrays.iter().enumerate().map(|(i, a)| {
+            arrow::datatypes::Field::new(format!("aggregate_{i}"), a.data_type().clone(), true)
+        }))
+        .collect();
+    let arrays = group_arrays.into_iter().chain(agg_arrays).collect();
+    Ok(RecordBatch::try_new_with_options(
+        Arc::new(arrow::datatypes::Schema::new(fields)),
+        arrays,
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )?)
+}
+
+/// Failure while applying retained evaluated input. Only a typed admission
+/// denial permits resumption, and only at `next_row`; other errors remain terminal.
+/// The cursor counts applied logical rows, not migration progress or groups.
+#[derive(Debug)]
+pub(crate) struct IngestionFailure {
+    pub(crate) next_row: usize,
+    pub(crate) error: QueryError,
+}
+
+impl IngestionFailure {
+    fn at(next_row: usize, error: QueryError) -> Self {
+        Self { next_row, error }
+    }
+}
+
+type IngestionResult<T> = std::result::Result<T, IngestionFailure>;
+
 /// Thread-local aggregation state.
 ///
 /// Uses two strategies:
 /// - **Perfect hash** (default): Fixed array indexed by group key, no hashing overhead.
 ///   Activated when the number of distinct groups ≤ PERFECT_HASH_MAX_GROUPS.
 /// - **HashMap fallback**: Standard hash table for high-cardinality groups.
-#[derive(Clone)]
 pub struct AggregationState {
     /// Fixed-array accumulators indexed by perfect hash (low cardinality fast path)
     perfect_accs: Vec<Vec<AccumulatorState>>,
@@ -1497,6 +1796,8 @@ pub struct AggregationState {
     key_strides: Vec<usize>,
     /// Group keys in order of first insertion (for output)
     key_order: Vec<GroupKey>,
+    /// Explicit occupancy: all-NULL keys and all-NULL aggregate inputs are real groups.
+    perfect_occupied: Vec<bool>,
     /// Total number of slots in perfect_accs
     perfect_capacity: usize,
     /// Whether we overflowed and fell back to HashMap
@@ -1504,10 +1805,11 @@ pub struct AggregationState {
 
     /// HashMap fallback: group key -> accumulator states
     groups: HashMap<GroupKey, Vec<AccumulatorState>>,
-    /// Raw-key fallback for a single Int64/Date32 group column: avoids the
-    /// per-row GroupKey/ScalarValue allocation of `groups` (u64 is the
-    /// bit-pattern of the value; nulls tracked separately).
-    raw_groups: HashMap<u64, Vec<AccumulatorState>>,
+    /// Query-owned key-to-index table and flat accumulator arena for one
+    /// Int64/Int32/Date32 group column. Nulls remain a separate single group.
+    /// Outer key/state/hash capacity is admitted; nested scalar payloads are
+    /// not yet independently reservation-owned.
+    raw_groups: RawStateMap,
     /// Specialized raw path for EXACTLY [Sum] over a Float64 input with a
     /// single raw-encodable group column: 16-byte (u64, f64) entries instead
     /// of a heap-boxed Vec<AccumulatorState> per group. Sum(f64) starts at
@@ -1534,10 +1836,11 @@ impl Default for AggregationState {
             key_maps: Vec::new(),
             key_strides: Vec::new(),
             key_order: Vec::new(),
+            perfect_occupied: Vec::new(),
             perfect_capacity: 0,
             overflowed: false,
             groups: HashMap::new(),
-            raw_groups: HashMap::new(),
+            raw_groups: RawStateMap::new(&process_memory_pool(), 0),
             raw_sums: HashMap::new(),
             raw_null: None,
             raw_type: None,
@@ -1550,7 +1853,16 @@ impl Default for AggregationState {
 
 impl AggregationState {
     pub fn new(agg_funcs: Vec<AggregateFunction>, input_types: Vec<DataType>) -> Self {
+        Self::new_with_pool(agg_funcs, input_types, &process_memory_pool())
+    }
+
+    pub fn new_with_pool(
+        agg_funcs: Vec<AggregateFunction>,
+        input_types: Vec<DataType>,
+        pool: &MemoryPool,
+    ) -> Self {
         Self {
+            raw_groups: RawStateMap::new(pool, agg_funcs.len()),
             agg_funcs,
             input_types,
             ..Default::default()
@@ -1595,13 +1907,17 @@ impl AggregationState {
             if id == next_id {
                 any_new = true;
                 self.raw_key_values[col].push(accessor.extract_scalar(row));
-            } else if matches!(
-                accessor,
-                TypedArrayAccessor::String(_)
-                    | TypedArrayAccessor::Other(_)
-                    | TypedArrayAccessor::DictString(_)
-            ) {
-                // Raw keys for strings/other types are lossy encodings — verify
+            } else if raw_key == u64::MAX
+                || matches!(
+                    accessor,
+                    TypedArrayAccessor::String(_)
+                        | TypedArrayAccessor::Decimal128(..)
+                        | TypedArrayAccessor::Other(_)
+                        | TypedArrayAccessor::DictString(_)
+                )
+            {
+                // NULL shares its sentinel with valid numeric bit patterns.
+                // Raw keys for strings/other types are also lossy — verify
                 // the hit against the registered value; on collision, fall back
                 // to the exact HashMap path for this whole state.
                 if !accessor.value_equals_scalar(row, &self.raw_key_values[col][id as usize]) {
@@ -1647,6 +1963,7 @@ impl AggregationState {
                             .collect()
                     })
                     .collect();
+                let mut new_occupied = vec![false; cap];
                 let mut new_key_order: Vec<GroupKey> = (0..cap)
                     .map(|_| GroupKey {
                         values: vec![ScalarValue::Null; n],
@@ -1658,10 +1975,7 @@ impl AggregationState {
                         continue;
                     }
                     // Check if this slot has data
-                    let has_data = !self.key_order[old_idx]
-                        .values
-                        .iter()
-                        .all(|v| matches!(v, ScalarValue::Null));
+                    let has_data = self.perfect_occupied[old_idx];
                     if !has_data {
                         continue;
                     }
@@ -1684,6 +1998,7 @@ impl AggregationState {
 
                     // Move accumulators and key_order to new position
                     std::mem::swap(&mut new_accs[new_idx], &mut self.perfect_accs[old_idx]);
+                    new_occupied[new_idx] = true;
                     new_key_order[new_idx] = std::mem::replace(
                         &mut self.key_order[old_idx],
                         GroupKey {
@@ -1694,6 +2009,7 @@ impl AggregationState {
 
                 self.perfect_accs = new_accs;
                 self.key_order = new_key_order;
+                self.perfect_occupied = new_occupied;
             } else {
                 // No rehash needed — just extend arrays
                 while self.perfect_accs.len() < cap {
@@ -1711,6 +2027,7 @@ impl AggregationState {
                     });
                 }
             }
+            self.perfect_occupied.resize(cap, false);
             self.perfect_capacity = cap;
         }
 
@@ -1720,19 +2037,14 @@ impl AggregationState {
             flat_idx += ids[col] as usize * self.key_strides[col];
         }
 
-        // Record key values for output (only on first assignment)
-        if flat_idx < self.key_order.len()
-            && self.key_order[flat_idx]
-                .values
-                .iter()
-                .all(|v| matches!(v, ScalarValue::Null))
-        {
-            for (col, accessor) in group_accessors.iter().enumerate() {
-                let val = accessor.extract_scalar(row);
-                if !matches!(val, ScalarValue::Null) {
-                    self.key_order[flat_idx].values[col] = val;
-                }
-            }
+        if !self.perfect_occupied[flat_idx] {
+            self.key_order[flat_idx] = GroupKey {
+                values: group_accessors
+                    .iter()
+                    .map(|accessor| accessor.extract_scalar(row))
+                    .collect(),
+            };
+            self.perfect_occupied[flat_idx] = true;
         }
 
         Some(flat_idx)
@@ -1750,35 +2062,49 @@ impl AggregationState {
             return Ok(());
         }
 
-        // Initialize perfect hash on first batch
-        if self.key_maps.is_empty() && !group_by_exprs.is_empty() {
-            self.init_perfect_hash(group_by_exprs.len());
-        }
+        let prepared = prepare_aggregate_batch(batch, group_by_exprs, agg_input_exprs)?;
+        self.process_evaluated_batch(&prepared, group_by_exprs.len())
+    }
 
+    /// Apply already-evaluated arrays; ordinary callers retain terminal-error
+    /// behavior. Spill-aware callers use the cursor API with the retained batch.
+    pub(crate) fn process_evaluated_batch(
+        &mut self,
+        batch: &RecordBatch,
+        group_count: usize,
+    ) -> Result<()> {
+        self.process_evaluated_from(batch, group_count, 0)
+            .map(|_| ())
+            .map_err(|failure| failure.error)
+    }
+
+    /// Resume at the first unapplied row of the same evaluated batch. Admission
+    /// errors preserve every applied row and return the exact next-row cursor.
+    /// This does not flush state or make unadmitted allocation paths spillable.
+    pub(crate) fn process_evaluated_from(
+        &mut self,
+        batch: &RecordBatch,
+        group_count: usize,
+        start_row: usize,
+    ) -> IngestionResult<usize> {
+        if start_row > batch.num_rows()
+            || group_count.checked_add(self.agg_funcs.len()) != Some(batch.num_columns())
+        {
+            return Err(IngestionFailure::at(
+                start_row,
+                QueryError::Execution("prepared aggregate input extent or arity mismatch".into()),
+            ));
+        }
+        let num_rows = batch.num_rows();
+        if start_row == num_rows {
+            return Ok(num_rows);
+        }
+        if self.key_maps.is_empty() && group_count != 0 {
+            self.init_perfect_hash(group_count);
+        }
         let prof = std::env::var("QE_AGG_PROF").is_ok();
-        let t0 = prof.then(std::time::Instant::now);
-        // Evaluate expressions once per batch
-        let group_arrays: Vec<ArrayRef> = group_by_exprs
-            .iter()
-            .map(|expr| evaluate_expr(batch, expr))
-            .collect::<Result<Vec<_>>>()?;
-        if let Some(t) = t0 {
-            AGG_PROF_GROUP_NS.fetch_add(
-                t.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
-        let t1 = prof.then(std::time::Instant::now);
-        let agg_arrays: Vec<ArrayRef> = agg_input_exprs
-            .iter()
-            .map(|expr| evaluate_expr(batch, expr))
-            .collect::<Result<Vec<_>>>()?;
-        if let Some(t) = t1 {
-            AGG_PROF_AGGEVAL_NS.fetch_add(
-                t.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
+        let _process_timer = AggProfileTimer::start(prof, &AGG_PROF_PROCESS_NS);
+        let (group_arrays, agg_arrays) = batch.columns().split_at(group_count);
 
         // Pre-downcast for typed access
         let group_accessors: Vec<TypedArrayAccessor> = group_arrays
@@ -1794,7 +2120,7 @@ impl AggregationState {
         // dictionary-encoded string with a small dictionary, resolve the
         // perfect-hash index ONCE per distinct key combination per batch
         // (packed table lookup per row afterwards).
-        if !self.overflowed && !group_by_exprs.is_empty() {
+        if !self.overflowed && group_count != 0 {
             // Fast combined-key components: a dictionary-encoded string's KEY
             // INDEX, or a null-free integer column whose per-batch range fits
             // 6 bits ((v - min) is the component — covers EXTRACT(YEAR ...)
@@ -1819,7 +2145,10 @@ impl AggregationState {
                     lo = lo.min(v);
                     hi = hi.max(v);
                 }
-                if vals.is_empty() || hi - lo <= 63 {
+                // Range metadata controls indexing only after a checked proof.
+                // MIN..MAX spans overflow i64 subtraction and must use the
+                // generic exact grouping path, never wrapped packed indices.
+                if vals.is_empty() || hi.checked_sub(lo).is_some_and(|width| width <= 63) {
                     let min = if vals.is_empty() { 0 } else { lo };
                     Some(FastComp::IntOff { vals, min })
                 } else {
@@ -1886,7 +2215,7 @@ impl AggregationState {
                     } else {
                         None
                     };
-                    for row in 0..num_rows {
+                    for row in start_row..num_rows {
                         let packed = match keys1 {
                             Some(k1) => (keys0.component(row) << shift) | k1.component(row),
                             None => keys0.component(row),
@@ -1917,8 +2246,8 @@ impl AggregationState {
                                         num_rows,
                                         &group_accessors,
                                         &agg_accessors,
-                                    );
-                                    return Ok(());
+                                    )?;
+                                    return Ok(num_rows);
                                 }
                             }
                         }
@@ -1933,7 +2262,7 @@ impl AggregationState {
                             }
                         }
                     }
-                    return Ok(());
+                    return Ok(num_rows);
                 }
             }
             // Perfect hash fast path
@@ -1957,7 +2286,7 @@ impl AggregationState {
                     })
                     .collect();
 
-                for row in 0..num_rows {
+                for row in start_row..num_rows {
                     if let Some(idx) = self.get_or_assign_perfect_index(&group_accessors, row) {
                         let accs = &mut self.perfect_accs[idx];
                         for (i, acc) in accs.iter_mut().enumerate() {
@@ -1965,13 +2294,13 @@ impl AggregationState {
                         }
                     } else {
                         self.drain_perfect_to_hashmap();
-                        self.process_rows_hashmap(row, num_rows, &group_accessors, &agg_accessors);
+                        self.process_rows_hashmap(row, num_rows, &group_accessors, &agg_accessors)?;
                         break;
                     }
                 }
             } else {
                 // Generic perfect hash path
-                for row in 0..num_rows {
+                for row in start_row..num_rows {
                     if let Some(idx) = self.get_or_assign_perfect_index(&group_accessors, row) {
                         let accs = &mut self.perfect_accs[idx];
                         for (i, acc) in accs.iter_mut().enumerate() {
@@ -1979,12 +2308,12 @@ impl AggregationState {
                         }
                     } else {
                         self.drain_perfect_to_hashmap();
-                        self.process_rows_hashmap(row, num_rows, &group_accessors, &agg_accessors);
+                        self.process_rows_hashmap(row, num_rows, &group_accessors, &agg_accessors)?;
                         break;
                     }
                 }
             }
-        } else if group_by_exprs.is_empty() {
+        } else if group_count == 0 {
             // No group-by: single accumulator
             if self.perfect_accs.is_empty() {
                 self.perfect_accs.push(
@@ -1996,19 +2325,20 @@ impl AggregationState {
                 );
                 self.perfect_capacity = 1;
                 self.key_order.push(GroupKey { values: vec![] });
+                self.perfect_occupied.push(true);
             }
             let accs = &mut self.perfect_accs[0];
-            for row in 0..num_rows {
+            for row in start_row..num_rows {
                 for (i, acc) in accs.iter_mut().enumerate() {
                     agg_accessors[i].update_accumulator(row, acc);
                 }
             }
         } else {
             // HashMap fallback
-            self.process_rows_hashmap(0, num_rows, &group_accessors, &agg_accessors);
+            self.process_rows_hashmap(start_row, num_rows, &group_accessors, &agg_accessors)?;
         }
 
-        Ok(())
+        Ok(num_rows)
     }
 
     /// Process rows using HashMap (slow path)
@@ -2018,7 +2348,7 @@ impl AggregationState {
         end_row: usize,
         group_accessors: &[TypedArrayAccessor],
         agg_accessors: &[TypedArrayAccessor],
-    ) {
+    ) -> IngestionResult<()> {
         // Raw fast path for a single Int64/Date32 group column: key the map by
         // the value's bit pattern instead of allocating a GroupKey per ROW.
         if group_accessors.len() == 1 {
@@ -2031,8 +2361,11 @@ impl AggregationState {
             if let Some(rt) = raw_type {
                 if self.raw_type.is_none() {
                     self.raw_type = Some(rt);
-                    self.normalize_raw();
                 }
+                // A previous migration may have failed after raw_type was set.
+                // Reconcile its retained source entries before applying another row.
+                self.normalize_raw()
+                    .map_err(|e| IngestionFailure::at(start_row, e))?;
                 // Run detection: clustered keys (lineitem is ordered by
                 // l_orderkey) produce runs of equal values — one map lookup
                 // per RUN instead of per row. Unclustered data degrades
@@ -2105,7 +2438,7 @@ impl AggregationState {
                         row = run_end;
                         continue;
                     }
-                    let accumulators = if is_null {
+                    let accumulators: &mut [AccumulatorState] = if is_null {
                         self.raw_null.get_or_insert_with(|| {
                             self.agg_funcs
                                 .iter()
@@ -2114,13 +2447,14 @@ impl AggregationState {
                                 .collect()
                         })
                     } else {
-                        self.raw_groups.entry(raw).or_insert_with(|| {
-                            self.agg_funcs
-                                .iter()
-                                .zip(&self.input_types)
-                                .map(|(func, dt)| AccumulatorState::new(func, dt))
-                                .collect()
-                        })
+                        self.raw_groups
+                            .get_or_insert_with(raw, || {
+                                self.agg_funcs
+                                    .iter()
+                                    .zip(&self.input_types)
+                                    .map(|(func, dt)| AccumulatorState::new(func, dt))
+                            })
+                            .map_err(|e| IngestionFailure::at(row, e))?
                     };
                     if let Some(slices) = &f64_slices {
                         for r in row..run_end {
@@ -2137,7 +2471,7 @@ impl AggregationState {
                     }
                     row = run_end;
                 }
-                return;
+                return Ok(());
             }
         }
 
@@ -2161,6 +2495,7 @@ impl AggregationState {
                 agg_accessors[i].update_accumulator(row, acc);
             }
         }
+        Ok(())
     }
 
     /// Convert a raw u64 key back into the GroupKey scalar it encodes.
@@ -2174,10 +2509,14 @@ impl AggregationState {
 
     /// Encode a single-scalar GroupKey as a raw u64 (when it matches raw_type).
     fn scalar_to_raw(&self, key: &GroupKey) -> Option<RawKey> {
+        Self::scalar_to_raw_type(key, &self.raw_type)
+    }
+
+    fn scalar_to_raw_type(key: &GroupKey, raw_type: &Option<DataType>) -> Option<RawKey> {
         if key.values.len() != 1 {
             return None;
         }
-        match (&key.values[0], &self.raw_type) {
+        match (&key.values[0], raw_type) {
             (ScalarValue::Null, _) => Some(RawKey::Null),
             (ScalarValue::Int64(v), Some(DataType::Int64)) => Some(RawKey::Value(*v as u64)),
             (ScalarValue::Int32(v), Some(DataType::Int32)) => Some(RawKey::Value(*v as i64 as u64)),
@@ -2190,82 +2529,44 @@ impl AggregationState {
 
     /// Move any GroupKey-keyed entries that encode raw-compatible keys into the
     /// raw maps so a group never lives in both maps at once.
-    fn normalize_raw(&mut self) {
+    fn normalize_raw(&mut self) -> Result<()> {
         if self.raw_type.is_none() || self.groups.is_empty() {
-            return;
+            return Ok(());
         }
-        let keys: Vec<GroupKey> = self.groups.keys().cloned().collect();
-        for key in keys {
-            match self.scalar_to_raw(&key) {
-                Some(RawKey::Value(raw)) => {
-                    let accs = self.groups.remove(&key).unwrap();
-                    match self.raw_groups.entry(raw) {
-                        hashbrown::hash_map::Entry::Occupied(mut e) => {
-                            for (a, b) in e.get_mut().iter_mut().zip(accs.iter()) {
-                                a.merge(b);
-                            }
-                        }
-                        hashbrown::hash_map::Entry::Vacant(v) => {
-                            v.insert(accs);
-                        }
+        let raw_type = &self.raw_type;
+        let raw_groups = &mut self.raw_groups;
+        let raw_null = &mut self.raw_null;
+        let mut failure = None;
+        // Remove a source entry only after its destination accepts it. On
+        // refusal retain that entry and the suffix, while already transferred
+        // entries belong solely to their destination. No cloned key list.
+        self.groups.retain(|key, accs| {
+            if failure.is_some() {
+                return true;
+            }
+            match Self::scalar_to_raw_type(key, raw_type) {
+                Some(RawKey::Value(raw)) => match raw_groups.insert_or_merge(raw, accs) {
+                    Ok(()) => false,
+                    Err(error) => {
+                        failure = Some(error);
+                        true
                     }
-                }
+                },
                 Some(RawKey::Null) => {
-                    let accs = self.groups.remove(&key).unwrap();
-                    match &mut self.raw_null {
+                    match raw_null {
                         Some(existing) => {
                             for (a, b) in existing.iter_mut().zip(accs.iter()) {
                                 a.merge(b);
                             }
                         }
-                        None => self.raw_null = Some(accs),
+                        None => *raw_null = Some(std::mem::take(accs)),
                     }
+                    false
                 }
-                None => {}
+                None => true,
             }
-        }
-    }
-
-    /// Check if a perfect hash slot has data.
-    /// For GROUP BY without aggregates (DISTINCT-like), check key_order instead.
-    fn slot_has_data(key: &GroupKey, accs: &[AccumulatorState]) -> bool {
-        // A slot whose key was recorded is a real group, even when every
-        // accumulator still looks "empty". That happens for legitimate
-        // results: COUNT(col) is 0 and MIN/MAX are NULL when the group's
-        // rows all carry NULL in the aggregated column (exactly what an
-        // outer join's NULL-extended rows produce), and SUM can genuinely be
-        // 0.0. Inferring occupancy from the accumulators deleted those whole
-        // rows from the output. This is the same occupancy test the
-        // perfect-hash rehash uses.
-        if !key.values.is_empty() && !key.values.iter().all(|v| matches!(v, ScalarValue::Null)) {
-            return true;
-        }
-        // An empty key vector is the GLOBAL (ungrouped) aggregate's single
-        // slot, not a free slot — a grouped key always carries one value per
-        // group column. SQL gives a global aggregate exactly one output row
-        // whatever the input, so this slot is never droppable (the accumulator
-        // probe would drop `SELECT SUM(x) FROM t` when every x is NULL).
-        if key.values.is_empty() && !accs.is_empty() {
-            return true;
-        }
-        // Unrecorded key: either a free slot, or a group whose key really is
-        // NULL in every column. Fall back to the accumulator probe, which
-        // keeps NULL-keyed groups that did see data.
-        if accs.is_empty() {
-            return false;
-        }
-        accs.iter().any(|a| match a {
-            AccumulatorState::Count(c) => *c > 0,
-            AccumulatorState::Sum(_, seen) => *seen,
-            AccumulatorState::SumInt(_, seen) => *seen,
-            AccumulatorState::Avg { count, .. } => *count > 0,
-            AccumulatorState::Min(v) => v.is_some(),
-            AccumulatorState::Max(v) => v.is_some(),
-            AccumulatorState::BoolAnd(v) => v.is_some(),
-            AccumulatorState::BoolOr(v) => v.is_some(),
-            AccumulatorState::First(v) => v.is_some(),
-            AccumulatorState::Variance { count, .. } => *count > 0,
-        })
+        });
+        failure.map_or(Ok(()), Err)
     }
 
     /// Drain perfect hash accumulators into the HashMap fallback
@@ -2273,12 +2574,13 @@ impl AggregationState {
         for (idx, accs) in self.perfect_accs.drain(..).enumerate() {
             if idx < self.key_order.len() {
                 let key = &self.key_order[idx];
-                if Self::slot_has_data(key, &accs) {
+                if self.perfect_occupied[idx] {
                     self.groups.insert(key.clone(), accs);
                 }
             }
         }
         self.key_order.clear();
+        self.perfect_occupied.clear();
     }
 
     /// Number of distinct groups currently held (for merge-strategy selection).
@@ -2287,9 +2589,7 @@ impl AggregationState {
             self.perfect_accs
                 .iter()
                 .enumerate()
-                .filter(|(idx, accs)| {
-                    *idx < self.key_order.len() && Self::slot_has_data(&self.key_order[*idx], accs)
-                })
+                .filter(|(idx, _)| *idx < self.key_order.len() && self.perfect_occupied[*idx])
                 .count()
         } else {
             0
@@ -2301,32 +2601,31 @@ impl AggregationState {
             + usize::from(self.raw_null.is_some())
     }
 
-    /// Fold the bare-f64 sum groups back into boxed raw_groups entries. Used
+    /// Fold bare-f64 sum groups into the fixed-arity raw state arena. Used
     /// by every consumer that doesn't understand raw_sums, so the fast
     /// representation can never silently drop groups.
     ///
     /// Every raw_sums entry is by construction a group that saw at least one
     /// non-NULL input (see `use_raw_sums`), so the demoted state is `seen`.
-    pub(crate) fn demote_raw_sums(&mut self) {
-        if self.raw_sums.is_empty() {
-            return;
-        }
-        for (k, v) in self.raw_sums.drain() {
-            match self.raw_groups.entry(k) {
-                hashbrown::hash_map::Entry::Occupied(mut e) => {
-                    if let AccumulatorState::Sum(s, seen) = &mut e.get_mut()[0] {
-                        *s += v;
-                        *seen = true;
-                    }
-                }
-                hashbrown::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(vec![AccumulatorState::Sum(v, true)]);
+    pub(crate) fn demote_raw_sums(&mut self) -> Result<()> {
+        let raw_groups = &mut self.raw_groups;
+        let mut failure = None;
+        self.raw_sums.retain(|&key, &mut value| {
+            if failure.is_some() {
+                return true;
+            }
+            match raw_groups.insert_or_merge(key, &[AccumulatorState::Sum(value, true)]) {
+                Ok(()) => false,
+                Err(error) => {
+                    failure = Some(error);
+                    true
                 }
             }
-        }
+        });
+        failure.map_or(Ok(()), Err)
     }
 
-    /// Inverse of demote_raw_sums: absorb boxed raw_groups (the pre-overflow
+    /// Inverse of demote_raw_sums: absorb arena raw_groups (the pre-overflow
     /// perfect-hash residue) into the bare-f64 map. Returns false (leaving
     /// state unchanged) if any accumulator isn't a plain Sum that already saw
     /// a non-NULL value — a bare f64 cannot represent "SUM is NULL", so a
@@ -2339,11 +2638,12 @@ impl AggregationState {
         {
             return false;
         }
-        for (k, accs) in self.raw_groups.drain() {
+        for (k, accs) in self.raw_groups.iter() {
             if let AccumulatorState::Sum(s, _) = accs[0] {
-                *self.raw_sums.entry(k).or_insert(0.0) += s;
+                *self.raw_sums.entry(*k).or_insert(0.0) += s;
             }
         }
+        self.raw_groups.clear();
         true
     }
 
@@ -2378,8 +2678,11 @@ impl AggregationState {
     /// Consume this state, sharding its groups by key hash into `p` buckets.
     /// Used by the parallel partitioned merge: entries for the same key always
     /// land in the same bucket regardless of which thread produced them.
-    pub(crate) fn into_shards(mut self, p: usize) -> Vec<Vec<(GroupKey, Vec<AccumulatorState>)>> {
-        self.demote_raw_sums();
+    pub(crate) fn into_shards(
+        mut self,
+        p: usize,
+    ) -> Result<Vec<Vec<(GroupKey, Vec<AccumulatorState>)>>> {
+        self.demote_raw_sums()?;
         self.drain_perfect_to_hashmap();
         let mut shards: Vec<Vec<(GroupKey, Vec<AccumulatorState>)>> =
             (0..p).map(|_| Vec::new()).collect();
@@ -2393,13 +2696,13 @@ impl AggregationState {
             key.hash(&mut hasher);
             shards[(hasher.finish() as usize) % p].push((key, accs));
         };
-        let raw_entries: Vec<(u64, Vec<AccumulatorState>)> = self.raw_groups.drain().collect();
-        for (raw, accs) in raw_entries {
+        let raw_entries = self.raw_groups.take_rows();
+        for (raw, accs) in raw_entries.iter() {
             push(
                 GroupKey {
-                    values: vec![self.raw_key_to_scalar(raw)],
+                    values: vec![self.raw_key_to_scalar(*raw)],
                 },
-                accs,
+                accs.to_vec(),
             );
         }
         if let Some(accs) = self.raw_null.take() {
@@ -2413,7 +2716,7 @@ impl AggregationState {
         for (key, accs) in self.groups.drain() {
             push(key, accs);
         }
-        shards
+        Ok(shards)
     }
 
     /// Shard raw-keyed groups by multiplicative hash of the u64 key.
@@ -2421,31 +2724,19 @@ impl AggregationState {
     /// Partition raw groups by key RANGE: shard i owns [min + i*w, ...).
     /// With clustered keys each state's entries land in few shards, and the
     /// per-shard merge can use direct addressing instead of a hash map.
-    pub(crate) fn into_range_shards(
-        mut self,
-        p: usize,
-        min: i64,
-        w: u64,
-    ) -> Vec<Vec<(u64, Vec<AccumulatorState>)>> {
-        self.demote_raw_sums();
-        let mut shards: Vec<Vec<(u64, Vec<AccumulatorState>)>> =
-            (0..p).map(|_| Vec::new()).collect();
-        for (raw, accs) in self.raw_groups.drain() {
+    pub(crate) fn into_range_shards(mut self, p: usize, min: i64, w: u64) -> Result<Vec<RawRows>> {
+        self.demote_raw_sums()?;
+        self.raw_groups.take_rows().shard(p, |raw| {
             let off = (raw as i64).wrapping_sub(min) as u64;
-            shards[((off / w) as usize).min(p - 1)].push((raw, accs));
-        }
-        shards
+            ((off / w) as usize).min(p - 1)
+        })
     }
 
-    pub(crate) fn into_raw_shards(mut self, p: usize) -> Vec<Vec<(u64, Vec<AccumulatorState>)>> {
-        self.demote_raw_sums();
-        let mut shards: Vec<Vec<(u64, Vec<AccumulatorState>)>> =
-            (0..p).map(|_| Vec::new()).collect();
-        for (raw, accs) in self.raw_groups.drain() {
-            let h = raw.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            shards[(h >> 33) as usize % p].push((raw, accs));
-        }
-        shards
+    pub(crate) fn into_raw_shards(mut self, p: usize) -> Result<Vec<RawRows>> {
+        self.demote_raw_sums()?;
+        self.raw_groups.take_rows().shard(p, |raw| {
+            (raw.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 33) as usize % p
+        })
     }
 
     /// Build a state holding pre-merged RAW groups (raw merge output path).
@@ -2455,13 +2746,16 @@ impl AggregationState {
         raw_type: DataType,
         raw_groups: HashMap<u64, Vec<AccumulatorState>>,
         raw_null: Option<Vec<AccumulatorState>>,
-    ) -> Self {
-        let mut state = Self::new(agg_funcs, input_types);
+        pool: &MemoryPool,
+    ) -> Result<Self> {
+        let mut state = Self::new_with_pool(agg_funcs, input_types, pool);
         state.overflowed = true;
         state.raw_type = Some(raw_type);
-        state.raw_groups = raw_groups;
+        for (key, values) in raw_groups {
+            state.raw_groups.insert_or_merge(key, &values)?;
+        }
         state.raw_null = raw_null;
-        state
+        Ok(state)
     }
 
     /// Build a state that holds pre-merged groups (parallel merge output path).
@@ -2477,7 +2771,7 @@ impl AggregationState {
     }
 
     /// Merge another state into this one
-    pub fn merge(&mut self, other: &AggregationState) {
+    pub fn merge(&mut self, other: &AggregationState) -> Result<()> {
         // Raw-mode reconciliation: if either side holds raw-keyed groups, both
         // sides must abandon the perfect-hash arrays (a key must never live in
         // two places) and converge into the raw maps via normalize_raw below.
@@ -2497,7 +2791,7 @@ impl AggregationState {
                 if idx >= other.key_order.len() {
                     continue;
                 }
-                if !Self::slot_has_data(&other.key_order[idx], other_accs) {
+                if !other.perfect_occupied[idx] {
                     continue;
                 }
 
@@ -2524,6 +2818,8 @@ impl AggregationState {
                             });
                         }
                         self.key_order[our_idx] = key.clone();
+                        self.perfect_occupied.resize(self.key_order.len(), false);
+                        self.perfect_occupied[our_idx] = true;
 
                         for (acc, other_acc) in
                             self.perfect_accs[our_idx].iter_mut().zip(other_accs.iter())
@@ -2586,6 +2882,8 @@ impl AggregationState {
                         });
                     }
                     self.key_order[our_idx] = key.clone();
+                    self.perfect_occupied.resize(self.key_order.len(), false);
+                    self.perfect_occupied[our_idx] = true;
                     for (acc, other_acc) in
                         self.perfect_accs[our_idx].iter_mut().zip(other_accs.iter())
                     {
@@ -2611,35 +2909,14 @@ impl AggregationState {
             }
         }
 
-        // Merge raw-keyed entries
-        for (raw, other_accs) in &other.raw_groups {
-            match self.raw_groups.entry(*raw) {
-                hashbrown::hash_map::Entry::Occupied(mut e) => {
-                    for (a, b) in e.get_mut().iter_mut().zip(other_accs.iter()) {
-                        a.merge(b);
-                    }
-                }
-                hashbrown::hash_map::Entry::Vacant(v) => {
-                    v.insert(other_accs.clone());
-                }
-            }
+        for (raw, values) in other.raw_groups.iter() {
+            self.raw_groups.insert_or_merge(*raw, values)?;
         }
-        // Merge bare-f64 sum entries (folded into boxed raw_groups here; the
-        // fast pair-based merge path never goes through this function).
-        for (raw, v) in &other.raw_sums {
-            match self.raw_groups.entry(*raw) {
-                hashbrown::hash_map::Entry::Occupied(mut e) => {
-                    if let AccumulatorState::Sum(s, seen) = &mut e.get_mut()[0] {
-                        *s += v;
-                        *seen = true;
-                    }
-                }
-                hashbrown::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(vec![AccumulatorState::Sum(*v, true)]);
-                }
-            }
+        for (raw, value) in &other.raw_sums {
+            self.raw_groups
+                .insert_or_merge(*raw, &[AccumulatorState::Sum(*value, true)])?;
         }
-        self.demote_raw_sums();
+        self.demote_raw_sums()?;
         if let Some(other_null) = &other.raw_null {
             match &mut self.raw_null {
                 Some(existing) => {
@@ -2652,8 +2929,9 @@ impl AggregationState {
         }
         // Unify any GroupKey-shaped entries that encode raw keys
         if raw_involved {
-            self.normalize_raw();
+            self.normalize_raw()?;
         }
+        Ok(())
     }
 
     /// Try to find the perfect hash index for a key, assigning new IDs if needed.
@@ -2717,6 +2995,7 @@ impl AggregationState {
                             .collect()
                     })
                     .collect();
+                let mut new_occupied = vec![false; cap];
                 let mut new_key_order: Vec<GroupKey> = (0..cap)
                     .map(|_| GroupKey {
                         values: vec![ScalarValue::Null; n],
@@ -2727,10 +3006,7 @@ impl AggregationState {
                     if old_idx >= self.key_order.len() {
                         continue;
                     }
-                    let has_data = !self.key_order[old_idx]
-                        .values
-                        .iter()
-                        .all(|v| matches!(v, ScalarValue::Null));
+                    let has_data = self.perfect_occupied[old_idx];
                     if !has_data {
                         continue;
                     }
@@ -2751,6 +3027,7 @@ impl AggregationState {
                     }
 
                     std::mem::swap(&mut new_accs[new_idx], &mut self.perfect_accs[old_idx]);
+                    new_occupied[new_idx] = true;
                     new_key_order[new_idx] = std::mem::replace(
                         &mut self.key_order[old_idx],
                         GroupKey {
@@ -2761,6 +3038,7 @@ impl AggregationState {
 
                 self.perfect_accs = new_accs;
                 self.key_order = new_key_order;
+                self.perfect_occupied = new_occupied;
             } else {
                 while self.perfect_accs.len() < cap {
                     self.perfect_accs.push(
@@ -2777,6 +3055,7 @@ impl AggregationState {
                     });
                 }
             }
+            self.perfect_occupied.resize(cap, false);
             self.perfect_capacity = cap;
         }
 
@@ -2791,6 +3070,16 @@ impl AggregationState {
 
     /// Build the output RecordBatch
     pub fn build_output(&self, schema: &SchemaRef) -> Result<RecordBatch> {
+        self.build_output_with_pool(schema, &process_memory_pool())
+    }
+
+    /// Decimal payloads retain their explicit pool reservation through Arrow clones/slices.
+    /// Other state, key and kernel allocations retain their existing accounting contracts.
+    pub(crate) fn build_output_with_pool(
+        &self,
+        schema: &SchemaRef,
+        pool: &MemoryPool,
+    ) -> Result<RecordBatch> {
         let num_group_cols = schema.fields().len() - self.agg_funcs.len();
 
         // Raw-direct fast path: single integer group column with all groups in
@@ -2801,7 +3090,7 @@ impl AggregationState {
             && self.groups.is_empty()
             && (self.overflowed || self.perfect_accs.is_empty())
         {
-            return self.build_output_raw(schema);
+            return self.build_output_raw(schema, pool);
         }
 
         // Collect all groups from perfect hash, HashMap, and raw maps.
@@ -2816,7 +3105,7 @@ impl AggregationState {
         let null_key = GroupKey {
             values: vec![ScalarValue::Null],
         };
-        let mut all_groups: Vec<(&GroupKey, &Vec<AccumulatorState>)> = Vec::new();
+        let mut all_groups: Vec<(&GroupKey, &[AccumulatorState])> = Vec::new();
 
         // From perfect hash
         if !self.overflowed {
@@ -2824,7 +3113,7 @@ impl AggregationState {
                 if idx >= self.key_order.len() {
                     continue;
                 }
-                if Self::slot_has_data(&self.key_order[idx], accs) {
+                if self.perfect_occupied[idx] {
                     all_groups.push((&self.key_order[idx], accs));
                 }
             }
@@ -2888,13 +3177,16 @@ impl AggregationState {
         // Aggregate columns
         for agg_idx in 0..self.agg_funcs.len() {
             let func = &self.agg_funcs[agg_idx];
-            let values: Vec<ScalarValue> = all_groups
+            let values = all_groups
                 .iter()
-                .map(|(_, accs)| accs[agg_idx].finalize(func))
-                .collect();
-
+                .map(|(_, accs)| accs[agg_idx].finalize(func));
             let field = schema.field(num_group_cols + agg_idx);
-            let array = build_scalar_array(&values, field.data_type())?;
+            let array = if let DataType::Decimal128(p, s) = field.data_type() {
+                build_decimal_output(values, num_groups, *p, *s, pool)?
+            } else {
+                let values: Vec<ScalarValue> = values.collect::<Result<_>>()?;
+                build_scalar_array(&values, field.data_type())?
+            };
             arrays.push(array);
         }
 
@@ -2903,21 +3195,27 @@ impl AggregationState {
     }
 
     /// build_output specialization for raw-keyed single-int-column states.
-    fn build_output_raw(&self, schema: &SchemaRef) -> Result<RecordBatch> {
-        let entries: Vec<(u64, &Vec<AccumulatorState>)> =
-            self.raw_groups.iter().map(|(k, v)| (*k, v)).collect();
-        build_output_raw_entries(&entries, self.raw_null.as_ref(), &self.agg_funcs, schema)
+    fn build_output_raw(&self, schema: &SchemaRef, pool: &MemoryPool) -> Result<RecordBatch> {
+        build_output_raw_entries(
+            self.raw_groups.iter().map(|(k, v)| (*k, v)),
+            self.raw_null.as_deref(),
+            &self.agg_funcs,
+            schema,
+            pool,
+        )
     }
 }
 
-/// Build the raw-mode output batch from an entry slice — shared by
+/// Build raw output by replaying a borrowed iterator without collecting row references.
+/// Shared by
 /// AggregationState::build_output_raw and the range-partitioned dense merge
 /// (which never materializes a HashMap).
-pub(crate) fn build_output_raw_entries(
-    entries: &[(u64, &Vec<AccumulatorState>)],
-    raw_null: Option<&Vec<AccumulatorState>>,
+pub(crate) fn build_output_raw_entries<'a>(
+    entries: impl ExactSizeIterator<Item = (u64, &'a [AccumulatorState])> + Clone,
+    raw_null: Option<&[AccumulatorState]>,
     agg_funcs: &[AggregateFunction],
     schema: &SchemaRef,
+    pool: &MemoryPool,
 ) -> Result<RecordBatch> {
     {
         let has_null = raw_null.is_some();
@@ -2929,8 +3227,8 @@ pub(crate) fn build_output_raw_entries(
         let key_array: ArrayRef = match schema.field(0).data_type() {
             DataType::Int32 => {
                 let mut b = Int32Builder::with_capacity(num_groups);
-                for (raw, _) in entries {
-                    b.append_value(*raw as i64 as i32);
+                for (raw, _) in entries.clone() {
+                    b.append_value(raw as i64 as i32);
                 }
                 if has_null {
                     b.append_null();
@@ -2939,18 +3237,26 @@ pub(crate) fn build_output_raw_entries(
             }
             DataType::Date32 => {
                 let mut b = arrow::array::Date32Builder::with_capacity(num_groups);
-                for (raw, _) in entries {
-                    b.append_value(*raw as i64 as i32);
+                for (raw, _) in entries.clone() {
+                    b.append_value(raw as i64 as i32);
                 }
                 if has_null {
                     b.append_null();
                 }
                 Arc::new(b.finish())
             }
+            DataType::Date64 | DataType::Timestamp(_, _) => {
+                let values: Vec<ScalarValue> = entries
+                    .clone()
+                    .map(|(raw, _)| ScalarValue::Int64(raw as i64))
+                    .chain(has_null.then_some(ScalarValue::Null))
+                    .collect();
+                build_scalar_array(&values, schema.field(0).data_type())?
+            }
             _ => {
                 let mut b = Int64Builder::with_capacity(num_groups);
-                for (raw, _) in entries {
-                    b.append_value(*raw as i64);
+                for (raw, _) in entries.clone() {
+                    b.append_value(raw as i64);
                 }
                 if has_null {
                     b.append_null();
@@ -2967,14 +3273,17 @@ pub(crate) fn build_output_raw_entries(
             let func = &agg_funcs[agg_idx];
             let field = schema.field(1 + agg_idx);
             let finalize_iter = entries
-                .iter()
+                .clone()
                 .map(|(_, accs)| accs[agg_idx].finalize(func))
                 .chain(raw_null.map(|accs| accs[agg_idx].finalize(func)));
             let array: ArrayRef = match field.data_type() {
+                DataType::Decimal128(p, s) => {
+                    build_decimal_output(finalize_iter, num_groups, *p, *s, pool)?
+                }
                 DataType::Int64 => {
                     let mut b = Int64Builder::with_capacity(num_groups);
                     for v in finalize_iter {
-                        match v {
+                        match v? {
                             ScalarValue::Int64(x) => b.append_value(x),
                             ScalarValue::Null => b.append_null(),
                             other => b.append_option(scalar_to_i64(&other)),
@@ -2985,7 +3294,7 @@ pub(crate) fn build_output_raw_entries(
                 DataType::Float64 => {
                     let mut b = Float64Builder::with_capacity(num_groups);
                     for v in finalize_iter {
-                        match v {
+                        match v? {
                             ScalarValue::Float64(x) => b.append_value(x.into_inner()),
                             ScalarValue::Null => b.append_null(),
                             other => b.append_option(scalar_to_f64(&other)),
@@ -2994,7 +3303,7 @@ pub(crate) fn build_output_raw_entries(
                     Arc::new(b.finish())
                 }
                 _ => {
-                    let values: Vec<ScalarValue> = finalize_iter.collect();
+                    let values: Vec<ScalarValue> = finalize_iter.collect::<Result<_>>()?;
                     build_scalar_array(&values, field.data_type())?
                 }
             };
@@ -3006,7 +3315,76 @@ pub(crate) fn build_output_raw_entries(
     }
 }
 
-fn extract_scalar(array: &ArrayRef, row: usize) -> ScalarValue {
+/// Retain the exact dictionary encoding supported by the morsel key accessor.
+/// This preserves the combined-key cache without weakening normalization for
+/// generic hash consumers or aggregate inputs. DictString checks both key and
+/// dictionary-value validity and compares logical values across codebooks.
+fn normalize_morsel_group_array(array: ArrayRef) -> Result<ArrayRef> {
+    match array.data_type() {
+        DataType::Dictionary(key, value)
+            if **key == DataType::Int32 && **value == DataType::Utf8 =>
+        {
+            Ok(array)
+        }
+        _ => normalize_aggregate_array(array),
+    }
+}
+
+/// Normalize only evaluated aggregate/key arrays, never the entire input batch.
+/// Unsupported scalar domains fail here rather than becoming fabricated NULLs.
+pub(crate) fn normalize_aggregate_array(array: ArrayRef) -> Result<ArrayRef> {
+    match array.data_type() {
+        DataType::Dictionary(_, value_type) => {
+            let decoded = compute::cast_with_options(
+                array.as_ref(),
+                value_type,
+                &compute::CastOptions {
+                    safe: false,
+                    ..Default::default()
+                },
+            )?;
+            normalize_aggregate_array(decoded)
+        }
+        // Keep temporal counts in their original unit. The output schema owns
+        // unit/timezone metadata; no conversion through microsecond scalars occurs.
+        DataType::Date64 | DataType::Timestamp(_, _) => Ok(compute::cast_with_options(
+            array.as_ref(),
+            &DataType::Int64,
+            &compute::CastOptions {
+                safe: false,
+                ..Default::default()
+            },
+        )?),
+        DataType::LargeUtf8 | DataType::Utf8View => Ok(compute::cast_with_options(
+            array.as_ref(),
+            &DataType::Utf8,
+            &compute::CastOptions {
+                safe: false,
+                ..Default::default()
+            },
+        )?),
+        DataType::Null
+        | DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Utf8
+        | DataType::Date32
+        | DataType::Decimal128(..) => Ok(array),
+        other => Err(QueryError::NotImplemented(format!(
+            "Aggregate scalar domain unsupported: {other:?}"
+        ))),
+    }
+}
+
+pub(crate) fn extract_scalar(array: &ArrayRef, row: usize) -> ScalarValue {
     if array.is_null(row) {
         return ScalarValue::Null;
     }
@@ -3112,8 +3490,7 @@ fn extract_scalar(array: &ArrayRef, row: usize) -> ScalarValue {
                 .downcast_ref::<arrow::array::Decimal128Array>()
                 .unwrap();
             let val = arr.value(row);
-            // Convert i128 to Decimal using scale
-            let decimal = rust_decimal::Decimal::from_i128_with_scale(val, *s as u32);
+            let decimal = DecimalValue::new(val, *s);
             ScalarValue::Decimal128(decimal)
         }
         _ => ScalarValue::Null,
@@ -3129,20 +3506,165 @@ fn build_group_array<'a>(
     build_scalar_array_ref(&values, data_type)
 }
 
-fn build_scalar_array(values: &[ScalarValue], data_type: &DataType) -> Result<ArrayRef> {
+/// Finalize exact decimal values straight into admitted Arrow buffers. The
+/// iterator can fail; both partial buffers are released on any conversion error.
+/// Admission precedes iteration/allocation and returned buffers own the leases.
+fn build_decimal_output(
+    values: impl IntoIterator<Item = Result<ScalarValue>>,
+    rows: usize,
+    precision: u8,
+    scale: i8,
+    pool: &MemoryPool,
+) -> Result<ArrayRef> {
+    use arrow::array::Decimal128Array;
+    use arrow::buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
+    let mut coefficients = ReservedBufferBuilder::<i128>::with_capacity(pool, rows)?;
+    let bytes = rows.div_ceil(8);
+    let mut validity = ReservedBufferBuilder::<u8>::with_capacity(pool, bytes)?;
+    validity.extend_reserved(bytes, std::iter::repeat(0u8))?;
+    let mut has_null = false;
+    coefficients.try_extend_reserved(
+        rows,
+        values
+            .into_iter()
+            .enumerate()
+            .map(|(i, value)| match value? {
+                ScalarValue::Decimal128(value) => {
+                    let scaled = value.rescale(scale)?;
+                    DecimalValue::validate_precision(scaled, precision)?;
+                    validity.as_mut_slice()[i / 8] |= 1 << (i % 8);
+                    Ok(scaled)
+                }
+                ScalarValue::Null => {
+                    has_null = true;
+                    Ok(0)
+                }
+                other => Err(QueryError::Type(format!(
+                    "non-decimal aggregate value {other:?} for {:?}",
+                    DataType::Decimal128(precision, scale)
+                ))),
+            }),
+    )?;
+    let nulls = if has_null {
+        Some(NullBuffer::new(BooleanBuffer::new(
+            validity.finish(),
+            0,
+            rows,
+        )))
+    } else {
+        None
+    };
+    let array = Decimal128Array::new(ScalarBuffer::new(coefficients.finish(), 0, rows), nulls)
+        .with_precision_and_scale(precision, scale)
+        .map_err(|e| QueryError::Execution(format!("Invalid decimal precision/scale: {e}")))?;
+    Ok(Arc::new(array))
+}
+
+pub(crate) fn build_scalar_array(values: &[ScalarValue], data_type: &DataType) -> Result<ArrayRef> {
     let refs: Vec<&ScalarValue> = values.iter().collect();
     build_scalar_array_ref(&refs, data_type)
 }
 
 fn build_scalar_array_ref(values: &[&ScalarValue], data_type: &DataType) -> Result<ArrayRef> {
+    macro_rules! integer_array {
+        ($array:ty, $native:ty) => {{
+            let mut output = Vec::with_capacity(values.len());
+            for value in values {
+                let value = match value {
+                    ScalarValue::Null => {
+                        output.push(None);
+                        continue;
+                    }
+                    ScalarValue::Int8(v) => *v as i128,
+                    ScalarValue::Int16(v) => *v as i128,
+                    ScalarValue::Int32(v) => *v as i128,
+                    ScalarValue::Int64(v) => *v as i128,
+                    ScalarValue::UInt8(v) => *v as i128,
+                    ScalarValue::UInt16(v) => *v as i128,
+                    ScalarValue::UInt32(v) => *v as i128,
+                    ScalarValue::UInt64(v) => *v as i128,
+                    other => {
+                        return Err(QueryError::Type(format!(
+                            "aggregate value {other:?} does not match {data_type:?}"
+                        )))
+                    }
+                };
+                output.push(Some(<$native>::try_from(value).map_err(|_| {
+                    QueryError::Execution(format!("aggregate {data_type:?} overflow"))
+                })?));
+            }
+            Ok(Arc::new(<$array>::from(output)) as ArrayRef)
+        }};
+    }
     match data_type {
+        DataType::Null if values.iter().all(|v| matches!(v, ScalarValue::Null)) => {
+            Ok(arrow::array::new_null_array(data_type, values.len()))
+        }
+        DataType::Date64 | DataType::Timestamp(_, _) => {
+            // Int64 <-> temporal casts preserve raw counts, unlike casts between
+            // timestamp units. Preserve the declared unit and timezone verbatim.
+            let counts = build_scalar_array_ref(values, &DataType::Int64)?;
+            Ok(compute::cast_with_options(
+                counts.as_ref(),
+                data_type,
+                &compute::CastOptions {
+                    safe: false,
+                    ..Default::default()
+                },
+            )?)
+        }
+        DataType::Int8 => integer_array!(arrow::array::Int8Array, i8),
+        DataType::Int16 => integer_array!(arrow::array::Int16Array, i16),
+        DataType::UInt8 => integer_array!(arrow::array::UInt8Array, u8),
+        DataType::UInt16 => integer_array!(arrow::array::UInt16Array, u16),
+        DataType::UInt32 => integer_array!(arrow::array::UInt32Array, u32),
+        DataType::UInt64 => integer_array!(arrow::array::UInt64Array, u64),
+        DataType::Float32 => {
+            let output = values
+                .iter()
+                .map(|value| match value {
+                    ScalarValue::Float32(value) => Ok(Some(value.into_inner())),
+                    ScalarValue::Null => Ok(None),
+                    other => Err(QueryError::Type(format!(
+                        "aggregate value {other:?} does not match {data_type:?}"
+                    ))),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Arc::new(arrow::array::Float32Array::from(output)))
+        }
+        DataType::Dictionary(_, value_type) => {
+            let decoded = build_scalar_array_ref(values, value_type)?;
+            Ok(compute::cast_with_options(
+                decoded.as_ref(),
+                data_type,
+                &compute::CastOptions {
+                    safe: false,
+                    ..Default::default()
+                },
+            )?)
+        }
+        DataType::LargeUtf8 | DataType::Utf8View => {
+            let decoded = build_scalar_array_ref(values, &DataType::Utf8)?;
+            Ok(compute::cast_with_options(
+                decoded.as_ref(),
+                data_type,
+                &compute::CastOptions {
+                    safe: false,
+                    ..Default::default()
+                },
+            )?)
+        }
         DataType::Int64 => {
             let mut builder = Int64Builder::with_capacity(values.len());
             for v in values {
                 match v {
                     ScalarValue::Int64(val) => builder.append_value(*val),
                     ScalarValue::Null => builder.append_null(),
-                    _ => builder.append_null(),
+                    other => {
+                        return Err(QueryError::Type(format!(
+                            "aggregate value {other:?} does not match {data_type:?}"
+                        )))
+                    }
                 }
             }
             Ok(Arc::new(builder.finish()))
@@ -3153,7 +3675,11 @@ fn build_scalar_array_ref(values: &[&ScalarValue], data_type: &DataType) -> Resu
                 match v {
                     ScalarValue::Float64(val) => builder.append_value(val.into_inner()),
                     ScalarValue::Null => builder.append_null(),
-                    _ => builder.append_null(),
+                    other => {
+                        return Err(QueryError::Type(format!(
+                            "aggregate value {other:?} does not match {data_type:?}"
+                        )))
+                    }
                 }
             }
             Ok(Arc::new(builder.finish()))
@@ -3164,7 +3690,11 @@ fn build_scalar_array_ref(values: &[&ScalarValue], data_type: &DataType) -> Resu
                 match v {
                     ScalarValue::Utf8(val) => builder.append_value(val),
                     ScalarValue::Null => builder.append_null(),
-                    _ => builder.append_null(),
+                    other => {
+                        return Err(QueryError::Type(format!(
+                            "aggregate value {other:?} does not match {data_type:?}"
+                        )))
+                    }
                 }
             }
             Ok(Arc::new(builder.finish()))
@@ -3173,41 +3703,33 @@ fn build_scalar_array_ref(values: &[&ScalarValue], data_type: &DataType) -> Resu
             let vals: Vec<Option<i32>> = values
                 .iter()
                 .map(|v| match v {
-                    ScalarValue::Date32(val) => Some(*val),
-                    _ => None,
+                    ScalarValue::Date32(val) => Ok(Some(*val)),
+                    ScalarValue::Null => Ok(None),
+                    other => Err(QueryError::Type(format!(
+                        "aggregate value {other:?} does not match {data_type:?}"
+                    ))),
                 })
-                .collect();
+                .collect::<Result<_>>()?;
             Ok(Arc::new(Date32Array::from(vals)))
         }
-        DataType::Decimal128(p, s) => {
-            let mut builder = Decimal128Builder::with_capacity(values.len());
-            for v in values {
-                match v {
-                    ScalarValue::Decimal128(val) => {
-                        // Convert Decimal to i128 by scaling
-                        let scaled = val.mantissa();
-                        builder.append_value(scaled)
-                    }
-                    ScalarValue::Null => builder.append_null(),
-                    _ => builder.append_null(),
-                }
-            }
-            Ok(Arc::new(
-                builder
-                    .finish()
-                    .with_precision_and_scale(*p, *s)
-                    .map_err(|e| {
-                        QueryError::Execution(format!("Invalid decimal precision/scale: {}", e))
-                    })?,
-            ))
-        }
+        DataType::Decimal128(p, s) => build_decimal_output(
+            values.iter().map(|v| Ok((**v).clone())),
+            values.len(),
+            *p,
+            *s,
+            &process_memory_pool(),
+        ),
         DataType::Boolean => {
             let mut builder = BooleanBuilder::with_capacity(values.len());
             for v in values {
                 match v {
                     ScalarValue::Boolean(val) => builder.append_value(*val),
                     ScalarValue::Null => builder.append_null(),
-                    _ => builder.append_null(),
+                    other => {
+                        return Err(QueryError::Type(format!(
+                            "aggregate value {other:?} does not match {data_type:?}"
+                        )))
+                    }
                 }
             }
             Ok(Arc::new(builder.finish()))
@@ -3217,9 +3739,17 @@ fn build_scalar_array_ref(values: &[&ScalarValue], data_type: &DataType) -> Resu
             for v in values {
                 match v {
                     ScalarValue::Int32(val) => builder.append_value(*val),
-                    ScalarValue::Int64(val) => builder.append_value(*val as i32),
+                    ScalarValue::Int64(val) => {
+                        builder.append_value(i32::try_from(*val).map_err(|_| {
+                            QueryError::Execution("aggregate Int32 overflow".into())
+                        })?)
+                    }
                     ScalarValue::Null => builder.append_null(),
-                    _ => builder.append_null(),
+                    other => {
+                        return Err(QueryError::Type(format!(
+                            "aggregate value {other:?} does not match {data_type:?}"
+                        )))
+                    }
                 }
             }
             Ok(Arc::new(builder.finish()))
@@ -3316,7 +3846,7 @@ pub fn execute_morsel_aggregation(
     let mut final_state = AggregationState::new(agg_funcs.clone(), input_types);
     for result in thread_states {
         let state = result?;
-        final_state.merge(&state);
+        final_state.merge(&state)?;
     }
 
     // Build output
@@ -3329,6 +3859,499 @@ mod dict_accessor_tests {
     use arrow::array::{DictionaryArray, Float64Array, StringArray};
     use arrow::datatypes::{DataType as ADataType, Field, Int32Type, Schema};
     use std::sync::Arc as StdArc;
+
+    #[test]
+    fn morsel_group_normalization_preserves_only_supported_dictionary_encoding() {
+        let dictionary: DictionaryArray<Int32Type> =
+            [Some("a"), None, Some("b")].into_iter().collect();
+        let source: ArrayRef = StdArc::new(dictionary);
+        let group = normalize_morsel_group_array(source.clone()).unwrap();
+        assert!(
+            StdArc::ptr_eq(&source, &group),
+            "group normalization must retain backing buffers"
+        );
+        assert!(matches!(
+            TypedArrayAccessor::from_array(&group),
+            TypedArrayAccessor::DictString(_)
+        ));
+        assert_eq!(
+            normalize_aggregate_array(source).unwrap().data_type(),
+            &DataType::Utf8,
+            "shared aggregate/hash normalization must continue to decode"
+        );
+        let other: DictionaryArray<arrow::datatypes::Int8Type> =
+            [Some("a"), None].into_iter().collect();
+        let normalized = normalize_morsel_group_array(StdArc::new(other)).unwrap();
+        assert_eq!(normalized.data_type(), &DataType::Utf8);
+        assert!(normalized.is_null(1));
+    }
+
+    #[test]
+    fn all_null_group_is_present_even_when_aggregates_saw_no_values() {
+        let schema = StdArc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("v", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                StdArc::new(Int64Array::from(vec![None])),
+                StdArc::new(Float64Array::from(vec![None])),
+            ],
+        )
+        .unwrap();
+        for (functions, inputs, types) in [
+            (
+                vec![AggregateFunction::Sum],
+                vec![Expr::column("v")],
+                vec![DataType::Float64],
+            ),
+            (
+                vec![AggregateFunction::Count],
+                vec![Expr::column("v")],
+                vec![DataType::Float64],
+            ),
+            (vec![], vec![], vec![]),
+        ] {
+            let mut state = AggregationState::new(functions.clone(), types.clone());
+            state
+                .process_batch(&batch, &[Expr::column("k")], &inputs)
+                .unwrap();
+            assert_eq!(state.group_count(), 1);
+            let mut fields = vec![Field::new("k", DataType::Int64, true)];
+            if let Some(function) = functions.first() {
+                fields.push(Field::new(
+                    "a",
+                    if *function == AggregateFunction::Count {
+                        DataType::Int64
+                    } else {
+                        DataType::Float64
+                    },
+                    true,
+                ));
+            }
+            let output_schema = StdArc::new(Schema::new(fields));
+            let output = state.build_output(&output_schema).unwrap();
+            assert_eq!(output.num_rows(), 1);
+            assert!(output.column(0).is_null(0));
+            if functions.first() == Some(&AggregateFunction::Sum) {
+                assert!(output.column(1).is_null(0));
+            }
+            if functions.first() == Some(&AggregateFunction::Count) {
+                assert_eq!(
+                    output
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0),
+                    0
+                );
+            }
+            let mut merged = AggregationState::new(functions, types);
+            merged.merge(&state).unwrap();
+            assert_eq!(merged.build_output(&output_schema).unwrap().num_rows(), 1);
+            state.drain_perfect_to_hashmap();
+            state.overflowed = true;
+            assert_eq!(state.build_output(&output_schema).unwrap().num_rows(), 1);
+        }
+    }
+
+    #[test]
+    fn all_null_group_survives_ingest_and_merge_stride_changes() {
+        let schema = StdArc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                StdArc::new(Int64Array::from(vec![None, None, Some(2)])),
+                StdArc::new(Int64Array::from(vec![None, Some(1), Some(2)])),
+                StdArc::new(Int64Array::from(vec![7, 3, 4])),
+            ],
+        )
+        .unwrap();
+        for merge in [false, true] {
+            let mut state =
+                AggregationState::new(vec![AggregateFunction::Sum], vec![DataType::Int64]);
+            for row in 0..3 {
+                let mut partial =
+                    AggregationState::new(vec![AggregateFunction::Sum], vec![DataType::Int64]);
+                let target = if merge { &mut partial } else { &mut state };
+                target
+                    .process_batch(
+                        &batch.slice(row, 1),
+                        &[Expr::column("a"), Expr::column("b")],
+                        &[Expr::column("v")],
+                    )
+                    .unwrap();
+                if merge {
+                    state.merge(&partial).unwrap();
+                }
+            }
+            let output = state.build_output(&schema).unwrap();
+            assert_eq!(output.num_rows(), 3);
+            let null_row = (0..output.num_rows())
+                .find(|&row| output.column(0).is_null(row) && output.column(1).is_null(row))
+                .unwrap();
+            assert_eq!(
+                output
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(null_row),
+                7
+            );
+        }
+    }
+
+    #[test]
+    fn dictionary_value_nulls_group_with_key_nulls_and_are_not_counted() {
+        let dictionary = DictionaryArray::<Int32Type>::try_new(
+            arrow::array::Int32Array::from(vec![0, 1, 2, 0]),
+            StdArc::new(StringArray::from(vec![None, Some(""), Some("a")])),
+        )
+        .unwrap();
+        let array: ArrayRef = StdArc::new(dictionary);
+        let accessor = TypedArrayAccessor::from_array(&array);
+        assert_eq!(accessor.extract_scalar(0), ScalarValue::Null);
+        assert_eq!(accessor.raw_key(0), u64::MAX);
+        let mut state = AggregationState::new(
+            vec![AggregateFunction::Count],
+            vec![array.data_type().clone()],
+        );
+        let batch = RecordBatch::try_new(
+            StdArc::new(Schema::new(vec![Field::new(
+                "k",
+                array.data_type().clone(),
+                true,
+            )])),
+            vec![array],
+        )
+        .unwrap();
+        // No NULL dictionary keys: exercises combined-dictionary fast path.
+        state
+            .process_batch(&batch, &[Expr::column("k")], &[Expr::column("k")])
+            .unwrap();
+        let null_keys: DictionaryArray<Int32Type> = [None::<&str>].into_iter().collect();
+        let batch2 = RecordBatch::try_new(batch.schema(), vec![StdArc::new(null_keys)]).unwrap();
+        state
+            .process_batch(&batch2, &[Expr::column("k")], &[Expr::column("k")])
+            .unwrap();
+        let schema = StdArc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, true),
+            Field::new("n", DataType::Int64, false),
+        ]));
+        let output = state.build_output(&schema).unwrap();
+        assert_eq!(output.num_rows(), 3);
+        for row in 0..3 {
+            let count = output
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(row);
+            assert_eq!(count, if output.column(0).is_null(row) { 0 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn dictionary_combined_keys_with_extreme_integers_fall_back_exactly() {
+        let dictionary: DictionaryArray<Int32Type> = [Some("a"), Some("a")].into_iter().collect();
+        let schema = StdArc::new(Schema::new(vec![
+            Field::new("d", dictionary.data_type().clone(), false),
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                StdArc::new(dictionary),
+                StdArc::new(Int64Array::from(vec![i64::MIN, i64::MAX])),
+                StdArc::new(Int64Array::from(vec![3, 7])),
+            ],
+        )
+        .unwrap();
+        let mut state = AggregationState::new(vec![AggregateFunction::Sum], vec![DataType::Int64]);
+        state
+            .process_batch(
+                &batch,
+                &[Expr::column("d"), Expr::column("k")],
+                &[Expr::column("v")],
+            )
+            .unwrap();
+        let output_schema = StdArc::new(Schema::new(vec![
+            Field::new("d", DataType::Utf8, false),
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let output = state.build_output(&output_schema).unwrap();
+        let mut rows = (0..output.num_rows())
+            .map(|row| {
+                (
+                    output
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(row),
+                    output
+                        .column(2)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(row),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        assert_eq!(rows, vec![(i64::MIN, 3), (i64::MAX, 7)]);
+    }
+
+    #[test]
+    fn dictionary_combined_logical_null_tuples_match_generic_groups() {
+        let dictionary = DictionaryArray::<Int32Type>::try_new(
+            arrow::array::Int32Array::from(vec![0, 1, 2, 0, 1]),
+            StdArc::new(StringArray::from(vec![None, Some("a"), None])),
+        )
+        .unwrap();
+        // Physical keys are all valid, but two dictionary entries mean SQL NULL.
+        assert_eq!(dictionary.null_count(), 0);
+        let schema = StdArc::new(Schema::new(vec![
+            Field::new("d", dictionary.data_type().clone(), true),
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                StdArc::new(dictionary),
+                StdArc::new(Int64Array::from(vec![1, 2, 1, 3, 3])),
+                StdArc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+            ],
+        )
+        .unwrap();
+        let output_schema = StdArc::new(Schema::new(vec![
+            Field::new("d", DataType::Utf8, true),
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let expected = vec![
+            (None, 1, 4),
+            (None, 3, 4),
+            (Some("a".to_string()), 2, 2),
+            (Some("a".to_string()), 3, 5),
+        ];
+        for generic in [false, true] {
+            let mut state =
+                AggregationState::new(vec![AggregateFunction::Sum], vec![DataType::Int64]);
+            state.overflowed = generic;
+            state
+                .process_batch(
+                    &batch,
+                    &[Expr::column("d"), Expr::column("k")],
+                    &[Expr::column("v")],
+                )
+                .unwrap();
+            let output = state.build_output(&output_schema).unwrap();
+            let strings = output
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let keys = output
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let sums = output
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let mut rows = (0..output.num_rows())
+                .map(|row| {
+                    (
+                        (!strings.is_null(row)).then(|| strings.value(row).to_string()),
+                        keys.value(row),
+                        sums.value(row),
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.sort();
+            assert_eq!(rows, expected, "generic={generic}");
+        }
+    }
+
+    #[test]
+    fn raw_sum_nullable_batches_keep_unseen_groups_boxed() {
+        let schema = StdArc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Float64, true),
+        ]));
+        let mut state =
+            AggregationState::new(vec![AggregateFunction::Sum], vec![DataType::Float64]);
+        state.overflowed = true; // isolate the representation entered after perfect overflow
+        for value in [None, Some(5.0), None] {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    StdArc::new(Int64Array::from(vec![7])),
+                    StdArc::new(Float64Array::from(vec![value])),
+                ],
+            )
+            .unwrap();
+            state
+                .process_batch(&batch, &[Expr::column("k")], &[Expr::column("v")])
+                .unwrap();
+            if value.is_none() && state.raw_sums.is_empty() {
+                assert!(!state.absorb_raw_groups_into_sums());
+                assert!(state.build_output(&schema).unwrap().column(1).is_null(0));
+            }
+        }
+        state.demote_raw_sums().unwrap();
+        let output = state.build_output(&schema).unwrap();
+        assert_eq!(output.num_rows(), 1);
+        assert_eq!(
+            output
+                .column(1)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0),
+            5.0
+        );
+    }
+
+    #[test]
+    fn decimal_accessor_keeps_exact_sum_and_null_state() {
+        for scale in [-4, 2, 38] {
+            let coefficient = 10_i128.pow(36) + 17;
+            let array: ArrayRef = StdArc::new(
+                arrow::array::Decimal128Array::from(vec![
+                    None,
+                    Some(coefficient),
+                    Some(-coefficient + 23),
+                    None,
+                ])
+                .with_precision_and_scale(38, scale)
+                .unwrap(),
+            );
+            let accessor = TypedArrayAccessor::from_array(&array);
+            let mut sum = AccumulatorState::new(&AggregateFunction::Sum, array.data_type());
+            accessor.update_accumulator(0, &mut sum);
+            assert!(matches!(
+                sum,
+                AccumulatorState::SumDecimal { seen: false, .. }
+            ));
+            for row in 1..4 {
+                accessor.update_accumulator(row, &mut sum);
+            }
+            assert!(matches!(
+                sum,
+                AccumulatorState::SumDecimal {
+                    coefficient: Some(23),
+                    seen: true,
+                    ..
+                }
+            ));
+            let mut count = AccumulatorState::Count(0);
+            for row in 0..4 {
+                accessor.update_accumulator(row, &mut count);
+            }
+            assert!(matches!(count, AccumulatorState::Count(2)));
+            let mut overflow = AccumulatorState::SumDecimal {
+                coefficient: Some(i128::MAX),
+                scale,
+                seen: true,
+            };
+            accessor.update_accumulator(1, &mut overflow);
+            accessor.update_accumulator(2, &mut overflow);
+            assert!(matches!(
+                overflow,
+                AccumulatorState::SumDecimal {
+                    coefficient: None,
+                    seen: true,
+                    ..
+                }
+            ));
+            assert_eq!(
+                accessor.extract_scalar(1),
+                ScalarValue::Decimal128(DecimalValue::new(coefficient, scale))
+            );
+        }
+    }
+
+    #[test]
+    fn null_sentinel_does_not_merge_negative_integer_groups() {
+        for data_type in [DataType::Int64, DataType::Int32, DataType::Date32] {
+            for null_first in [false, true] {
+                let values = if null_first {
+                    vec![None, Some(-1)]
+                } else {
+                    vec![Some(-1), None]
+                };
+                let keys: ArrayRef = match data_type {
+                    DataType::Int64 => StdArc::new(Int64Array::from(values.clone())),
+                    DataType::Int32 => StdArc::new(arrow::array::Int32Array::from(
+                        values
+                            .iter()
+                            .map(|v| v.map(|x| x as i32))
+                            .collect::<Vec<_>>(),
+                    )),
+                    _ => StdArc::new(Date32Array::from(
+                        values
+                            .iter()
+                            .map(|v| v.map(|x| x as i32))
+                            .collect::<Vec<_>>(),
+                    )),
+                };
+                let schema = StdArc::new(Schema::new(vec![
+                    Field::new("k", data_type.clone(), true),
+                    Field::new("v", DataType::Int64, false),
+                ]));
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![keys, StdArc::new(Int64Array::from(vec![3, 7]))],
+                )
+                .unwrap();
+                let mut state =
+                    AggregationState::new(vec![AggregateFunction::Sum], vec![DataType::Int64]);
+                // Separate batches exercise an existing raw-key hit, not just insertion.
+                for row in 0..2 {
+                    state
+                        .process_batch(
+                            &batch.slice(row, 1),
+                            &[Expr::column("k")],
+                            &[Expr::column("v")],
+                        )
+                        .unwrap();
+                }
+                let output = state.build_output(&schema).unwrap();
+                assert_eq!(
+                    output.num_rows(),
+                    2,
+                    "{data_type:?}, null_first={null_first}"
+                );
+                let sums = output
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                for row in 0..2 {
+                    let expected = if output.column(0).is_null(row) == null_first {
+                        3
+                    } else {
+                        7
+                    };
+                    assert_eq!(sums.value(row), expected);
+                }
+            }
+        }
+    }
 
     /// Dictionary-encoded group keys aggregate identically to plain strings,
     /// including across batches with DIFFERENT dictionaries for equal values.
@@ -3400,3 +4423,9 @@ mod dict_accessor_tests {
         assert!((got[1].1 - 110.0).abs() < 1e-9);
     }
 }
+
+#[cfg(test)]
+mod decimal_output_tests;
+
+#[cfg(test)]
+mod domain_tests;

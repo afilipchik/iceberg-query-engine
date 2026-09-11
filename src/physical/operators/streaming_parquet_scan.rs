@@ -10,24 +10,28 @@ use crate::storage::row_group_pruning;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use futures::StreamExt;
 use std::fmt;
+#[cfg(test)]
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
+mod admitted;
 
 /// A work unit: one row group from one file
 #[derive(Debug, Clone)]
 struct RowGroupWork {
-    file_path: PathBuf,
+    file_path: Arc<PathBuf>,
     row_group_idx: usize,
+    snapshot: Arc<crate::storage::metadata_cache::ParquetSnapshot>,
 }
 
 /// Streaming Parquet scan operator that reads row groups on-demand.
 ///
 /// Unlike `MemoryTableExec` which materializes all data before processing,
-/// this operator lazily reads one row group at a time, keeping memory usage
-/// bounded by `batch_size * num_partitions`.
+/// this operator lazily reads row groups. Reader output row limits do not
+/// account for decoder pages, predicate scratch or all concurrent partitions;
+/// downstream byte admission remains necessary.
 /// Runtime join-key filter payload: a bitmap over a bounded key range when
 /// the build keys span a small domain (one AND per probe test, L2-resident),
 /// otherwise a hash set. A 222K-key HashSet probed 60M times cost as much as
@@ -36,6 +40,7 @@ struct RowGroupWork {
 pub enum RuntimeFilterPayload {
     Bitmap { min: i64, bits: Vec<u64> },
     Set(hashbrown::HashSet<i64>),
+    Admitted(super::runtime_filter::AdmittedRuntimeFilter),
 }
 
 impl RuntimeFilterPayload {
@@ -43,17 +48,16 @@ impl RuntimeFilterPayload {
     pub fn contains(&self, v: i64) -> bool {
         match self {
             RuntimeFilterPayload::Bitmap { min, bits } => {
-                let off = v.wrapping_sub(*min);
-                if off < 0 {
+                let Some(off) = v.checked_sub(*min).and_then(|v| usize::try_from(v).ok()) else {
                     return false;
-                }
-                let off = off as usize;
+                };
                 match bits.get(off >> 6) {
                     Some(w) => (w >> (off & 63)) & 1 == 1,
                     None => false,
                 }
             }
             RuntimeFilterPayload::Set(set) => set.contains(&v),
+            RuntimeFilterPayload::Admitted(filter) => filter.contains(v),
         }
     }
 }
@@ -81,15 +85,18 @@ pub struct StreamingParquetScanExec {
     /// Logical schema with proper qualified column names
     schema: SchemaRef,
     /// Projection column indices
-    projection: Option<Vec<usize>>,
+    projection: Arc<Option<Vec<usize>>>,
     /// Row groups to read, distributed across partitions
-    partitioned_work: Vec<Vec<RowGroupWork>>,
+    partitioned_work: Vec<Arc<Vec<RowGroupWork>>>,
     /// Batch size for reading
     batch_size: usize,
+    /// Planner-estimated pressure selects streaming/reader policy, not a byte proof.
+    memory_pressure: bool,
+    memory_pool: crate::execution::SharedMemoryPool,
     /// Runtime filter configuration (written by the planner when a join links)
     runtime_filter: RuntimeFilterConfig,
     /// Static predicate applied at the decoder (expr, provider column indices)
-    filter_spec: Option<(Expr, Vec<usize>)>,
+    filter_spec: Arc<Option<(Expr, Vec<usize>)>>,
     /// Schema override coercing dict-safe filter string columns
     dict_filter_schema: Option<SchemaRef>,
     /// Post-projection column positions to cast back to Utf8 on emission
@@ -98,6 +105,9 @@ pub struct StreamingParquetScanExec {
     /// A file that has one is read decode-free; filters that the parquet
     /// path pushes into the decoder apply vectorized post-load instead.
     ipc_dirs: std::collections::HashMap<PathBuf, PathBuf>,
+    /// Enforced exposed-byte layout for raw fixed-width output only. Presence
+    /// never changes provider routing; any available IPC sidecar declines it.
+    fixed_output: Option<Arc<crate::physical::fixed_width_output::FixedWidthOutputLayout>>,
 }
 
 impl fmt::Debug for StreamingParquetScanExec {
@@ -126,8 +136,33 @@ impl StreamingParquetScanExec {
         filter: Option<&Expr>,
         provider_schema: &SchemaRef,
     ) -> Result<Self> {
+        Self::try_new_with_batch_size(
+            table_name,
+            files,
+            schema,
+            projection,
+            filter,
+            provider_schema,
+            8_192,
+            false,
+        )
+    }
+
+    /// Configure reader output before decoding. Strict row targets use Parquet
+    /// directly: the IPC shortcut materializes a row group and may emit larger
+    /// batches, so reslicing its result would retain an unbudgeted remainder.
+    pub fn try_new_with_batch_size(
+        table_name: impl Into<String>,
+        files: &[PathBuf],
+        schema: SchemaRef,
+        projection: Option<Vec<usize>>,
+        filter: Option<&Expr>,
+        provider_schema: &SchemaRef,
+        batch_size: usize,
+        enforce_batch_size: bool,
+    ) -> Result<Self> {
         let table_name = table_name.into();
-        let batch_size = 8_192;
+        let batch_size = batch_size.max(1);
 
         // Dictionary coercion for filter string columns: when every
         // reference to a Utf8 column in the predicate is dictionary-safe
@@ -154,14 +189,12 @@ impl StreamingParquetScanExec {
                         && safe.iter().any(|c| c.eq_ignore_ascii_case(f.name()))
                     {
                         changed = true;
-                        arrow::datatypes::Field::new(
-                            f.name(),
-                            arrow::datatypes::DataType::Dictionary(
+                        f.as_ref()
+                            .clone()
+                            .with_data_type(arrow::datatypes::DataType::Dictionary(
                                 Box::new(arrow::datatypes::DataType::Int32),
                                 Box::new(arrow::datatypes::DataType::Utf8),
-                            ),
-                            f.is_nullable(),
-                        )
+                            ))
                     } else {
                         f.as_ref().clone()
                     }
@@ -224,23 +257,28 @@ impl StreamingParquetScanExec {
         // Discover matching row groups from all files
         let mut all_work = Vec::new();
         for file_path in files {
-            let file = File::open(file_path)?;
-            let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-            let metadata = builder.metadata().clone();
+            let snapshot = Arc::new(crate::storage::metadata_cache::ParquetSnapshot::open(
+                file_path,
+                dict_filter_schema.clone(),
+            )?);
+            let metadata = snapshot.metadata().metadata();
 
             let matching_rgs =
                 row_group_pruning::prune_row_groups(&metadata, provider_schema, filter);
 
+            let shared_path = Arc::new(file_path.clone());
+
             for rg_idx in matching_rgs {
                 all_work.push(RowGroupWork {
-                    file_path: file_path.clone(),
+                    file_path: shared_path.clone(),
                     row_group_idx: rg_idx,
+                    snapshot: snapshot.clone(),
                 });
             }
         }
 
         let ipc_dirs: std::collections::HashMap<PathBuf, PathBuf> =
-            if crate::storage::ipc_cache::enabled() {
+            if !enforce_batch_size && batch_size == 8_192 && crate::storage::ipc_cache::enabled() {
                 files
                     .iter()
                     .filter_map(|f| {
@@ -273,17 +311,30 @@ impl StreamingParquetScanExec {
             None => schema,
         };
 
+        let fixed_output = if ipc_dirs.is_empty() {
+            crate::physical::fixed_width_output::FixedWidthOutputLayout::try_new(
+                projected_schema.clone(),
+                batch_size,
+            )
+            .map(Arc::new)
+        } else {
+            None
+        };
+
         Ok(Self {
             table_name,
             schema: projected_schema,
-            projection,
-            partitioned_work,
+            projection: Arc::new(projection),
+            partitioned_work: partitioned_work.into_iter().map(Arc::new).collect(),
             batch_size,
+            memory_pressure: false,
+            memory_pool: crate::execution::process_memory_pool(),
             runtime_filter: RuntimeFilterConfig::default(),
-            filter_spec,
+            filter_spec: Arc::new(filter_spec),
             dict_filter_schema,
             coerce_back,
             ipc_dirs,
+            fixed_output,
         })
     }
 
@@ -291,10 +342,53 @@ impl StreamingParquetScanExec {
     pub fn runtime_filter_config(&self) -> RuntimeFilterConfig {
         std::sync::Arc::clone(&self.runtime_filter)
     }
+
+    pub(crate) fn with_memory_pressure(mut self, memory_pressure: bool) -> Self {
+        self.memory_pressure = memory_pressure;
+        self
+    }
+
+    pub(crate) fn with_memory_pool(mut self, pool: crate::execution::SharedMemoryPool) -> Self {
+        self.memory_pool = pool;
+        self
+    }
+
+    fn uses_admitted_reader(&self) -> bool {
+        self.memory_pressure && self.fixed_output.is_none() && self.ipc_dirs.is_empty()
+    }
 }
 
 #[async_trait]
 impl PhysicalOperator for StreamingParquetScanExec {
+    fn runtime_filter_target(
+        &self,
+        output: usize,
+    ) -> Option<crate::physical::plan::RuntimeFilterTarget> {
+        if self.schema.fields().get(output)?.data_type() != &arrow::datatypes::DataType::Int64 {
+            return None;
+        }
+        let source = match self.projection.as_ref() {
+            Some(projection) => *projection.get(output)?,
+            None => output,
+        };
+        Some((self.runtime_filter_config(), source))
+    }
+    async fn prepare_admitted_queue_input(
+        &self,
+        pool: crate::execution::SharedMemoryPool,
+    ) -> Result<Option<crate::physical::PreparedAdmittedInput>> {
+        admitted::prepare(self, pool)
+    }
+    fn pool_independent_queue_copy_bound(
+        &self,
+    ) -> Option<crate::physical::queue_layout::QueueCopyBound> {
+        Some(self.fixed_output.as_ref()?.queue_bound())
+    }
+    fn pool_independent_gather_copy_bound(
+        &self,
+    ) -> Option<crate::physical::queue_layout::GatherCopyBound> {
+        Some(self.fixed_output.as_ref()?.gather_bound())
+    }
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -311,8 +405,11 @@ impl PhysicalOperator for StreamingParquetScanExec {
         if partition >= self.partitioned_work.len() {
             return Ok(Box::pin(futures::stream::empty()));
         }
+        if self.uses_admitted_reader() {
+            return Ok(admitted::execute(self, partition));
+        }
 
-        let work_items = self.partitioned_work[partition].clone();
+        let work_items = self.partitioned_work[partition].as_ref().clone();
         let projection = self.projection.clone();
         let batch_size = self.batch_size;
         let schema = self.schema.clone();
@@ -321,7 +418,7 @@ impl PhysicalOperator for StreamingParquetScanExec {
         // its build side drains — a scan that started earlier (semi/anti
         // probes drained concurrently) would otherwise never see it.
         let runtime_cfg = std::sync::Arc::clone(&self.runtime_filter);
-        let filter_spec = std::sync::Arc::new(self.filter_spec.clone());
+        let filter_spec = self.filter_spec.clone();
         let dict_schema = self.dict_filter_schema.clone();
         let coerce_back = std::sync::Arc::new(self.coerce_back.clone());
 
@@ -375,7 +472,9 @@ impl PhysicalOperator for StreamingParquetScanExec {
                     if let Some(mut reader) = current_reader.take() {
                         match reader.next() {
                             Some(Ok(batch)) => {
-                                let result = wrap_batch(batch, &schema, &coerce_back);
+                                let result =
+                                    reorder_parquet_projection(batch, projection.as_deref())
+                                        .and_then(|batch| wrap_batch(batch, &schema, &coerce_back));
                                 return Some((
                                     result,
                                     (
@@ -440,7 +539,7 @@ impl PhysicalOperator for StreamingParquetScanExec {
                     // once per DICTIONARY VALUE there, and post-load evaluation
                     // over materialized strings measurably loses (Q13
                     // 425→538ms when this guard was missing).
-                    let ipc_dir = ipc_dirs.get(&work.file_path).filter(|dir| {
+                    let ipc_dir = ipc_dirs.get(work.file_path.as_ref()).filter(|dir| {
                         // v2 sidecars store low-cardinality strings dict-
                         // encoded; a dict-coercion scan may take the IPC path
                         // when every column it wants coerced is stored dict
@@ -498,17 +597,7 @@ impl PhysicalOperator for StreamingParquetScanExec {
                         }
                     }
 
-                    let builder = match match &dict_schema {
-                        Some(ds) => {
-                            crate::storage::metadata_cache::cached_reader_builder_with_schema(
-                                &work.file_path,
-                                ds.clone(),
-                            )
-                        }
-                        None => {
-                            crate::storage::metadata_cache::cached_reader_builder(&work.file_path)
-                        }
-                    } {
+                    let builder = match work.snapshot.reader_builder() {
                         Ok(b) => b,
                         Err(e) => {
                             return Some((
@@ -606,7 +695,7 @@ impl PhysicalOperator for StreamingParquetScanExec {
                         ))
                     };
 
-                    let builder = if let Some(ref indices) = projection {
+                    let builder = if let Some(indices) = projection.as_ref() {
                         let mask = parquet::arrow::ProjectionMask::roots(
                             builder.parquet_schema(),
                             indices.iter().copied(),
@@ -641,7 +730,13 @@ impl PhysicalOperator for StreamingParquetScanExec {
             },
         );
 
-        Ok(Box::pin(stream))
+        let fixed_output = self.fixed_output.clone();
+        Ok(Box::pin(stream.map(move |result| {
+            result.and_then(|batch| match &fixed_output {
+                Some(layout) => layout.normalize(batch),
+                None => Ok(batch),
+            })
+        })))
     }
 
     fn output_partitions(&self) -> usize {
@@ -650,6 +745,19 @@ impl PhysicalOperator for StreamingParquetScanExec {
 
     fn name(&self) -> &str {
         "StreamingParquetScan"
+    }
+
+    fn execution_details(&self) -> Option<String> {
+        Some(serde_json::json!({
+            "table": self.table_name,
+            "reader_batch_rows": self.batch_size,
+            "decoder": if self.uses_admitted_reader() { "admitted_flat" } else { "legacy" },
+            "memory_pressure": self.memory_pressure,
+            "route": if self.ipc_dirs.is_empty() { "parquet" } else { "parquet_or_ipc_sidecar" },
+            "copied_output_bound": if self.fixed_output.is_some() { "fixed_width" } else { "unknown" },
+            "partitions": self.output_partitions(),
+            "projected_types": self.schema.fields().iter().map(|f| f.data_type().to_string()).collect::<Vec<_>>(),
+        }).to_string())
     }
 }
 
@@ -663,10 +771,154 @@ impl fmt::Display for StreamingParquetScanExec {
             total_rgs,
             self.partitioned_work.len()
         )?;
-        if let Some(ref proj) = self.projection {
+        if let Some(proj) = self.projection.as_ref() {
             write!(f, " projection={:?}", proj)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod execution_detail_tests {
+    use super::*;
+    use arrow::{
+        array::StringArray,
+        datatypes::{DataType, Field, Schema},
+    };
+    use futures::TryStreamExt;
+
+    #[tokio::test]
+    async fn replaced_file_cannot_reuse_planned_row_groups() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("data.parquet");
+        let replacement = directory.path().join("replacement.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, true)]));
+        let write = |path: &std::path::Path, values: Vec<Option<&str>>| {
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(values))])
+                    .unwrap();
+            let mut writer = parquet::arrow::ArrowWriter::try_new(
+                File::create(path).unwrap(),
+                schema.clone(),
+                Some(
+                    parquet::file::properties::WriterProperties::builder()
+                        .set_max_row_group_size(2)
+                        .build(),
+                ),
+            )
+            .unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        };
+        write(&path, vec![Some("old"), None, Some("old"), Some("tail")]);
+        let stamp = File::open(&path)
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .modified()
+            .unwrap();
+        let scan = StreamingParquetScanExec::try_new_with_batch_size(
+            "versioned",
+            std::slice::from_ref(&path),
+            schema.clone(),
+            None,
+            None,
+            &schema,
+            2,
+            true,
+        )
+        .unwrap();
+        write(&replacement, vec![Some("new"), Some("new")]);
+        File::open(&replacement)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stamp))
+            .unwrap();
+        std::fs::rename(replacement, path).unwrap();
+        for partition in 0..scan.output_partitions() {
+            let mut stream = scan.execute(partition).await.unwrap();
+            let error = stream
+                .try_next()
+                .await
+                .expect_err("changed file must refuse before output");
+            assert!(
+                error.to_string().contains("changed after scan planning"),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reported_variable_reader_quantum_matches_actual_batches() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("variable.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, true)]));
+        let values: Vec<Option<String>> = (0..39)
+            .map(|i| {
+                if i % 5 == 0 {
+                    None
+                } else {
+                    Some(format!("duplicate-{}", i % 3))
+                }
+            })
+            .collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(values.clone()))],
+        )
+        .unwrap();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(
+            File::create(&path).unwrap(),
+            schema.clone(),
+            None,
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        for (rows, pressure, expected_batches) in [(1, true, 39), (17, false, 3)] {
+            let scan = StreamingParquetScanExec::try_new_with_batch_size(
+                "variable",
+                std::slice::from_ref(&path),
+                schema.clone(),
+                None,
+                None,
+                &schema,
+                rows,
+                true,
+            )
+            .unwrap()
+            .with_memory_pressure(pressure);
+            let plan = crate::physical::plan::display_plan(&scan, 0);
+            let details: serde_json::Value =
+                serde_json::from_str(plan.trim().strip_prefix("StreamingParquetScan ").unwrap())
+                    .unwrap();
+            let actual_quantum = rows;
+            assert_eq!(details["reader_batch_rows"], actual_quantum);
+            assert_eq!(details["memory_pressure"], pressure);
+            assert_eq!(details["route"], "parquet");
+            assert_eq!(details["copied_output_bound"], "unknown");
+            assert_eq!(details["projected_types"], serde_json::json!(["Utf8"]));
+            let mut actual = Vec::new();
+            let mut count = 0;
+            for partition in 0..scan.output_partitions() {
+                let mut stream = scan.execute(partition).await.unwrap();
+                while let Some(batch) = stream.try_next().await.unwrap() {
+                    assert!(batch.num_rows() <= actual_quantum);
+                    count += 1;
+                    actual.extend(
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .unwrap()
+                            .iter()
+                            .map(|s| s.map(str::to_owned)),
+                    );
+                }
+            }
+            assert_eq!(count, expected_batches);
+            assert_eq!(actual, values);
+        }
     }
 }
 
@@ -833,6 +1085,39 @@ fn ipc_read_work(
     Ok(out)
 }
 
+/// Parquet ProjectionMask is a set: readers emit unique roots in file order.
+/// Restore the requested order and repeated columns before applying logical
+/// names/types. IPC's RecordBatch::project already preserves that order.
+fn reorder_parquet_projection(
+    batch: RecordBatch,
+    requested: Option<&[usize]>,
+) -> Result<RecordBatch> {
+    let Some(requested) = requested else {
+        return Ok(batch);
+    };
+    if requested.windows(2).all(|pair| pair[0] < pair[1]) {
+        if batch.num_columns() != requested.len() {
+            return Err(QueryError::Execution(
+                "Parquet projection column count differs".into(),
+            ));
+        }
+        return Ok(batch);
+    }
+    let mut roots = requested.to_vec();
+    roots.sort_unstable();
+    roots.dedup();
+    if batch.num_columns() != roots.len() {
+        return Err(QueryError::Execution(
+            "Parquet projection root count differs".into(),
+        ));
+    }
+    let order = requested
+        .iter()
+        .map(|root| roots.binary_search(root).expect("requested root retained"))
+        .collect::<Vec<_>>();
+    batch.project(&order).map_err(Into::into)
+}
+
 /// dictionary filter columns back to Utf8 (survivors only — the RowFilter
 /// already dropped non-matching rows).
 fn wrap_batch(
@@ -871,4 +1156,296 @@ fn wrap_batch(
     }
     RecordBatch::try_new(schema.clone(), cols)
         .map_err(|e| QueryError::Execution(format!("Schema mismatch: {}", e)))
+}
+
+#[cfg(test)]
+mod batch_configuration_tests {
+    use super::*;
+    use futures::TryStreamExt;
+
+    #[tokio::test]
+    async fn configured_reader_emits_bounded_batches_with_complete_nullable_values() {
+        use arrow::array::{ArrayRef, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bounded.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let expected: Vec<Option<i64>> = (0..1171)
+            .map(|i| if i % 7 == 0 { None } else { Some(i - 500) })
+            .collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(expected.clone())) as ArrayRef],
+        )
+        .unwrap();
+        let properties = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_size(200)
+            .build();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(
+            std::fs::File::create(&path).unwrap(),
+            schema.clone(),
+            Some(properties),
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let exec = StreamingParquetScanExec::try_new_with_batch_size(
+            "bounded",
+            &[path],
+            schema.clone(),
+            None,
+            None,
+            &schema,
+            17,
+            true,
+        )
+        .unwrap();
+        let mut actual = Vec::new();
+        let mut batches = 0;
+        for partition in 0..exec.output_partitions() {
+            let mut stream = exec.execute(partition).await.unwrap();
+            while let Some(batch) = stream.try_next().await.unwrap() {
+                assert!(batch.num_rows() <= 17);
+                batches += 1;
+                actual.extend(
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .iter(),
+                );
+            }
+        }
+        assert!(batches > 1);
+        actual.sort_unstable();
+        let mut expected = expected;
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+}
+
+#[cfg(test)]
+mod fixed_streaming_contract_tests {
+    use super::*;
+    use crate::physical::operators::spillable::owned_input_batch_charge;
+    use crate::planner::{BinaryOp, ScalarValue};
+    use arrow::array::{Array, ArrayRef, Date32Array, Decimal128Array, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use futures::TryStreamExt;
+
+    fn fixture(path: &std::path::Path) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Decimal128(20, 3), true),
+            Field::new("day", DataType::Date32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..257)) as ArrayRef,
+                Arc::new(
+                    Decimal128Array::from(
+                        (0..257)
+                            .map(|i| {
+                                if i % 5 == 0 {
+                                    None
+                                } else {
+                                    Some(i as i128 * 123 - 10000)
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .with_precision_and_scale(20, 3)
+                    .unwrap(),
+                ),
+                Arc::new(Date32Array::from(
+                    (0..257)
+                        .map(|i| if i % 7 == 0 { None } else { Some(i - 120) })
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let properties = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(61))
+            .build();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(
+            File::create(path).unwrap(),
+            schema,
+            Some(properties),
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        batch
+    }
+
+    #[tokio::test]
+    async fn raw_projection_static_runtime_filters_preserve_values_and_copy_bounds() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fixed.parquet");
+        let input = fixture(&path);
+        for (low, high) in [(0, 257), (71, 193), (500, 600)] {
+            let predicate = Expr::BinaryExpr {
+                left: Box::new(Expr::BinaryExpr {
+                    left: Box::new(Expr::column("id")),
+                    op: BinaryOp::GtEq,
+                    right: Box::new(Expr::Literal(ScalarValue::Int64(low))),
+                }),
+                op: BinaryOp::And,
+                right: Box::new(Expr::BinaryExpr {
+                    left: Box::new(Expr::column("id")),
+                    op: BinaryOp::Lt,
+                    right: Box::new(Expr::Literal(ScalarValue::Int64(high))),
+                }),
+            };
+            let scan = StreamingParquetScanExec::try_new_with_batch_size(
+                "fixed",
+                &[path.clone()],
+                input.schema(),
+                Some(vec![1, 2, 0, 1]),
+                Some(&predicate),
+                &input.schema(),
+                17,
+                true,
+            )
+            .unwrap();
+            assert!(scan.resident_queue_copy_bound().is_none());
+            let bound = scan
+                .pool_independent_queue_copy_bound()
+                .unwrap()
+                .max_bytes()
+                .unwrap();
+            assert!(scan.pool_independent_gather_copy_bound().is_some());
+            let admitted = (0..257).filter(|i| i % 3 == 1).collect();
+            let slot = Arc::new(parking_lot::Mutex::new(Some(Arc::new(
+                RuntimeFilterPayload::Set(admitted),
+            ))));
+            scan.runtime_filter_config().lock().push((0, slot));
+            let mut actual = Vec::new();
+            for partition in 0..scan.output_partitions() {
+                let mut stream = scan.execute(partition).await.unwrap();
+                while let Some(batch) = stream.try_next().await.unwrap() {
+                    assert!(batch.num_rows() <= 17);
+                    assert!(owned_input_batch_charge(&batch).unwrap() <= bound);
+                    assert_eq!(batch.column(0), batch.column(3));
+                    let ids = batch
+                        .column(2)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap();
+                    let amounts = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Decimal128Array>()
+                        .unwrap();
+                    let days = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Date32Array>()
+                        .unwrap();
+                    for i in 0..batch.num_rows() {
+                        actual.push((
+                            ids.value(i),
+                            (!amounts.is_null(i)).then(|| amounts.value(i)),
+                            (!days.is_null(i)).then(|| days.value(i)),
+                        ));
+                    }
+                }
+            }
+            actual.sort();
+            let expected = (0..257i64)
+                .filter(|i| *i >= low && *i < high && i % 3 == 1)
+                .map(|i| {
+                    (
+                        i,
+                        (i % 5 != 0).then_some(i as i128 * 123 - 10000),
+                        (i % 7 != 0).then_some(i as i32 - 120),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_ipc_sidecar_preserves_route_and_declines_raw_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fixed.parquet");
+        let input = fixture(&path);
+        let sidecar = directory.path().join("fixed.parquet.qeipc");
+        std::fs::create_dir(&sidecar).unwrap();
+        // Match each actual source row group with its exact Arrow representation.
+        for (rg, start) in (0..257).step_by(61).enumerate() {
+            let batch = input.slice(start, (257 - start).min(61));
+            let mut writer = arrow::ipc::writer::FileWriter::try_new(
+                File::create(sidecar.join(format!("rg_{rg:05}.arrow"))).unwrap(),
+                &batch.schema(),
+            )
+            .unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        let metadata = std::fs::metadata(&path).unwrap();
+        let modified = metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        std::fs::write(
+            sidecar.join(".complete"),
+            format!("v2:{}:{modified}", metadata.len()),
+        )
+        .unwrap();
+        let scan = StreamingParquetScanExec::try_new(
+            "fixed",
+            &[path.clone()],
+            input.schema(),
+            None,
+            None,
+            &input.schema(),
+        )
+        .unwrap();
+        if crate::storage::ipc_cache::enabled() {
+            assert_eq!(scan.ipc_dirs.len(), 1);
+            assert!(scan.pool_independent_queue_copy_bound().is_none());
+            assert!(scan.pool_independent_gather_copy_bound().is_none());
+        } else {
+            assert!(scan.ipc_dirs.is_empty());
+            assert!(scan.pool_independent_queue_copy_bound().is_some());
+        }
+        let mut ids = Vec::new();
+        for p in 0..scan.output_partitions() {
+            let mut stream = scan.execute(p).await.unwrap();
+            while let Some(batch) = stream.try_next().await.unwrap() {
+                ids.extend(
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .copied(),
+                );
+            }
+        }
+        ids.sort();
+        assert_eq!(ids, (0..257).collect::<Vec<_>>());
+        let strict = StreamingParquetScanExec::try_new_with_batch_size(
+            "fixed",
+            &[path],
+            input.schema(),
+            None,
+            None,
+            &input.schema(),
+            17,
+            true,
+        )
+        .unwrap();
+        assert!(strict.ipc_dirs.is_empty());
+        assert!(strict.pool_independent_queue_copy_bound().is_some());
+    }
 }

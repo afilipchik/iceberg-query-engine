@@ -56,7 +56,7 @@ const LANCE_BATCH_SIZE: usize = 8192;
 /// bridged. Creating a runtime per scan would be both wasteful and *wrong*:
 /// `Runtime::block_on` panics when called from inside another runtime's
 /// context, and scans run inside the engine's async execution. A single shared
-/// runtime, driven from a dedicated thread (see `block_on_lance`), avoids both.
+/// runtime, reached through a bounded reply channel (see `block_on_lance`), avoids both.
 ///
 /// Sized to `num_cpus`, not a small constant: a scan fans out one task per
 /// fragment (58 for SF=10 lineitem), and a narrow pool would serialize the
@@ -76,21 +76,36 @@ pub(super) fn lance_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-/// Drive a Lance future to completion from synchronous code.
+/// Drive a Lance future on the persistent I/O runtime and return its result.
 ///
-/// The future is driven on the shared Lance runtime from a *separate* thread,
-/// so this is safe to call whether or not the caller is already inside an async
-/// context — the nested-runtime panic only triggers when `block_on` runs on a
-/// thread already owned by a runtime.
-fn block_on_lance<F, T>(fut: F) -> Result<T>
+/// The one-slot reply channel avoids a new bridge thread (and abandoned thread
+/// heap) on every operation. The future runs on the independent Lance runtime,
+/// so callers may be synchronous or inside a current-thread Tokio runtime.
+/// Reentrant callers on the Lance runtime hand their worker core back while
+/// waiting, preserving nested I/O progress instead of starving that runtime.
+pub(super) fn block_on_lance<F, T>(fut: F) -> Result<T>
 where
     F: std::future::Future<Output = Result<T>> + Send + 'static,
     T: Send + 'static,
 {
     let rt = lance_runtime();
-    std::thread::spawn(move || rt.block_on(fut))
-        .join()
-        .unwrap_or_else(|_| Err(QueryError::Execution("Lance scan thread panicked".into())))
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let _task = rt.spawn(async move {
+        let result = fut.await;
+        let _ = sender.send(result);
+    });
+    let receive = || {
+        receiver.recv().unwrap_or_else(|_| {
+            Err(QueryError::Execution(
+                "Lance I/O task panicked or was cancelled before returning a result".into(),
+            ))
+        })
+    };
+    if tokio::runtime::Handle::try_current().is_ok_and(|current| current.id() == rt.handle().id()) {
+        tokio::task::block_in_place(receive)
+    } else {
+        receive()
+    }
 }
 
 fn lance_err(context: &str, e: impl fmt::Display) -> QueryError {
@@ -2270,6 +2285,83 @@ mod tests {
         assert_eq!(
             lance_filter_sql(&e, &s).unwrap(),
             "(l_orderkey > 3) AND (l_returnflag = 'R') AND (l_quantity < 24)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod runtime_bridge_contract {
+    use super::*;
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    #[test]
+    fn sequential_calls_reuse_bounded_runtime_workers() {
+        let workers = num_cpus::get().max(2);
+        let mut threads = HashSet::new();
+        for _ in 0..workers + 8 {
+            let id = block_on_lance(async { Ok(std::thread::current().id()) }).unwrap();
+            threads.insert(id);
+        }
+        assert!(
+            threads.len() <= workers,
+            "{} calls ran on {} distinct threads, exceeding {} runtime workers",
+            workers + 8,
+            threads.len(),
+            workers
+        );
+    }
+
+    #[test]
+    fn values_and_storage_errors_survive_the_bridge() {
+        assert_eq!(
+            block_on_lance(async { Ok(vec![1_i64, 2, 2]) }).unwrap(),
+            vec![1, 2, 2]
+        );
+        let error =
+            block_on_lance(async { Err::<(), _>(QueryError::Storage("bridge-marker".into())) })
+                .unwrap_err();
+        assert!(matches!(error, QueryError::Storage(ref message) if message == "bridge-marker"));
+    }
+
+    #[test]
+    fn a_panicking_future_returns_a_named_error() {
+        let error = block_on_lance(async {
+            panic!("intentional bridge panic");
+            #[allow(unreachable_code)]
+            Ok::<(), QueryError>(())
+        })
+        .unwrap_err();
+        assert!(matches!(error, QueryError::Execution(_)));
+        assert!(error.to_string().contains("Lance"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_thread_caller_can_drive_lance_io() {
+        let value = block_on_lance(async {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            Ok(17)
+        })
+        .unwrap();
+        assert_eq!(value, 17);
+    }
+
+    #[test]
+    fn caller_on_lance_runtime_can_drive_nested_io() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        lance_runtime().spawn(async move {
+            let result = block_on_lance(async {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                Ok(23)
+            });
+            let _ = sender.send(result);
+        });
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap(),
+            23
         );
     }
 }

@@ -226,6 +226,15 @@ impl PhysicalOperator for VectorSearchExec {
 
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
         crate::physical::check_partition(self, partition)?;
+        // The fallback must already represent a global Sort+Limit result.
+        // Validate before provider work as well: an indexed result must never
+        // hide a malformed exact fallback that later loses whole partitions.
+        if self.fallback.output_partitions() != 1 {
+            return Err(QueryError::Execution(format!(
+                "VectorSearch exact fallback must have one global output partition, got {}",
+                self.fallback.output_partitions(),
+            )));
+        }
 
         if let Some(batches) = self.try_index()? {
             let results: Vec<Result<RecordBatch>> = batches.into_iter().map(Ok).collect();

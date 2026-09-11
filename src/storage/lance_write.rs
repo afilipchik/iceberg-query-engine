@@ -76,21 +76,13 @@ fn lance_err(context: &str, e: impl std::fmt::Display) -> QueryError {
     QueryError::Storage(format!("Lance {}: {}", context, e))
 }
 
-/// Run a Lance write on the shared Lance runtime.
-///
-/// Same reasoning as the reader's `block_on_lance`: `Runtime::block_on` panics
-/// if called from a thread a runtime already owns, and writes are invoked from
-/// synchronous CLI code that may or may not be inside one. Driving the future
-/// from a dedicated thread is safe either way.
+/// Use the same persistent-worker bridge and runtime-context handling as reads.
 fn block_on_write<F, T>(fut: F) -> Result<T>
 where
     F: std::future::Future<Output = Result<T>> + Send + 'static,
     T: Send + 'static,
 {
-    let rt = super::lance::lance_runtime();
-    std::thread::spawn(move || rt.block_on(fut))
-        .join()
-        .unwrap_or_else(|_| Err(QueryError::Execution("Lance write thread panicked".into())))
+    super::lance::block_on_lance(fut)
 }
 
 /// Write a `RecordBatchReader` to `path`.

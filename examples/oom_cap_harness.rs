@@ -47,12 +47,14 @@
 //!
 //! Exit-code protocol (consumed by the shell driver):
 //!   0   = scenario COMPLETED with a correct-looking result
-//!   2   = scenario REFUSED cleanly (a named engine error; process alive)
+//!   2   = scenario REFUSED cleanly (allowlisted resource diagnostic only)
 //!   1   = wrong result / unexpected error class
 //!   134 = abort at the rlimit cap (allocation failure) — a FAIL verdict
 //!   137 = SIGKILL by the kernel/memcg — a FAIL verdict
 //!
 //! Env knobs:
+//!   QE_HARNESS_PARTITIONS    positive generator partition count (default 1)
+//!   QE_HARNESS_RESIDENT_INPUT 1 = immutable development fixture (max 2M rows/input); default lazy
 //!   QE_HARNESS_ROWS          synthetic rows for agg/sort (default 250_000_000 — ~4GB raw, comfortably above BOTH default cap levers)
 //!   QE_HARNESS_MEMORY_LIMIT  engine memory_limit bytes for agg/sort
 //!                            (default 256MB — far below the input, so the
@@ -81,7 +83,7 @@
 //!   spill / ON-filter spill — post-fix: COMPLETED with the closed-form
 //!   counts documented at `scenario_join`.)
 
-use arrow::array::Int64Array;
+use arrow::array::{Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use futures::stream::TryStreamExt;
@@ -90,12 +92,198 @@ use query_engine::physical::operators::spillable::AggregateExpr;
 use query_engine::physical::operators::{
     ExternalSortExec, SpillableHashAggregateExec, SpillableHashJoinExec,
 };
+use query_engine::physical::queue_layout::QueueCopyBound;
 use query_engine::physical::{PhysicalOperator, RecordBatchStream};
 use query_engine::planner::{AggregateFunction, BinaryOp, Expr, JoinType, SortExpr};
 use query_engine::{ExecutionConfig, ExecutionContext};
 use std::sync::Arc;
 
 const BATCH_ROWS: i64 = 131_072;
+
+const VALUE_MODULUS: i64 = 1_000_003;
+const VALUE_MULTIPLIER: i64 = 2_654_435_761;
+
+fn harness_partitions() -> query_engine::Result<usize> {
+    let value = std::env::var("QE_HARNESS_PARTITIONS").unwrap_or_else(|_| "1".into());
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|n| *n > 0)
+        .ok_or_else(|| {
+            query_engine::QueryError::InvalidArgument(
+                "QE_HARNESS_PARTITIONS must be a positive integer".into(),
+            )
+        })
+}
+
+fn partition_range(
+    total: i64,
+    offset: i64,
+    partitions: usize,
+    partition: usize,
+) -> query_engine::Result<(i64, i64)> {
+    if total < 0 || offset < 0 || partitions == 0 || partition >= partitions {
+        return Err(query_engine::QueryError::InvalidArgument(
+            "invalid generator range/partition".into(),
+        ));
+    }
+    let end = offset.checked_add(total).ok_or_else(|| {
+        query_engine::QueryError::InvalidArgument("generator ID range overflow".into())
+    })?;
+    if end > i64::MAX / VALUE_MULTIPLIER {
+        return Err(query_engine::QueryError::InvalidArgument(
+            "generator range exceeds exact nonoverflow multiplication domain".into(),
+        ));
+    }
+    let first = (total as u128 * partition as u128 / partitions as u128) as i64;
+    let last = (total as u128 * (partition as u128 + 1) / partitions as u128) as i64;
+    Ok((offset + first, last - first))
+}
+
+fn wrong(message: impl Into<String>) -> query_engine::QueryError {
+    query_engine::QueryError::Execution(format!("WRONG RESULT: {}", message.into()))
+}
+
+fn bitmap(bits: usize) -> query_engine::Result<Vec<u64>> {
+    let words = bits
+        .checked_add(63)
+        .ok_or_else(|| wrong("validator bitmap size overflow"))?
+        / 64;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(words)
+        .map_err(|e| wrong(format!("validator bitmap allocation failed: {e}")))?;
+    values.resize(words, 0);
+    Ok(values)
+}
+fn mark_unique(seen: &mut [u64], id: usize) -> bool {
+    let bit = 1u64 << (id % 64);
+    let word = &mut seen[id / 64];
+    let fresh = *word & bit == 0;
+    *word |= bit;
+    fresh
+}
+fn int_column(batch: &RecordBatch, index: usize) -> query_engine::Result<&Int64Array> {
+    batch
+        .columns()
+        .get(index)
+        .and_then(|a| a.as_any().downcast_ref())
+        .ok_or_else(|| wrong("missing or non-Int64 output column"))
+}
+
+struct AggregateOracle {
+    total: i64,
+    inverse: i64,
+    seen: Vec<u64>,
+    groups: usize,
+}
+impl AggregateOracle {
+    fn new(total: i64) -> query_engine::Result<Self> {
+        partition_range(total, 0, 1, 0)?;
+        // Extended Euclid independently inverts the generator's modular map.
+        let (mut old_r, mut r) = (VALUE_MODULUS, VALUE_MULTIPLIER % VALUE_MODULUS);
+        let (mut old_t, mut t) = (0i64, 1i64);
+        while r != 0 {
+            let q = old_r / r;
+            (old_r, r) = (r, old_r - q * r);
+            (old_t, t) = (t, old_t - q * t);
+        }
+        if old_r != 1 {
+            return Err(wrong("generator modular map is not bijective"));
+        }
+        Ok(Self {
+            total,
+            inverse: old_t.rem_euclid(VALUE_MODULUS),
+            seen: bitmap(VALUE_MODULUS as usize)?,
+            groups: 0,
+        })
+    }
+    fn accept(&mut self, batch: &RecordBatch) -> query_engine::Result<()> {
+        if batch.num_columns() != 2 {
+            return Err(wrong("expected exactly two output columns"));
+        }
+        let (keys, counts) = (int_column(batch, 0)?, int_column(batch, 1)?);
+        for row in 0..batch.num_rows() {
+            if keys.is_null(row) || counts.is_null(row) {
+                return Err(wrong("NULL aggregate key/count"));
+            }
+            let key = keys.value(row);
+            if !(0..VALUE_MODULUS).contains(&key) {
+                return Err(wrong("aggregate key outside generator domain"));
+            }
+            let residue = ((key as i128 * self.inverse as i128) % VALUE_MODULUS as i128) as i64;
+            let expected = if residue < self.total {
+                1 + (self.total - 1 - residue) / VALUE_MODULUS
+            } else {
+                0
+            };
+            if expected == 0
+                || counts.value(row) != expected
+                || !mark_unique(&mut self.seen, key as usize)
+            {
+                return Err(wrong("aggregate key multiplicity/count mismatch"));
+            }
+            self.groups += 1;
+        }
+        Ok(())
+    }
+    fn finish(&self) -> query_engine::Result<()> {
+        if self.groups != self.total.min(VALUE_MODULUS) as usize {
+            return Err(wrong("missing aggregate groups"));
+        }
+        Ok(())
+    }
+}
+
+struct SortOracle {
+    total: i64,
+    seen: Vec<u64>,
+    rows: usize,
+    last: i64,
+}
+impl SortOracle {
+    fn new(total: i64) -> query_engine::Result<Self> {
+        partition_range(total, 0, 1, 0)?;
+        Ok(Self {
+            total,
+            seen: bitmap(total as usize)?,
+            rows: 0,
+            last: i64::MIN,
+        })
+    }
+    fn accept(&mut self, batch: &RecordBatch) -> query_engine::Result<()> {
+        if batch.num_columns() != 2 {
+            return Err(wrong("expected exactly two output columns"));
+        }
+        let (ids, values) = (int_column(batch, 0)?, int_column(batch, 1)?);
+        for row in 0..batch.num_rows() {
+            if ids.is_null(row) || values.is_null(row) {
+                return Err(wrong("NULL sorted ID/value"));
+            }
+            let (id, value) = (ids.value(row), values.value(row));
+            // Reduce operands first: this oracle does not duplicate generator
+            // wrapping multiplication and stays bounded below modulus squared.
+            let expected =
+                (id.rem_euclid(VALUE_MODULUS) * (VALUE_MULTIPLIER % VALUE_MODULUS)) % VALUE_MODULUS;
+            if !(0..self.total).contains(&id)
+                || value != expected
+                || value < self.last
+                || !mark_unique(&mut self.seen, id as usize)
+            {
+                return Err(wrong("sorted range/value/order/uniqueness mismatch"));
+            }
+            self.last = value;
+            self.rows += 1;
+        }
+        Ok(())
+    }
+    fn finish(&self) -> query_engine::Result<()> {
+        if self.rows != self.total as usize {
+            return Err(wrong("missing sorted IDs"));
+        }
+        Ok(())
+    }
+}
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
@@ -135,6 +323,7 @@ struct LazyGeneratorExec {
     /// 0 for every scenario except the join ones, whose probe side needs
     /// a key range that only partially overlaps the build side.
     id_offset: i64,
+    partitions: usize,
 }
 
 fn make_batch(schema: &SchemaRef, start: i64, n: i64) -> RecordBatch {
@@ -163,18 +352,16 @@ impl PhysicalOperator for LazyGeneratorExec {
         vec![]
     }
     fn output_partitions(&self) -> usize {
-        1
+        self.partitions
     }
     fn name(&self) -> &str {
         "LazyGenerator"
     }
     async fn execute(&self, partition: usize) -> query_engine::Result<RecordBatchStream> {
-        if partition != 0 {
-            return Ok(Box::pin(futures::stream::empty()));
-        }
+        query_engine::physical::check_partition(self, partition)?;
+        let (id_offset, total_rows) =
+            partition_range(self.total_rows, self.id_offset, self.partitions, partition)?;
         let schema = self.schema.clone();
-        let total_rows = self.total_rows;
-        let id_offset = self.id_offset;
         let stream = futures::stream::unfold(0i64, move |emitted| {
             let schema = schema.clone();
             async move {
@@ -186,6 +373,133 @@ impl PhysicalOperator for LazyGeneratorExec {
             }
         });
         Ok(Box::pin(stream))
+    }
+}
+
+// This opt-in fixture is resident before execution. Its allocations are subject
+// to the process/cgroup cap, not admitted by the query pool. The capability only
+// covers copied queue output and absence of same-pool dependencies while pulling.
+const MAX_RESIDENT_FIXTURE_ROWS: i64 = 2_000_000;
+
+#[derive(Debug)]
+struct ResidentGeneratorExec {
+    schema: SchemaRef,
+    batches: Arc<Vec<RecordBatch>>,
+    partition_batches: Vec<std::ops::Range<usize>>,
+    bound: QueueCopyBound,
+    fixture_array_bytes: usize,
+}
+
+impl ResidentGeneratorExec {
+    fn new(generator: LazyGeneratorExec) -> query_engine::Result<Self> {
+        partition_range(
+            generator.total_rows,
+            generator.id_offset,
+            generator.partitions,
+            0,
+        )?;
+        if generator.total_rows > MAX_RESIDENT_FIXTURE_ROWS {
+            return Err(query_engine::QueryError::Execution(format!(
+                "resident harness fixture requires explicit rows <= {MAX_RESIDENT_FIXTURE_ROWS} per input"
+            )));
+        }
+        let mut batches = Vec::new();
+        let mut partition_batches = Vec::new();
+        partition_batches
+            .try_reserve_exact(generator.partitions)
+            .map_err(|e| {
+                query_engine::QueryError::Execution(format!(
+                    "resident fixture partition metadata: {e}"
+                ))
+            })?;
+        let mut fixture_array_bytes = 0usize;
+        for partition in 0..generator.partitions {
+            let (offset, rows) = partition_range(
+                generator.total_rows,
+                generator.id_offset,
+                generator.partitions,
+                partition,
+            )?;
+            let first = batches.len();
+            let mut emitted = 0;
+            while emitted < rows {
+                let n = BATCH_ROWS.min(rows - emitted);
+                let batch = make_batch(&generator.schema, offset + emitted, n);
+                for array in batch.columns() {
+                    fixture_array_bytes = fixture_array_bytes
+                        .checked_add(array.get_array_memory_size())
+                        .ok_or_else(|| {
+                            query_engine::QueryError::Execution(
+                                "resident fixture byte count overflow".into(),
+                            )
+                        })?;
+                }
+                batches.push(batch);
+                emitted += n;
+            }
+            partition_batches.push(first..batches.len());
+        }
+        let bound = QueueCopyBound::from_batches(&generator.schema, &batches).ok_or_else(|| {
+            query_engine::QueryError::Execution("resident fixture copy layout unsupported".into())
+        })?;
+        Ok(Self {
+            schema: generator.schema,
+            batches: Arc::new(batches),
+            partition_batches,
+            bound,
+            fixture_array_bytes,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl PhysicalOperator for ResidentGeneratorExec {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+    fn children(&self) -> Vec<Arc<dyn PhysicalOperator>> {
+        vec![]
+    }
+    fn output_partitions(&self) -> usize {
+        self.partition_batches.len()
+    }
+    fn name(&self) -> &str {
+        "ResidentHarnessFixture"
+    }
+    fn resident_queue_copy_bound(&self) -> Option<QueueCopyBound> {
+        Some(self.bound.clone())
+    }
+    async fn execute(&self, partition: usize) -> query_engine::Result<RecordBatchStream> {
+        query_engine::physical::check_partition(self, partition)?;
+        let batches = self.batches.clone();
+        let range = self.partition_batches[partition].clone();
+        // Clone batch metadata only when requested, keeping exactly the declared
+        // partition ranges, including empty partitions. No query-pool calls.
+        Ok(Box::pin(futures::stream::iter(
+            range.map(move |index| Ok(batches[index].clone())),
+        )))
+    }
+}
+
+fn generator_input(
+    generator: LazyGeneratorExec,
+    label: &str,
+) -> query_engine::Result<Arc<dyn PhysicalOperator>> {
+    match std::env::var("QE_HARNESS_RESIDENT_INPUT").as_deref() {
+        Ok("1") => {
+            let rows = generator.total_rows;
+            let fixture = ResidentGeneratorExec::new(generator)?;
+            eprintln!(
+                "resident_input={label} rows={rows} fixture_array_bytes={} copied_queue_bound_bytes={} input_partitions={} rayon_threads={} envelope_selection=not_observed",
+                fixture.fixture_array_bytes, fixture.bound.max_bytes().expect("validated bound"),
+                fixture.output_partitions(), rayon::current_num_threads(),
+            );
+            Ok(Arc::new(fixture))
+        }
+        Err(std::env::VarError::NotPresent) | Ok("0") => Ok(Arc::new(generator)),
+        _ => Err(query_engine::QueryError::Execution(
+            "QE_HARNESS_RESIDENT_INPUT must be 0 or 1".into(),
+        )),
     }
 }
 
@@ -203,11 +517,15 @@ fn spill_dir(tag: &str) -> std::path::PathBuf {
 async fn scenario_agg() -> query_engine::Result<String> {
     let total_rows = env_usize("QE_HARNESS_ROWS", 250_000_000) as i64;
     let memory_limit = env_usize("QE_HARNESS_MEMORY_LIMIT", 256 * 1024 * 1024);
-    let input: Arc<dyn PhysicalOperator> = Arc::new(LazyGeneratorExec {
-        schema: gen_schema(),
-        total_rows,
-        id_offset: 0,
-    });
+    let input = generator_input(
+        LazyGeneratorExec {
+            schema: gen_schema(),
+            total_rows,
+            id_offset: 0,
+            partitions: harness_partitions()?,
+        },
+        "agg",
+    )?;
     // GROUP BY val (1,000,003 distinct groups), COUNT(DISTINCT id).
     // `distinct: true` makes this fused-streaming-INELIGIBLE by
     // construction (`fused_streaming_eligible` requires `!a.distinct`), so
@@ -221,6 +539,7 @@ async fn scenario_agg() -> query_engine::Result<String> {
     let config = ExecutionConfig::new()
         .with_memory_limit(memory_limit)
         .with_spill_path(sd.clone());
+    let pool = create_memory_pool(memory_limit);
     let agg = SpillableHashAggregateExec::new(
         input,
         vec![Expr::column("val")],
@@ -231,71 +550,63 @@ async fn scenario_agg() -> query_engine::Result<String> {
             second_arg: None,
         }],
         out_schema,
-        create_memory_pool(memory_limit),
+        pool.clone(),
         config,
     );
-    let mut stream = agg.execute(0).await?;
-    let mut groups = 0usize;
-    while let Some(batch) = stream.try_next().await? {
-        groups += batch.num_rows();
+    let mut oracle = AggregateOracle::new(total_rows)?;
+    for partition in 0..agg.output_partitions() {
+        let mut stream = agg.execute(partition).await?;
+        while let Some(batch) = stream.try_next().await? {
+            oracle.accept(&batch)?;
+        }
     }
+    oracle.finish()?;
+    eprintln!(
+        "query_reserved_peak_bytes={} envelope_selection=not_observed",
+        pool.reserved_peak()
+    );
     let _ = std::fs::remove_dir_all(&sd);
-    let expected = 1_000_003.min(total_rows as usize);
-    if groups == expected {
-        Ok(format!("groups={groups} (expected {expected})"))
-    } else {
-        Err(query_engine::QueryError::Execution(format!(
-            "WRONG RESULT: groups={groups}, expected {expected}"
-        )))
-    }
+    Ok(format!("groups={} exact_counts=true input_partitions={} output_partitions={} spilled={} spill_accounted_bytes={} validator_bytes={}", oracle.groups, harness_partitions()?, agg.output_partitions(), pool.spilled() > 0, pool.spilled(), oracle.seen.len() * 8))
 }
 
 async fn scenario_sort() -> query_engine::Result<String> {
     let total_rows = env_usize("QE_HARNESS_ROWS", 250_000_000) as i64;
     let memory_limit = env_usize("QE_HARNESS_MEMORY_LIMIT", 256 * 1024 * 1024);
-    let input: Arc<dyn PhysicalOperator> = Arc::new(LazyGeneratorExec {
-        schema: gen_schema(),
-        total_rows,
-        id_offset: 0,
-    });
+    let input = generator_input(
+        LazyGeneratorExec {
+            schema: gen_schema(),
+            total_rows,
+            id_offset: 0,
+            partitions: harness_partitions()?,
+        },
+        "sort",
+    )?;
     let sd = spill_dir("sort");
     let _ = std::fs::remove_dir_all(&sd);
     let config = ExecutionConfig::new()
         .with_memory_limit(memory_limit)
         .with_spill_path(sd.clone());
+    let pool = create_memory_pool(memory_limit);
     let sort = ExternalSortExec::new(
         input,
         vec![SortExpr::new(Expr::column("val")).asc()],
-        create_memory_pool(memory_limit),
+        pool.clone(),
         config,
     );
-    let mut stream = sort.execute(0).await?;
-    let mut rows = 0usize;
-    let mut last: i64 = i64::MIN;
-    let mut ordered = true;
-    while let Some(batch) = stream.try_next().await? {
-        rows += batch.num_rows();
-        let col = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("val column is Int64");
-        for i in 0..col.len() {
-            let v = col.value(i);
-            if v < last {
-                ordered = false;
-            }
-            last = v;
+    let mut oracle = SortOracle::new(total_rows)?;
+    for partition in 0..sort.output_partitions() {
+        let mut stream = sort.execute(partition).await?;
+        while let Some(batch) = stream.try_next().await? {
+            oracle.accept(&batch)?;
         }
     }
+    oracle.finish()?;
+    eprintln!(
+        "query_reserved_peak_bytes={} envelope_selection=not_observed",
+        pool.reserved_peak()
+    );
     let _ = std::fs::remove_dir_all(&sd);
-    if rows == total_rows as usize && ordered {
-        Ok(format!("rows={rows}, globally ordered"))
-    } else {
-        Err(query_engine::QueryError::Execution(format!(
-            "WRONG RESULT: rows={rows} (expected {total_rows}), ordered={ordered}"
-        )))
-    }
+    Ok(format!("rows={} exact_ids_values=true globally_ordered=true input_partitions={} output_partitions={} spilled={} spill_accounted_bytes={} validator_bytes={}", oracle.rows, harness_partitions()?, sort.output_partitions(), pool.spilled() > 0, pool.spilled(), oracle.seen.len() * 8))
 }
 
 async fn scenario_native_scan() -> query_engine::Result<String> {
@@ -381,6 +692,7 @@ async fn scenario_insert() -> query_engine::Result<String> {
 /// ON filter can name both sides unambiguously.
 async fn scenario_join(join_type: JoinType) -> query_engine::Result<String> {
     let build_rows = env_usize("QE_HARNESS_JOIN_BUILD_ROWS", 40_000_000) as i64;
+    partition_range(build_rows, 0, 1, 0)?;
     let build_right = env_str("QE_HARNESS_JOIN_BUILD_RIGHT", "1") != "0";
     let memory_limit = env_usize("QE_HARNESS_MEMORY_LIMIT", 256 * 1024 * 1024);
     let filter_mode = env_str("QE_HARNESS_FILTER", "eq");
@@ -391,16 +703,24 @@ async fn scenario_join(join_type: JoinType) -> query_engine::Result<String> {
         Field::new("pid", DataType::Int64, false),
         Field::new("pval", DataType::Int64, false),
     ]));
-    let build: Arc<dyn PhysicalOperator> = Arc::new(LazyGeneratorExec {
-        schema: gen_schema(),
-        total_rows: build_rows,
-        id_offset: 0,
-    });
-    let probe: Arc<dyn PhysicalOperator> = Arc::new(LazyGeneratorExec {
-        schema: probe_schema,
-        total_rows: probe_rows,
-        id_offset: probe_offset,
-    });
+    let build = generator_input(
+        LazyGeneratorExec {
+            schema: gen_schema(),
+            total_rows: build_rows,
+            id_offset: 0,
+            partitions: harness_partitions()?,
+        },
+        "join_build",
+    )?;
+    let probe = generator_input(
+        LazyGeneratorExec {
+            schema: probe_schema,
+            total_rows: probe_rows,
+            id_offset: probe_offset,
+            partitions: harness_partitions()?,
+        },
+        "join_probe",
+    )?;
     let (left, right, on) = if build_right {
         (
             probe,
@@ -439,22 +759,23 @@ async fn scenario_join(join_type: JoinType) -> query_engine::Result<String> {
     } else {
         None
     };
-    let join = SpillableHashJoinExec::new(
-        left,
-        right,
-        on,
-        join_type,
-        create_memory_pool(memory_limit),
-        config,
-    )
-    .with_build_right(build_right)
-    .with_filter(filter);
-    let mut stream = join.execute(0).await?;
+    let pool = create_memory_pool(memory_limit);
+    let join = SpillableHashJoinExec::new(left, right, on, join_type, pool.clone(), config)
+        .with_build_right(build_right)
+        .with_filter(filter);
     let mut rows = 0usize;
-    while let Some(batch) = stream.try_next().await? {
-        rows += batch.num_rows();
+    let output_partitions = join.output_partitions();
+    for partition in 0..output_partitions {
+        let mut stream = join.execute(partition).await?;
+        while let Some(batch) = stream.try_next().await? {
+            rows += batch.num_rows();
+        }
     }
     drop(join);
+    eprintln!(
+        "query_reserved_peak_bytes={} envelope_selection=not_observed",
+        pool.reserved_peak()
+    );
     let _ = std::fs::remove_dir_all(&sd);
     let quarter = (build_rows / 4) as usize;
     let expected = match (join_type, build_right) {
@@ -474,12 +795,64 @@ async fn scenario_join(join_type: JoinType) -> query_engine::Result<String> {
     };
     if rows == expected {
         Ok(format!(
-            "{join_type:?} join (build_right={build_right}) rows={rows} (expected {expected})"
+            "{join_type:?} join (build_right={build_right}) rows={rows} (expected {expected}) input_partitions={} output_partitions={output_partitions} spilled={} spill_accounted_bytes={}", harness_partitions()?, pool.spilled() > 0, pool.spilled()
         ))
     } else {
         Err(query_engine::QueryError::Execution(format!(
             "WRONG RESULT: {join_type:?} join (build_right={build_right}) rows={rows}, expected {expected}"
         )))
+    }
+}
+
+/// Fail closed: recognize typed pool admission pressure and the one fixed
+/// legacy join guard. Display text cannot prove a resource refusal.
+fn resource_refusal(error: &query_engine::QueryError) -> Option<&'static str> {
+    if error.is_memory_limit() {
+        return Some("memory-pool");
+    }
+    match error.root() {
+        query_engine::QueryError::Execution(message)
+            if message == "HashJoin legacy candidate memory bound exceeded; bounded output support required" =>
+        {
+            Some("legacy-join-candidate")
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod classifier_tests {
+    use super::resource_refusal;
+    use query_engine::{execution::MemoryPool, QueryError};
+
+    #[test]
+    fn real_owned_pool_denial_is_a_named_resource_refusal() {
+        let pool = MemoryPool::new_named("cap-fixture", 16);
+        let _held = pool.allocate(12).unwrap();
+        let denied = pool.allocate(5).unwrap_err();
+        assert_eq!(resource_refusal(&denied), Some("memory-pool"));
+        assert_eq!(
+            resource_refusal(&QueryError::Execution(
+                "HashJoin legacy candidate memory bound exceeded; bounded output support required"
+                    .into()
+            )),
+            Some("legacy-join-candidate")
+        );
+    }
+
+    #[test]
+    fn wrong_results_nonresource_errors_and_malformed_diagnostics_fail() {
+        for error in [
+            QueryError::Execution("WRONG RESULT: rows=1, expected 2".into()),
+            QueryError::Execution("aggregate spill sub-partitioning routed rows incorrectly".into()),
+            QueryError::Execution("Failed to create spill directory: permission denied".into()),
+            QueryError::NotImplemented("memory limit exceeded".into()),
+            QueryError::InvalidArgument("unknown scenario".into()),
+            QueryError::Execution("unrelated memory budget problem".into()),
+            QueryError::Execution("Memory limit exceeded in 'x': requested 1 additional bytes, used 0, limit 100".into()),
+            QueryError::Execution("Memory limit exceeded in 'x': requested 2 additional bytes, used 0, limit 1 WRONG RESULT".into()),
+            QueryError::Execution("Memory limit exceeded in 'x': requested many additional bytes, used 0, limit 1".into()),
+        ] { assert_eq!(resource_refusal(&error), None, "{error}"); }
     }
 }
 
@@ -518,11 +891,265 @@ fn main() {
             std::process::exit(0);
         }
         Err(e) => {
+            if let Some(resource) = resource_refusal(&e) {
+                println!(
+                    "HARNESS RESULT: REFUSED scenario={scenario} resource={resource} error={e} peak_rss_mb={:?}",
+                    peak_rss_mb()
+                );
+                std::process::exit(2);
+            }
             println!(
-                "HARNESS RESULT: REFUSED scenario={scenario} error={e} peak_rss_mb={:?}",
+                "HARNESS RESULT: FAILED scenario={scenario} error={e} peak_rss_mb={:?}",
                 peak_rss_mb()
             );
-            std::process::exit(2);
+            std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod partition_oracle_tests {
+    use super::*;
+
+    fn pair_batch(first: Vec<Option<i64>>, second: Vec<Option<i64>>) -> RecordBatch {
+        RecordBatch::try_from_iter(vec![
+            (
+                "a",
+                Arc::new(Int64Array::from(first)) as arrow::array::ArrayRef,
+            ),
+            (
+                "b",
+                Arc::new(Int64Array::from(second)) as arrow::array::ArrayRef,
+            ),
+        ])
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn generator_partitions_cover_exact_contiguous_ids_and_empty_ranges() {
+        for (total, partitions) in [(10, 3), (2, 5), (0, 4)] {
+            let generator = LazyGeneratorExec {
+                schema: gen_schema(),
+                total_rows: total,
+                id_offset: 37,
+                partitions,
+            };
+            let mut ids = Vec::new();
+            for part in 0..partitions {
+                let mut stream = generator.execute(part).await.unwrap();
+                while let Some(batch) = stream.try_next().await.unwrap() {
+                    let id = int_column(&batch, 0).unwrap();
+                    let value = int_column(&batch, 1).unwrap();
+                    for row in 0..batch.num_rows() {
+                        ids.push(id.value(row));
+                        assert_eq!(
+                            value.value(row),
+                            (id.value(row) % VALUE_MODULUS) * (VALUE_MULTIPLIER % VALUE_MODULUS)
+                                % VALUE_MODULUS
+                        );
+                    }
+                }
+            }
+            assert_eq!(ids, (37..37 + total).collect::<Vec<_>>());
+            assert!(generator.execute(partitions).await.is_err());
+        }
+        assert!(partition_range(i64::MAX, 0, 1, 0).is_err());
+        assert!(partition_range(1, 0, 0, 0).is_err());
+    }
+
+    #[test]
+    fn aggregate_oracle_checks_counts_uniqueness_and_nulls() {
+        let key = VALUE_MULTIPLIER % VALUE_MODULUS;
+        let mut good = AggregateOracle::new(2).unwrap();
+        good.accept(&pair_batch(
+            vec![Some(key), Some(0)],
+            vec![Some(1), Some(1)],
+        ))
+        .unwrap();
+        good.finish().unwrap();
+        for wrong_batch in [
+            pair_batch(vec![Some(key), Some(0)], vec![Some(2), Some(1)]),
+            pair_batch(vec![Some(0), Some(0)], vec![Some(1), Some(1)]),
+            pair_batch(vec![None, Some(0)], vec![Some(1), Some(1)]),
+            pair_batch(vec![Some(key), Some(0)], vec![None, Some(1)]),
+        ] {
+            assert!(AggregateOracle::new(2)
+                .unwrap()
+                .accept(&wrong_batch)
+                .is_err());
+        }
+        let mut periodic = AggregateOracle::new(VALUE_MODULUS + 1).unwrap();
+        periodic
+            .accept(&pair_batch(vec![Some(0)], vec![Some(2)]))
+            .unwrap();
+        assert!(periodic.finish().is_err(), "missing groups must fail");
+        AggregateOracle::new(0).unwrap().finish().unwrap();
+    }
+
+    #[test]
+    fn sort_oracle_rejects_wrong_values_duplicates_range_and_nulls() {
+        let key = VALUE_MULTIPLIER % VALUE_MODULUS;
+        let mut good = SortOracle::new(2).unwrap();
+        good.accept(&pair_batch(
+            vec![Some(0), Some(1)],
+            vec![Some(0), Some(key)],
+        ))
+        .unwrap();
+        good.finish().unwrap();
+        for bad in [
+            pair_batch(vec![Some(0), Some(1)], vec![Some(0), Some(key + 1)]),
+            pair_batch(vec![Some(0), Some(0)], vec![Some(0), Some(0)]),
+            pair_batch(vec![Some(2)], vec![Some(0)]),
+            pair_batch(vec![None], vec![Some(0)]),
+            pair_batch(vec![Some(0)], vec![None]),
+            pair_batch(vec![Some(1), Some(0)], vec![Some(key), Some(0)]),
+        ] {
+            assert!(SortOracle::new(2).unwrap().accept(&bad).is_err());
+        }
+        assert!(SortOracle::new(2).unwrap().finish().is_err());
+        SortOracle::new(0).unwrap().finish().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod resident_fixture_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn resident_matches_lazy_exactly_with_fixed_partitions_and_valid_bound() {
+        for (rows, partitions) in [(0, 4), (2, 4), (19, 4), (BATCH_ROWS * 4 + 11, 4)] {
+            let make = || LazyGeneratorExec {
+                schema: gen_schema(),
+                total_rows: rows,
+                id_offset: 37,
+                partitions,
+            };
+            let lazy = make();
+            let resident = ResidentGeneratorExec::new(make()).unwrap();
+            assert_eq!(resident.output_partitions(), partitions);
+            assert!(lazy.resident_queue_copy_bound().is_none());
+            let bound = resident
+                .resident_queue_copy_bound()
+                .unwrap()
+                .max_bytes()
+                .unwrap();
+            let mut seen = 0;
+            for partition in 0..partitions {
+                let mut expected = lazy.execute(partition).await.unwrap();
+                let mut actual = resident.execute(partition).await.unwrap();
+                loop {
+                    match (
+                        expected.try_next().await.unwrap(),
+                        actual.try_next().await.unwrap(),
+                    ) {
+                        (Some(expected), Some(actual)) => {
+                            assert_eq!(actual, expected);
+                            for row in 0..actual.num_rows() {
+                                let id = int_column(&actual, 0).unwrap().value(row);
+                                let value = int_column(&actual, 1).unwrap().value(row);
+                                assert_eq!(id, 37 + seen);
+                                assert_eq!(
+                                    value,
+                                    (id % VALUE_MODULUS) * (VALUE_MULTIPLIER % VALUE_MODULUS)
+                                        % VALUE_MODULUS
+                                );
+                                seen += 1;
+                            }
+                            assert!(
+                                QueueCopyBound::from_batches(&actual.schema(), &[actual])
+                                    .unwrap()
+                                    .max_bytes()
+                                    .unwrap()
+                                    <= bound
+                            );
+                        }
+                        (None, None) => break,
+                        _ => panic!("partition batch boundary mismatch"),
+                    }
+                }
+            }
+            assert_eq!(seen, rows);
+            assert!(resident.execute(partitions).await.is_err());
+            assert!(resident.fixture_array_bytes >= rows as usize * 16);
+        }
+    }
+
+    #[test]
+    fn resident_fixture_rejects_accidental_large_or_invalid_preparation() {
+        for (total_rows, partitions) in [(MAX_RESIDENT_FIXTURE_ROWS + 1, 4), (-1, 4), (1, 0)] {
+            assert!(ResidentGeneratorExec::new(LazyGeneratorExec {
+                schema: gen_schema(),
+                total_rows,
+                id_offset: 0,
+                partitions,
+            })
+            .is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod shared_classifier_tests {
+    #[test]
+    fn shared_errors_keep_exact_refusal_grammar_without_broadening() {
+        use query_engine::QueryError;
+        use std::sync::Arc;
+        let pool = query_engine::execution::create_memory_pool(1);
+        let denied = pool.allocate(2).unwrap_err();
+        assert_eq!(
+            super::resource_refusal(&QueryError::Shared(Arc::new(denied))),
+            Some("memory-pool")
+        );
+        for error in [
+            QueryError::Execution("out of memory maybe".into()),
+            QueryError::Type("Memory limit exceeded".into()),
+        ] {
+            assert_eq!(
+                super::resource_refusal(&QueryError::Shared(Arc::new(error))),
+                None
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod typed_classifier_regressions {
+    use super::resource_refusal;
+    use query_engine::{error::PartitionPhase, execution::MemoryPool, QueryError};
+    use std::sync::Arc;
+    #[test]
+    fn partition_refusal_preserves_type_and_rejects_matching_display_text() {
+        let pool = MemoryPool::new_named("classification fixture", 16);
+        let denial = pool.allocate(17).unwrap_err();
+        let text = match &denial {
+            QueryError::MemoryLimit { pool, requested, used, limit } =>
+                format!("Memory limit exceeded in '{pool}': requested {requested} additional bytes, used {used}, limit {limit}"),
+            other => panic!("expected actual pool denial: {other}"),
+        };
+        let lookalike = QueryError::Execution(text);
+        assert_eq!(denial.to_string(), lookalike.to_string());
+        assert_eq!(
+            resource_refusal(&lookalike),
+            None,
+            "text cannot prove admission denial"
+        );
+        let nested = QueryError::Shared(Arc::new(QueryError::Partition {
+            partition_id: 3,
+            phase: PartitionPhase::Collection,
+            source: Box::new(QueryError::Shared(Arc::new(denial))),
+        }));
+        assert_eq!(resource_refusal(&nested), Some("memory-pool"));
+        let io = QueryError::Partition {
+            partition_id: 1,
+            phase: PartitionPhase::Execution,
+            source: Box::new(QueryError::Io(std::io::Error::from(
+                std::io::ErrorKind::OutOfMemory,
+            ))),
+        };
+        assert_eq!(
+            resource_refusal(&io),
+            None,
+            "allocator/IO error is not admitted pressure"
+        );
     }
 }

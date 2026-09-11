@@ -1,6 +1,6 @@
 //! Hash join operator
 
-use crate::error::Result;
+use crate::error::{QueryError, Result};
 use crate::physical::operators::filter::evaluate_expr;
 use crate::physical::operators::vectorized_hash;
 use crate::physical::{PhysicalOperator, RecordBatchStream};
@@ -17,6 +17,54 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
+
+mod outer_probe;
+
+/// Own all partition work through completion or cancellation. Results retain
+/// declared partition order even though failures are observed as tasks finish.
+/// This fixes task lifetime, not admission of the collected build/probe payload.
+async fn collect_join_partitions(
+    input: Arc<dyn PhysicalOperator>,
+    phase: &'static str,
+) -> Result<Vec<Vec<RecordBatch>>> {
+    let partitions = input.output_partitions();
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut results: Vec<Option<Vec<RecordBatch>>> = (0..partitions).map(|_| None).collect();
+    for partition in 0..partitions {
+        let input = input.clone();
+        tasks.spawn(async move {
+            let stream = input.execute(partition).await?;
+            let batches = stream.try_collect().await?;
+            Ok::<_, crate::error::QueryError>((partition, batches))
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok((partition, batches))) => results[partition] = Some(batches),
+            Ok(Err(error)) => {
+                tasks.shutdown().await;
+                return Err(error);
+            }
+            Err(error) => {
+                tasks.shutdown().await;
+                return Err(crate::error::QueryError::Execution(format!(
+                    "{phase} partition task failed: {error}"
+                )));
+            }
+        }
+    }
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(partition, result)| {
+            result.ok_or_else(|| {
+                crate::error::QueryError::Internal(format!(
+                    "{phase} partition {partition} completed without a result"
+                ))
+            })
+        })
+        .collect()
+}
 
 // Debug logging for crash investigation (disabled by default)
 #[allow(dead_code)]
@@ -45,113 +93,288 @@ fn debug_log(_msg: &str) {
 struct RowStore {
     stride: usize,
     data: Vec<u8>,
-    /// (byte offset in row, width in bytes, column type) per build column,
-    /// in build batch column order.
     cols: Vec<(usize, u8, arrow::datatypes::DataType)>,
+    /// Includes terminal nrows; validates each original batch's row domain.
+    row_offsets: Vec<usize>,
     nrows: usize,
+    // Buffers/metadata above drop before their hierarchical reservation.
+    _reservation: crate::execution::MemoryReservation,
 }
 
-impl RowStore {
-    /// Build the row store plus the per-batch global-row offsets from the
-    /// (unconcatenated) build batches, so a hash-table entry's
-    /// (batch_idx, row_idx) maps to row `row_offsets[batch_idx] + row_idx`.
-    /// Caller guarantees every column is fixed-width
-    /// (Int64/Float64/Int32/Date32) and null-free.
-    fn build(batches: &[RecordBatch]) -> (Self, Vec<usize>) {
-        use arrow::datatypes::DataType;
-        let mut cols: Vec<(usize, u8, DataType)> = Vec::with_capacity(batches[0].num_columns());
-        let mut stride = 0usize;
-        for col in batches[0].columns() {
-            let dt = col.data_type().clone();
-            let w: u8 = match dt {
-                DataType::Int64 | DataType::Float64 => 8,
-                DataType::Int32 | DataType::Date32 => 4,
-                _ => unreachable!("row-store eligibility admits only fixed-width columns"),
-            };
-            cols.push((stride, w, dt));
-            stride += w as usize;
-        }
-        let nrows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        let mut row_offsets = Vec::with_capacity(batches.len());
-        let mut base = 0usize;
-        for b in batches {
-            row_offsets.push(base);
-            base += b.num_rows();
-        }
-        let mut data = vec![0u8; nrows * stride];
-        // Each batch owns a disjoint region of `data`; fill them in parallel.
-        let mut slices: Vec<(&RecordBatch, &mut [u8])> = Vec::with_capacity(batches.len());
-        let mut rest: &mut [u8] = data.as_mut_slice();
-        for b in batches {
-            let (chunk, r) = std::mem::take(&mut rest).split_at_mut(b.num_rows() * stride);
-            slices.push((b, chunk));
-            rest = r;
-        }
-        let cols_ref = &cols;
-        slices
-            .par_iter_mut()
-            .for_each(|(batch, chunk)| fill_row_store_chunk(batch, chunk, cols_ref, stride));
-        (
-            RowStore {
-                stride,
-                data,
-                cols,
-                nrows,
-            },
-            row_offsets,
-        )
+#[derive(Clone, Copy)]
+enum RowStoreSrc<'a> {
+    I64(&'a [i64]),
+    F64(&'a [f64]),
+    I32(&'a [i32]),
+}
+fn row_store_error(message: &str) -> crate::error::QueryError {
+    crate::error::QueryError::Execution(format!("row store: {message}"))
+}
+fn row_store_width(dt: &arrow::datatypes::DataType) -> Option<u8> {
+    use arrow::datatypes::DataType;
+    match dt {
+        DataType::Int64 | DataType::Float64 => Some(8),
+        DataType::Int32 | DataType::Date32 => Some(4),
+        _ => None,
     }
 }
-
-/// Pack one batch's rows into its region of the row store. Row-major write
-/// order: the destination is written sequentially while each source column
-/// is read sequentially.
+fn row_store_charge(
+    nrows: usize,
+    stride: usize,
+    columns: usize,
+    batches: usize,
+) -> Result<(usize, usize, usize)> {
+    // Global-u32 gather uses u32::MAX as an invalid/sentinel domain elsewhere.
+    if nrows > u32::MAX as usize {
+        return Err(row_store_error("global row IDs exceed u32 domain"));
+    }
+    let data = nrows
+        .checked_mul(stride)
+        .ok_or_else(|| row_store_error("payload layout overflow"))?;
+    let offsets = batches
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(std::mem::size_of::<usize>()))
+        .ok_or_else(|| row_store_error("offset layout overflow"))?;
+    let cols = columns
+        .checked_mul(std::mem::size_of::<(usize, u8, arrow::datatypes::DataType)>())
+        .ok_or_else(|| row_store_error("column layout overflow"))?;
+    let retained = std::mem::size_of::<RowStore>()
+        .checked_add(data)
+        .and_then(|n| n.checked_add(offsets))
+        .and_then(|n| n.checked_add(cols))
+        .ok_or_else(|| row_store_error("retained layout overflow"))?;
+    let sources = batches
+        .checked_mul(columns)
+        .and_then(|n| n.checked_mul(std::mem::size_of::<RowStoreSrc<'_>>()))
+        .ok_or_else(|| row_store_error("source view layout overflow"))?;
+    let chunks = batches
+        .checked_mul(std::mem::size_of::<(&[RowStoreSrc<'_>], &mut [u8])>())
+        .ok_or_else(|| row_store_error("chunk layout overflow"))?;
+    let temporary = sources
+        .checked_add(chunks)
+        .and_then(|n| n.checked_add(std::mem::size_of::<Vec<RowStoreSrc<'_>>>()))
+        .and_then(|n| n.checked_add(std::mem::size_of::<Vec<(&[RowStoreSrc<'_>], &mut [u8])>>()))
+        .ok_or_else(|| row_store_error("temporary layout overflow"))?;
+    Ok((data, retained, temporary))
+}
+fn row_store_vec<T>(count: usize) -> Result<Vec<T>> {
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(count)
+        .map_err(|e| row_store_error(&format!("allocation refused: {e}")))?;
+    Ok(result)
+}
+fn row_store_owned_vec<T>(
+    count: usize,
+    guard: &mut crate::execution::MemoryReservation,
+) -> Result<Vec<T>> {
+    let result = row_store_vec::<T>(count)?;
+    let excess = result
+        .capacity()
+        .checked_sub(count)
+        .and_then(|n| n.checked_mul(std::mem::size_of::<T>()))
+        .ok_or_else(|| row_store_error("actual capacity overflow"))?;
+    if excess != 0 {
+        let total = guard
+            .size()
+            .checked_add(excess)
+            .ok_or_else(|| row_store_error("actual admission overflow"))?;
+        // Admit allocator excess before subsequent allocation or packing.
+        guard.resize(total)?;
+    }
+    Ok(result)
+}
+impl RowStore {
+    fn build(batches: &[RecordBatch], pool: &crate::execution::SharedMemoryPool) -> Result<Self> {
+        use arrow::datatypes::DataType;
+        let first = batches
+            .first()
+            .ok_or_else(|| row_store_error("no build batches"))?;
+        if first.num_columns() == 0 {
+            return Err(row_store_error("no build columns"));
+        }
+        let mut stride = 0usize;
+        for array in first.columns() {
+            let width = row_store_width(array.data_type()).ok_or_else(|| {
+                crate::error::QueryError::NotImplemented("row-store physical type".into())
+            })?;
+            stride = stride
+                .checked_add(width as usize)
+                .ok_or_else(|| row_store_error("stride overflow"))?;
+        }
+        let mut nrows = 0usize;
+        for batch in batches {
+            if batch.num_columns() != first.num_columns()
+                || batch
+                    .columns()
+                    .iter()
+                    .zip(first.columns())
+                    .any(|(a, b)| a.data_type() != b.data_type())
+            {
+                return Err(crate::error::QueryError::Type(
+                    "row-store build batches have inconsistent physical schemas".into(),
+                ));
+            }
+            if batch.columns().iter().any(|a| a.null_count() != 0) {
+                return Err(crate::error::QueryError::NotImplemented(
+                    "row-store nullable payload".into(),
+                ));
+            }
+            nrows = nrows
+                .checked_add(batch.num_rows())
+                .ok_or_else(|| row_store_error("row count overflow"))?;
+        }
+        let (data_bytes, retained_bytes, temp_bytes) =
+            row_store_charge(nrows, stride, first.num_columns(), batches.len())?;
+        let mut reservation = pool.allocate(retained_bytes)?;
+        // Declared before temporary vectors: those vectors drop first on errors.
+        let mut temporary = pool.allocate(temp_bytes)?;
+        let mut cols = row_store_owned_vec(first.num_columns(), &mut reservation)?;
+        let mut offset = 0usize;
+        for array in first.columns() {
+            let width = row_store_width(array.data_type()).expect("validated width");
+            cols.push((offset, width, array.data_type().clone()));
+            offset += width as usize;
+        }
+        let mut row_offsets = row_store_owned_vec(
+            batches
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| row_store_error("batch count overflow"))?,
+            &mut reservation,
+        )?;
+        let mut base = 0usize;
+        row_offsets.push(base);
+        for batch in batches {
+            base += batch.num_rows();
+            row_offsets.push(base);
+        }
+        let mut data = row_store_owned_vec(data_bytes, &mut reservation)?;
+        data.resize(data_bytes, 0u8);
+        let source_count = batches
+            .len()
+            .checked_mul(first.num_columns())
+            .ok_or_else(|| row_store_error("source count overflow"))?;
+        let mut sources = row_store_owned_vec(source_count, &mut temporary)?;
+        for batch in batches {
+            for array in batch.columns() {
+                let source = match array.data_type() {
+                    DataType::Int64 => RowStoreSrc::I64(
+                        array
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .ok_or_else(|| {
+                                crate::error::QueryError::Type(
+                                    "invalid row-store Int64 array".into(),
+                                )
+                            })?
+                            .values(),
+                    ),
+                    DataType::Float64 => RowStoreSrc::F64(
+                        array
+                            .as_any()
+                            .downcast_ref::<arrow::array::Float64Array>()
+                            .ok_or_else(|| {
+                                crate::error::QueryError::Type(
+                                    "invalid row-store Float64 array".into(),
+                                )
+                            })?
+                            .values(),
+                    ),
+                    DataType::Int32 => RowStoreSrc::I32(
+                        array
+                            .as_any()
+                            .downcast_ref::<arrow::array::Int32Array>()
+                            .ok_or_else(|| {
+                                crate::error::QueryError::Type(
+                                    "invalid row-store Int32 array".into(),
+                                )
+                            })?
+                            .values(),
+                    ),
+                    DataType::Date32 => RowStoreSrc::I32(
+                        array
+                            .as_any()
+                            .downcast_ref::<arrow::array::Date32Array>()
+                            .ok_or_else(|| {
+                                crate::error::QueryError::Type(
+                                    "invalid row-store Date32 array".into(),
+                                )
+                            })?
+                            .values(),
+                    ),
+                    _ => return Err(row_store_error("validated physical type changed")),
+                };
+                sources.push(source);
+            }
+        }
+        let mut slices = row_store_owned_vec(batches.len(), &mut temporary)?;
+        let mut rest = data.as_mut_slice();
+        for (index, batch) in batches.iter().enumerate() {
+            let bytes = batch
+                .num_rows()
+                .checked_mul(stride)
+                .ok_or_else(|| row_store_error("batch extent overflow"))?;
+            let (chunk, next) = std::mem::take(&mut rest).split_at_mut(bytes);
+            rest = next;
+            let start = index * first.num_columns();
+            slices.push((&sources[start..start + first.num_columns()], chunk));
+        }
+        slices
+            .par_iter_mut()
+            .for_each(|(source, chunk)| fill_row_store_chunk(source, chunk, &cols, stride));
+        drop(slices);
+        drop(sources);
+        drop(temporary);
+        Ok(Self {
+            stride,
+            data,
+            cols,
+            row_offsets,
+            nrows,
+            _reservation: reservation,
+        })
+    }
+    fn global_row(&self, batch: usize, row: usize) -> Result<usize> {
+        let start = *self
+            .row_offsets
+            .get(batch)
+            .ok_or_else(|| row_store_error("batch index out of range"))?;
+        let end = *self
+            .row_offsets
+            .get(
+                batch
+                    .checked_add(1)
+                    .ok_or_else(|| row_store_error("batch index overflow"))?,
+            )
+            .ok_or_else(|| row_store_error("batch index out of range"))?;
+        if row >= end - start {
+            return Err(row_store_error("batch row index out of range"));
+        }
+        start
+            .checked_add(row)
+            .ok_or_else(|| row_store_error("global row overflow"))
+    }
+}
 fn fill_row_store_chunk(
-    batch: &RecordBatch,
+    srcs: &[RowStoreSrc<'_>],
     chunk: &mut [u8],
     cols: &[(usize, u8, arrow::datatypes::DataType)],
     stride: usize,
 ) {
-    use arrow::datatypes::DataType;
-    enum Src<'a> {
-        I64(&'a [i64]),
-        F64(&'a [f64]),
-        I32(&'a [i32]),
-    }
-    let srcs: Vec<Src> = batch
-        .columns()
-        .iter()
-        .map(|c| match c.data_type() {
-            DataType::Int64 => Src::I64(c.as_any().downcast_ref::<Int64Array>().unwrap().values()),
-            DataType::Float64 => Src::F64(
-                c.as_any()
-                    .downcast_ref::<arrow::array::Float64Array>()
-                    .unwrap()
-                    .values(),
-            ),
-            DataType::Int32 => Src::I32(
-                c.as_any()
-                    .downcast_ref::<arrow::array::Int32Array>()
-                    .unwrap()
-                    .values(),
-            ),
-            DataType::Date32 => Src::I32(
-                c.as_any()
-                    .downcast_ref::<arrow::array::Date32Array>()
-                    .unwrap()
-                    .values(),
-            ),
-            _ => unreachable!("row-store eligibility admits only fixed-width columns"),
-        })
-        .collect();
-    for r in 0..batch.num_rows() {
-        let base = r * stride;
-        for (k, src) in srcs.iter().enumerate() {
-            let off = base + cols[k].0;
-            match src {
-                Src::I64(v) => chunk[off..off + 8].copy_from_slice(&v[r].to_le_bytes()),
-                Src::F64(v) => chunk[off..off + 8].copy_from_slice(&v[r].to_le_bytes()),
-                Src::I32(v) => chunk[off..off + 4].copy_from_slice(&v[r].to_le_bytes()),
+    for (row, destination) in chunk.chunks_exact_mut(stride).enumerate() {
+        for (index, source) in srcs.iter().enumerate() {
+            let off = cols[index].0;
+            match source {
+                RowStoreSrc::I64(v) => {
+                    destination[off..off + 8].copy_from_slice(&v[row].to_le_bytes())
+                }
+                RowStoreSrc::F64(v) => {
+                    destination[off..off + 8].copy_from_slice(&v[row].to_le_bytes())
+                }
+                RowStoreSrc::I32(v) => {
+                    destination[off..off + 4].copy_from_slice(&v[row].to_le_bytes())
+                }
             }
         }
     }
@@ -164,7 +387,21 @@ fn gather_build_from_row_store(
     store: &RowStore,
     row_offsets: &[usize],
     build_indices: &[(usize, usize)],
-) -> Vec<ArrayRef> {
+) -> Result<Vec<ArrayRef>> {
+    if row_offsets != store.row_offsets.as_slice() {
+        return Err(row_store_error("offset mapping does not belong to store"));
+    }
+    gather_row_store_rows(
+        store,
+        build_indices
+            .iter()
+            .map(|&(batch, row)| store.global_row(batch, row)),
+    )
+}
+fn gather_row_store_rows(
+    store: &RowStore,
+    rows: impl ExactSizeIterator<Item = Result<usize>>,
+) -> Result<Vec<ArrayRef>> {
     use arrow::datatypes::DataType;
     enum Buf {
         I64(Vec<i64>),
@@ -172,26 +409,28 @@ fn gather_build_from_row_store(
         I32(Vec<i32>),
         D32(Vec<i32>),
     }
-    let n = build_indices.len();
-    let mut bufs: Vec<Buf> = store
-        .cols
-        .iter()
-        .map(|(_, _, dt)| match dt {
-            DataType::Int64 => Buf::I64(Vec::with_capacity(n)),
-            DataType::Float64 => Buf::F64(Vec::with_capacity(n)),
-            DataType::Int32 => Buf::I32(Vec::with_capacity(n)),
-            DataType::Date32 => Buf::D32(Vec::with_capacity(n)),
-            _ => unreachable!("row-store eligibility admits only fixed-width columns"),
-        })
-        .collect();
-    let stride = store.stride;
-    for &(batch_idx, row_idx) in build_indices {
-        let row = row_offsets[batch_idx] + row_idx;
-        debug_assert!(row < store.nrows);
-        let base = row * stride;
-        for (k, &(off, _, _)) in store.cols.iter().enumerate() {
-            let p = base + off;
-            match &mut bufs[k] {
+    let n = rows.len();
+    let mut bufs = row_store_vec(store.cols.len())?;
+    for (_, _, dt) in &store.cols {
+        bufs.push(match dt {
+            DataType::Int64 => Buf::I64(row_store_vec(n)?),
+            DataType::Float64 => Buf::F64(row_store_vec(n)?),
+            DataType::Int32 => Buf::I32(row_store_vec(n)?),
+            DataType::Date32 => Buf::D32(row_store_vec(n)?),
+            _ => return Err(row_store_error("unsupported stored type")),
+        });
+    }
+    for row in rows {
+        let row = row?;
+        if row >= store.nrows {
+            return Err(row_store_error("global row index out of range"));
+        }
+        let base = row
+            .checked_mul(store.stride)
+            .ok_or_else(|| row_store_error("gather offset overflow"))?;
+        for (index, &(offset, _, _)) in store.cols.iter().enumerate() {
+            let p = base + offset;
+            match &mut bufs[index] {
                 Buf::I64(v) => v.push(i64::from_le_bytes(store.data[p..p + 8].try_into().unwrap())),
                 Buf::F64(v) => v.push(f64::from_le_bytes(store.data[p..p + 8].try_into().unwrap())),
                 Buf::I32(v) | Buf::D32(v) => {
@@ -200,14 +439,16 @@ fn gather_build_from_row_store(
             }
         }
     }
-    bufs.into_iter()
-        .map(|buf| match buf {
+    let mut result = row_store_vec(store.cols.len())?;
+    for buf in bufs {
+        result.push(match buf {
             Buf::I64(v) => Arc::new(Int64Array::from(v)) as ArrayRef,
             Buf::F64(v) => Arc::new(arrow::array::Float64Array::from(v)) as ArrayRef,
             Buf::I32(v) => Arc::new(arrow::array::Int32Array::from(v)) as ArrayRef,
             Buf::D32(v) => Arc::new(arrow::array::Date32Array::from(v)) as ArrayRef,
-        })
-        .collect()
+        });
+    }
+    Ok(result)
 }
 
 /// Cached build side data - collected once, reused across partitions
@@ -233,7 +474,7 @@ struct BuildSideCache {
     /// columns); when present the columnar concat was skipped and `batches`
     /// keeps the unconcatenated originals (still needed for the hash tables'
     /// key buffers and fallback paths).
-    row_store: Option<(RowStore, Vec<usize>)>,
+    row_store: Option<RowStore>,
 }
 
 /// Vectorized hash table using open addressing with batch-level operations.
@@ -274,6 +515,29 @@ fn evaluate_join_keys(batch: &RecordBatch, exprs: &[Expr]) -> Result<Vec<ArrayRe
         .collect()
 }
 
+fn join_index_bucket_count(rows: usize) -> Result<usize> {
+    rows.checked_mul(2)
+        .and_then(|n| n.max(16).checked_next_power_of_two())
+        .ok_or_else(|| QueryError::Execution("join index bucket count overflow".into()))
+}
+
+fn join_index_bytes(buckets: usize, rows: usize) -> Result<usize> {
+    buckets
+        .checked_mul(std::mem::size_of::<u32>())
+        .and_then(|b| {
+            rows.checked_mul(std::mem::size_of::<u32>() + std::mem::size_of::<(u32, u32)>())
+                .and_then(|r| b.checked_add(r))
+        })
+        .ok_or_else(|| QueryError::Execution("join index size overflow".into()))
+}
+
+/// Costing bound for heads/next/entries only. Direct addressing cannot exceed
+/// this layout. Payload, evaluated keys and gather storage are separate, and
+/// actual construction must still reserve its allocations in the query pool.
+pub(crate) fn join_index_storage_bound(rows: usize) -> Result<usize> {
+    join_index_bytes(join_index_bucket_count(rows)?, rows)
+}
+
 struct VectorizedHashTable {
     /// heads[hash & mask] = index of the first chain entry, or u32::MAX if empty.
     /// Flat chained layout: one contiguous allocation each for heads/next/entries
@@ -299,11 +563,18 @@ struct VectorizedHashTable {
     /// and no key comparison at all (dimension-table PK builds: customer,
     /// part, supplier).
     direct: Option<(i64, i64)>,
+    // Private index buffers are dropped before their admission owner. This
+    // covers heads/next/entries only, not key arrays or build payload.
+    _index_reservation: crate::execution::MemoryReservation,
 }
 
 impl VectorizedHashTable {
     /// Build the vectorized hash table from build-side batches.
-    fn build(batches: &[RecordBatch], key_exprs: &[Expr]) -> Result<Self> {
+    fn build(
+        batches: &[RecordBatch],
+        key_exprs: &[Expr],
+        pool: &crate::execution::SharedMemoryPool,
+    ) -> Result<Option<Self>> {
         // Evaluate key expressions for each batch and check types
         let mut build_key_arrays: Vec<Vec<ArrayRef>> = Vec::with_capacity(batches.len());
         let mut total_rows = 0usize;
@@ -315,28 +586,27 @@ impl VectorizedHashTable {
             let key_arrays = evaluate_join_keys(batch, key_exprs)?;
             // Verify we can vectorize these types
             if !key_arrays.is_empty() && !vectorized_hash::can_vectorize_arrays(&key_arrays) {
-                return Err(crate::error::QueryError::Execution(
-                    "Cannot vectorize key types".into(),
-                ));
+                return Ok(None);
             }
-            total_rows += batch.num_rows();
+            total_rows = total_rows.checked_add(batch.num_rows()).ok_or_else(|| {
+                crate::error::QueryError::Execution("join index row count overflow".into())
+            })?;
             build_key_arrays.push(key_arrays);
         }
 
-        if total_rows >= u32::MAX as usize {
+        if total_rows >= u32::MAX as usize || batches.len() > u32::MAX as usize {
             return Err(crate::error::QueryError::Execution(
                 "Build side too large for vectorized hash table".into(),
             ));
         }
 
         // Size buckets to next_power_of_2(total_rows * 2) for ~50% load factor
-        let bucket_count = (total_rows * 2).max(16).next_power_of_two();
+        let bucket_count = join_index_bucket_count(total_rows)?;
         let mask = bucket_count - 1;
         // Inserts happen AFTER the mode decision below: building the hash
         // layout and then rebuilding direct-address doubled build cost.
-        let mut heads: Vec<u32> = Vec::new();
-        let mut next: Vec<u32> = Vec::with_capacity(total_rows);
-        let mut entries: Vec<(u32, u32)> = Vec::with_capacity(total_rows);
+        let mut index_rows = total_rows;
+        let mut index_buckets = bucket_count;
 
         // Zero-copy i64 buffers for fast chain comparisons (columns first,
         // batches second). Only when EVERY key column in EVERY batch is Int64.
@@ -386,35 +656,62 @@ impl VectorizedHashTable {
                     }
                 }
                 const DIRECT_MAX_RANGE: i64 = 16_000_000;
-                if n_keys > 0 && kmax.saturating_sub(kmin) < DIRECT_MAX_RANGE {
-                    let range = (kmax - kmin + 1) as usize;
-                    let mut dheads: Vec<u32> = vec![u32::MAX; range];
-                    let mut dnext: Vec<u32> = Vec::with_capacity(n_keys);
-                    let mut dentries: Vec<(u32, u32)> = Vec::with_capacity(n_keys);
-                    for (batch_idx, key_arrays) in build_key_arrays.iter().enumerate() {
-                        let arr = key_arrays[0].as_any().downcast_ref::<Int64Array>().unwrap();
-                        let vals = &bufs[0][batch_idx];
-                        for row in 0..vals.len() {
-                            if arr.is_null(row) {
-                                continue;
-                            }
-                            let slot = (vals[row] - kmin) as usize;
-                            let entry_idx = dentries.len() as u32;
-                            dentries.push((batch_idx as u32, row as u32));
-                            dnext.push(dheads[slot]);
-                            dheads[slot] = entry_idx;
-                        }
-                    }
-                    heads = dheads;
-                    next = dnext;
-                    entries = dentries;
+                if n_keys > 0
+                    && kmax.saturating_sub(kmin) < DIRECT_MAX_RANGE
+                    && (kmax - kmin + 1) as usize <= bucket_count
+                {
+                    index_buckets = (kmax - kmin + 1) as usize;
+                    index_rows = n_keys;
                     direct = Some((kmin, kmax));
                 }
             }
         }
 
+        // Choose the final representation before allocating; the old direct
+        // path allocated and discarded a second set of next/entry vectors.
+        let index_bytes = join_index_bytes(index_buckets, index_rows)?;
+        let mut reservation = pool.allocate(index_bytes)?;
+        fn index_vec<T>(
+            count: usize,
+            reservation: &mut crate::execution::MemoryReservation,
+        ) -> Result<Vec<T>> {
+            let mut values = Vec::new();
+            values.try_reserve_exact(count).map_err(|e| {
+                crate::error::QueryError::Execution(format!("join index allocation failed: {e}"))
+            })?;
+            // The allocator may report more capacity than requested. Charge
+            // that excess before allocating any subsequent vector.
+            let charged = values
+                .capacity()
+                .checked_sub(count)
+                .and_then(|n| n.checked_mul(std::mem::size_of::<T>()))
+                .and_then(|n| reservation.size().checked_add(n))
+                .ok_or_else(|| {
+                    crate::error::QueryError::Execution("join index capacity overflow".into())
+                })?;
+            reservation.resize(charged)?;
+            Ok(values)
+        }
+        let mut heads: Vec<u32> = index_vec(index_buckets, &mut reservation)?;
+        let mut next: Vec<u32> = index_vec(index_rows, &mut reservation)?;
+        let mut entries: Vec<(u32, u32)> = index_vec(index_rows, &mut reservation)?;
+        heads.resize(index_buckets, u32::MAX);
+        if let Some((min, _)) = direct {
+            for (batch_idx, key_arrays) in build_key_arrays.iter().enumerate() {
+                let arr = key_arrays[0].as_any().downcast_ref::<Int64Array>().unwrap();
+                for row in 0..arr.len() {
+                    if arr.is_null(row) {
+                        continue;
+                    }
+                    let slot = (arr.value(row) - min) as usize;
+                    let entry_idx = entries.len() as u32;
+                    entries.push((batch_idx as u32, row as u32));
+                    next.push(heads[slot]);
+                    heads[slot] = entry_idx;
+                }
+            }
+        }
         if direct.is_none() {
-            heads = vec![u32::MAX; bucket_count];
             for (batch_idx, key_arrays) in build_key_arrays.iter().enumerate() {
                 if key_arrays.is_empty() {
                     continue;
@@ -434,7 +731,7 @@ impl VectorizedHashTable {
             }
         }
 
-        Ok(VectorizedHashTable {
+        Ok(Some(VectorizedHashTable {
             heads,
             next,
             entries,
@@ -442,7 +739,8 @@ impl VectorizedHashTable {
             build_key_arrays,
             i64_key_bufs,
             direct,
-        })
+            _index_reservation: reservation,
+        }))
     }
 
     /// Probe the hash table with a batch of probe keys.
@@ -518,8 +816,78 @@ impl VectorizedHashTable {
         false
     }
 
-    fn probe_batch(&self, probe_key_arrays: &[ArrayRef], num_rows: usize) -> Vec<(u32, u32, u32)> {
+    fn iter_matches<'a>(
+        &'a self,
+        keys: &'a [ArrayRef],
+        num_rows: usize,
+    ) -> impl Iterator<Item = (u32, u32, u32)> + 'a {
+        let hashes = vectorized_hash::hash_arrays(keys, num_rows);
+        let (mut row, mut entry, mut started) = (0usize, u32::MAX, false);
+        std::iter::from_fn(move || {
+            while row < num_rows {
+                if !started {
+                    started = true;
+                    entry = if vectorized_hash::has_null(keys, row) {
+                        u32::MAX
+                    } else if let Some((min, max)) = self.direct {
+                        match keys[0].as_any().downcast_ref::<Int64Array>() {
+                            Some(values)
+                                if values.value(row) >= min && values.value(row) <= max =>
+                            {
+                                self.heads[(values.value(row) - min) as usize]
+                            }
+                            _ => u32::MAX,
+                        }
+                    } else {
+                        self.heads[hashes[row] as usize & self.mask]
+                    };
+                }
+                if entry == u32::MAX {
+                    row += 1;
+                    started = false;
+                    continue;
+                }
+                let (bb, br) = self.entries[entry as usize];
+                entry = self.next[entry as usize];
+                if self.direct.is_some()
+                    || vectorized_hash::compare_row(
+                        &self.build_key_arrays[bb as usize],
+                        br as usize,
+                        keys,
+                        row,
+                    )
+                {
+                    return Some((bb, br, row as u32));
+                }
+            }
+            None
+        })
+    }
+
+    fn probe_batch(
+        &self,
+        probe_key_arrays: &[ArrayRef],
+        num_rows: usize,
+    ) -> Result<Vec<(u32, u32, u32)>> {
         let mut matches = Vec::new();
+        fn push(matches: &mut Vec<(u32, u32, u32)>, entry: (u32, u32, u32)) -> Result<()> {
+            // Legacy callers materialize candidates. Keep this allocation
+            // finite and fallible even when they bypass execute's admission.
+            if matches.len() == 1_048_576 {
+                return Err(crate::error::QueryError::Execution(
+                    "HashJoin legacy candidate memory bound exceeded; bounded output support required".into(),
+                ));
+            }
+            if matches.len() == matches.capacity() {
+                matches.try_reserve(1).map_err(|error| {
+                    crate::error::QueryError::Execution(format!(
+                        "HashJoin legacy candidate allocation refused: {error}"
+                    ))
+                })?;
+            }
+            matches.push(entry);
+            Ok(())
+        }
 
         // Direct-address probe: bounds check + slot load; chain entries are
         // exactly equal keys, so no hashing and no comparisons.
@@ -540,11 +908,11 @@ impl VectorizedHashTable {
                     let mut entry = self.heads[(k - kmin) as usize];
                     while entry != u32::MAX {
                         let (bb, br) = self.entries[entry as usize];
-                        matches.push((bb, br, probe_row as u32));
+                        push(&mut matches, (bb, br, probe_row as u32))?;
                         entry = self.next[entry as usize];
                     }
                 }
-                return matches;
+                return Ok(matches);
             }
         }
 
@@ -573,12 +941,12 @@ impl VectorizedHashTable {
                             }
                         }
                         if eq {
-                            matches.push((bb, br, probe_row as u32));
+                            push(&mut matches, (bb, br, probe_row as u32))?;
                         }
                         entry = self.next[entry as usize];
                     }
                 }
-                return matches;
+                return Ok(matches);
             }
         }
 
@@ -600,13 +968,13 @@ impl VectorizedHashTable {
                     probe_key_arrays,
                     probe_row,
                 ) {
-                    matches.push((build_batch, build_row, probe_row as u32));
+                    push(&mut matches, (build_batch, build_row, probe_row as u32))?;
                 }
                 entry = self.next[entry as usize];
             }
         }
 
-        matches
+        Ok(matches)
     }
 
     /// Whether `for_each_i64_candidate` point lookups work on this table:
@@ -813,7 +1181,9 @@ pub struct HashJoinExec {
     /// Schema combining left and right for filter evaluation
     combined_schema: SchemaRef,
     /// Cached build side - computed once, shared across all partition executions
-    build_cache: OnceCell<BuildSideCache>,
+    build_cache: OnceCell<Arc<BuildSideCache>>,
+    outer_round: std::sync::Mutex<Option<Arc<outer_probe::Round>>>,
+    memory_pool: crate::execution::SharedMemoryPool,
     /// When true, build hash table from right side (smaller) instead of left.
     /// Used for Left joins where the right side is much smaller than the left.
     build_right: bool,
@@ -907,11 +1277,20 @@ impl HashJoinExec {
             filter,
             combined_schema,
             build_cache: OnceCell::new(),
+            outer_round: std::sync::Mutex::new(None),
+            memory_pool: crate::execution::process_memory_pool(),
             build_right: false,
             probe_runtime_filter: None,
             probe_runtime_filter_pair: 0,
             retained: None,
         }
+    }
+
+    /// Set admission for future initialization. Existing initialized caches
+    /// retain their original reservation owner; this never rebinds live memory.
+    pub fn with_memory_pool(mut self, pool: crate::execution::SharedMemoryPool) -> Self {
+        self.memory_pool = pool;
+        self
     }
 
     /// Set build_right flag: when true, build hash table from right side.
@@ -978,128 +1357,75 @@ impl HashJoinExec {
     }
 }
 
-#[async_trait]
-impl PhysicalOperator for HashJoinExec {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-
-    fn children(&self) -> Vec<Arc<dyn PhysicalOperator>> {
-        vec![self.left.clone(), self.right.clone()]
-    }
-
-    async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
-        crate::physical::check_partition(self, partition)?;
-
-        debug_log(&format!(
-            "execute() partition={} join_type={:?}",
-            partition, self.join_type
-        ));
-
-        // Determine build and probe sides
-        // For Right join: always build from right.
-        // For Left join with build_right=true: build from right (smaller side).
-        // Otherwise: build from left.
-        let (build_side, probe_side, swapped) =
-            if self.build_right || matches!(self.join_type, JoinType::Right) {
-                (&self.right, &self.left, true)
+impl HashJoinExec {
+    /// Construct the shared pull-driven Inner stream without polling its input.
+    fn inner_probe_stream(
+        &self,
+        cache: Arc<BuildSideCache>,
+        input: RecordBatchStream,
+        probe_keys: Vec<Expr>,
+        swapped: bool,
+    ) -> RecordBatchStream {
+        let left_len = self.left.schema().fields().len();
+        let probe_keep = self.retained.as_ref().map(|mask| {
+            if swapped {
+                mask[..left_len].to_vec()
             } else {
-                (&self.left, &self.right, false)
-            };
-
-        let (on_left, on_right): (Vec<_>, Vec<_>) = self.on.iter().cloned().unzip();
-        let build_keys = if swapped {
-            on_right.clone()
-        } else {
-            on_left.clone()
+                mask[left_len..].to_vec()
+            }
+        });
+        let profile = JoinProfile::new("inner_probe", &probe_keys);
+        let state = InnerProbeStream {
+            profile,
+            cache,
+            input,
+            batch: None,
+            keys: Vec::new(),
+            hashes: Vec::new(),
+            i64_keys: None,
+            key_nulls: Vec::new(),
+            row: 0,
+            entry: u32::MAX,
+            started: false,
+            key_exprs: probe_keys,
+            swapped,
+            schema: self.schema.clone(),
+            filter: self.filter.clone(),
+            combined_schema: self.combined_schema.clone(),
+            probe_keep,
         };
-        let probe_keys = if swapped { &on_left } else { &on_right };
+        Box::pin(stream::try_unfold(state, |mut state| async move {
+            match state.next_batch().await? {
+                Some(batch) => Ok(Some((batch, state))),
+                None => Ok(None),
+            }
+        }))
+    }
 
-        // For Semi/Anti joins, start probe collection early so it overlaps
-        // with the build side — UNLESS this join publishes a runtime filter
-        // into the probe-side scan. Prefetch would start decoding before the
-        // build exists, so the filter (published only after the build drains)
-        // could never prune anything: Q21's l2/l3 lineitem probes decoded
-        // ~35M rows each where the bitmap admits ~2.5M. With a linked filter
-        // the probe is collected AFTER the build instead (see below); the
-        // bitmap-pruned decode is far cheaper than what overlap saved.
-        let defer_probe_for_filter = self.probe_runtime_filter.is_some();
-        let probe_prefetch_handle = if matches!(self.join_type, JoinType::Semi | JoinType::Anti)
-            && !defer_probe_for_filter
-        {
-            let probe = probe_side.clone();
-            Some(tokio::spawn(async move {
-                let probe_partitions = probe.output_partitions().max(1);
-                let handles: Vec<_> = (0..probe_partitions)
-                    .map(|p| {
-                        let probe = probe.clone();
-                        tokio::spawn(async move {
-                            let stream = probe.execute(p).await?;
-                            let batches: Vec<RecordBatch> = stream.try_collect().await?;
-                            Ok::<_, crate::error::QueryError>(batches)
-                        })
-                    })
-                    .collect();
-                let mut all_batches = Vec::new();
-                for handle in handles {
-                    let batches = handle.await.map_err(|e| {
-                        crate::error::QueryError::Execution(format!(
-                            "Probe partition task failed: {}",
-                            e
-                        ))
-                    })??;
-                    all_batches.extend(batches);
-                }
-                Ok::<_, crate::error::QueryError>(all_batches)
-            }))
-        } else {
-            None
-        };
-
-        // All join types can skip the generic hash table when i64 fast path is available.
-        // The generic probe loop has i64 fallback logic, and specialized parallel paths
-        // (Semi/Anti, Inner) handle i64 directly.
+    /// Complete the shared build phase without starting any probe/output stream.
+    /// Partition tasks are owned by the initialization future; cancelled attempts
+    /// leave OnceCell retryable. This is not a prepared output-byte guarantee.
+    async fn ensure_build_cache(
+        &self,
+        build_side: &Arc<dyn PhysicalOperator>,
+        build_keys: &[Expr],
+        swapped: bool,
+    ) -> Result<&Arc<BuildSideCache>> {
         let can_skip_generic_ht = true;
-
-        // Get or build the cached build side (computed ONCE, reused across all partitions)
-        // For Semi/Anti, probe collection runs concurrently via probe_prefetch_handle
-        let cache = self
+        self
             .build_cache
             .get_or_try_init(|| async {
+                let mut profile = JoinProfile::new("build_initialization", build_keys);
+                JoinProfile::phase(&mut profile, 0);
                 debug_log(&format!(
                     "CACHE MISS: Building hash table for join_type={:?}",
                     self.join_type
                 ));
 
                 // Collect ALL partitions from the build side
-                let build_partitions = build_side.output_partitions().max(1);
-                debug_log(&format!(
-                    "Collecting {} build partitions from {}",
-                    build_partitions,
-                    build_side.name()
-                ));
-
-                // Collect all build partitions in parallel using tokio::spawn
-                let handles: Vec<_> = (0..build_partitions)
-                    .map(|p| {
-                        let build = build_side.clone();
-                        tokio::spawn(async move {
-                            let stream = build.execute(p).await?;
-                            let batches: Vec<RecordBatch> = stream.try_collect().await?;
-                            Ok::<_, crate::error::QueryError>(batches)
-                        })
-                    })
-                    .collect();
-                let mut partition_results = Vec::with_capacity(handles.len());
-                for handle in handles {
-                    let batches = handle.await.map_err(|e| {
-                        crate::error::QueryError::Execution(format!(
-                            "Build partition task failed: {}",
-                            e
-                        ))
-                    })??;
-                    partition_results.push(batches);
-                }
+                let partition_results =
+                    collect_join_partitions(build_side.clone(), "Build").await?;
+                JoinProfile::phase(&mut profile, 7);
 
                 let mut build_batches = Vec::new();
                 let mut total_build_rows = 0usize;
@@ -1118,81 +1444,9 @@ impl PhysicalOperator for HashJoinExec {
                     total_build_bytes
                 ));
 
-                // Publish the build keys as a runtime filter for the probe-side
-                // scan (Inner joins, single i64 key, reasonably small builds):
-                // the scan then decodes only rows whose key can match.
-                if let Some(slot) = &self.probe_runtime_filter {
-                    // Bitmap filters stay cheap far beyond the HashSet cap:
-                    // 16M keys over a <=64M domain is an 8MB bitmap.
-                    if build_keys.len() > self.probe_runtime_filter_pair
-                        && total_build_rows <= 16_000_000
-                    {
-                        let mut keys: Vec<i64> = Vec::with_capacity(total_build_rows);
-                        let mut ok = true;
-                        'outer_rt: for batch in &build_batches {
-                            match crate::physical::operators::evaluate_expr(
-                                batch,
-                                &build_keys[self.probe_runtime_filter_pair],
-                            ) {
-                                Ok(arr) => match arr.as_any().downcast_ref::<Int64Array>() {
-                                    Some(a) => {
-                                        for i in 0..a.len() {
-                                            if !a.is_null(i) {
-                                                keys.push(a.value(i));
-                                            }
-                                        }
-                                    }
-                                    None => {
-                                        ok = false;
-                                        break 'outer_rt;
-                                    }
-                                },
-                                Err(_) => {
-                                    ok = false;
-                                    break 'outer_rt;
-                                }
-                            }
-                        }
-                        if std::env::var("RT_DEBUG").is_ok() && (!ok || keys.is_empty()) {
-                            eprintln!("[rt] publish FAILED: ok={} keys={}", ok, keys.len());
-                        }
-                        if ok && !keys.is_empty() {
-                            use crate::physical::operators::streaming_parquet_scan::RuntimeFilterPayload;
-                            let min = keys.iter().copied().min().unwrap();
-                            let max = keys.iter().copied().max().unwrap();
-                            // Bitmap width cap: 2^31 bits = 256MB. The old cap
-                            // (64M bits = 8MB) was tuned at SF=10, where
-                            // o_orderkey's whole domain fits; at SF=100 the
-                            // domain is ~600M and Q4/Q18-class filters (5-7M
-                            // build keys that prune >95% of a 600M-row probe)
-                            // were silently skipped. vec![0u64; ..] is calloc'd
-                            // zero pages, so an under-filled wide bitmap costs
-                            // its touched pages, not its width.
-                            const BITMAP_MAX_BITS: i64 = 2_147_483_648;
-                            // Too wide for a bitmap and too many keys for a
-                            // cheap set: publish nothing.
-                            let skip = (max - min) >= BITMAP_MAX_BITS && keys.len() > 4_000_000;
-                            let payload = if skip {
-                                None
-                            } else if (max - min) < BITMAP_MAX_BITS {
-                                let width = (max - min) as usize + 1;
-                                let mut bits = vec![0u64; width.div_ceil(64)];
-                                for k in &keys {
-                                    let off = (k - min) as usize;
-                                    bits[off >> 6] |= 1u64 << (off & 63);
-                                }
-                                Some(RuntimeFilterPayload::Bitmap { min, bits })
-                            } else {
-                                Some(RuntimeFilterPayload::Set(keys.into_iter().collect()))
-                            };
-                            if std::env::var("RT_DEBUG").is_ok() {
-                                eprintln!("[rt] publish: skip={}", payload.is_none());
-                            }
-                            if let Some(p) = payload {
-                                *slot.lock() = Some(std::sync::Arc::new(p));
-                            }
-                        }
-                    }
+                if let Some(profile) = &mut profile {
+                    profile.input_rows = total_build_rows;
+                    profile.input_batches = build_batches.len();
                 }
 
                 // Join-output pruning: the build side's contribution to the
@@ -1290,7 +1544,7 @@ impl PhysicalOperator for HashJoinExec {
                     );
                 }
                 let row_store = if row_store_eligible {
-                    Some(RowStore::build(&rs_batches))
+                    Some(RowStore::build(&rs_batches, &self.memory_pool)?)
                 } else {
                     None
                 };
@@ -1300,7 +1554,7 @@ impl PhysicalOperator for HashJoinExec {
                 let timing = std::env::var("HJ_TIMING").is_ok();
                 let t_vht = std::time::Instant::now();
                 let vectorized_ht = if !build_keys.is_empty() {
-                    VectorizedHashTable::build(&build_batches, &build_keys).ok()
+                    VectorizedHashTable::build(&build_batches, &build_keys, &self.memory_pool)?
                 } else {
                     None
                 };
@@ -1358,7 +1612,7 @@ impl PhysicalOperator for HashJoinExec {
                 }
 
                 // Skip expensive generic hash table build when vectorized or i64 fast path is available
-                let hash_table = if vectorized_ht.is_some()
+                let hash_table = if self.join_type == JoinType::Inner || vectorized_ht.is_some()
                     || (i64_hash_table.is_some() && can_skip_generic_ht)
                 {
                     HashMap::new()
@@ -1401,7 +1655,21 @@ impl PhysicalOperator for HashJoinExec {
                     }
                     _ => build_batches,
                 };
-                Ok::<_, crate::error::QueryError>(BuildSideCache {
+                // Publish only the exact arrays already used by the hash table.
+                // Optional filter admission cannot replay computed/volatile keys.
+                if let (Some(slot), Some(table)) = (&self.probe_runtime_filter, &vectorized_ht) {
+                    if let Some(filter) = super::runtime_filter::prepare(
+                        &table.build_key_arrays, self.probe_runtime_filter_pair, &self.memory_pool,
+                    ) {
+                        *slot.lock() = Some(Arc::new(
+                            super::streaming_parquet_scan::RuntimeFilterPayload::Admitted(filter),
+                        ));
+                    }
+                }
+                if let Some(profile) = &mut profile {
+                    profile.completed = true;
+                }
+                Ok::<_, crate::error::QueryError>(Arc::new(BuildSideCache {
                     batches: build_batches,
                     hash_table,
                     i64_hash_table,
@@ -1409,49 +1677,521 @@ impl PhysicalOperator for HashJoinExec {
                     build_matched,
                     completed_partitions: std::sync::atomic::AtomicUsize::new(0),
                     row_store,
-                })
+                }))
             })
+            .await
+    }
+}
+
+/// Only the actual nonpreserved probe output may carry a pruning target.
+/// Retained output ordinals must be restored before choosing the child.
+pub(crate) fn runtime_filter_probe_ordinal(
+    join_type: JoinType,
+    build_right: bool,
+    retained: Option<&[bool]>,
+    left_width: usize,
+    right_width: usize,
+    output: usize,
+) -> Option<usize> {
+    if !matches!(join_type, JoinType::Inner) && !(join_type == JoinType::Left && !build_right) {
+        return None;
+    }
+    let width = left_width.checked_add(right_width)?;
+    let original = match retained {
+        Some(mask) if mask.len() == width => {
+            mask.iter()
+                .enumerate()
+                .filter(|(_, keep)| **keep)
+                .nth(output)?
+                .0
+        }
+        Some(_) => return None,
+        None if output < width => output,
+        None => return None,
+    };
+    if build_right {
+        (original < left_width).then_some(original)
+    } else if original >= left_width {
+        Some(original - left_width)
+    } else {
+        None
+    }
+}
+
+#[async_trait]
+impl PhysicalOperator for HashJoinExec {
+    fn runtime_filter_target(
+        &self,
+        output: usize,
+    ) -> Option<crate::physical::plan::RuntimeFilterTarget> {
+        let index = runtime_filter_probe_ordinal(
+            self.join_type,
+            self.build_right,
+            self.retained.as_deref(),
+            self.left.schema().fields().len(),
+            self.right.schema().fields().len(),
+            output,
+        )?;
+        let probe = if self.build_right {
+            &self.left
+        } else {
+            &self.right
+        };
+        probe.runtime_filter_target(index)
+    }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn children(&self) -> Vec<Arc<dyn PhysicalOperator>> {
+        vec![self.left.clone(), self.right.clone()]
+    }
+
+    async fn prepare_admitted_queue_input(
+        &self,
+        pool: crate::execution::SharedMemoryPool,
+    ) -> Result<Option<crate::physical::PreparedAdmittedInput>> {
+        if !outer_probe::admitted_eligible(self)
+            || self.filter.is_some()
+            || !Arc::ptr_eq(&pool, &self.memory_pool)
+        {
+            return Ok(None);
+        }
+        let swapped = self.build_right || self.join_type == JoinType::Right;
+        let (build, probe) = if swapped {
+            (&self.right, &self.left)
+        } else {
+            (&self.left, &self.right)
+        };
+        let (left, right): (Vec<_>, Vec<_>) = self.on.iter().cloned().unzip();
+        let (build_keys, probe_keys) = if swapped {
+            (right, left)
+        } else {
+            (left, right)
+        };
+        let cache = self.ensure_build_cache(build, &build_keys, swapped).await?;
+        if cache.vectorized_ht.is_none() && cache.batches.iter().any(|b| b.num_rows() != 0) {
+            return Ok(None);
+        }
+        // A copied-output bound alone does not prove ownership of future
+        // child decoder/scratch allocations. Preserve the admitted capability
+        // transitively; an unsupported child keeps ordinary serial consumption.
+        let Some(prepared) = probe.prepare_admitted_queue_input(pool.clone()).await? else {
+            return Ok(None);
+        };
+        if !prepared.pool.is_within(&pool)
+            || prepared.streams.as_slice().len() != self.output_partitions()
+        {
+            return Err(QueryError::Execution(
+                "bounded outer join child pool/partition mismatch".into(),
+            ));
+        }
+        let runtime_pool = prepared.pool.clone();
+        let mut streams = crate::execution::reserved_vec::ReservedVec::with_capacity(
+            &pool,
+            self.output_partitions(),
+        )?;
+        for (partition, input) in prepared.streams.into_owned_iter().enumerate() {
+            streams.extend_reserved(
+                1,
+                [outer_probe::stream(
+                    self,
+                    cache.clone(),
+                    input,
+                    probe_keys.clone(),
+                    swapped,
+                    partition,
+                    true,
+                    runtime_pool.clone(),
+                )?],
+            )?;
+        }
+        Ok(Some(crate::physical::PreparedAdmittedInput {
+            pool: runtime_pool,
+            streams,
+        }))
+    }
+
+    async fn prepare_queue_input(&self) -> Result<Option<crate::physical::PreparedQueueInput>> {
+        if self.join_type != JoinType::Inner
+            || self.filter.as_ref().is_some_and(Expr::contains_subquery)
+            || self
+                .on
+                .iter()
+                .any(|(left, right)| left.contains_subquery() || right.contains_subquery())
+        {
+            return Ok(None);
+        }
+        let (build, probe, swapped) = if self.build_right {
+            (&self.right, &self.left, true)
+        } else {
+            (&self.left, &self.right, false)
+        };
+        if probe.output_partitions() != self.output_partitions() {
+            return Ok(None);
+        }
+        let (left_keys, right_keys): (Vec<_>, Vec<_>) = self.on.iter().cloned().unzip();
+        let (build_keys, probe_keys) = if swapped {
+            (right_keys, left_keys)
+        } else {
+            (left_keys, right_keys)
+        };
+        let cache = self.ensure_build_cache(build, &build_keys, swapped).await?;
+        // Ordinary multi-batch columnar gather remains unsupported. An owned,
+        // validated row store has its own fixed-width physical output proof.
+        if (cache.row_store.is_none() && cache.batches.len() != 1)
+            || cache.vectorized_ht.is_none()
+            || cache.batches.iter().all(|batch| batch.num_rows() == 0)
+        {
+            return Ok(None);
+        }
+        let row_store_schema = if let Some(store) = &cache.row_store {
+            let Some(first) = cache.batches.first() else {
+                return Ok(None);
+            };
+            if first.num_columns() != store.cols.len()
+                || first
+                    .columns()
+                    .iter()
+                    .zip(&store.cols)
+                    .any(|(array, (_, _, dt))| array.data_type() != dt)
+            {
+                return Err(row_store_error(
+                    "retained output schema differs from validated store",
+                ));
+            }
+            Some(first.schema())
+        } else {
+            None
+        };
+        let left_len = self.left.schema().fields().len();
+        let probe_keep = self.retained.as_ref().map(|mask| {
+            if swapped {
+                &mask[..left_len]
+            } else {
+                &mask[left_len..]
+            }
+        });
+        // Finish our own build/factory checks before recursively initializing
+        // the probe. A child Some owns initialized, unpulled streams even when
+        // its output proof is Unknown; never drop it and execute again.
+        let (probe_streams, output) = if let Some(prepared) = probe.prepare_queue_input().await? {
+            if prepared.streams.len() != probe.output_partitions() {
+                return Err(crate::error::QueryError::Execution(
+                    "prepared join probe partition contract violated".into(),
+                ));
+            }
+            let bound = match &prepared.output {
+                crate::physical::PreparedOutputBound::Layouts(layouts) => {
+                    if let Some(build_schema) = &row_store_schema {
+                        crate::physical::queue_layout::row_store_prepared_output_copy_bound(
+                            build_schema,
+                            layouts,
+                            probe_keep,
+                            swapped,
+                            &self.schema,
+                            INNER_CANDIDATE_ROWS,
+                        )
+                    } else {
+                        crate::physical::queue_layout::inner_prepared_output_copy_bound(
+                            &cache.batches,
+                            layouts,
+                            probe_keep,
+                            swapped,
+                            &self.schema,
+                            INNER_CANDIDATE_ROWS,
+                        )
+                    }
+                }
+                _ => None,
+            };
+            (
+                prepared.streams,
+                bound
+                    .map(crate::physical::PreparedOutputBound::Layouts)
+                    .unwrap_or(crate::physical::PreparedOutputBound::Unknown),
+            )
+        } else {
+            let Some(probe_bound) = probe.pool_independent_gather_copy_bound() else {
+                return Ok(None);
+            };
+            let bound = if let Some(build_schema) = &row_store_schema {
+                crate::physical::queue_layout::row_store_output_copy_bound(
+                    build_schema,
+                    &probe_bound,
+                    probe_keep,
+                    swapped,
+                    &self.schema,
+                    INNER_CANDIDATE_ROWS,
+                )
+            } else {
+                crate::physical::queue_layout::inner_output_copy_bound(
+                    &cache.batches,
+                    &probe_bound,
+                    None,
+                    probe_keep,
+                    swapped,
+                    &self.schema,
+                    INNER_CANDIDATE_ROWS,
+                )
+            };
+            let Some(bound) = bound else {
+                return Ok(None);
+            };
+            let mut inputs = Vec::new();
+            inputs
+                .try_reserve_exact(probe.output_partitions())
+                .map_err(|e| {
+                    crate::error::QueryError::Execution(format!(
+                        "prepared probe stream allocation failed: {e}"
+                    ))
+                })?;
+            for partition in 0..probe.output_partitions() {
+                inputs.push(probe.execute(partition).await?);
+            }
+            (inputs, crate::physical::PreparedOutputBound::Layouts(bound))
+        };
+        // No producer task or output pull. If initialization fails or is
+        // cancelled, this owned Vec drops all previously initialized streams.
+        let mut streams = Vec::new();
+        streams
+            .try_reserve_exact(probe.output_partitions())
+            .map_err(|e| {
+                crate::error::QueryError::Execution(format!(
+                    "prepared join stream allocation failed: {e}"
+                ))
+            })?;
+        for input in probe_streams {
+            streams.push(self.inner_probe_stream(
+                Arc::clone(cache),
+                input,
+                probe_keys.clone(),
+                swapped,
+            ));
+        }
+        Ok(Some(crate::physical::PreparedQueueInput {
+            streams,
+            output,
+        }))
+    }
+
+    async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
+        crate::physical::check_partition(self, partition)?;
+
+        debug_log(&format!(
+            "execute() partition={} join_type={:?}",
+            partition, self.join_type
+        ));
+
+        // Determine build and probe sides
+        // For Right join: always build from right.
+        // For Left join with build_right=true: build from right (smaller side).
+        // Otherwise: build from left.
+        let (build_side, probe_side, swapped) =
+            if self.build_right || matches!(self.join_type, JoinType::Right) {
+                (&self.right, &self.left, true)
+            } else {
+                (&self.left, &self.right, false)
+            };
+
+        let (on_left, on_right): (Vec<_>, Vec<_>) = self.on.iter().cloned().unzip();
+        let build_keys = if swapped {
+            on_right.clone()
+        } else {
+            on_left.clone()
+        };
+        let probe_keys = if swapped { &on_left } else { &on_right };
+
+        // For Semi/Anti joins, start probe collection early so it overlaps
+        // with the build side — UNLESS this join publishes a runtime filter
+        // into the probe-side scan. Prefetch would start decoding before the
+        // build exists, so the filter (published only after the build drains)
+        // could never prune anything: Q21's l2/l3 lineitem probes decoded
+        // ~35M rows each where the bitmap admits ~2.5M. With a linked filter
+        // the probe is collected AFTER the build instead (see below); the
+        // bitmap-pruned decode is far cheaper than what overlap saved.
+        let defer_probe_for_filter = self.probe_runtime_filter.is_some();
+        let probe_prefetch_handle = if matches!(self.join_type, JoinType::Semi | JoinType::Anti)
+            && !defer_probe_for_filter
+        {
+            let probe = probe_side.clone();
+            let mut prefetch = tokio::task::JoinSet::new();
+            prefetch.spawn(async move {
+                Ok::<_, crate::error::QueryError>(
+                    collect_join_partitions(probe, "Probe")
+                        .await?
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>(),
+                )
+            });
+            Some(prefetch)
+        } else {
+            None
+        };
+
+        // Collected variants finish their work before returning a stream. Keep
+        // cache waiting separate from the initializer's existing build trace.
+        let mut collected_profile = match self.join_type {
+            _ if outer_probe::eligible(self) => None,
+            JoinType::Inner => None,
+            JoinType::Left => JoinProfile::new("collected_left", probe_keys),
+            JoinType::Right => JoinProfile::new("collected_right", probe_keys),
+            JoinType::Full => JoinProfile::new("collected_full", probe_keys),
+            JoinType::Cross => JoinProfile::new("collected_cross", probe_keys),
+            JoinType::Semi => JoinProfile::new("collected_semi", probe_keys),
+            JoinType::Anti => JoinProfile::new("collected_anti", probe_keys),
+            JoinType::Single => JoinProfile::new("collected_single", probe_keys),
+            JoinType::Mark => JoinProfile::new("collected_mark", probe_keys),
+        };
+        JoinProfile::phase(&mut collected_profile, 11);
+        let cache = self
+            .ensure_build_cache(build_side, &build_keys, swapped)
             .await?;
+
+        // Inner joins are pull-driven: neither the probe input nor the output
+        // cardinality is materialized before returning the first batch.
+        if self.join_type == JoinType::Inner {
+            if cache.batches.iter().all(|batch| batch.num_rows() == 0) {
+                return Ok(Box::pin(stream::empty()));
+            }
+            if cache.vectorized_ht.is_none() {
+                return Err(crate::error::QueryError::NotImplemented(
+                    "HashJoin bounded inner probe requires supported exact vectorized keys".into(),
+                ));
+            }
+            return Ok(self.inner_probe_stream(
+                Arc::clone(cache),
+                probe_side.execute(partition).await?,
+                probe_keys.clone(),
+                swapped,
+            ));
+        }
+
+        if outer_probe::eligible(self)
+            && (cache.vectorized_ht.is_some() || cache.batches.iter().all(|b| b.num_rows() == 0))
+        {
+            // The outer cursor owns completion, not construction of its stream.
+            // Do not report a collected-route record for this lazy path.
+            return outer_probe::stream(
+                self,
+                cache.clone(),
+                probe_side.execute(partition).await?,
+                probe_keys.clone(),
+                swapped,
+                partition,
+                false,
+                self.memory_pool.clone(),
+            );
+        }
 
         // Collect probe batches. For Semi/Anti, await the prefetched probe data
         // that was running concurrently with the build side — or, when the
         // prefetch was deferred so the published runtime filter can prune the
         // probe-side decode, collect ALL probe partitions now.
-        let probe_batches: Vec<RecordBatch> = if let Some(handle) = probe_prefetch_handle {
-            handle.await.map_err(|e| {
-                crate::error::QueryError::Execution(format!("Probe prefetch task failed: {}", e))
-            })??
-        } else if matches!(self.join_type, JoinType::Semi | JoinType::Anti) {
-            let probe_partitions = probe_side.output_partitions().max(1);
-            let handles: Vec<_> = (0..probe_partitions)
-                .map(|p| {
-                    let probe = probe_side.clone();
-                    tokio::spawn(async move {
-                        let stream = probe.execute(p).await?;
-                        let batches: Vec<RecordBatch> = stream.try_collect().await?;
-                        Ok::<_, crate::error::QueryError>(batches)
-                    })
-                })
-                .collect();
-            let mut all_batches = Vec::new();
-            for handle in handles {
-                let batches = handle.await.map_err(|e| {
+        JoinProfile::phase(&mut collected_profile, 0);
+        let probe_batches: Vec<RecordBatch> = if let Some(mut prefetch) = probe_prefetch_handle {
+            prefetch
+                .join_next()
+                .await
+                .ok_or_else(|| {
+                    crate::error::QueryError::Internal(
+                        "Probe prefetch completed without a task".into(),
+                    )
+                })?
+                .map_err(|error| {
                     crate::error::QueryError::Execution(format!(
-                        "Probe partition task failed: {}",
-                        e
+                        "Probe prefetch task failed: {error}"
                     ))
-                })??;
-                all_batches.extend(batches);
-            }
-            all_batches
+                })??
+        } else if matches!(self.join_type, JoinType::Semi | JoinType::Anti) {
+            collect_join_partitions(probe_side.clone(), "Probe")
+                .await?
+                .into_iter()
+                .flatten()
+                .collect()
         } else {
             let probe_stream = probe_side.execute(partition).await?;
             probe_stream.try_collect().await?
         };
 
+        if let Some(profile) = &mut collected_profile {
+            profile.input_batches = probe_batches.len();
+            profile.input_rows = probe_batches.iter().map(RecordBatch::num_rows).sum();
+        }
+        JoinProfile::phase(&mut collected_profile, 8);
         // Safety check: prevent cross join explosions
         let build_rows: usize = cache.batches.iter().map(|b| b.num_rows()).sum();
         let probe_rows: usize = probe_batches.iter().map(|b| b.num_rows()).sum();
+        if matches!(
+            self.join_type,
+            JoinType::Left | JoinType::Right | JoinType::Full | JoinType::Cross
+        ) {
+            // These legacy variants still gather a complete probe result. Bound
+            // their worst-case candidate count before allocating match vectors;
+            // clean refusal is safer than trying to recover after allocation.
+            const MAX_LEGACY_CANDIDATES: usize = 1_048_576;
+            let candidates = if let Some(table) = &cache.vectorized_ht {
+                let mut count = 0usize;
+                'count: for batch in &probe_batches {
+                    // probe_batch owns one candidate vector per input batch,
+                    // not one per partition. A finite vector bound must not
+                    // become a limit on valid total output cardinality.
+                    count = 0;
+                    let keys = evaluate_join_keys(batch, probe_keys)?;
+                    let hashes = vectorized_hash::hash_arrays(&keys, batch.num_rows());
+                    for row in 0..batch.num_rows() {
+                        if vectorized_hash::has_null(&keys, row) {
+                            continue;
+                        }
+                        let mut entry = if let Some((min, max)) = table.direct {
+                            let Some(values) = keys[0].as_any().downcast_ref::<Int64Array>() else {
+                                return Err(crate::error::QueryError::Execution(
+                                    "HashJoin candidate admission key domain differs".into(),
+                                ));
+                            };
+                            let key = values.value(row);
+                            if key < min || key > max {
+                                continue;
+                            }
+                            table.heads[(key - min) as usize]
+                        } else {
+                            table.heads[hashes[row] as usize & table.mask]
+                        };
+                        while entry != u32::MAX {
+                            let (bb, br) = table.entries[entry as usize];
+                            if table.direct.is_some()
+                                || vectorized_hash::compare_row(
+                                    &table.build_key_arrays[bb as usize],
+                                    br as usize,
+                                    &keys,
+                                    row,
+                                )
+                            {
+                                count += 1;
+                                if count > MAX_LEGACY_CANDIDATES {
+                                    break 'count;
+                                }
+                            }
+                            entry = table.next[entry as usize];
+                        }
+                    }
+                }
+                count
+            } else {
+                probe_batches
+                    .iter()
+                    .map(|batch| build_rows.saturating_mul(batch.num_rows()))
+                    .max()
+                    .unwrap_or(0)
+            };
+            if candidates > MAX_LEGACY_CANDIDATES {
+                return Err(crate::error::QueryError::Execution(format!(
+                    "HashJoin {:?} requires bounded output support: potential candidate count exceeds {}",
+                    self.join_type, MAX_LEGACY_CANDIDATES
+                )));
+            }
+        }
         if self.join_type == JoinType::Cross && build_rows > 0 && probe_rows > 0 {
             let max_output = build_rows.saturating_mul(probe_rows);
             const CROSS_JOIN_LIMIT: usize = 10_000_000;
@@ -1464,8 +2204,12 @@ impl PhysicalOperator for HashJoinExec {
             }
         }
 
+        JoinProfile::phase(&mut collected_profile, 9);
         let t_probe = std::time::Instant::now();
-        let row_store = cache.row_store.as_ref().map(|(rs, ro)| (rs, ro.as_slice()));
+        let row_store = cache
+            .row_store
+            .as_ref()
+            .map(|rs| (rs, rs.row_offsets.as_slice()));
         // Join-output pruning: the probe side's keep flags (the build side's
         // were applied when the cache pruned its batches).
         let left_len = self.left.schema().fields().len();
@@ -1493,6 +2237,7 @@ impl PhysicalOperator for HashJoinExec {
             probe_keep.as_deref(),
         )?;
 
+        JoinProfile::phase(&mut collected_profile, 10);
         // Emit unmatched BUILD rows exactly once PER FULL ROUND: the last
         // probe partition of a round scans the shared matched bits.
         //
@@ -1547,6 +2292,12 @@ impl PhysicalOperator for HashJoinExec {
                 }
             }
         }
+        if let Some(profile) = &mut collected_profile {
+            profile.output_batches = result.len();
+            profile.output_rows = result.iter().map(RecordBatch::num_rows).sum();
+            profile.completed = true;
+        }
+        drop(collected_profile);
         if std::env::var("HJ_TIMING").is_ok() {
             eprintln!(
                 "[hj] partition {} probe: {} rows in {:?}",
@@ -1595,6 +2346,323 @@ impl fmt::Display for HashJoinExec {
             .map(|(l, r)| format!("{} = {}", l, r))
             .collect();
         write!(f, "{} Join on [{}]", self.join_type, on_str.join(", "))
+    }
+}
+
+// A row bound limits candidate index/filter work; it is not a byte budget for
+// arbitrarily wide payloads or ownership of the collected build side.
+const INNER_CANDIDATE_ROWS: usize = 4096;
+// A match-count limit alone does not bound scans of NULLs, misses or hash
+// collisions. Cooperatively yield after this many cursor steps as well.
+const INNER_PROBE_WORK_STEPS: usize = 4096;
+
+// Opt-in wall attribution. Phases can overlap other streams and nested operators;
+// they are not exclusive CPU measurements. Drop records early stop/error as an
+// incomplete stream, including time spent awaiting input or downstream polling.
+struct JoinProfile {
+    route: &'static str,
+    id: u64,
+    keys: Vec<String>,
+    elapsed: [std::time::Duration; 12],
+    phase: usize,
+    tick: std::time::Instant,
+    input_rows: usize,
+    input_batches: usize,
+    candidates: usize,
+    output_rows: usize,
+    output_batches: usize,
+    completed: bool,
+}
+
+impl JoinProfile {
+    fn new(route: &'static str, keys: &[Expr]) -> Option<Self> {
+        if std::env::var("QE_JOIN_STREAM_PROF").as_deref() != Ok("1") {
+            return None;
+        }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Some(Self {
+            route,
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            keys: keys.iter().map(ToString::to_string).collect(),
+            elapsed: [std::time::Duration::ZERO; 12],
+            phase: 6,
+            tick: std::time::Instant::now(),
+            input_rows: 0,
+            input_batches: 0,
+            candidates: 0,
+            output_rows: 0,
+            output_batches: 0,
+            completed: false,
+        })
+    }
+
+    fn phase(profile: &mut Option<Self>, next: usize) {
+        if let Some(profile) = profile {
+            let now = std::time::Instant::now();
+            profile.elapsed[profile.phase] += now.duration_since(profile.tick);
+            profile.tick = now;
+            profile.phase = next;
+        }
+    }
+}
+
+impl Drop for JoinProfile {
+    fn drop(&mut self) {
+        use std::io::Write;
+        self.elapsed[self.phase] += self.tick.elapsed();
+        let ms = self.elapsed.map(|duration| duration.as_secs_f64() * 1000.0);
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "[join-stream] {}",
+            serde_json::json!({
+                "route": self.route, "id": self.id, "keys": self.keys,
+                "completed": self.completed, "unwinding": std::thread::panicking(),
+                "input_rows": self.input_rows, "input_batches": self.input_batches,
+                // Collected probing combines traversal, filtering and gathering;
+                // it does not expose an exact candidate count to this observer.
+                "candidates": if self.route.starts_with("collected_") { None } else { Some(self.candidates) },
+                "output_rows": self.output_rows, "output_batches": self.output_batches,
+                "input_wait_ms": ms[0], "key_prepare_ms": ms[1],
+                "candidate_ms": ms[2], "filter_ms": ms[3], "gather_ms": ms[4],
+                "yield_wait_ms": ms[5], "downstream_wait_ms": ms[6],
+                "build_state_ms": ms[7],
+                "preflight_ms": ms[8], "collected_probe_ms": ms[9],
+                "unmatched_build_ms": ms[10], "build_cache_wait_ms": ms[11]
+            })
+        );
+    }
+}
+
+struct InnerProbeStream {
+    profile: Option<JoinProfile>,
+    cache: Arc<BuildSideCache>,
+    input: RecordBatchStream,
+    batch: Option<RecordBatch>,
+    keys: Vec<ArrayRef>,
+    hashes: Vec<u64>,
+    // Zero-copy typed handles and validity buffers, resolved once per batch.
+    // Preserve the old i64 tuple fast path without per-candidate downcasts.
+    i64_keys: Option<Vec<Int64Array>>,
+    key_nulls: Vec<arrow::buffer::NullBuffer>,
+    row: usize,
+    entry: u32,
+    started: bool,
+    key_exprs: Vec<Expr>,
+    swapped: bool,
+    schema: SchemaRef,
+    filter: Option<Expr>,
+    combined_schema: SchemaRef,
+    probe_keep: Option<Vec<bool>>,
+}
+
+impl InnerProbeStream {
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        loop {
+            if self.batch.is_none() {
+                JoinProfile::phase(&mut self.profile, 0);
+                let Some(batch) = self.input.try_next().await? else {
+                    if let Some(profile) = &mut self.profile {
+                        profile.completed = true;
+                    }
+                    JoinProfile::phase(&mut self.profile, 6);
+                    return Ok(None);
+                };
+                JoinProfile::phase(&mut self.profile, 1);
+                if let Some(profile) = &mut self.profile {
+                    profile.input_rows += batch.num_rows();
+                    profile.input_batches += 1;
+                }
+                self.keys = evaluate_join_keys(&batch, &self.key_exprs)?;
+                let table = self
+                    .cache
+                    .vectorized_ht
+                    .as_ref()
+                    .expect("validated inner keys");
+                if !vectorized_hash::can_vectorize_arrays(&self.keys)
+                    || table.build_key_arrays.first().is_some_and(|build| {
+                        build.len() != self.keys.len()
+                            || build
+                                .iter()
+                                .zip(&self.keys)
+                                .any(|(left, right)| left.data_type() != right.data_type())
+                    })
+                {
+                    return Err(crate::error::QueryError::Execution(
+                        "HashJoin bounded probe requires matching exact key domains".into(),
+                    ));
+                }
+                self.i64_keys = if table.i64_key_bufs.is_some() {
+                    self.keys
+                        .iter()
+                        .map(|array| array.as_any().downcast_ref::<Int64Array>().cloned())
+                        .collect()
+                } else {
+                    None
+                };
+                if table.direct.is_some() && self.i64_keys.is_none() {
+                    return Err(crate::error::QueryError::Execution(
+                        "HashJoin direct-key domain differs".into(),
+                    ));
+                }
+                // Dictionary keys have already been decoded. The admitted
+                // domains have ordinary Arrow validity, so these bitmaps retain
+                // logical NULL checks without dynamic dispatch on every row.
+                self.key_nulls = self
+                    .keys
+                    .iter()
+                    .filter_map(|array| array.nulls())
+                    .filter(|nulls| nulls.null_count() != 0)
+                    .cloned()
+                    .collect();
+                self.hashes = if table.direct.is_some() {
+                    Vec::new()
+                } else {
+                    vectorized_hash::hash_arrays(&self.keys, batch.num_rows())
+                };
+                self.row = 0;
+                self.entry = u32::MAX;
+                self.started = false;
+                self.batch = Some(batch);
+            }
+            let batch = self.batch.as_ref().expect("loaded probe batch");
+            let table = self
+                .cache
+                .vectorized_ht
+                .as_ref()
+                .expect("validated inner keys");
+            JoinProfile::phase(&mut self.profile, 2);
+            let mut build_indices = Vec::new();
+            let mut probe_indices = Vec::new();
+            build_indices
+                .try_reserve_exact(INNER_CANDIDATE_ROWS)
+                .map_err(|e| {
+                    crate::error::QueryError::Execution(format!(
+                        "HashJoin candidate allocation refused: {e}"
+                    ))
+                })?;
+            probe_indices
+                .try_reserve_exact(INNER_CANDIDATE_ROWS)
+                .map_err(|e| {
+                    crate::error::QueryError::Execution(format!(
+                        "HashJoin candidate allocation refused: {e}"
+                    ))
+                })?;
+            let mut work_steps = 0;
+            while self.row < batch.num_rows() && build_indices.len() < INNER_CANDIDATE_ROWS {
+                if work_steps == INNER_PROBE_WORK_STEPS {
+                    // Cursor, current input and at most 4096 candidate pairs
+                    // stay owned by this future; dropping it stops further work.
+                    JoinProfile::phase(&mut self.profile, 5);
+                    tokio::task::yield_now().await;
+                    JoinProfile::phase(&mut self.profile, 2);
+                    work_steps = 0;
+                }
+                work_steps += 1;
+                if !self.started {
+                    self.started = true;
+                    if self.key_nulls.iter().any(|nulls| !nulls.is_valid(self.row)) {
+                        self.entry = u32::MAX;
+                    } else if let Some((min, max)) = table.direct {
+                        let values = &self.i64_keys.as_ref().expect("validated direct keys")[0];
+                        let value = values.value(self.row);
+                        self.entry = if value >= min && value <= max {
+                            table.heads[(value - min) as usize]
+                        } else {
+                            u32::MAX
+                        };
+                    } else {
+                        self.entry = table.heads[self.hashes[self.row] as usize & table.mask];
+                    }
+                }
+                if self.entry == u32::MAX {
+                    self.row += 1;
+                    self.started = false;
+                    continue;
+                }
+                let (build_batch, build_row) = table.entries[self.entry as usize];
+                self.entry = table.next[self.entry as usize];
+                // Hashes locate candidates only; SQL equality always checks the
+                // complete key tuple (direct chains already prove exact i64 keys).
+                let equal = if table.direct.is_some() {
+                    true
+                } else if let (Some(build), Some(probe)) = (&table.i64_key_bufs, &self.i64_keys) {
+                    probe.iter().enumerate().all(|(column, values)| {
+                        build[column][build_batch as usize][build_row as usize]
+                            == values.value(self.row)
+                    })
+                } else {
+                    vectorized_hash::compare_row(
+                        &table.build_key_arrays[build_batch as usize],
+                        build_row as usize,
+                        &self.keys,
+                        self.row,
+                    )
+                };
+                if equal {
+                    build_indices.push((build_batch as usize, build_row as usize));
+                    probe_indices.push(self.row);
+                }
+            }
+            if let Some(profile) = &mut self.profile {
+                profile.candidates += build_indices.len();
+            }
+            JoinProfile::phase(&mut self.profile, 3);
+            if let Some(filter) = &self.filter {
+                (build_indices, probe_indices) = filter_candidate_pairs(
+                    &self.cache.batches,
+                    batch,
+                    build_indices,
+                    probe_indices,
+                    self.swapped,
+                    &self.combined_schema,
+                    filter,
+                )?;
+            }
+            JoinProfile::phase(&mut self.profile, 4);
+            let result = if build_indices.is_empty() {
+                None
+            } else {
+                let pruned;
+                let probe = match &self.probe_keep {
+                    Some(keep) if keep.iter().any(|keep| !keep) => {
+                        pruned = prune_batch_columns(batch, keep);
+                        &pruned
+                    }
+                    _ => batch,
+                };
+                Some(create_joined_batch(
+                    &self.cache.batches,
+                    probe,
+                    &build_indices,
+                    &probe_indices,
+                    self.swapped,
+                    &self.schema,
+                    self.cache
+                        .row_store
+                        .as_ref()
+                        .map(|store| (store, store.row_offsets.as_slice())),
+                )?)
+            };
+            if self.row == batch.num_rows() {
+                self.batch = None;
+                self.keys.clear();
+                self.hashes.clear();
+                self.i64_keys = None;
+                self.key_nulls.clear();
+            }
+            if let Some(batch) = &result {
+                if let Some(profile) = &mut self.profile {
+                    profile.output_rows += batch.num_rows();
+                    profile.output_batches += 1;
+                }
+                JoinProfile::phase(&mut self.profile, 6);
+                return Ok(result);
+            }
+            // Filtered-out chunks should give cancellation/scheduling a chance,
+            // without spawning an eager producer or retaining an output queue.
+            JoinProfile::phase(&mut self.profile, 5);
+            tokio::task::yield_now().await;
+        }
     }
 }
 
@@ -2158,15 +3226,7 @@ impl CompiledFilter {
         ) {
             let bv = b_arr.value(build_row);
             let pv = p_arr.value(probe_row);
-            return match self.op {
-                BinaryOp::Eq => bv == pv,
-                BinaryOp::NotEq => bv != pv,
-                BinaryOp::Lt => bv < pv,
-                BinaryOp::LtEq => bv <= pv,
-                BinaryOp::Gt => bv > pv,
-                BinaryOp::GtEq => bv >= pv,
-                _ => false,
-            };
+            return crate::planner::numeric::sql_float_compare(bv, self.op, pv);
         }
 
         // Utf8 path
@@ -2239,29 +3299,7 @@ fn resolve_column_in_combined(
         .collect();
     let combined = Schema::new(combined_fields);
 
-    // Use the exact same resolution as find_column_index in filter.rs
-    // 1. Try qualified name
-    if let Some(relation) = &col.relation {
-        let qualified = format!("{}.{}", relation, col.name);
-        if let Ok(idx) = combined.index_of(&qualified) {
-            return Some(idx);
-        }
-    }
-
-    // 2. Try unqualified name
-    if let Ok(idx) = combined.index_of(&col.name) {
-        return Some(idx);
-    }
-
-    // 3. Try suffix match
-    let suffix = format!(".{}", col.name);
-    for (i, field) in combined.fields().iter().enumerate() {
-        if field.name().ends_with(&suffix) || field.name() == &col.name {
-            return Some(i);
-        }
-    }
-
-    None
+    crate::planner::resolve_arrow_column(&combined, col)
 }
 
 /// Parallel probe for INNER joins using specialized i64 hash table.
@@ -2531,7 +3569,7 @@ fn probe_semi_anti_parallel(
                 // probe row's candidates are skipped (`done_pr`) — keeps
                 // duplicated-key builds O(probe + build), not O(pairs).
                 let mut done_pr: Option<usize> = None;
-                for (bb, br, pr) in v.probe_batch(keys, n_rows) {
+                for (bb, br, pr) in v.iter_matches(keys, n_rows) {
                     let (bb, br, pr) = (bb as usize, br as usize, pr as usize);
                     if swapped {
                         if probe_matched_batch[pr].load(Ordering::Relaxed) {
@@ -2958,7 +3996,7 @@ fn probe_vectorized(
                         // Generic key layout: fall through to the tuple path.
                     }
                     let t = clk(prof);
-                    let matches = vht.probe_batch(&probe_key_arrays, n_rows);
+                    let matches = vht.probe_batch(&probe_key_arrays, n_rows)?;
                     lap(t, &t_probe);
                     if matches.is_empty() {
                         return Ok(None);
@@ -3052,7 +4090,7 @@ fn probe_vectorized(
                 .map(|probe_batch| {
                     let probe_key_arrays = evaluate_join_keys(probe_batch, probe_key_exprs)?;
                     let n_rows = probe_batch.num_rows();
-                    let matches = vht.probe_batch(&probe_key_arrays, n_rows);
+                    let matches = vht.probe_batch(&probe_key_arrays, n_rows)?;
                     let mut build_indices: Vec<(usize, usize)> = Vec::with_capacity(matches.len());
                     let mut probe_indices: Vec<usize> = Vec::with_capacity(matches.len());
                     for (bb, br, pr) in &matches {
@@ -3161,7 +4199,7 @@ fn probe_vectorized(
                     .map(|start| start..std::cmp::min(start + CHUNK_SIZE, n_rows))
                     .collect();
 
-                let chunk_results: Vec<Vec<(u32, u32, u32)>> = chunks
+                let chunk_results: Result<Vec<Vec<(u32, u32, u32)>>> = chunks
                     .par_iter()
                     .map(|range| {
                         // Create sliced key arrays for this chunk
@@ -3170,19 +4208,19 @@ fn probe_vectorized(
                             .iter()
                             .map(|a| a.slice(range.start, chunk_len))
                             .collect();
-                        let mut matches = vht.probe_batch(&chunk_keys, chunk_len);
+                        let mut matches = vht.probe_batch(&chunk_keys, chunk_len)?;
                         // Adjust probe indices back to original batch coordinates
                         for m in &mut matches {
                             m.2 += range.start as u32;
                         }
-                        matches
+                        Ok(matches)
                     })
                     .collect();
 
                 // Merge all matches
                 let mut all_build_indices: Vec<(usize, usize)> = Vec::new();
                 let mut all_probe_indices: Vec<usize> = Vec::new();
-                for chunk_matches in chunk_results {
+                for chunk_matches in chunk_results? {
                     for (bb, br, pr) in chunk_matches {
                         all_build_indices.push((bb as usize, br as usize));
                         all_probe_indices.push(pr as usize);
@@ -3226,7 +4264,7 @@ fn probe_vectorized(
 
             JoinType::Left => {
                 // For Left join: collect matches, then add unmatched probe rows with nulls
-                let matches = vht.probe_batch(&probe_key_arrays, n_rows);
+                let matches = vht.probe_batch(&probe_key_arrays, n_rows)?;
 
                 let mut build_indices: Vec<(usize, usize)> = Vec::with_capacity(matches.len());
                 let mut probe_indices: Vec<usize> = Vec::with_capacity(matches.len());
@@ -3294,7 +4332,7 @@ fn probe_vectorized(
 
             JoinType::Right => {
                 // Right join: collect matches and track build-side matches
-                let matches = vht.probe_batch(&probe_key_arrays, n_rows);
+                let matches = vht.probe_batch(&probe_key_arrays, n_rows)?;
 
                 let mut build_indices: Vec<(usize, usize)> = Vec::with_capacity(matches.len());
                 let mut probe_indices: Vec<usize> = Vec::with_capacity(matches.len());
@@ -3349,7 +4387,7 @@ fn probe_vectorized(
             }
 
             JoinType::Full => {
-                let matches = vht.probe_batch(&probe_key_arrays, n_rows);
+                let matches = vht.probe_batch(&probe_key_arrays, n_rows)?;
 
                 let mut build_indices: Vec<(usize, usize)> = Vec::with_capacity(matches.len());
                 let mut probe_indices: Vec<usize> = Vec::with_capacity(matches.len());
@@ -3424,7 +4462,7 @@ fn probe_vectorized(
 
             JoinType::Single | JoinType::Mark => {
                 // Treat like Semi for now
-                let matches = vht.probe_batch(&probe_key_arrays, n_rows);
+                let matches = vht.probe_batch(&probe_key_arrays, n_rows)?;
                 for (bb, br, _pr) in matches {
                     if needs_build_tracking {
                         build_matched[bb as usize][br as usize] = true;
@@ -3955,11 +4993,7 @@ fn create_joined_batch(
                 .map(|col_idx| gather_column(build_batches, col_idx, build_indices))
                 .collect()
         } else {
-            Ok(gather_build_from_row_store(
-                store,
-                row_offsets,
-                build_indices,
-            ))
+            gather_build_from_row_store(store, row_offsets, build_indices)
         }
     } else if build_batches.len() == 1 {
         let has_null_sentinels = build_indices.iter().any(|&(b, _)| b == usize::MAX);
@@ -4046,50 +5080,8 @@ fn create_joined_batch(
 /// Row-store gather where the row ids are already GLOBAL (offsets applied
 /// at emission). Mirror of `gather_build_from_row_store` minus the
 /// per-match (batch_idx, row_idx) resolution.
-fn gather_build_from_row_store_global(store: &RowStore, rows: &[u32]) -> Vec<ArrayRef> {
-    use arrow::datatypes::DataType;
-    enum Buf {
-        I64(Vec<i64>),
-        F64(Vec<f64>),
-        I32(Vec<i32>),
-        D32(Vec<i32>),
-    }
-    let n = rows.len();
-    let mut bufs: Vec<Buf> = store
-        .cols
-        .iter()
-        .map(|(_, _, dt)| match dt {
-            DataType::Int64 => Buf::I64(Vec::with_capacity(n)),
-            DataType::Float64 => Buf::F64(Vec::with_capacity(n)),
-            DataType::Int32 => Buf::I32(Vec::with_capacity(n)),
-            DataType::Date32 => Buf::D32(Vec::with_capacity(n)),
-            _ => unreachable!("row-store eligibility admits only fixed-width columns"),
-        })
-        .collect();
-    let stride = store.stride;
-    for &row in rows {
-        let base = row as usize * stride;
-        for (k, &(off, _, _)) in store.cols.iter().enumerate() {
-            let p = base + off;
-            match &mut bufs[k] {
-                Buf::I64(v) => v.push(i64::from_le_bytes(store.data[p..p + 8].try_into().unwrap())),
-                Buf::F64(v) => v.push(f64::from_le_bytes(store.data[p..p + 8].try_into().unwrap())),
-                Buf::I32(v) | Buf::D32(v) => {
-                    v.push(i32::from_le_bytes(store.data[p..p + 4].try_into().unwrap()))
-                }
-            }
-        }
-    }
-    bufs.into_iter()
-        .map(|b| -> ArrayRef {
-            match b {
-                Buf::I64(v) => Arc::new(Int64Array::from(v)),
-                Buf::F64(v) => Arc::new(arrow::array::Float64Array::from(v)),
-                Buf::I32(v) => Arc::new(arrow::array::Int32Array::from(v)),
-                Buf::D32(v) => Arc::new(arrow::array::Date32Array::from(v)),
-            }
-        })
-        .collect()
+fn gather_build_from_row_store_global(store: &RowStore, rows: &[u32]) -> Result<Vec<ArrayRef>> {
+    gather_row_store_rows(store, rows.iter().map(|row| Ok(*row as usize)))
 }
 
 /// Joined-batch construction from u32 row ids emitted DIRECTLY by
@@ -4108,7 +5100,7 @@ fn create_joined_batch_u32(
     row_store: Option<(&RowStore, &[usize])>,
 ) -> Result<RecordBatch> {
     let build_columns: Vec<ArrayRef> = if let Some((store, _)) = row_store {
-        gather_build_from_row_store_global(store, &build_rows)
+        gather_build_from_row_store_global(store, &build_rows)?
     } else if build_batches.is_empty() || build_batches[0].num_columns() == 0 {
         Vec::new()
     } else {
@@ -4185,7 +5177,10 @@ fn batch_with_actual_types(declared: &SchemaRef, columns: Vec<ArrayRef>) -> Resu
                 if f.data_type() == c.data_type() {
                     f.as_ref().clone()
                 } else {
-                    arrow::datatypes::Field::new(f.name(), c.data_type().clone(), true)
+                    f.as_ref()
+                        .clone()
+                        .with_data_type(c.data_type().clone())
+                        .with_nullable(true)
                 }
             })
             .collect();
@@ -4423,6 +5418,152 @@ mod tests {
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use futures::TryStreamExt;
+
+    #[test]
+    fn index_cost_bound_covers_dense_null_and_extreme_domains() {
+        assert!(join_index_storage_bound(usize::MAX).is_err());
+        for (keys, direct) in [
+            (vec![Some(0), Some(1), None, Some(1)], true),
+            (vec![Some(i64::MIN), Some(i64::MAX)], false),
+            (vec![None; 4], false),
+        ] {
+            let bound = join_index_storage_bound(keys.len()).unwrap();
+            let pool = crate::execution::create_memory_pool(65536);
+            let keys: ArrayRef = Arc::new(Int64Array::from(keys));
+            let batch = RecordBatch::try_from_iter([("k", keys)]).unwrap();
+            let table = VectorizedHashTable::build(&[batch], &[Expr::column("k")], &pool)
+                .unwrap()
+                .unwrap();
+            assert_eq!(table.direct.is_some(), direct);
+            assert!(pool.used() <= bound);
+            drop(table);
+            assert_eq!(pool.used(), 0);
+        }
+    }
+
+    #[test]
+    fn sparse_integer_domain_uses_a_budgeted_hash_index() {
+        let pool = crate::execution::create_memory_pool(65536);
+        let keys: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(0),
+            Some(15_000_000),
+            Some(0),
+            None,
+        ]));
+        let batch = RecordBatch::try_from_iter([("k", keys)]).unwrap();
+        let table = VectorizedHashTable::build(&[batch], &[Expr::column("k")], &pool)
+            .unwrap()
+            .unwrap();
+        assert!(table.direct.is_none());
+        let probe: ArrayRef = Arc::new(Int64Array::from(vec![Some(0), Some(15_000_000), None]));
+        let mut matches = table.probe_batch(&[probe], 3).unwrap();
+        matches.sort_unstable();
+        assert_eq!(matches, vec![(0, 0, 0), (0, 1, 1), (0, 2, 0)]);
+        drop(table);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn join_index_declines_only_unsupported_domains() {
+        let pool = crate::execution::create_memory_pool(0);
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Float32, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::Float32Array::from(vec![1.0]))],
+        )
+        .unwrap();
+        assert!(
+            VectorizedHashTable::build(&[batch.clone()], &[Expr::column("k")], &pool)
+                .unwrap()
+                .is_none()
+        );
+        let err = match VectorizedHashTable::build(&[batch], &[Expr::column("missing")], &pool) {
+            Err(e) => e,
+            Ok(_) => panic!("binding errors cannot masquerade as unsupported domains"),
+        };
+        assert_eq!(err.kind(), "ColumnNotFound");
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn join_index_reservation_lifetime_and_parent_contention() {
+        use crate::execution::{create_memory_pool, MemoryPool};
+        for keys in [vec![1, 2, 2, 3], vec![i64::MIN, 0, i64::MAX, 0]] {
+            let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+            let batch =
+                RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(keys))]).unwrap();
+            let parent = create_memory_pool(1024);
+            let a = Arc::new(MemoryPool::new_child(&parent, "join-a", 1024));
+            let table = VectorizedHashTable::build(&[batch.clone()], &[Expr::column("k")], &a)
+                .unwrap()
+                .unwrap();
+            let charged = table.heads.capacity() * 4
+                + table.next.capacity() * 4
+                + table.entries.capacity() * 8;
+            assert_eq!(a.used(), charged);
+            assert_eq!(parent.used(), charged);
+            let blocker = parent.allocate(parent.available()).unwrap();
+            let b = Arc::new(MemoryPool::new_child(&parent, "join-b", 1024));
+            assert!(VectorizedHashTable::build(&[batch], &[Expr::column("k")], &b).is_err());
+            assert_eq!(b.used(), 0);
+            drop(blocker);
+            assert_eq!(parent.used(), charged);
+            drop(table);
+            assert_eq!(parent.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn join_index_refusal_is_not_swallowed_as_fallback() {
+        let left = create_left_batch();
+        let right = create_right_batch();
+        let pool = crate::execution::create_memory_pool(1);
+        let join = HashJoinExec::new(
+            Arc::new(MemoryTableExec::new("l", left.schema(), vec![left], None)),
+            Arc::new(MemoryTableExec::new("r", right.schema(), vec![right], None)),
+            vec![(Expr::column("id"), Expr::column("id"))],
+            JoinType::Inner,
+        )
+        .with_memory_pool(pool.clone());
+        let err = match join.execute(0).await {
+            Ok(_) => panic!("index admission must refuse"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), "Execution");
+        assert!(
+            err.to_string().contains("Memory limit exceeded in"),
+            "{err}"
+        );
+        assert!(join.build_cache.get().is_none());
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn join_index_owner_survives_operator_until_prepared_streams_drop() {
+        let left = create_left_batch();
+        let right = create_right_batch();
+        let pool = crate::execution::create_memory_pool(1024 * 1024);
+        let join = HashJoinExec::new(
+            Arc::new(MemoryTableExec::new("l", left.schema(), vec![left], None)),
+            Arc::new(MemoryTableExec::new("r", right.schema(), vec![right], None)),
+            vec![(Expr::column("id"), Expr::column("id"))],
+            JoinType::Inner,
+        )
+        .with_memory_pool(pool.clone());
+        let prepared = join
+            .prepare_queue_input()
+            .await
+            .unwrap()
+            .expect("resident Inner prepares");
+        assert!(pool.used() > 0);
+        drop(join);
+        assert!(
+            pool.used() > 0,
+            "prepared streams retain the cached index owner"
+        );
+        drop(prepared);
+        assert_eq!(pool.used(), 0);
+    }
 
     fn create_left_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -5677,6 +6818,511 @@ mod tests {
                     "dict={dict} {jt:?}: build-side marking took {elapsed:?} — quadratic walk regressed?"
                 );
                 eprintln!("[hjdict-002] dict={dict} {jt:?}: {got} rows in {elapsed:?}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod prepared_inner_bound_tests {
+    use super::*;
+    use crate::physical::operators::spillable::owned_input_batch_charge;
+    use crate::physical::queue_layout::{inner_output_copy_bound, GatherCopyBound};
+    use arrow::array::{DictionaryArray, Int32Array, StringArray};
+    use arrow::datatypes::{Field, Int32Type};
+
+    fn build(rows: usize, dictionary: bool) -> RecordBatch {
+        let strings: ArrayRef = if dictionary {
+            Arc::new(
+                DictionaryArray::<Int32Type>::try_new(
+                    Int32Array::from(
+                        (0..rows)
+                            .map(|i| {
+                                if i % 3 == 0 {
+                                    None
+                                } else {
+                                    Some((i % 2) as i32)
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    Arc::new(StringArray::from(vec![Some("long".repeat(1024)), None])),
+                )
+                .unwrap(),
+            )
+        } else {
+            Arc::new(StringArray::from(
+                (0..rows)
+                    .map(|i| {
+                        if i % 3 == 0 {
+                            None
+                        } else if i % 2 == 0 {
+                            Some("long".repeat(1024))
+                        } else {
+                            Some("s".into())
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            ))
+        };
+        RecordBatch::try_from_iter(vec![
+            (
+                "bk",
+                Arc::new(Int64Array::from_iter_values(0..rows as i64)) as ArrayRef,
+            ),
+            ("bv", strings),
+        ])
+        .unwrap()
+    }
+    fn probe() -> RecordBatch {
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "pk",
+                Arc::new(Int64Array::from(vec![10, 11, 12, 13])) as ArrayRef,
+            ),
+            (
+                "pv",
+                Arc::new(StringArray::from(vec![
+                    "excluded".repeat(1000),
+                    "x".repeat(1000),
+                    "y".into(),
+                    "z".into(),
+                ])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        batch.slice(1, 3)
+    }
+    #[test]
+    fn actual_inner_gathers_masks_orientations_and_repeated_values_obey_maximum() {
+        for (rows, dictionary) in [(3, false), (3, true), (4097, false)] {
+            let build = build(rows, dictionary);
+            let probe = probe();
+            let probe_bound =
+                GatherCopyBound::from_batches(&probe.schema(), &[probe.clone()]).unwrap();
+            for swapped in [false, true] {
+                for masked in [false, true] {
+                    let bk = if masked {
+                        vec![false, true]
+                    } else {
+                        vec![true, true]
+                    };
+                    let pk = if masked {
+                        vec![true, false]
+                    } else {
+                        vec![true, true]
+                    };
+                    let mut fields = Vec::new();
+                    for i in
+                        0..bk.iter().filter(|v| **v).count() + pk.iter().filter(|v| **v).count()
+                    {
+                        // Intentionally logical types: actual gather rewrites the
+                        // mismatches including its small-build dictionary branch.
+                        fields.push(Field::new(
+                            format!("{}_{i}", "long_alias".repeat(20)),
+                            arrow::datatypes::DataType::Utf8,
+                            true,
+                        ));
+                    }
+                    let schema = Arc::new(Schema::new(fields));
+                    let bound = inner_output_copy_bound(
+                        &[build.clone()],
+                        &probe_bound,
+                        Some(&bk),
+                        Some(&pk),
+                        swapped,
+                        &schema,
+                        4096,
+                    )
+                    .unwrap();
+                    let actual_build = prune_batch_columns(&build, &bk);
+                    let actual_probe = prune_batch_columns(&probe, &pk);
+                    for count in [0, 3, 4096] {
+                        let build_indices = (0..count).map(|i| (0, i % rows)).collect::<Vec<_>>();
+                        let probe_indices = (0..count).map(|i| i % 3).collect::<Vec<_>>();
+                        let output = create_joined_batch(
+                            &[actual_build.clone()],
+                            &actual_probe,
+                            &build_indices,
+                            &probe_indices,
+                            swapped,
+                            &schema,
+                            None,
+                        )
+                        .unwrap();
+                        assert_eq!(output.num_rows(), count);
+                        assert!(
+                            owned_input_batch_charge(&output).unwrap()
+                                <= bound.max_bytes().unwrap(),
+                            "rows={rows} dict={dictionary} swapped={swapped} masked={masked}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn explicit_small_build_dictionary_schema_and_full_child_are_bounded() {
+        // Exercise the encoded alternative regardless of process QE_DICT_GATHER,
+        // without mutating global environment or racing other tests.
+        let source = build(3, false);
+        let probe = probe();
+        let schema = Arc::new(Schema::new(
+            source
+                .schema()
+                .fields()
+                .iter()
+                .chain(probe.schema().fields())
+                .map(|f| f.as_ref().clone())
+                .collect::<Vec<_>>(),
+        ));
+        let bound = inner_output_copy_bound(
+            &[source.clone()],
+            &GatherCopyBound::from_batches(&probe.schema(), &[probe.clone()]).unwrap(),
+            None,
+            None,
+            false,
+            &schema,
+            4096,
+        )
+        .unwrap();
+        let keys = Int32Array::from(vec![1; 4096]);
+        let encoded: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(keys, source.column(1).clone()).unwrap(),
+        );
+        let indices = UInt32Array::from(vec![1; 4096]);
+        let output = batch_with_actual_types(
+            &schema,
+            vec![
+                compute::take(source.column(0).as_ref(), &indices, None).unwrap(),
+                encoded,
+                compute::take(probe.column(0).as_ref(), &indices, None).unwrap(),
+                compute::take(probe.column(1).as_ref(), &indices, None).unwrap(),
+            ],
+        )
+        .unwrap();
+        assert!(owned_input_batch_charge(&output).unwrap() <= bound.max_bytes().unwrap());
+    }
+    #[test]
+    fn unsupported_concat_masks_and_arithmetic_decline() {
+        let build = build(3, false);
+        let probe = probe();
+        let gather = GatherCopyBound::from_batches(&probe.schema(), &[probe.clone()]).unwrap();
+        let schema = Arc::new(Schema::new(
+            build
+                .schema()
+                .fields()
+                .iter()
+                .chain(probe.schema().fields())
+                .map(|f| f.as_ref().clone())
+                .collect::<Vec<_>>(),
+        ));
+        assert!(inner_output_copy_bound(
+            &[build.clone(), build.clone()],
+            &gather,
+            None,
+            None,
+            false,
+            &schema,
+            4096
+        )
+        .is_none());
+        assert!(inner_output_copy_bound(
+            &[build.clone()],
+            &gather,
+            Some(&[true]),
+            None,
+            false,
+            &schema,
+            4096
+        )
+        .is_none());
+        assert!(
+            inner_output_copy_bound(&[build], &gather, None, None, false, &schema, usize::MAX)
+                .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod row_store_owned_tests {
+    use super::*;
+    use crate::execution::create_memory_pool;
+    use arrow::array::{Date32Array, Float64Array, Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field};
+    fn batch(rows: &[(i64, u64, i32, i32)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("f", DataType::Float64, false),
+            Field::new("i", DataType::Int32, false),
+            Field::new("d", DataType::Date32, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    rows.iter().map(|r| f64::from_bits(r.1)).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int32Array::from(
+                    rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                )),
+                Arc::new(Date32Array::from(
+                    rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+    #[test]
+    fn row_store_exact_bits_signed_types_and_duplicate_multibatch_indices() {
+        let a = (i64::MIN, 0x8000_0000_0000_0000, -1, -12345);
+        let b = (7, 0x7ff8_0000_0000_0042, i32::MIN, -1);
+        let c = (i64::MAX, 0xfff0_0000_0000_0000, 3, 0);
+        let source = batch(&[c, a, b]).slice(1, 2);
+        let batches = vec![source, batch(&[c, a])];
+        let pool = create_memory_pool(1 << 20);
+        let store = RowStore::build(&batches, &pool).unwrap();
+        let indices = [(1, 1), (0, 0), (0, 1), (1, 0), (0, 1)];
+        let output = gather_build_from_row_store(&store, &store.row_offsets, &indices).unwrap();
+        let expected = [a, a, b, c, b];
+        for (row, value) in expected.iter().enumerate() {
+            assert_eq!(
+                output[0]
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(row),
+                value.0
+            );
+            assert_eq!(
+                output[1]
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .value(row)
+                    .to_bits(),
+                value.1
+            );
+            assert_eq!(
+                output[2]
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(row),
+                value.2
+            );
+            assert_eq!(
+                output[3]
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .unwrap()
+                    .value(row),
+                value.3
+            );
+        }
+        let global = gather_build_from_row_store_global(&store, &[3, 0, 1, 2, 1]).unwrap();
+        for (a, b) in output.iter().zip(&global) {
+            assert_eq!(a.to_data(), b.to_data());
+        }
+        assert!(
+            gather_build_from_row_store(&store, &store.row_offsets, &[(0, 2)]).is_err(),
+            "must not spill into next batch's row domain"
+        );
+        assert!(gather_build_from_row_store_global(&store, &[4]).is_err());
+    }
+    #[test]
+    fn row_store_schema_and_null_rejection_precedes_admission() {
+        let pool = create_memory_pool(1 << 20);
+        let first = batch(&[(1, 0, -1, -1)]);
+        let changed =
+            RecordBatch::try_from_iter([("k", Arc::new(Int32Array::from(vec![-1])) as ArrayRef)])
+                .unwrap();
+        let error = RowStore::build(&[first.clone(), changed], &pool)
+            .err()
+            .unwrap();
+        assert!(matches!(error, crate::error::QueryError::Type(_)));
+        assert_eq!(pool.used(), 0);
+        let nullable =
+            RecordBatch::try_from_iter([("k", Arc::new(Int64Array::from(vec![None])) as ArrayRef)])
+                .unwrap();
+        assert!(matches!(
+            RowStore::build(&[nullable], &pool),
+            Err(crate::error::QueryError::NotImplemented(_))
+        ));
+        let unsupported =
+            RecordBatch::try_from_iter([("k", Arc::new(StringArray::from(vec!["x"])) as ArrayRef)])
+                .unwrap();
+        assert!(matches!(
+            RowStore::build(&[unsupported], &pool),
+            Err(crate::error::QueryError::NotImplemented(_))
+        ));
+        assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn row_store_retained_and_temporary_admission_refusal_and_last_owner_drop() {
+        let batches = vec![batch(&[(1, 0, 2, 3); 5]), batch(&[(2, 0, 4, 5); 7])];
+        let pool = create_memory_pool(1 << 20);
+        let store = Arc::new(RowStore::build(&batches, &pool).unwrap());
+        let actual = std::mem::size_of::<RowStore>()
+            + store.data.capacity()
+            + store.row_offsets.capacity() * std::mem::size_of::<usize>()
+            + store.cols.capacity() * std::mem::size_of::<(usize, u8, DataType)>();
+        assert_eq!(pool.used(), actual);
+        assert!(
+            pool.reserved_peak() > pool.used(),
+            "source/chunk temporary views were admitted too"
+        );
+        let peak = pool.reserved_peak();
+        let clone = store.clone();
+        drop(store);
+        assert_eq!(pool.used(), actual);
+        drop(clone);
+        assert_eq!(pool.used(), 0);
+        for limit in [actual - 1, peak - 1] {
+            let tight = create_memory_pool(limit);
+            let error = RowStore::build(&batches, &tight)
+                .err()
+                .expect("insufficient retained/transient admission");
+            assert!(error.to_string().contains("Memory limit exceeded in '"));
+            assert_eq!(tight.used(), 0);
+        }
+        let fitting = create_memory_pool(peak);
+        let store = RowStore::build(&batches, &fitting).unwrap();
+        assert_eq!(fitting.used(), actual);
+        drop(store);
+        assert_eq!(fitting.used(), 0);
+    }
+    #[test]
+    fn row_store_checked_layout_rejects_overflow_and_global_u32_limit() {
+        assert!(row_store_charge(2, usize::MAX, 1, 1).is_err());
+        assert!(row_store_charge(1, 8, usize::MAX, 1).is_err());
+        assert!(row_store_charge(1, 8, 1, usize::MAX).is_err());
+        if let Some(n) = (u32::MAX as usize).checked_add(1) {
+            assert!(row_store_charge(n, 1, 1, 1).is_err());
+        }
+    }
+    #[test]
+    fn row_store_real_gather_bound_covers_multibatch_and_nullable_probe_strings() {
+        use crate::physical::operators::spillable::owned_input_batch_charge;
+        use crate::physical::queue_layout::{row_store_output_copy_bound, GatherCopyBound};
+        let builds = vec![
+            batch(&[(1, 0, -1, -2)]),
+            batch(&[(2, 0, -3, -4), (3, 0, -5, -6)]),
+        ];
+        let pool = create_memory_pool(1 << 20);
+        let store = RowStore::build(&builds, &pool).unwrap();
+        let text = "abc".repeat(100);
+        let probe = RecordBatch::try_from_iter([(
+            "p",
+            Arc::new(StringArray::from(vec![
+                Some(text.as_str()),
+                None,
+                Some("q"),
+            ])) as ArrayRef,
+        )])
+        .unwrap();
+        for swapped in [false, true] {
+            let fields = if swapped {
+                probe
+                    .schema()
+                    .fields()
+                    .iter()
+                    .cloned()
+                    .chain(builds[0].schema().fields().iter().cloned())
+                    .collect::<Vec<_>>()
+            } else {
+                builds[0]
+                    .schema()
+                    .fields()
+                    .iter()
+                    .cloned()
+                    .chain(probe.schema().fields().iter().cloned())
+                    .collect::<Vec<_>>()
+            };
+            let schema = Arc::new(Schema::new(fields));
+            let metadata =
+                GatherCopyBound::from_batches(&probe.schema(), std::slice::from_ref(&probe))
+                    .unwrap();
+            let bound = row_store_output_copy_bound(
+                &builds[0].schema(),
+                &metadata,
+                None,
+                swapped,
+                &schema,
+                4,
+            )
+            .unwrap();
+            let output = create_joined_batch(
+                &builds,
+                &probe,
+                &[(1, 1), (0, 0), (1, 0), (1, 1)],
+                &[0, 0, 1, 2],
+                swapped,
+                &schema,
+                Some((&store, &store.row_offsets)),
+            )
+            .unwrap();
+            assert!(owned_input_batch_charge(&output).unwrap() <= bound.max_bytes().unwrap());
+            assert!(
+                bound.gather_max_bytes(7).is_some(),
+                "fixed build proof composes downstream"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod compiled_float_residual_oracle {
+    use super::*;
+
+    #[test]
+    fn compiled_float_residual_matches_independent_sql_oracle() {
+        let oracle: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/float_comparison_duckdb_1_4_4.json"
+        ))
+        .unwrap();
+        let ops = [
+            BinaryOp::Eq,
+            BinaryOp::NotEq,
+            BinaryOp::Lt,
+            BinaryOp::LtEq,
+            BinaryOp::Gt,
+            BinaryOp::GtEq,
+        ];
+        for case in oracle["cases"].as_array().unwrap() {
+            let (Some(a), Some(b)) = (case["left"].as_str(), case["right"].as_str()) else {
+                continue;
+            };
+            // Caller owns NULL rejection; this specialized evaluator receives
+            // only non-NULL slots. Exercise it directly rather than a fallback.
+            let build = RecordBatch::try_from_iter(vec![(
+                "a",
+                Arc::new(arrow::array::Float64Array::from(vec![a
+                    .parse::<f64>()
+                    .unwrap()])) as ArrayRef,
+            )])
+            .unwrap();
+            let probe = RecordBatch::try_from_iter(vec![(
+                "b",
+                Arc::new(arrow::array::Float64Array::from(vec![b
+                    .parse::<f64>()
+                    .unwrap()])) as ArrayRef,
+            )])
+            .unwrap();
+            for (i, op) in ops.into_iter().enumerate() {
+                let filter = CompiledFilter {
+                    build_col_idx: 0,
+                    probe_col_idx: 0,
+                    op,
+                };
+                assert_eq!(
+                    filter.evaluate(&build, 0, &probe, 0),
+                    case["expected"][i].as_bool().unwrap(),
+                    "{a} {op:?} {b}"
+                );
             }
         }
     }

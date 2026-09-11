@@ -15,13 +15,126 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// A source-only aggregate can omit a projection only when every emitted field
+/// keeps its exact bound identity and value. Subsetting/reordering is safe for
+/// name-bound expressions; renaming and computation require explicit remapping.
+fn source_preserving_project(node: &crate::planner::ProjectNode) -> bool {
+    let input = node.input.schema();
+    node.exprs.len() == node.schema.fields().len()
+        && node
+            .exprs
+            .iter()
+            .zip(node.schema.fields())
+            .all(|(expr, output)| {
+                let mut value = expr;
+                while let Expr::Alias { expr, .. } = value {
+                    value = expr;
+                }
+                let Expr::Column(column) = value else {
+                    return false;
+                };
+                input
+                    .resolve_column(column)
+                    .is_some_and(|(_, field)| field == output)
+                    && node.schema.resolve_column(column).is_some()
+            })
+}
+
 /// Shared CTE materialization cache. Allows SubqueryExecutor planners to access
 /// CTEs materialized by the main planner.
 pub type SharedCteCache =
     Arc<parking_lot::Mutex<HashMap<usize, (SchemaRef, Vec<arrow::record_batch::RecordBatch>)>>>;
 
+/// Estimates choose streaming; actual queue reservations remain authoritative.
+fn parquet_scan_batch_policy(
+    schema: &SchemaRef,
+    requested: usize,
+    budget: Option<usize>,
+    estimated_materialization: Option<u64>,
+    spill_covered: bool,
+) -> (usize, bool) {
+    let requested = requested.max(1);
+    let Some(budget) = budget else {
+        return (requested, false);
+    };
+    use crate::physical::operators::spillable::input_queue_fixed_width_row_limit;
+    let limit = input_queue_fixed_width_row_limit(schema, requested, budget);
+    let supported = input_queue_fixed_width_row_limit(schema, 1, usize::MAX).is_some();
+    let quantum_too_large = supported && limit != Some(requested);
+    let materialization_too_large =
+        estimated_materialization.is_some_and(|bytes| u128::from(bytes) > budget as u128);
+    let pressure = spill_covered && (quantum_too_large || materialization_too_large);
+    let rows = limit.unwrap_or(if pressure { 1 } else { requested });
+    (rows, pressure)
+}
+
+/// Narrow only emitted streaming roots, preserving the parent Project's resolver.
+/// Predicate/runtime read dependencies remain owned by the scanner.
+fn streaming_project_output_hint(
+    scan: &crate::planner::ScanNode,
+    exprs: &[Expr],
+) -> Option<Vec<usize>> {
+    fn column(expr: &Expr) -> Option<&crate::planner::Column> {
+        match expr {
+            Expr::Column(c) => Some(c),
+            Expr::Alias { expr, .. } => column(expr),
+            _ => None,
+        }
+    }
+    if exprs.is_empty() {
+        return None;
+    }
+    let logical = plan_schema_to_arrow(&scan.schema);
+    let mut original = Vec::new();
+    original
+        .try_reserve_exact(
+            scan.projection
+                .as_ref()
+                .map_or(logical.fields().len(), Vec::len),
+        )
+        .ok()?;
+    if let Some(projection) = &scan.projection {
+        original.extend_from_slice(projection);
+    } else {
+        original.extend(0..logical.fields().len());
+    }
+    let effective = Arc::new(logical.project(&original).ok()?);
+    let mut wanted = Vec::new();
+    wanted.try_reserve_exact(exprs.len()).ok()?;
+    for expr in exprs {
+        let index =
+            crate::physical::operators::find_column_index_in_schema(&effective, column(expr)?)
+                .ok()?;
+        wanted.push(*original.get(index)?);
+    }
+    let mut reduced = Vec::new();
+    reduced.try_reserve_exact(original.len()).ok()?;
+    for root in original.iter().copied() {
+        if wanted.contains(&root) && !reduced.contains(&root) {
+            reduced.push(root);
+        }
+    }
+    if reduced.is_empty() || reduced == original {
+        return None;
+    }
+    let emitted = Arc::new(logical.project(&reduced).ok()?);
+    for (expr, root) in exprs.iter().zip(wanted) {
+        let index =
+            crate::physical::operators::find_column_index_in_schema(&emitted, column(expr)?)
+                .ok()?;
+        if reduced.get(index) != Some(&root) {
+            return None;
+        }
+    }
+    Some(reduced)
+}
+
 /// Physical planner that converts logical plans to physical execution plans
 pub struct PhysicalPlanner {
+    #[cfg(feature = "gpu")]
+    gpu_resident: Option<Arc<crate::physical::gpu::ResidentRequest>>,
+    #[cfg(feature = "gpu")]
+    gpu_candidates: Option<Arc<std::sync::Mutex<Vec<Arc<crate::physical::gpu::GpuAggPlan>>>>>,
     /// Table providers for accessing table data
     tables: HashMap<String, Arc<dyn TableProvider>>,
     /// Optional subquery executor for handling subqueries in filters
@@ -42,18 +155,6 @@ pub struct PhysicalPlanner {
     /// Aggregate child so the aggregate can filter per shard BEFORE
     /// materializing output arrays (Q18 builds 650K rows instead of 15M).
     pending_agg_filter: RefCell<Option<Expr>>,
-    /// Streaming scans created in this plan, keyed by operator address:
-    /// (runtime-filter config handle, provider schema). Joins link runtime
-    /// key filters to their probe-side scans through this registry.
-    streaming_scans: RefCell<
-        HashMap<
-            usize,
-            (
-                crate::physical::operators::streaming_parquet_scan::RuntimeFilterConfig,
-                SchemaRef,
-            ),
-        >,
-    >,
     /// Per-Inner-join ancestor reference sets keyed by `&JoinNode` address,
     /// computed by `analyze_join_output_usage` before planning. At join
     /// construction the refs become a retention mask over the PHYSICAL
@@ -111,9 +212,25 @@ impl Default for PhysicalPlanner {
 }
 
 impl PhysicalPlanner {
+    #[cfg(feature = "gpu")]
+    pub(crate) fn set_gpu_resident(&mut self, request: Arc<crate::physical::gpu::ResidentRequest>) {
+        self.gpu_resident = Some(request);
+    }
+    #[cfg(feature = "gpu")]
+    pub(crate) fn set_gpu_candidates(
+        &mut self,
+        output: Arc<std::sync::Mutex<Vec<Arc<crate::physical::gpu::GpuAggPlan>>>>,
+    ) {
+        self.gpu_candidates = Some(output);
+    }
+
     /// Create a new physical planner without memory management (uses regular operators)
     pub fn new() -> Self {
         Self {
+            #[cfg(feature = "gpu")]
+            gpu_resident: None,
+            #[cfg(feature = "gpu")]
+            gpu_candidates: None,
             tables: HashMap::new(),
             subquery_executor: None,
             memory_pool: None,
@@ -121,7 +238,6 @@ impl PhysicalPlanner {
             scan_cache: RefCell::new(HashMap::new()),
             cte_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             pending_agg_filter: RefCell::new(None),
-            streaming_scans: RefCell::new(HashMap::new()),
             join_retained: RefCell::new(HashMap::new()),
             spill_covered_scans: RefCell::new(std::collections::HashSet::new()),
         }
@@ -130,6 +246,10 @@ impl PhysicalPlanner {
     /// Create a physical planner with memory management (uses spillable operators)
     pub fn with_config(memory_pool: SharedMemoryPool, config: ExecutionConfig) -> Self {
         Self {
+            #[cfg(feature = "gpu")]
+            gpu_resident: None,
+            #[cfg(feature = "gpu")]
+            gpu_candidates: None,
             tables: HashMap::new(),
             subquery_executor: None,
             memory_pool: Some(memory_pool),
@@ -137,7 +257,6 @@ impl PhysicalPlanner {
             scan_cache: RefCell::new(HashMap::new()),
             cte_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             pending_agg_filter: RefCell::new(None),
-            streaming_scans: RefCell::new(HashMap::new()),
             join_retained: RefCell::new(HashMap::new()),
             spill_covered_scans: RefCell::new(std::collections::HashSet::new()),
         }
@@ -213,8 +332,10 @@ impl PhysicalPlanner {
                 }
             }
             LogicalPlan::Project(node) => {
-                // Project can be handled if input is Scan or Filter->Scan
-                self.try_extract_parquet_source(&node.input)
+                // Never erase a value computation or a binding change.
+                source_preserving_project(node)
+                    .then(|| self.try_extract_parquet_source(&node.input))
+                    .flatten()
             }
             _ => None,
         }
@@ -273,13 +394,19 @@ impl PhysicalPlanner {
                 let projection = node.projection.clone();
                 Some((provider.clone(), input_schema, projection))
             }
-            LogicalPlan::Project(node) => self.try_extract_native_dense_source(&node.input),
+            LogicalPlan::Project(node) if source_preserving_project(node) => {
+                self.try_extract_native_dense_source(&node.input)
+            }
             _ => None,
         }
     }
 
     /// Helper to create a FilterExec with subquery executor if needed
-    fn create_filter(&self, input: Arc<dyn PhysicalOperator>, predicate: Expr) -> FilterExec {
+    fn create_filter(
+        &self,
+        input: Arc<dyn PhysicalOperator>,
+        predicate: Expr,
+    ) -> Result<FilterExec> {
         let has_subquery = predicate.contains_subquery();
         // Pre-compute uncorrelated scalar subqueries as literal values
         let predicate = if has_subquery {
@@ -292,13 +419,28 @@ impl PhysicalPlanner {
             predicate
         };
         let still_has_subquery = predicate.contains_subquery();
-        let filter = FilterExec::new(input, predicate);
+        let initialized = match (&self.memory_pool, &self.config) {
+            (Some(pool), Some(config)) => {
+                crate::physical::operators::initialized_membership::InitializedMembership::try_new(
+                    &predicate,
+                    &input.schema(),
+                    &self.tables,
+                    pool,
+                    config,
+                )?
+            }
+            _ => None,
+        };
+        let mut filter = FilterExec::new(input, predicate);
+        if let Some(owner) = initialized {
+            filter = filter.with_initialized_membership(owner);
+        }
         if still_has_subquery {
             if let Some(ref executor) = self.subquery_executor {
-                return filter.with_subquery_executor(executor.clone());
+                return Ok(filter.with_subquery_executor(executor.clone()));
             }
         }
-        filter
+        Ok(filter)
     }
 
     /// Replace uncorrelated scalar subqueries with their computed literal values.
@@ -334,11 +476,13 @@ impl PhysicalPlanner {
             Expr::Cast {
                 expr: inner,
                 data_type,
+                mode,
             } => {
                 let inner = Self::precompute_uncorrelated_scalars(*inner, executor);
                 Expr::Cast {
                     expr: Box::new(inner),
                     data_type,
+                    mode,
                 }
             }
             Expr::Alias { expr: inner, name } => {
@@ -600,7 +744,7 @@ impl PhysicalPlanner {
     }
 
     /// Pre-scan tables that are accessed multiple times and cache the results.
-    fn prescan_shared_tables(&self, logical: &LogicalPlan) {
+    fn prescan_shared_tables(&self, logical: &LogicalPlan) -> Result<()> {
         use rayon::prelude::*;
 
         let mut table_scans: HashMap<String, Vec<Option<Vec<usize>>>> = HashMap::new();
@@ -619,6 +763,16 @@ impl PhysicalPlanner {
             .filter(|(_, projections)| projections.len() > 1) // Only shared tables
             .filter_map(|(table_name, projections)| {
                 let provider = self.tables.get(table_name)?;
+                // Shared caching is optional. Respect the same preflight refusal
+                // as ordinary native scan routing BEFORE invoking the provider;
+                // a failed scan must still propagate, never become a cache miss.
+                if provider
+                    .as_any()
+                    .downcast_ref::<crate::storage::NativeTable>()
+                    .is_some_and(|native| native.scan_budget_exceeded())
+                {
+                    return None;
+                }
                 // Size the table from its files when it is Parquet, else from
                 // provider statistics. Keying this off `parquet_files()` alone
                 // left every non-Parquet provider (e.g. Lance) exempt from the
@@ -644,10 +798,13 @@ impl PhysicalPlanner {
             .collect();
 
         // Execute all scans in parallel using rayon
-        let results: Vec<_> = scan_tasks
+        let results: Result<Vec<_>> = scan_tasks
             .par_iter()
-            .filter_map(|(table_name, provider, proj)| {
-                let batches = provider.scan(proj.as_deref()).ok()?;
+            .map(|(table_name, provider, proj)| {
+                // Once a provider has been invoked, failure is not a cache
+                // miss. Retrying through ordinary planning could hide an
+                // error after the source has consumed or changed its input.
+                let batches = provider.scan(proj.as_deref())?;
                 let schema = match proj {
                     Some(indices) => {
                         let base_schema = provider.schema();
@@ -659,14 +816,15 @@ impl PhysicalPlanner {
                     }
                     None => provider.schema(),
                 };
-                Some((table_name.clone(), schema, batches))
+                Ok((table_name.clone(), schema, batches))
             })
             .collect();
 
         let mut cache = self.scan_cache.borrow_mut();
-        for (table_name, schema, batches) in results {
+        for (table_name, schema, batches) in results? {
             cache.insert(table_name, (schema, batches));
         }
+        Ok(())
     }
 
     /// Pre-materialize CTEs that are referenced multiple times. This ensures both
@@ -736,6 +894,45 @@ impl PhysicalPlanner {
             self.cte_cache.lock().insert(key, (schema, batches));
         }
         Ok(())
+    }
+
+    /// Alias only emitted physical roots. SubqueryAlias changes relation names;
+    /// column-list renames are separate logical projections. Using emitted roots
+    /// preserves pruning and cached CTE consumers without guessing full ordinals.
+    fn apply_relation_alias(
+        &self,
+        input: Arc<dyn PhysicalOperator>,
+        alias: &str,
+    ) -> Result<Arc<dyn PhysicalOperator>> {
+        let schema = input.schema();
+        let bound = PlanSchema::from_qualified_arrow(schema.as_ref());
+        if bound
+            .fields()
+            .iter()
+            .all(|field| field.relation.as_deref() == Some(alias))
+        {
+            return Ok(input);
+        }
+        let exprs = bound
+            .fields()
+            .iter()
+            .map(|field| {
+                Expr::Column(crate::planner::Column {
+                    relation: field.relation.clone(),
+                    name: field.name.clone(),
+                })
+            })
+            .collect();
+        let fields = bound
+            .fields()
+            .iter()
+            .map(|field| field.clone().with_relation(alias).to_arrow_field())
+            .collect::<Vec<_>>();
+        let mut project = ProjectExec::new(input, exprs, Arc::new(Schema::new(fields)));
+        if let Some(pool) = &self.memory_pool {
+            project = project.with_memory_pool(pool.clone());
+        }
+        Ok(Arc::new(project))
     }
 
     /// Hash a CTE name to a usize key for the cache.
@@ -1163,7 +1360,7 @@ impl PhysicalPlanner {
         }
         self.materialize_shared_ctes(logical)?;
         // Pre-scan tables that are accessed multiple times to avoid redundant parquet reads
-        self.prescan_shared_tables(logical);
+        self.prescan_shared_tables(logical)?;
         // Join-output pruning analysis: which columns of each Inner join's
         // output do its ANCESTORS actually reference? ON-only columns (the
         // usual case: surrogate keys) are dead the instant the probe
@@ -1286,6 +1483,11 @@ impl PhysicalPlanner {
                     aggregates,
                     schema,
                 )
+                .with_memory_pool(
+                    self.memory_pool
+                        .clone()
+                        .unwrap_or_else(crate::execution::process_memory_pool),
+                )
                 .with_post_filter(post_filter);
                 return Ok(Arc::new(morsel_agg));
             } else if let Some((provider, input_schema, projection)) =
@@ -1324,6 +1526,11 @@ impl PhysicalPlanner {
                         aggregates,
                         schema,
                     )
+                    .with_memory_pool(
+                        self.memory_pool
+                            .clone()
+                            .unwrap_or_else(crate::execution::process_memory_pool),
+                    )
                     .with_post_filter(post_filter)
                     .with_native_provider(provider);
                     return Ok(Arc::new(morsel_agg));
@@ -1360,14 +1567,293 @@ impl PhysicalPlanner {
             .with_disjoint_groups(disjoint);
             Ok(Arc::new(agg))
         } else {
-            let agg = HashAggregateExec::new(input, node.group_by.clone(), aggregates, schema);
+            let agg = HashAggregateExec::new(input, node.group_by.clone(), aggregates, schema)
+                .with_memory_pool(
+                    self.memory_pool
+                        .clone()
+                        .unwrap_or_else(crate::execution::process_memory_pool),
+                );
             match post_filter {
                 Some(pred) => {
-                    let filter = self.create_filter(Arc::new(agg), pred);
+                    let filter = self.create_filter(Arc::new(agg), pred)?;
                     Ok(Arc::new(filter))
                 }
                 None => Ok(Arc::new(agg)),
             }
+        }
+    }
+
+    fn lower_scan(
+        &self,
+        node: &crate::planner::ScanNode,
+        streaming_output_hint: Option<&[usize]>,
+    ) -> Result<Arc<dyn PhysicalOperator>> {
+        let provider = self
+            .tables
+            .get(&node.table_name)
+            .ok_or_else(|| QueryError::TableNotFound(node.table_name.clone()))?;
+
+        // Use the logical schema (with aliases) instead of the provider schema
+        let logical_schema = plan_schema_to_arrow(&node.schema);
+
+        let output_schema = match &node.projection {
+            Some(indices) => Arc::new(logical_schema.project(indices)?),
+            None => logical_schema.clone(),
+        };
+        let configured_batch_size = self.config.as_ref().map_or(8_192, |c| c.batch_size);
+        let spill_covered = self
+            .spill_covered_scans
+            .borrow()
+            .contains(&(node as *const _ as usize));
+        let (reader_batch_size, memory_pressure) = if provider.parquet_files().is_some() {
+            parquet_scan_batch_policy(
+                &output_schema,
+                configured_batch_size,
+                self.memory_pool.as_ref().map(|pool| pool.max()),
+                provider.statistics().map(|stats| stats.total_byte_size),
+                spill_covered,
+            )
+        } else {
+            (configured_batch_size, false)
+        };
+
+        // Unfiltered single-use parquet scans stream lazily, partitioned
+        // by row group: decode overlaps with the consumer (join probes,
+        // sorts) instead of materializing the whole table at plan time.
+        // Filtered scans keep the eager path (decoder-level RowFilter);
+        // prescanned shared tables use the cache below.
+        // Filtered scans also stream when the predicate is fully
+        // decodable at the parquet layer (subquery-free, all columns
+        // resolve in the provider schema) — the decoder RowFilter
+        // applies it completely, so no FilterExec is needed and the
+        // scan can additionally take runtime join-key filters.
+        let filter_streams = node.filter.as_ref().is_none_or(|f| {
+            if f.contains_subquery() {
+                return false;
+            }
+            // Small tables keep the eager path: it already pushes a
+            // decoder RowFilter and reads row groups with better
+            // parallelism than a lazy stream (Q16's part scan lost
+            // 180ms as a filtered stream).
+            let big = provider
+                .parquet_files()
+                .map(|files| {
+                    files
+                        .iter()
+                        .filter_map(|f| std::fs::metadata(f).ok())
+                        .map(|m| m.len())
+                        .sum::<u64>()
+                        > 400_000_000
+                })
+                .unwrap_or(false);
+            if !big && !memory_pressure {
+                return false;
+            }
+            let mut cols: Vec<String> = Vec::new();
+            crate::physical::morsel::collect_expr_columns(f, &mut cols);
+            !cols.is_empty()
+                && cols.iter().all(|c| {
+                    provider
+                        .schema()
+                        .fields()
+                        .iter()
+                        .any(|pf| pf.name().eq_ignore_ascii_case(c))
+                })
+        });
+        if filter_streams && !self.scan_cache.borrow().contains_key(&node.table_name) {
+            if let Some(files) = provider.parquet_files() {
+                let emission_projection = if let Some(hint) = streaming_output_hint {
+                    let mut indices = Vec::new();
+                    indices.try_reserve_exact(hint.len()).map_err(|e| {
+                        QueryError::Execution(format!(
+                            "streaming projection allocation failed: {e}"
+                        ))
+                    })?;
+                    indices.extend_from_slice(hint);
+                    Some(indices)
+                } else {
+                    node.projection.clone()
+                };
+                let reader_batch_size = if streaming_output_hint.is_some() {
+                    let emitted = Arc::new(
+                        logical_schema.project(
+                            emission_projection
+                                .as_ref()
+                                .expect("hint supplies projection"),
+                        )?,
+                    );
+                    parquet_scan_batch_policy(
+                        &emitted,
+                        configured_batch_size,
+                        self.memory_pool.as_ref().map(|pool| pool.max()),
+                        provider.statistics().map(|stats| stats.total_byte_size),
+                        spill_covered,
+                    )
+                    .0
+                } else {
+                    reader_batch_size
+                };
+                let exec =
+                    crate::physical::operators::StreamingParquetScanExec::try_new_with_batch_size(
+                        &node.table_name,
+                        &files,
+                        logical_schema.clone(),
+                        emission_projection,
+                        node.filter.as_ref(),
+                        &provider.schema(),
+                        reader_batch_size,
+                        memory_pressure || configured_batch_size != 8_192,
+                    )?
+                    .with_memory_pressure(memory_pressure)
+                    .with_memory_pool(
+                        self.memory_pool
+                            .clone()
+                            .unwrap_or_else(crate::execution::process_memory_pool),
+                    );
+                let arc: Arc<dyn PhysicalOperator> = Arc::new(exec);
+                return Ok(arc);
+            }
+        }
+
+        // Over-budget native tables stream into spill-capable
+        // consumers instead of refusing (oom-safety-hardening task
+        // 004; epic Architecture Decision 4; spill-boundaries task
+        // 001 widened "feeds an Aggregate" to "spill-covered": a
+        // spillable join on either side or an external sort covers
+        // too). Fires ONLY when the materializing scan WOULD refuse
+        // (`scan_budget_exceeded`) AND the Scan is in
+        // `spill_covered_scans` — in-budget tables take the exact
+        // pre-existing path below (dense-direct-address and
+        // GPU-offload eligibility unchanged), and materializing
+        // shapes (raw `SELECT *`, LIMIT-only) still reach
+        // `check_scan_budget`'s named refusal.
+        if !self.scan_cache.borrow().contains_key(&node.table_name)
+            && self
+                .spill_covered_scans
+                .borrow()
+                .contains(&(node as *const _ as usize))
+        {
+            if let Some(native) = provider
+                .as_any()
+                .downcast_ref::<crate::storage::NativeTable>()
+            {
+                if native.scan_budget_exceeded() {
+                    let exec = crate::physical::operators::NativeStreamingScanExec::new(
+                        &node.table_name,
+                        native,
+                        logical_schema.clone(),
+                        node.projection.clone(),
+                        node.filter.as_ref(),
+                    );
+                    let arc: Arc<dyn PhysicalOperator> = Arc::new(exec);
+                    // The operator prunes segments but never
+                    // evaluates predicates — always re-apply the
+                    // full filter above it.
+                    return match &node.filter {
+                        Some(predicate) => {
+                            let filter = self.create_filter(arc, predicate.clone())?;
+                            Ok(Arc::new(filter))
+                        }
+                        None => Ok(arc),
+                    };
+                }
+            }
+        }
+
+        // Check scan cache for pre-scanned tables (shared across multiple aliases)
+        let cache = self.scan_cache.borrow();
+        let exec = if let Some((cached_schema, cached_batches)) = cache.get(&node.table_name) {
+            // Cache hit: project from cached union-projected scan
+            let batches = if let Some(ref requested_indices) = node.projection {
+                // Map requested projection indices to positions in cached batches
+                // Cached batches use union projection indices
+                let cached_fields: Vec<&str> = cached_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect();
+                let provider_schema = provider.schema();
+
+                cached_batches
+                    .iter()
+                    .map(|batch| {
+                        let columns: Vec<arrow::array::ArrayRef> = requested_indices
+                            .iter()
+                            .map(|&orig_idx| {
+                                // Find the position of this original column in the cached batches
+                                let col_name = provider_schema.field(orig_idx).name();
+                                let cached_pos = cached_fields
+                                    .iter()
+                                    .position(|&n| n == col_name.as_str())
+                                    .unwrap_or(orig_idx);
+                                batch.column(cached_pos).clone()
+                            })
+                            .collect();
+                        // Field TYPES follow the actual columns: v2
+                        // IPC sidecars serve low-cardinality strings
+                        // dictionary-encoded, and the logical schema
+                        // still says Utf8.
+                        let fields: Vec<_> = requested_indices
+                            .iter()
+                            .zip(columns.iter())
+                            .map(|(&i, c)| {
+                                let f = logical_schema.field(i);
+                                if f.data_type() == c.data_type() {
+                                    f.clone()
+                                } else {
+                                    arrow::datatypes::Field::new(
+                                        f.name(),
+                                        c.data_type().clone(),
+                                        true,
+                                    )
+                                }
+                            })
+                            .collect();
+                        let schema = Arc::new(Schema::new(fields));
+                        arrow::record_batch::RecordBatch::try_new(schema, columns)
+                            .map_err(|e| QueryError::Execution(format!("Projection failed: {}", e)))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                cached_batches.clone()
+            };
+
+            let schema = match &node.projection {
+                Some(indices) => {
+                    let fields: Vec<_> = indices
+                        .iter()
+                        .map(|&i| logical_schema.field(i).clone())
+                        .collect();
+                    Arc::new(Schema::new(fields))
+                }
+                None => logical_schema,
+            };
+            MemoryTableExec::new(&node.table_name, schema, batches, None)
+        } else {
+            // No cache: use scan_with_filter for Parquet row group pruning
+            drop(cache);
+            let batches =
+                provider.scan_with_filter(node.projection.as_deref(), node.filter.as_ref())?;
+            let schema = match &node.projection {
+                Some(indices) => {
+                    let fields: Vec<_> = indices
+                        .iter()
+                        .map(|&i| logical_schema.field(i).clone())
+                        .collect();
+                    Arc::new(Schema::new(fields))
+                }
+                None => logical_schema,
+            };
+            MemoryTableExec::new(&node.table_name, schema, batches, None)
+        };
+
+        // If there's a filter on the scan, wrap with FilterExec
+        match &node.filter {
+            Some(predicate) => {
+                let filter = self.create_filter(Arc::new(exec), predicate.clone())?;
+                Ok(Arc::new(filter))
+            }
+            None => Ok(Arc::new(exec)),
         }
     }
 
@@ -1376,223 +1862,7 @@ impl PhysicalPlanner {
         logical: &LogicalPlan,
     ) -> Result<Arc<dyn PhysicalOperator>> {
         match logical {
-            LogicalPlan::Scan(node) => {
-                let provider = self
-                    .tables
-                    .get(&node.table_name)
-                    .ok_or_else(|| QueryError::TableNotFound(node.table_name.clone()))?;
-
-                // Use the logical schema (with aliases) instead of the provider schema
-                let logical_schema = plan_schema_to_arrow(&node.schema);
-
-                // Unfiltered single-use parquet scans stream lazily, partitioned
-                // by row group: decode overlaps with the consumer (join probes,
-                // sorts) instead of materializing the whole table at plan time.
-                // Filtered scans keep the eager path (decoder-level RowFilter);
-                // prescanned shared tables use the cache below.
-                // Filtered scans also stream when the predicate is fully
-                // decodable at the parquet layer (subquery-free, all columns
-                // resolve in the provider schema) — the decoder RowFilter
-                // applies it completely, so no FilterExec is needed and the
-                // scan can additionally take runtime join-key filters.
-                let filter_streams = node.filter.as_ref().is_none_or(|f| {
-                    if f.contains_subquery() {
-                        return false;
-                    }
-                    // Small tables keep the eager path: it already pushes a
-                    // decoder RowFilter and reads row groups with better
-                    // parallelism than a lazy stream (Q16's part scan lost
-                    // 180ms as a filtered stream).
-                    let big = provider
-                        .parquet_files()
-                        .map(|files| {
-                            files
-                                .iter()
-                                .filter_map(|f| std::fs::metadata(f).ok())
-                                .map(|m| m.len())
-                                .sum::<u64>()
-                                > 400_000_000
-                        })
-                        .unwrap_or(false);
-                    if !big {
-                        return false;
-                    }
-                    let mut cols: Vec<String> = Vec::new();
-                    crate::physical::morsel::collect_expr_columns(f, &mut cols);
-                    !cols.is_empty()
-                        && cols.iter().all(|c| {
-                            provider
-                                .schema()
-                                .fields()
-                                .iter()
-                                .any(|pf| pf.name().eq_ignore_ascii_case(c))
-                        })
-                });
-                if filter_streams && !self.scan_cache.borrow().contains_key(&node.table_name) {
-                    if let Some(files) = provider.parquet_files() {
-                        let exec = crate::physical::operators::StreamingParquetScanExec::try_new(
-                            &node.table_name,
-                            &files,
-                            logical_schema.clone(),
-                            node.projection.clone(),
-                            node.filter.as_ref(),
-                            &provider.schema(),
-                        )?;
-                        let cfg = exec.runtime_filter_config();
-                        let arc: Arc<dyn PhysicalOperator> = Arc::new(exec);
-                        self.streaming_scans.borrow_mut().insert(
-                            Arc::as_ptr(&arc) as *const () as usize,
-                            (cfg, provider.schema()),
-                        );
-                        return Ok(arc);
-                    }
-                }
-
-                // Over-budget native tables stream into spill-capable
-                // consumers instead of refusing (oom-safety-hardening task
-                // 004; epic Architecture Decision 4; spill-boundaries task
-                // 001 widened "feeds an Aggregate" to "spill-covered": a
-                // spillable join on either side or an external sort covers
-                // too). Fires ONLY when the materializing scan WOULD refuse
-                // (`scan_budget_exceeded`) AND the Scan is in
-                // `spill_covered_scans` — in-budget tables take the exact
-                // pre-existing path below (dense-direct-address and
-                // GPU-offload eligibility unchanged), and materializing
-                // shapes (raw `SELECT *`, LIMIT-only) still reach
-                // `check_scan_budget`'s named refusal.
-                if !self.scan_cache.borrow().contains_key(&node.table_name)
-                    && self
-                        .spill_covered_scans
-                        .borrow()
-                        .contains(&(node as *const _ as usize))
-                {
-                    if let Some(native) = provider
-                        .as_any()
-                        .downcast_ref::<crate::storage::NativeTable>()
-                    {
-                        if native.scan_budget_exceeded() {
-                            let exec = crate::physical::operators::NativeStreamingScanExec::new(
-                                &node.table_name,
-                                native,
-                                logical_schema.clone(),
-                                node.projection.clone(),
-                                node.filter.as_ref(),
-                            );
-                            let arc: Arc<dyn PhysicalOperator> = Arc::new(exec);
-                            // The operator prunes segments but never
-                            // evaluates predicates — always re-apply the
-                            // full filter above it.
-                            return match &node.filter {
-                                Some(predicate) => {
-                                    let filter = self.create_filter(arc, predicate.clone());
-                                    Ok(Arc::new(filter))
-                                }
-                                None => Ok(arc),
-                            };
-                        }
-                    }
-                }
-
-                // Check scan cache for pre-scanned tables (shared across multiple aliases)
-                let cache = self.scan_cache.borrow();
-                let exec = if let Some((cached_schema, cached_batches)) =
-                    cache.get(&node.table_name)
-                {
-                    // Cache hit: project from cached union-projected scan
-                    let batches = if let Some(ref requested_indices) = node.projection {
-                        // Map requested projection indices to positions in cached batches
-                        // Cached batches use union projection indices
-                        let cached_fields: Vec<&str> = cached_schema
-                            .fields()
-                            .iter()
-                            .map(|f| f.name().as_str())
-                            .collect();
-                        let provider_schema = provider.schema();
-
-                        cached_batches
-                            .iter()
-                            .map(|batch| {
-                                let columns: Vec<arrow::array::ArrayRef> = requested_indices
-                                    .iter()
-                                    .map(|&orig_idx| {
-                                        // Find the position of this original column in the cached batches
-                                        let col_name = provider_schema.field(orig_idx).name();
-                                        let cached_pos = cached_fields
-                                            .iter()
-                                            .position(|&n| n == col_name.as_str())
-                                            .unwrap_or(orig_idx);
-                                        batch.column(cached_pos).clone()
-                                    })
-                                    .collect();
-                                // Field TYPES follow the actual columns: v2
-                                // IPC sidecars serve low-cardinality strings
-                                // dictionary-encoded, and the logical schema
-                                // still says Utf8.
-                                let fields: Vec<_> = requested_indices
-                                    .iter()
-                                    .zip(columns.iter())
-                                    .map(|(&i, c)| {
-                                        let f = logical_schema.field(i);
-                                        if f.data_type() == c.data_type() {
-                                            f.clone()
-                                        } else {
-                                            arrow::datatypes::Field::new(
-                                                f.name(),
-                                                c.data_type().clone(),
-                                                true,
-                                            )
-                                        }
-                                    })
-                                    .collect();
-                                let schema = Arc::new(Schema::new(fields));
-                                arrow::record_batch::RecordBatch::try_new(schema, columns).map_err(
-                                    |e| QueryError::Execution(format!("Projection failed: {}", e)),
-                                )
-                            })
-                            .collect::<Result<Vec<_>>>()?
-                    } else {
-                        cached_batches.clone()
-                    };
-
-                    let schema = match &node.projection {
-                        Some(indices) => {
-                            let fields: Vec<_> = indices
-                                .iter()
-                                .map(|&i| logical_schema.field(i).clone())
-                                .collect();
-                            Arc::new(Schema::new(fields))
-                        }
-                        None => logical_schema,
-                    };
-                    MemoryTableExec::new(&node.table_name, schema, batches, None)
-                } else {
-                    // No cache: use scan_with_filter for Parquet row group pruning
-                    drop(cache);
-                    let batches = provider
-                        .scan_with_filter(node.projection.as_deref(), node.filter.as_ref())?;
-                    let schema = match &node.projection {
-                        Some(indices) => {
-                            let fields: Vec<_> = indices
-                                .iter()
-                                .map(|&i| logical_schema.field(i).clone())
-                                .collect();
-                            Arc::new(Schema::new(fields))
-                        }
-                        None => logical_schema,
-                    };
-                    MemoryTableExec::new(&node.table_name, schema, batches, None)
-                };
-
-                // If there's a filter on the scan, wrap with FilterExec
-                match &node.filter {
-                    Some(predicate) => {
-                        let filter = self.create_filter(Arc::new(exec), predicate.clone());
-                        Ok(Arc::new(filter))
-                    }
-                    None => Ok(Arc::new(exec)),
-                }
-            }
-
+            LogicalPlan::Scan(node) => self.lower_scan(node, None),
             LogicalPlan::Filter(node) => {
                 // HAVING pushdown: a subquery-free predicate directly above an
                 // Aggregate is applied to the aggregate's output batches with
@@ -1613,18 +1883,26 @@ impl PhysicalPlanner {
                         // consumed by the aggregate operator
                         return Ok(agg);
                     }
-                    let filter = self.create_filter(agg, node.predicate.clone());
+                    let filter = self.create_filter(agg, node.predicate.clone())?;
                     return Ok(Arc::new(filter));
                 }
                 let input = self.create_physical_plan_inner(&node.input)?;
-                let filter = self.create_filter(input, node.predicate.clone());
+                let filter = self.create_filter(input, node.predicate.clone())?;
                 Ok(Arc::new(filter))
             }
 
             LogicalPlan::Project(node) => {
-                let input = self.create_physical_plan_inner(&node.input)?;
+                let input = if let LogicalPlan::Scan(scan) = node.input.as_ref() {
+                    let hint = streaming_project_output_hint(scan, &node.exprs);
+                    self.lower_scan(scan, hint.as_deref())?
+                } else {
+                    self.create_physical_plan_inner(&node.input)?
+                };
                 let schema = plan_schema_to_arrow(&node.schema);
                 let mut project = ProjectExec::new(input, node.exprs.clone(), schema);
+                if let Some(pool) = &self.memory_pool {
+                    project = project.with_memory_pool(pool.clone());
+                }
                 // If any projection expression contains a subquery, attach executor
                 let has_subquery = node.exprs.iter().any(|e| e.contains_subquery());
                 if has_subquery {
@@ -1706,115 +1984,53 @@ impl PhysicalPlanner {
                         JoinType::Left | JoinType::Right | JoinType::Full
                     );
 
-                // Runtime join-key filter: joins with a single plain
-                // probe-key column over a streaming parquet scan decode only
-                // rows whose key exists in the (small) build side. Safe for
-                // Inner; also for Semi, Anti and Left when the build is the
-                // LEFT side (probe rows outside the build key set can never
-                // match a build row, and for Left the PRESERVED side is the
-                // build side, so a dropped probe row was never going to
-                // reach the output either way). NOT safe when the build
-                // flips to the right: for swapped Semi/Anti the probe rows
-                // ARE the output (Anti would drop exactly the rows it must
-                // keep), and for Left the probe side would then be the
-                // preserved one (unmatched rows must still NULL-extend).
-                // Right/Full are excluded too: Right always builds from its
-                // own (preserved) right side, so the wiring below — which
-                // targets the physical RIGHT child as "the probe scan" —
-                // would target the wrong side; Full preserves both sides, so
-                // no side may be dropped from the scan at all.
+                // Filter only probe rows that cannot contribute to the result.
+                // Right-built Semi preserves matching left rows, so its left
+                // probe may be filtered. Right-built Anti/Left must retain
+                // unmatched probe rows. Full and Right remain excluded.
                 let build_prefers_left = matches!(
                     node.join_type,
                     JoinType::Left | JoinType::Semi | JoinType::Anti
                 ) && !build_right_for_left;
-                let rt_eligible = matches!(node.join_type, JoinType::Inner) || build_prefers_left;
+                let rt_probe_left = node.join_type == JoinType::Semi && build_right_for_left;
+                let rt_eligible = matches!(node.join_type, JoinType::Inner)
+                    || build_prefers_left
+                    || rt_probe_left;
+                let rt_probe = if rt_probe_left { &left } else { &right };
                 // Multi-key joins publish a partial filter on the first
                 // column pair (a correct superset of matching rows).
                 let rt_pair = on
                     .iter()
-                    .position(|(_, r)| matches!(r, Expr::Column(_)))
+                    .position(|(l, r)| matches!(if rt_probe_left { l } else { r }, Expr::Column(_)))
                     .unwrap_or(0);
-                // `linked_scan_cfg`, when set, is the (multi-slot filter
-                // config, provider schema) this join successfully linked to
-                // -- either a DIRECT probe-side streaming scan, or,
-                // transitively, an already-linked ANCESTOR join's own probe
-                // scan (see the re-registration below the branch that builds
-                // `result`). Captured here so it can be re-published under
-                // THIS join's own resulting operator pointer once that
-                // pointer exists, letting a LATER join up the tree chain
-                // through this one exactly as if it were a plain scan.
-                let mut linked_scan_cfg: Option<(
-                    crate::physical::operators::streaming_parquet_scan::RuntimeFilterConfig,
-                    SchemaRef,
-                )> = None;
-                let probe_rt_filter = if rt_eligible && !on.is_empty() {
-                    if let Some(Expr::Column(c)) = on.get(rt_pair).map(|(_, r)| r) {
-                        // The probe-side streaming scan may sit under column
-                        // pass-through Projects (decorrelated subquery
-                        // shapes); the filter column is resolved by NAME in
-                        // the provider schema, so digging through is safe.
-                        // It may ALSO, after unwrapping Projects, land
-                        // directly on an already-linked ANCESTOR join's own
-                        // output (registered below): a leaf touched by two or
-                        // more independently eligible joins is reached this
-                        // way without walking back down into that ancestor's
-                        // children, which would risk resolving its BUILD
-                        // side instead of its probe side for a join this
-                        // code didn't itself gate as build-stays-left.
-                        let mut probe_leaf = Arc::clone(&right);
-                        while probe_leaf.name() == "Project" {
-                            let ch = probe_leaf.children();
-                            if ch.len() != 1 {
-                                break;
-                            }
-                            probe_leaf = ch.into_iter().next().unwrap();
-                        }
-                        let key = Arc::as_ptr(&probe_leaf) as *const () as usize;
-                        let scans = self.streaming_scans.borrow();
-                        if std::env::var("RT_DEBUG").is_ok() && !scans.contains_key(&key) {
+                // Resolve the actual output ordinal, then require a proven
+                // value-preserving path. Computed Projects and unknown sources
+                // decline rather than applying build keys to a same-named input.
+                let probe_rt_filter = if rt_eligible && std::env::var("RT_DISABLE").is_err() {
+                    on.get(rt_pair).and_then(|(l, r)| {
+                        let expression = if rt_probe_left { l } else { r };
+                        let Expr::Column(column) = expression else {
+                            return None;
+                        };
+                        let index = crate::physical::operators::find_column_index_in_schema(
+                            &rt_probe.schema(),
+                            column,
+                        )
+                        .ok()?;
+                        let (cfg, source) = rt_probe.runtime_filter_target(index)?;
+                        let slot: crate::physical::operators::SharedRuntimeFilter =
+                            Default::default();
+                        cfg.lock().push((source, Arc::clone(&slot)));
+                        if std::env::var("RT_DEBUG").is_ok() {
                             eprintln!(
-                                "[rt] no link: jt={:?} probe_leaf={} col={}",
-                                node.join_type,
-                                probe_leaf.name(),
-                                c.name
+                                "[rt] linked col {} ({}) slots_now={}",
+                                source,
+                                column.name,
+                                cfg.lock().len()
                             );
                         }
-                        let linked = scans.get(&key).and_then(|(cfg, pschema)| {
-                            pschema
-                                .fields()
-                                .iter()
-                                .position(|f| f.name().eq_ignore_ascii_case(&c.name))
-                                .filter(|_| std::env::var("RT_DISABLE").is_err())
-                                .map(|idx| {
-                                    let slot: crate::physical::operators::SharedRuntimeFilter =
-                                        Default::default();
-                                    // Push, never overwrite: a leaf already
-                                    // linked to an earlier join's filter gets
-                                    // ANOTHER, independent, AND-combined slot
-                                    // rather than losing the first one.
-                                    cfg.lock().push((idx, Arc::clone(&slot)));
-                                    if std::env::var("RT_DEBUG").is_ok() {
-                                        eprintln!(
-                                            "[rt] linked col {} ({}) slots_now={}",
-                                            idx,
-                                            c.name,
-                                            cfg.lock().len()
-                                        );
-                                    }
-                                    (slot, Arc::clone(cfg), Arc::clone(pschema))
-                                })
-                        });
-                        drop(scans);
-                        match linked {
-                            Some((slot, cfg, pschema)) => {
-                                linked_scan_cfg = Some((cfg, pschema));
-                                Some(slot)
-                            }
-                            None => None,
-                        }
-                    } else {
-                        None
-                    }
+                        Some(slot)
+                    })
                 } else {
                     None
                 };
@@ -1848,14 +2064,16 @@ impl PhysicalPlanner {
                                 .iter()
                                 .flat_map(|sc| sc.fields().iter())
                                 .map(|f| {
-                                    let (frel, fname) = match f.name().split_once('.') {
-                                        Some((r, n)) => (Some(r), n),
-                                        None => (None, f.name().as_str()),
+                                    // Unknown legacy identity cannot prove a column dead.
+                                    let Some((frel, fname)) =
+                                        crate::planner::arrow_field_identity(f)
+                                    else {
+                                        return true;
                                     };
                                     need.iter().any(|c| {
-                                        c.name.eq_ignore_ascii_case(fname)
+                                        c.name == fname
                                             && match (&c.relation, frel) {
-                                                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                                                (Some(a), Some(b)) => a == b,
                                                 _ => true,
                                             }
                                     })
@@ -1887,7 +2105,8 @@ impl PhysicalPlanner {
                     } else {
                         match &node.filter {
                             Some(predicate) => {
-                                let filter = self.create_filter(Arc::new(join), predicate.clone());
+                                let filter =
+                                    self.create_filter(Arc::new(join), predicate.clone())?;
                                 Arc::new(filter)
                             }
                             None => Arc::new(join),
@@ -1903,39 +2122,32 @@ impl PhysicalPlanner {
                         node.join_type,
                         node.filter.clone(),
                     )
-                    .with_build_right(build_right_for_left);
+                    .with_build_right(build_right_for_left)
+                    .with_memory_pool(
+                        self.memory_pool
+                            .clone()
+                            .unwrap_or_else(crate::execution::process_memory_pool),
+                    );
                     Arc::new(join)
                 } else {
                     // Use regular hash join (no memory management)
                     let join = HashJoinExec::new(left, right, on, node.join_type)
-                        .with_build_right(build_right_for_left);
+                        .with_build_right(build_right_for_left)
+                        .with_memory_pool(
+                            self.memory_pool
+                                .clone()
+                                .unwrap_or_else(crate::execution::process_memory_pool),
+                        );
 
                     // Inner/Cross only: ON is equivalent to WHERE here.
                     match &node.filter {
                         Some(predicate) => {
-                            let filter = self.create_filter(Arc::new(join), predicate.clone());
+                            let filter = self.create_filter(Arc::new(join), predicate.clone())?;
                             Arc::new(filter)
                         }
                         None => Arc::new(join),
                     }
                 };
-
-                // Chain runtime-filter linking: a join that itself linked to
-                // a probe-side scan (directly, or transitively through an
-                // earlier-linked join below it) re-publishes that SAME
-                // (config, schema) pair under its OWN resulting operator's
-                // pointer. A LATER, independently eligible join whose probe
-                // side is exactly THIS join's output then finds it through
-                // the ordinary Project-unwrap-only lookup above, with no
-                // extra downcasting or children()-walking needed -- and,
-                // being a fresh `push` onto the SAME multi-slot config
-                // rather than a new one, both joins' filters apply
-                // AND-combined at the original scan.
-                if let Some(scan_link) = linked_scan_cfg {
-                    self.streaming_scans
-                        .borrow_mut()
-                        .insert(Arc::as_ptr(&result) as *const () as usize, scan_link);
-                }
 
                 Ok(result)
             }
@@ -1948,9 +2160,35 @@ impl PhysicalPlanner {
                 {
                     let offload_ok = self.config.as_ref().map_or(true, |c| c.gpu_offload);
                     if offload_ok && self.pending_agg_filter.borrow().is_none() {
-                        if let Some(gplan) = crate::physical::gpu::plan_gpu_agg(node, &self.tables)
-                        {
+                        let gpu_plan =
+                            if self.gpu_resident.is_some() || self.gpu_candidates.is_some() {
+                                crate::physical::gpu::plan_gpu_agg_resident(node, &self.tables)
+                            } else {
+                                crate::physical::gpu::plan_gpu_agg(node, &self.tables)
+                            };
+                        if let Some(gplan) = gpu_plan {
                             let inner = self.lower_aggregate_cpu(node)?;
+                            if let Some(candidates) = &self.gpu_candidates {
+                                if inner.output_partitions() != 1 {
+                                    return Err(crate::physical::gpu::residency_error(
+                                        "multi-output GPU delegate",
+                                    ));
+                                }
+                                let mut candidates = candidates.lock().unwrap();
+                                candidates.try_reserve(1).map_err(|_| {
+                                    crate::physical::gpu::residency_error(
+                                        "candidate metadata allocation refused",
+                                    )
+                                })?;
+                                candidates.push(Arc::new(gplan.clone()));
+                            }
+                            if let Some(request) = &self.gpu_resident {
+                                request.bind(&gplan, inner.output_partitions())?;
+                                return Ok(Arc::new(
+                                    crate::physical::gpu::GpuAggExec::new(gplan, inner)
+                                        .with_resident_request(request.clone()),
+                                ));
+                            }
                             return Ok(Arc::new(crate::physical::gpu::GpuAggExec::new(
                                 gplan, inner,
                             )));
@@ -2092,7 +2330,12 @@ impl PhysicalPlanner {
                     );
                     Ok(Arc::new(agg))
                 } else {
-                    let agg = HashAggregateExec::new(input, group_by, vec![], input_schema);
+                    let agg = HashAggregateExec::new(input, group_by, vec![], input_schema)
+                        .with_memory_pool(
+                            self.memory_pool
+                                .clone()
+                                .unwrap_or_else(crate::execution::process_memory_pool),
+                        );
                     Ok(Arc::new(agg))
                 }
             }
@@ -2139,6 +2382,11 @@ impl PhysicalPlanner {
                             group_by,
                             vec![], // No aggregates, just grouping for distinct
                             schema,
+                        )
+                        .with_memory_pool(
+                            self.memory_pool
+                                .clone()
+                                .unwrap_or_else(crate::execution::process_memory_pool),
                         );
                         Ok(Arc::new(agg))
                     }
@@ -2172,11 +2420,11 @@ impl PhysicalPlanner {
                             batches.clone(),
                             None,
                         );
-                        return Ok(Arc::new(exec));
+                        return self.apply_relation_alias(Arc::new(exec), &node.alias);
                     }
                 }
-                // Not cached, pass through to input
-                self.create_physical_plan_inner(&node.input)
+                let input = self.create_physical_plan_inner(&node.input)?;
+                self.apply_relation_alias(input, &node.alias)
             }
 
             LogicalPlan::EmptyRelation(node) => {
@@ -2252,7 +2500,11 @@ impl PhysicalPlanner {
                             )));
                         }
                         for (i, expr) in row.iter().enumerate() {
-                            per_column[i].push(evaluate_expr(&dummy_row, expr)?);
+                            let value = evaluate_expr(&dummy_row, expr)?;
+                            per_column[i].push(crate::planner::numeric::cast_strict(
+                                &value,
+                                schema.field(i).data_type(),
+                            )?);
                         }
                     }
                     let columns: Vec<arrow::array::ArrayRef> = per_column
@@ -2342,26 +2594,34 @@ impl PhysicalPlanner {
                         // consumed by the aggregate operator
                         return Ok(agg);
                     }
-                    let filter = self.create_filter(agg, node.predicate.clone());
+                    let filter = self.create_filter(agg, node.predicate.clone())?;
                     return Ok(Arc::new(filter));
                 }
                 let input = self.create_physical_plan_with_delim_state(&node.input, delim_state)?;
-                let filter = self.create_filter(input, node.predicate.clone());
+                let filter = self.create_filter(input, node.predicate.clone())?;
                 Ok(Arc::new(filter))
             }
             LogicalPlan::Project(node) => {
                 let input = self.create_physical_plan_with_delim_state(&node.input, delim_state)?;
                 let schema = plan_schema_to_arrow(&node.schema);
-                let project = ProjectExec::new(input, node.exprs.clone(), schema);
+                let mut project = ProjectExec::new(input, node.exprs.clone(), schema);
+                if let Some(pool) = &self.memory_pool {
+                    project = project.with_memory_pool(pool.clone());
+                }
                 Ok(Arc::new(project))
             }
             LogicalPlan::Join(node) => {
                 let left = self.create_physical_plan_with_delim_state(&node.left, delim_state)?;
                 let right = self.create_physical_plan_with_delim_state(&node.right, delim_state)?;
-                let join = HashJoinExec::new(left, right, node.on.clone(), node.join_type);
+                let join = HashJoinExec::new(left, right, node.on.clone(), node.join_type)
+                    .with_memory_pool(
+                        self.memory_pool
+                            .clone()
+                            .unwrap_or_else(crate::execution::process_memory_pool),
+                    );
                 match &node.filter {
                     Some(predicate) => {
-                        let filter = self.create_filter(Arc::new(join), predicate.clone());
+                        let filter = self.create_filter(Arc::new(join), predicate.clone())?;
                         Ok(Arc::new(filter))
                     }
                     None => Ok(Arc::new(join)),
@@ -2371,11 +2631,17 @@ impl PhysicalPlanner {
                 let input = self.create_physical_plan_with_delim_state(&node.input, delim_state)?;
                 let aggregates = extract_aggregates(&node.aggregates);
                 let schema = plan_schema_to_arrow(&node.schema);
-                let agg = HashAggregateExec::new(input, node.group_by.clone(), aggregates, schema);
+                let agg = HashAggregateExec::new(input, node.group_by.clone(), aggregates, schema)
+                    .with_memory_pool(
+                        self.memory_pool
+                            .clone()
+                            .unwrap_or_else(crate::execution::process_memory_pool),
+                    );
                 Ok(Arc::new(agg))
             }
             LogicalPlan::SubqueryAlias(node) => {
-                self.create_physical_plan_with_delim_state(&node.input, delim_state)
+                let input = self.create_physical_plan_with_delim_state(&node.input, delim_state)?;
+                self.apply_relation_alias(input, &node.alias)
             }
             // For other node types, fall back to regular planning
             _ => self.create_physical_plan_inner(logical),
@@ -2887,5 +3153,645 @@ mod tests {
             .unwrap()
             .build();
         assert_eq!(coverage(&planner, &plan), vec![("big".to_string(), true)]);
+    }
+}
+
+#[cfg(test)]
+mod scan_batch_policy_tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn fixed_width_quantum_reduces_under_pressure_without_changing_default() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let (rows, pressure) =
+            parquet_scan_batch_policy(&schema, 8192, Some(8192), Some(16_000), true);
+        assert!(pressure);
+        assert!(rows > 0 && rows < 1171);
+        assert_eq!(
+            parquet_scan_batch_policy(&schema, 8192, Some(40 << 30), Some(16_000), true),
+            (8192, false)
+        );
+        assert_eq!(
+            parquet_scan_batch_policy(&schema, 37, Some(40 << 30), Some(16_000), true),
+            (37, false)
+        );
+    }
+
+    #[test]
+    fn unsupported_output_uses_one_row_only_under_covered_memory_pressure() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, true)]));
+        assert_eq!(
+            parquet_scan_batch_policy(&schema, 8192, Some(8192), Some(16_000), true),
+            (1, true)
+        );
+        assert_eq!(
+            parquet_scan_batch_policy(&schema, 8192, Some(8192), Some(16_000), false),
+            (8192, false)
+        );
+        assert_eq!(
+            parquet_scan_batch_policy(&schema, 8192, Some(40 << 30), Some(16_000), true),
+            (8192, false)
+        );
+    }
+}
+
+#[cfg(test)]
+mod streaming_project_emission_tests {
+    use super::*;
+    use arrow::array::{
+        Array, ArrayRef, Date32Array, Decimal128Array, Int64Array, RecordBatch, StringArray,
+    };
+    use futures::TryStreamExt;
+    use std::path::PathBuf;
+
+    #[derive(Debug)]
+    struct FixtureProvider {
+        schema: SchemaRef,
+        file: PathBuf,
+        bytes: u64,
+    }
+    impl TableProvider for FixtureProvider {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+        fn parquet_files(&self) -> Option<Vec<PathBuf>> {
+            Some(vec![self.file.clone()])
+        }
+        fn statistics(&self) -> Option<crate::physical::operators::TableStatistics> {
+            Some(crate::physical::operators::TableStatistics {
+                row_count: 79,
+                total_byte_size: self.bytes,
+                column_stats: HashMap::new(),
+            })
+        }
+        fn scan(&self, _: Option<&[usize]>) -> Result<Vec<RecordBatch>> {
+            panic!("covered filtered fixture must use streaming, not provider materialization")
+        }
+    }
+    #[tokio::test]
+    async fn streaming_project_prunes_filter_only_string_and_preserves_roots_nulls_duplicates() {
+        use crate::planner::{ProjectNode, ScalarValue, ScanNode};
+        use arrow::datatypes::DataType;
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("data.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Decimal128(20, 2), true),
+            Field::new("flag", DataType::Utf8, true),
+            Field::new("day", DataType::Date32, false),
+        ]));
+        let discard = "x".repeat(512);
+        let flags = (0..79)
+            .map(|i| {
+                if i % 7 == 0 {
+                    None
+                } else if i % 3 == 0 {
+                    Some("keep")
+                } else {
+                    Some(discard.as_str())
+                }
+            })
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..79)) as ArrayRef,
+                Arc::new(
+                    Decimal128Array::from(
+                        (0..79)
+                            .map(|i| {
+                                if i % 5 == 0 {
+                                    None
+                                } else {
+                                    Some(i as i128 * 11)
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .with_precision_and_scale(20, 2)
+                    .unwrap(),
+                ),
+                Arc::new(StringArray::from(flags)),
+                Arc::new(Date32Array::from_iter_values((0..79).map(|i| 19000 + i))),
+            ],
+        )
+        .unwrap();
+        let bytes = batch.get_array_memory_size() as u64;
+        assert!(bytes > 8192);
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(13))
+            .build();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(
+            std::fs::File::create(&file).unwrap(),
+            schema.clone(),
+            Some(props),
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let scan = Arc::new(LogicalPlan::Scan(ScanNode {
+            table_name: "fixture".into(),
+            schema: PlanSchema::from(schema.as_ref()),
+            projection: Some(vec![3, 0, 2, 1]),
+            filter: Some(Expr::column("flag").eq(Expr::literal(ScalarValue::Utf8("keep".into())))),
+        }));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("d", DataType::Date32, true),
+            Field::new("a", DataType::Decimal128(20, 2), true),
+            Field::new("k", DataType::Int64, true),
+            Field::new("again", DataType::Decimal128(20, 2), true),
+        ]));
+        let logical = LogicalPlan::Project(ProjectNode {
+            input: scan.clone(),
+            exprs: vec![
+                Expr::column("day").alias("d"),
+                Expr::column("amount").alias("a"),
+                Expr::column("id").alias("k"),
+                Expr::column("amount").alias("again"),
+            ],
+            schema: PlanSchema::from(output_schema.as_ref()),
+        });
+        let physical = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap()
+            .install(|| {
+                let pool = crate::execution::create_memory_pool(8192);
+                let config = ExecutionConfig::new()
+                    .with_memory_limit(8192)
+                    .with_batch_size(17)
+                    .with_spill_path(directory.path().join("spill"));
+                let mut planner = PhysicalPlanner::with_config(pool, config);
+                planner.register_table(
+                    "fixture",
+                    Arc::new(FixtureProvider {
+                        schema: schema.clone(),
+                        file: file.clone(),
+                        bytes,
+                    }),
+                );
+                // Isolate the already-established spill-coverage routing contract;
+                // the unchanged original ScanNode address must reach lower_scan.
+                let LogicalPlan::Scan(node) = scan.as_ref() else {
+                    unreachable!()
+                };
+                planner
+                    .spill_covered_scans
+                    .borrow_mut()
+                    .insert(node as *const _ as usize);
+                let result = planner.create_physical_plan_inner(&logical).unwrap();
+                let (_, source_column) = result
+                    .runtime_filter_target(2)
+                    .expect("projected Int64 alias must preserve its scan target");
+                assert_eq!(source_column, 0, "id is original file ordinal zero");
+                assert!(result.runtime_filter_target(0).is_none());
+                result
+            });
+        let child = physical.children().remove(0);
+        assert_eq!(child.name(), "StreamingParquetScan");
+        assert_eq!(
+            child
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
+            ["day", "id", "amount"]
+        );
+        assert_eq!(child.output_partitions(), 3);
+        assert!(child.resident_queue_copy_bound().is_none());
+        assert!(physical.pool_independent_gather_copy_bound().is_some());
+        let bytes = physical
+            .pool_independent_queue_copy_bound()
+            .unwrap()
+            .max_bytes()
+            .unwrap();
+        let mut actual = Vec::new();
+        for partition in 0..physical.output_partitions() {
+            let mut stream = physical.execute(partition).await.unwrap();
+            while let Some(batch) = stream.try_next().await.unwrap() {
+                assert!(batch.num_rows() <= 17);
+                assert_eq!(batch.schema(), plan_schema_to_arrow(&logical.schema()));
+                assert!(
+                    crate::physical::operators::spillable::owned_input_batch_charge(&batch)
+                        .unwrap()
+                        <= bytes
+                );
+                let day = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .unwrap();
+                let amount = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .unwrap();
+                let id = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let duplicate = batch
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .unwrap();
+                for row in 0..batch.num_rows() {
+                    let value = (!amount.is_null(row)).then(|| amount.value(row));
+                    assert_eq!(
+                        value,
+                        (!duplicate.is_null(row)).then(|| duplicate.value(row))
+                    );
+                    actual.push((id.value(row), day.value(row), value));
+                }
+            }
+        }
+        actual.sort_unstable();
+        let expected = (0..79)
+            .filter(|i| i % 3 == 0 && i % 7 != 0)
+            .map(|i| {
+                (
+                    i as i64,
+                    19000 + i,
+                    if i % 5 == 0 {
+                        None
+                    } else {
+                        Some(i as i128 * 11)
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn shared_scan_cache_keeps_other_consumer_columns() {
+        use arrow::datatypes::DataType;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("flag", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![3, 4])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+        let mut planner = PhysicalPlanner::with_config(
+            crate::execution::create_memory_pool(8192),
+            ExecutionConfig::new().with_memory_limit(8192),
+        );
+        planner.register_table(
+            "cached",
+            Arc::new(FixtureProvider {
+                schema: schema.clone(),
+                file: PathBuf::from("not-opened-cached-fixture.parquet"),
+                bytes: 100,
+            }),
+        );
+        planner
+            .scan_cache
+            .borrow_mut()
+            .insert("cached".into(), (schema.clone(), vec![batch]));
+        for name in ["id", "flag"] {
+            let scan = Arc::new(LogicalPlan::Scan(crate::planner::ScanNode {
+                table_name: "cached".into(),
+                schema: PlanSchema::from(schema.as_ref()),
+                projection: None,
+                filter: None,
+            }));
+            let index = schema.index_of(name).unwrap();
+            let output = Arc::new(schema.project(&[index]).unwrap());
+            let logical = LogicalPlan::Project(crate::planner::ProjectNode {
+                input: scan,
+                exprs: vec![Expr::column(name)],
+                schema: PlanSchema::from(output.as_ref()),
+            });
+            let physical = planner.create_physical_plan_inner(&logical).unwrap();
+            assert_eq!(
+                physical.children()[0].schema().fields().len(),
+                2,
+                "per-consumer hint must not narrow table cache"
+            );
+            let mut rows = 0;
+            for partition in 0..physical.output_partitions() {
+                let mut stream = physical.execute(partition).await.unwrap();
+                while let Some(batch) = stream.try_next().await.unwrap() {
+                    assert_eq!(batch.schema(), plan_schema_to_arrow(&logical.schema()));
+                    rows += batch.num_rows();
+                }
+            }
+            assert_eq!(rows, 2);
+            assert_eq!(planner.scan_cache.borrow()["cached"].0.fields().len(), 2);
+        }
+    }
+}
+
+#[cfg(test)]
+mod streaming_emission_hint_tests {
+    use super::*;
+    use arrow::datatypes::DataType;
+    #[test]
+    fn emission_hint_preserves_unique_roots_and_declines_ambiguity() {
+        let schema = Schema::new(vec![
+            Field::new("left.id", DataType::Int64, true),
+            Field::new("right.id", DataType::Int64, true),
+            Field::new("flag", DataType::Utf8, true),
+        ]);
+        let mut scan = crate::planner::ScanNode {
+            table_name: "fixture".into(),
+            schema: PlanSchema::from_qualified_arrow(&schema),
+            projection: Some(vec![1, 0, 2]),
+            filter: None,
+        };
+        let exprs = vec![
+            Expr::qualified_column("right", "id").alias("a"),
+            Expr::qualified_column("left", "id"),
+            Expr::qualified_column("right", "id").alias("b"),
+        ];
+        assert_eq!(
+            streaming_project_output_hint(&scan, &exprs),
+            Some(vec![1, 0])
+        );
+        assert!(streaming_project_output_hint(&scan, &[Expr::column("id")]).is_none());
+        assert!(streaming_project_output_hint(
+            &scan,
+            &[Expr::literal(crate::planner::ScalarValue::Int64(1))]
+        )
+        .is_none());
+        assert!(streaming_project_output_hint(&scan, &[Expr::column("missing")]).is_none());
+        assert!(streaming_project_output_hint(&scan, &[]).is_none());
+        scan.projection = Some(vec![1, 0, 2, 1]);
+        assert!(
+            streaming_project_output_hint(&scan, &exprs).is_none(),
+            "ambiguous physical identities must not produce an emission certificate"
+        );
+    }
+}
+
+#[cfg(test)]
+mod narrowed_streaming_read_dependencies {
+    use super::*;
+    use crate::physical::operators::streaming_parquet_scan::{
+        RuntimeFilterPayload, StreamingParquetScanExec,
+    };
+    use arrow::array::{Array, ArrayRef, Decimal128Array, Int64Array, RecordBatch, StringArray};
+    use arrow::datatypes::DataType;
+    use futures::TryStreamExt;
+    fn fixture(path: &std::path::Path) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("gate", DataType::Int64, false),
+            Field::new("flag", DataType::Utf8, true),
+            Field::new("value", DataType::Decimal128(20, 2), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..43)) as ArrayRef,
+                Arc::new(Int64Array::from_iter_values((0..43).map(|i| i % 4))),
+                Arc::new(StringArray::from(
+                    (0..43)
+                        .map(|i| {
+                            if i % 7 == 0 {
+                                None
+                            } else if i % 5 == 0 {
+                                Some("discard")
+                            } else {
+                                Some("keep")
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(
+                    Decimal128Array::from(
+                        (0..43)
+                            .map(|i| {
+                                if i % 11 == 0 {
+                                    None
+                                } else {
+                                    Some(i as i128 * 10)
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .with_precision_and_scale(20, 2)
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(11))
+            .build();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(
+            std::fs::File::create(path).unwrap(),
+            batch.schema(),
+            Some(props),
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        batch
+    }
+    fn predicate() -> Expr {
+        Expr::column("flag").eq(Expr::literal(crate::planner::ScalarValue::Utf8(
+            "keep".into(),
+        )))
+    }
+    fn link(scan: &StreamingParquetScanExec) {
+        for (root, set) in [
+            (0, (0..43).filter(|i| i % 3 == 0).collect()),
+            (1, [1, 3].into_iter().collect()),
+        ] {
+            scan.runtime_filter_config().lock().push((
+                root,
+                Arc::new(parking_lot::Mutex::new(Some(Arc::new(
+                    RuntimeFilterPayload::Set(set),
+                )))),
+            ));
+        }
+    }
+    async fn check(scan: &StreamingParquetScanExec) {
+        let mut actual = Vec::new();
+        for partition in 0..scan.output_partitions() {
+            let mut stream = scan.execute(partition).await.unwrap();
+            while let Some(batch) = stream.try_next().await.unwrap() {
+                assert_eq!(batch.num_columns(), 2);
+                for column in batch.columns() {
+                    assert_eq!(column.data_type(), &DataType::Decimal128(20, 2));
+                }
+                assert_eq!(batch.column(0), batch.column(1));
+                let values = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .unwrap();
+                actual.extend(values.iter());
+                if let Some(bound) = scan.pool_independent_queue_copy_bound() {
+                    assert!(
+                        crate::physical::operators::spillable::owned_input_batch_charge(&batch)
+                            .unwrap()
+                            <= bound.max_bytes().unwrap()
+                    );
+                }
+            }
+        }
+        actual.sort();
+        let mut expected = (0..43)
+            .filter(|i| i % 3 == 0 && [1, 3].contains(&(i % 4)) && i % 7 != 0 && i % 5 != 0)
+            .map(|i| {
+                if i % 11 == 0 {
+                    None
+                } else {
+                    Some(i as i128 * 10)
+                }
+            })
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert!(!expected.is_empty());
+        assert!(expected.contains(&None));
+        assert_eq!(actual, expected);
+    }
+    #[tokio::test]
+    async fn narrowed_raw_output_reads_static_and_two_absent_runtime_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.parquet");
+        let batch = fixture(&path);
+        let scan = StreamingParquetScanExec::try_new_with_batch_size(
+            "fixture",
+            &[path],
+            batch.schema(),
+            Some(vec![3, 3]),
+            Some(&predicate()),
+            &batch.schema(),
+            17,
+            true,
+        )
+        .unwrap();
+        assert!(scan.pool_independent_queue_copy_bound().is_some());
+        link(&scan);
+        check(&scan).await;
+    }
+    #[tokio::test]
+    #[ignore = "dedicated QE_IPC_CACHE=auto process required; must exercise real sidecar, never silent fallback"]
+    async fn narrowed_existing_ipc_reads_predicate_and_two_absent_runtime_roots() {
+        assert!(
+            crate::storage::ipc_cache::enabled(),
+            "run dedicated target with QE_IPC_CACHE=auto"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.parquet");
+        let batch = fixture(&path);
+        let sidecar = dir.path().join("source.parquet.qeipc");
+        std::fs::create_dir(&sidecar).unwrap();
+        // Dictionary-encode the predicate column so the scanner's dictionary
+        // preference is genuinely compatible with this real IPC sidecar.
+        for (rg, start) in (0..43).step_by(11).enumerate() {
+            let slice = batch.slice(start, (43 - start).min(11));
+            let mut columns = slice.columns().to_vec();
+            columns[2] = arrow::compute::cast(
+                &columns[2],
+                &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            )
+            .unwrap();
+            let fields = slice
+                .schema()
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(i, f)| Field::new(f.name(), columns[i].data_type().clone(), f.is_nullable()))
+                .collect::<Vec<_>>();
+            let encoded = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+            let mut writer = arrow::ipc::writer::FileWriter::try_new(
+                std::fs::File::create(sidecar.join(format!("rg_{rg:05}.arrow"))).unwrap(),
+                &encoded.schema(),
+            )
+            .unwrap();
+            writer.write(&encoded).unwrap();
+            writer.finish().unwrap();
+        }
+        let metadata = std::fs::metadata(&path).unwrap();
+        let modified = metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        std::fs::write(
+            sidecar.join(".complete"),
+            format!("v2:{}:{modified}", metadata.len()),
+        )
+        .unwrap();
+        let scan = StreamingParquetScanExec::try_new(
+            "fixture",
+            &[path.clone()],
+            batch.schema(),
+            Some(vec![3, 3]),
+            Some(&predicate()),
+            &batch.schema(),
+        )
+        .unwrap();
+        assert!(scan.pool_independent_queue_copy_bound().is_none());
+        assert!(scan.pool_independent_gather_copy_bound().is_none());
+        link(&scan);
+        // An accidental raw-reader fallback now fails, proving actual IPC use.
+        std::fs::remove_file(path).unwrap();
+        check(&scan).await;
+    }
+}
+
+#[cfg(test)]
+mod aggregate_source_projection_tests {
+    use super::source_preserving_project;
+    use crate::planner::{Expr, LogicalPlan, PlanSchema, ProjectNode, ScanNode, SchemaField};
+    use arrow::datatypes::DataType;
+    use std::sync::Arc;
+
+    #[test]
+    fn source_identity_proof_allows_subsets_and_reordering_but_not_renaming() {
+        let fields = vec![
+            SchemaField::new("x", DataType::Int64),
+            SchemaField::new("y", DataType::Int64),
+        ];
+        let input = Arc::new(LogicalPlan::Scan(ScanNode {
+            table_name: "t".into(),
+            schema: PlanSchema::new(fields.clone()),
+            projection: None,
+            filter: None,
+        }));
+        for indices in [vec![0, 1], vec![1, 0], vec![1]] {
+            let node = ProjectNode {
+                input: input.clone(),
+                exprs: indices
+                    .iter()
+                    .map(|i| Expr::column(&fields[*i].name))
+                    .collect(),
+                schema: PlanSchema::new(indices.iter().map(|i| fields[*i].clone()).collect()),
+            };
+            assert!(source_preserving_project(&node));
+        }
+        let renamed = ProjectNode {
+            input: input.clone(),
+            exprs: vec![Expr::Alias {
+                expr: Box::new(Expr::column("x")),
+                name: "y".into(),
+            }],
+            schema: PlanSchema::new(vec![fields[1].clone()]),
+        };
+        assert!(!source_preserving_project(&renamed));
+        let duplicate = ProjectNode {
+            input,
+            exprs: vec![Expr::column("x"), Expr::column("x")],
+            schema: PlanSchema::new(vec![fields[0].clone(), fields[0].clone()]),
+        };
+        assert!(!source_preserving_project(&duplicate));
     }
 }

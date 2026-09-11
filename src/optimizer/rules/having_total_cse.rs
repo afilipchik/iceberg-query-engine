@@ -166,3 +166,112 @@ fn try_cse(filter: &FilterNode) -> Option<LogicalPlan> {
         },
     }))
 }
+
+#[cfg(test)]
+mod typed_having_substitution_contract_tests {
+    use super::*;
+    use crate::planner::{BinaryOp, DecimalValue, PlanSchema, ScalarValue, ScanNode, SchemaField};
+    use arrow::datatypes::DataType;
+    fn sum(scale: i8) -> Expr {
+        Expr::Aggregate {
+            func: AggregateFunction::Sum,
+            args: vec![Expr::Literal(ScalarValue::Decimal128(DecimalValue::new(
+                10_i128.pow(scale as u32),
+                scale,
+            )))],
+            distinct: false,
+        }
+    }
+    fn fixture(inner_scale: i8) -> LogicalPlan {
+        let source = Arc::new(LogicalPlan::Scan(ScanNode {
+            table_name: "fixture".into(),
+            schema: PlanSchema::new(vec![SchemaField::new("g", DataType::Int64)]),
+            projection: None,
+            filter: None,
+        }));
+        let outer = LogicalPlan::Aggregate(AggregateNode {
+            input: source.clone(),
+            group_by: vec![Expr::column("g")],
+            aggregates: vec![sum(1)],
+            schema: PlanSchema::new(vec![
+                SchemaField::new("g", DataType::Int64),
+                SchemaField::new("v", DataType::Decimal128(38, 1)),
+            ]),
+        });
+        let inner = LogicalPlan::Aggregate(AggregateNode {
+            input: source,
+            group_by: vec![],
+            aggregates: vec![sum(inner_scale)],
+            schema: PlanSchema::new(vec![SchemaField::new(
+                "total",
+                DataType::Decimal128(38, inner_scale),
+            )]),
+        });
+        LogicalPlan::Filter(FilterNode {
+            input: Arc::new(outer),
+            predicate: Expr::BinaryExpr {
+                left: Box::new(Expr::column("v")),
+                op: BinaryOp::Lt,
+                right: Box::new(Expr::ScalarSubquery(Arc::new(inner))),
+            },
+        })
+    }
+    #[test]
+    fn having_total_substitution_cannot_replace_scale_two_with_scale_one() {
+        let rewritten = HavingTotalCse.optimize(&fixture(2)).unwrap();
+        let LogicalPlan::Filter(filter) = rewritten else {
+            panic!("expected filter")
+        };
+        let Expr::BinaryExpr { right, .. } = filter.predicate else {
+            panic!("expected predicate")
+        };
+        let Expr::ScalarSubquery(sub) = *right else {
+            panic!("expected subquery")
+        };
+        let LogicalPlan::Aggregate(aggregate) = sub.as_ref() else {
+            panic!("expected scalar aggregate")
+        };
+        // Infer from the actual substituted input, independently of the stale
+        // declared field. The old rewrite produces scale1 under a scale2 field.
+        assert_eq!(
+            aggregate.schema.fields()[0].data_type,
+            DataType::Decimal128(38, 2)
+        );
+        assert_eq!(
+            aggregate.aggregates[0]
+                .data_type(&aggregate.input.schema())
+                .unwrap(),
+            DataType::Decimal128(38, 2)
+        );
+        assert!(
+            matches!(aggregate.input.as_ref(), LogicalPlan::Scan(_)),
+            "different physical scales must retain their own input expression"
+        );
+    }
+    #[test]
+    fn identical_scale_having_cse_preserves_inferred_output_type() {
+        let rewritten = HavingTotalCse.optimize(&fixture(1)).unwrap();
+        let LogicalPlan::Filter(filter) = rewritten else {
+            panic!("expected filter")
+        };
+        let Expr::BinaryExpr { right, .. } = filter.predicate else {
+            panic!("expected predicate")
+        };
+        let Expr::ScalarSubquery(sub) = *right else {
+            panic!("expected subquery")
+        };
+        let LogicalPlan::Aggregate(aggregate) = sub.as_ref() else {
+            panic!("expected aggregate")
+        };
+        assert_eq!(
+            aggregate.aggregates[0]
+                .data_type(&aggregate.input.schema())
+                .unwrap(),
+            DataType::Decimal128(38, 1)
+        );
+        assert!(matches!(
+            aggregate.input.as_ref(),
+            LogicalPlan::SubqueryAlias(_)
+        ));
+    }
+}

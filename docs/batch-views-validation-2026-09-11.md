@@ -1,0 +1,7 @@
+# Aggregate batch views: feature/resource validation — 2026-09-11
+
+Validation64579 is terminal1. Each ownership mode passes1098library tests/11ignored,125contract integrations and28spill/numeric/focused tests. Default disjoint native/IPC passes63/0; experimental partial passes62/1. Six legacy spill tests refuse memory in each mode. The partial native aggregate's final-bit Float64 rendering difference remains. No failure names were added or removed versus decoder-rollback validation79575; this does not prove identical refusal boundaries or close resource acceptance.
+
+The comparison also verifies complete test-executable/result counts, nondecreasing pass counts, unchanged ignored counts, failure totals and matching process exit codes. A compile failure with no panic names cannot pass this gate. All523 source inputs verify after the locked/offline lance,gpu runs. Rayon16,48GiB cgroup cap,one build job and repository TMPDIR. Full commands,environments,current/prior logs and hashes are in the [25-file archive](benchmarks/2026-09-11-batch-views-validation/manifest.json).
+
+Sequence35732 passed comparison and is building the optimized candidate;120matched diagnostic outputs against240cd5e2 follow automatically. Evidence finisher29174 waits for successful terminal measurement before computing ratios,comparing plans and archiving all samples. Source remains frozen. No optimized improvement, native admission, canonical GPU execution or DuckDB leadership is claimed.

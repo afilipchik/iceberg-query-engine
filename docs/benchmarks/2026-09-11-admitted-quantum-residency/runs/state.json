@@ -1,0 +1,480 @@
+{
+  "canonical_decoded_ipc": {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark",
+      "run",
+      "--dataset",
+      ".scratch/public-bench/tpch-sf10/dataset.json",
+      "--engine-binary",
+      ".scratch/parallel-aggregate-input/admitted_quantum_benchmark_embedded",
+      "--output",
+      ".scratch/public-bench/admitted-quantum-residency-32g-01/canonical_decoded_ipc",
+      "--track",
+      "decoded_ipc",
+      "--provider-manifest",
+      ".scratch/public-bench/canonical-sf10-providers-01/decoded_ipc/provider.json",
+      "--threads",
+      "16",
+      "--memory-gib",
+      "32",
+      "--process-cap-gib",
+      "48",
+      "--samples",
+      "3",
+      "--sessions",
+      "1",
+      "--gpu-residency",
+      "mixed"
+    ],
+    "started_unix": 1789140852.2263243,
+    "status": "terminal",
+    "capacity_experiment_not_16g_gate": true,
+    "workload_kind": "canonical_sf10",
+    "exit_code": 0,
+    "finished_unix": 1789141099.5721898,
+    "report": {
+      "version": 1,
+      "complete": true,
+      "issues": [],
+      "groups": [
+        {
+          "geomean": 0.6576407186298951,
+          "suite_ratio": 1.1280354155287664,
+          "engine_total_ms": 18110.681916999998,
+          "duckdb_total_ms": 16055.064998567104,
+          "wins": 15,
+          "queries": 22,
+          "worst_ratio": 6.0730231661649015,
+          "query_ratios": {
+            "q01": 6.0730231661649015,
+            "q02": 0.12961293633775303,
+            "q03": 0.45507302100067737,
+            "q04": 0.21147339882835275,
+            "q05": 0.4622131575827152,
+            "q06": 0.5878999922459959,
+            "q07": 0.5287290673325541,
+            "q08": 0.3027509246161659,
+            "q09": 0.608130225226791,
+            "q10": 1.344700619300235,
+            "q11": 0.23908495420097944,
+            "q12": 0.41689293282562767,
+            "q13": 3.277742968450342,
+            "q14": 0.7839251379437056,
+            "q15": 1.111339985417586,
+            "q16": 3.0518211477206636,
+            "q17": 0.38411370032777553,
+            "q18": 4.1056251704964035,
+            "q19": 1.3421782785976295,
+            "q20": 0.19276473823223492,
+            "q21": 0.2460793116126775,
+            "q22": 0.42139587042529125
+          },
+          "ci95": {
+            "geomean": [
+              0.602962836948643,
+              0.6882184031710928
+            ],
+            "suite_ratio": [
+              1.030341907552645,
+              1.1793826482513192
+            ]
+          },
+          "per_session": {
+            "s1": {
+              "geomean": 0.6576407186298951,
+              "suite_ratio": 1.1280354155287664,
+              "engine_total_ms": 18110.681916999998,
+              "duckdb_total_ms": 16055.064998567104,
+              "wins": 15,
+              "queries": 22,
+              "worst_ratio": 6.0730231661649015
+            }
+          },
+          "workload": "tpch_sf10",
+          "track": "decoded_ipc",
+          "leadership": false
+        }
+      ],
+      "latency_leadership": false,
+      "certification": "incomplete: resource, concurrency and regression gates are separate"
+    }
+  },
+  "canonical_gpu_control": {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark",
+      "run",
+      "--dataset",
+      ".scratch/public-bench/tpch-sf10/dataset.json",
+      "--engine-binary",
+      ".scratch/parallel-aggregate-input/admitted_quantum_benchmark_embedded",
+      "--output",
+      ".scratch/public-bench/admitted-quantum-residency-32g-01/canonical_gpu_control",
+      "--track",
+      "gpu_control",
+      "--provider-manifest",
+      ".scratch/public-bench/canonical-sf10-providers-01/decoded_ipc/provider.json",
+      "--threads",
+      "16",
+      "--memory-gib",
+      "32",
+      "--process-cap-gib",
+      "48",
+      "--samples",
+      "3",
+      "--sessions",
+      "1",
+      "--gpu-residency",
+      "mixed",
+      "--host-arrow-preloaded"
+    ],
+    "started_unix": 1789141099.5724678,
+    "status": "terminal",
+    "capacity_experiment_not_16g_gate": true,
+    "workload_kind": "canonical_sf10",
+    "exit_code": 0,
+    "finished_unix": 1789141466.7976887,
+    "report": {
+      "version": 1,
+      "complete": true,
+      "issues": [],
+      "groups": [
+        {
+          "geomean": 0.8212657396780936,
+          "suite_ratio": 1.3864985194055168,
+          "engine_total_ms": 17878.129598,
+          "duckdb_total_ms": 12894.445502664894,
+          "wins": 14,
+          "queries": 22,
+          "worst_ratio": 6.351473748359887,
+          "query_ratios": {
+            "q01": 6.351473748359887,
+            "q02": 0.24126806344369492,
+            "q03": 0.5526991231796943,
+            "q04": 0.24765716940739227,
+            "q05": 0.46543836183647785,
+            "q06": 0.641259660315591,
+            "q07": 0.6836912438883306,
+            "q08": 0.5060475018764038,
+            "q09": 0.6590336148977795,
+            "q10": 1.7793380659357716,
+            "q11": 0.331958524471195,
+            "q12": 0.5588072255420931,
+            "q13": 4.272638257773921,
+            "q14": 1.1516489765651572,
+            "q15": 1.1215508045880327,
+            "q16": 3.202919155781751,
+            "q17": 0.5320773553071005,
+            "q18": 4.7576189611497846,
+            "q19": 1.5436118941346608,
+            "q20": 0.29980072728674223,
+            "q21": 0.29695712401157115,
+            "q22": 0.45358436089338877
+          },
+          "ci95": {
+            "geomean": [
+              0.8070298700522499,
+              0.8410076968756988
+            ],
+            "suite_ratio": [
+              1.3531857796504176,
+              1.4206136635252642
+            ]
+          },
+          "per_session": {
+            "s1": {
+              "geomean": 0.8212657396780936,
+              "suite_ratio": 1.3864985194055168,
+              "engine_total_ms": 17878.129598,
+              "duckdb_total_ms": 12894.445502664894,
+              "wins": 14,
+              "queries": 22,
+              "worst_ratio": 6.351473748359887
+            }
+          },
+          "workload": "tpch_sf10",
+          "track": "gpu_control",
+          "leadership": false
+        }
+      ],
+      "latency_leadership": false,
+      "certification": "incomplete: resource, concurrency and regression gates are separate"
+    }
+  },
+  "canonical_gpu_mixed": {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark",
+      "run",
+      "--dataset",
+      ".scratch/public-bench/tpch-sf10/dataset.json",
+      "--engine-binary",
+      ".scratch/parallel-aggregate-input/admitted_quantum_benchmark_embedded",
+      "--output",
+      ".scratch/public-bench/admitted-quantum-residency-32g-01/canonical_gpu_mixed",
+      "--track",
+      "gpu",
+      "--provider-manifest",
+      ".scratch/public-bench/canonical-sf10-providers-01/decoded_ipc/provider.json",
+      "--threads",
+      "16",
+      "--memory-gib",
+      "32",
+      "--process-cap-gib",
+      "48",
+      "--samples",
+      "3",
+      "--sessions",
+      "1",
+      "--gpu-residency",
+      "mixed",
+      "--host-arrow-preloaded",
+      "--gpu-control-manifest",
+      ".scratch/public-bench/admitted-quantum-residency-32g-01/canonical_gpu_control/manifest.json"
+    ],
+    "started_unix": 1789141466.7981203,
+    "status": "terminal",
+    "capacity_experiment_not_16g_gate": true,
+    "workload_kind": "canonical_sf10",
+    "exit_code": 0,
+    "finished_unix": 1789141840.1430383,
+    "report": {
+      "version": 1,
+      "complete": true,
+      "issues": [],
+      "groups": [
+        {
+          "geomean": 0.8281827968778901,
+          "suite_ratio": 1.3743619955366548,
+          "engine_total_ms": 18007.388915,
+          "duckdb_total_ms": 13102.362385950983,
+          "wins": 14,
+          "queries": 22,
+          "worst_ratio": 5.356445417487781,
+          "query_ratios": {
+            "q01": 5.356445417487781,
+            "q02": 0.26324808132947114,
+            "q03": 0.5219777209263158,
+            "q04": 0.244818750011857,
+            "q05": 0.46612659167690756,
+            "q06": 0.6510698768294061,
+            "q07": 0.6801821341263158,
+            "q08": 0.5223573755068854,
+            "q09": 0.6225212135466561,
+            "q10": 1.8223049375077585,
+            "q11": 0.3459266180136457,
+            "q12": 0.6652452162132023,
+            "q13": 4.308249446845975,
+            "q14": 1.1540267285487844,
+            "q15": 1.144595962177713,
+            "q16": 3.250766935862012,
+            "q17": 0.5322395800608503,
+            "q18": 4.725050111752232,
+            "q19": 1.4769539403911707,
+            "q20": 0.3311214541923836,
+            "q21": 0.30268504630124626,
+            "q22": 0.45243793446110314
+          },
+          "ci95": {
+            "geomean": [
+              0.764959522245108,
+              0.8365434394169403
+            ],
+            "suite_ratio": [
+              1.3221352369999684,
+              1.3901671365825676
+            ]
+          },
+          "per_session": {
+            "s1": {
+              "geomean": 0.8281827968778901,
+              "suite_ratio": 1.3743619955366548,
+              "engine_total_ms": 18007.388915,
+              "duckdb_total_ms": 13102.362385950983,
+              "wins": 14,
+              "queries": 22,
+              "worst_ratio": 5.356445417487781
+            }
+          },
+          "workload": "tpch_sf10",
+          "track": "gpu",
+          "leadership": false
+        }
+      ],
+      "latency_leadership": false,
+      "certification": "incomplete: resource, concurrency and regression gates are separate"
+    }
+  },
+  "smoke_gpu_control": {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark",
+      "run",
+      "--dataset",
+      ".scratch/public-bench/custom-gpu-float-smoke/dataset.json",
+      "--engine-binary",
+      ".scratch/parallel-aggregate-input/admitted_quantum_benchmark_embedded",
+      "--output",
+      ".scratch/public-bench/admitted-quantum-residency-32g-01/smoke_gpu_control",
+      "--track",
+      "gpu_control",
+      "--provider-manifest",
+      ".scratch/public-bench/custom-gpu-float-ipc-01/provider.json",
+      "--threads",
+      "4",
+      "--memory-gib",
+      "4",
+      "--process-cap-gib",
+      "8",
+      "--samples",
+      "20",
+      "--sessions",
+      "1",
+      "--gpu-residency",
+      "mixed",
+      "--host-arrow-preloaded"
+    ],
+    "started_unix": 1789141840.1434975,
+    "status": "terminal",
+    "capacity_experiment_not_16g_gate": false,
+    "workload_kind": "custom_float_smoke_not_sf10",
+    "exit_code": 0,
+    "finished_unix": 1789141843.1987016,
+    "report": {
+      "version": 1,
+      "complete": true,
+      "issues": [],
+      "groups": [
+        {
+          "geomean": 1.371135619897719,
+          "suite_ratio": 2.01826826558029,
+          "engine_total_ms": 44.295371,
+          "duckdb_total_ms": 21.94721670821309,
+          "wins": 1,
+          "queries": 2,
+          "worst_ratio": 2.9060552243556197,
+          "query_ratios": {
+            "q01": 2.9060552243556197,
+            "q06": 0.6469295120051171
+          },
+          "ci95": {
+            "geomean": [
+              1.237374488512609,
+              1.6112788789487476
+            ],
+            "suite_ratio": [
+              1.9159093742993876,
+              2.314467932106228
+            ]
+          },
+          "per_session": {
+            "s1": {
+              "geomean": 1.371135619897719,
+              "suite_ratio": 2.01826826558029,
+              "engine_total_ms": 44.295371,
+              "duckdb_total_ms": 21.94721670821309,
+              "wins": 1,
+              "queries": 2,
+              "worst_ratio": 2.9060552243556197
+            }
+          },
+          "workload": "custom_gpu_float_smoke",
+          "track": "gpu_control",
+          "leadership": false
+        }
+      ],
+      "latency_leadership": false,
+      "certification": "incomplete: resource, concurrency and regression gates are separate"
+    }
+  },
+  "smoke_gpu_required": {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark",
+      "run",
+      "--dataset",
+      ".scratch/public-bench/custom-gpu-float-smoke/dataset.json",
+      "--engine-binary",
+      ".scratch/parallel-aggregate-input/admitted_quantum_benchmark_embedded",
+      "--output",
+      ".scratch/public-bench/admitted-quantum-residency-32g-01/smoke_gpu_required",
+      "--track",
+      "gpu",
+      "--provider-manifest",
+      ".scratch/public-bench/custom-gpu-float-ipc-01/provider.json",
+      "--threads",
+      "4",
+      "--memory-gib",
+      "4",
+      "--process-cap-gib",
+      "8",
+      "--samples",
+      "20",
+      "--sessions",
+      "1",
+      "--gpu-residency",
+      "required",
+      "--host-arrow-preloaded",
+      "--gpu-control-manifest",
+      ".scratch/public-bench/admitted-quantum-residency-32g-01/smoke_gpu_control/manifest.json"
+    ],
+    "started_unix": 1789141843.1990962,
+    "status": "terminal",
+    "capacity_experiment_not_16g_gate": false,
+    "workload_kind": "custom_float_smoke_not_sf10",
+    "exit_code": 0,
+    "finished_unix": 1789141846.147461,
+    "report": {
+      "version": 1,
+      "complete": true,
+      "issues": [],
+      "groups": [
+        {
+          "geomean": 0.08035489541637031,
+          "suite_ratio": 0.07846041037712646,
+          "engine_total_ms": 1.95904,
+          "duckdb_total_ms": 24.968515848740935,
+          "wins": 2,
+          "queries": 2,
+          "worst_ratio": 0.09847246697426158,
+          "query_ratios": {
+            "q01": 0.06557070636875074,
+            "q06": 0.09847246697426158
+          },
+          "ci95": {
+            "geomean": [
+              0.07086271142017735,
+              0.09574308572547308
+            ],
+            "suite_ratio": [
+              0.06983018993071244,
+              0.0910575611717933
+            ]
+          },
+          "per_session": {
+            "s1": {
+              "geomean": 0.08035489541637031,
+              "suite_ratio": 0.07846041037712646,
+              "engine_total_ms": 1.95904,
+              "duckdb_total_ms": 24.968515848740935,
+              "wins": 2,
+              "queries": 2,
+              "worst_ratio": 0.09847246697426158
+            }
+          },
+          "workload": "custom_gpu_float_smoke",
+          "track": "gpu",
+          "leadership": false
+        }
+      ],
+      "latency_leadership": false,
+      "certification": "incomplete: resource, concurrency and regression gates are separate"
+    }
+  }
+}

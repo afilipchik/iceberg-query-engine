@@ -1,0 +1,825 @@
+{
+  "version": 1,
+  "profile": "development",
+  "cache_state": "warm_host",
+  "gpu_residency_policy": "mixed",
+  "gpu_preparation_timeout_seconds": null,
+  "host_arrow_preloaded": false,
+  "tracks": [
+    "raw_parquet"
+  ],
+  "sessions": [
+    "s1"
+  ],
+  "samples_per_query": 3,
+  "timing_boundary": "embedded_parse_to_arrow_consumed",
+  "source_revision": "88849c4f8e47b6fc9149ffd15de0429cd9d3ad41",
+  "working_tree": " M AGENTS.md\n M CLAUDE.md\n M Cargo.lock\n M Cargo.toml\n M README.md\n M docs/benchmark-report-sf10.md\n M examples/oom_cap_harness.rs\n M scripts/oom_cap_harness.sh\n M scripts/safe_benchmark.sh\n M src/distributed/coordinator.rs\n M src/distributed/flight.rs\n M src/distributed/server.rs\n M src/error.rs\n M src/execution/context.rs\n M src/execution/memory.rs\n M src/execution/mod.rs\n M src/optimizer/mod.rs\n M src/optimizer/rules/constant_folding.rs\n M src/optimizer/rules/derive_or_predicates.rs\n M src/optimizer/rules/eager_aggregation.rs\n M src/optimizer/rules/group_key_reduction.rs\n M src/optimizer/rules/having_total_cse.rs\n M src/optimizer/rules/join_reorder.rs\n M src/optimizer/rules/packed_group_keys.rs\n M src/optimizer/rules/packed_join_keys.rs\n M src/optimizer/rules/predicate_pushdown.rs\n M src/optimizer/rules/projection_pushdown.rs\n M src/optimizer/rules/subquery_decorrelation.rs\n M src/physical/compiled_expr.rs\n M src/physical/gpu.rs\n M src/physical/mod.rs\n M src/physical/morsel_agg.rs\n M src/physical/operators/delim_join.rs\n M src/physical/operators/filter.rs\n M src/physical/operators/hash_agg.rs\n M src/physical/operators/hash_join.rs\n M src/physical/operators/mod.rs\n M src/physical/operators/morsel_agg.rs\n M src/physical/operators/native_scan.rs\n M src/physical/operators/project.rs\n M src/physical/operators/scan.rs\n M src/physical/operators/spillable.rs\n M src/physical/operators/streaming_parquet_scan.rs\n M src/physical/operators/subquery.rs\n M src/physical/operators/vector_search.rs\n M src/physical/operators/vectorized_hash.rs\n M src/physical/plan.rs\n M src/physical/planner.rs\n M src/physical/vector.rs\n M src/planner/binder.rs\n M src/planner/logical_expr.rs\n M src/planner/mod.rs\n M src/planner/schema.rs\n M src/storage/ipc_cache.rs\n M src/storage/lance.rs\n M src/storage/lance_write.rs\n M src/storage/metadata_cache.rs\n M src/storage/mod.rs\n M src/storage/native_rollup.rs\n M src/storage/native_table.rs\n M src/storage/row_group_pruning.rs\n M tests/native_dictionary_semi_anti.rs\n M tests/native_streaming_scan_tests.rs\n M tests/partition_contract.rs\n M tests/spill_tests.rs\n?? .claude/epics/realistic-benchmarks-duckdb-leadership/\n?? .claude/prds/realistic-benchmarks-duckdb-leadership.md\n?? docs/README.md\n?? docs/active-join-profile-2026-09-08.md\n?? docs/admitted-aggregate-frontier-2026-09-08.md\n?? docs/admitted-computed-pipeline-2026-09-09.md\n?? docs/admitted-construction-optimization-2026-09-06.md\n?? docs/admitted-group-output-2026-09-07.md\n?? docs/admitted-having-output-2026-09-09.md\n?? docs/admitted-pipeline-q09-measurement-2026-09-09.md\n?? docs/admitted-planned-quantum-2026-09-11.md\n?? docs/admitted-protected-pairs-2026-09-08.md\n?? docs/admitted-queue-preparation-2026-09-08.md\n?? docs/admitted-queue-protocol-2026-09-08.md\n?? docs/admitted-queue-provider-screen-2026-09-08.md\n?? docs/admitted-queue-q12-2026-09-08.md\n?? docs/admitted-route-cost-confound-2026-09-11.md\n?? docs/admitted-spill-io-2026-09-09.md\n?? docs/admitted-zstd-2026-09-08.md\n?? docs/agent-checkpoint-history-2026-09-06.md\n?? docs/agent-checkpoint-history-2026-09-08.md\n?? docs/agent-checkpoint-history-2026-09-09.md\n?? docs/agent-checkpoint-history-2026-09-10.md\n?? docs/agent-checkpoint-history-2026-09-11.md\n?? docs/aggregate-admission-migration-2026-09-07.md\n?? docs/aggregate-batch-binding-investigation-2026-09-11.md\n?? docs/aggregate-batch-dispatch-2026-09-08.md\n?? docs/aggregate-batch-views-2026-09-11.md\n?? docs/aggregate-capability-routing-2026-09-08.md\n?? docs/aggregate-expression-quantum-2026-09-08.md\n?? docs/aggregate-fallback-pool-audit-2026-09-07.md\n?? docs/aggregate-ingestion-cursor-2026-09-07.md\n?? docs/aggregate-key-binding-audit-2026-09-09.md\n?? docs/aggregate-output-quantum-2026-09-09.md\n?? docs/aggregate-output-quantum-audit-2026-09-09.md\n?? docs/aggregate-research-follow-up-2026-09-07.md\n?? docs/aggregate-route-control-2026-09-11.md\n?? docs/aggregate-row-transaction-attribution-2026-09-10.md\n?? docs/aggregate-source-projection-correctness-2026-09-08.md\n?? docs/aggregate-spill-threshold-2026-09-09.md\n?? docs/aggregate-startup-headroom-2026-09-10.md\n?? docs/aggregate-state-arena-2026-09-07.md\n?? docs/aggregate-state-codec-2026-09-07.md\n?? docs/aggregate-state-layout-path-2026-09-07.md\n?? docs/aggregate-state-rows-2026-09-07.md\n?? docs/aggregate-thread-scaling-2026-09-08.md\n?? docs/aggregate-threshold-paired-2026-09-09.md\n?? docs/aggregate-threshold-provider-screen-2026-09-09.md\n?? docs/aggregate-threshold-residency-2026-09-09.md\n?? docs/aggregate-update-boundary-2026-09-08.md\n?? docs/architecture.md\n?? docs/arrow-key-input-2026-09-07.md\n?? docs/arrow-state-input-2026-09-07.md\n?? docs/balanced-aggregate-native-scaling-2026-09-09.md\n?? docs/balanced-aggregate-ownership-2026-09-09.md\n?? docs/batch-views-measurement-2026-09-11.md\n?? docs/batch-views-providers-screen-2026-09-11.md\n?? docs/batch-views-residency-screen-2026-09-11.md\n?? docs/batch-views-screen-failure-attribution-2026-09-11.md\n?? docs/batch-views-validation-2026-09-11.md\n?? docs/benchmark-baseline-sf10-2026-09-05.md\n?? docs/benchmark-calibration-contract-gap-2026-09-08.md\n?? docs/benchmark-comparator-scaling-2026-09-06.md\n?? docs/benchmark-query-gates-2026-09-08.md\n?? docs/benchmark-startup-order-2026-09-07.md\n?? docs/benchmark-worker-shutdown-2026-09-08.md\n?? docs/benchmarks/\n?? docs/boolean-and-scalar-contracts-2026-09-06.md\n?? docs/borrowed-fixed-input-2026-09-10.md\n?? docs/borrowed-fixed-measurement-2026-09-10.md\n?? docs/borrowed-fixed-provider-screen-2026-09-10.md\n?? docs/borrowed-key-output-2026-09-07.md\n?? docs/bound-aggregate-arrays-2026-09-08.md\n?? docs/bound-keys-paired-2026-09-09.md\n?? docs/bound-keys-provider-screen-2026-09-09.md\n?? docs/bound-keys-residency-2026-09-09.md\n?? docs/bound-keys-short-query-control-2026-09-09.md\n?? docs/bound-selection-and-resident-quantum-2026-09-09.md\n?? docs/bounded-outer-pipeline-2026-09-09.md\n?? docs/budget-aware-expression-quantum-2026-09-08.md\n?? docs/budget-quantum-provider-screen-2026-09-08.md\n?? docs/budget-quantum-residency-2026-09-08.md\n?? docs/build-schema-admission-2026-09-09.md\n?? docs/build-schema-admission-provider-screen-2026-09-09.md\n?? docs/build-schema-bottleneck-attribution-2026-09-10.md\n?? docs/canonical-group-storage-2026-09-07.md\n?? docs/canonical-sf1-findings-2026-09-05.md\n?? docs/cast-construction-costs-2026-09-07.md\n?? docs/cast-kernel-allocation-interface-2026-09-07.md\n?? docs/coercion-memory-admission-2026-09-06.md\n?? docs/collected-join-profile-2026-09-09.md\n?? docs/compact-fixed-measurement-2026-09-10.md\n?? docs/compact-fixed-state-2026-09-10.md\n?? docs/compiled-coercion-attribution-2026-09-11.md\n?? docs/compiled-coercion-measurement-2026-09-11.md\n?? docs/compiled-numeric-coercion-plan-2026-09-11.md\n?? docs/constant-cast-normalization-2026-09-06.md\n?? docs/contiguous-copy-paired-2026-09-09.md\n?? docs/contiguous-copy-provider-screen-2026-09-09.md\n?? docs/contiguous-copy-residency-2026-09-09.md\n?? docs/contiguous-resident-copy-2026-09-09.md\n?? docs/coordinated-spill-progress-2026-09-11.md\n?? docs/copied-frontier-working-space-2026-09-11.md\n?? docs/correlated-empty-result-contract-2026-09-11.md\n?? docs/correlated-reduction-proof-audit-2026-09-11.md\n?? docs/correlated-reduction-validation-2026-09-11.md\n?? docs/cross-owner-partial-merge-2026-09-09.md\n?? docs/current-canonical-sf10-2026-09-07.md\n?? docs/decimal-aggregate-root-reuse-design-2026-09-06.md\n?? docs/decimal-expression-admission-2026-09-09.md\n?? docs/decimal-output-ownership-2026-09-07.md\n?? docs/decoded-output-quantum-2026-09-09.md\n?? docs/decoder-rollback-2026-09-11.md\n?? docs/decoder-rollback-validation-2026-09-11.md\n?? docs/dense-aggregate-domain-and-null-semantics-2026-09-07.md\n?? docs/dense-domain-current-protected-2026-09-07.md\n?? docs/dense-domain-full-sf10-2026-09-07.md\n?? docs/dense-domain-historical-protected-2026-09-07.md\n?? docs/dictionary-chunks-paired-2026-09-09.md\n?? docs/dictionary-chunks-provider-screen-2026-09-09.md\n?? docs/dictionary-chunks-residency-2026-09-09.md\n?? docs/dictionary-grouping-investigation-2026-09-06.md\n?? docs/direct-fixed-measurement-2026-09-10.md\n?? docs/direct-fixed-q18-attribution-2026-09-10.md\n?? docs/direct-fixed-updates-2026-09-10.md\n?? docs/empty-scalar-validation-2026-09-11.md\n?? docs/encoded-input-source-review-2026-09-08.md\n?? docs/execution-checkpoint-2026-09-06.md\n?? docs/expression-output-identity-2026-09-06.md\n?? docs/first-batch-refusal-ledger-2026-09-11.md\n?? docs/fixed-width-admitted-scan-2026-09-09.md\n?? docs/float-comparison-domain-findings-2026-09-06.md\n?? docs/float-dispatch-triage-2026-09-11.md\n?? docs/float-extrema-ordering-2026-09-07.md\n?? docs/float-grouping-domain-findings-2026-09-06.md\n?? docs/frozen585-benchmark-outcome-2026-09-06.md\n?? docs/frozen587-benchmark-outcome-2026-09-06.md\n?? docs/frozen591-benchmark-outcome-2026-09-06.md\n?? docs/frozen593-benchmark-outcome-2026-09-06.md\n?? docs/fused-aggregate-budget-overshoot-2026-09-07.md\n?? docs/fused-aggregate-error-lifecycle-2026-09-07.md\n?? docs/fused-evaluated-input-2026-09-07.md\n?? docs/generic-aggregate-profile-2026-09-11.md\n?? docs/gpu-hard-admission-design-2026-09-06.md\n?? docs/gpu-residency-benchmark-gate-2026-09-06.md\n?? docs/gpu-resident-session-implementation-2026-09-06.md\n?? docs/gpu-resident-validation-2026-09-06.md\n?? docs/gpu-resource-contract-investigation-2026-09-06.md\n?? docs/group-key-bitmap-performance-2026-09-06.md\n?? docs/iceberg-benchmark-boundary-investigation-2026-09-06.md\n?? docs/incremental-dictionary-ids-2026-09-09.md\n?? docs/incremental-header-admission-plan-2026-09-11.md\n?? docs/incremental-header-measurement-2026-09-11.md\n?? docs/incremental-header-refusal-results-2026-09-11.md\n?? docs/incremental-header-validation-2026-09-11.md\n?? docs/indexed-group-storage-2026-09-07.md\n?? docs/infallible-cast-construction-2026-09-06.md\n?? docs/ingestion-controller-2026-09-07.md\n?? docs/inline-aggregate-input-2026-09-08.md\n?? docs/inline-input-provider-screen-2026-09-08.md\n?? docs/inline-input-residency-2026-09-08.md\n?? docs/input-retention-attribution-2026-09-09.md\n?? docs/ipc-extent-validation-2026-09-08.md\n?? docs/ipc-preload-admission-2026-09-08.md\n?? docs/ipc-scalar-subquery-attribution-2026-09-06.md\n?? docs/ipc-sf10-resource-investigation-2026-09-06.md\n?? docs/isolated-window-benchmark-2026-09-09.md\n?? docs/join-index-admission-2026-09-08.md\n?? docs/join-index-provider-screen-2026-09-08.md\n?? docs/join-key-regression-investigation-2026-09-06.md\n?? docs/join-stream-source-audit-2026-09-08.md\n?? docs/key-read-validation-2026-09-07.md\n?? docs/lance-runtime-bridge-2026-09-07.md\n?? docs/left-count-binding-contract-2026-09-11.md\n?? docs/left-count-measurement-2026-09-11.md\n?? docs/left-count-provider-screen-2026-09-11.md\n?? docs/left-count-resource-2026-09-11.md\n?? docs/left-count-retained-reduction-2026-09-11.md\n?? docs/left-count-validation-2026-09-11.md\n?? docs/legacy-spill-refusal-attribution-2026-09-11.md\n?? docs/legacy-spill-refusal-results-2026-09-11.md\n?? docs/literal-coercion-budget-findings-2026-09-06.md\n?? docs/literal-memory-admission-2026-09-06.md\n?? docs/live-admitted-parquet-scan-2026-09-08.md\n?? docs/live-aggregate-profile-2026-09-07.md\n?? docs/live-dictionary-boundary-2026-09-07.md\n?? docs/live-spill-integration-2026-09-07.md\n?? docs/local-engine-source-comparison-2026-09-07.md\n?? docs/memory-aggregate-source-comparison-2026-09-08.md\n?? docs/metadata-cache-identity-2026-09-08.md\n?? docs/native-admitted-reader-design-2026-09-10.md\n?? docs/native-anti-test-contract-2026-09-11.md\n?? docs/native-cpu-next-profile-2026-09-06.md\n?? docs/native-decimal-pipeline-investigation-2026-09-06.md\n?? docs/native-header-precision-2026-09-11.md\n?? docs/native-incremental-ipc-2026-09-10.md\n?? docs/native-incremental-measurement-2026-09-10.md\n?? docs/native-q6-execution-profile-2026-09-11.md\n?? docs/native-shared-prescan-budget-2026-09-08.md\n?? docs/nested-prepared-gather-propagation-design-2026-09-06.md\n?? docs/next-memory-ownership-2026-09-06.md\n?? docs/next-shared-cpu-boundary-profile-2026-09-06.md\n?? docs/optimizer-column-identity-follow-up-2026-09-11.md\n?? docs/optimizer-convergence-proposal-2026-09-07.md\n?? docs/optimizer-overhead-investigation-2026-09-06.md\n?? docs/optional-output-validity-2026-09-09.md\n?? docs/or-column-identity-2026-09-07.md\n?? docs/outer-count-preaggregation-design-2026-09-09.md\n?? docs/outer-on-predicate-pushdown-2026-09-07.md\n?? docs/output-quantum-native-2026-09-09.md\n?? docs/output-quantum-protected-2026-09-09.md\n?? docs/output-quantum-q09-attribution-2026-09-09.md\n?? docs/output-quantum-residency-2026-09-09.md\n?? docs/output-quantum-short-query-control-2026-09-09.md\n?? docs/packed-block-padding-2026-09-08.md\n?? docs/packed-word-decoding-2026-09-11.md\n?? docs/packed-word-measurement-2026-09-11.md\n?? docs/packed-word-validation-2026-09-11.md\n?? docs/page-header-lifetime-2026-09-09.md\n?? docs/parallel-aggregate-candidate-2026-09-08.md\n?? docs/parallel-aggregate-input-2026-09-08.md\n?? docs/parallel-aggregate-reduction-2026-09-09.md\n?? docs/parallel-input-ownership-design-2026-09-06.md\n?? docs/parallel-key-gpu-runtime-2026-09-08.md\n?? docs/parallel-key-preparation-2026-09-08.md\n?? docs/parallel-key-provider-screen-2026-09-08.md\n?? docs/parallel-key-residency-2026-09-08.md\n?? docs/parallel-reduction-native-2026-09-09.md\n?? docs/parallel-reduction-ownership-2026-09-09.md\n?? docs/parallel-reduction-provider-screen-2026-09-09.md\n?? docs/parse-maintenance-stalls-2026-09-07.md\n?? docs/partial-native-input-attribution-2026-09-10.md\n?? docs/partition-boundary-audit-2026-09-05.md\n?? docs/partition-error-and-spill-contract-2026-09-09.md\n?? docs/partition-plan-2026-09-07.md\n?? docs/partition-scheduler-2026-09-07.md\n?? docs/peer-spill-measurement-2026-09-11.md\n?? docs/peer-spill-provider-screen-2026-09-11.md\n?? docs/preallocated-cast-traversal-2026-09-07.md\n?? docs/prepared-aggregate-keys-2026-09-08.md\n?? docs/prepared-input-ownership-2026-09-06.md\n?? docs/prepared-join-queue-bound-audit-2026-09-06.md\n?? docs/prepared-key-provider-screen-2026-09-08.md\n?? docs/prepared-key-state-profile-2026-09-08.md\n?? docs/prepared-pipeline-regressions-2026-09-06.md\n?? docs/prepared-wrapper-composition-plan-2026-09-06.md\n?? docs/project-audit-2026-09-05.md\n?? docs/projection-memory-integration-2026-09-06.md\n?? docs/projection-memory-performance-2026-09-06.md\n?? docs/provider-cpu-excess-triage-2026-09-07.md\n?? docs/public-workload-findings-2026-09-06.md\n?? docs/q1-aggregate-owner-skew-2026-09-09.md\n?? docs/q12-input-serialization-2026-09-08.md\n?? docs/qualified-column-identity-2026-09-07.md\n?? docs/qualified-identity-protected-followup-2026-09-07.md\n?? docs/quarter-budget-spill-reproduction-2026-09-09.md\n?? docs/queue-schema-metadata-contract-2026-09-09.md\n?? docs/reference-calibration-stop-2026-09-08.md\n?? docs/reference-worker-retirement-2026-09-08.md\n?? docs/repartition-2026-09-07.md\n?? docs/repeated-validity-decoding-2026-09-11.md\n?? docs/resident-startup-diagnostics-2026-09-08.md\n?? docs/resource-gate-follow-up-2026-09-10.md\n?? docs/result-memory-admission-design-2026-09-06.md\n?? docs/result-memory-boundary-findings-2026-09-06.md\n?? docs/retained-input-allocation-accounting-2026-09-08.md\n?? docs/retained-input-credit-measurement-2026-09-10.md\n?? docs/retained-input-credit-provider-screen-2026-09-10.md\n?? docs/retained-input-credit-q07-2026-09-10.md\n?? docs/retained-input-progress-credit-2026-09-10.md\n?? docs/retained-key-component-2026-09-08.md\n?? docs/right-built-semi-runtime-filter-2026-09-11.md\n?? docs/right-semi-measurement-2026-09-11.md\n?? docs/right-semi-provider-screen-2026-09-11.md\n?? docs/right-semi-residency-2026-09-11.md\n?? docs/right-semi-validation-2026-09-11.md\n?? docs/row-restoration-2026-09-07.md\n?? docs/run-collection-2026-09-07.md\n?? docs/run-compaction-2026-09-07.md\n?? docs/run-merge-2026-09-07.md\n?? docs/runtime-filter-admission-2026-09-09.md\n?? docs/runtime-filter-lineage-2026-09-09.md\n?? docs/runtime-variable-output-quantum-design-2026-09-06.md\n?? docs/scalar-state-read-2026-09-07.md\n?? docs/scan-budget-batching-cliff-2026-09-08.md\n?? docs/selected-scalar-ownership-2026-09-07.md\n?? docs/selected-state-slots-2026-09-07.md\n?? docs/serial-aggregate-input-2026-09-08.md\n?? docs/shared-aggregate-finalization-profile-2026-09-07.md\n?? docs/shared-cpu-regression-diagnosis-2026-09-06.md\n?? docs/shared-prescan-error-propagation-2026-09-08.md\n?? docs/short-query-null-control-2026-09-09.md\n?? docs/spill-directory-2026-09-07.md\n?? docs/spill-files-2026-09-07.md\n?? docs/spill-frames-2026-09-07.md\n?? docs/spill-io-paired-2026-09-09.md\n?? docs/spill-io-provider-screen-2026-09-09.md\n?? docs/spill-io-residency-2026-09-09.md\n?? docs/spill-test-output-floor-2026-09-09.md\n?? docs/split-progress-2026-09-07.md\n?? docs/sql-float-cast-performance-2026-09-06.md\n?? docs/startup-headroom-measurement-2026-09-10.md\n?? docs/startup-headroom-provider-screen-2026-09-10.md\n?? docs/state-row-write-2026-09-07.md\n?? docs/streaming-fixed-width-capability-plan-2026-09-06.md\n?? docs/streaming-fixed-width-contracts-2026-09-06.md\n?? docs/streaming-fixed-width-source-sha256-2026-09-06.txt\n?? docs/streaming-input-ownership-audit-2026-09-06.md\n?? docs/streaming-project-output-pruning-plan-2026-09-06.md\n?? docs/string-domain-findings-2026-09-06.md\n?? docs/systemic-contracts-2026-09-06.md\n?? docs/systemic-correctness-fixes-2026-09-05.md\n?? docs/timestamp-domain-contract-2026-09-07.md\n?? docs/try-cast-bitmap-construction-2026-09-07.md\n?? docs/try-cast-construction-2026-09-06.md\n?? docs/try-cast-input-validity-2026-09-06.md\n?? docs/typed-literal-binding-2026-09-06.md\n?? docs/typed-state-input-follow-up-2026-09-10.md\n?? docs/validity-repeated-measurement-2026-09-11.md\n?? docs/validity-repeated-validation-2026-09-11.md\n?? docs/variable-output-ownership-integration-review-2026-09-06.md\n?? docs/variable-output-prefix-component-2026-09-06.md\n?? docs/vectorized-group-growth-investigation-2026-09-06.md\n?? examples/benchmark_embedded.rs\n?? examples/benchmark_support/\n?? examples/metadata_cache_probe.rs\n?? examples/prepared_plan_probe.rs\n?? examples/sf10_gpu_serve.rs\n?? scripts/benchmark/\n?? scripts/sf10_baseline.py\n?? src/execution/expression_memory.rs\n?? src/execution/reserved_buffer.rs\n?? src/execution/reserved_scalar.rs\n?? src/execution/reserved_scalar/\n?? src/execution/reserved_vec.rs\n?? src/execution/retained_batch.rs\n?? src/optimizer/properties.rs\n?? src/optimizer/rules/subquery_decorrelation/\n?? src/physical/compiled_expr/\n?? src/physical/dense_domain.rs\n?? src/physical/fixed_width_output.rs\n?? src/physical/morsel_agg/\n?? src/physical/operators/aggregate_fallback_pool_tests.rs\n?? src/physical/operators/closed_subquery.rs\n?? src/physical/operators/filter/\n?? src/physical/operators/hash_join/\n?? src/physical/operators/initialized_membership.rs\n?? src/physical/operators/int64_membership.rs\n?? src/physical/operators/project/\n?? src/physical/operators/regex_replace.rs\n?? src/physical/operators/runtime_filter.rs\n?? src/physical/operators/scan/\n?? src/physical/operators/spillable/\n?? src/physical/operators/streaming_parquet_scan/\n?? src/physical/operators/substring.rs\n?? src/physical/queue_layout.rs\n?? src/planner/decimal.rs\n?? src/planner/numeric.rs\n?? src/planner/reserved_cast.rs\n?? src/planner/reserved_decimal.rs\n?? src/planner/reserved_decimal/\n?? src/planner/reserved_literal.rs\n?? src/planner/reserved_numeric.rs\n?? src/planner/temporal.rs\n?? src/storage/admitted_batch.rs\n?? src/storage/admitted_column_pages.rs\n?? src/storage/admitted_dictionary_utf8.rs\n?? src/storage/admitted_flat_column.rs\n?? src/storage/admitted_flat_column/\n?? src/storage/admitted_gather.rs\n?? src/storage/admitted_hybrid.rs\n?? src/storage/admitted_page_body.rs\n?? src/storage/admitted_page_read.rs\n?? src/storage/admitted_plain_fixed.rs\n?? src/storage/admitted_plain_utf8.rs\n?? src/storage/admitted_row_group.rs\n?? src/storage/admitted_selection.rs\n?? src/storage/admitted_selection/\n?? src/storage/bounded_page_header.rs\n?? src/storage/bounded_page_header/\n?? tests/aggregate_arena_admission.rs\n?? tests/aggregate_binding_transparency.rs\n?? tests/aggregate_encoding_contract.rs\n?? tests/aggregate_expression_quantum.rs\n?? tests/aggregate_order_contract_tests.rs\n?? tests/aggregate_output_name_contract.rs\n?? tests/aggregate_post_filter_admission.rs\n?? tests/aggregate_startup_headroom.rs\n?? tests/boolean_null_contract_tests.rs\n?? tests/cast_contract_tests.rs\n?? tests/coercion_memory_admission.rs\n?? tests/constant_cast_folding_contract.rs\n?? tests/decimal_expression_admission.rs\n?? tests/decimal_root_reuse_aggregate_contract.rs\n?? tests/dense_aggregate_null_domain.rs\n?? tests/dictionary_group_contract_tests.rs\n?? tests/distinct_sum_empty_contract.rs\n?? tests/expression_identity_contract.rs\n?? tests/fixtures/\n?? tests/float_comparison_contract.rs\n?? tests/float_extrema_contract.rs\n?? tests/fused_aggregate_budget_transition.rs\n?? tests/fused_aggregate_evaluated_keys.rs\n?? tests/fused_aggregate_input_errors.rs\n?? tests/fused_input_cpu_parallelism.rs\n?? tests/group_key_equivalence_contract.rs\n?? tests/hash_join_initialization_ownership.rs\n?? tests/hash_join_streaming_tests.rs\n?? tests/initialized_membership_contract.rs\n?? tests/ipc_extent_contract.rs\n?? tests/live_dictionary_input.rs\n?? tests/materialization_partition_audit_tests.rs\n?? tests/membership_contract_tests.rs\n?? tests/memory_reservation_contract.rs\n?? tests/memory_table_statistics.rs\n?? tests/optimizer_convergence_contract.rs\n?? tests/outer_on_pushdown.rs\n?? tests/outer_stream_contract.rs\n?? tests/parallel_input_spill_contract.rs\n?? tests/prepared_join_contract.rs\n?? tests/prepared_row_store_contract.rs\n?? tests/prepared_wrapper_unknown_contract.rs\n?? tests/projection_memory_admission.rs\n?? tests/qualified_column_identity.rs\n?? tests/regex_replace_contract_tests.rs\n?? tests/reserved_buffer_builder.rs\n?? tests/result_buffer_ownership.rs\n?? tests/row_store_schema_contract.rs\n?? tests/runtime_filter_domain_contract.rs\n?? tests/runtime_filter_lineage_contract.rs\n?? tests/scalar_comparison_contract_tests.rs\n?? tests/scalar_domain_contract_tests.rs\n?? tests/semantic_proof_tests.rs\n?? tests/shared_prescan_errors.rs\n?? tests/streaming_prepared_join_contract.rs\n?? tests/substring_contract_tests.rs\n?? tests/systemic_numeric_tests.rs\n?? tests/timestamp_domain_contract.rs\n?? tests/typed_literal_contract.rs\n?? tests/typed_memory_pressure.rs\n?? tests/values_type_contract_tests.rs\n",
+  "engine_binary_sha256": "beb0cdfd180507aa4ab00e7aa2ec9ea2c38f787b803aaa62de0b26bb239b75c5",
+  "duckdb_version": "1.4.4",
+  "dataset_manifest_sha256": "ff097ac1f71b689618970e7c7c16c721ccab205c76286ea1f29866f34a8c7e99",
+  "dataset_path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/tpch-sf10/dataset.json",
+  "provider_conversion": null,
+  "gpu_cpu_control": null,
+  "workloads": [
+    {
+      "id": "tpch_sf10",
+      "queries": [
+        {
+          "id": "q01",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 0,
+              "direction": "asc",
+              "nulls": "last"
+            },
+            {
+              "column": 1,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q01.sql",
+          "sql_sha256": "8aefe77a1c97459bc69acbbcdaf3b8637d8ea22dfc3ac7be732d4446da83b69b",
+          "original_sql_path": "original-sql/q01.sql",
+          "original_sql_sha256": "8aefe77a1c97459bc69acbbcdaf3b8637d8ea22dfc3ac7be732d4446da83b69b",
+          "oracle_sql_path": "oracle-sql/q01.sql",
+          "oracle_sql_sha256": "8aefe77a1c97459bc69acbbcdaf3b8637d8ea22dfc3ac7be732d4446da83b69b"
+        },
+        {
+          "id": "q02",
+          "result_policy": "limit_ties",
+          "order_by": [
+            {
+              "column": 0,
+              "direction": "desc",
+              "nulls": "last"
+            },
+            {
+              "column": 2,
+              "direction": "asc",
+              "nulls": "last"
+            },
+            {
+              "column": 1,
+              "direction": "asc",
+              "nulls": "last"
+            },
+            {
+              "column": 3,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": 100,
+          "adaptations": [],
+          "sql_path": "sql/q02.sql",
+          "sql_sha256": "a2219893f952dd2a2586ab297d909ec2d440faabb5e692f24880158aa6877344",
+          "original_sql_path": "original-sql/q02.sql",
+          "original_sql_sha256": "a2219893f952dd2a2586ab297d909ec2d440faabb5e692f24880158aa6877344",
+          "oracle_sql_path": "oracle-sql/q02.sql",
+          "oracle_sql_sha256": "228cd114a8f291d969c5f0fd3da8011288c8c39fd42d4c4fb55831a289efb8bc"
+        },
+        {
+          "id": "q03",
+          "result_policy": "limit_ties",
+          "order_by": [
+            {
+              "column": 1,
+              "direction": "desc",
+              "nulls": "last"
+            },
+            {
+              "column": 2,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": 10,
+          "adaptations": [],
+          "sql_path": "sql/q03.sql",
+          "sql_sha256": "1f120d790d4914652cbf3fbc0fa28ed6573e4adee61ae7164a8c3d99b7c6b7fe",
+          "original_sql_path": "original-sql/q03.sql",
+          "original_sql_sha256": "1f120d790d4914652cbf3fbc0fa28ed6573e4adee61ae7164a8c3d99b7c6b7fe",
+          "oracle_sql_path": "oracle-sql/q03.sql",
+          "oracle_sql_sha256": "420db74dd3f3d65e789365b7e55305e7fc2884929f2811be9c939453c0accfe1"
+        },
+        {
+          "id": "q04",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 0,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q04.sql",
+          "sql_sha256": "2a2be89752fc917bc71e1a59168ead9d00d40c40ea0bbe646206e414b372f888",
+          "original_sql_path": "original-sql/q04.sql",
+          "original_sql_sha256": "2a2be89752fc917bc71e1a59168ead9d00d40c40ea0bbe646206e414b372f888",
+          "oracle_sql_path": "oracle-sql/q04.sql",
+          "oracle_sql_sha256": "2a2be89752fc917bc71e1a59168ead9d00d40c40ea0bbe646206e414b372f888"
+        },
+        {
+          "id": "q05",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 1,
+              "direction": "desc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q05.sql",
+          "sql_sha256": "495def7debb02ab1def31da07fbc88b4796813b754832ce15d54a35dcb104577",
+          "original_sql_path": "original-sql/q05.sql",
+          "original_sql_sha256": "495def7debb02ab1def31da07fbc88b4796813b754832ce15d54a35dcb104577",
+          "oracle_sql_path": "oracle-sql/q05.sql",
+          "oracle_sql_sha256": "495def7debb02ab1def31da07fbc88b4796813b754832ce15d54a35dcb104577"
+        },
+        {
+          "id": "q06",
+          "result_policy": "bag",
+          "order_by": [],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q06.sql",
+          "sql_sha256": "3638535fb92a6026b3359a2ad9e6ed7da9ad9080152513e6fd3818d1a853c29f",
+          "original_sql_path": "original-sql/q06.sql",
+          "original_sql_sha256": "3638535fb92a6026b3359a2ad9e6ed7da9ad9080152513e6fd3818d1a853c29f",
+          "oracle_sql_path": "oracle-sql/q06.sql",
+          "oracle_sql_sha256": "3638535fb92a6026b3359a2ad9e6ed7da9ad9080152513e6fd3818d1a853c29f"
+        },
+        {
+          "id": "q07",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 0,
+              "direction": "asc",
+              "nulls": "last"
+            },
+            {
+              "column": 1,
+              "direction": "asc",
+              "nulls": "last"
+            },
+            {
+              "column": 2,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q07.sql",
+          "sql_sha256": "5e8077121a42ca8ebf5ff54e5842a614e839da945b0331e3b63d9ccad2361201",
+          "original_sql_path": "original-sql/q07.sql",
+          "original_sql_sha256": "5e8077121a42ca8ebf5ff54e5842a614e839da945b0331e3b63d9ccad2361201",
+          "oracle_sql_path": "oracle-sql/q07.sql",
+          "oracle_sql_sha256": "5e8077121a42ca8ebf5ff54e5842a614e839da945b0331e3b63d9ccad2361201"
+        },
+        {
+          "id": "q08",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 0,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q08.sql",
+          "sql_sha256": "948338f54b97a2c49aea15f8c4d609ecf244d00ad7754edcea60b4748504a1ce",
+          "original_sql_path": "original-sql/q08.sql",
+          "original_sql_sha256": "948338f54b97a2c49aea15f8c4d609ecf244d00ad7754edcea60b4748504a1ce",
+          "oracle_sql_path": "oracle-sql/q08.sql",
+          "oracle_sql_sha256": "948338f54b97a2c49aea15f8c4d609ecf244d00ad7754edcea60b4748504a1ce"
+        },
+        {
+          "id": "q09",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 0,
+              "direction": "asc",
+              "nulls": "last"
+            },
+            {
+              "column": 1,
+              "direction": "desc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q09.sql",
+          "sql_sha256": "af90ccbe30ece396209e6627c10c0086ed54208100357922ee404de8bb867e56",
+          "original_sql_path": "original-sql/q09.sql",
+          "original_sql_sha256": "af90ccbe30ece396209e6627c10c0086ed54208100357922ee404de8bb867e56",
+          "oracle_sql_path": "oracle-sql/q09.sql",
+          "oracle_sql_sha256": "af90ccbe30ece396209e6627c10c0086ed54208100357922ee404de8bb867e56"
+        },
+        {
+          "id": "q10",
+          "result_policy": "limit_ties",
+          "order_by": [
+            {
+              "column": 2,
+              "direction": "desc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": 20,
+          "adaptations": [],
+          "sql_path": "sql/q10.sql",
+          "sql_sha256": "0b48b00cffa3776b32e67e9041191dea25095e2a952ee5251990b9c8585031ed",
+          "original_sql_path": "original-sql/q10.sql",
+          "original_sql_sha256": "0b48b00cffa3776b32e67e9041191dea25095e2a952ee5251990b9c8585031ed",
+          "oracle_sql_path": "oracle-sql/q10.sql",
+          "oracle_sql_sha256": "620f9aea3c0e9bf80054148247ba2eab9b1c887e4725760420e5144c66ecc065"
+        },
+        {
+          "id": "q11",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 1,
+              "direction": "desc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [
+            {
+              "reason": "TPC-H Q11 threshold scales as 0.0001 / SF",
+              "from": "0.0001000000",
+              "to": "0.00001"
+            }
+          ],
+          "sql_path": "sql/q11.sql",
+          "sql_sha256": "4ab5557616bc55119e5ddd6d6c38363c9ead291703317114ebff983bb003cd19",
+          "original_sql_path": "original-sql/q11.sql",
+          "original_sql_sha256": "f313c766fac507c1204fb6f2bacd35719a61a11c0f69601302555150dddeda78",
+          "oracle_sql_path": "oracle-sql/q11.sql",
+          "oracle_sql_sha256": "4ab5557616bc55119e5ddd6d6c38363c9ead291703317114ebff983bb003cd19"
+        },
+        {
+          "id": "q12",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 0,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q12.sql",
+          "sql_sha256": "3814c9f4b7a476ee894c477d43cedb299603b1ed0f5315790d52839c8da355bf",
+          "original_sql_path": "original-sql/q12.sql",
+          "original_sql_sha256": "3814c9f4b7a476ee894c477d43cedb299603b1ed0f5315790d52839c8da355bf",
+          "oracle_sql_path": "oracle-sql/q12.sql",
+          "oracle_sql_sha256": "3814c9f4b7a476ee894c477d43cedb299603b1ed0f5315790d52839c8da355bf"
+        },
+        {
+          "id": "q13",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 1,
+              "direction": "desc",
+              "nulls": "last"
+            },
+            {
+              "column": 0,
+              "direction": "desc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q13.sql",
+          "sql_sha256": "4a4a0b2c5646b2cad8f220a8f4b73ccb9f0acd45542353d63c18a69227bc20a3",
+          "original_sql_path": "original-sql/q13.sql",
+          "original_sql_sha256": "4a4a0b2c5646b2cad8f220a8f4b73ccb9f0acd45542353d63c18a69227bc20a3",
+          "oracle_sql_path": "oracle-sql/q13.sql",
+          "oracle_sql_sha256": "4a4a0b2c5646b2cad8f220a8f4b73ccb9f0acd45542353d63c18a69227bc20a3"
+        },
+        {
+          "id": "q14",
+          "result_policy": "bag",
+          "order_by": [],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q14.sql",
+          "sql_sha256": "e7ec7960a4c49219fc76dc03495a1530aeb30c796413dd1dc9d501b86934f222",
+          "original_sql_path": "original-sql/q14.sql",
+          "original_sql_sha256": "e7ec7960a4c49219fc76dc03495a1530aeb30c796413dd1dc9d501b86934f222",
+          "oracle_sql_path": "oracle-sql/q14.sql",
+          "oracle_sql_sha256": "e7ec7960a4c49219fc76dc03495a1530aeb30c796413dd1dc9d501b86934f222"
+        },
+        {
+          "id": "q15",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 0,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q15.sql",
+          "sql_sha256": "1cb57383eeff60261a1b4b2a141c71d8672729d743a7dfa74d9a4bcaf69c44d4",
+          "original_sql_path": "original-sql/q15.sql",
+          "original_sql_sha256": "1cb57383eeff60261a1b4b2a141c71d8672729d743a7dfa74d9a4bcaf69c44d4",
+          "oracle_sql_path": "oracle-sql/q15.sql",
+          "oracle_sql_sha256": "1cb57383eeff60261a1b4b2a141c71d8672729d743a7dfa74d9a4bcaf69c44d4"
+        },
+        {
+          "id": "q16",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 3,
+              "direction": "desc",
+              "nulls": "last"
+            },
+            {
+              "column": 0,
+              "direction": "asc",
+              "nulls": "last"
+            },
+            {
+              "column": 1,
+              "direction": "asc",
+              "nulls": "last"
+            },
+            {
+              "column": 2,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q16.sql",
+          "sql_sha256": "45085e7672cb1500e625e048156fc55369e7a9bc91fd3647c3f7735a870c3ef8",
+          "original_sql_path": "original-sql/q16.sql",
+          "original_sql_sha256": "45085e7672cb1500e625e048156fc55369e7a9bc91fd3647c3f7735a870c3ef8",
+          "oracle_sql_path": "oracle-sql/q16.sql",
+          "oracle_sql_sha256": "45085e7672cb1500e625e048156fc55369e7a9bc91fd3647c3f7735a870c3ef8"
+        },
+        {
+          "id": "q17",
+          "result_policy": "bag",
+          "order_by": [],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q17.sql",
+          "sql_sha256": "dfc7f00ac8a500c2ac2735b05b41b462bbe4af9ce7cd6c37e42d1bb9df4a02e1",
+          "original_sql_path": "original-sql/q17.sql",
+          "original_sql_sha256": "dfc7f00ac8a500c2ac2735b05b41b462bbe4af9ce7cd6c37e42d1bb9df4a02e1",
+          "oracle_sql_path": "oracle-sql/q17.sql",
+          "oracle_sql_sha256": "dfc7f00ac8a500c2ac2735b05b41b462bbe4af9ce7cd6c37e42d1bb9df4a02e1"
+        },
+        {
+          "id": "q18",
+          "result_policy": "limit_ties",
+          "order_by": [
+            {
+              "column": 4,
+              "direction": "desc",
+              "nulls": "last"
+            },
+            {
+              "column": 3,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": 100,
+          "adaptations": [],
+          "sql_path": "sql/q18.sql",
+          "sql_sha256": "8c5076061727d974f96708f0da930fc58843eac297a80c7ad658d64d152a19bb",
+          "original_sql_path": "original-sql/q18.sql",
+          "original_sql_sha256": "8c5076061727d974f96708f0da930fc58843eac297a80c7ad658d64d152a19bb",
+          "oracle_sql_path": "oracle-sql/q18.sql",
+          "oracle_sql_sha256": "07d34393b6aac758b2d1f817283bf2c97052967e4bb9832b76bcf85793d55c86"
+        },
+        {
+          "id": "q19",
+          "result_policy": "bag",
+          "order_by": [],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q19.sql",
+          "sql_sha256": "341f97d1f74deb30aca2a8b0ee849772a3b0e098a06cf12266c63573cb985478",
+          "original_sql_path": "original-sql/q19.sql",
+          "original_sql_sha256": "341f97d1f74deb30aca2a8b0ee849772a3b0e098a06cf12266c63573cb985478",
+          "oracle_sql_path": "oracle-sql/q19.sql",
+          "oracle_sql_sha256": "341f97d1f74deb30aca2a8b0ee849772a3b0e098a06cf12266c63573cb985478"
+        },
+        {
+          "id": "q20",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 0,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q20.sql",
+          "sql_sha256": "fa96ad5cb897bf31ec9b96a6b2a0d1f7132e71e2f481321e6db16628bc3e5fd5",
+          "original_sql_path": "original-sql/q20.sql",
+          "original_sql_sha256": "fa96ad5cb897bf31ec9b96a6b2a0d1f7132e71e2f481321e6db16628bc3e5fd5",
+          "oracle_sql_path": "oracle-sql/q20.sql",
+          "oracle_sql_sha256": "fa96ad5cb897bf31ec9b96a6b2a0d1f7132e71e2f481321e6db16628bc3e5fd5"
+        },
+        {
+          "id": "q21",
+          "result_policy": "limit_ties",
+          "order_by": [
+            {
+              "column": 1,
+              "direction": "desc",
+              "nulls": "last"
+            },
+            {
+              "column": 0,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": 100,
+          "adaptations": [],
+          "sql_path": "sql/q21.sql",
+          "sql_sha256": "b29463f30a64e45a795047ee6e557e6c3c1f01fc612acc997873594048e74b59",
+          "original_sql_path": "original-sql/q21.sql",
+          "original_sql_sha256": "b29463f30a64e45a795047ee6e557e6c3c1f01fc612acc997873594048e74b59",
+          "oracle_sql_path": "oracle-sql/q21.sql",
+          "oracle_sql_sha256": "cfa8a51490c2630943ffcfab649eff7968cbdac6683b0bfe0f58e36c19c08e7f"
+        },
+        {
+          "id": "q22",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 0,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q22.sql",
+          "sql_sha256": "d8ed6332e75f9193391000ba071e17adcf735a2d99c5a4da0f7c13d695ccbd42",
+          "original_sql_path": "original-sql/q22.sql",
+          "original_sql_sha256": "d8ed6332e75f9193391000ba071e17adcf735a2d99c5a4da0f7c13d695ccbd42",
+          "oracle_sql_path": "oracle-sql/q22.sql",
+          "oracle_sql_sha256": "d8ed6332e75f9193391000ba071e17adcf735a2d99c5a4da0f7c13d695ccbd42"
+        }
+      ]
+    }
+  ],
+  "created_at": "2026-09-11T15:20:24.945875+00:00",
+  "environment": {
+    "platform": "Linux-6.17.0-35-generic-x86_64-with-glibc2.39",
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "setup": {
+      "track": "raw_parquet",
+      "threads": 16,
+      "memory_limit": "4294967296B",
+      "process_cap_bytes": 12884901888,
+      "temp_directory": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/admitted-quantum-sf10-providers-01/raw_parquet/scratch/duckdb-temp",
+      "tables": [
+        {
+          "name": "region",
+          "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/tpch-sf10/parquet/region.parquet"
+        },
+        {
+          "name": "nation",
+          "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/tpch-sf10/parquet/nation.parquet"
+        },
+        {
+          "name": "supplier",
+          "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/tpch-sf10/parquet/supplier.parquet"
+        },
+        {
+          "name": "customer",
+          "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/tpch-sf10/parquet/customer.parquet"
+        },
+        {
+          "name": "part",
+          "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/tpch-sf10/parquet/part.parquet"
+        },
+        {
+          "name": "partsupp",
+          "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/tpch-sf10/parquet/partsupp.parquet"
+        },
+        {
+          "name": "orders",
+          "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/tpch-sf10/parquet/orders.parquet"
+        },
+        {
+          "name": "lineitem",
+          "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/tpch-sf10/parquet/lineitem.parquet"
+        }
+      ]
+    },
+    "containment": {
+      "path": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/safe-build-3233595-31706.scope",
+      "memory.max": "51539607552",
+      "memory.swap.max": "0"
+    }
+  },
+  "limitations": [
+    "CPU provider development run; residency/resource/concurrency certification pending",
+    "both APIs collect Arrow results; query-wide result reservations pending",
+    "operator-level resource attribution and per-query RSS sampling pending",
+    "engine plan text may be capped by the production QueryMetrics API",
+    "GPU residency is observed per query; isolated synchronous cold-upload timing is not implemented"
+  ],
+  "seed": 20260905,
+  "command": [
+    "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/scripts/benchmark/__main__.py",
+    "run",
+    "--dataset",
+    ".scratch/public-bench/tpch-sf10/dataset.json",
+    "--engine-binary",
+    ".scratch/parallel-aggregate-input/admitted_quantum_benchmark_embedded",
+    "--output",
+    ".scratch/public-bench/admitted-quantum-sf10-providers-01/raw_parquet",
+    "--track",
+    "raw_parquet",
+    "--samples",
+    "3",
+    "--sessions",
+    "1",
+    "--threads",
+    "16",
+    "--memory-gib",
+    "4",
+    "--process-cap-gib",
+    "12"
+  ],
+  "implementation_sha256": {
+    "scripts/benchmark/compare.py": "3ff90cc9fe8430ee242ee9921141047ca09d809ef71cb8b61acf2f66a7fcffa3",
+    "scripts/benchmark/contract.py": "7b9662bb7c26c9a0c056ba7524e441628e4e5b3c519fcb24d4afdb5acf6cd063",
+    "scripts/benchmark/duckdb_worker.py": "d05b9815b9807ae07feaa12df705f726254a1d0facdfae352681c1871966fe4a",
+    "scripts/benchmark/exact_bag.py": "42ef8dfeef0924da8d24d59402b90164988197011153a1b1baaad84abe35f1ec",
+    "scripts/benchmark/gpu_residency.py": "733fc371f7ae3acf39f9c85ae2b40826af3167ea69ffa3c5b5db7aaaa5088e45",
+    "scripts/benchmark/isolated_windows.py": "651fb971115ad694aac70fd4d8261f134d542b524c2b99a8b6e192c6b532af9f",
+    "scripts/benchmark/ordinary_runner.py": "f0e6e00b8668eac2d1be3c4942af79136e8c9dcfd3ee565546bb6001f07714f3",
+    "scripts/benchmark/paired.py": "86194a5e377cd990b2108ae4b3f75c8f4c2a7b152e330d3950749d5882212f1c",
+    "scripts/benchmark/prepare.py": "ea69ecbe7fbf19d023226785011ed45b65faebed048056f7a77c9300d4c04e82",
+    "scripts/benchmark/prepare_public.py": "4d5ea03ee0449c6a99cc33d816fb099e6f246dff8c3e061a52ecba27a2fffbe9",
+    "scripts/benchmark/providers.py": "f651e5ed5c1f51ade24b6c683e16ba3f290ce061e60ac8ca638b0d2bf280bd31",
+    "scripts/benchmark/query_gate.py": "5f56ec359b2af6ef22caed4c75092251a09593dfcc15525059cfe6b80a57af49",
+    "scripts/benchmark/resident_runner.py": "37b33992d2410f6d192d3d1d03f7f3a68468aa4a02c39702d84205eed3b53ca3",
+    "scripts/benchmark/run.py": "c584775e8efd9d604c994048211aca15666fa535843e7d6a4cd5765f4ffff3f4",
+    "scripts/benchmark/__init__.py": "6fea5171377bc8d169b04c06c141d8be5d496cde3c0562d00a9cc3593f8c2324",
+    "scripts/benchmark/__main__.py": "ac8604fd0b4e35c315421d44fdc70ebb915cd45e644009b5ea97b612967a0acc",
+    "examples/benchmark_support/ipc_preload.rs": "a79abdb2606c9060a408b9b418c6824c335ced2c0a8a2aa415ab07bec9dc9cfe",
+    "examples/benchmark_embedded.rs": "74d7fc3fade1f71946815c5626298db573b31e60d63f97d8fab5314192794230",
+    "scripts/benchmark/tpch_sql_sha256.json": "f04fa5bee4b6712238e9d93663f855c9c621e3e3d58096b9d53918db7d7248a0",
+    "scripts/benchmark/licenses/duckdb-tpch-v1.4.4-LICENSE": "9707215566ccff424af5d763992690038d34320f1d9b596d237665975ee50476"
+  },
+  "engine_source_sha256": {
+    "src/arrow_ffi/array.rs": "4e13a878c0d069c96ccac90cc88ac97d36778a93b9043349f81e847e72d8b022",
+    "src/arrow_ffi/codec.rs": "f47fa5a3ba3d66d25888a84dd3302952347714506903919a2b1dd45716fe772e",
+    "src/arrow_ffi/export.rs": "4e937762401d6ad46e6f726b967a20a7a3e44de2ed4e880dd4444e2c72e81f0a",
+    "src/arrow_ffi/import.rs": "a5be9c2033eb03b0b5cb933e7a3e2cf9b48b9492434cb04d0e045fd09cc45c94",
+    "src/arrow_ffi/mod.rs": "81ae73532bb51ffc22bda4d3fef031dab1b66ef7c3e7a4ee600f85a4aae133de",
+    "src/cli/helper.rs": "7e0d86d429990369116303f5c3c3f8a4211d7d5ab90f69984b65f948fb3eee4b",
+    "src/cli/mod.rs": "ae11720baeba4847ef13b7070f8ed73e2aaa5639f9e1cd4b182a9bbdce3a64b1",
+    "src/cli/output.rs": "faab87b144ebdf5f47f21a0f57cce441fb9291e443aaf5e8247cfec4d46d6472",
+    "src/distributed/coordinator.rs": "16f46c0ff197586ab35d2b9f9944b6156c9af30f278850be0dde79c50d17d0ed",
+    "src/distributed/flight.rs": "9ba390865c852170f8c21b892c0ab71045a203a0cc0368634b93ccb5d7932d3c",
+    "src/distributed/gather.rs": "f2db42c5c17cffc493ee6f9d6a87aedb0d58824ad473ea7fc0a976859145397f",
+    "src/distributed/http_client.rs": "0d87271ee3547d95753747c91c084e88a3b766d29f479422aad36a735740ac27",
+    "src/distributed/membership.rs": "cc6c8503e6da5319e577ef9fa174ee49a47776bda4581d21db5e636dcf609577",
+    "src/distributed/mod.rs": "c4a4731c9ae2ba97a2e6d42d6943c0162226493ff4175768740892e808e8b424",
+    "src/distributed/plan.rs": "3ac12757478c3d6ffcedc6b1f2b9df875f8189a63c97039585a7a4da1726c6a0",
+    "src/distributed/query_log.rs": "c93447abf56f87f99bd49e092c80bc2eb2c0d8c4c2bcfe64bd7407c239af1818",
+    "src/distributed/server.rs": "b0154d1187c2f6a173dd6e957e2e29633bb060748224ca91822b00fccb4c233f",
+    "src/distributed/shard.rs": "07ea5ef8d92745f7f74e8e384fee421be4000a4993fba12df9de858fbd98f201",
+    "src/distributed/splits.rs": "733e39345255c48ef8f2f5b710ca62288db93a653ad6e6b713ef20857f425b68",
+    "src/error.rs": "14b25cd7325e52e7e4e330c072a936e75231e71c9e2b664a9620b58be42469d5",
+    "src/execution/alloc_profile.rs": "1ab0fd016faf1cd7c26899372168261e15398c21475d3ee9efc51f486ad8749b",
+    "src/execution/context.rs": "9fea5be17a29a33127e474bdcbd408e64ec2201d83afecd8ed141e698d295651",
+    "src/execution/expression_memory.rs": "48a83d5e928a506e0577e58154ae93152553324cad446af3d2acf21e2d58b2de",
+    "src/execution/memory.rs": "37f269cbebe46b942f1cb6abaa8b24c61982518fd416267e51d45bea7fdf21c5",
+    "src/execution/mod.rs": "7ed84804fbf367f8e3e7c8b37750b12e34859cfc4b21436b4da170879d30b767",
+    "src/execution/reserved_buffer.rs": "cfb8dfc41ad76b29fa6ff4ad4ea8792a6205a9ce043d4231b80201de5dca139d",
+    "src/execution/reserved_scalar/decode.rs": "b604b0b0b0d0267b3790b807e33d750b1641e722274e89cd6e0b9fa7e610ccc3",
+    "src/execution/reserved_scalar.rs": "2cb21df8b02222636bbf075517557a76e17af9c3ceebcf2d99bd36fc9f52ba7b",
+    "src/execution/reserved_vec.rs": "92ba77c5166216f522fae11391744f53689c57bd87597992c114e0963f910a0a",
+    "src/execution/retained_batch.rs": "f2bde904d689462bcc7e7b834b423c8ebfafa58a0af8031ee2faa24c01644a22",
+    "src/execution/topology.rs": "affda0b2e614fe3610fa8e1819b08621cd5bc81204a25f54f4f48f9e501802f6",
+    "src/lib.rs": "0241e4d49672885aa3382a6520b64a06759ddc88ebbcc414b9d5e9369c567f54",
+    "src/main.rs": "d289aedee46cf126177fdcad74dbaea6676f91b1b10f9c171ede92281d74bf18",
+    "src/metastore/gravitino.rs": "d7025da3a854a3eb7e142c95e5a892d1079bfc1a3cf9bda545e40c645175b97c",
+    "src/metastore/mod.rs": "ac0fd83c675851715b1d932f99bc5a881ee33e2b78c7a8ac3a30280b5443232d",
+    "src/optimizer/cost.rs": "2b6497c774bab439f7260b88fc10d92564701401c3c596d07a70fe540c0e1f2c",
+    "src/optimizer/mod.rs": "af0bc8866487c5395f8beb8eeda0449aeaddb29ea389554cec3883f3b9632400",
+    "src/optimizer/properties.rs": "86941801b5ad2e34725e312b5ad3b5c590c53f93c00ff658e4c6a33660d1127a",
+    "src/optimizer/rules/constant_folding.rs": "ec4c8a2f19573504ddd87331390376bba85fc5559cfd1c69004c83714c787023",
+    "src/optimizer/rules/derive_or_predicates.rs": "092cc191820d0c11ecf4d59746f1356fbea1640b8298eb2754aa2dc96c4f66ce",
+    "src/optimizer/rules/eager_aggregation.rs": "725121518f2bce6adbd6ce75988e28c5a19e6a3852d8c4e25409149287d17efb",
+    "src/optimizer/rules/flatten_dependent_join.rs": "c45dffbe8eb86c4fa430f785c5cce82315592ea703538171d42138d3af8d1493",
+    "src/optimizer/rules/group_key_reduction.rs": "48624dde70723389b1713f538b5c2062cfc97e3c616c4c3f787c7661ce4dd06e",
+    "src/optimizer/rules/having_total_cse.rs": "286dee3785f562e04c1f25051a558ed1c400ea96ce1d3a003b64000e56f01b13",
+    "src/optimizer/rules/join_reorder.rs": "702a408036f329fe1778c31d6662df9eb5ead0bea2f090651d7156e538683f60",
+    "src/optimizer/rules/mod.rs": "c416b301fe9d220073bb07ab6a94c0479d40fc2d8a6f21b419bbd9ddd0c70cc8",
+    "src/optimizer/rules/packed_group_keys.rs": "c8a2be66b947807dcc2ef1772ad1357e4b28542e3139fe4f293120275cc70ddb",
+    "src/optimizer/rules/packed_join_keys.rs": "bb02d5c28c34458b3264605004c348c9cd1d80fde9ec023662dda70e0189018f",
+    "src/optimizer/rules/predicate_pushdown.rs": "88ffe99d3b00aae65c8f0f1cee2f2bdbaa6508b8ec27ed17e77681d2508fdcd7",
+    "src/optimizer/rules/projection_pushdown.rs": "d0800a9da23db870b208b8eacf96268162bc06e5e774cd036922eb59d03fcecc",
+    "src/optimizer/rules/semi_join_pushdown.rs": "ec7f29a378cdfb9c2ead6501edf57f8232a0c84aa8ee8975c452a4736ca2e08a",
+    "src/optimizer/rules/subquery_decorrelation/empty_result.rs": "f7c10dccc524ccf1f7a90d5f437f6e49a98e3073e94a96aaa03b93196bae427e",
+    "src/optimizer/rules/subquery_decorrelation.rs": "9ebe76cd92f6eb7bfc89116530ad7d7f1aa2db9ebe5513efc3d3de38fac92e51",
+    "src/optimizer/rules/vector_search.rs": "16f6d810a51bbf04763c2cde263089fd87f98bcdf1add8042dd2b1e1e0406d74",
+    "src/parser/ast.rs": "e0b5461e40a516f07cf31c174d1c71491ec6561e754a8179d911a926234065d0",
+    "src/parser/mod.rs": "b27a82e08c960329a2c9ec8e2430af1a0d7afcee365b00e08a5f761b76fd96d5",
+    "src/physical/compiled_expr/decimal.rs": "a2bbf8c86211871b6ed94c0a63410d5ba02feea92013263dbb81f3afbf5582b8",
+    "src/physical/compiled_expr/numeric_coercion.rs": "27a5ef1e285c8b031d6de15808fb5a2b41769b6198454338e666a25b4eaea212",
+    "src/physical/compiled_expr/numeric_coercion_tests.rs": "4cb18358653866d9dbd1b1b935a3973b0f8943bb1b5fb73699c7e536c26b9319",
+    "src/physical/compiled_expr.rs": "4fe9fca7e78cac8c61b9770a4a8f2832a14b9a14fc677caeb22f4de7b900bb06",
+    "src/physical/dense_domain.rs": "f46026927b99ae7c8e1b4c10082f795ec69fb063e461be1659bcae5aeb11d9cf",
+    "src/physical/fixed_width_output.rs": "8fa5375d4fbbf282aa38f4fec806ba84ea2afcb15f12929d5af2c8c85dba9c04",
+    "src/physical/gpu.rs": "514235bae65ebfc80545e1e19e8e444f541bbb855d2e12229490645de7cfa24a",
+    "src/physical/mod.rs": "a5ba5f45e3278fbf777cfe1881b0784ee1e53978c8a2c54b25a9a776eb366ccb",
+    "src/physical/morsel.rs": "24a72040b8cb7903d6ed6242e117d19dba4eea4f65b927e2fe1d173d18711bc8",
+    "src/physical/morsel_agg/admitted_output.rs": "f7a610eb8e7ff1e13dc29a5a33b63e47b585c9b375557ae7128aa4d8b8b62d3d",
+    "src/physical/morsel_agg/decimal_output_tests.rs": "784393bbae01ebb9a38fd04e1719d48142c53500bcbe64f4b45477b565fbbc68",
+    "src/physical/morsel_agg/domain_tests.rs": "a76b5d2c06284b89ba7b540d9d853b4a001ed39288b098736e8e896b07f40be5",
+    "src/physical/morsel_agg/fixed_cell.rs": "586ca436942131adfc5953074071c3d15bd443729c2b9a95de4cab59b3e82258",
+    "src/physical/morsel_agg/float_extrema_tests.rs": "ff5267033f5f39e867a64805569205de800173e9f5511a2840242df05768cc72",
+    "src/physical/morsel_agg/group_rows.rs": "0e2b9d06268d5c3843c38529348817a13468fcf1ae77ab90b4114bde1d6efb72",
+    "src/physical/morsel_agg/ingestion_controller.rs": "407c8f646f65bd3b2ec8ddb5e3e8cc20fec3fbdd0e9261b69ce33a8eb1199cbb",
+    "src/physical/morsel_agg/ingestion_cursor_tests.rs": "0c46391d306967995896bdc1cafd2e6d16aa420b6d685c0084a2b39570187baa",
+    "src/physical/morsel_agg/input_frontier/tests.rs": "b07cec0d940551976279e8e50215dede04719ac22ad47566ef8c631c879f4070",
+    "src/physical/morsel_agg/input_frontier.rs": "848de45230ba58aff7021c4c10b75eaadfc6001a9e5f86fe84614604111f5782",
+    "src/physical/morsel_agg/key_rows/arrow_input.rs": "8831df586ce37f33c20cf40732a42aab3d93ba8932c8f323b9987e1a8394a79e",
+    "src/physical/morsel_agg/key_rows/bound_arrays.rs": "94ee4a4a2e152d1eef8bf579261b248cce543f79feca2a65625f1b5182da4180",
+    "src/physical/morsel_agg/key_rows/preparation_benchmark.rs": "3b4fd1c2e9fb10cfaa87ad50001b0b40035d38cb4dbf5cb0b1dbff696061241f",
+    "src/physical/morsel_agg/key_rows.rs": "8369be7d1aa5e8f3f57ca21b8267e36ee3ea641253d1b662a0ad44001a8d69fc",
+    "src/physical/morsel_agg/live_spill.rs": "806ef0785e6c7b700bbeb0735039e0e383d2399ed940eb33ce6fa65833707d7a",
+    "src/physical/morsel_agg/migration_admission_tests.rs": "8da8544bc82258904f3e7954690c55ad915ee77aecc5727a9d9aab8f569a6ebd",
+    "src/physical/morsel_agg/output_quantum.rs": "ed8fbd5b3fb2474d2c705badaadfea6bebf37b9f2141165a66601661818c0b9c",
+    "src/physical/morsel_agg/parallel_controllers.rs": "29dfa234a510fb061a739bd536a4d3f886889e846d79f92c4605c49def0ef23f",
+    "src/physical/morsel_agg/parallel_merge.rs": "56028158442383a12827cb79c42664e54376f1d88fc393e85b357e626fed927e",
+    "src/physical/morsel_agg/partial_merge.rs": "5eee1661af2ea8000b35e0f1deaf551cd43d8f6e758a1919c52ca198130ea703",
+    "src/physical/morsel_agg/partition_scheduler.rs": "39bc9b7da499e5b4c10ee8de4859d60da076e045622da2a3ba89532d6a4f9564",
+    "src/physical/morsel_agg/prepared_input_tests.rs": "983e60b2a83ebaef90212ab48b2b38ff1a992e9cb51dfd4ad43c0e7e385331ac",
+    "src/physical/morsel_agg/prepared_keys.rs": "fcab731291c4fe344044b6926b79116000d7c32533dfa219dfef6e485ef347d8",
+    "src/physical/morsel_agg/raw_state.rs": "af648bb7c18b0c37998fde6f8285ffc0f1ab0cff08545b8a4cb3afbcde3fd154",
+    "src/physical/morsel_agg/repartition.rs": "770bc62fa07b36bf072f92267ad7c2c12f345120d48de83b2c024a2254afcadc",
+    "src/physical/morsel_agg/row_router.rs": "39001588306b3c94b1e68b7ca67d0905f860e6799d1840d893ffc982fe0c2610",
+    "src/physical/morsel_agg/row_selection.rs": "a7ceaf7a4a9fd61a67d1cebb70ef804cb3d76091d85753df391b9dedc32eaa4e",
+    "src/physical/morsel_agg/run_merge.rs": "a50cfd357dae8dae924ff67a1a3a1fe445eba7455675dc16967128edb17ecbe4",
+    "src/physical/morsel_agg/scalar_state_codec.rs": "b5c99fe3b0e5840b04e69f1b8030dba6fd1cb1296f5ef0334e83117ad6290cf0",
+    "src/physical/morsel_agg/selected_state.rs": "f58aba9b7543efb5bb8b6f978e1252cb41fc27ccf2f3d25fc2db5e6ae82517f3",
+    "src/physical/morsel_agg/spill_files.rs": "1bad76239b932808bfd1778c80aee56c4baf0e25264d6517eb4da1a55d551e32",
+    "src/physical/morsel_agg/spill_frames.rs": "e8d1eed16915dce278d29ed2079074650a3d612f1b2a4bbaccf7e1b165083691",
+    "src/physical/morsel_agg/spill_io.rs": "3fd56697e0d3069340c27aaf802328e0588f849927995e78d8183ba8bf5d3a30",
+    "src/physical/morsel_agg/state_codec.rs": "750478e04fd41c01321d22bfe534b563575562f39406be9496b5e7f7b422315a",
+    "src/physical/morsel_agg/state_rows/array_view.rs": "ab7e9b4f3e99c90d41e82685f2f0502869f581b235b1d66e02bf6559539e56d8",
+    "src/physical/morsel_agg/state_rows/batch_binding_tests.rs": "82ba5615827fa50e3f6cc88600b580959bbd4244f1580e7d32da15f54acd7774",
+    "src/physical/morsel_agg/state_rows.rs": "fd29a05b07f71405458f97711b02dd2265506ae83802a278c92cca90303584f8",
+    "src/physical/morsel_agg.rs": "81df6df2a2c6f753d9ab810a4e7e1b1fa5b3db2bf5ef8e842fe45e131a9746e8",
+    "src/physical/operators/aggregate_fallback_pool_tests.rs": "5378b23b81e853f5637767b914494d26a43e9de76761a98e1867892ab8e9add0",
+    "src/physical/operators/closed_subquery.rs": "f6cbf1ecd28459fca06c4788e5dc9911017291906b1fb679093ae19978a8a71e",
+    "src/physical/operators/delim_join.rs": "fc3625c20e84eaadc60f5b12d198ab48ce3b2c9a9e2b90af25853f6c239f0ff4",
+    "src/physical/operators/filter/admitted_batch.rs": "f6f23b068ef477c659427e0636a97da4d4c0d313a42ce9255c77bd3490b5d6e0",
+    "src/physical/operators/filter/admitted_input.rs": "d8e3e03b5d2fe9d2a6d059f96b07daf3a4ce93205996d7bea934940604822841",
+    "src/physical/operators/filter/temporal/tests.rs": "1a565eb0af4247fd430feb5314e05e439821261ff638e25a9188bd03a8291dbf",
+    "src/physical/operators/filter/temporal.rs": "e676553381b3718824bb070aa0c3d652ad52c1d8f9c71895c5a0ce2a76408905",
+    "src/physical/operators/filter.rs": "5212c09685740343dedd261ea21190e386b1a2b9b26dcc9a34deb8338d4b5c21",
+    "src/physical/operators/hash_agg.rs": "7ba5433fdbd75fbdf2fa11c9f908884a1ec6d147c1e734ee789b8836c76669d5",
+    "src/physical/operators/hash_join/outer_probe.rs": "64166bc7d73b180f5d84c4d9cea66f503269df192332c8293fbde7cd43924b60",
+    "src/physical/operators/hash_join.rs": "eb0f4c16192e77d81325dd2a3b994736cbdfa9087138d01fa5460588a853c691",
+    "src/physical/operators/iceberg.rs": "db8c902203f453f9ae767486be83864e65b41299ae11b9233800da88dffca93b",
+    "src/physical/operators/initialized_membership.rs": "af63218950e385433c88e8b7990553041302c67966526863954ec3b964029988",
+    "src/physical/operators/int64_membership.rs": "78ae84f30e61524e5b6c0e4a97db6009c3eb92aa36d53bbcf8eb605e8c5569cf",
+    "src/physical/operators/limit.rs": "06cf2cd07de67e709005fffb30fc6ac0c1d6aa2e4a7e55a21b5c32cf6fef595e",
+    "src/physical/operators/mod.rs": "9ccfb86bf665cdf9e0754bfcfd823b435cb7c228183115dd9b87fde758785e59",
+    "src/physical/operators/morsel_agg.rs": "68876ead597db2bfc1a977d8ff121a18a83670fc6cfa3cbceb6c724628e0a355",
+    "src/physical/operators/native_scan.rs": "7ffcab9104fdf02a2038150de3f542a034c402b75a0f8ba3444d6a7a94611a64",
+    "src/physical/operators/parquet.rs": "9047114331f6a2471c597e0550ccead8e8235581189d2f83df37adf52808d194",
+    "src/physical/operators/project/admitted/tests.rs": "e4998b0967e331fdeda936c858826b0f5d9a09f83ae3d319795772222bb7ea0a",
+    "src/physical/operators/project/admitted.rs": "3ed64566cef9b1d5f2f4143aea2db545f02906668c25590900a37a1eea667bde",
+    "src/physical/operators/project.rs": "b1daa415631ede633b172ac9bfcdb69825f92b6128d3701ea2a6216f89f26f3f",
+    "src/physical/operators/regex_replace.rs": "9c6fa8f4616a58a8446b5e97b7a1a5c7e758b43ebe4710e6f0a2f069aea2676d",
+    "src/physical/operators/runtime_filter.rs": "c95f18c983a2cd18c83bee4742d06cc0d6f2f338de5e561bd49e3874c9509dab",
+    "src/physical/operators/scan/admitted_memory.rs": "737354627782e31182884755253f7841840b6aade298046b4a2ce0efe0fc75c3",
+    "src/physical/operators/scan.rs": "921cd4c4c6a7e2a3150ed1925d33613a358c48710101dbd8dd17e4fd9e9bd646",
+    "src/physical/operators/sort.rs": "d32f24a14cd005e5cb17eb6f5a1ec89bb45f1228a4433a6822c90574754e3054",
+    "src/physical/operators/spillable/admitted_queue_tests.rs": "0b3a076b453a5dfc926f1056036fd26047b9549af25323de6fbcb1651a09785b",
+    "src/physical/operators/spillable.rs": "0e294bd7cb6cb525a723d653ce99870419a8fc2e3327e5f7a0d5ff420344a9a1",
+    "src/physical/operators/streaming_parquet_scan/admitted.rs": "9db6a22c5788560469f3e504636d630037b3bea891df31b5aad6a0cef86b2f77",
+    "src/physical/operators/streaming_parquet_scan/admitted_quantum_tests.rs": "e30a29759be2ae01f7a3f3d06b1c0c27c09f2f2cc5e558d151726c77950235bd",
+    "src/physical/operators/streaming_parquet_scan.rs": "90795668137abf3438c48fcb60a61b73f4e2ee4e428f9d0e9de22c6c452eecdf",
+    "src/physical/operators/subquery.rs": "38a865663d4347f99a5640dfef0cfcd49684883ab26eb7cf952ca68cf825ba73",
+    "src/physical/operators/substring.rs": "5119a161f7801104f8c0b7c042b0a60c0e13ff8f9c3f721ebf8c78e2e888fc43",
+    "src/physical/operators/union.rs": "3f68efedec4db99d133829a74537703b9d0d6cde63f196c2013366152fee0957",
+    "src/physical/operators/vector_search.rs": "7d725d423f739e9a85c04864d314870c67207d25224205b1dd2a7a1d6dd0feba",
+    "src/physical/operators/vectorized_hash.rs": "d519d2420b82cd2300e06bf87646db8bd40dca3694f525ea6cf8fcdb80affc07",
+    "src/physical/operators/window.rs": "4ff446b2fe5ed59cc8a6e106279948a01872b4888f23d93f9d0e00d8c1857a47",
+    "src/physical/plan.rs": "a12e03cf36fa84fd5dca298dd3b31bce49217be1c33a74dbb9e306943853ebda",
+    "src/physical/planner.rs": "61724caa3024d16ad44878973313f4624b0d59162bcc2df2d1f9a3d926d46e7b",
+    "src/physical/queue_layout.rs": "61c34193260ee64a3866805b933b261e3abf8385e407e98a52352e4d69f3e442",
+    "src/physical/vector.rs": "93b87017bf0fe711407fcb8a7b2568cb62664bd219b9366155ef21d2927be493",
+    "src/physical/vectorized_agg.rs": "1002f8991ece3839408b6813e76a1d69c7133f4b00ee4c9fdc65673aaabf7985",
+    "src/planner/binder.rs": "c243c095bf072f81c6119cfe7e2c61979e661b93ebbaf6a9b863926a3120fbc7",
+    "src/planner/decimal.rs": "96b35f63093d3e3c529539a71e4827a73a6a3ac8aafad9eb61bd7f7404bfffb8",
+    "src/planner/logical_expr.rs": "312aa0abac9bd8f271dcf2d2a9f8d5792ed44c34c6d690dc98d6e7f392b1dd03",
+    "src/planner/logical_plan.rs": "95c4be4370723be67a5102570f58f08205ba113a70a645277a2c49667732162f",
+    "src/planner/mod.rs": "9f39f154aa98159a219a046da691d4302bcd4534d3c51b14f733b380c69c2260",
+    "src/planner/numeric.rs": "a091751cc137d5dd21cfee30156dc7529c0be6dfb3d03ec38f0d744d7941ccb3",
+    "src/planner/reserved_cast.rs": "ab5b1ccb286332abaf8d7154fa0106a37c7393f1b0eb29a4817e6fe8103dfad2",
+    "src/planner/reserved_decimal/tests.rs": "49759b8638cdb5fc8acb473a02129095f4c6fe8fb59ab15f9a39db0b9b940041",
+    "src/planner/reserved_decimal.rs": "79f62d61066b852bf98d054da8dab7147a61368e6d4de8e91fe0e6b07c7632f7",
+    "src/planner/reserved_literal.rs": "63c09731f6ad405803745f285864d36531e24e8c38e73bab0ba48a21b26e42f4",
+    "src/planner/reserved_numeric.rs": "5d36309d4405bb50199a0a4c4a6e572f4c67c2afd1aaee2f0a4bb0c13e7e9e86",
+    "src/planner/schema.rs": "26a165bb2842ba164d8bf7a8b0ecb6f75fa38ac4aea16af8c516475fdcdbf4a0",
+    "src/planner/temporal.rs": "f6c3128b0fcf5ef0ac32802289ee1cdeeb4d34c072c3002c1f417f9abf23ed56",
+    "src/planner/vector_types.rs": "3fa6ec6802eb31fce0f7c3c155828ad476c5ab57765fe7c356ef887677926280",
+    "src/storage/admitted_batch.rs": "701a70b91df7678d57890eb1c48de6c6ef2cc323ac2c9cad4f2a2e2dbe9aad3b",
+    "src/storage/admitted_column_pages.rs": "37f3a305d5a78c3754c5620660070644ee8b87eaaa4d73a1f1167b293661eede",
+    "src/storage/admitted_dictionary_utf8.rs": "25d18a082a8e9a8d44127dc1afa892946c1885d4a50946d72813b697cb080674",
+    "src/storage/admitted_flat_column/dictionary_page.rs": "202547ba8cdb3a2c1a1d648bd3437063e22249f0bcb8cff91590e2a182282085",
+    "src/storage/admitted_flat_column.rs": "45eac19ebb3e02f97a125698e715174091e6bb79a6e27e7b53d8f4f95f6a610f",
+    "src/storage/admitted_gather.rs": "0f9c88ebc8785fbe6734c309f3f5e1c710499bc3210de90c9019b84cb14aa29d",
+    "src/storage/admitted_hybrid.rs": "662c5a59af290ee927bef01aabc693bfa33cd0ec45b949350883dce8682bdae1",
+    "src/storage/admitted_page_body.rs": "2fb735803c93dc05bcbaf31e7384a364fe48e7a5ddd850783329b2a5174f0425",
+    "src/storage/admitted_page_read.rs": "a5b8520170574fe2c1159e769eb2009ae14640acc138dc908274afc0f2bc680b",
+    "src/storage/admitted_plain_fixed.rs": "267e70575117f365b9266955975971f684e8158b7e065f77f552c509b466fc2c",
+    "src/storage/admitted_plain_utf8.rs": "e9b52a9db677ab688056e1925e122b9fbcb64c13d32999281adc6a9f722b850c",
+    "src/storage/admitted_row_group.rs": "40ef2cf8bb1d378ac76e39af67b60c4b8f1c23523ed6b0e51c36a4e3773479de",
+    "src/storage/admitted_selection/range.rs": "98da6e7185aff77233599a5b26387af507176c3d7420e1902f2abf1371ddb8f3",
+    "src/storage/admitted_selection.rs": "e5fe77c673ebf4a3547925ec13d4d0554afb2fb303b7ec282676fbd4a4cc8703",
+    "src/storage/bounded_page_header/incremental_tests.rs": "d367b0c165670222eb3541e95144a4bd1a2c881155b30f2cb6bdfbc3ad9ccfa1",
+    "src/storage/bounded_page_header.rs": "1035ae613f4d1dc3d18058fa58f0e40e61cd4eefac2573b60c5c73a3c920c3d4",
+    "src/storage/iceberg.rs": "670f10a9a0e3baaca577a2f02c352b0acc343fbf7df2cc0de9aa9938eefe1577",
+    "src/storage/ipc_cache.rs": "e2a71c6f98907e9d5f133cd7eaf6b68f06b6f4020a31c52d7db08d1e3f8e28e3",
+    "src/storage/lance.rs": "163648ae1d508e03489a773733ac542e6649095590f2b8e6f1c777d958fd440c",
+    "src/storage/lance_write.rs": "aa752551d2366d2597b58296d2ed5d967601e24e1cf27792035594ce8040a181",
+    "src/storage/metadata_cache.rs": "413bcb1dfc57836a8d314410cfcb3dad8c5d506509075eba476d997758a36386",
+    "src/storage/mod.rs": "5c9a578c98b68d6717900b9ef1756df28f4c13a9d2370def60388a802c54b45b",
+    "src/storage/native_delete.rs": "6be16a9baeec0c44d29fafcc09e9c25aefd18f593fb8c3b3024294eeeaf44977",
+    "src/storage/native_manifest.rs": "61ef9e7dd57ab68c1f8840dca61280e8134b94cd7a932a429008a930e8934ebd",
+    "src/storage/native_rollup.rs": "b4354a5f2b56f20378d35837741090c5418c6271a12c98a6152d229e65c9baeb",
+    "src/storage/native_table.rs": "8fc6f1a788570039fd9675a1c8b6f3b20b4269386341ce7c63aa3298be5f6767",
+    "src/storage/native_update.rs": "aa469fae94acb6ab298784027ea72ea9084d50a381dc25f6770c92b2caebf450",
+    "src/storage/native_write.rs": "fea0504c4ed9294aaa199969836a1458095b98960e3534b783b48d336af548ae",
+    "src/storage/parquet.rs": "c709acfd7a9a5602d9be445ea343b76effe0acd7447a7a38f10161b1c6e42a6d",
+    "src/storage/pulsar.rs": "784e25a1d779c73e9d4a7abf8ea1e8ddc2564d5d3232c86456193c09c3bd6df6",
+    "src/storage/row_group_pruning.rs": "88831247d911fe3583364f700f7fb7b38ded508802c6a2c7dd02fad432c4c7dd",
+    "src/tpch/generator.rs": "4e9fffb995e7ad547631775f7494a7f1ef1d06fbe07b77fbe2e50e8ed99e44e8",
+    "src/tpch/mod.rs": "aa2c878c6d2b7b002cf3fb265488eaf789ce2f29b0279d9fda2d24287b0505a6",
+    "src/tpch/queries.rs": "4c8c4a79359cf998df374ba57e71846185d95e2c9515a9f65d2321bc997c6745",
+    "src/tpch/schema.rs": "5272b2976992757c19d7f2d6cafbc033b93b5dc5ffe4aa56aa57852075358e51",
+    "Cargo.toml": "14697e00f45f4305af5b1293ab0dc6002f3c45a35cead74fc5c0d3424647b292",
+    "Cargo.lock": "77bbd15d62da7f8b66ca49f7d7af486980a1791b54dd21d6582ca82fd988b2be"
+  },
+  "scope_before": {
+    "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0",
+    "memory.peak": "19570667520",
+    "memory.current": "4003155968"
+  }
+}

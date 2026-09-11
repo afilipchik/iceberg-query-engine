@@ -1,0 +1,7 @@
+# Empty scalar aggregate validation — 2026-09-11
+
+Both-mode job16808 completed with exit1. With `lance,gpu`, both default disjoint and experimental partial ownership passed 1,092 library tests (11 ignored), 117 contract integrations, and 28 spill/numeric/focused tests. Native/IPC passed58 with2 failures in disjoint and57 with3 failures in partial. Six legacy spill tests fail in each mode. Failure names are unchanged from correlated-reduction validation45945; this does not certify unchanged denial boundaries or close resource acceptance.
+
+The new scalar regression covers missing groups, matched NULL values, COUNT DISTINCT, duplicate and NULL outer keys, alias collisions, and lazy errors. Original GROUP BY, HAVING and LIMIT shapes retain scalar execution when the empty-result proof declines.
+
+Reproduction: `TMPDIR="$PWD/.scratch" SAFE_BUILD_MEM=48G SAFE_BUILD_JOBS=1 scripts/claude-safe-build.sh python3 .scratch/parallel-aggregate-input/run_empty_scalar_validation.py`. The driver records exact locked/offline Cargo commands, feature flags, ownership environment and all eight suite outcomes. Source hashes before and after verify521 inputs against the repair snapshot; no source changed during validation. See the [archive manifest](benchmarks/2026-09-11-empty-scalar-validation/manifest.json), including old/new failure-name comparison and full logs. No optimized measurement of this source has run yet.

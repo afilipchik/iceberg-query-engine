@@ -1,3 +1,5 @@
+> Documentation audit, 2026-09-05: this file preserves historical engineering notes and contains superseded claims. Start with [current architecture](docs/architecture.md), [audit and path forward](docs/project-audit-2026-09-05.md), and [Codex working guide](AGENTS.md). Verify source and dated evidence before treating an old status or certification as current.
+
 # Query Engine - AI Agent Guide
 
 This document is designed to help AI agents (Claude, Copilot, etc.) understand and work with this codebase effectively.

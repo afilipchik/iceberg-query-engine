@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "complete": true,
+  "issues": [],
+  "groups": [
+    {
+      "geomean": 1.371135619897719,
+      "suite_ratio": 2.01826826558029,
+      "engine_total_ms": 44.295371,
+      "duckdb_total_ms": 21.94721670821309,
+      "wins": 1,
+      "queries": 2,
+      "worst_ratio": 2.9060552243556197,
+      "query_ratios": {
+        "q01": 2.9060552243556197,
+        "q06": 0.6469295120051171
+      },
+      "ci95": {
+        "geomean": [
+          1.237374488512609,
+          1.6112788789487476
+        ],
+        "suite_ratio": [
+          1.9159093742993876,
+          2.314467932106228
+        ]
+      },
+      "per_session": {
+        "s1": {
+          "geomean": 1.371135619897719,
+          "suite_ratio": 2.01826826558029,
+          "engine_total_ms": 44.295371,
+          "duckdb_total_ms": 21.94721670821309,
+          "wins": 1,
+          "queries": 2,
+          "worst_ratio": 2.9060552243556197
+        }
+      },
+      "workload": "custom_gpu_float_smoke",
+      "track": "gpu_control",
+      "leadership": false
+    }
+  ],
+  "latency_leadership": false,
+  "certification": "incomplete: resource, concurrency and regression gates are separate"
+}

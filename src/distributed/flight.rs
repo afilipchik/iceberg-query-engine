@@ -226,7 +226,7 @@ impl QeFlightService {
 /// Map an engine error onto the gRPC status vocabulary. Kept in one place so
 /// every RPC agrees; the message is the engine's error Display, verbatim.
 pub(crate) fn query_error_status(e: &QueryError) -> Status {
-    match e {
+    match e.root() {
         QueryError::Parse(_) | QueryError::Bind(_) | QueryError::Type(_) | QueryError::Plan(_) => {
             Status::invalid_argument(e.to_string())
         }

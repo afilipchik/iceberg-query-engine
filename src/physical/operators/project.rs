@@ -9,12 +9,16 @@ use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use futures::stream::TryStreamExt;
+use futures::StreamExt;
 use std::fmt;
 use std::sync::Arc;
+
+mod admitted;
 
 /// Projection execution operator
 pub struct ProjectExec {
     input: Arc<dyn PhysicalOperator>,
+    memory_pool: Option<crate::execution::SharedMemoryPool>,
     exprs: Vec<Expr>,
     schema: SchemaRef,
     /// Optional subquery executor for handling subqueries in projection expressions
@@ -37,7 +41,13 @@ impl ProjectExec {
             exprs,
             schema,
             subquery_executor: None,
+            memory_pool: None,
         }
+    }
+
+    pub fn with_memory_pool(mut self, pool: crate::execution::SharedMemoryPool) -> Self {
+        self.memory_pool = Some(pool);
+        self
     }
 
     /// Set the subquery executor for this projection
@@ -54,9 +64,15 @@ impl ProjectExec {
             .iter()
             .map(|e| {
                 let name = e.output_name();
-                let plan_schema = crate::planner::PlanSchema::from(input_schema.as_ref());
+                let plan_schema =
+                    crate::planner::PlanSchema::from_qualified_arrow(input_schema.as_ref());
                 let dt = e.data_type(&plan_schema)?;
-                Ok(Field::new(name, dt, true))
+                let mut field = crate::planner::SchemaField::new(name, dt);
+                if let Expr::Column(column) = e {
+                    field.name = column.name.clone();
+                    field.relation = column.relation.clone();
+                }
+                Ok(field.to_arrow_field())
             })
             .collect();
 
@@ -67,12 +83,163 @@ impl ProjectExec {
             exprs,
             schema,
             subquery_executor: None,
+            memory_pool: None,
         })
     }
 }
 
 #[async_trait]
 impl PhysicalOperator for ProjectExec {
+    fn runtime_filter_target(
+        &self,
+        output: usize,
+    ) -> Option<crate::physical::plan::RuntimeFilterTarget> {
+        let mut expression = self.exprs.get(output)?;
+        while let Expr::Alias { expr, .. } = expression {
+            expression = expr;
+        }
+        let Expr::Column(column) = expression else {
+            return None;
+        };
+        let input_schema = self.input.schema();
+        let index =
+            crate::physical::operators::find_column_index_in_schema(&input_schema, column).ok()?;
+        if input_schema.field(index).data_type() != self.schema.fields().get(output)?.data_type() {
+            return None;
+        }
+        self.input.runtime_filter_target(index)
+    }
+    async fn prepare_admitted_queue_input(
+        &self,
+        pool: crate::execution::SharedMemoryPool,
+    ) -> Result<Option<crate::physical::PreparedAdmittedInput>> {
+        if !self.exprs.iter().all(is_column_alias) {
+            return admitted::prepare(self, pool).await;
+        }
+        if self.exprs.len() != self.schema.fields().len() {
+            return Err(crate::QueryError::Execution(
+                "admitted Project expression/schema width mismatch".into(),
+            ));
+        }
+        let Some(prepared) = self
+            .input
+            .prepare_admitted_queue_input(pool.clone())
+            .await?
+        else {
+            return Ok(None);
+        };
+        if !prepared.pool.is_within(&pool) {
+            return Err(crate::QueryError::Execution(
+                "admitted Project pool mismatch".into(),
+            ));
+        }
+        fn column(expr: &Expr) -> &crate::planner::Column {
+            match expr {
+                Expr::Column(c) => c,
+                Expr::Alias { expr, .. } => column(expr),
+                _ => unreachable!(),
+            }
+        }
+        let input_schema = self.input.schema();
+        let mut indices =
+            crate::execution::reserved_vec::ReservedVec::with_capacity(&pool, self.exprs.len())?;
+        for (expr, field) in self.exprs.iter().zip(self.schema.fields()) {
+            let index = crate::physical::operators::find_column_index_in_schema(
+                &input_schema,
+                column(expr),
+            )?;
+            if input_schema.field(index).data_type() != field.data_type() {
+                return Err(crate::QueryError::Execution(
+                    "admitted Project requires exact column types".into(),
+                ));
+            }
+            indices.extend_reserved(1, [index])?;
+        }
+        let indices = Arc::new(indices);
+        let mut streams = crate::execution::reserved_vec::ReservedVec::with_capacity(
+            &pool,
+            prepared.streams.as_slice().len(),
+        )?;
+        for input in prepared.streams.into_owned_iter() {
+            let indices = indices.clone();
+            let schema = self.schema.clone();
+            let output_pool = pool.clone();
+            let output = input.map(move |result| {
+                let batch = result?;
+                let mut arrays = crate::execution::reserved_vec::ReservedVec::with_capacity(
+                    &output_pool,
+                    indices.as_slice().len(),
+                )?;
+                for &index in indices.as_slice() {
+                    arrays.extend_reserved(1, [batch.column(index).clone()])?;
+                }
+                crate::storage::admitted_batch::finish(
+                    schema.clone(),
+                    batch.num_rows(),
+                    arrays,
+                    &output_pool,
+                )
+            });
+            streams.extend_reserved(1, [crate::physical::admit_stream(output, &pool)?])?;
+        }
+        Ok(Some(crate::physical::PreparedAdmittedInput {
+            pool,
+            streams,
+        }))
+    }
+    async fn prepare_queue_input(&self) -> Result<Option<crate::physical::PreparedQueueInput>> {
+        if !self.exprs.iter().all(is_column_alias) {
+            return Ok(None);
+        }
+        let Some(prepared) = self.input.prepare_queue_input().await? else {
+            return Ok(None);
+        };
+        let output = prepared.output.projected(&self.exprs, &self.schema);
+        let mut streams = Vec::new();
+        streams
+            .try_reserve_exact(prepared.streams.len())
+            .map_err(|e| {
+                crate::error::QueryError::Execution(format!(
+                    "prepared wrapper stream allocation failed: {e}"
+                ))
+            })?;
+        for stream in prepared.streams {
+            streams.push(self.wrap_stream(stream)?);
+        }
+        Ok(Some(crate::physical::PreparedQueueInput {
+            streams,
+            output,
+        }))
+    }
+
+    fn resident_queue_copy_bound(&self) -> Option<crate::physical::queue_layout::QueueCopyBound> {
+        self.input
+            .resident_queue_copy_bound()?
+            .projected(&self.exprs, &self.schema)
+    }
+
+    fn resident_gather_copy_bound(&self) -> Option<crate::physical::queue_layout::GatherCopyBound> {
+        self.input
+            .resident_gather_copy_bound()?
+            .projected(&self.exprs, &self.schema)
+    }
+
+    fn pool_independent_queue_copy_bound(
+        &self,
+    ) -> Option<crate::physical::queue_layout::QueueCopyBound> {
+        self.input
+            .pool_independent_queue_copy_bound()?
+            .projected(&self.exprs, &self.schema)
+    }
+
+    fn pool_independent_gather_copy_bound(
+        &self,
+    ) -> Option<crate::physical::queue_layout::GatherCopyBound> {
+        self.input
+            .pool_independent_gather_copy_bound()?
+            .projected(&self.exprs, &self.schema)
+    }
+
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -85,18 +252,7 @@ impl PhysicalOperator for ProjectExec {
         crate::physical::check_partition(self, partition)?;
 
         let input_stream = self.input.execute(partition).await?;
-        let exprs = self.exprs.clone();
-        let schema = self.schema.clone();
-        let subquery_exec = self.subquery_executor.clone();
-
-        let projected = input_stream.and_then(move |batch| {
-            let exprs = exprs.clone();
-            let schema = schema.clone();
-            let subquery_exec = subquery_exec.clone();
-            async move { project_batch(&batch, &exprs, &schema, subquery_exec.as_ref()) }
-        });
-
-        Ok(Box::pin(projected))
+        self.wrap_stream(input_stream)
     }
 
     fn name(&self) -> &str {
@@ -172,7 +328,10 @@ fn project_batch(
                     if f.data_type() == c.data_type() {
                         f.as_ref().clone()
                     } else {
-                        arrow::datatypes::Field::new(f.name(), c.data_type().clone(), true)
+                        f.as_ref()
+                            .clone()
+                            .with_data_type(c.data_type().clone())
+                            .with_nullable(true)
                     }
                 })
                 .collect::<Vec<_>>(),
@@ -260,5 +419,43 @@ mod tests {
         assert_eq!(values.value(0), 20);
         assert_eq!(values.value(1), 40);
         assert_eq!(values.value(2), 60);
+    }
+}
+
+impl ProjectExec {
+    fn wrap_stream(&self, input_stream: RecordBatchStream) -> Result<RecordBatchStream> {
+        let exprs = self.exprs.clone();
+        let schema = self.schema.clone();
+        let subquery_exec = self.subquery_executor.clone();
+        let memory_pool = self.memory_pool.clone();
+
+        let projected = input_stream.and_then(move |batch| {
+            let exprs = exprs.clone();
+            let schema = schema.clone();
+            let subquery_exec = subquery_exec.clone();
+            let memory_pool = memory_pool.clone();
+            async move {
+                if crate::execution::expression_memory::trace_enabled() {
+                    eprintln!("[reserved-expression] {}", serde_json::json!({"event":"projection","rows":batch.num_rows(),"column_alias_only":exprs.iter().all(is_column_alias)}));
+                }
+                let evaluate = || project_batch(&batch, &exprs, &schema, subquery_exec.as_ref());
+                match memory_pool {
+                    Some(pool) => {
+                        crate::execution::expression_memory::with_expression_pool(&pool, evaluate)
+                    }
+                    None => evaluate(),
+                }
+            }
+        });
+
+        Ok(Box::pin(projected))
+    }
+}
+
+fn is_column_alias(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column(_) => true,
+        Expr::Alias { expr, .. } => is_column_alias(expr),
+        _ => false,
     }
 }

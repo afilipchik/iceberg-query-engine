@@ -5,6 +5,19 @@
 //! - Apache Iceberg tables (`storage::iceberg`): spec metadata + Avro
 //!   manifests resolved to a `ParquetTable`
 
+pub(crate) mod admitted_batch;
+pub(crate) mod admitted_column_pages;
+pub(crate) mod admitted_dictionary_utf8;
+pub(crate) mod admitted_flat_column;
+pub(crate) mod admitted_gather;
+pub(crate) mod admitted_hybrid;
+pub(crate) mod admitted_page_body;
+pub(crate) mod admitted_page_read;
+pub(crate) mod admitted_plain_fixed;
+pub(crate) mod admitted_plain_utf8;
+pub(crate) mod admitted_row_group;
+pub(crate) mod admitted_selection;
+pub(crate) mod bounded_page_header;
 pub mod iceberg;
 mod parquet;
 pub mod row_group_pruning;

@@ -608,7 +608,7 @@ pub async fn execute_any_distributed(
 ) -> Result<DistributedResult> {
     match plan_distributed(base, sql) {
         Ok(_) => execute_distributed(base, sql, participants, transport).await,
-        Err(QueryError::NotImplemented(_)) => {
+        Err(e) if matches!(e.root(), QueryError::NotImplemented(_)) => {
             let plan = plan_gather(base, sql)?;
             execute_gathered(base, &plan, participants, transport).await
         }

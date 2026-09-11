@@ -1,24 +1,25 @@
 //! Eager aggregation (Yan & Larson): pre-aggregate a fanout join input.
 //!
 //! Pattern: `Aggregate(SUM...) over Inner Join(R, S)` where relation R's
-//! columns appear only in the join keys and as linear factors inside SUM
+//! columns appear only in the join keys and as direct floating SUM inputs
 //! arguments. R is replaced by `Aggregate(R, group_by = join keys,
 //! SUM(factor)..., COUNT(*))`, the join becomes key-unique (1:1 per probe
 //! key group), and the outer SUM terms are rewritten:
 //!
-//!   SUM(a*r + b)  ->  SUM(a*SUM_r + b*cnt)
+//!   SUM(r)  ->  SUM(SUM_r)
 //!
-//! where `SUM_r`/`cnt` come from the pre-aggregate. This collapses TPC-H
-//! Q09's 4x-duplicated partsupp fanout: the top join's output drops from
-//! 26M rows to 6.6M, and the 8M-row partsupp side shrinks to 2M groups.
+//! where `SUM_r` comes from the pre-aggregate. Scalar multiplication is not
+//! distributed across SUM: even non-null finite inputs can overflow a partial
+//! sum before multiplication, changing zero into NaN for a zero multiplier.
 //!
 //! When R joins on two integer key columns, the pre-aggregate groups by a
 //! single packed expression `k0 * K + k1` (K a power of two derived from
-//! footer statistics) so it stays on the fast single-int raw aggregation
+//! structural type/predicate proofs) so it stays on the fast single-int raw aggregation
 //! path, and the join condition is rewritten to compare packed keys.
 //!
-//! Correctness gates (all verified from footer statistics / plan shape):
-//! - all output aggregates are non-DISTINCT SUMs,
+//! Correctness gates (plan shape, schema nullability and structural domains):
+//! - all output aggregates are non-DISTINCT floating SUMs of a direct R column,
+//! - R-side factors are direct floating columns; exact arithmetic is not reassociated,
 //! - group_by and join filter reference no R columns,
 //! - each SUM term has at most one factor over R columns, that factor's
 //!   columns are null-free (an R-side NULL would drop the entire term row
@@ -113,16 +114,15 @@ impl EagerAggregation {
     }
 
     /// LEFT-join count pushdown: `Aggregate(group=[k], COUNT(r_col)) over
-    /// LEFT Join(L, R) on k = fk` with k a unique null-free key of L becomes
+    /// LEFT Join(L, R) on k = fk` with k a structurally unique grouping key of L becomes
     ///
     ///   Project [k, COALESCE(cnt, 0)]
     ///     LEFT Join on k = fk
     ///       L
     ///       Aggregate(R, group=[fk], COUNT(r_col) AS cnt)
     ///
-    /// Each L row yields exactly one group (k unique), so the outer
-    /// aggregate disappears entirely — Q13 counted 16.5M joined rows into
-    /// 1.5M groups when orders could be counted by o_custkey first.
+    /// With unknown left uniqueness, retain a final SUM of each left row's
+    /// count. Statistics may select this route, but cannot erase duplicates.
     fn try_rewrite_left_count(&self, agg: &AggregateNode, join: &JoinNode) -> Option<LogicalPlan> {
         if agg.group_by.len() != 1 || agg.aggregates.len() != 1 || join.on.len() != 1 {
             return None;
@@ -134,9 +134,11 @@ impl EagerAggregation {
         let (Expr::Column(l_col), Expr::Column(r_col)) = (l_on, r_on) else {
             return None;
         };
-        // Group key must be the left join key and a unique key of the
-        // left-side base table
-        if l_col.name.to_lowercase() != k.name.to_lowercase() {
+        // Group key must be the left join key and proven unique in the
+        // exact left subtree, not merely estimated unique in a base table.
+        if crate::optimizer::properties::column_index(&join.left.schema(), l_col)
+            != crate::optimizer::properties::column_index(&join.left.schema(), k)
+        {
             return None;
         }
         let l_schema = join.left.schema();
@@ -144,27 +146,15 @@ impl EagerAggregation {
         if !column_in_schema(l_col, &l_schema) || !column_in_schema(r_col, &r_schema) {
             return None;
         }
-        let l_table = {
-            let mut found = None;
-            for (t, st) in &self.table_stats {
-                if st.column_stats.contains_key(&k.name.to_lowercase()) {
-                    if found.is_some() {
-                        return None;
-                    }
-                    found = Some(t.clone());
-                }
-            }
-            found?
-        };
-        {
-            let st = self.table_stats.get(&l_table)?;
-            let cs = st.column_stats.get(&k.name.to_lowercase())?;
-            if cs.null_count != Some(0)
-                || cs
-                    .ndv_est
-                    .map(|n| (n as usize) < st.row_count)
-                    .unwrap_or(true)
-            {
+        // A base-table NDV estimate is not a uniqueness proof. Derive the
+        // property from this exact left subtree (including projections).
+        let unique_left = crate::optimizer::properties::proves_unique_column(&join.left, k);
+        if !unique_left {
+            // Costing may select preaggregation, but cannot remove the final
+            // aggregate: every duplicate left row must contribute its count.
+            let index = crate::optimizer::properties::column_index(&r_schema, r_col)?;
+            let (rows, groups) = self.left_count_key_estimate(&join.right, index)?;
+            if groups.saturating_mul(10) > rows.saturating_mul(7) || rows == 0 {
                 return None;
             }
         }
@@ -187,16 +177,24 @@ impl EagerAggregation {
             _ => return None,
         };
 
+        // Internal output names must not capture either input's bound columns.
+        // Checking names regardless of relation also keeps unqualified lookup unique.
+        let mut count_name = "__ea_cnt".to_string();
+        while l_schema
+            .fields()
+            .iter()
+            .chain(r_schema.fields())
+            .chain(agg.schema.fields())
+            .any(|field| field.name == count_name)
+        {
+            count_name.push('_');
+        }
+
         // Pre-aggregate R by its join key
         let pre_fields = vec![
+            r_on.to_field(&r_schema).ok()?,
             SchemaField {
-                name: r_col.name.clone(),
-                data_type: DataType::Int64,
-                nullable: true,
-                relation: None,
-            },
-            SchemaField {
-                name: "__ea_cnt".to_string(),
+                name: count_name.clone(),
                 data_type: DataType::Int64,
                 nullable: true,
                 relation: None,
@@ -211,7 +209,7 @@ impl EagerAggregation {
                     args: vec![Expr::Column(count_arg)],
                     distinct: false,
                 }),
-                name: "__ea_cnt".to_string(),
+                name: count_name.clone(),
             }],
             schema: PlanSchema::new(pre_fields),
         });
@@ -233,11 +231,26 @@ impl EagerAggregation {
             args: vec![
                 Expr::Column(crate::planner::Column {
                     relation: None,
-                    name: "__ea_cnt".to_string(),
+                    name: count_name.clone(),
                 }),
                 Expr::Literal(crate::planner::ScalarValue::Int64(0)),
             ],
         };
+        if !unique_left {
+            return Some(LogicalPlan::Aggregate(AggregateNode {
+                input: Arc::new(new_join),
+                group_by: agg.group_by.clone(),
+                aggregates: vec![Expr::Alias {
+                    expr: Box::new(Expr::Aggregate {
+                        func: AggregateFunction::Sum,
+                        args: vec![count_expr],
+                        distinct: false,
+                    }),
+                    name: agg.schema.fields()[1].name.clone(),
+                }],
+                schema: agg.schema.clone(),
+            }));
+        }
         let count_out = match out_alias {
             Some(name) => Expr::Alias {
                 expr: Box::new(count_expr),
@@ -253,6 +266,30 @@ impl EagerAggregation {
             exprs: vec![agg.group_by[0].clone(), count_out],
             schema: agg.schema.clone(),
         }))
+    }
+
+    // Follow only identity-preserving column lineage for a costing estimate.
+    // Filters can change the estimate's accuracy, never the rewrite's semantics.
+    fn left_count_key_estimate(&self, plan: &LogicalPlan, index: usize) -> Option<(u64, u64)> {
+        match plan {
+            LogicalPlan::Scan(scan) => {
+                let stats = self.table_stats.get(&scan.table_name)?;
+                let field = scan.schema.fields().get(index)?;
+                let groups = stats.column_stats.get(&field.name)?.ndv_est?;
+                Some((stats.row_count as u64, groups))
+            }
+            LogicalPlan::Filter(node) => self.left_count_key_estimate(&node.input, index),
+            LogicalPlan::SubqueryAlias(node) => self.left_count_key_estimate(&node.input, index),
+            LogicalPlan::Project(node) => {
+                let Expr::Column(column) = strip_alias(node.exprs.get(index)?) else {
+                    return None;
+                };
+                let child_index =
+                    crate::optimizer::properties::column_index(&node.input.schema(), column)?;
+                self.left_count_key_estimate(&node.input, child_index)
+            }
+            _ => None,
+        }
     }
 
     fn try_rewrite_side(
@@ -310,8 +347,22 @@ impl EagerAggregation {
             if *func != AggregateFunction::Sum || *distinct || args.len() != 1 {
                 return None;
             }
+            // Reassociation of exact arithmetic changes intermediate overflow
+            // and decimal scale/rounding behavior. This rule currently builds
+            // float count factors and cannot preserve those contracts.
+            if !matches!(
+                args[0].data_type(&join.schema).ok()?,
+                DataType::Float32 | DataType::Float64
+            ) {
+                return None;
+            }
             let mut terms = Vec::new();
             flatten_terms(&args[0], false, &mut terms);
+            // SUM(a*r + b) cannot become SUM(a*SUM(r) + b*COUNT): a NULL
+            // in either additive term originally discards the entire row.
+            if terms.len() != 1 {
+                return None;
+            }
             all_terms.push(terms);
         }
 
@@ -319,6 +370,13 @@ impl EagerAggregation {
         let mut r_factors: Vec<Expr> = Vec::new();
         for terms in &all_terms {
             for term in terms {
+                // Preserve scalar evaluation before aggregation. For example,
+                // SUM(0 * x) is zero for finite x, but 0 * SUM(x) can be NaN
+                // when the partial sum overflows. Null counts and ranges used
+                // for costing do not prove this reassociation safe.
+                if term.negated || term.factors.len() != 1 {
+                    return None;
+                }
                 let mut r_count = 0;
                 for f in &term.factors {
                     let refs_r = expr_references_schema(f, &r_schema);
@@ -327,26 +385,37 @@ impl EagerAggregation {
                         if !expr_only_references_schema(f, &r_schema) {
                             return None;
                         }
+                        // Only a direct floating column has a supported
+                        // partial SUM type and no hidden per-row arithmetic
+                        // overflow, cast failure or NULL-producing operation.
+                        if !matches!(f, Expr::Column(_))
+                            || !matches!(
+                                f.data_type(&r_schema).ok()?,
+                                DataType::Float32 | DataType::Float64
+                            )
+                        {
+                            return None;
+                        }
                         r_count += 1;
                         if !r_factors.contains(f) {
                             r_factors.push(f.clone());
                         }
                     }
                 }
-                if r_count > 1 {
+                if r_count != 1 {
                     return None;
                 }
             }
         }
 
-        // Null-safety: every R column used in a factor must be null-free
-        let stats = self.table_stats.get(&r_scan.table_name)?;
+        // Statistics are costing hints, not semantic nullability proofs.
+        // Require the actual input schema's non-null contract instead.
         for f in &r_factors {
             let mut cols = Vec::new();
             collect_columns(f, &mut cols);
             for c in cols {
-                let cs = stats.column_stats.get(&c.name.to_lowercase())?;
-                if cs.null_count != Some(0) {
+                let index = crate::optimizer::properties::column_index(&r_schema, &c)?;
+                if r_schema.fields()[index].nullable {
                     return None;
                 }
             }
@@ -357,6 +426,7 @@ impl EagerAggregation {
         // correlation, consistent with the join cost model) and require real
         // fanout. Without duplication the rewrite only adds an aggregation.
         {
+            let stats = self.table_stats.get(&r_scan.table_name)?;
             let mut ndv_max = 0u64;
             for kexpr in &r_keys {
                 let cs = self.column_stats_for(&r_scan.table_name, kexpr)?;
@@ -502,28 +572,6 @@ impl EagerAggregation {
         self.table_stats.get(table)?.column_stats.get(&name)
     }
 
-    /// Find statistics for a plain column by name across all tables. Only
-    /// unambiguous (single-table) matches count.
-    fn lookup_column_stats(
-        &self,
-        e: &Expr,
-    ) -> Option<&crate::physical::operators::ColumnStatistics> {
-        let name = match e {
-            Expr::Column(c) => c.name.to_lowercase(),
-            _ => return None,
-        };
-        let mut found = None;
-        for stats in self.table_stats.values() {
-            if let Some(cs) = stats.column_stats.get(&name) {
-                if found.is_some() {
-                    return None; // ambiguous
-                }
-                found = Some(cs);
-            }
-        }
-        found
-    }
-
     /// Build the R-side group expression and the matching S-side key
     /// expression. Single key: identity. Dual int keys: packed `k0*K + k1`.
     fn build_keys(
@@ -548,36 +596,52 @@ impl EagerAggregation {
         };
 
         if r_keys.len() == 1 {
-            if !int_like(&r_keys[0], &r_scan.schema) {
+            let s_schema = if r_is_left {
+                join.right.schema()
+            } else {
+                join.left.schema()
+            };
+            if !int_like(&r_keys[0], &r_scan.schema) || !int_like(&s_keys[0], &s_schema) {
                 return None;
             }
-            return Some((r_keys[0].clone(), s_keys[0].clone()));
+            // The pre-aggregate key schema is Int64. Widen Int32 keys
+            // explicitly rather than emitting an Int32 array under that schema.
+            let widen = |expr: &Expr, schema: &PlanSchema| -> Option<Expr> {
+                Some(if expr.data_type(schema).ok()? == DataType::Int32 {
+                    cast_i64(expr.clone())
+                } else {
+                    expr.clone()
+                })
+            };
+            return Some((
+                widen(&r_keys[0], &r_scan.schema)?,
+                widen(&s_keys[0], &s_schema)?,
+            ));
         }
 
-        // Dual key: packing is collision-free only if BOTH sides' second key
-        // stays below the modulus K and both first keys are non-negative —
-        // an S value >= K would carry into the first key's lanes and could
-        // alias onto a different valid R key. Bound every key column via
-        // footer statistics (S keys must be plain base-table columns).
-        let mut bounds = Vec::new();
+        // Derive both domains from their exact input subtrees. A name-matched
+        // footer/sample range cannot prove that a projected or joined key
+        // remains in that range. Share the ordinary packed-join proof.
+        use super::packed_group_keys::{integer_domain, packing_radix, IntegerDomain};
+        let (r_plan, s_plan) = if r_is_left {
+            (&join.left, &join.right)
+        } else {
+            (&join.right, &join.left)
+        };
+        let mut domains = Vec::new();
         for (i, k) in r_keys.iter().enumerate() {
-            let r_cs = self.column_stats_for(&r_scan.table_name, k)?;
-            let s_cs = self.lookup_column_stats(&s_keys[i])?;
-            let (r_min, r_max) = (r_cs.min_i64?, r_cs.max_i64?);
-            let (s_min, s_max) = (s_cs.min_i64?, s_cs.max_i64?);
-            if r_min < 0 || s_min < 0 {
+            let (Expr::Column(r_col), Expr::Column(s_col)) = (k, &s_keys[i]) else {
                 return None;
-            }
-            bounds.push(r_max.max(s_max));
+            };
+            let r = integer_domain(r_plan, r_col)?;
+            let s = integer_domain(s_plan, s_col)?;
+            domains.push(IntegerDomain {
+                min: r.min.min(s.min),
+                max: r.max.max(s.max),
+                nullable: r.nullable || s.nullable,
+            });
         }
-        // K = next power of two above max over both sides of key1
-        let k1_max = bounds[1];
-        let k = (k1_max as u64 + 1).next_power_of_two() as i64;
-        let k0_max = bounds[0];
-        // Overflow guard
-        if (k0_max as i128) * (k as i128) + (k1_max as i128) > i64::MAX as i128 {
-            return None;
-        }
+        let k = packing_radix(domains[0], domains[1])?;
         let pack = |a: &Expr, b: &Expr| -> Expr {
             Expr::BinaryExpr {
                 left: Box::new(Expr::BinaryExpr {
@@ -597,6 +661,7 @@ fn cast_i64(e: Expr) -> Expr {
     Expr::Cast {
         expr: Box::new(e),
         data_type: DataType::Int64,
+        mode: crate::planner::CastMode::Strict,
     }
 }
 
@@ -709,6 +774,7 @@ fn cast_f64_if_needed(cnt: Expr, _factors: &[Expr]) -> Expr {
     Expr::Cast {
         expr: Box::new(cnt),
         data_type: DataType::Float64,
+        mode: crate::planner::CastMode::Strict,
     }
 }
 
@@ -777,5 +843,220 @@ pub(crate) fn expr_children(e: &Expr) -> Vec<&Expr> {
             expr, low, high, ..
         } => vec![expr, low, high],
         _ => vec![],
+    }
+}
+
+#[cfg(test)]
+mod semantic_domain_tests {
+    use super::*;
+    use crate::physical::operators::ColumnStatistics;
+    use crate::planner::{Column, ScalarValue};
+
+    fn col(name: &str) -> Expr {
+        Expr::Column(Column::new(name))
+    }
+    fn scan(table: &str, key_type: DataType, factor_nullable: bool) -> Arc<LogicalPlan> {
+        Arc::new(LogicalPlan::Scan(ScanNode {
+            table_name: table.into(),
+            schema: PlanSchema::new(vec![
+                SchemaField::new(format!("{table}0"), key_type.clone()),
+                SchemaField::new(format!("{table}1"), key_type),
+                SchemaField::new(format!("{table}v"), DataType::Float64)
+                    .with_nullable(factor_nullable),
+            ]),
+            projection: None,
+            filter: None,
+        }))
+    }
+    fn join(left: Arc<LogicalPlan>, right: Arc<LogicalPlan>, two_keys: bool) -> JoinNode {
+        JoinNode {
+            schema: left.schema().merge(&right.schema()),
+            left,
+            right,
+            join_type: JoinType::Inner,
+            on: if two_keys {
+                vec![(col("r0"), col("s0")), (col("r1"), col("s1"))]
+            } else {
+                vec![(col("r0"), col("s0"))]
+            },
+            filter: None,
+        }
+    }
+    fn estimated_bounds() -> HashMap<String, TableStatistics> {
+        ["r", "s"]
+            .into_iter()
+            .map(|table| {
+                (
+                    table.into(),
+                    TableStatistics {
+                        row_count: 1000,
+                        total_byte_size: 24000,
+                        column_stats: ["0", "1", "v"]
+                            .into_iter()
+                            .map(|suffix| {
+                                (
+                                    format!("{table}{suffix}"),
+                                    ColumnStatistics {
+                                        min_i64: Some(0),
+                                        max_i64: Some(1),
+                                        null_count: Some(0),
+                                        ndv_est: Some(2),
+                                        ..Default::default()
+                                    },
+                                )
+                            })
+                            .collect(),
+                    },
+                )
+            })
+            .collect()
+    }
+    #[test]
+    fn estimated_key_ranges_never_establish_packing_or_alias_lineage() {
+        let rule = EagerAggregation::with_table_statistics(estimated_bounds());
+        let node = join(
+            scan("r", DataType::Int64, false),
+            scan("s", DataType::Int64, false),
+            true,
+        );
+        let LogicalPlan::Scan(r_scan) = node.left.as_ref() else {
+            unreachable!()
+        };
+        assert!(rule
+            .build_keys(&[col("r0"), col("r1")], &node, true, r_scan)
+            .is_none());
+
+        let right = scan("s", DataType::UInt16, false);
+        let projected = right
+            .as_ref()
+            .clone()
+            .project(vec![
+                col("s0"),
+                Expr::Alias {
+                    expr: Box::new(Expr::BinaryExpr {
+                        left: Box::new(col("s1")),
+                        op: BinaryOp::Multiply,
+                        right: Box::new(Expr::Literal(ScalarValue::UInt16(2))),
+                    }),
+                    name: "s1".into(),
+                },
+                col("sv"),
+            ])
+            .unwrap();
+        let node = join(
+            scan("r", DataType::UInt16, false),
+            Arc::new(projected),
+            true,
+        );
+        let LogicalPlan::Scan(r_scan) = node.left.as_ref() else {
+            unreachable!()
+        };
+        assert!(rule
+            .build_keys(&[col("r0"), col("r1")], &node, true, r_scan)
+            .is_none());
+    }
+    #[test]
+    fn structural_domains_pack_and_single_int32_key_is_widened() {
+        let rule = EagerAggregation::new();
+        let node = join(
+            scan("r", DataType::UInt16, false),
+            scan("s", DataType::UInt16, false),
+            true,
+        );
+        let LogicalPlan::Scan(r_scan) = node.left.as_ref() else {
+            unreachable!()
+        };
+        let pair = rule
+            .build_keys(&[col("r0"), col("r1")], &node, true, r_scan)
+            .unwrap();
+        assert!(pair.0.to_string().contains("65536"));
+        let node = join(
+            scan("r", DataType::Int32, false),
+            scan("s", DataType::Int32, false),
+            false,
+        );
+        let LogicalPlan::Scan(r_scan) = node.left.as_ref() else {
+            unreachable!()
+        };
+        let pair = rule.build_keys(&[col("r0")], &node, true, r_scan).unwrap();
+        assert_eq!(
+            pair.0.data_type(&node.left.schema()).unwrap(),
+            DataType::Int64
+        );
+        assert_eq!(
+            pair.1.data_type(&node.right.schema()).unwrap(),
+            DataType::Int64
+        );
+    }
+    #[test]
+    fn zero_null_estimate_does_not_override_nullable_factor_schema() {
+        let rule = EagerAggregation::with_table_statistics(estimated_bounds());
+        for nullable in [true, false] {
+            let node = join(
+                scan("r", DataType::Int64, nullable),
+                scan("s", DataType::Int64, false),
+                false,
+            );
+            let plan = LogicalPlan::Aggregate(AggregateNode {
+                input: Arc::new(LogicalPlan::Join(node)),
+                group_by: vec![col("s1")],
+                aggregates: vec![Expr::Alias {
+                    name: "total".into(),
+                    expr: Box::new(Expr::Aggregate {
+                        func: AggregateFunction::Sum,
+                        args: vec![col("rv")],
+                        distinct: false,
+                    }),
+                }],
+                schema: PlanSchema::new(vec![
+                    SchemaField::new("s1", DataType::Int64),
+                    SchemaField::new("total", DataType::Float64),
+                ]),
+            });
+            let rewritten = rule.optimize(&plan).unwrap();
+            if nullable {
+                assert_eq!(
+                    rewritten, plan,
+                    "a zero-null estimate is not a schema contract"
+                );
+            } else {
+                assert_ne!(
+                    rewritten, plan,
+                    "schema-proven non-null factors remain eligible"
+                );
+            }
+        }
+    }
+    #[test]
+    fn floating_scalar_multiplication_is_not_moved_after_sum() {
+        let rule = EagerAggregation::with_table_statistics(estimated_bounds());
+        let node = join(
+            scan("r", DataType::Int64, false),
+            scan("s", DataType::Int64, false),
+            false,
+        );
+        let plan = LogicalPlan::Aggregate(AggregateNode {
+            input: Arc::new(LogicalPlan::Join(node)),
+            group_by: vec![col("s1")],
+            aggregates: vec![Expr::Alias {
+                name: "total".into(),
+                expr: Box::new(Expr::Aggregate {
+                    func: AggregateFunction::Sum,
+                    distinct: false,
+                    args: vec![Expr::BinaryExpr {
+                        left: Box::new(col("rv")),
+                        op: BinaryOp::Multiply,
+                        right: Box::new(Expr::Literal(ScalarValue::Float64(0.0.into()))),
+                    }],
+                }),
+            }],
+            schema: PlanSchema::new(vec![
+                SchemaField::new("s1", DataType::Int64),
+                SchemaField::new("total", DataType::Float64),
+            ]),
+        });
+        assert_eq!(rule.optimize(&plan).unwrap(), plan);
+        assert_eq!(f64::MAX * 0.0 + f64::MAX * 0.0, 0.0);
+        assert!(((f64::MAX + f64::MAX) * 0.0).is_nan());
     }
 }

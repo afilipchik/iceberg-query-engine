@@ -785,3 +785,24 @@ async fn limit_over_a_multi_partition_scan_is_per_query() {
         10
     );
 }
+
+#[test]
+fn cte_and_subquery_materialization_drives_every_declared_partition() {
+    let input = FixedPartitionScan::new(4, 2, 7);
+    let expected = input.total_rows();
+    let result = query_engine::physical::run_subquery_plan(Arc::new(input)).unwrap();
+    assert_eq!(result.iter().map(|b| b.num_rows()).sum::<usize>(), expected);
+    let ids = result
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ids, (0..expected as i64).collect::<Vec<_>>());
+}

@@ -18,7 +18,7 @@ pub fn hash_arrays(key_arrays: &[ArrayRef], num_rows: usize) -> Vec<u64> {
 }
 
 /// Hash a single array column, combining with existing hash values.
-fn hash_array_into(array: &ArrayRef, hashes: &mut [u64]) {
+pub(crate) fn hash_array_into(array: &ArrayRef, hashes: &mut [u64]) {
     let num_rows = hashes.len();
 
     if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
@@ -42,7 +42,8 @@ fn hash_array_into(array: &ArrayRef, hashes: &mut [u64]) {
         let nulls = arr.nulls();
         for i in 0..num_rows {
             if nulls.map_or(true, |n| n.is_valid(i)) {
-                hashes[i] = combine_hash(hashes[i], values[i].to_bits());
+                hashes[i] =
+                    combine_hash(hashes[i], crate::planner::numeric::sql_float_key(values[i]));
             }
         }
     } else if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
@@ -124,20 +125,48 @@ pub fn compare_row(
     arrays_b: &[ArrayRef],
     row_b: usize,
 ) -> bool {
-    for (a, b) in arrays_a.iter().zip(arrays_b.iter()) {
-        if !compare_array_values(a, row_a, b, row_b) {
-            return false;
-        }
-    }
-    true
+    compare_rows_with_nulls(arrays_a, row_a, arrays_b, row_b, false)
+}
+
+/// Group keys use NOT DISTINCT equivalence: NULL groups with NULL, unlike
+/// ordinary equi-join keys. Float equality and hashes are shared with joins.
+#[inline]
+pub fn compare_group_row(
+    arrays_a: &[ArrayRef],
+    row_a: usize,
+    arrays_b: &[ArrayRef],
+    row_b: usize,
+) -> bool {
+    compare_rows_with_nulls(arrays_a, row_a, arrays_b, row_b, true)
+}
+
+#[inline]
+fn compare_rows_with_nulls(
+    arrays_a: &[ArrayRef],
+    row_a: usize,
+    arrays_b: &[ArrayRef],
+    row_b: usize,
+    nulls_equal: bool,
+) -> bool {
+    arrays_a.len() == arrays_b.len()
+        && arrays_a
+            .iter()
+            .zip(arrays_b)
+            .all(|(a, b)| compare_array_values(a, row_a, b, row_b, nulls_equal))
 }
 
 /// Compare a single value between two arrays at given rows.
 #[inline]
-fn compare_array_values(a: &ArrayRef, row_a: usize, b: &ArrayRef, row_b: usize) -> bool {
-    // Handle nulls: null != null in SQL semantics
-    if a.is_null(row_a) || b.is_null(row_b) {
-        return false;
+fn compare_array_values(
+    a: &ArrayRef,
+    row_a: usize,
+    b: &ArrayRef,
+    row_b: usize,
+    nulls_equal: bool,
+) -> bool {
+    let (a_null, b_null) = (a.is_null(row_a), b.is_null(row_b));
+    if a_null || b_null {
+        return nulls_equal && a_null && b_null;
     }
 
     if let (Some(aa), Some(bb)) = (
@@ -158,7 +187,11 @@ fn compare_array_values(a: &ArrayRef, row_a: usize, b: &ArrayRef, row_b: usize) 
         a.as_any().downcast_ref::<arrow::array::Float64Array>(),
         b.as_any().downcast_ref::<arrow::array::Float64Array>(),
     ) {
-        return aa.value(row_a) == bb.value(row_b);
+        return crate::planner::numeric::sql_float_compare(
+            aa.value(row_a),
+            crate::planner::BinaryOp::Eq,
+            bb.value(row_b),
+        );
     }
 
     if let (Some(aa), Some(bb)) = (

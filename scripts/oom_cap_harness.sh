@@ -13,7 +13,7 @@
 #
 # Verdict rules (PRD: "a scenario passes only if the engine completes or
 # refuses cleanly under BOTH levers"):
-#   exit 0 (COMPLETED) or exit 2 (clean named REFUSED) → PASS
+#   exit 0 + COMPLETED marker or exit 2 + classified resource REFUSED → PASS
 #   exit 137 (SIGKILL/memcg), 134 (abort at rlimit), 124 (timeout),
 #   anything else → FAIL
 #
@@ -72,6 +72,7 @@ for scenario in $SCENARIOS; do
     log="$LOGDIR/${scenario}_${lever}.log"
     start_ts="$(date '+%Y-%m-%d %H:%M:%S')"
     if [[ "$lever" == "cgroup" ]]; then
+      effective_cap="$cap"
       timeout -s KILL "$RUN_TIMEOUT" systemd-run --user --scope --quiet --collect \
         --unit="$unit" \
         -p MemoryMax="$cap" -p MemorySwapMax=0 \
@@ -97,6 +98,7 @@ for scenario in $SCENARIOS; do
       cap_mb="$(numfmt --from=iec "${cap^^}" 2>/dev/null || echo $((1024 * 1024 * 1024)))"
       cap_mb=$((cap_mb / 1024 / 1024))
       rlimit_cap="$((cap_mb + 1024))M"
+      effective_cap="$rlimit_cap"
       timeout -s KILL "$RUN_TIMEOUT" systemd-run --user --scope --quiet --collect \
         --unit="$unit" \
         -p MemoryMax=8G -p MemorySwapMax=0 \
@@ -110,10 +112,20 @@ for scenario in $SCENARIOS; do
     peak_mb=$(( ${peak_kb:-0} / 1024 ))
     # /usr/bin/time exits 128+signal when the child is signalled; the child
     # itself exits 134 on abort. Normalize both spellings.
-    detail="$(grep -oE 'HARNESS RESULT: (COMPLETED|REFUSED)[^|]*' "$log" | head -1)"
+    detail="$(grep -oE 'HARNESS RESULT: (COMPLETED|REFUSED|FAILED)[^|]*' "$log" | head -1)"
     case "$code" in
-      0) verdict=PASS reason=completed ;;
-      2) verdict=PASS reason=clean-refusal ;;
+      0)
+        if grep -qE "^HARNESS RESULT: COMPLETED scenario=${scenario} " "$log"; then
+          verdict=PASS reason=completed
+        else
+          verdict=FAIL reason=missing-completion-evidence
+        fi ;;
+      2)
+        if grep -qE "^HARNESS RESULT: REFUSED scenario=${scenario} resource=(memory-pool|legacy-join-candidate) " "$log"; then
+          verdict=PASS reason=clean-resource-refusal
+        else
+          verdict=FAIL reason=unclassified-refusal
+        fi ;;
       134) verdict=FAIL reason=abort-at-rlimit ;;
       137) verdict=FAIL reason=oom-sigkill ;;
       124) verdict=FAIL reason=timeout ;;
@@ -139,7 +151,7 @@ for scenario in $SCENARIOS; do
       fi
     fi
 
-    echo "RESULT scenario=$scenario lever=$lever cap=$cap exit=$code peak_rss_mb=$peak_mb verdict=$verdict reason=$reason detail=${detail:-n/a} log=$log"
+    echo "RESULT scenario=$scenario lever=$lever cap=$effective_cap exit=$code peak_rss_mb=$peak_mb verdict=$verdict reason=$reason detail=${detail:-n/a} log=$log"
     [[ "$verdict" == "FAIL" ]] && overall=1
   done
 done

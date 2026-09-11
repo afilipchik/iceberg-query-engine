@@ -1,6 +1,7 @@
 //! Subquery execution support
 
 use crate::error::{QueryError, Result};
+use crate::physical::operators::filter::scalar_to_array;
 use crate::physical::operators::TableProvider;
 use crate::physical::PhysicalPlanner;
 use crate::planner::{Expr, LogicalPlan, ScalarValue};
@@ -9,6 +10,78 @@ use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+// Diagnostic only: no query/result identity or cache policy changes.
+#[derive(Clone, Copy)]
+struct ScalarTrace(u64);
+impl ScalarTrace {
+    fn enabled() -> Option<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        (std::env::var("QE_SCALAR_SUBQUERY_TRACE").as_deref() == Ok("1"))
+            .then(|| Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)))
+    }
+    fn emit(self, event: &str, detail: serde_json::Value) {
+        use std::io::Write;
+        // Broken stderr must not turn successful SQL into an error.
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "[scalar-subquery] {}",
+            serde_json::json!({"call":self.0,"event":event,"detail":detail})
+        );
+    }
+    fn tree(self, physical: &dyn crate::physical::PhysicalOperator) {
+        fn walk(
+            t: ScalarTrace,
+            op: &dyn crate::physical::PhysicalOperator,
+            path: String,
+            left: &mut usize,
+        ) {
+            if *left == 0 {
+                return;
+            }
+            *left -= 1;
+            t.emit("operator", serde_json::json!({"path":path,"name":op.name(),"partitions":op.output_partitions()}));
+            for (i, child) in op.children().iter().enumerate() {
+                if *left == 0 {
+                    break;
+                }
+                walk(t, child.as_ref(), format!("{path}/{i}"), left);
+            }
+        }
+        let mut left = 512;
+        walk(self, physical, "root".into(), &mut left);
+        self.emit(
+            "tree_end",
+            serde_json::json!({"node_limit":512,"limit_reached":left==0}),
+        );
+    }
+}
+struct ScalarPhase {
+    trace: Option<ScalarTrace>,
+    phase: &'static str,
+    start: Option<std::time::Instant>,
+    completed: bool,
+}
+impl ScalarPhase {
+    fn new(trace: Option<ScalarTrace>, phase: &'static str) -> Self {
+        Self {
+            trace,
+            phase,
+            start: trace.map(|_| std::time::Instant::now()),
+            completed: false,
+        }
+    }
+    fn finish(mut self) {
+        self.completed = true;
+    }
+}
+impl Drop for ScalarPhase {
+    fn drop(&mut self) {
+        if let (Some(trace), Some(start)) = (self.trace, self.start) {
+            trace.emit("phase", serde_json::json!({"phase":self.phase,"ms":start.elapsed().as_secs_f64()*1000.0,"completed":self.completed,"unwinding":std::thread::panicking()}));
+        }
+    }
+}
 
 /// Shared runtime for subquery execution. Created once, reused across all subquery
 /// evaluations. This eliminates the overhead of creating a new runtime per subquery.
@@ -35,17 +108,45 @@ fn subquery_runtime() -> &'static tokio::runtime::Runtime {
 fn run_subquery_blocking(
     physical: Arc<dyn crate::physical::PhysicalOperator>,
 ) -> Result<Vec<RecordBatch>> {
+    run_subquery_blocking_traced(physical, None)
+}
+fn run_subquery_blocking_traced(
+    physical: Arc<dyn crate::physical::PhysicalOperator>,
+    trace: Option<ScalarTrace>,
+) -> Result<Vec<RecordBatch>> {
+    let bridge = ScalarPhase::new(trace, "bridge_total");
+    let runtime = ScalarPhase::new(trace, "runtime_acquire");
     let rt = subquery_runtime();
-    std::thread::spawn(move || {
-        let stream = rt.block_on(physical.execute(0))?;
-        rt.block_on(async { stream.try_collect().await })
+    runtime.finish();
+    let dispatch_start = trace.map(|_| std::time::Instant::now());
+    let result = std::thread::spawn(move || {
+        if let Some(t) = trace {
+            t.emit("bridge_enter", serde_json::json!({"dispatch_ms":dispatch_start.unwrap().elapsed().as_secs_f64()*1000.0,"rayon_threads":rayon::current_num_threads(),"tokio_workers":rt.metrics().num_workers(),"visible_cpus":num_cpus::get()}));
+        }
+        rt.block_on(async {
+            let mut batches = Vec::new();
+            for partition in 0..physical.output_partitions().max(1) {
+                if let Some(t) = trace { t.emit("partition", serde_json::json!({"partition":partition})); }
+                let execute = ScalarPhase::new(trace, "partition_execute");
+                let stream = physical.execute(partition).await?;
+                execute.finish();
+                let collect = ScalarPhase::new(trace, "partition_collect");
+                batches.extend(stream.try_collect::<Vec<_>>().await?);
+                collect.finish();
+            }
+            Ok(batches)
+        })
     })
     .join()
     .unwrap_or_else(|_| {
         Err(QueryError::Execution(
             "Subquery execution thread panicked".into(),
         ))
-    })
+    });
+    if result.is_ok() {
+        bridge.finish();
+    }
+    result
 }
 
 /// Execute a physical plan synchronously, collecting all output batches.
@@ -83,19 +184,7 @@ struct SubqueryExecutorInner {
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct CorrelatedCacheKey {
     plan_hash: usize,
-    correlation_values: Vec<CorrelationValue>,
-}
-
-/// A hashable representation of correlation column values
-#[derive(Clone, Hash, PartialEq, Eq)]
-enum CorrelationValue {
-    Null,
-    Int64(i64),
-    Int32(i32),
-    Float64Bits(u64), // Store f64 as bits for hashing
-    Utf8(String),
-    Boolean(bool),
-    Date32(i32),
+    correlation_values: Vec<ScalarValue>,
 }
 
 /// Result of a subquery execution
@@ -143,44 +232,15 @@ impl SubqueryExecutor {
     }
 
     /// Extract correlation values from a batch row for cache key
-    fn extract_correlation_values(&self, batch: &RecordBatch, row: usize) -> Vec<CorrelationValue> {
-        use arrow::array::*;
-
+    fn extract_correlation_values(
+        &self,
+        batch: &RecordBatch,
+        row: usize,
+    ) -> Result<Vec<ScalarValue>> {
         batch
             .columns()
             .iter()
-            .map(|col| {
-                if col.is_null(row) {
-                    return CorrelationValue::Null;
-                }
-                match col.data_type() {
-                    arrow::datatypes::DataType::Int64 => {
-                        let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-                        CorrelationValue::Int64(arr.value(row))
-                    }
-                    arrow::datatypes::DataType::Int32 => {
-                        let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
-                        CorrelationValue::Int32(arr.value(row))
-                    }
-                    arrow::datatypes::DataType::Float64 => {
-                        let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
-                        CorrelationValue::Float64Bits(arr.value(row).to_bits())
-                    }
-                    arrow::datatypes::DataType::Utf8 => {
-                        let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
-                        CorrelationValue::Utf8(arr.value(row).to_string())
-                    }
-                    arrow::datatypes::DataType::Boolean => {
-                        let arr = col.as_any().downcast_ref::<BooleanArray>().unwrap();
-                        CorrelationValue::Boolean(arr.value(row))
-                    }
-                    arrow::datatypes::DataType::Date32 => {
-                        let arr = col.as_any().downcast_ref::<Date32Array>().unwrap();
-                        CorrelationValue::Date32(arr.value(row))
-                    }
-                    _ => CorrelationValue::Null,
-                }
-            })
+            .map(|column| array_ref_to_scalar(column, row))
             .collect()
     }
 
@@ -188,7 +248,7 @@ impl SubqueryExecutor {
     fn get_correlated_cache(
         &self,
         plan_hash: usize,
-        correlation_values: &[CorrelationValue],
+        correlation_values: &[ScalarValue],
     ) -> Option<SubqueryResult> {
         let cache = self.inner.correlated_cache.lock();
         let key = CorrelatedCacheKey {
@@ -205,7 +265,7 @@ impl SubqueryExecutor {
     fn set_correlated_cache(
         &self,
         plan_hash: usize,
-        correlation_values: Vec<CorrelationValue>,
+        correlation_values: Vec<ScalarValue>,
         result: SubqueryResult,
     ) {
         let mut cache = self.inner.correlated_cache.lock();
@@ -254,8 +314,31 @@ impl SubqueryExecutor {
         planner
     }
 
+    fn plan_subquery(
+        &self,
+        plan: &LogicalPlan,
+    ) -> Result<Arc<dyn crate::physical::PhysicalOperator>> {
+        use crate::optimizer::OptimizerRule;
+        // Expression subqueries have their own scope and are not traversed by
+        // the outer plan's projection rule. Apply the same column dependency
+        // analysis at this execution boundary before providers materialize
+        // their scans. Keep the original plan as the per-query cache identity.
+        let pruned = crate::optimizer::rules::ProjectionPushdown.optimize(plan)?;
+        self.create_planner().create_physical_plan(&pruned)
+    }
+
     /// Execute a scalar subquery and return the scalar value
     pub fn execute_scalar(&self, plan: &LogicalPlan) -> Result<ScalarValue> {
+        let trace = ScalarTrace::enabled();
+        let total = ScalarPhase::new(trace, "scalar_total");
+        if let Some(t) = trace {
+            t.emit("entry", serde_json::json!({"rayon_threads":rayon::current_num_threads(),"visible_cpus":num_cpus::get()}));
+        }
+        if plan.schema().fields().len() != 1 {
+            return Err(QueryError::Execution(
+                "Scalar subquery must return one column".into(),
+            ));
+        }
         if std::env::var("CTE_DEBUG").is_ok() {
             eprintln!("[cte] execute_scalar enter");
         }
@@ -264,33 +347,50 @@ impl SubqueryExecutor {
         {
             let cache = self.inner.cache.lock();
             if let Some(SubqueryResult::Scalar(value)) = cache.get(&key) {
+                if let Some(t) = trace {
+                    t.emit("cache_hit", serde_json::json!({}));
+                }
+                total.finish();
                 return Ok(value.clone());
             }
         }
 
-        let planner = self.create_planner();
-        let physical = planner.create_physical_plan(plan)?;
+        if let Some(t) = trace {
+            t.emit("cache_miss", serde_json::json!({}));
+        }
+        let planning = ScalarPhase::new(trace, "rhs_physical_plan");
+        let physical = self.plan_subquery(plan)?;
+        planning.finish();
+        if let Some(t) = trace {
+            t.tree(physical.as_ref());
+        }
+        let batches = run_subquery_blocking_traced(physical, trace)?;
+        let normalize = ScalarPhase::new(trace, "normalize_and_cache");
 
-        // Run the async code reusing the existing runtime when possible
-        let batches = run_subquery_blocking(physical)?;
-
-        if batches.is_empty() || batches[0].num_rows() == 0 {
+        let rows = batches.iter().map(|b| b.num_rows()).sum::<usize>();
+        if rows == 0 {
             let result = ScalarValue::Null;
             self.inner
                 .cache
                 .lock()
                 .insert(key, SubqueryResult::Scalar(result.clone()));
+            normalize.finish();
+            total.finish();
             return Ok(result);
         }
 
-        let batch = &batches[0];
-        if batch.num_rows() != 1 {
+        if rows != 1 {
             return Err(QueryError::Execution(format!(
                 "Scalar subquery returned {} rows, expected 1",
-                batch.num_rows()
+                rows
             )));
         }
-
+        let batch = batches.iter().find(|b| b.num_rows() > 0).unwrap();
+        if batch.num_columns() != 1 {
+            return Err(QueryError::Execution(
+                "Scalar subquery must return one column".into(),
+            ));
+        }
         let column = batch.column(0);
         let scalar = array_ref_to_scalar(column, 0)?;
 
@@ -298,11 +398,18 @@ impl SubqueryExecutor {
             .cache
             .lock()
             .insert(key, SubqueryResult::Scalar(scalar.clone()));
+        normalize.finish();
+        total.finish();
         Ok(scalar)
     }
 
     /// Execute an IN subquery and return the array of values
     pub fn execute_in_subquery(&self, plan: &LogicalPlan) -> Result<ArrayRef> {
+        if plan.schema().fields().len() != 1 {
+            return Err(QueryError::Execution(
+                "IN subquery must return one column".into(),
+            ));
+        }
         let key = self.plan_hash(plan);
 
         {
@@ -312,8 +419,7 @@ impl SubqueryExecutor {
             }
         }
 
-        let planner = self.create_planner();
-        let physical = planner.create_physical_plan(plan)?;
+        let physical = self.plan_subquery(plan)?;
 
         // Run the async code reusing the existing runtime when possible
         let batches = run_subquery_blocking(physical)?;
@@ -361,8 +467,7 @@ impl SubqueryExecutor {
             }
         }
 
-        let planner = self.create_planner();
-        let physical = planner.create_physical_plan(plan)?;
+        let physical = self.plan_subquery(plan)?;
 
         // Run the async code reusing the existing runtime when possible
         let batches = run_subquery_blocking(physical)?;
@@ -389,6 +494,12 @@ impl SubqueryExecutor {
 fn array_ref_to_scalar(array: &ArrayRef, index: usize) -> Result<ScalarValue> {
     use arrow::array::*;
 
+    if let arrow::datatypes::DataType::Dictionary(_, value_type) = array.data_type() {
+        return array_ref_to_scalar(
+            &crate::planner::numeric::cast_strict(array, value_type)?,
+            index,
+        );
+    }
     if array.is_null(index) {
         return Ok(ScalarValue::Null);
     }
@@ -457,6 +568,52 @@ fn array_ref_to_scalar(array: &ArrayRef, index: usize) -> Result<ScalarValue> {
                 .ok_or_else(|| QueryError::Type("Expected Date32Array".into()))?;
             ScalarValue::Date32(arr.value(index))
         }
+        arrow::datatypes::DataType::UInt8 => ScalarValue::UInt8(
+            array
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .unwrap()
+                .value(index),
+        ),
+        arrow::datatypes::DataType::UInt16 => ScalarValue::UInt16(
+            array
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .unwrap()
+                .value(index),
+        ),
+        arrow::datatypes::DataType::UInt32 => ScalarValue::UInt32(
+            array
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap()
+                .value(index),
+        ),
+        arrow::datatypes::DataType::UInt64 => ScalarValue::UInt64(
+            array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(index),
+        ),
+        arrow::datatypes::DataType::Date64 => ScalarValue::Date64(
+            array
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .unwrap()
+                .value(index),
+        ),
+        arrow::datatypes::DataType::Decimal128(_, scale) => {
+            let array = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            ScalarValue::Decimal128(crate::planner::DecimalValue::new(
+                array.value(index),
+                *scale,
+            ))
+        }
+        arrow::datatypes::DataType::Timestamp(_, _) => ScalarValue::Timestamp(
+            crate::planner::TimestampValue::from_array(array.as_ref(), index)
+                .ok_or_else(|| QueryError::Type("invalid timestamp scalar array".into()))?,
+        ),
         dt => {
             return Err(QueryError::NotImplemented(format!(
                 "Unsupported type for scalar subquery: {:?}",
@@ -468,21 +625,7 @@ fn array_ref_to_scalar(array: &ArrayRef, index: usize) -> Result<ScalarValue> {
 
 /// Create an empty array of the given type
 fn new_empty_array(data_type: arrow::datatypes::DataType) -> ArrayRef {
-    use arrow::array::*;
-    match data_type {
-        arrow::datatypes::DataType::Boolean => {
-            Arc::new(BooleanArray::from(vec![] as Vec<Option<bool>>))
-        }
-        arrow::datatypes::DataType::Int64 => Arc::new(Int64Array::from(vec![] as Vec<Option<i64>>)),
-        arrow::datatypes::DataType::Int32 => Arc::new(Int32Array::from(vec![] as Vec<Option<i32>>)),
-        arrow::datatypes::DataType::Float64 => {
-            Arc::new(Float64Array::from(vec![] as Vec<Option<f64>>))
-        }
-        arrow::datatypes::DataType::Utf8 => {
-            Arc::new(StringArray::from(vec![] as Vec<Option<&str>>))
-        }
-        _ => Arc::new(Int64Array::from(vec![] as Vec<Option<i64>>)),
-    }
+    arrow::array::new_empty_array(&data_type)
 }
 
 /// Collect all table names/aliases defined in a logical plan's FROM clause
@@ -580,6 +723,17 @@ fn has_outer_references(expr: &Expr, local_tables: &std::collections::HashSet<St
                 || has_outer_references(low, local_tables)
                 || has_outer_references(high, local_tables)
         }
+        Expr::InSubquery { expr, subquery, .. } => {
+            let mut nested_scope = local_tables.clone();
+            nested_scope.extend(collect_table_aliases(subquery));
+            has_outer_references(expr, local_tables)
+                || plan_has_outer_references(subquery, &nested_scope)
+        }
+        Expr::Exists { subquery, .. } | Expr::ScalarSubquery(subquery) => {
+            let mut nested_scope = local_tables.clone();
+            nested_scope.extend(collect_table_aliases(subquery));
+            plan_has_outer_references(subquery, &nested_scope)
+        }
         _ => false,
     }
 }
@@ -668,9 +822,12 @@ pub fn evaluate_subquery_expr(
                 Ok(scalar) => {
                     // Use the same value for all rows
                     let num_rows = batch.num_rows();
-                    Ok(scalar_to_array(&scalar, num_rows))
+                    Ok(crate::planner::numeric::cast_strict(
+                        &scalar_to_array(&scalar, num_rows)?,
+                        &plan.schema().fields()[0].data_type,
+                    )?)
                 }
-                Err(QueryError::ColumnNotFound(_)) => {
+                Err(e) if matches!(e.root(), QueryError::ColumnNotFound(_)) => {
                     // Fallback: Correlated subquery (shouldn't happen with plan analysis)
                     execute_correlated_scalar_subquery(batch, plan, executor)
                 }
@@ -682,13 +839,21 @@ pub fn evaluate_subquery_expr(
             subquery,
             negated,
         } => {
-            // Execute the IN subquery once to get the set of values
+            let left_array =
+                super::filter::evaluate_expr_with_subquery(batch, expr, Some(executor))?;
+            if is_correlated_subquery(subquery) {
+                let mut results = Vec::with_capacity(batch.num_rows());
+                for row in 0..batch.num_rows() {
+                    let substituted = substitute_correlated_columns(subquery, batch, row)?;
+                    let right = executor.execute_in_subquery(&substituted)?;
+                    let membership =
+                        evaluate_in_subquery(&left_array.slice(row, 1), &right, *negated)?;
+                    let membership = membership.as_any().downcast_ref::<BooleanArray>().unwrap();
+                    results.push((!membership.is_null(0)).then(|| membership.value(0)));
+                }
+                return Ok(Arc::new(BooleanArray::from(results)));
+            }
             let in_values = executor.execute_in_subquery(subquery)?;
-
-            // Evaluate the left side expression
-            let left_array = super::filter::evaluate_expr(batch, expr)?;
-
-            // Check membership
             evaluate_in_subquery(&left_array, &in_values, *negated)
         }
         Expr::Exists { subquery, negated } => {
@@ -706,7 +871,7 @@ pub fn evaluate_subquery_expr(
                     let arr = BooleanArray::from(vec![result; batch.num_rows()]);
                     Ok(Arc::new(arr))
                 }
-                Err(QueryError::ColumnNotFound(_)) => {
+                Err(e) if matches!(e.root(), QueryError::ColumnNotFound(_)) => {
                     // Fallback: Correlated EXISTS subquery (shouldn't happen with plan analysis)
                     execute_correlated_exists_subquery(batch, subquery, *negated, executor)
                 }
@@ -740,7 +905,7 @@ fn execute_correlated_scalar_subquery(
 
     for row in 0..num_rows {
         // Extract correlation values for this row (used as cache key)
-        let correlation_values = executor.extract_correlation_values(batch, row);
+        let correlation_values = executor.extract_correlation_values(batch, row)?;
 
         // Check cache first
         if let Some(SubqueryResult::Scalar(cached)) =
@@ -753,10 +918,7 @@ fn execute_correlated_scalar_subquery(
         // Cache miss - execute the subquery
         let substituted_plan = substitute_correlated_columns(plan, batch, row)?;
 
-        let scalar = match executor.execute_scalar(&substituted_plan) {
-            Ok(scalar) => scalar,
-            Err(_e) => crate::planner::ScalarValue::Null,
-        };
+        let scalar = executor.execute_scalar(&substituted_plan)?;
 
         // Cache the result
         executor.set_correlated_cache(
@@ -768,7 +930,7 @@ fn execute_correlated_scalar_subquery(
     }
 
     // Convert results to an array
-    results_array_from_scalars(&results, num_rows)
+    results_array_from_scalars(&results, num_rows, &plan.schema().fields()[0].data_type)
 }
 
 /// Execute a correlated EXISTS subquery for each row in the batch
@@ -786,7 +948,7 @@ fn execute_correlated_exists_subquery(
 
     for row in 0..num_rows {
         // Extract correlation values for this row (used as cache key)
-        let correlation_values = executor.extract_correlation_values(batch, row);
+        let correlation_values = executor.extract_correlation_values(batch, row)?;
 
         // Check cache first
         if let Some(SubqueryResult::Boolean(cached)) =
@@ -799,9 +961,7 @@ fn execute_correlated_exists_subquery(
         // Cache miss - execute the subquery
         let substituted_plan = substitute_correlated_columns(subquery, batch, row)?;
 
-        let exists = executor
-            .execute_exists(&substituted_plan)
-            .unwrap_or_default();
+        let exists = executor.execute_exists(&substituted_plan)?;
 
         // Cache the result (before applying negation)
         executor.set_correlated_cache(
@@ -860,8 +1020,17 @@ fn substitute_correlated_columns(
         }
     }
 
-    // Recursively substitute column references in the plan
-    substitute_columns_in_plan(plan, &column_values, &local_tables)
+    // Do not execute/cache a plan with an unresolved outer scope. Nested
+    // correlation requires scope-aware substitution beyond the supported
+    // single-level expressions; refusing it is preferable to capturing a
+    // same-named column from the wrong row.
+    let substituted = substitute_columns_in_plan(plan, &column_values, &local_tables)?;
+    if is_correlated_subquery(&substituted) {
+        return Err(QueryError::NotImplemented(
+            "nested or unresolved correlated subquery scope".into(),
+        ));
+    }
+    Ok(substituted)
 }
 
 /// Recursively substitute column references with literals in a logical plan
@@ -1092,9 +1261,9 @@ fn substitute_columns_in_expr(
 
             if let Some(substituted) = column_values.get(&qualified_name) {
                 substituted.clone()
-            } else if let Some(substituted) = column_values.get(&col.name) {
-                substituted.clone()
             } else {
+                // A qualified outer reference must resolve that exact scope;
+                // matching only its bare name can capture a local column.
                 expr.clone()
             }
         }
@@ -1149,11 +1318,13 @@ fn substitute_columns_in_expr(
         Expr::Cast {
             expr: inner,
             data_type,
+            mode,
         } => {
             let new_expr = substitute_columns_in_expr(inner, column_values, local_tables);
             Expr::Cast {
                 expr: Box::new(new_expr),
                 data_type: data_type.clone(),
+                mode: *mode,
             }
         }
         Expr::Case {
@@ -1182,6 +1353,41 @@ fn substitute_columns_in_expr(
                 else_expr: new_else.map(Box::new),
             }
         }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(substitute_columns_in_expr(
+                expr,
+                column_values,
+                local_tables,
+            )),
+            list: list
+                .iter()
+                .map(|expr| substitute_columns_in_expr(expr, column_values, local_tables))
+                .collect(),
+            negated: *negated,
+        },
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
+            expr: Box::new(substitute_columns_in_expr(
+                expr,
+                column_values,
+                local_tables,
+            )),
+            low: Box::new(substitute_columns_in_expr(low, column_values, local_tables)),
+            high: Box::new(substitute_columns_in_expr(
+                high,
+                column_values,
+                local_tables,
+            )),
+            negated: *negated,
+        },
         // For other expressions, return as-is
         _ => expr.clone(),
     }
@@ -1193,147 +1399,69 @@ fn array_ref_to_scalar_value(array: &ArrayRef, index: usize) -> Result<ScalarVal
 }
 
 /// Convert a vector of scalars to an arrow array
-fn results_array_from_scalars(scalars: &[ScalarValue], num_rows: usize) -> Result<ArrayRef> {
+fn results_array_from_scalars(
+    scalars: &[ScalarValue],
+    num_rows: usize,
+    data_type: &arrow::datatypes::DataType,
+) -> Result<ArrayRef> {
     if scalars.is_empty() {
-        return Ok(Arc::new(arrow::array::NullArray::new(num_rows)));
+        return Ok(arrow::array::new_null_array(data_type, num_rows));
     }
-
-    // All scalars should have the same type
-    match &scalars[0] {
-        ScalarValue::Int64(_) => {
-            use arrow::array::Int64Array;
-            let values: Vec<Option<i64>> = scalars
-                .iter()
-                .map(|s| match s {
-                    ScalarValue::Int64(v) => Some(*v),
-                    ScalarValue::Null => None,
-                    _ => Some(0),
-                })
-                .collect();
-            Ok(Arc::new(Int64Array::from(values)))
-        }
-        ScalarValue::Float64(_) => {
-            use arrow::array::Float64Array;
-            let values: Vec<Option<f64>> = scalars
-                .iter()
-                .map(|s| match s {
-                    ScalarValue::Float64(v) => Some(v.0),
-                    ScalarValue::Null => None,
-                    _ => Some(0.0),
-                })
-                .collect();
-            Ok(Arc::new(Float64Array::from(values)))
-        }
-        ScalarValue::Boolean(_) => {
-            use arrow::array::BooleanArray;
-            let values: Vec<Option<bool>> = scalars
-                .iter()
-                .map(|s| match s {
-                    ScalarValue::Boolean(v) => Some(*v),
-                    ScalarValue::Null => None,
-                    _ => Some(false),
-                })
-                .collect();
-            Ok(Arc::new(BooleanArray::from(values)))
-        }
-        ScalarValue::Utf8(_) => {
-            use arrow::array::StringArray;
-            let values: Vec<Option<&str>> = scalars
-                .iter()
-                .map(|s| match s {
-                    ScalarValue::Utf8(v) => Some(v.as_str()),
-                    ScalarValue::Null => None,
-                    _ => Some(""),
-                })
-                .collect();
-            Ok(Arc::new(StringArray::from(values)))
-        }
-        _ => {
-            // Default to null array for unsupported types
-            Ok(Arc::new(arrow::array::NullArray::new(num_rows)))
-        }
-    }
+    let arrays = scalars
+        .iter()
+        .map(|scalar| crate::planner::numeric::cast_strict(&scalar_to_array(scalar, 1)?, data_type))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let references = arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+    Ok(arrow::compute::concat(&references)?)
 }
 
 /// Evaluate IN subquery by checking membership
 fn evaluate_in_subquery(left: &ArrayRef, right: &ArrayRef, negated: bool) -> Result<ArrayRef> {
-    use arrow::array::*;
+    use crate::planner::numeric::cast_strict;
+    use arrow::datatypes::DataType;
+    use arrow::row::{RowConverter, SortField};
+    use std::collections::HashSet;
 
-    let num_rows = left.len();
-    let mut result = Vec::with_capacity(num_rows);
-
-    for i in 0..num_rows {
-        let mut found = false;
-
-        if left.is_null(i) {
-            result.push(Some(false));
-            continue;
-        }
-
-        for j in 0..right.len() {
-            if right.is_null(j) {
-                continue;
-            }
-
-            let matches = match (left.data_type(), right.data_type()) {
-                (arrow::datatypes::DataType::Int64, arrow::datatypes::DataType::Int64) => {
-                    let left_arr = left.as_any().downcast_ref::<Int64Array>().unwrap();
-                    let right_arr = right.as_any().downcast_ref::<Int64Array>().unwrap();
-                    left_arr.value(i) == right_arr.value(j)
-                }
-                (arrow::datatypes::DataType::Int32, arrow::datatypes::DataType::Int32) => {
-                    let left_arr = left.as_any().downcast_ref::<Int32Array>().unwrap();
-                    let right_arr = right.as_any().downcast_ref::<Int32Array>().unwrap();
-                    left_arr.value(i) == right_arr.value(j)
-                }
-                (arrow::datatypes::DataType::Float64, arrow::datatypes::DataType::Float64) => {
-                    let left_arr = left.as_any().downcast_ref::<Float64Array>().unwrap();
-                    let right_arr = right.as_any().downcast_ref::<Float64Array>().unwrap();
-                    left_arr.value(i) == right_arr.value(j)
-                }
-                (arrow::datatypes::DataType::Utf8, arrow::datatypes::DataType::Utf8) => {
-                    let left_arr = left.as_any().downcast_ref::<StringArray>().unwrap();
-                    let right_arr = right.as_any().downcast_ref::<StringArray>().unwrap();
-                    left_arr.value(i) == right_arr.value(j)
-                }
-                _ => {
-                    return Err(QueryError::NotImplemented(format!(
-                        "IN subquery not supported for types: {:?} IN {:?}",
-                        left.data_type(),
-                        right.data_type()
-                    )))
-                }
-            };
-
-            if matches {
-                found = true;
-                break;
-            }
-        }
-
-        result.push(Some(if negated { !found } else { found }));
+    // The empty-set identity takes precedence over NULL on the left.
+    if right.is_empty() {
+        return Ok(Arc::new(BooleanArray::from(vec![negated; left.len()])));
     }
+    let decode = |array: &ArrayRef| -> Result<ArrayRef> {
+        if let DataType::Dictionary(_, value_type) = array.data_type() {
+            cast_strict(array, value_type)
+        } else {
+            Ok(array.clone())
+        }
+    };
+    let left = decode(left)?;
+    let right = decode(right)?;
+    let common = crate::planner::numeric::common_type(left.data_type(), right.data_type())?;
+    let left = cast_strict(&left, &common)?;
+    let right = cast_strict(&right, &common)?;
 
-    Ok(Arc::new(BooleanArray::from(result)))
-}
-
-/// Convert scalar value to array (for scalar subquery results)
-fn scalar_to_array(value: &ScalarValue, num_rows: usize) -> ArrayRef {
-    use arrow::array::*;
-
-    match value {
-        ScalarValue::Null => Arc::new(NullArray::new(num_rows)),
-        ScalarValue::Boolean(v) => Arc::new(BooleanArray::from(vec![*v; num_rows])),
-        ScalarValue::Int8(v) => Arc::new(Int8Array::from(vec![*v; num_rows])),
-        ScalarValue::Int16(v) => Arc::new(Int16Array::from(vec![*v; num_rows])),
-        ScalarValue::Int32(v) => Arc::new(Int32Array::from(vec![*v; num_rows])),
-        ScalarValue::Int64(v) => Arc::new(Int64Array::from(vec![*v; num_rows])),
-        ScalarValue::Float32(v) => Arc::new(Float32Array::from(vec![v.0; num_rows])),
-        ScalarValue::Float64(v) => Arc::new(Float64Array::from(vec![v.0; num_rows])),
-        ScalarValue::Utf8(v) => Arc::new(StringArray::from(vec![v.as_str(); num_rows])),
-        ScalarValue::Date32(v) => Arc::new(Date32Array::from(vec![*v; num_rows])),
-        _ => Arc::new(Int64Array::from(vec![0i64; num_rows])),
-    }
+    // Arrow row encoding retains exact integer/decimal domains and supports
+    // all scalar comparison types without converting them to floating point.
+    let converter = RowConverter::new(vec![SortField::new(common)])?;
+    let right_rows = converter.convert_columns(&[right.clone()])?;
+    let set: HashSet<_> = (0..right.len())
+        .filter(|&row| !right.is_null(row))
+        .map(|row| right_rows.row(row))
+        .collect();
+    let left_rows = converter.convert_columns(&[left.clone()])?;
+    let result: BooleanArray = (0..left.len())
+        .map(|row| {
+            if left.is_null(row) {
+                None
+            } else if set.contains(&left_rows.row(row)) {
+                Some(!negated)
+            } else if right.null_count() != 0 {
+                None
+            } else {
+                Some(negated)
+            }
+        })
+        .collect();
+    Ok(Arc::new(result))
 }
 
 #[cfg(test)]
@@ -1344,7 +1472,7 @@ mod tests {
     #[test]
     fn test_scalar_to_array_conversion() {
         let scalar = ScalarValue::Int64(42);
-        let arr = scalar_to_array(&scalar, 3);
+        let arr = scalar_to_array(&scalar, 3).unwrap();
         let int_arr = arr.as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(int_arr.len(), 3);
         assert_eq!(int_arr.value(0), 42);
@@ -1363,5 +1491,213 @@ mod tests {
         assert!(!bool_arr.value(0));
         assert!(!bool_arr.value(1));
         assert!(!bool_arr.value(2));
+    }
+}
+
+#[cfg(test)]
+mod scalar_trace_cache_contract_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[derive(Debug)]
+    struct CountingProvider {
+        batch: RecordBatch,
+        calls: AtomicUsize,
+        fail: bool,
+    }
+    impl TableProvider for CountingProvider {
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            self.batch.schema()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn scan(&self, projection: Option<&[usize]>) -> Result<Vec<RecordBatch>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(QueryError::Type("counting scalar source failure".into()));
+            }
+            Ok(vec![match projection {
+                Some(indices) => self.batch.project(indices)?,
+                None => self.batch.clone(),
+            }])
+        }
+    }
+    fn fixture(fail: bool) -> (Arc<CountingProvider>, SubqueryExecutor, LogicalPlan) {
+        let batch = RecordBatch::try_from_iter([(
+            "v",
+            Arc::new(arrow::array::Int64Array::from(vec![73])) as ArrayRef,
+        )])
+        .unwrap();
+        let provider = Arc::new(CountingProvider {
+            batch,
+            calls: AtomicUsize::new(0),
+            fail,
+        });
+        let executor = SubqueryExecutor::from_tables(HashMap::from([(
+            "counted".into(),
+            provider.clone() as Arc<dyn TableProvider>,
+        )]));
+        let plan = LogicalPlan::Scan(crate::planner::ScanNode {
+            table_name: "counted".into(),
+            schema: crate::planner::PlanSchema::new(vec![crate::planner::SchemaField::new(
+                "v",
+                arrow::datatypes::DataType::Int64,
+            )]),
+            projection: None,
+            filter: None,
+        });
+        (provider, executor, plan)
+    }
+    #[test]
+    fn scalar_miss_then_hit_reads_provider_once() {
+        let (provider, executor, plan) = fixture(false);
+        assert_eq!(
+            executor.execute_scalar(&plan).unwrap(),
+            ScalarValue::Int64(73)
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            executor.execute_scalar(&plan).unwrap(),
+            ScalarValue::Int64(73)
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn source_error_preserves_type_and_does_not_publish_scalar_cache() {
+        let (provider, executor, plan) = fixture(true);
+        for count in 1..=2 {
+            let error = executor.execute_scalar(&plan).unwrap_err();
+            assert!(
+                matches!(error, QueryError::Type(ref message) if message == "counting scalar source failure"),
+                "{error}"
+            );
+            assert_eq!(provider.calls.load(Ordering::SeqCst), count);
+            assert!(executor.inner.cache.lock().is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod subquery_projection_contract_tests {
+    use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use parking_lot::Mutex;
+
+    #[derive(Debug)]
+    struct ProjectedSource {
+        batch: RecordBatch,
+        projections: Mutex<Vec<Option<Vec<usize>>>>,
+    }
+    impl TableProvider for ProjectedSource {
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            self.batch.schema()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn scan(&self, projection: Option<&[usize]>) -> Result<Vec<RecordBatch>> {
+            self.projections
+                .lock()
+                .push(projection.map(<[usize]>::to_vec));
+            // Several batches exercise output collection and duplicate/NULL
+            // semantics independently of column-pruning plan text.
+            let batch = match projection {
+                Some(p) => self.batch.project(p)?,
+                None => self.batch.clone(),
+            };
+            Ok(vec![batch.slice(0, 2), batch.slice(2, 2)])
+        }
+    }
+    fn fixture(sql: &str) -> (Arc<ProjectedSource>, SubqueryExecutor, LogicalPlan) {
+        let batch = RecordBatch::try_from_iter([
+            (
+                "v",
+                Arc::new(Int64Array::from(vec![Some(7), Some(7), None, Some(90)])) as ArrayRef,
+            ),
+            (
+                "keep",
+                Arc::new(Int64Array::from(vec![1, 1, 1, 0])) as ArrayRef,
+            ),
+            (
+                "unused",
+                Arc::new(StringArray::from(vec!["payload"; 4])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let provider = Arc::new(ProjectedSource {
+            batch,
+            projections: Mutex::new(vec![]),
+        });
+        let mut context = crate::ExecutionContext::new();
+        context.register_table_provider("t", provider.clone());
+        let plan = context.logical_plan(sql).unwrap();
+        let executor = SubqueryExecutor::from_tables(HashMap::from([(
+            "t".into(),
+            provider.clone() as Arc<dyn TableProvider>,
+        )]));
+        (provider, executor, plan)
+    }
+    #[test]
+    fn scalar_prunes_unused_provider_columns_and_preserves_cache() {
+        let (source, executor, plan) = fixture("SELECT sum(v) FROM t WHERE keep > 0");
+        for _ in 0..2 {
+            assert_eq!(
+                executor.execute_scalar(&plan).unwrap(),
+                ScalarValue::Int64(14)
+            );
+        }
+        assert_eq!(*source.projections.lock(), vec![Some(vec![0, 1])]);
+    }
+    #[test]
+    fn in_prunes_unused_columns_without_losing_duplicates_or_nulls() {
+        let (source, executor, plan) = fixture("SELECT v FROM t WHERE keep > 0");
+        let result = executor.execute_in_subquery(&plan).unwrap();
+        let result = result.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(
+            result.iter().collect::<Vec<_>>(),
+            vec![Some(7), Some(7), None]
+        );
+        assert_eq!(*source.projections.lock(), vec![Some(vec![0, 1])]);
+    }
+    #[test]
+    fn exists_retains_filter_dependencies_and_empty_result() {
+        for (predicate, expected) in [("keep > 0", true), ("keep > 9", false)] {
+            let (source, executor, plan) = fixture(&format!("SELECT v FROM t WHERE {predicate}"));
+            assert_eq!(executor.execute_exists(&plan).unwrap(), expected);
+            assert_eq!(*source.projections.lock(), vec![Some(vec![0, 1])]);
+        }
+    }
+    #[test]
+    fn scalar_cardinality_error_survives_pruning() {
+        let (_, executor, plan) = fixture("SELECT v FROM t WHERE keep > 0");
+        assert!(executor
+            .execute_scalar(&plan)
+            .unwrap_err()
+            .to_string()
+            .contains("returned 3 rows"));
+    }
+
+    #[test]
+    fn already_pruned_subquery_keeps_provider_column_ordinals() {
+        use crate::optimizer::OptimizerRule;
+        let (source, executor, plan) = fixture("SELECT sum(v) FROM t WHERE keep > 0");
+        let plan = crate::optimizer::ProjectionPushdown
+            .optimize(&plan)
+            .unwrap();
+        assert_eq!(
+            executor.execute_scalar(&plan).unwrap(),
+            ScalarValue::Int64(14)
+        );
+        assert_eq!(*source.projections.lock(), vec![Some(vec![0, 1])]);
+    }
+
+    #[test]
+    fn nested_correlated_membership_keeps_outer_filter_only_column() {
+        let (_, executor, plan) =
+            fixture("SELECT sum(v) FROM t WHERE v IN (SELECT u.v FROM t u WHERE u.keep = t.keep)");
+        assert_eq!(
+            executor.execute_scalar(&plan).unwrap(),
+            ScalarValue::Int64(104)
+        );
     }
 }

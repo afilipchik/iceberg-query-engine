@@ -1,15 +1,17 @@
 # Query Engine
 
+Current engineering documentation: [architecture and tests](docs/architecture.md), [2026-09-05 audit and path forward](docs/project-audit-2026-09-05.md), and [Codex guide](AGENTS.md). Historical performance claims below should be read with the audit’s dataset, cache and correctness qualifications.
+
 A high-performance SQL query engine built from scratch in Rust, designed for analytical workloads on columnar data formats.
 
 ## Features
 
-- **Full SQL Support**: SELECT, JOIN, GROUP BY, ORDER BY, LIMIT, UNION, and more
+- **SQL Support**: SELECT, JOIN, GROUP BY, ORDER BY, LIMIT, UNION, and more
 - **Trino SQL Compatibility**: 100+ functions including math, string, date/time, regex, JSON, and aggregates
 - **Window Functions**: the full SQL-standard suite — ROW_NUMBER, RANK, DENSE_RANK, PERCENT_RANK, CUME_DIST, NTILE, LAG, LEAD, FIRST/LAST/NTH_VALUE, and COUNT/SUM/AVG/MIN/MAX over ROWS/RANGE frames, with PARTITION BY and named WINDOW clauses
 - **Grouping Extensions**: GROUPING SETS, ROLLUP, CUBE with GROUPING()
 - **Correlated Subqueries**: EXISTS, NOT EXISTS, IN, NOT IN, scalar subqueries
-- **TPC-H Benchmark**: All 22 TPC-H queries passing (160+ SQL tests total)
+- **TPC-H-derived workload**: 22 query shapes and independent regression fixtures; see the audit for dataset and oracle limitations
 - **Parquet Support**: Read Parquet files and directories directly
 - **Lance Support** (feature `lance`): Read and write Lance datasets, with version time travel and vector search
 - **Iceberg Support**: Read Apache Iceberg tables (v1/v2 metadata, Avro manifests, snapshot time travel)
@@ -17,7 +19,7 @@ A high-performance SQL query engine built from scratch in Rust, designed for ana
 - **Vector Search**: k-NN over embedding columns (`cosine_distance`, `l2_distance`, …), exact by default with opt-in IVF_PQ index pushdown
 - **Arrow Flight RPC**: standard gRPC endpoint (`serve --flight-bind`) — query from `pyarrow.flight` or any Flight client, single-node or distributed
 - **Web UI + query log**: every `serve` node keeps a bounded log of the statements it ran and serves a dependency-free UI at `/ui` — recent queries, per-query debugging detail (timings, memory, spill, pruning, plans, distribution, error), statistics, cluster, tables and a SQL console; the same facts are JSON at `/queries`, `/queries/{id}`, `/stats`, `/tables`
-- **GPU Aggregate Offload** (feature `gpu`): fused filter+aggregate kernels over VRAM-resident columns — 39-59x on Q6-shaped scans, 9-17x on Q1-shaped grouped aggregates (RTX 5090); first touch stays on the CPU and uploads in the background, so the GPU is never slower
+- **GPU Aggregate Offload** (feature `gpu`): fused filter+aggregate kernels over VRAM-resident columns — 39-59x on Q6-shaped scans, 9-17x on Q1-shaped grouped aggregates (RTX 5090); first touch stays on the CPU and uploads in the background, with benefit depending on query shape and residency
 - **Larger-Than-Memory**: Spillable operators for datasets exceeding available RAM
 - **Interactive REPL**: SQL shell with history and tab completion
 - **Streaming Execution**: Memory-efficient processing via Arrow RecordBatch streams
@@ -27,16 +29,23 @@ A high-performance SQL query engine built from scratch in Rust, designed for ana
 
 ### Prerequisites
 
-- Rust 1.70+ (install via [rustup](https://rustup.rs/))
+- Rust 1.93.0+ (install via [rustup](https://rustup.rs/))
 
 ### Build
 
+Local builds, tests, benchmarks and engine runs use the repository’s cgroup wrapper. It requires a working user systemd session; do not bypass it if unavailable. Its historical filename is `scripts/claude-safe-build.sh`. Before running commands, keep temporary files in repository scratch:
+
+```bash
+mkdir -p .scratch
+export TMPDIR="$PWD/.scratch"
+```
+
 ```bash
 # Debug build
-cargo build
+scripts/claude-safe-build.sh cargo build
 
 # Release build (recommended for benchmarks)
-cargo build --release
+scripts/claude-safe-build.sh cargo build --release
 ```
 
 The binary will be at `./target/release/query_engine`.
@@ -48,53 +57,60 @@ The Lance reader/writer is behind the `lance` feature and needs `protoc`
 
 ```bash
 # e.g. apt install protobuf-compiler / brew install protobuf
-cargo build --release --features lance
+scripts/claude-safe-build.sh cargo build --release --features lance
 # or point at a local protoc:
-PROTOC=/path/to/protoc cargo build --release --features lance
+PROTOC=/path/to/protoc scripts/claude-safe-build.sh cargo build --release --features lance
 ```
 
-The `lance` crate is pinned to 0.23.x deliberately — it is the last version
-built against arrow 53, the arrow major this engine uses. Do not bump it.
+The optional `lance` dependency is version 10 and shares Arrow 58 with the
+engine. Upgrade the Arrow/Lance family together and verify `Cargo.lock`.
 
 ## Testing
 
+Generate the fixture datasets on a clean checkout (after the scratch setup above):
+
+```bash
+scripts/claude-safe-build.sh cargo run --locked -- generate-parquet --sf 0.001 --output data/tpch-1mb
+scripts/claude-safe-build.sh cargo run --locked -- generate-parquet --sf 0.01 --output data/tpch-10mb
+```
+
 ```bash
 # Run all tests
-cargo test
+scripts/claude-safe-build.sh cargo test
 
 # Run specific module tests
-cargo test parser
-cargo test planner
-cargo test optimizer
-cargo test physical
-cargo test tpch
+scripts/claude-safe-build.sh cargo test parser
+scripts/claude-safe-build.sh cargo test planner
+scripts/claude-safe-build.sh cargo test optimizer
+scripts/claude-safe-build.sh cargo test physical
+scripts/claude-safe-build.sh cargo test tpch
 
 # Run with output
-cargo test -- --nocapture
+scripts/claude-safe-build.sh cargo test -- --nocapture
 ```
 
 ## Quick Start
 
 ### 1. Generate Test Data
 
-Generate TPC-H benchmark data in Parquet format:
+Generate the project's TPC-H-derived regression data in Parquet format:
 
 ```bash
 # Small dataset (~10MB)
-./target/release/query_engine generate-parquet --sf 0.01 --output ./data/tpch-10mb
+scripts/claude-safe-build.sh ./target/release/query_engine generate-parquet --sf 0.01 --output ./data/tpch-10mb
 
 # Medium dataset (~100MB)
-./target/release/query_engine generate-parquet --sf 0.1 --output ./data/tpch-100mb
+scripts/claude-safe-build.sh ./target/release/query_engine generate-parquet --sf 0.1 --output ./data/tpch-100mb
 
 # Large dataset (~1GB)
-./target/release/query_engine generate-parquet --sf 1.0 --output ./data/tpch-1gb
+scripts/claude-safe-build.sh ./target/release/query_engine generate-parquet --sf 1.0 --output ./data/tpch-1gb
 ```
 
 ### 2. Start Interactive SQL Shell
 
 ```bash
 # Start REPL with TPC-H tables preloaded
-./target/release/query_engine repl --tpch ./data/tpch-10mb
+scripts/claude-safe-build.sh ./target/release/query_engine repl --tpch ./data/tpch-10mb
 ```
 
 Once in the REPL:
@@ -146,39 +162,39 @@ sql> .quit
 
 ```bash
 # Run TPC-H query #1
-./target/release/query_engine query --num 1 --sf 0.01
+scripts/claude-safe-build.sh ./target/release/query_engine query --num 1 --sf 0.01
 
 # Show query plan
-./target/release/query_engine query --num 1 --sf 0.01 --plan
+scripts/claude-safe-build.sh ./target/release/query_engine query --num 1 --sf 0.01 --plan
 ```
 
 ### Run Custom SQL
 
 ```bash
-./target/release/query_engine sql "SELECT * FROM lineitem LIMIT 10" --sf 0.01
+scripts/claude-safe-build.sh ./target/release/query_engine sql "SELECT * FROM lineitem LIMIT 10" --sf 0.01
 ```
 
 ### Run Benchmark
 
 ```bash
 # Benchmark with in-memory data
-./target/release/query_engine benchmark --sf 0.01 --iterations 3
+scripts/claude-safe-build.sh ./target/release/query_engine benchmark --sf 0.01 --iterations 3
 
 # Benchmark with Parquet files
-./target/release/query_engine benchmark-parquet --path ./data/tpch-100mb --iterations 3
+scripts/claude-safe-build.sh ./target/release/query_engine benchmark-parquet --path ./data/tpch-100mb --iterations 3
 ```
 
 ### Load Parquet Files
 
 ```bash
 # Load single file
-./target/release/query_engine load-parquet \
+scripts/claude-safe-build.sh ./target/release/query_engine load-parquet \
     --path ./data/orders.parquet \
     --name orders \
     --query "SELECT COUNT(*) FROM orders"
 
 # Load directory
-./target/release/query_engine load-parquet \
+scripts/claude-safe-build.sh ./target/release/query_engine load-parquet \
     --path ./data/tpch-10mb \
     --name lineitem \
     --query "SELECT * FROM lineitem LIMIT 5"
@@ -190,26 +206,26 @@ Read, write, time-travel and benchmark Lance datasets:
 
 ```bash
 # Load a Lance dataset and query it
-./target/release/query_engine load-lance \
+scripts/claude-safe-build.sh ./target/release/query_engine load-lance \
     --path ./data/orders.lance --name orders \
     --query "SELECT COUNT(*) FROM orders"
 
 # Convert Parquet to Lance, streamed (never materializes either side)
-./target/release/query_engine write-lance \
+scripts/claude-safe-build.sh ./target/release/query_engine write-lance \
     --from-parquet ./data/tpch-10mb --out ./data/tpch-10mb-lance
 
 # CREATE TABLE AS SELECT, in effect: run SQL and write the result
-./target/release/query_engine write-lance \
+scripts/claude-safe-build.sh ./target/release/query_engine write-lance \
     --sql "SELECT * FROM orders WHERE o_totalprice > 100000" \
     --tables ./data/tpch-10mb --out ./data/big_orders.lance
 
 # Time travel: list versions, query an old one
-./target/release/query_engine lance-versions --path ./data/orders.lance
-./target/release/query_engine load-lance --path ./data/orders.lance \
+scripts/claude-safe-build.sh ./target/release/query_engine lance-versions --path ./data/orders.lance
+scripts/claude-safe-build.sh ./target/release/query_engine load-lance --path ./data/orders.lance \
     --name o --version 1 --query "SELECT COUNT(*) FROM o"
 
 # TPC-H benchmark over Lance datasets
-./target/release/query_engine benchmark-lance \
+scripts/claude-safe-build.sh ./target/release/query_engine benchmark-lance \
     --path ./data/tpch-10mb-lance --iterations 3
 ```
 
@@ -233,7 +249,7 @@ same engine, reachable from any Flight client with zero custom glue:
 ```bash
 # Flight listens on the HTTP port + 1 by default (here: 7778).
 # --flight-bind <addr> overrides it; --flight-bind none disables it.
-./target/release/query_engine serve --bind 0.0.0.0:7777 --data ./data/tpch-10mb
+scripts/claude-safe-build.sh ./target/release/query_engine serve --bind 0.0.0.0:7777 --data ./data/tpch-10mb
 ```
 
 ```python
@@ -275,7 +291,7 @@ running queries are visible, and completed with everything the engine knows:
 - failures: the `QueryError` variant name and message
 
 ```bash
-./target/release/query_engine serve --bind 0.0.0.0:7777 --data ./data/tpch-10mb
+scripts/claude-safe-build.sh ./target/release/query_engine serve --bind 0.0.0.0:7777 --data ./data/tpch-10mb
 open http://127.0.0.1:7777/ui               # Overview · Queries · Statistics · Cluster · Tables · SQL
 
 curl 'http://127.0.0.1:7777/queries?limit=20&state=failed'   # newest first
@@ -354,23 +370,38 @@ tests/
 | `apache-avro` | Iceberg manifest lists/files |
 | `lance` | Lance dataset reader/writer (optional, `--features lance`) |
 
-## Performance
+## Benchmark evidence
 
-TPC-H SF=100 (100GB), warm, all 22 queries, validated cell-exact against
-DuckDB:
+The [2026-09-05 baseline](docs/benchmark-baseline-sf10-2026-09-05.md) covers raw Parquet, decoded IPC, native tables, Iceberg, Lance and GPU-assisted execution, plus a GPU CPU control. All **1,540 measured executions** passed typed validation and time gates, with matched CPU affinity and ten samples per query.
+
+The initial [canonical SF1 experiment](docs/canonical-sf1-findings-2026-09-05.md)
+validated only **6 of 22 queries**. The [systemic engine fixes](docs/systemic-correctness-fixes-2026-09-05.md)
+now validate **22 of 22**, across 132 paired samples with exact typed comparisons
+and fresh time gates. Corrected raw-Parquet SF1 suite time is **2.140× DuckDB**.
+The SF10 figures above and below precede these production changes; provider/GPU
+certification on the updated engine remains follow-up work. Use the
+[versioned benchmark commands](scripts/benchmark/README.md) for new experiments.
+
+Engine/DuckDB suite ratios: **1.638× raw Parquet**, **1.150× decoded IPC/Parquet**, **1.700× native/native**, **1.288× Iceberg/Iceberg**, **1.016× direct Lance/Lance**, and **1.089× GPU-assisted IPC/Parquet**. The GPU CPU control is 1.151×; only Q1 and Q6 executed on device. See the report for residency costs, reference differences and per-query dispersion.
+
+## Historical performance measurements
+
+These August measurements use the project's custom TPC-H-derived data and SQL. Reported correctness means agreement under the historical comparator, which is not exact typed equality. Decoded IPC-cache results use a different storage premise from raw Parquet. See the [audit's benchmark analysis](docs/project-audit-2026-09-05.md#2-what-the-performance-evidence-actually-says) before comparing or citing these numbers.
+
+Custom workload SF=100 (nominal 100GB), warm, all 22 queries, reported agreement against DuckDB:
 
 ```
 Parquet:                  65.1s  (DuckDB on the same files: 40.1s)
 Parquet + IPC sidecars:   47.1s  (0.70x DuckDB native tables)
-Lance:                   ~101s   (DuckDB's lance extension: 69.1s)
+Lance:                   ~101s   (DuckDB via Arrow integration: 69.1s)
 ```
 
 *Measured 2026-08 on an i9-13900KF (8P+16E cores), parallel execution.
 See `CLAUDE.md` for the full benchmark history and methodology.*
 
-### TPC-H SF=1 (measured 2026-08-21)
+### Custom TPC-H-derived SF=1 (measured 2026-08-21)
 
-All 22 queries, warm, best of 3 per query, **results cell-exact vs DuckDB**.
+All 22 queries, warm, best of 3 per query, with reported agreement under the historical comparator.
 Both engines read the identical parquet files ("same parquet"); the native
 column is DuckDB's best case (data pre-loaded into in-memory tables, decode
 excluded). DuckDB 1.4.4, 16 threads.

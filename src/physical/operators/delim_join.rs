@@ -1,4 +1,8 @@
-//! DelimJoin and DelimGet physical operators for efficient correlated subquery execution
+//! Quarantined DelimJoin execution and retained DelimGet/plan interfaces.
+//!
+//! DelimJoinExec refuses execution until exact typed equality, NULL/scalar
+//! semantics, complete partition consumption and memory ownership are provided.
+//! The historical helper implementation below is not a supported execution path.
 //!
 //! DelimJoin is a specialized join that:
 //! 1. Collects all rows from the outer (left) side
@@ -20,7 +24,6 @@ use arrow::compute;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
-use futures::StreamExt;
 use hashbrown::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, RwLock};
@@ -149,65 +152,13 @@ impl PhysicalOperator for DelimJoinExec {
     async fn execute(&self, partition: usize) -> Result<BoxStream<'static, Result<RecordBatch>>> {
         crate::physical::check_partition(self, partition)?;
 
-        // Step 1: Collect all rows from the outer side
-        let mut outer_batches = Vec::new();
-        let outer_stream = self.left.execute(0).await?;
-        let collected: Vec<Result<RecordBatch>> = outer_stream.collect().await;
-        for batch_result in collected {
-            outer_batches.push(batch_result?);
-        }
-
-        if outer_batches.is_empty() {
-            return Ok(Box::pin(stream::empty()));
-        }
-
-        // Step 2: Extract distinct correlation values
-        // Pass the `on` conditions so we can name the columns correctly for the inner side
-        let distinct_batch =
-            extract_distinct_values(&outer_batches, &self.delim_columns, &self.on)?;
-
-        // Step 3: Store in shared state for DelimGet to use
-        self.delim_state
-            .set_distinct_values(distinct_batch.clone(), distinct_batch.schema());
-
-        // Step 4: Execute the inner side (which will use DelimGet with our values)
-        let mut inner_batches = Vec::new();
-        let inner_stream = self.right.execute(0).await?;
-        let collected: Vec<Result<RecordBatch>> = inner_stream.collect().await;
-        for batch_result in collected {
-            inner_batches.push(batch_result?);
-        }
-
-        // Step 5: Build hash table from inner results
-        let inner_hash = build_hash_table(&inner_batches, &self.on)?;
-
-        // Step 6: Probe and produce output based on join type
-        let result_batches = match self.join_type {
-            JoinType::Semi => {
-                produce_semi_output(&outer_batches, &inner_hash, &self.on, &self.schema)?
-            }
-            JoinType::Anti => {
-                produce_anti_output(&outer_batches, &inner_hash, &self.on, &self.schema)?
-            }
-            JoinType::Single => produce_single_output(
-                &outer_batches,
-                &inner_batches,
-                &inner_hash,
-                &self.on,
-                &self.schema,
-            )?,
-            JoinType::Mark => {
-                produce_mark_output(&outer_batches, &inner_hash, &self.on, &self.schema)?
-            }
-            _ => {
-                return Err(QueryError::NotImplemented(format!(
-                    "DelimJoin with {:?} not supported",
-                    self.join_type
-                )))
-            }
-        };
-
-        Ok(Box::pin(stream::iter(result_batches.into_iter().map(Ok))))
+        // This operator used hashes as semantic equality, omitted child
+        // partitions and did not enforce scalar cardinality/NULL semantics.
+        // Refuse before reading children or publishing mutable DelimState;
+        // repairing only partition consumption would still return wrong data.
+        Err(QueryError::NotImplemented(
+            "DelimJoin exact dependent-join contract is not implemented: typed equality, NULL/scalar semantics, complete partitions and query memory ownership are required".into(),
+        ))
     }
 }
 

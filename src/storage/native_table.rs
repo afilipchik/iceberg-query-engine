@@ -114,8 +114,8 @@
 //! `NativeStreamingScanExec` (`src/physical/operators/native_scan.rs`)
 //! whenever this provider's [`scan_budget_exceeded`](NativeTable::
 //! scan_budget_exceeded) is true — segment-at-a-time streaming through the
-//! same `ipc_cache::read_row_group` reader, deletion-vector-filtered
-//! ([`read_segment_batches`](NativeTable::read_segment_batches)) and
+//! incremental IPC reader, deletion-vector-filtered through
+//! `open_segment_batches` and
 //! segment-pruned ([`streaming_segment_ids`](NativeTable::
 //! streaming_segment_ids)), feeding the always-spillable aggregate/join
 //! operators — so the query COMPLETES by spilling instead of refusing
@@ -133,7 +133,7 @@ use crate::planner::{BinaryOp, Expr, ScalarValue, UnaryOp};
 use crate::storage::ipc_cache;
 use crate::storage::native_manifest::{self, ColumnStats, NativeManifest, Segment};
 use crate::storage::row_group_pruning::{eval_range, eval_range_f64, flip_op};
-use arrow::array::{ArrayRef, BooleanArray};
+use arrow::array::BooleanArray;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -369,6 +369,16 @@ impl NativeTable {
         segment_id: u32,
         projection: Option<&[usize]>,
     ) -> Result<Vec<RecordBatch>> {
+        self.open_segment_batches(segment_id, projection)?.collect()
+    }
+
+    /// Open one immutable segment; decode and deletion-filter only on each pull.
+    /// Metadata and dictionaries remain reader-owned, not query-pool admitted.
+    pub(crate) fn open_segment_batches(
+        &self,
+        segment_id: u32,
+        projection: Option<&[usize]>,
+    ) -> Result<NativeSegmentReader> {
         let seg = self
             .manifest
             .segments
@@ -380,12 +390,12 @@ impl NativeTable {
                     self.dir.display()
                 ))
             })?;
-        let batches = ipc_cache::read_row_group(&self.dir, seg.id as usize, projection, None)?;
-        if seg.deleted_rows.is_empty() {
-            Ok(batches)
-        } else {
-            filter_deleted_rows(batches, &seg.deleted_rows)
-        }
+        Ok(NativeSegmentReader {
+            batches: ipc_cache::open_row_group(&self.dir, seg.id as usize, projection)?,
+            deleted_rows: seg.deleted_rows.clone(),
+            selection: DeletionCursor::default(),
+            failed: false,
+        })
     }
 
     /// Segments this provider actually reads, in canonical (id-ascending)
@@ -529,40 +539,75 @@ fn table_statistics_from(
 /// passed through completely unchanged (zero-copy, no `compute::filter`
 /// call at all) — the common case for a lightly-deleted segment spread
 /// across many batches.
+#[derive(Default)]
+struct DeletionCursor {
+    offset: u64,
+    cursor: usize,
+}
+
+impl DeletionCursor {
+    fn apply(&mut self, batch: RecordBatch, deleted_rows: &[u32]) -> Result<RecordBatch> {
+        let n = batch.num_rows();
+        let end = self
+            .offset
+            .checked_add(n as u64)
+            .ok_or_else(|| QueryError::Execution("native deletion row offset overflow".into()))?;
+        while self.cursor < deleted_rows.len() && u64::from(deleted_rows[self.cursor]) < self.offset
+        {
+            self.cursor += 1;
+        }
+        if self.cursor >= deleted_rows.len() || u64::from(deleted_rows[self.cursor]) >= end {
+            self.offset = end;
+            return Ok(batch);
+        }
+        let mut keep = vec![true; n];
+        while self.cursor < deleted_rows.len() && u64::from(deleted_rows[self.cursor]) < end {
+            keep[(u64::from(deleted_rows[self.cursor]) - self.offset) as usize] = false;
+            self.cursor += 1;
+        }
+        let mask = BooleanArray::from(keep);
+        let result = arrow::compute::filter_record_batch(&batch, &mask)?;
+        self.offset = end;
+        Ok(result)
+    }
+}
+
+/// Incremental source state never retains deletion-filtered survivor batches.
+/// Callers retaining outputs still own those allocations; this is not admission.
+pub(crate) struct NativeSegmentReader {
+    batches: ipc_cache::RowGroupReader,
+    deleted_rows: Vec<u32>,
+    selection: DeletionCursor,
+    failed: bool,
+}
+
+impl Iterator for NativeSegmentReader {
+    type Item = Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        let result = self
+            .batches
+            .next()?
+            .and_then(|batch| self.selection.apply(batch, &self.deleted_rows));
+        if result.is_err() {
+            self.failed = true;
+        }
+        Some(result)
+    }
+}
+
 fn filter_deleted_rows(
     batches: Vec<RecordBatch>,
     deleted_rows: &[u32],
 ) -> Result<Vec<RecordBatch>> {
-    let mut out = Vec::with_capacity(batches.len());
-    let mut local_offset: u32 = 0;
-    let mut cursor = 0usize;
-    for batch in batches {
-        let n = batch.num_rows() as u32;
-        let end = local_offset + n;
-        while cursor < deleted_rows.len() && deleted_rows[cursor] < local_offset {
-            cursor += 1;
-        }
-        if cursor >= deleted_rows.len() || deleted_rows[cursor] >= end {
-            // No deleted row falls inside this batch's range.
-            out.push(batch);
-            local_offset = end;
-            continue;
-        }
-        let mut keep = vec![true; n as usize];
-        while cursor < deleted_rows.len() && deleted_rows[cursor] < end {
-            keep[(deleted_rows[cursor] - local_offset) as usize] = false;
-            cursor += 1;
-        }
-        let mask = BooleanArray::from(keep);
-        let cols: Result<Vec<ArrayRef>> = batch
-            .columns()
-            .iter()
-            .map(|c| arrow::compute::filter(c.as_ref(), &mask).map_err(Into::into))
-            .collect();
-        out.push(RecordBatch::try_new(batch.schema(), cols?)?);
-        local_offset = end;
-    }
-    Ok(out)
+    let mut selection = DeletionCursor::default();
+    batches
+        .into_iter()
+        .map(|batch| selection.apply(batch, deleted_rows))
+        .collect()
 }
 
 // ============================================================================
@@ -680,7 +725,9 @@ fn check_comparison(
         ScalarValue::Int8(v) => check_i64_stats(cs, effective_op, *v as i64),
         ScalarValue::Date32(v) => check_i64_stats(cs, effective_op, *v as i64),
         ScalarValue::Date64(v) => check_i64_stats(cs, effective_op, *v),
-        ScalarValue::Timestamp(v) => check_i64_stats(cs, effective_op, *v),
+        // ColumnStats does not record timestamp units/timezone. Raw counts
+        // cannot safely prune against a differently typed scalar.
+        ScalarValue::Timestamp(_) => true,
         ScalarValue::Float64(v) => check_f64_stats(cs, effective_op, v.into_inner()),
         ScalarValue::Float32(v) => check_f64_stats(cs, effective_op, v.into_inner() as f64),
         // Utf8/Boolean/Decimal128/UInt*/List/etc: `ColumnStats` has no
@@ -1025,6 +1072,131 @@ mod tests {
         publish_table_dir(&staging, final_dir).unwrap();
 
         (schema, vec![batch0, batch1])
+    }
+
+    #[test]
+    fn incremental_segment_deletions_preserve_snapshot_offsets_and_output_lifetime() {
+        use arrow::array::Array;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t");
+        std::fs::create_dir(&path).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("label", DataType::Utf8, true),
+        ]));
+        let segment_path = path.join("rg_00000.arrow");
+        let file = std::fs::File::create(&segment_path).unwrap();
+        let mut writer = arrow::ipc::writer::FileWriter::try_new(file, &schema).unwrap();
+        const N: u32 = 4096;
+        // Empty physical batches must not advance deletion offsets.
+        for (start, len) in [(0, N), (N, 0), (N, N), (2 * N, N)] {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(
+                        (start..start + len).map(i64::from),
+                    )),
+                    Arc::new(StringArray::from_iter((start..start + len).map(|id| {
+                        if id % 11 == 0 {
+                            None
+                        } else {
+                            Some(format!("label-{}", id % 13))
+                        }
+                    }))),
+                ],
+            )
+            .unwrap();
+            writer.write(&batch).unwrap();
+        }
+        writer.finish().unwrap();
+        drop(writer);
+        let deleted: Vec<u32> = (0..3 * N).filter(|id| *id < N || id % 7 == 0).collect();
+        let segment = Segment {
+            id: 0,
+            path: Segment::expected_file_name(0),
+            row_count: u64::from(3 * N),
+            byte_size: std::fs::metadata(&segment_path).unwrap().len(),
+            column_stats: BTreeMap::new(),
+            deleted_rows: deleted,
+        };
+        let manifest = NativeManifest::build(
+            &schema,
+            NativeManifest::generate_table_id(),
+            1,
+            vec![segment],
+            1_700_000_000_000,
+        )
+        .unwrap();
+        write_manifest(&path, &manifest).unwrap();
+        let mut table = NativeTable::try_new(&path).unwrap();
+        let mut reader = table.open_segment_batches(0, None).unwrap();
+        // An already-open reader retains the exact deletion snapshot.
+        table.manifest.segments[0].deleted_rows.clear();
+        drop(table);
+        assert_eq!(reader.next().unwrap().unwrap().num_rows(), 0);
+        assert_eq!(reader.next().unwrap().unwrap().num_rows(), 0);
+        let mut actual = Vec::new();
+        let first = reader.next().unwrap().unwrap();
+        let detached = first.column(1).clone();
+        let weak_ids = Arc::downgrade(first.column(0));
+        let check = |batch: &RecordBatch, actual: &mut Vec<i64>| {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let labels = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                let id = ids.value(row);
+                actual.push(id);
+                assert_eq!(labels.is_null(row), id % 11 == 0);
+                if !labels.is_null(row) {
+                    assert_eq!(labels.value(row), format!("label-{}", id % 13));
+                }
+            }
+        };
+        check(&first, &mut actual);
+        let detached_len = detached.len();
+        drop(first);
+        assert!(
+            weak_ids.upgrade().is_none(),
+            "reader retained filtered output"
+        );
+        for batch in reader.by_ref() {
+            check(&batch.unwrap(), &mut actual);
+        }
+        assert!(reader.next().is_none());
+        drop(reader);
+        assert_eq!(detached.len(), detached_len);
+        assert_eq!(
+            actual,
+            (N..3 * N)
+                .filter(|id| id % 7 != 0)
+                .map(i64::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn deletion_cursor_preserves_zero_column_rows_and_large_offsets() {
+        let batch = RecordBatch::try_new_with_options(
+            Arc::new(Schema::empty()),
+            vec![],
+            &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(3)),
+        )
+        .unwrap();
+        let mut cursor = DeletionCursor {
+            offset: u64::from(u32::MAX) - 1,
+            cursor: 0,
+        };
+        let out = cursor.apply(batch, &[u32::MAX]).unwrap();
+        assert_eq!(out.num_rows(), 2);
+        assert_eq!(out.num_columns(), 0);
+        assert_eq!(cursor.offset, u64::from(u32::MAX) + 2);
     }
 
     #[test]

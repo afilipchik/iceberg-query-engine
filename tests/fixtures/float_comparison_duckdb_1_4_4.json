@@ -1,0 +1,781 @@
+{
+  "duckdb_version": "1.4.4",
+  "operators": [
+    "=",
+    "<>",
+    "<",
+    "<=",
+    ">",
+    ">="
+  ],
+  "cases": [
+    {
+      "left": "-0.0",
+      "right": "-0.0",
+      "expected": [
+        true,
+        false,
+        false,
+        true,
+        false,
+        true
+      ]
+    },
+    {
+      "left": "-0.0",
+      "right": "0.0",
+      "expected": [
+        true,
+        false,
+        false,
+        true,
+        false,
+        true
+      ]
+    },
+    {
+      "left": "-0.0",
+      "right": "NaN",
+      "expected": [
+        false,
+        true,
+        true,
+        true,
+        false,
+        false
+      ]
+    },
+    {
+      "left": "-0.0",
+      "right": "Infinity",
+      "expected": [
+        false,
+        true,
+        true,
+        true,
+        false,
+        false
+      ]
+    },
+    {
+      "left": "-0.0",
+      "right": "-Infinity",
+      "expected": [
+        false,
+        true,
+        false,
+        false,
+        true,
+        true
+      ]
+    },
+    {
+      "left": "-0.0",
+      "right": "1.0",
+      "expected": [
+        false,
+        true,
+        true,
+        true,
+        false,
+        false
+      ]
+    },
+    {
+      "left": "-0.0",
+      "right": "-1.0",
+      "expected": [
+        false,
+        true,
+        false,
+        false,
+        true,
+        true
+      ]
+    },
+    {
+      "left": "-0.0",
+      "right": null,
+      "expected": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "left": "0.0",
+      "right": "-0.0",
+      "expected": [
+        true,
+        false,
+        false,
+        true,
+        false,
+        true
+      ]
+    },
+    {
+      "left": "0.0",
+      "right": "0.0",
+      "expected": [
+        true,
+        false,
+        false,
+        true,
+        false,
+        true
+      ]
+    },
+    {
+      "left": "0.0",
+      "right": "NaN",
+      "expected": [
+        false,
+        true,
+        true,
+        true,
+        false,
+        false
+      ]
+    },
+    {
+      "left": "0.0",
+      "right": "Infinity",
+      "expected": [
+        false,
+        true,
+        true,
+        true,
+        false,
+        false
+      ]
+    },
+    {
+      "left": "0.0",
+      "right": "-Infinity",
+      "expected": [
+        false,
+        true,
+        false,
+        false,
+        true,
+        true
+      ]
+    },
+    {
+      "left": "0.0",
+      "right": "1.0",
+      "expected": [
+        false,
+        true,
+        true,
+        true,
+        false,
+        false
+      ]
+    },
+    {
+      "left": "0.0",
+      "right": "-1.0",
+      "expected": [
+        false,
+        true,
+        false,
+        false,
+        true,
+        true
+      ]
+    },
+    {
+      "left": "0.0",
+      "right": null,
+      "expected": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "left": "NaN",
+      "right": "-0.0",
+      "expected": [
+        false,
+        true,
+        false,
+        false,
+        true,
+        true
+      ]
+    },
+    {
+      "left": "NaN",
+      "right": "0.0",
+      "expected": [
+        false,
+        true,
+        false,
+        false,
+        true,
+        true
+      ]
+    },
+    {
+      "left": "NaN",
+      "right": "NaN",
+      "expected": [
+        true,
+        false,
+        false,
+        true,
+        false,
+        true
+      ]
+    },
+    {
+      "left": "NaN",
+      "right": "Infinity",
+      "expected": [
+        false,
+        true,
+        false,
+        false,
+        true,
+        true
+      ]
+    },
+    {
+      "left": "NaN",
+      "right": "-Infinity",
+      "expected": [
+        false,
+        true,
+        false,
+        false,
+        true,
+        true
+      ]
+    },
+    {
+      "left": "NaN",
+      "right": "1.0",
+      "expected": [
+        false,
+        true,
+        false,
+        false,
+        true,
+        true
+      ]
+    },
+    {
+      "left": "NaN",
+      "right": "-1.0",
+      "expected": [
+        false,
+        true,
+        false,
+        false,
+        true,
+        true
+      ]
+    },
+    {
+      "left": "NaN",
+      "right": null,
+      "expected": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "left": "Infinity",
+      "right": "-0.0",
+      "expected": [
+        false,
+        true,
+        false,
+        false,
+        true,
+        true
+      ]
+    },
+    {
+      "left": "Infinity",
+      "right": "0.0",
+      "expected": [
+        false,
+        true,
+        false,
+        false,
+        true,
+        true
+      ]
+    },
+    {
+      "left": "Infinity",
+      "right": "NaN",
+      "expected": [
+        false,
+        true,
+        true,
+        true,
+        false,
+        false
+      ]
+    },
+    {
+      "left": "Infinity",
+      "right": "Infinity",
+      "expected": [
+        true,
+        false,
+        false,
+        true,
+        false,
+        true
+      ]
+    },
+    {
+      "left": "Infinity",
+      "right": "-Infinity",
+      "expected": [
+        false,
+        true,
+        false,
+        false,
+        true,
+        true
+      ]
+    },
+    {
+      "left": "Infinity",
+      "right": "1.0",
+      "expected": [
+        false,
+        true,
+        false,
+        false,
+        true,
+        true
+      ]
+    },
+    {
+      "left": "Infinity",
+      "right": "-1.0",
+      "expected": [
+        false,
+        true,
+        false,
+        false,
+        true,
+        true
+      ]
+    },
+    {
+      "left": "Infinity",
+      "right": null,
+      "expected": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "left": "-Infinity",
+      "right": "-0.0",
+      "expected": [
+        false,
+        true,
+        true,
+        true,
+        false,
+        false
+      ]
+    },
+    {
+      "left": "-Infinity",
+      "right": "0.0",
+      "expected": [
+        false,
+        true,
+        true,
+        true,
+        false,
+        false
+      ]
+    },
+    {
+      "left": "-Infinity",
+      "right": "NaN",
+      "expected": [
+        false,
+        true,
+        true,
+        true,
+        false,
+        false
+      ]
+    },
+    {
+      "left": "-Infinity",
+      "right": "Infinity",
+      "expected": [
+        false,
+        true,
+        true,
+        true,
+        false,
+        false
+      ]
+    },
+    {
+      "left": "-Infinity",
+      "right": "-Infinity",
+      "expected": [
+        true,
+        false,
+        false,
+        true,
+        false,
+        true
+      ]
+    },
+    {
+      "left": "-Infinity",
+      "right": "1.0",
+      "expected": [
+        false,
+        true,
+        true,
+        true,
+        false,
+        false
+      ]
+    },
+    {
+      "left": "-Infinity",
+      "right": "-1.0",
+      "expected": [
+        false,
+        true,
+        true,
+        true,
+        false,
+        false
+      ]
+    },
+    {
+      "left": "-Infinity",
+      "right": null,
+      "expected": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "left": "1.0",
+      "right": "-0.0",
+      "expected": [
+        false,
+        true,
+        false,
+        false,
+        true,
+        true
+      ]
+    },
+    {
+      "left": "1.0",
+      "right": "0.0",
+      "expected": [
+        false,
+        true,
+        false,
+        false,
+        true,
+        true
+      ]
+    },
+    {
+      "left": "1.0",
+      "right": "NaN",
+      "expected": [
+        false,
+        true,
+        true,
+        true,
+        false,
+        false
+      ]
+    },
+    {
+      "left": "1.0",
+      "right": "Infinity",
+      "expected": [
+        false,
+        true,
+        true,
+        true,
+        false,
+        false
+      ]
+    },
+    {
+      "left": "1.0",
+      "right": "-Infinity",
+      "expected": [
+        false,
+        true,
+        false,
+        false,
+        true,
+        true
+      ]
+    },
+    {
+      "left": "1.0",
+      "right": "1.0",
+      "expected": [
+        true,
+        false,
+        false,
+        true,
+        false,
+        true
+      ]
+    },
+    {
+      "left": "1.0",
+      "right": "-1.0",
+      "expected": [
+        false,
+        true,
+        false,
+        false,
+        true,
+        true
+      ]
+    },
+    {
+      "left": "1.0",
+      "right": null,
+      "expected": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "left": "-1.0",
+      "right": "-0.0",
+      "expected": [
+        false,
+        true,
+        true,
+        true,
+        false,
+        false
+      ]
+    },
+    {
+      "left": "-1.0",
+      "right": "0.0",
+      "expected": [
+        false,
+        true,
+        true,
+        true,
+        false,
+        false
+      ]
+    },
+    {
+      "left": "-1.0",
+      "right": "NaN",
+      "expected": [
+        false,
+        true,
+        true,
+        true,
+        false,
+        false
+      ]
+    },
+    {
+      "left": "-1.0",
+      "right": "Infinity",
+      "expected": [
+        false,
+        true,
+        true,
+        true,
+        false,
+        false
+      ]
+    },
+    {
+      "left": "-1.0",
+      "right": "-Infinity",
+      "expected": [
+        false,
+        true,
+        false,
+        false,
+        true,
+        true
+      ]
+    },
+    {
+      "left": "-1.0",
+      "right": "1.0",
+      "expected": [
+        false,
+        true,
+        true,
+        true,
+        false,
+        false
+      ]
+    },
+    {
+      "left": "-1.0",
+      "right": "-1.0",
+      "expected": [
+        true,
+        false,
+        false,
+        true,
+        false,
+        true
+      ]
+    },
+    {
+      "left": "-1.0",
+      "right": null,
+      "expected": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "left": null,
+      "right": "-0.0",
+      "expected": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "left": null,
+      "right": "0.0",
+      "expected": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "left": null,
+      "right": "NaN",
+      "expected": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "left": null,
+      "right": "Infinity",
+      "expected": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "left": null,
+      "right": "-Infinity",
+      "expected": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "left": null,
+      "right": "1.0",
+      "expected": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "left": null,
+      "right": "-1.0",
+      "expected": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "left": null,
+      "right": null,
+      "expected": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    }
+  ]
+}

@@ -8,6 +8,9 @@
 //! - Final merge of all thread-local states
 
 use crate::error::{QueryError, Result};
+use crate::execution::reserved_vec::ReservedVec;
+use crate::execution::{process_memory_pool, MemoryPool, MemoryReservation, SharedMemoryPool};
+use crate::physical::dense_domain::{bounded_i64_width, checked_i64_index};
 use crate::physical::morsel::{ParallelParquetSource, DEFAULT_MORSEL_SIZE};
 use crate::physical::morsel_agg::AggregationState;
 use crate::physical::operators::evaluate_expr;
@@ -64,6 +67,9 @@ pub struct MorselAggregateExec {
     /// `dense_direct_key_bounds`) that the dense path will accept the
     /// group-by/aggregate shape.
     native_provider: Option<Arc<dyn TableProvider>>,
+    /// Admission domain for the dense accumulator allocation. Other morsel
+    /// representations and provider buffers are not yet reservation-backed.
+    memory_pool: SharedMemoryPool,
 }
 
 impl fmt::Debug for MorselAggregateExec {
@@ -98,7 +104,14 @@ impl MorselAggregateExec {
             input_schema,
             post_filter: None,
             native_provider: None,
+            memory_pool: process_memory_pool(),
         }
+    }
+
+    /// Use the query's admission domain for dense accumulator storage.
+    pub fn with_memory_pool(mut self, memory_pool: SharedMemoryPool) -> Self {
+        self.memory_pool = memory_pool;
+        self
     }
 
     /// Attach a HAVING predicate applied to output batches before returning.
@@ -244,14 +257,24 @@ impl PhysicalOperator for MorselAggregateExec {
         let timing = std::env::var("AGG_TIMING").is_ok();
         let t0 = std::time::Instant::now();
         // Execute in parallel - each thread processes morsels and maintains its own hash table
+        let profile = std::env::var("QE_AGG_PROF").is_ok();
         let thread_states: Vec<Result<AggregationState>> = (0..num_threads)
             .into_par_iter()
             .map(|_thread_id| {
-                let mut state = AggregationState::new(agg_funcs.clone(), input_types.clone());
+                let mut state = AggregationState::new_with_pool(
+                    agg_funcs.clone(),
+                    input_types.clone(),
+                    &self.memory_pool,
+                );
 
                 // Keep processing morsels from the source
                 while let Some(work) = source.get_work() {
+                    let scan_timer = crate::physical::morsel_agg::AggProfileTimer::start(
+                        profile,
+                        &crate::physical::morsel_agg::AGG_PROF_SCAN_NS,
+                    );
                     let batches = source.read_row_group(&work)?;
+                    drop(scan_timer);
 
                     for batch in batches {
                         // Apply filter if present
@@ -319,6 +342,7 @@ impl PhysicalOperator for MorselAggregateExec {
             &input_types,
             &output_schema,
             self.post_filter.as_ref(),
+            &self.memory_pool,
         )?;
         if timing {
             eprintln!(
@@ -362,6 +386,95 @@ pub(crate) enum DenseAgg {
     SumI64,
     Count,
     Avg,
+}
+
+/// The reservation is declared last so accumulator buffers are destroyed before
+/// their capacity is released. Output arrays copy values out of these buffers;
+/// their separate ownership is not covered by this reservation.
+struct DenseAccumulators {
+    presence: Vec<AtomicU64>,
+    acc_f64: Vec<Vec<AtomicU64>>,
+    acc_i64: Vec<Vec<AtomicI64>>,
+    seen: Vec<Vec<AtomicU64>>,
+    _reservation: MemoryReservation,
+}
+
+impl DenseAccumulators {
+    fn required_bytes(width: usize, kinds: &[(DenseAgg, Option<Expr>)]) -> Result<usize> {
+        let arrays = kinds.iter().try_fold(0usize, |total, (kind, _)| {
+            total.checked_add(if matches!(kind, DenseAgg::Avg) { 2 } else { 1 })
+        });
+        let bytes = arrays
+            .and_then(|n| n.checked_mul(width))
+            .and_then(|n| {
+                let bitmaps = 1 + kinds
+                    .iter()
+                    .filter(|(kind, _)| matches!(kind, DenseAgg::SumF64 | DenseAgg::SumI64))
+                    .count();
+                width
+                    .div_ceil(64)
+                    .checked_mul(bitmaps)
+                    .and_then(|bits| n.checked_add(bits))
+            })
+            .and_then(|n| n.checked_mul(std::mem::size_of::<AtomicU64>()))
+            .and_then(|n| {
+                // Outer vectors contain one inner Vec header per aggregate,
+                // including the empty vectors for the other accumulator type.
+                kinds
+                    .len()
+                    .checked_mul(3 * std::mem::size_of::<Vec<AtomicU64>>())
+                    .and_then(|headers| n.checked_add(headers))
+            });
+        bytes.ok_or_else(|| {
+            QueryError::Execution(
+                "Dense aggregate accumulator allocation size overflow".to_string(),
+            )
+        })
+    }
+
+    fn try_new(
+        width: usize,
+        kinds: &[(DenseAgg, Option<Expr>)],
+        pool: &MemoryPool,
+    ) -> Result<Self> {
+        let reservation = pool.allocate(Self::required_bytes(width, kinds)?)?;
+        // try_reserve_exact prevents geometric capacity growth beyond the
+        // charged allocation layout. Initialization cannot grow these vectors.
+        let presence = dense_vec(width.div_ceil(64), || AtomicU64::new(0))?;
+        let mut acc_f64 = dense_vec(kinds.len(), Vec::new)?;
+        let mut acc_i64 = dense_vec(kinds.len(), Vec::new)?;
+        let mut seen = dense_vec(kinds.len(), Vec::new)?;
+        for (index, (kind, _)) in kinds.iter().enumerate() {
+            if matches!(kind, DenseAgg::SumF64 | DenseAgg::SumI64) {
+                seen[index] = dense_vec(width.div_ceil(64), || AtomicU64::new(0))?;
+            }
+            if matches!(kind, DenseAgg::SumF64 | DenseAgg::Avg) {
+                acc_f64[index] = dense_vec(width, || AtomicU64::new(0))?;
+            }
+            if matches!(kind, DenseAgg::SumI64 | DenseAgg::Count | DenseAgg::Avg) {
+                acc_i64[index] = dense_vec(width, || AtomicI64::new(0))?;
+            }
+        }
+        // Keep the vectors immutable in shape for the entire execution.
+        Ok(Self {
+            presence,
+            acc_f64,
+            acc_i64,
+            seen,
+            _reservation: reservation,
+        })
+    }
+}
+
+fn dense_vec<T>(len: usize, init: impl FnMut() -> T) -> Result<Vec<T>> {
+    let mut result = Vec::new();
+    result.try_reserve_exact(len).map_err(|error| {
+        QueryError::Execution(format!(
+            "Dense aggregate accumulator allocation failed: {error}"
+        ))
+    })?;
+    result.resize_with(len, init);
+    Ok(result)
 }
 
 /// Pure, source-agnostic eligibility check for the dense-direct-address
@@ -460,10 +573,7 @@ pub(crate) fn dense_direct_key_bounds(
     if min > max {
         return None;
     }
-    let width = (max as i128 - min as i128 + 1) as u128;
-    if width > 64_000_000 {
-        return None;
-    }
+    bounded_i64_width(min, max, 64_000_000)?;
     Some((min, max))
 }
 
@@ -479,46 +589,61 @@ fn accumulate_dense_batch(
     batch: &RecordBatch,
     key_pos: usize,
     kmin: i64,
+    width: usize,
     kinds: &[(DenseAgg, Option<Expr>)],
     acc_i64: &[Vec<AtomicI64>],
     acc_f64: &[Vec<AtomicU64>],
     presence: &[AtomicU64],
+    seen: &[Vec<AtomicU64>],
+    pool: &MemoryPool,
 ) -> Result<()> {
     let key_arr = batch.column(key_pos);
-    if key_arr.null_count() > 0 {
-        return Err(QueryError::Execution(
-            "dense agg: null group keys unsupported".into(),
-        ));
-    }
-    let keys_i64: Vec<i64> = match key_arr.data_type() {
-        DataType::Int64 => key_arr
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .values()
-            .to_vec(),
-        DataType::Int32 => key_arr
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap()
-            .values()
-            .iter()
-            .map(|&v| v as i64)
-            .collect(),
-        DataType::Date32 => key_arr
-            .as_any()
-            .downcast_ref::<Date32Array>()
-            .unwrap()
-            .values()
-            .iter()
-            .map(|&v| v as i64)
-            .collect(),
+    let mut indices = ReservedVec::with_capacity(pool, batch.num_rows())?;
+    let index = |row: usize, value: i64| {
+        if key_arr.is_null(row) {
+            Ok(width)
+        } else {
+            checked_i64_index(value, kmin, width)
+        }
+    };
+    match key_arr.data_type() {
+        DataType::Int64 => {
+            let keys = key_arr.as_any().downcast_ref::<Int64Array>().unwrap();
+            indices.try_extend_reserved(
+                batch.num_rows(),
+                keys.values()
+                    .iter()
+                    .enumerate()
+                    .map(|(row, value)| index(row, *value)),
+            )?;
+        }
+        DataType::Int32 => {
+            let keys = key_arr.as_any().downcast_ref::<Int32Array>().unwrap();
+            indices.try_extend_reserved(
+                batch.num_rows(),
+                keys.values()
+                    .iter()
+                    .enumerate()
+                    .map(|(row, value)| index(row, *value as i64)),
+            )?;
+        }
+        DataType::Date32 => {
+            let keys = key_arr.as_any().downcast_ref::<Date32Array>().unwrap();
+            indices.try_extend_reserved(
+                batch.num_rows(),
+                keys.values()
+                    .iter()
+                    .enumerate()
+                    .map(|(row, value)| index(row, *value as i64)),
+            )?;
+        }
         _ => {
             return Err(QueryError::Execution(
                 "dense agg: unexpected key type".into(),
             ))
         }
-    };
+    }
+    let offsets = indices.as_slice();
     for (ai, (kind, input)) in kinds.iter().enumerate() {
         let arr = match input {
             Some(e) => Some(evaluate_expr(batch, e)?),
@@ -527,14 +652,14 @@ fn accumulate_dense_batch(
         match kind {
             DenseAgg::Count => {
                 if let Some(arr) = &arr {
-                    for (r, &k) in keys_i64.iter().enumerate() {
+                    for (r, &k) in offsets.iter().enumerate() {
                         if !arr.is_null(r) {
-                            acc_i64[ai][(k - kmin) as usize].fetch_add(1, Ordering::Relaxed);
+                            acc_i64[ai][k].fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 } else {
-                    for &k in &keys_i64 {
-                        acc_i64[ai][(k - kmin) as usize].fetch_add(1, Ordering::Relaxed);
+                    for &k in offsets {
+                        acc_i64[ai][k].fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -546,11 +671,12 @@ fn accumulate_dense_batch(
                     .ok_or_else(|| QueryError::Execution("dense agg: expected Int64".into()))?;
                 let vals = arr.values();
                 let has_nulls = arr.null_count() > 0;
-                for (r, &k) in keys_i64.iter().enumerate() {
+                for (r, &k) in offsets.iter().enumerate() {
                     if has_nulls && arr.is_null(r) {
                         continue;
                     }
-                    acc_i64[ai][(k - kmin) as usize].fetch_add(vals[r], Ordering::Relaxed);
+                    acc_i64[ai][k].fetch_add(vals[r], Ordering::Relaxed);
+                    seen[ai][k >> 6].fetch_or(1u64 << (k & 63), Ordering::Relaxed);
                 }
             }
             DenseAgg::SumF64 | DenseAgg::Avg => {
@@ -561,11 +687,11 @@ fn accumulate_dense_batch(
                     .ok_or_else(|| QueryError::Execution("dense agg: expected Float64".into()))?;
                 let vals = arr.values();
                 let has_nulls = arr.null_count() > 0;
-                for (r, &k) in keys_i64.iter().enumerate() {
+                for (r, &k) in offsets.iter().enumerate() {
                     if has_nulls && arr.is_null(r) {
                         continue;
                     }
-                    let cell = &acc_f64[ai][(k - kmin) as usize];
+                    let cell = &acc_f64[ai][k];
                     let mut cur = cell.load(Ordering::Relaxed);
                     loop {
                         let nv = f64::from_bits(cur) + vals[r];
@@ -580,14 +706,16 @@ fn accumulate_dense_batch(
                         }
                     }
                     if matches!(kind, DenseAgg::Avg) {
-                        acc_i64[ai][(k - kmin) as usize].fetch_add(1, Ordering::Relaxed);
+                        acc_i64[ai][k].fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        seen[ai][k >> 6].fetch_or(1u64 << (k & 63), Ordering::Relaxed);
                     }
                 }
             }
         }
     }
-    for &k in &keys_i64 {
-        let off = (k - kmin) as usize;
+    for &k in offsets {
+        let off = k;
         presence[off >> 6].fetch_or(1u64 << (off & 63), Ordering::Relaxed);
     }
     Ok(())
@@ -738,30 +866,25 @@ impl MorselAggregateExec {
             }
             (kmin, kmax)
         };
-        let width_u = (kmax as i128 - kmin as i128 + 1) as u64;
-        if width_u > 64_000_000 {
+        let Some(width) = bounded_i64_width(kmin, kmax, 64_000_000) else {
             return Ok(None);
-        }
-        let width = width_u as usize;
+        };
+        let slots = width
+            .checked_add(1)
+            .ok_or_else(|| QueryError::Execution("dense aggregate null slot overflow".into()))?;
 
-        // Shared atomic accumulator arrays (zeroed lazily by the allocator)
-        let presence: Vec<AtomicU64> = (0..width.div_ceil(64)).map(|_| AtomicU64::new(0)).collect();
-        let acc_f64: Vec<Vec<AtomicU64>> = kinds
-            .iter()
-            .map(|(k, _)| match k {
-                DenseAgg::SumF64 | DenseAgg::Avg => (0..width).map(|_| AtomicU64::new(0)).collect(),
-                _ => Vec::new(),
-            })
-            .collect();
-        let acc_i64: Vec<Vec<AtomicI64>> = kinds
-            .iter()
-            .map(|(k, _)| match k {
-                DenseAgg::SumI64 | DenseAgg::Count | DenseAgg::Avg => {
-                    (0..width).map(|_| AtomicI64::new(0)).collect()
-                }
-                _ => Vec::new(),
-            })
-            .collect();
+        // Admit the fixed-capacity accumulator storage before allocating it.
+        // A selected dense path refuses by name on denial; it must not silently
+        // move the same work to an unbudgeted representation.
+        let dense_pool = MemoryPool::new_child(
+            &self.memory_pool,
+            "dense aggregate accumulators",
+            self.memory_pool.max(),
+        );
+        let storage = DenseAccumulators::try_new(slots, &kinds, &dense_pool)?;
+        let presence = &storage.presence;
+        let acc_f64 = &storage.acc_f64;
+        let acc_i64 = &storage.acc_i64;
 
         // Column positions AFTER projection -- shared by both source kinds.
         let proj_pos = |eff: &Option<Vec<usize>>, idx: usize| -> Option<usize> {
@@ -795,7 +918,16 @@ impl MorselAggregateExec {
                 .par_iter()
                 .map(|batch| {
                     accumulate_dense_batch(
-                        batch, key_pos, kmin, &kinds, &acc_i64, &acc_f64, &presence,
+                        batch,
+                        key_pos,
+                        kmin,
+                        width,
+                        &kinds,
+                        &acc_i64,
+                        &acc_f64,
+                        &presence,
+                        &storage.seen,
+                        &dense_pool,
                     )
                 })
                 .collect();
@@ -844,7 +976,16 @@ impl MorselAggregateExec {
                         let batches = source.read_row_group(&work)?;
                         for batch in batches {
                             accumulate_dense_batch(
-                                &batch, key_pos, kmin, &kinds, &acc_i64, &acc_f64, &presence,
+                                &batch,
+                                key_pos,
+                                kmin,
+                                width,
+                                &kinds,
+                                &acc_i64,
+                                &acc_f64,
+                                &presence,
+                                &storage.seen,
+                                &dense_pool,
                             )?;
                         }
                         source.complete_work();
@@ -883,12 +1024,12 @@ impl MorselAggregateExec {
             .map(|ci| -> Result<Option<RecordBatch>> {
                 let w0 = ci * WORDS_PER_CHUNK;
                 let w1 = (w0 + WORDS_PER_CHUNK).min(presence.len());
-                let mut keys: Vec<i64> = Vec::new();
+                let mut keys: Vec<usize> = Vec::new();
                 for w in w0..w1 {
                     let mut bits = presence[w].load(Ordering::Relaxed);
                     while bits != 0 {
                         let b = bits.trailing_zeros() as usize;
-                        keys.push(kmin + ((w << 6) + b) as i64);
+                        keys.push((w << 6) + b);
                         bits &= bits - 1;
                     }
                 }
@@ -897,50 +1038,58 @@ impl MorselAggregateExec {
                 }
                 let mut arrays: Vec<ArrayRef> = Vec::with_capacity(1 + kinds.len());
                 let key_array: ArrayRef = match key_dt {
-                    DataType::Int32 => Arc::new(arrow::array::Int32Array::from_iter_values(
-                        keys.iter().map(|&k| k as i32),
+                    DataType::Int32 => Arc::new(arrow::array::Int32Array::from_iter(
+                        keys.iter()
+                            .map(|&slot| (slot != width).then(|| (kmin + slot as i64) as i32)),
                     )),
-                    DataType::Date32 => Arc::new(arrow::array::Date32Array::from_iter_values(
-                        keys.iter().map(|&k| k as i32),
+                    DataType::Date32 => Arc::new(arrow::array::Date32Array::from_iter(
+                        keys.iter()
+                            .map(|&slot| (slot != width).then(|| (kmin + slot as i64) as i32)),
                     )),
-                    _ => Arc::new(Int64Array::from_iter_values(keys.iter().copied())),
+                    _ => Arc::new(Int64Array::from_iter(
+                        keys.iter()
+                            .map(|&slot| (slot != width).then(|| kmin + slot as i64)),
+                    )),
                 };
                 arrays.push(key_array);
                 for (ai, (kind, _)) in kinds.iter().enumerate() {
                     let arr: ArrayRef = match kind {
-                        DenseAgg::Count => {
-                            Arc::new(Int64Array::from_iter_values(keys.iter().map(|&k| {
-                                acc_i64[ai][(k - kmin) as usize].load(Ordering::Relaxed)
-                            })))
-                        }
+                        DenseAgg::Count => Arc::new(Int64Array::from_iter_values(
+                            keys.iter().map(|&k| acc_i64[ai][k].load(Ordering::Relaxed)),
+                        )),
                         DenseAgg::SumI64 => {
-                            let it = keys
-                                .iter()
-                                .map(|&k| acc_i64[ai][(k - kmin) as usize].load(Ordering::Relaxed));
+                            let it = keys.iter().map(|&slot| {
+                                let seen = storage.seen[ai][slot >> 6].load(Ordering::Relaxed)
+                                    & (1u64 << (slot & 63))
+                                    != 0;
+                                seen.then(|| acc_i64[ai][slot].load(Ordering::Relaxed))
+                            });
                             match &out_dt[ai] {
-                                DataType::Float64 => {
-                                    Arc::new(arrow::array::Float64Array::from_iter_values(
-                                        it.map(|v| v as f64),
-                                    ))
-                                }
-                                _ => Arc::new(Int64Array::from_iter_values(it)),
+                                DataType::Float64 => Arc::new(Float64Array::from_iter(
+                                    it.map(|v| v.map(|v| v as f64)),
+                                )),
+                                _ => Arc::new(Int64Array::from_iter(it)),
                             }
                         }
-                        DenseAgg::SumF64 => Arc::new(arrow::array::Float64Array::from_iter_values(
-                            keys.iter().map(|&k| {
-                                f64::from_bits(
-                                    acc_f64[ai][(k - kmin) as usize].load(Ordering::Relaxed),
-                                )
-                            }),
-                        )),
-                        DenseAgg::Avg => Arc::new(arrow::array::Float64Array::from_iter_values(
-                            keys.iter().map(|&k| {
-                                let off = (k - kmin) as usize;
-                                let s = f64::from_bits(acc_f64[ai][off].load(Ordering::Relaxed));
-                                let c = acc_i64[ai][off].load(Ordering::Relaxed);
-                                s / c as f64
-                            }),
-                        )),
+                        DenseAgg::SumF64 => {
+                            Arc::new(Float64Array::from_iter(keys.iter().map(|&slot| {
+                                let seen = storage.seen[ai][slot >> 6].load(Ordering::Relaxed)
+                                    & (1u64 << (slot & 63))
+                                    != 0;
+                                seen.then(|| {
+                                    f64::from_bits(acc_f64[ai][slot].load(Ordering::Relaxed))
+                                })
+                            })))
+                        }
+                        DenseAgg::Avg => {
+                            Arc::new(Float64Array::from_iter(keys.iter().map(|&slot| {
+                                let count = acc_i64[ai][slot].load(Ordering::Relaxed);
+                                (count > 0).then(|| {
+                                    f64::from_bits(acc_f64[ai][slot].load(Ordering::Relaxed))
+                                        / count as f64
+                                })
+                            })))
+                        }
                     };
                     arrays.push(arr);
                 }
@@ -963,5 +1112,265 @@ impl MorselAggregateExec {
             );
         }
         Ok(Some(Box::pin(stream::iter(batches.into_iter().map(Ok)))))
+    }
+}
+
+#[cfg(test)]
+mod dense_memory_tests {
+    use super::*;
+    use crate::physical::operators::{ColumnStatistics, TableStatistics};
+    use arrow::datatypes::{Field, Schema};
+    use futures::TryStreamExt;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn dense_layout_is_admitted_before_allocation_and_released_after_drop() {
+        let kinds = vec![(DenseAgg::Avg, None), (DenseAgg::Count, None)];
+        let bytes = DenseAccumulators::required_bytes(100, &kinds).unwrap();
+        assert_eq!(bytes, 3 * 100 * 8 + 2 * 8 + 6 * 24);
+        let pool = MemoryPool::new(bytes - 1);
+        assert!(DenseAccumulators::try_new(100, &kinds, &pool).is_err());
+        assert_eq!(pool.used(), 0);
+        assert_eq!(pool.reserved_peak(), 0);
+        let pool = MemoryPool::new(bytes);
+        let storage = DenseAccumulators::try_new(100, &kinds, &pool).unwrap();
+        let actual = storage.presence.capacity() * std::mem::size_of::<AtomicU64>()
+            + storage.acc_f64.capacity() * std::mem::size_of::<Vec<AtomicU64>>()
+            + storage.acc_i64.capacity() * std::mem::size_of::<Vec<AtomicI64>>()
+            + storage.seen.capacity() * std::mem::size_of::<Vec<AtomicU64>>()
+            + storage
+                .seen
+                .iter()
+                .map(|v| v.capacity() * std::mem::size_of::<AtomicU64>())
+                .sum::<usize>()
+            + storage
+                .acc_f64
+                .iter()
+                .map(|v| v.capacity() * std::mem::size_of::<AtomicU64>())
+                .sum::<usize>()
+            + storage
+                .acc_i64
+                .iter()
+                .map(|v| v.capacity() * std::mem::size_of::<AtomicI64>())
+                .sum::<usize>();
+        assert_eq!(pool.used(), actual);
+        assert!(storage.acc_i64[1]
+            .iter()
+            .all(|a| a.load(Ordering::Relaxed) == 0));
+        drop(storage);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn dense_domains_share_parent_admission() {
+        let kinds = vec![(DenseAgg::Count, None)];
+        let bytes = DenseAccumulators::required_bytes(100, &kinds).unwrap();
+        let parent = MemoryPool::new(bytes);
+        let first = MemoryPool::new_child(&parent, "first dense aggregate", bytes);
+        let second = MemoryPool::new_child(&parent, "second dense aggregate", bytes);
+        let storage = DenseAccumulators::try_new(100, &kinds, &first).unwrap();
+        assert!(DenseAccumulators::try_new(100, &kinds, &second).is_err());
+        assert_eq!(second.used(), 0);
+        drop(storage);
+        let storage = DenseAccumulators::try_new(100, &kinds, &second).unwrap();
+        assert_eq!(parent.used(), bytes);
+        drop(storage);
+        assert_eq!(parent.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn dense_owner_releases_when_cancelled() {
+        let pool = Arc::new(MemoryPool::new(4096));
+        let task_pool = Arc::clone(&pool);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _storage =
+                DenseAccumulators::try_new(100, &[(DenseAgg::Count, None)], &task_pool).unwrap();
+            tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        rx.await.unwrap();
+        assert!(pool.used() > 0);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[derive(Debug)]
+    struct ObservedProvider {
+        batch: RecordBatch,
+        pool: SharedMemoryPool,
+        scans: AtomicUsize,
+        fail_scan: bool,
+    }
+
+    impl TableProvider for ObservedProvider {
+        fn schema(&self) -> SchemaRef {
+            self.batch.schema()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn scan(&self, projection: Option<&[usize]>) -> Result<Vec<RecordBatch>> {
+            self.scans.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                self.pool.used() > 0,
+                "dense storage must stay admitted throughout scan"
+            );
+            if self.fail_scan {
+                return Err(QueryError::Execution("injected scan failure".to_string()));
+            }
+            Ok(vec![match projection {
+                Some(indices) => self.batch.project(indices)?,
+                None => self.batch.clone(),
+            }])
+        }
+        fn statistics(&self) -> Option<TableStatistics> {
+            Some(TableStatistics {
+                row_count: 3,
+                total_byte_size: 24,
+                column_stats: [(
+                    "k".to_string(),
+                    ColumnStatistics {
+                        min_i64: Some(0),
+                        max_i64: Some(99),
+                        null_count: Some(0),
+                        ..Default::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            })
+        }
+    }
+
+    fn observed_operator(
+        limit: usize,
+        fail_scan: bool,
+    ) -> (MorselAggregateExec, Arc<ObservedProvider>) {
+        let pool = Arc::new(MemoryPool::new(limit));
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![0, 99, 99]))],
+        )
+        .unwrap();
+        let provider = Arc::new(ObservedProvider {
+            batch,
+            pool: Arc::clone(&pool),
+            scans: AtomicUsize::new(0),
+            fail_scan,
+        });
+        let output = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("count", DataType::Int64, false),
+        ]));
+        let op = MorselAggregateExec::new(
+            Vec::new(),
+            schema,
+            None,
+            None,
+            vec![Expr::column("k")],
+            vec![AggregateExpr {
+                func: AggregateFunction::Count,
+                input: Expr::Wildcard,
+                distinct: false,
+                second_arg: None,
+            }],
+            output,
+        )
+        .with_native_provider(provider.clone())
+        .with_memory_pool(pool);
+        (op, provider)
+    }
+
+    #[tokio::test]
+    async fn selected_dense_path_refuses_before_scan_and_releases_on_error() {
+        let (operator, provider) = observed_operator(1, false);
+        let error = match operator.execute(0).await {
+            Err(error) => error,
+            Ok(_) => panic!("expected dense admission denial"),
+        };
+        assert!(error.to_string().contains("dense aggregate accumulators"));
+        assert_eq!(provider.scans.load(Ordering::Relaxed), 0);
+        assert_eq!(provider.pool.used(), 0);
+        let (operator, provider) = observed_operator(4096, true);
+        assert!(operator.execute(0).await.is_err());
+        assert_eq!(provider.scans.load(Ordering::Relaxed), 1);
+        assert_eq!(provider.pool.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn dense_execution_holds_admission_through_accumulation_and_preserves_values() {
+        let (operator, provider) = observed_operator(4096, false);
+        let batches: Vec<RecordBatch> = operator
+            .execute(0)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut actual = Vec::new();
+        for batch in batches {
+            let keys = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let counts = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            actual.extend((0..batch.num_rows()).map(|row| (keys.value(row), counts.value(row))));
+        }
+        assert_eq!(actual, vec![(0, 1), (99, 2)]);
+        assert_eq!(provider.scans.load(Ordering::Relaxed), 1);
+        assert!(provider.pool.reserved_peak() > 0);
+        assert_eq!(provider.pool.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn sql_and_planning_time_cte_use_query_admission_domain() {
+        use crate::ExecutionContext;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dense.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![0, 99, 99]))],
+        )
+        .unwrap();
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let mut denied = ExecutionContext::with_memory_limit(1);
+        denied.register_parquet("dense", &path).unwrap();
+        let error = denied
+            .sql("SELECT k, COUNT(*) FROM dense GROUP BY k")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("dense aggregate accumulators"));
+        assert_eq!(denied.memory_used(), 0);
+
+        let mut admitted = ExecutionContext::with_memory_limit(4096);
+        admitted.register_parquet("dense", &path).unwrap();
+        let query =
+            "WITH c AS (SELECT k, COUNT(*) AS n FROM dense GROUP BY k) SELECT SUM(n) FROM c";
+        let result = admitted.sql(query).await.unwrap();
+        assert!(result.metrics.reserved_peak_memory_bytes > 0);
+        assert!(result.metrics.reserved_peak_memory_bytes <= 4096);
+        assert_eq!(admitted.memory_used(), 0);
+        assert_eq!(result.row_count, 1);
+        assert_eq!(
+            result.batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            3
+        );
     }
 }

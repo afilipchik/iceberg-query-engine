@@ -1,7 +1,9 @@
 //! Execution context - main entry point for query execution
 
-use crate::error::{QueryError, Result};
-use crate::execution::{create_memory_pool, ExecutionConfig, SharedMemoryPool, SpillMetrics};
+use crate::error::{PartitionPhase, QueryError, Result};
+use crate::execution::{
+    process_memory_pool, ExecutionConfig, MemoryPool, SharedMemoryPool, SpillMetrics,
+};
 use crate::optimizer::Optimizer;
 use crate::parser;
 use crate::physical::operators::{MemoryTable, TableProvider};
@@ -18,6 +20,7 @@ use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -47,13 +50,15 @@ pub struct QueryMetrics {
     pub execute_time: Duration,
     /// Total time
     pub total_time: Duration,
-    /// Peak memory usage during execution (bytes): the memory pool's
-    /// high-water mark between this query's start and end (query-ui epic,
-    /// task 001 — before that this was `pool.used()` read AFTER every
-    /// reservation had been released, i.e. ~0 for any query that spilled).
-    /// Pool-wide: concurrent queries sharing the context's pool all see the
-    /// peak of their sum.
+    /// Stable process-local identifier of this SQL invocation.
+    pub query_id: u64,
+    /// Legacy high-water telemetry for this query's own pool: the maximum
+    /// of admitted reservations and reported local estimates, not exact RSS.
     pub peak_memory_bytes: usize,
+    /// Peak of admitted reservations in this query's own accounting domain.
+    pub reserved_peak_memory_bytes: usize,
+    /// Largest operator-local estimate reported for this query (not additive).
+    pub observed_peak_memory_bytes: usize,
     /// Number of result batches (before dictionary decoding, which is 1:1).
     pub batches: usize,
     /// Base tables the bound plan scans, sorted and deduplicated; when a
@@ -414,37 +419,40 @@ fn collect_scan_table_names(plan: &LogicalPlan, out: &mut Vec<String>) {
 
 impl ExecutionContext {
     pub fn new() -> Self {
-        let config = ExecutionConfig::default();
-        let memory_pool = create_memory_pool(config.memory_limit);
-        Self {
-            catalog: InMemoryCatalog::new(),
-            tables: HashMap::new(),
-            optimizer: Optimizer::new(),
-            parallel_partitions: rayon::current_num_threads(),
-            memory_pool,
-            config,
-            native_table_root: PathBuf::from("./native_tables"),
-        }
+        Self::with_config(ExecutionConfig::default())
     }
 
-    /// Create a new context with a specific memory limit
+    /// Create a new context with a specific memory limit.
     pub fn with_memory_limit(max_bytes: usize) -> Self {
-        let config = ExecutionConfig::default().with_memory_limit(max_bytes);
-        let memory_pool = create_memory_pool(max_bytes);
-        Self {
-            catalog: InMemoryCatalog::new(),
-            tables: HashMap::new(),
-            optimizer: Optimizer::new(),
-            parallel_partitions: rayon::current_num_threads(),
-            memory_pool,
-            config,
-            native_table_root: PathBuf::from("./native_tables"),
-        }
+        Self::with_config(ExecutionConfig::default().with_memory_limit(max_bytes))
     }
 
-    /// Create a new context with custom configuration
+    /// Create a context under the process-wide reservation budget.
     pub fn with_config(config: ExecutionConfig) -> Self {
-        let memory_pool = create_memory_pool(config.memory_limit);
+        Self::build_with_parent_pool(config, process_memory_pool())
+    }
+
+    /// Share a budget across contexts, such as a server's concurrent clients.
+    /// The parent must be `process_memory_pool()` or one of its descendants;
+    /// this prevents a custom hierarchy from bypassing process admission.
+    pub fn with_config_and_parent_pool(
+        config: ExecutionConfig,
+        parent: SharedMemoryPool,
+    ) -> Result<Self> {
+        if !parent.is_within(&process_memory_pool()) {
+            return Err(QueryError::InvalidArgument(
+                "Execution memory parent must descend from process_memory_pool()".to_string(),
+            ));
+        }
+        Ok(Self::build_with_parent_pool(config, parent))
+    }
+
+    fn build_with_parent_pool(config: ExecutionConfig, parent: SharedMemoryPool) -> Self {
+        let memory_pool = Arc::new(MemoryPool::new_child(
+            &parent,
+            "execution context",
+            config.memory_limit,
+        ));
         Self {
             catalog: InMemoryCatalog::new(),
             tables: HashMap::new(),
@@ -878,9 +886,7 @@ impl ExecutionContext {
         let num_partitions = physical.output_partitions().max(1);
         let mut streams: Vec<RecordBatchStream> = Vec::with_capacity(num_partitions);
         for partition_id in 0..num_partitions {
-            let stream = physical.execute(partition_id).await.map_err(|e| {
-                QueryError::Execution(format!("Partition {partition_id} execution failed: {e}"))
-            })?;
+            let stream = Self::execute_partition(physical.as_ref(), partition_id).await?;
             let out_schema = write_schema.clone();
             let decoded: RecordBatchStream = Box::pin(stream.and_then(move |b| {
                 let out_schema = out_schema.clone();
@@ -1234,14 +1240,142 @@ impl ExecutionContext {
 
     /// Execute a SQL query and return results
     pub async fn sql(&self, query: &str) -> Result<QueryResult> {
+        self.sql_impl(
+            query,
+            #[cfg(feature = "gpu")]
+            None,
+        )
+        .await
+    }
+
+    /// Untimed explicit preparation. Does not execute CPU output streams.
+    #[cfg(feature = "gpu")]
+    pub async fn prepare_gpu_resident(
+        &self,
+        query: &str,
+        timeout: std::time::Duration,
+    ) -> Result<crate::physical::gpu::PreparedGpuSession> {
+        use crate::physical::gpu::*;
+        let started = Instant::now();
+        let stmt = parser::parse_sql(query)?;
+        resident_statement(&stmt)?;
+        let logical = Binder::new(&self.catalog).bind(&stmt)?;
+        resident_logical(&logical, &self.tables)?;
+        let optimized = self.optimized_plan(query)?;
+        resident_logical(&optimized, &self.tables)?;
+        let candidates = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut planner =
+            PhysicalPlanner::with_config(self.memory_pool.clone(), self.config.clone());
+        for (name, provider) in &self.tables {
+            planner.register_table(name.clone(), provider.clone());
+        }
+        planner.set_gpu_candidates(candidates.clone());
+        let physical = planner.create_physical_plan(&optimized)?;
+        drop(physical);
+        drop(planner);
+        let plan = {
+            let mut candidates = candidates.lock().unwrap();
+            if candidates.len() != 1 {
+                return Err(residency_error(
+                    "preparation requires exactly one GPU operator",
+                ));
+            }
+            candidates.pop().unwrap()
+        };
+        if !plan.provider.as_any().is::<MemoryTable>() {
+            return Err(residency_error("provider is not immutable MemoryTable"));
+        }
+        resident_memory_layout(&plan)?;
+        let engine = GpuEngine::get().ok_or_else(|| residency_error("device unavailable"))?;
+        let remaining = timeout
+            .checked_sub(started.elapsed())
+            .ok_or_else(|| residency_error("preparation deadline elapsed before upload"))?;
+        let (lease, ack) = engine
+            .prepare_resident(plan.clone(), remaining)
+            .await
+            .map_err(|e| {
+                residency_error(&format!(
+                    "prepare {:?}: {}: {}",
+                    e.kind, e.dependency, e.detail
+                ))
+            })?;
+        Ok(PreparedGpuSession::new(
+            lease,
+            ack,
+            plan,
+            query.to_owned(),
+            started.elapsed().as_secs_f64() * 1000.0,
+        ))
+    }
+
+    /// Same timed parse-to-consumed-result path as sql(), with required device
+    /// execution and evidence even when parsing/planning/dispatch fails.
+    #[cfg(feature = "gpu")]
+    pub async fn sql_gpu_resident(
+        &self,
+        query: &str,
+        session: &crate::physical::gpu::PreparedGpuSession,
+    ) -> crate::physical::gpu::GpuResidentQueryOutcome {
+        use crate::physical::gpu::*;
+        let request = match session.begin() {
+            Ok(request) => request,
+            Err(error) => {
+                return GpuResidentQueryOutcome {
+                    evidence: GpuResidentEvidence {
+                        session_id: session.metadata().session_id,
+                        matched_operators: 0,
+                        attempted_device_runs: 0,
+                        completed_device_runs: 0,
+                        failures: 1,
+                        failure_reason: Some(error.to_string()),
+                    },
+                    result: Err(error),
+                }
+            }
+        };
+        let mut result = self.sql_impl(query, Some(request.clone())).await;
+        if result.is_ok() {
+            if let Err(error) = request.check_completed() {
+                result = Err(error);
+            }
+        }
+        let evidence = request.evidence(result.as_ref().err().map(ToString::to_string));
+        GpuResidentQueryOutcome { result, evidence }
+    }
+
+    async fn sql_impl(
+        &self,
+        query: &str,
+        #[cfg(feature = "gpu")] resident: Option<Arc<crate::physical::gpu::ResidentRequest>>,
+    ) -> Result<QueryResult> {
         let start = Instant::now();
+        #[cfg(feature = "gpu")]
+        if resident
+            .as_ref()
+            .is_some_and(|request| request.sql != query)
+        {
+            return Err(crate::physical::gpu::residency_error(
+                "SQL text differs from prepared request",
+            ));
+        }
         let mut metrics = QueryMetrics::default();
-        // Open this query's peak-memory window (see `QueryMetrics::peak_memory_bytes`).
-        self.memory_pool.reset_peak();
+        // Every SQL invocation owns an independent telemetry/admission domain.
+        // Concurrent queries never reset each other's peaks or spill counters.
+        static NEXT_QUERY_ID: AtomicU64 = AtomicU64::new(1);
+        metrics.query_id = NEXT_QUERY_ID.fetch_add(1, Ordering::Relaxed);
+        let query_pool = Arc::new(MemoryPool::new_child(
+            &self.memory_pool,
+            format!("query {}", metrics.query_id),
+            self.config.memory_limit,
+        ));
 
         // Parse
         let parse_start = Instant::now();
         let stmt = parser::parse_sql(query)?;
+        #[cfg(feature = "gpu")]
+        if resident.is_some() {
+            crate::physical::gpu::resident_statement(&stmt)?;
+        }
         metrics.parse_time = parse_start.elapsed();
 
         // `CREATE TABLE ... AS SELECT` needs `&mut self` (registering the
@@ -1364,6 +1498,10 @@ impl ExecutionContext {
         let plan_start = Instant::now();
         let mut binder = Binder::new(&self.catalog);
         let logical = binder.bind(&stmt)?;
+        #[cfg(feature = "gpu")]
+        if resident.is_some() {
+            crate::physical::gpu::resident_logical(&logical, &self.tables)?;
+        }
         metrics.plan_time = plan_start.elapsed();
         metrics.tables = collect_scan_tables(&logical);
 
@@ -1406,14 +1544,22 @@ impl ExecutionContext {
 
         // Physical planning with spillable operators for memory safety
         let physical_start = Instant::now();
-        let mut planner =
-            PhysicalPlanner::with_config(self.memory_pool.clone(), self.config.clone());
+        let mut planner = PhysicalPlanner::with_config(query_pool.clone(), self.config.clone());
+        #[cfg(feature = "gpu")]
+        if let Some(request) = &resident {
+            crate::physical::gpu::resident_logical(&optimized, &self.tables)?;
+            planner.set_gpu_resident(request.clone());
+        }
         for (name, provider) in &self.tables {
             planner.register_table(name.clone(), provider.clone());
         }
         // Enable subquery execution support
         planner.enable_subquery_execution();
         let physical = planner.create_physical_plan(&optimized)?;
+        #[cfg(feature = "gpu")]
+        if let Some(request) = &resident {
+            request.check_planned()?;
+        }
         metrics.plan_time += physical_start.elapsed();
         metrics.physical_plan = Some(cap_debug_text(crate::physical::display_plan(
             physical.as_ref(),
@@ -1431,20 +1577,7 @@ impl ExecutionContext {
         let partition_futures: Vec<_> = (0..num_partitions)
             .map(|partition_id| {
                 let physical = physical.clone();
-                async move {
-                    let stream = physical.execute(partition_id).await.map_err(|e| {
-                        crate::error::QueryError::Execution(format!(
-                            "Partition {} execution failed: {}",
-                            partition_id, e
-                        ))
-                    })?;
-                    stream.try_collect().await.map_err(|e| {
-                        crate::error::QueryError::Execution(format!(
-                            "Partition {} collection failed: {}",
-                            partition_id, e
-                        ))
-                    })
-                }
+                async move { Self::collect_partition(physical, partition_id).await }
             })
             .collect();
 
@@ -1464,8 +1597,10 @@ impl ExecutionContext {
 
         // Capture memory metrics: the pool's high-water mark over this
         // query's window, not the post-release residual.
-        metrics.peak_memory_bytes = self.memory_pool.peak();
-        let spilled = self.memory_pool.spilled();
+        metrics.peak_memory_bytes = query_pool.peak();
+        metrics.reserved_peak_memory_bytes = query_pool.reserved_peak();
+        metrics.observed_peak_memory_bytes = query_pool.observed_peak();
+        let spilled = query_pool.spilled();
         if spilled > 0 {
             metrics.spill_metrics = Some(SpillMetrics {
                 bytes_spilled: spilled,
@@ -1526,6 +1661,37 @@ impl ExecutionContext {
     fn bounded_partition_merge(streams: Vec<RecordBatchStream>, limit: usize) -> RecordBatchStream {
         use futures::StreamExt;
         Box::pin(futures::stream::iter(streams).flatten_unordered(Some(limit.max(1))))
+    }
+
+    /// Collect one declared output partition. Preserve the existing all-partition
+    /// scheduling and error boundary; callers never retry consumed input here.
+    async fn execute_partition(
+        physical: &dyn PhysicalOperator,
+        partition_id: usize,
+    ) -> Result<RecordBatchStream> {
+        physical
+            .execute(partition_id)
+            .await
+            .map_err(|source| QueryError::Partition {
+                partition_id,
+                phase: PartitionPhase::Execution,
+                source: Box::new(source),
+            })
+    }
+
+    async fn collect_partition(
+        physical: Arc<dyn PhysicalOperator>,
+        partition_id: usize,
+    ) -> Result<Vec<RecordBatch>> {
+        let stream = Self::execute_partition(physical.as_ref(), partition_id).await?;
+        stream
+            .try_collect()
+            .await
+            .map_err(|source| QueryError::Partition {
+                partition_id,
+                phase: PartitionPhase::Collection,
+                source: Box::new(source),
+            })
     }
 
     /// Concurrency cap for [`Self::bounded_partition_merge`]. Overridable
@@ -1731,9 +1897,7 @@ impl ExecutionContext {
         let num_partitions = physical.output_partitions().max(1);
         let mut streams: Vec<RecordBatchStream> = Vec::with_capacity(num_partitions);
         for partition_id in 0..num_partitions {
-            let stream = physical.execute(partition_id).await.map_err(|e| {
-                QueryError::Execution(format!("Partition {partition_id} execution failed: {e}"))
-            })?;
+            let stream = Self::execute_partition(physical.as_ref(), partition_id).await?;
             let out_schema = write_schema.clone();
             let decoded: RecordBatchStream = Box::pin(stream.and_then(move |b| {
                 let out_schema = out_schema.clone();
@@ -1906,9 +2070,7 @@ impl ExecutionContext {
         let num_partitions = physical.output_partitions().max(1);
         let mut streams: Vec<RecordBatchStream> = Vec::with_capacity(num_partitions);
         for partition_id in 0..num_partitions {
-            let stream = physical.execute(partition_id).await.map_err(|e| {
-                QueryError::Execution(format!("Partition {partition_id} execution failed: {e}"))
-            })?;
+            let stream = Self::execute_partition(physical.as_ref(), partition_id).await?;
             let decoded: RecordBatchStream =
                 Box::pin(stream.and_then(|b| async move { decode_dictionary_batch(b) }));
             streams.push(decoded);
@@ -2250,7 +2412,7 @@ fn decode_dictionary_batch(b: RecordBatch) -> Result<RecordBatch> {
         .iter()
         .zip(cols.iter())
         .map(|(f, c): (_, &arrow::array::ArrayRef)| {
-            arrow::datatypes::Field::new(f.name(), c.data_type().clone(), f.is_nullable())
+            f.as_ref().clone().with_data_type(c.data_type().clone())
         })
         .collect();
     RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)
@@ -2906,5 +3068,133 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.row_count, 5); // 5 unique names
+    }
+}
+
+#[cfg(test)]
+mod partition_error_contract_tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct FailingPartition {
+        during_collection: bool,
+        original: Arc<QueryError>,
+        pool: Arc<MemoryPool>,
+        calls: Arc<AtomicU64>,
+    }
+    #[async_trait::async_trait]
+    impl PhysicalOperator for FailingPartition {
+        fn schema(&self) -> SchemaRef {
+            Arc::new(Schema::empty())
+        }
+        fn children(&self) -> Vec<Arc<dyn PhysicalOperator>> {
+            vec![]
+        }
+        fn name(&self) -> &str {
+            "FailingPartition"
+        }
+        fn output_partitions(&self) -> usize {
+            4
+        }
+        async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
+            crate::physical::check_partition(self, partition)?;
+            assert_eq!(partition, 3);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let lease = self.pool.allocate(1024)?;
+            let error = QueryError::Shared(self.original.clone());
+            if !self.during_collection {
+                return Err(error);
+            }
+            let batches = vec![Ok(RecordBatch::new_empty(self.schema())), Err(error)];
+            Ok(Box::pin(futures::stream::unfold(
+                (batches.into_iter(), lease),
+                |(mut rows, lease)| async move { rows.next().map(|row| (row, (rows, lease))) },
+            )))
+        }
+    }
+    async fn check_partition_cause(during_collection: bool) {
+        let denial_pool = MemoryPool::new_named("typed refusal fixture", 16);
+        let denial = denial_pool.allocate(17).unwrap_err();
+        let lookalike = QueryError::Execution(denial.to_string());
+        for original in [
+            denial,
+            QueryError::Io(std::io::Error::from_raw_os_error(13)),
+            lookalike,
+        ] {
+            let original = Arc::new(original);
+            let pool = Arc::new(MemoryPool::new_named("partition owner", 4096));
+            let calls = Arc::new(AtomicU64::new(0));
+            let op = Arc::new(FailingPartition {
+                during_collection,
+                original: original.clone(),
+                pool: pool.clone(),
+                calls: calls.clone(),
+            });
+            let error = ExecutionContext::collect_partition(op, 3)
+                .await
+                .unwrap_err();
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "no input replay");
+            assert_eq!(pool.used(), 0, "failed stream releases its admitted owner");
+            assert_eq!(
+                error.kind(),
+                "Execution",
+                "public query-log category is stable"
+            );
+            let phase = if during_collection {
+                "collection"
+            } else {
+                "execution"
+            };
+            assert_eq!(
+                error.to_string(),
+                format!("Execution error: Partition 3 {phase} failed: {original}")
+            );
+            assert!(
+                std::ptr::eq(error.root(), original.as_ref()),
+                "context must retain the original typed cause: {error}"
+            );
+            assert_eq!(error.is_memory_limit(), original.is_memory_limit());
+            let shared = QueryError::Shared(Arc::new(error));
+            assert_eq!(shared.kind(), "Execution");
+            assert!(std::ptr::eq(shared.root(), original.as_ref()));
+        }
+    }
+    #[tokio::test]
+    async fn partition_execution_retains_typed_cause_without_replay() {
+        check_partition_cause(false).await;
+    }
+    #[tokio::test]
+    async fn partition_collection_retains_typed_cause_and_releases_stream() {
+        check_partition_cause(true).await;
+    }
+    #[tokio::test]
+    async fn sql_retained_aggregate_refusal_keeps_typed_memory_cause() {
+        let mut ctx = ExecutionContext::with_memory_limit(256 * 1024);
+        for table in ["lineitem", "orders"] {
+            ctx.register_parquet(
+                table,
+                format!(
+                    "{}/data/tpch-10mb/{table}.parquet",
+                    env!("CARGO_MANIFEST_DIR")
+                ),
+            )
+            .unwrap();
+        }
+        let before = ctx.memory_pool().used();
+        let error = ctx.sql("SELECT l_orderkey, o_orderdate, SUM(l_quantity) AS qty, COUNT(*) AS cnt FROM lineitem, orders WHERE l_orderkey = o_orderkey GROUP BY l_orderkey, o_orderdate").await.unwrap_err();
+        assert_eq!(
+            ctx.memory_pool().used(),
+            before,
+            "query refusal releases reservations"
+        );
+        assert!(
+            error.is_memory_limit(),
+            "SQL must retain typed admission cause: {error}"
+        );
+        assert_eq!(error.kind(), "Execution");
+        assert!(matches!(
+            error.root(),
+            QueryError::MemoryLimit { limit: 262144, .. }
+        ));
     }
 }

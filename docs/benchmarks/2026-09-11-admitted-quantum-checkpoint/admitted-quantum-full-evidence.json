@@ -1,0 +1,21 @@
+{
+  "status": "terminal",
+  "archives": {
+    "providers": {
+      "files_verified": 1433,
+      "omitted_payloads": 4,
+      "omitted_bytes": 0
+    },
+    "residency": {
+      "files_verified": 1458,
+      "omitted_payloads": 0,
+      "omitted_bytes": 0
+    }
+  },
+  "source_inputs": 527,
+  "audit_exits": {
+    "providers": 0,
+    "provider_ratios": 0,
+    "residency": 0
+  }
+}

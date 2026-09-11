@@ -1,0 +1,13 @@
+{
+  "files": {
+    "admitted-quantum-checkpoint-evidence.json": "5d7a3321210297e34236f380539dfb42758f7daf9af62b24319b953778c54a87",
+    "admitted-quantum-checkpoint.json": "de01f55ee71af3e79892f5b0f953062a922361b86dabb034fc94638cdd329c6d",
+    "admitted-quantum-full-evidence.json": "5d55c713cc810922fba52252d46a626a964158121912234d38b84ea36b8818f8",
+    "admitted-quantum-residency-ratios.json": "cc15128514e2efe37779bfb90ebfb8de4134b890c77ccd7b2d445309d87351c1",
+    "run_admitted_quantum_checkpoint.py": "c32c345726f4624e67bcdcc43559bdbb52b3ee7db7b5a651fc623472cc47d39e",
+    "run_admitted_quantum_checkpoint_evidence.py": "9af36078a18fae5c25952158d6f633c58582ba7790b58c5148ebe57bf394fa1e"
+  },
+  "source_count": 527,
+  "release_sha256": "beb0cdfd180507aa4ab00e7aa2ec9ea2c38f787b803aaa62de0b26bb239b75c5",
+  "note": "Supplement to immutable verified provider/residency/triage archives; ratios use per-query medians for independently validated complete measured pairs."
+}

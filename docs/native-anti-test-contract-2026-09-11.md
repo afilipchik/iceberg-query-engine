@@ -1,0 +1,24 @@
+# Native anti-join regression contract — 2026-09-11
+
+The packed-word validation reproduces two native dictionary test failures before either result comparison executes: `anti_join_on_dictionary_key_with_build_left_is_cell_exact` and `anti_join_on_dictionary_key_with_build_right_is_cell_exact` both assert zero physical Anti operators where the test demands one. This is a reproduced plan-assertion failure, not evidence that their outputs are wrong or correct. The exact logs are preserved in the [validation archive](benchmarks/2026-09-11-packed-word-validation/packed-word-disjoint-native_ipc.log).
+
+Source explains the disagreement. Both test queries in `tests/native_dictionary_semi_anti.rs` use NOT IN. `decorrelate_in_subquery` explicitly declines negated membership because an ordinary Anti join cannot preserve RHS NULL poisoning and empty-RHS semantics. This is the intended semantic repair documented on September6. Reverting that guard to satisfy the old test would reintroduce an SQL bug. The test currently conflates a membership SQL contract with an operator-orientation regression.
+
+After the active packed-word measurement freeze ends, repair coverage through separate assertions:
+
+1. Retain the existing NOT IN queries as native-versus-source result checks, then add independent expected values on a small fixture with duplicate keys, NULL keys, NULL dictionary values and empty/nonempty RHS. Do not require an ordinary Anti operator for this SQL.
+2. Exercise ordinary dictionary Anti joins using equality-correlated NOT EXISTS, or a bound logical Anti plan if the optimizer legitimately chooses another route. Assert both build orientations and actual dictionary input at the join boundary. Preserve duplicate output rows and independently expected values; a same-engine source comparison is supplemental evidence.
+3. Keep the current SEMI regressions and traverse all declared input/output partitions. Do not weaken dictionary/build-orientation checks merely to make a test green.
+4. Run focused membership/native regressions, then the existing both-mode gate. Record removed failure names as a repaired test contract, separate from any engine repair or resource acceptance. The partial-mode floating result discrepancy and six legacy spill failures remain separate investigations.
+
+This is a source-grounded diagnosis and pending implementation, not a closed gate. No source or test change was made during the optimized build/paired measurements.
+
+A formatted draft is prepared at `.scratch/parallel-aggregate-input/native_dictionary_semi_anti.pending.rs`, with original/draft SHA256 values in `native-anti-test-draft.json`. It retains both NOT IN queries as result checks, substitutes equality-correlated NOT EXISTS for ordinary Anti route assertions, and adds an independent dictionary-codebook/NULL/duplicate/empty-input matrix for both physical build orientations. The draft has not been applied or compiled; implementation must wait for terminal packed-word measurement and archive verification.
+
+Supervisor82790 is queued in a48GiB systemd scope with one build job. It waits for successful terminal packed-word evidence, rechecks every archive/source hash, applies only the recorded test draft, checks formatting, and runs native dictionary, membership and semantic-proof integrations under disjoint and partial ownership. The expanded draft also checks native and memory-source SQL results against an independent nullable membership oracle at1/3partitions and refuses silent rendering errors. No test result is claimed until its logs complete. Initial sandboxed launch was terminal1 before execution because systemd bus access was denied; the contained launch uses the permitted escalation.
+
+## Applied repair and validation
+
+After sequence56279 and evidence19981 were terminal0 and the915-file packed-word archive verified, supervisor82790 applied only `tests/native_dictionary_semi_anti.rs`. Formatting passes. Both ownership modes pass27integrations each:7membership,7native dictionary/operator tests and13semantic-proof tests. The two former Anti plan failures now exercise actual NOT EXISTS Anti plans with the required build orientation and dictionary input; original NOT IN queries still compare native/source results. The independent fixtures pass24physical Semi/Anti combinations and80native/source SQL membership/existence cases with NULLs, duplicates, empty RHS and differing dictionary codebooks. No engine rewrite, memory policy, dependency or default changed. Rendering errors now fail instead of silently producing an empty string.
+
+All521 inputs verify after execution. This repairs test coverage; it does not clear the partial float comparison, six legacy spill failures, or full native resource acceptance. [Source and evidence archive](benchmarks/2026-09-11-native-anti-contract/manifest.json).

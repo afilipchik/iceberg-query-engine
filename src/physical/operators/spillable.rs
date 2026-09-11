@@ -232,71 +232,767 @@ pub(crate) async fn collect_input_partitions_concurrently(
 /// AFTER `collect_input_partitions_concurrently` had already fully
 /// materialized it).
 ///
-/// This function keeps the same "one task per input partition, drained
-/// concurrently" parallelism, but hands batches to the caller as they arrive
-/// via a small, FIXED-capacity channel instead of a growing `Vec`. The
-/// callers (`SpillableHashJoinExec::compute_build_decision`,
-/// `SpillableHashAggregateExec::execute` — oom-safety-hardening task 002 —
-/// and `ExternalSortExec::execute` — task 003) can then track a
-/// running size total and switch to a bounded, spill-capable structure the
-/// moment it would exceed the threshold, without ever buffering more than a
-/// bounded number of batches ahead of that check. The channel's own fixed
-/// bound is what keeps this mechanism itself from becoming a second,
-/// subtler unbounded-memory path.
-async fn stream_merge_input_partitions(
-    input: &Arc<dyn PhysicalOperator>,
-) -> Result<RecordBatchStream> {
-    let input_partitions = input.output_partitions().max(1);
-    if input_partitions == 1 {
-        // Nothing to merge — avoid the task-spawn/channel round trip.
-        return input.execute(0).await;
+/// Queue occupancy accounting, including batches waiting to send. This is not
+/// admission before upstream allocation or ownership after consumer handoff.
+struct QueuedInputBatch {
+    batch: RecordBatch,
+    // Drop buffers before releasing their queue accounting guard.
+    _reservation: Option<crate::execution::MemoryReservation>,
+    // Demand becomes available only after the queue charge is released.
+    _demand: tokio::sync::OwnedSemaphorePermit,
+}
+
+// Round exposed buffer bytes to safe u128 storage. ArrayData::build
+// validates the resulting type/alignment; no unchecked array construction.
+fn copied_input_buffer_bytes(len: usize) -> Result<usize> {
+    len.checked_add(15)
+        .map(|n| n / 16)
+        .and_then(|words| words.checked_mul(16))
+        .ok_or_else(|| QueryError::Execution("input queue copy size overflow".into()))
+}
+
+#[cfg(test)]
+thread_local! { static INPUT_QUEUE_COPY_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+fn own_input_buffer(buffer: &arrow::buffer::Buffer) -> Result<arrow::buffer::Buffer> {
+    let bytes = copied_input_buffer_bytes(buffer.len())?;
+    let words = bytes / 16;
+    #[cfg(test)]
+    INPUT_QUEUE_COPY_ATTEMPTS.with(|count| count.set(count.get() + 1));
+    let mut owned = Vec::<u128>::new();
+    owned.try_reserve_exact(words).map_err(|error| {
+        QueryError::Execution(format!(
+            "input queue owned buffer allocation refused: {error}"
+        ))
+    })?;
+    // Do not retain an allocation larger than the pre-admitted exact layout.
+    // Global Vec normally reports precisely the requested capacity; this check
+    // makes a different allocator's excess capacity an explicit refusal.
+    if owned.capacity() != words {
+        return Err(QueryError::Execution(
+            "input queue copy allocator capacity differs from admitted layout".into(),
+        ));
+    }
+    for chunk in buffer.as_slice().chunks(16) {
+        let mut bytes = [0u8; 16];
+        bytes[..chunk.len()].copy_from_slice(chunk);
+        owned.push(u128::from_ne_bytes(bytes));
+    }
+    Ok(arrow::buffer::Buffer::from_vec(owned).slice_with_length(0, buffer.len()))
+}
+
+fn own_input_data(data: arrow::array::ArrayData) -> Result<arrow::array::ArrayData> {
+    let mut buffers = Vec::new();
+    buffers
+        .try_reserve_exact(data.buffers().len())
+        .map_err(|error| {
+            QueryError::Execution(format!(
+                "input queue buffer metadata allocation refused: {error}"
+            ))
+        })?;
+    for buffer in data.buffers() {
+        buffers.push(own_input_buffer(buffer)?);
+    }
+    let mut children = Vec::new();
+    children
+        .try_reserve_exact(data.child_data().len())
+        .map_err(|error| {
+            QueryError::Execution(format!(
+                "input queue child metadata allocation refused: {error}"
+            ))
+        })?;
+    for child in data.child_data() {
+        children.push(own_input_data(child.clone())?);
+    }
+    let nulls = data
+        .nulls()
+        .map(|nulls| {
+            let bits = nulls.inner();
+            Ok::<_, QueryError>(arrow::buffer::NullBuffer::new(
+                arrow::buffer::BooleanBuffer::new(
+                    own_input_buffer(nulls.buffer())?,
+                    bits.offset(),
+                    bits.len(),
+                ),
+            ))
+        })
+        .transpose()?;
+    Ok(data
+        .into_builder()
+        .buffers(buffers)
+        .child_data(children)
+        .nulls(nulls)
+        .build()?)
+}
+
+pub(crate) fn own_input_batch(batch: RecordBatch) -> Result<RecordBatch> {
+    let mut columns = Vec::new();
+    columns
+        .try_reserve_exact(batch.num_columns())
+        .map_err(|error| {
+            QueryError::Execution(format!(
+                "input queue column metadata allocation refused: {error}"
+            ))
+        })?;
+    for array in batch.columns() {
+        let data = array.to_data();
+        columns.push(arrow::array::make_array(own_input_data(data)?));
+    }
+    Ok(RecordBatch::try_new_with_options(
+        batch.schema(),
+        columns,
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )?)
+}
+
+fn add_input_charge(total: &mut usize, bytes: usize) -> Result<()> {
+    *total = total
+        .checked_add(bytes)
+        .ok_or_else(|| QueryError::Execution("input queue memory accounting overflow".into()))?;
+    Ok(())
+}
+
+pub(crate) fn owned_input_column_charge(array: &ArrayRef) -> Result<usize> {
+    fn data_bytes(data: &arrow::array::ArrayData, total: &mut usize) -> Result<()> {
+        add_input_charge(total, std::mem::size_of_val(data))?;
+        for buffer in data.buffers() {
+            add_input_charge(total, std::mem::size_of_val(buffer))?;
+            // Public Buffer APIs cannot identify custom owners. Charge copies.
+            add_input_charge(total, copied_input_buffer_bytes(buffer.len())?)?;
+        }
+        if let Some(nulls) = data.nulls() {
+            add_input_charge(total, copied_input_buffer_bytes(nulls.buffer().len())?)?;
+        }
+        for child in data.child_data() {
+            data_bytes(child, total)?;
+        }
+        Ok(())
+    }
+    let mut total = std::mem::size_of::<ArrayRef>();
+    add_input_charge(&mut total, std::mem::size_of_val(array.as_ref()))?;
+    data_bytes(&array.to_data(), &mut total)?;
+    Ok(total)
+}
+
+pub(crate) fn owned_input_schema_charge(schema: &SchemaRef) -> Result<usize> {
+    let mut total = std::mem::size_of_val(schema.as_ref());
+    for field in schema.fields() {
+        add_input_charge(&mut total, field.size())?;
+    }
+    for (key, value) in schema.metadata() {
+        add_input_charge(&mut total, std::mem::size_of::<(String, String)>())?;
+        add_input_charge(&mut total, key.capacity())?;
+        add_input_charge(&mut total, value.capacity())?;
+    }
+    Ok(total)
+}
+
+pub(crate) fn owned_input_batch_base_charge() -> usize {
+    std::mem::size_of::<QueuedInputBatch>()
+}
+
+pub(crate) fn owned_input_batch_charge(batch: &RecordBatch) -> Result<usize> {
+    let mut total = owned_input_batch_base_charge();
+    for array in batch.columns() {
+        add_input_charge(&mut total, owned_input_column_charge(array)?)?;
+    }
+    // Shared schema metadata is deliberately charged per queued batch. These
+    // are accounted copied-layout bytes, not unique physical bytes or RSS.
+    add_input_charge(&mut total, owned_input_schema_charge(&batch.schema())?)?;
+    Ok(total)
+}
+
+/// Choose a scan row target from the compact fixed-width copy layout. This is
+/// scheduling, not a memory reservation: actual queue admission still checks
+/// the emitted buffers. Variable-width/encoded layouts have no schema-only bound.
+pub(crate) fn input_queue_fixed_width_row_limit(
+    schema: &SchemaRef,
+    requested: usize,
+    budget: usize,
+) -> Option<usize> {
+    use arrow::datatypes::DataType;
+    let widths: Vec<Option<usize>> = schema
+        .fields()
+        .iter()
+        .map(|field| match field.data_type() {
+            DataType::Boolean => Some(None),
+            DataType::Null => Some(Some(0)),
+            DataType::FixedSizeBinary(width) if *width >= 0 => Some(Some(*width as usize)),
+            other => other.primitive_width().map(Some),
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let base = owned_input_batch_charge(&RecordBatch::new_empty(schema.clone())).ok()?;
+    let fits = |rows: usize| -> Option<bool> {
+        let mut bytes = base;
+        for width in &widths {
+            let payload = match width {
+                Some(width) => rows.checked_mul(*width)?,
+                None => rows.checked_add(7)? / 8,
+            };
+            bytes = bytes.checked_add(copied_input_buffer_bytes(payload).ok()?)?;
+            // Allow validity even for a non-nullable declared field. Include
+            // up to seven leading bitmap bits, then the owned-copy alignment.
+            let validity = rows.checked_add(14)? / 8;
+            bytes = bytes.checked_add(copied_input_buffer_bytes(validity).ok()?)?;
+        }
+        Some(bytes <= budget)
+    };
+    if fits(1) != Some(true) {
+        return None;
+    }
+    let mut low = 1;
+    let mut high = requested.max(1);
+    while low < high {
+        let distance = high - low;
+        let middle = low + distance / 2 + distance % 2;
+        if fits(middle) == Some(true) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    Some(low)
+}
+
+// Opt-in attribution only. Durations from concurrent producers overlap and
+// must not be summed as wall time. Drop emits partial/error/cancellation work.
+struct InputTrace {
+    id: u64,
+    phase: &'static str,
+    started: std::time::Instant,
+    detail: serde_json::Value,
+    completed: bool,
+}
+
+impl InputTrace {
+    fn new(phase: &'static str, detail: impl FnOnce() -> serde_json::Value) -> Option<Self> {
+        if std::env::var("QE_INPUT_QUEUE_TRACE").as_deref() != Ok("1") {
+            return None;
+        }
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Some(Self {
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
+            phase,
+            started: std::time::Instant::now(),
+            detail: detail(),
+            completed: false,
+        })
     }
 
-    // Small and FIXED per producer partition: enough that a fast producer
-    // doesn't stall on every single batch, not enough to reintroduce
-    // unbounded buffering — a handful of batches, never the whole build
-    // side, can sit in this channel at once.
-    const PER_PARTITION_CAPACITY: usize = 4;
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(
-        PER_PARTITION_CAPACITY * input_partitions,
-    );
+    fn finish(trace: &mut Option<Self>) {
+        if let Some(t) = trace.as_mut() {
+            t.completed = true;
+        }
+        drop(trace.take());
+    }
+}
 
-    for part in 0..input_partitions {
+impl Drop for InputTrace {
+    fn drop(&mut self) {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "[input-queue] {}",
+            serde_json::json!({
+                "id":self.id,"phase":self.phase,"ms":self.started.elapsed().as_secs_f64()*1000.0,
+                "completed":self.completed,"unwinding":std::thread::panicking(),"detail":self.detail
+            })
+        );
+    }
+}
+
+struct InputQueueStream {
+    receiver: tokio::sync::mpsc::Receiver<QueuedInputBatch>,
+    producers: tokio::task::JoinSet<Result<()>>,
+    label: &'static str,
+    finished: bool,
+    pending_error: Option<QueryError>,
+    // Fixed parallel slots remain admitted until queue AND producers release
+    // them, including asynchronous cancellation cleanup.
+    envelope: Option<Arc<crate::execution::MemoryReservation>>,
+    _queue_metadata: Option<Arc<crate::execution::MemoryReservation>>,
+}
+
+enum QueueStreams {
+    Legacy(std::vec::IntoIter<RecordBatchStream>),
+    Admitted(crate::execution::reserved_vec::ReservedIntoIter<RecordBatchStream>),
+}
+impl Iterator for QueueStreams {
+    type Item = RecordBatchStream;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Legacy(iter) => iter.next(),
+            Self::Admitted(iter) => iter.next(),
+        }
+    }
+}
+
+impl InputQueueStream {
+    fn stop(&mut self) {
+        self.finished = true;
+        self.receiver.close();
+        self.producers.abort_all();
+        while self.receiver.try_recv().is_ok() {}
+        self.envelope.take();
+    }
+}
+
+impl Drop for InputQueueStream {
+    fn drop(&mut self) {
+        self.stop();
+        // JoinSet also aborts on drop. Already-running spawn_blocking work in
+        // an upstream operator is not preempted by async task cancellation.
+    }
+}
+
+impl futures::Stream for InputQueueStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(None);
+        }
+        if this.pending_error.is_some() {
+            // Cancellation cannot preempt a synchronous decoder poll. Reap all
+            // owned tasks before exposing failure so query teardown/retry cannot
+            // overlap their remaining allocations or side effects.
+            for _ in 0..64 {
+                match this.producers.poll_join_next(cx) {
+                    Poll::Ready(Some(_)) => continue,
+                    Poll::Ready(None) => {
+                        this.finished = true;
+                        return Poll::Ready(Some(Err(this.pending_error.take().unwrap())));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        // Observe task failures before yielding more batches. Bound completed
+        // task work per poll so a large partition count cannot monopolize it.
+        let mut completions = 0;
+        for _ in 0..64 {
+            completions += 1;
+            match this.producers.poll_join_next(cx) {
+                Poll::Ready(Some(Ok(Ok(())))) => continue,
+                Poll::Ready(Some(result)) => {
+                    let error = match result {
+                        Ok(Err(error)) => error,
+                        Err(error) => QueryError::Execution(format!(
+                            "{} producer task failed: {error}",
+                            this.label
+                        )),
+                        Ok(Ok(())) => unreachable!(),
+                    };
+                    this.stop();
+                    this.finished = false;
+                    this.pending_error = Some(error);
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Poll::Ready(None) | Poll::Pending => break,
+            }
+        }
+        if completions == 64 {
+            cx.waker().wake_by_ref();
+        }
+        match this.receiver.poll_recv(cx) {
+            Poll::Ready(Some(queued)) => {
+                let QueuedInputBatch {
+                    batch,
+                    _reservation,
+                    _demand,
+                } = queued;
+                // Consumer ownership begins here; the queue no longer retains
+                // this batch. Downstream retained state needs its own admission.
+                drop(_reservation);
+                drop(_demand);
+                Poll::Ready(Some(Ok(batch)))
+            }
+            Poll::Ready(None) if this.producers.is_empty() => {
+                this.finished = true;
+                this.envelope.take();
+                Poll::Ready(None)
+            }
+            Poll::Ready(None) => {
+                // A closed channel alone is not successful completion: a
+                // producer panic may have dropped its last sender. JoinSet
+                // registered our waker above; wait for completion instead of
+                // self-waking in a loop while the final task is still pending.
+                // The completion-budget branch already wakes when needed.
+                Poll::Pending
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+#[cfg(test)]
+mod admitted_queue_tests;
+
+async fn stream_merge_input_partitions(
+    input: &Arc<dyn PhysicalOperator>,
+    pool: &SharedMemoryPool,
+    label: &'static str,
+) -> Result<RecordBatchStream> {
+    let partitions = input.output_partitions();
+    let mut preparation_trace = InputTrace::new("queue_prepare", || {
+        serde_json::json!({
+            "label":label,"operator":input.name(),"partitions":partitions
+        })
+    });
+    if partitions == 0 {
+        InputTrace::finish(&mut preparation_trace);
+        return Ok(Box::pin(stream::empty()));
+    }
+    if partitions == 1 {
+        let result = input.execute(0).await;
+        if result.is_ok() {
+            InputTrace::finish(&mut preparation_trace);
+        }
+        return result;
+    }
+    const PER_PARTITION_CAPACITY: usize = 4;
+    let capacity = partitions
+        .checked_mul(PER_PARTITION_CAPACITY)
+        .ok_or_else(|| QueryError::Execution(format!("{label} input queue capacity overflow")))?;
+    if capacity > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(QueryError::Execution(format!(
+            "{label} input queue capacity exceeds runtime limit"
+        )));
+    }
+    // Explicit preparation may need this pool for a nested build. Complete it
+    // before admitting any outer output slots; ordinary execute is not a proof
+    // that an unknown operator has finished initializing or stayed pull-driven.
+    let admitted = input.prepare_admitted_queue_input(pool.clone()).await?;
+    let admitted_mode = admitted.is_some();
+    if let Some(prepared) = &admitted {
+        if !prepared.pool.is_within(pool) || prepared.streams.as_slice().len() != partitions {
+            return Err(QueryError::Execution(format!(
+                "{label} admitted input pool/partition contract violated"
+            )));
+        }
+    }
+    let prepared = if admitted_mode {
+        None
+    } else {
+        input.prepare_queue_input().await?
+    };
+    let prepared_mode = admitted_mode || prepared.is_some();
+    let (bound, mut prepared_streams) = if let Some(prepared) = admitted {
+        (
+            None,
+            Some(QueueStreams::Admitted(prepared.streams.into_owned_iter())),
+        )
+    } else if let Some(prepared) = prepared {
+        if prepared.streams.len() != partitions {
+            return Err(QueryError::Execution(format!(
+                "{label} prepared partition contract violated: expected {partitions}, got {}",
+                prepared.streams.len()
+            )));
+        }
+        let bytes = prepared.output.max_bytes();
+        (
+            bytes,
+            Some(QueueStreams::Legacy(prepared.streams.into_iter())),
+        )
+    } else {
+        (
+            input
+                .pool_independent_queue_copy_bound()
+                .and_then(|b| b.max_bytes()),
+            None,
+        )
+    };
+    let pool = Arc::new(crate::execution::MemoryPool::new_child(
+        pool,
+        label,
+        pool.max(),
+    ));
+    // Conservative task/channel/handle allowance, retained through cancellation
+    // by both the queue and producers. Decoder and output leases are separate.
+    let queue_metadata = if admitted_mode {
+        let bytes = partitions
+            .checked_mul(16384)
+            .and_then(|n| {
+                capacity
+                    .checked_mul(std::mem::size_of::<QueuedInputBatch>() * 4)
+                    .and_then(|c| n.checked_add(c))
+            })
+            .and_then(|n| n.checked_add(4096))
+            .ok_or_else(|| QueryError::Execution(format!("{label} queue metadata overflow")))?;
+        Some(Arc::new(pool.allocate(bytes)?))
+    } else {
+        None
+    };
+    let (tx, receiver) = tokio::sync::mpsc::channel(capacity);
+    let mut producers = tokio::task::JoinSet::new();
+    // Audited resident pipelines and explicit prepared descriptors promise a
+    // copied-output bound AND pool-independent future pulls.
+    // A fixed envelope avoids per-batch contention among our own queued slots.
+    // It does not admit upstream expression scratch or retained source storage.
+    let max_slots = partitions.min(rayon::current_num_threads().max(1));
+    let declared_bound = bound;
+    let parallel = bound.and_then(|bytes| {
+        (2..=max_slots).rev().find_map(|slots| {
+            let total = bytes.checked_mul(slots)?;
+            pool.try_allocate(total)
+                .map(|guard| (slots, bytes, Arc::new(guard)))
+        })
+    });
+    let (slots, bound, envelope) = if admitted_mode {
+        (max_slots, None, None)
+    } else {
+        match parallel {
+            Some((slots, bytes, guard)) => (slots, Some(bytes), Some(guard)),
+            None => (1, None, None),
+        }
+    };
+    let queue_id = preparation_trace.as_ref().map(|t| t.id);
+    if let Some(t) = preparation_trace.as_mut() {
+        t.detail = serde_json::json!({"label":label,"operator":input.name(),"partitions":partitions,
+            "prepared":prepared_mode,"admitted_buffers":admitted_mode,"declared_bound":declared_bound,"slots":slots,
+            "max_slots":max_slots,"envelope_bytes":bound.and_then(|b| b.checked_mul(slots))});
+    }
+    InputTrace::finish(&mut preparation_trace);
+    let demand = Arc::new(tokio::sync::Semaphore::new(slots));
+    for part in 0..partitions {
         let input = input.clone();
         let tx = tx.clone();
-        tokio::spawn(async move {
-            let mut stream = match input.execute(part).await {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
+        let pool = pool.clone();
+        let demand = demand.clone();
+        let envelope = envelope.clone();
+        let queue_metadata = queue_metadata.clone();
+        let prepared_stream = prepared_streams.as_mut().and_then(Iterator::next);
+        producers.spawn(async move {
+            let mut trace = queue_id.and_then(|id| {
+                InputTrace::new("queue_producer", || {
+                    serde_json::json!({
+                        "queue":id,"partition":part,"rows":0,"batches":0,"charged_copy_bytes":0,
+                        "permit_ms":0.0,"poll_ms":0.0,"charge_ms":0.0,"copy_ms":0.0,"send_ms":0.0
+                    })
+                })
+            });
+            // Retain even when parked before a pull; Drop cancels asynchronously.
+            let _envelope = envelope;
+            let _queue_metadata = queue_metadata;
+            let tick = trace.as_ref().map(|_| std::time::Instant::now());
+            let mut stream = match prepared_stream {
+                Some(stream) => stream,
+                None => input.execute(part).await?,
             };
+            input_trace_add_ms(&mut trace, "execute_ms", tick);
+            drop(input);
             loop {
-                match stream.try_next().await {
-                    Ok(Some(batch)) => {
-                        if tx.send(Ok(batch)).await.is_err() {
-                            // Receiver gone (e.g. the consumer bailed on an
-                            // earlier error) — stop pulling from our own
-                            // upstream rather than spin producing into the
-                            // void.
-                            return;
-                        }
+                // Backpressure precedes upstream polling: no newly pulled
+                // batch waits unreserved for another queued batch to drain.
+                // Unknown layouts retain one demand; proven layouts use the
+                // fixed pre-admitted parallel slots.
+                let tick = trace.as_ref().map(|_| std::time::Instant::now());
+                let permit =
+                    demand.clone().acquire_owned().await.map_err(|_| {
+                        QueryError::Execution(format!("{label} demand gate closed"))
+                    })?;
+                input_trace_add_ms(&mut trace, "permit_ms", tick);
+                let tick = trace.as_ref().map(|_| std::time::Instant::now());
+                let Some(batch) = stream.try_next().await? else {
+                    input_trace_add_ms(&mut trace, "poll_ms", tick);
+                    InputTrace::finish(&mut trace);
+                    return Ok(());
+                };
+                input_trace_add_ms(&mut trace, "poll_ms", tick);
+                let tick = trace.as_ref().map(|_| std::time::Instant::now());
+                let bytes = if admitted_mode {
+                    0
+                } else {
+                    owned_input_batch_charge(&batch)
+                        .map_err(|error| QueryError::Execution(format!("{label}: {error}")))?
+                };
+                // Preserve the owned-pool refusal grammar used by the cap
+                // harness; the denying child or ancestor is already named.
+                let reservation = if admitted_mode {
+                    None
+                } else if let Some(limit) = bound {
+                    if bytes > limit {
+                        return Err(QueryError::Execution(format!(
+                            "{label} copy-bound contract violated: actual {bytes}, bound {limit}"
+                        )));
                     }
-                    Ok(None) => return,
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                        return;
+                    None
+                } else {
+                    Some(pool.allocate(bytes)?)
+                };
+                input_trace_add_ms(&mut trace, "charge_ms", tick);
+                if let Some(t) = trace.as_mut() {
+                    for (key, n) in [
+                        ("rows", batch.num_rows()),
+                        ("batches", 1),
+                        ("charged_copy_bytes", bytes),
+                    ] {
+                        t.detail[key] = serde_json::json!(t.detail[key]
+                            .as_u64()
+                            .unwrap_or(0)
+                            .saturating_add(n as u64));
                     }
+                }
+                let tick = trace.as_ref().map(|_| std::time::Instant::now());
+                let batch = if admitted_mode {
+                    batch
+                } else {
+                    own_input_batch(batch)?
+                };
+                input_trace_add_ms(&mut trace, "copy_ms", tick);
+                let queued = QueuedInputBatch {
+                    batch,
+                    _reservation: reservation,
+                    _demand: permit,
+                };
+                // Admission includes the pending-send value; never await budget
+                // availability, which could deadlock against downstream state.
+                let tick = trace.as_ref().map(|_| std::time::Instant::now());
+                let sent = tx.send(queued).await;
+                input_trace_add_ms(&mut trace, "send_ms", tick);
+                if sent.is_err() {
+                    return Ok(());
                 }
             }
         });
     }
-    // Drop this function's own sender handle so the channel closes once
-    // every spawned producer task (each holds its own clone) finishes.
     drop(tx);
+    Ok(Box::pin(InputQueueStream {
+        receiver,
+        producers,
+        label,
+        finished: false,
+        pending_error: None,
+        envelope,
+        _queue_metadata: queue_metadata,
+    }))
+}
 
-    Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+fn input_trace_add_ms(trace: &mut Option<InputTrace>, key: &str, tick: Option<std::time::Instant>) {
+    if let (Some(t), Some(tick)) = (trace.as_mut(), tick) {
+        t.detail[key] = serde_json::json!(
+            t.detail[key].as_f64().unwrap_or(0.0) + tick.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
+
+/// A closed merge channel is not proof of successful blocking-task completion.
+/// Retain/poll its handle so a panic cannot turn a valid prefix into clean EOF.
+struct OwnedTaskOutputStream {
+    label: &'static str,
+    receiver: tokio::sync::mpsc::Receiver<Result<RecordBatch>>,
+    worker: Option<tokio::task::JoinHandle<()>>,
+    finished: bool,
+}
+impl OwnedTaskOutputStream {
+    fn stop(&mut self) {
+        self.finished = true;
+        self.receiver.close();
+        while self.receiver.try_recv().is_ok() {}
+        if let Some(worker) = self.worker.take() {
+            worker.abort();
+        }
+        // Async producers stop cooperatively on Tokio cancellation. Started
+        // blocking tasks cannot be aborted: their captured file owners survive
+        // until their closed-receiver sink stops and their closure exits.
+    }
+}
+impl Drop for OwnedTaskOutputStream {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+impl futures::Stream for OwnedTaskOutputStream {
+    type Item = Result<RecordBatch>;
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(None);
+        }
+        if let Some(worker) = &mut this.worker {
+            match std::future::Future::poll(std::pin::Pin::new(worker), cx) {
+                Poll::Ready(Ok(())) => this.worker = None,
+                Poll::Ready(Err(error)) => {
+                    let error =
+                        QueryError::Execution(format!("{} task failed: {error}", this.label));
+                    this.stop();
+                    return Poll::Ready(Some(Err(error)));
+                }
+                Poll::Pending => (),
+            }
+        }
+        match this.receiver.poll_recv(cx) {
+            Poll::Ready(Some(Ok(batch))) => Poll::Ready(Some(Ok(batch))),
+            Poll::Ready(Some(Err(error))) => {
+                this.stop();
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) if this.worker.is_none() => {
+                this.finished = true;
+                Poll::Ready(None)
+            }
+            // Worker poll registered a waker. Sender drop can precede panic or
+            // normal return; wait without self-waking or reporting early EOF.
+            Poll::Ready(None) | Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Stop at the exact fetch boundary without another upstream poll. Dropping
+/// the task stream here closes its receiver while the worker keeps file ownership.
+struct SortFetchStream {
+    input: Option<OwnedTaskOutputStream>,
+    remaining: usize,
+}
+impl futures::Stream for SortFetchStream {
+    type Item = Result<RecordBatch>;
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        if this.remaining == 0 {
+            this.input.take();
+            return Poll::Ready(None);
+        }
+        let Some(input) = this.input.as_mut() else {
+            return Poll::Ready(None);
+        };
+        match futures::Stream::poll_next(std::pin::Pin::new(input), cx) {
+            Poll::Ready(Some(Ok(batch))) => {
+                let batch = truncate_batches_to_limit(vec![batch], this.remaining)
+                    .pop()
+                    .expect("positive fetch retains its batch");
+                this.remaining -= batch.num_rows();
+                if this.remaining == 0 {
+                    this.input.take();
+                }
+                Poll::Ready(Some(Ok(batch)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                this.input.take();
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                this.input.take();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 // ============================================================================
@@ -394,6 +1090,31 @@ enum BuildDecision {
     /// materialized `Vec` — can own a handle to it without borrowing
     /// `&self` (a `RecordBatchStream` cannot).
     Spill(Arc<SpillState>),
+}
+
+/// Own a newly-created operator spill directory across initialization and work.
+/// Move this guard with background work; never delete files before its last use.
+struct SpillDirectoryOwner(Option<PathBuf>);
+
+impl SpillDirectoryOwner {
+    fn create(path: PathBuf) -> Result<Self> {
+        // The configured parent already exists. Never adopt/delete a stale or
+        // foreign existing directory merely because its counter-based name fits.
+        std::fs::create_dir(&path).map_err(|error| {
+            QueryError::Execution(format!("Failed to create spill directory: {error}"))
+        })?;
+        Ok(Self(Some(path)))
+    }
+    fn into_path(mut self) -> PathBuf {
+        self.0.take().expect("initialization directory owned")
+    }
+}
+impl Drop for SpillDirectoryOwner {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
 }
 
 /// The memoized, already-partitioned build side of a spilling join (see
@@ -620,6 +1341,25 @@ struct SpilledPartition {
 
 #[async_trait]
 impl PhysicalOperator for SpillableHashJoinExec {
+    fn runtime_filter_target(
+        &self,
+        output: usize,
+    ) -> Option<crate::physical::plan::RuntimeFilterTarget> {
+        let index = super::hash_join::runtime_filter_probe_ordinal(
+            self.join_type,
+            self.build_right,
+            self.retained.as_deref(),
+            self.left.schema().fields().len(),
+            self.right.schema().fields().len(),
+            output,
+        )?;
+        let probe = if self.build_right {
+            &self.left
+        } else {
+            &self.right
+        };
+        probe.runtime_filter_target(index)
+    }
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -639,6 +1379,51 @@ impl PhysicalOperator for SpillableHashJoinExec {
                 };
                 probe_side.output_partitions().max(1)
             }
+        }
+    }
+
+    async fn prepare_admitted_queue_input(
+        &self,
+        pool: crate::execution::SharedMemoryPool,
+    ) -> Result<Option<crate::physical::PreparedAdmittedInput>> {
+        if !matches!(
+            self.join_type,
+            JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full
+        ) {
+            return Ok(None);
+        }
+        let swapped = self.build_right || self.join_type == JoinType::Right;
+        let build = if swapped { &self.right } else { &self.left };
+        let decision = self
+            .build_decision
+            .get_or_try_init(|| self.compute_build_decision(build, swapped))
+            .await?;
+        match decision {
+            BuildDecision::InMemory(join) => join.prepare_admitted_queue_input(pool).await,
+            BuildDecision::Spill(_) => Ok(None),
+        }
+    }
+
+    async fn prepare_queue_input(&self) -> Result<Option<crate::physical::PreparedQueueInput>> {
+        if self.join_type != JoinType::Inner {
+            return Ok(None);
+        }
+        let (build, _probe, swapped) = if self.build_right {
+            (&self.right, &self.left, true)
+        } else {
+            (&self.left, &self.right, false)
+        };
+        // Decide the outer build before asking the in-memory delegate to
+        // recursively prepare its probe. Spilled output remains unsupported.
+        let decision = self
+            .build_decision
+            .get_or_try_init(|| self.compute_build_decision(build, swapped))
+            .await?;
+        match decision {
+            BuildDecision::InMemory(join) => join.prepare_queue_input().await,
+            // Computing the decision owns initialization files; never start
+            // the spill output producer merely to decline this capability.
+            BuildDecision::Spill(_) => Ok(None),
         }
     }
 
@@ -767,9 +1552,9 @@ impl SpillableHashJoinExec {
         self.config.ensure_spill_dir()?;
         let spill_id = SPILL_COUNTER.fetch_add(1, Ordering::Relaxed);
         let spill_dir = self.config.spill_path.join(format!("join_0_{}", spill_id));
-        std::fs::create_dir_all(&spill_dir).map_err(|e| {
-            QueryError::Execution(format!("Failed to create spill directory: {}", e))
-        })?;
+        // Declared before the nested build future: its local writers/stream
+        // drop before this guard cleans the initialization directory.
+        let init_directory = SpillDirectoryOwner::create(spill_dir.clone())?;
 
         if sj_trace {
             let prefix_rows: usize = prefix.iter().map(|b| b.num_rows()).sum();
@@ -797,7 +1582,7 @@ impl SpillableHashJoinExec {
             partitions,
             tables,
             spilled,
-            spill_dir,
+            spill_dir: init_directory.into_path(),
         })))
     }
 
@@ -821,18 +1606,35 @@ impl SpillableHashJoinExec {
         // concurrently (the streaming analog of
         // `collect_input_partitions_concurrently`'s own parallel-drain
         // benefit for a pipeline-breaking operator's collect side).
-        let mut build_stream = stream_merge_input_partitions(build_side).await?;
+        let mut build_stream =
+            stream_merge_input_partitions(build_side, &self.memory_pool, "join build input queue")
+                .await?;
         let mut flat_batches: Vec<RecordBatch> = Vec::new();
         let mut flat_size: usize = 0;
+        let mut flat_rows: usize = 0;
 
         while let Some(batch) = build_stream.try_next().await? {
             let batch_size = estimate_batch_size(&batch);
+            let next_size = flat_size
+                .checked_add(batch_size)
+                .ok_or_else(|| QueryError::Execution("join build payload size overflow".into()))?;
+            let next_rows = flat_rows
+                .checked_add(batch.num_rows())
+                .ok_or_else(|| QueryError::Execution("join build row count overflow".into()))?;
+            let index_size = if build_keys.is_empty() {
+                0
+            } else {
+                super::hash_join::join_index_storage_bound(next_rows)?
+            };
+            let working_size = next_size
+                .checked_add(index_size)
+                .ok_or_else(|| QueryError::Execution("join build working size overflow".into()))?;
             let chaos_crossing = chaos_after_batches
                 .map(|n| flat_batches.len() >= n)
                 .unwrap_or(false);
             // The batch is already in memory when this decision is made: record it.
-            self.memory_pool.observe(flat_size + batch_size);
-            if flat_size + batch_size > memory_threshold || chaos_crossing {
+            self.memory_pool.observe(next_size);
+            if working_size > memory_threshold || chaos_crossing {
                 if chaos_crossing && sj_trace {
                     eprintln!(
                         "[sj-trace] compute_build_decision CHAOS forcing spill (QE_SPILL_CHAOS_FORCE_SPILL) at flat_batches={} flat_size={}",
@@ -854,7 +1656,8 @@ impl SpillableHashJoinExec {
                     .finish_via_spill(prefix, build_stream, &build_keys, sj_trace)
                     .await;
             }
-            flat_size += batch_size;
+            flat_size = next_size;
+            flat_rows = next_rows;
             self.memory_pool.observe(flat_size);
             flat_batches.push(batch);
         }
@@ -887,13 +1690,15 @@ impl SpillableHashJoinExec {
                 .await;
         }
 
-        // Never crossed the threshold: the build side genuinely fits.
-        // Same in-memory HashJoinExec construction as before — reached
-        // without ever risking an unbounded collection to get here.
-        let build_schema = flat_batches
-            .first()
-            .map(|b| b.schema())
-            .unwrap_or_else(|| build_side.schema());
+        // Payload plus the vectorized index costing bound stayed below the
+        // threshold. This is not admission proof for every build allocation:
+        // the delegate still reserves actual index/row-store storage, and
+        // evaluated keys and generic-map paths have separate resource costs.
+        // Preserve the producer's declared domain and column identity. Physical
+        // batches may encode those values as dictionaries (and change codebooks
+        // between batches); MemoryTableExec already adapts actual output types.
+        // A materialization must not turn that encoding into the join's schema.
+        let build_schema = build_side.schema();
         let build_mem = Arc::new(crate::physical::operators::MemoryTableExec::new(
             "join_build",
             build_schema,
@@ -913,7 +1718,8 @@ impl SpillableHashJoinExec {
                 self.join_type,
                 self.filter.clone(),
             )
-            .with_build_right(self.build_right);
+            .with_build_right(self.build_right)
+            .with_memory_pool(self.memory_pool.clone());
             hj.probe_runtime_filter = self.probe_runtime_filter.clone();
             hj.probe_runtime_filter_pair = self.probe_runtime_filter_pair;
             hj.set_retained(self.retained.clone());
@@ -925,7 +1731,8 @@ impl SpillableHashJoinExec {
                 self.on.clone(),
                 self.join_type,
             )
-            .with_build_right(self.build_right);
+            .with_build_right(self.build_right)
+            .with_memory_pool(self.memory_pool.clone());
             hj.probe_runtime_filter = self.probe_runtime_filter.clone();
             hj.probe_runtime_filter_pair = self.probe_runtime_filter_pair;
             hj.set_retained(self.retained.clone());
@@ -1032,7 +1839,9 @@ impl SpillableHashJoinExec {
         // probe input partition is drained concurrently, a handful of
         // batches can be in flight at once, never the whole side.
         let probe_partitions = probe_side.output_partitions().max(1);
-        let probe_stream = stream_merge_input_partitions(probe_side).await?;
+        let probe_stream =
+            stream_merge_input_partitions(probe_side, &self.memory_pool, "join probe input queue")
+                .await?;
 
         let (build_side, _) = if swapped {
             (&self.right, &self.left)
@@ -1072,7 +1881,7 @@ impl SpillableHashJoinExec {
         let state = Arc::clone(state);
         let (tx, rx) =
             tokio::sync::mpsc::channel::<Result<RecordBatch>>(SPILL_JOIN_OUTPUT_CHANNEL_CAPACITY);
-        tokio::spawn(async move {
+        let worker = tokio::spawn(async move {
             let sj_t0 = std::time::Instant::now();
             match run_spill_join_producer(&state, &ctx, probe_stream, &tx).await {
                 Ok(Some(stats)) => {
@@ -1109,7 +1918,12 @@ impl SpillableHashJoinExec {
                 }
             }
         });
-        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        Ok(Box::pin(OwnedTaskOutputStream {
+            label: "spill join output",
+            receiver: rx,
+            worker: Some(worker),
+            finished: false,
+        }))
     }
 
     /// Evict partition `idx`'s currently-resident batches to disk right now,
@@ -1610,6 +2424,7 @@ struct ProbePhase {
     probe_rows: usize,
     in_memory_matched: usize,
     abandoned: bool,
+    file_owner: Arc<ProbeSpillFiles>,
 }
 
 /// Send one output batch; `false` means the consumer dropped the stream.
@@ -1622,9 +2437,22 @@ async fn emit_join_batch(
     tx.send(Ok(batch)).await.is_ok()
 }
 
-fn remove_probe_files(files: &[Option<PathBuf>]) {
-    for f in files.iter().flatten() {
-        let _ = std::fs::remove_file(f);
+/// Per-call files outlive every writer and reader, including blocking work
+/// whose awaiting async producer has been cancelled. Retaining the build state
+/// also prevents its directory from disappearing before these users finish.
+struct ProbeSpillFiles {
+    state: Arc<SpillState>,
+    call_id: u64,
+}
+impl Drop for ProbeSpillFiles {
+    fn drop(&mut self) {
+        for idx in 0..NUM_PARTITIONS {
+            let path = self
+                .state
+                .spill_dir
+                .join(format!("probe_{}_{}.parquet", self.call_id, idx));
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -1642,7 +2470,6 @@ async fn run_spill_join_producer(
 ) -> Result<Option<SpillJoinStats>> {
     let phase_a = probe_with_spilling(state, ctx, probe_stream, tx).await?;
     if phase_a.abandoned {
-        remove_probe_files(&phase_a.probe_spill_files);
         return Ok(None);
     }
     if ctx.sj_trace {
@@ -1661,7 +2488,6 @@ async fn run_spill_join_producer(
     // work with no await points, so it runs on the blocking pool and
     // pushes batches through `blocking_send` (bounded, back-pressured).
     let outcome = process_spilled_partitions(state, ctx, &phase_a, tx).await;
-    remove_probe_files(&phase_a.probe_spill_files);
     let spilled_matched = match outcome? {
         Some(n) => n,
         None => return Ok(None),
@@ -1842,7 +2668,9 @@ async fn process_spilled_partitions(
         let probe_file = phase_a.probe_spill_files[idx].clone();
         let probe_key_checksum = phase_a.probe_key_checksums[idx];
         let chunk_budget = plan.chunk_budget;
+        let file_owner = phase_a.file_owner.clone();
         jobs.spawn_blocking(move || -> PhaseBJobResult {
+            let _file_owner = file_owner;
             let sp = state2.spilled[idx]
                 .as_ref()
                 .expect("spilled partition checked above");
@@ -1939,10 +2767,17 @@ struct PhaseAState {
     /// preserved build side): one bitmap per RESIDENT partition (per build
     /// batch), marked from many probe pieces at once → `AtomicBool`.
     build_matched: Vec<Option<Vec<Vec<std::sync::atomic::AtomicBool>>>>,
+    // Last field: writers must drop before the last file owner.
+    file_owner: Arc<ProbeSpillFiles>,
 }
 
 impl PhaseAState {
-    fn new(state: &SpillState, build_side_output: bool, memory_threshold: usize) -> Result<Self> {
+    fn new(
+        state: &Arc<SpillState>,
+        build_side_output: bool,
+        memory_threshold: usize,
+        call_id: u64,
+    ) -> Result<Self> {
         use std::sync::atomic::AtomicBool;
         let build_matched = (0..NUM_PARTITIONS)
             .map(|idx| {
@@ -1963,6 +2798,10 @@ impl PhaseAState {
             probe_spill_files: (0..NUM_PARTITIONS).map(|_| None).collect(),
             probe_key_checksums: (0..NUM_PARTITIONS).map(|_| None).collect(),
             build_matched,
+            file_owner: Arc::new(ProbeSpillFiles {
+                state: state.clone(),
+                call_id,
+            }),
         })
     }
 }
@@ -2183,7 +3022,7 @@ async fn probe_with_spilling(
     // bare (`SpillJoinCtx::probe_emit` / `build_emit`); matched pairs are
     // emitted as INNER pairs alongside.
     let build_bitmap = ctx.build_bitmap();
-    let mut st = PhaseAState::new(state, build_bitmap, ctx.memory_threshold)?;
+    let mut st = PhaseAState::new(state, build_bitmap, ctx.memory_threshold, ctx.call_id)?;
     let mut in_memory_matched = 0usize;
     // join-spill-streaming task 001: probe rows counted as they flow
     // (QE_SPILL_DEBUG trace), since the probe side is no longer a Vec.
@@ -2200,6 +3039,7 @@ async fn probe_with_spilling(
             probe_rows,
             in_memory_matched,
             abandoned: true,
+            file_owner: st.file_owner,
         })
     };
 
@@ -2284,6 +3124,7 @@ async fn probe_with_spilling(
         spill_writers,
         probe_spill_files,
         probe_key_checksums,
+        file_owner,
         ..
     } = st;
     drop(pool);
@@ -2295,6 +3136,7 @@ async fn probe_with_spilling(
         probe_rows: probe_rows_in,
         in_memory_matched,
         abandoned: false,
+        file_owner,
     })
 }
 
@@ -2743,361 +3585,20 @@ impl SpillableHashAggregateExec {
             })
     }
 
-    /// Stream every input partition into a bounded channel consumed by
-    /// balanced aggregation worker threads (work distribution is by
-    /// availability, not by partition, so skewed partitions don't serialize).
-    /// Returns Ok(None) to fall back to the materializing path when a worker
-    /// can't process a batch or the group-count budget trips — the input is
-    /// re-executed there.
+    /// Bind a spillable partial-state path before input consumption. Unsupported
+    /// layouts alone may return None. Once input starts, failures are terminal;
+    /// budget pressure flushes partial states without reexecuting the source.
     async fn execute_fused_streaming(&self) -> Result<Option<RecordBatchStream>> {
-        use crate::physical::morsel_agg::{merge_states_to_batches, AggregationState};
-        use crate::planner::AggregateFunction;
-        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-
-        let plan_schema =
-            crate::planner::PlanSchema::from_qualified_arrow(self.input.schema().as_ref());
-        let input_types: Vec<arrow::datatypes::DataType> = self
-            .aggregates
-            .iter()
-            .map(|a| {
-                a.input
-                    .data_type(&plan_schema)
-                    .unwrap_or(arrow::datatypes::DataType::Float64)
-            })
-            .collect();
-        let agg_funcs: Vec<AggregateFunction> = self.aggregates.iter().map(|a| a.func).collect();
-        let agg_inputs: Vec<Expr> = self.aggregates.iter().map(|a| a.input.clone()).collect();
-        let timing = std::env::var("AGG_TIMING").is_ok();
-        // QE_SPILL_DEBUG tracing (task 001, spill-join-correctness epic): see
-        // the identical-purpose comment on `execute_spill_path`. This
-        // function's own doc comment already states it may fall back to
-        // `Ok(None)` and have its input RE-EXECUTED by the caller
-        // (`SpillableHashAggregateExec::execute`'s
-        // `collect_input_partitions_concurrently` path) — tracing here
-        // shows directly whether that fallback is actually taken, and why.
-        let sj_trace = std::env::var("QE_SPILL_DEBUG").is_ok();
-        let sj_call_id = next_sj_trace_id();
-        let t_start = std::time::Instant::now();
-        let busy_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
-
-        // Group-state budget: a worker aborts the fused attempt if its state
-        // estimate exceeds an equal share of the memory budget.
-        let n_workers = rayon::current_num_threads().clamp(2, 32);
-        let per_group_bytes = 64 + 48 * self.aggregates.len();
-        let memory_threshold =
-            (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
-        let group_limit = ((memory_threshold / n_workers) / per_group_bytes).max(64);
-
-        // Grouped aggregates hash-partition batches to PER-WORKER channels so
-        // every worker owns a disjoint key subset: the finalize is then a
-        // parallel per-state build instead of a full shard merge. With one
-        // shared channel, 32 workers each accumulated partials over the WHOLE
-        // key space and the merge paid the overlap (Q13 at SF=100: 126M
-        // partial slots for 15M real groups, 4.3s of a 7.5s query). Global
-        // aggregates (no GROUP BY) keep the shared channel — every row is one
-        // group, and partitioning would serialize onto one worker.
-        let disjoint = self.disjoint_hint && !self.group_by.is_empty();
-        let mut txs: Vec<crossbeam::channel::Sender<RecordBatch>> = Vec::with_capacity(n_workers);
-        let mut rxs: Vec<crossbeam::channel::Receiver<RecordBatch>> = Vec::with_capacity(n_workers);
-        if disjoint {
-            for _ in 0..n_workers {
-                let (t, r) = crossbeam::channel::bounded::<RecordBatch>(8);
-                txs.push(t);
-                rxs.push(r);
-            }
-        } else {
-            let (t, r) = crossbeam::channel::bounded::<RecordBatch>(n_workers * 8);
-            txs.push(t);
-            rxs.push(r);
-        }
-        let abort = Arc::new(AtomicBool::new(false));
-        // QE_SPILL_DEBUG tracing (task 001, spill-join-correctness epic):
-        // `abort` alone doesn't say WHY — capture the first worker-side
-        // error's message so a caught abort is diagnosable, not just
-        // detected. `Mutex<Option<String>>` rather than a second atomic
-        // flag/enum: the interesting content is the error text itself.
-        let abort_reason: Arc<std::sync::Mutex<Option<String>>> =
-            Arc::new(std::sync::Mutex::new(None));
-
-        // Aggregation workers: dedicated OS threads pulling from the channel.
-        let mut workers = Vec::with_capacity(n_workers);
-        for w in 0..n_workers {
-            let rx = if disjoint {
-                rxs[w].clone()
-            } else {
-                rxs[0].clone()
-            };
-            let abort = Arc::clone(&abort);
-            let abort_reason = Arc::clone(&abort_reason);
-            let agg_funcs = agg_funcs.clone();
-            let input_types = input_types.clone();
-            let agg_inputs = agg_inputs.clone();
-            let group_by = self.group_by.clone();
-            let busy_ns = Arc::clone(&busy_ns);
-            workers.push(std::thread::spawn(move || {
-                let mut state = AggregationState::new(agg_funcs, input_types);
-                let mut batches_seen = 0usize;
-                while let Ok(batch) = rx.recv() {
-                    if abort.load(AtomicOrdering::Relaxed) {
-                        continue; // keep draining so senders never block forever
-                    }
-                    let t = std::time::Instant::now();
-                    if let Err(e) = state.process_batch(&batch, &group_by, &agg_inputs) {
-                        if sj_trace {
-                            let mut guard = abort_reason.lock().unwrap();
-                            if guard.is_none() {
-                                *guard = Some(format!(
-                                    "worker {} process_batch error after {} batches: {}",
-                                    w, batches_seen, e
-                                ));
-                            }
-                        }
-                        abort.store(true, AtomicOrdering::Relaxed);
-                        continue;
-                    }
-                    busy_ns.fetch_add(t.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
-                    batches_seen += 1;
-                    if batches_seen % 16 == 0 && state.group_count() > group_limit {
-                        abort.store(true, AtomicOrdering::Relaxed);
-                    }
-                }
-                if state.group_count() > group_limit {
-                    abort.store(true, AtomicOrdering::Relaxed);
-                }
-                if std::env::var("QE_WORKER_DEBUG").is_ok() {
-                    eprintln!(
-                        "[fused-worker] batches={} groups={}",
-                        batches_seen,
-                        state.group_count()
-                    );
-                }
-                state
-            }));
-        }
-        drop(rxs);
-
-        // Drain tasks: one per input partition. Disjoint mode partitions each
-        // batch by group-key hash and routes piece i to worker i's channel;
-        // the scatter runs on the drain task, so it parallelizes across input
-        // partitions.
-        let input_partitions = self.input.output_partitions().max(1);
-        if sj_trace {
-            eprintln!(
-                "[sj-trace] execute_fused_streaming START call_id={} input_partitions={} disjoint={}",
-                sj_call_id, input_partitions, disjoint
-            );
-        }
-        let mut drains = Vec::with_capacity(input_partitions);
-        for p in 0..input_partitions {
-            let input = self.input.clone();
-            let txs = txs.clone();
-            let abort = Arc::clone(&abort);
-            let group_by = self.group_by.clone();
-            drains.push(tokio::spawn(async move {
-                let mut coalesce: Vec<(usize, Vec<RecordBatch>)> =
-                    (0..txs.len()).map(|_| (0, Vec::new())).collect();
-                let mut stream = input.execute(p).await?;
-                while let Some(batch) = stream.try_next().await? {
-                    if abort.load(AtomicOrdering::Relaxed) {
-                        break;
-                    }
-                    let pieces: Vec<(usize, RecordBatch)> = if disjoint {
-                        // Coalesce per-worker pieces before sending: an
-                        // 8192-row batch split 32 ways is 256-row slivers,
-                        // and per-batch costs in process_batch (expr eval
-                        // setup, hash-table probes' setup) tripled worker
-                        // busy time when slivers went out directly.
-                        let mut out: Vec<(usize, RecordBatch)> = Vec::new();
-                        for (i, b) in partition_batch_by_hash(&batch, &group_by, txs.len())?
-                            .into_iter()
-                            .enumerate()
-                        {
-                            let Some(b) = b else { continue };
-                            if b.num_rows() == 0 {
-                                continue;
-                            }
-                            let (rows, bufd) = &mut coalesce[i];
-                            *rows += b.num_rows();
-                            bufd.push(b);
-                            if *rows >= 8_192 {
-                                let merged =
-                                    arrow::compute::concat_batches(&bufd[0].schema(), bufd.iter())
-                                        .map_err(|e| QueryError::Execution(e.to_string()))?;
-                                bufd.clear();
-                                *rows = 0;
-                                out.push((i, merged));
-                            }
-                        }
-                        out
-                    } else {
-                        vec![(0, batch)]
-                    };
-                    if pieces.is_empty() {
-                        continue;
-                    }
-                    // Bounded sends provide backpressure; run them off the
-                    // async reactor so a full channel doesn't stall others.
-                    let txs2 = txs.clone();
-                    let send_res = tokio::task::spawn_blocking(move || {
-                        for (i, piece) in pieces {
-                            if txs2[i].send(piece).is_err() {
-                                return true;
-                            }
-                        }
-                        false
-                    })
-                    .await;
-                    match send_res {
-                        Ok(false) => {}
-                        _ => break, // channel closed or join error
-                    }
-                }
-                // Flush the per-worker coalescing buffers.
-                let mut tail: Vec<(usize, RecordBatch)> = Vec::new();
-                for (i, (rows, bufd)) in coalesce.iter_mut().enumerate() {
-                    if *rows > 0 {
-                        let merged = arrow::compute::concat_batches(&bufd[0].schema(), bufd.iter())
-                            .map_err(|e| QueryError::Execution(e.to_string()))?;
-                        bufd.clear();
-                        tail.push((i, merged));
-                    }
-                }
-                if !tail.is_empty() && !abort.load(AtomicOrdering::Relaxed) {
-                    let txs2 = txs.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        for (i, piece) in tail {
-                            if txs2[i].send(piece).is_err() {
-                                return;
-                            }
-                        }
-                    })
-                    .await;
-                }
-                Ok::<_, QueryError>(())
-            }));
-        }
-        drop(txs);
-
-        let mut drain_failed = false;
-        let mut first_drain_err: Option<String> = None;
-        for (p, d) in drains.into_iter().enumerate() {
-            match d.await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    drain_failed = true;
-                    if sj_trace && first_drain_err.is_none() {
-                        first_drain_err = Some(format!("drain task p={} returned Err: {}", p, e));
-                    }
-                }
-                Err(join_err) => {
-                    drain_failed = true;
-                    if sj_trace && first_drain_err.is_none() {
-                        first_drain_err = Some(format!(
-                            "drain task p={} join error (panic?): {}",
-                            p, join_err
-                        ));
-                    }
-                }
-            }
-        }
-        let t_drained = t_start.elapsed();
-
-        let mut states = Vec::with_capacity(workers.len());
-        let mut first_worker_join_err: Option<String> = None;
-        for (w, worker) in workers.into_iter().enumerate() {
-            match worker.join() {
-                Ok(state) => states.push(state),
-                Err(e) => {
-                    drain_failed = true;
-                    if sj_trace && first_worker_join_err.is_none() {
-                        let msg = e
-                            .downcast_ref::<&str>()
-                            .map(|s| s.to_string())
-                            .or_else(|| e.downcast_ref::<String>().cloned())
-                            .unwrap_or_else(|| "<non-string panic payload>".to_string());
-                        first_worker_join_err = Some(format!("worker w={} panicked: {}", w, msg));
-                    }
-                }
-            }
-        }
-
-        let aborted = abort.load(AtomicOrdering::Relaxed);
-        if drain_failed || aborted {
-            if sj_trace {
-                let group_limit_exceeded = states.iter().any(|s| s.group_count() > group_limit);
-                let total_groups_so_far: usize = states.iter().map(|s| s.group_count()).sum();
-                let process_batch_reason = abort_reason.lock().unwrap().clone();
-                eprintln!(
-                    "[sj-trace] execute_fused_streaming ABORTED call_id={} drain_failed={} abort_flag={} \
-                     group_limit_exceeded={} group_limit={} states_collected={} total_groups_so_far={} \
-                     elapsed={:?} first_drain_err={:?} first_worker_join_err={:?} process_batch_reason={:?} \
-                     -> falling back to Ok(None); CALLER WILL RE-EXECUTE THE INPUT \
-                     (collect_input_partitions_concurrently) FROM SCRATCH",
-                    sj_call_id,
-                    drain_failed,
-                    aborted,
-                    group_limit_exceeded,
-                    group_limit,
-                    states.len(),
-                    total_groups_so_far,
-                    t_start.elapsed(),
-                    first_drain_err,
-                    first_worker_join_err,
-                    process_batch_reason
-                );
-            }
-            return Ok(None);
-        }
-
-        let t_workers = t_start.elapsed();
-        let total_groups: usize = states.iter().map(|s| s.group_count()).sum();
-        let mut batches = if disjoint {
-            crate::physical::morsel_agg::finalize_disjoint_states(
-                states,
-                &agg_funcs,
-                &input_types,
-                &self.schema,
-                self.post_filter.as_ref(),
-            )?
-        } else {
-            merge_states_to_batches(states, &agg_funcs, &input_types, &self.schema)?
-        };
-        let t_merged = t_start.elapsed();
-        if !disjoint {
-            if let Some(pred) = &self.post_filter {
-                batches = crate::physical::operators::filter_batches(batches, pred)?;
-            }
-        }
-        if std::env::var("QE_AGG_PROF").is_ok() {
-            use std::sync::atomic::Ordering as O;
-            eprintln!(
-                "[agg-prof] group-eval: {:.1}ms; agg-eval: {:.1}ms (cumulative across workers)",
-                crate::physical::morsel_agg::AGG_PROF_GROUP_NS.load(O::Relaxed) as f64 / 1e6,
-                crate::physical::morsel_agg::AGG_PROF_AGGEVAL_NS.load(O::Relaxed) as f64 / 1e6,
-            );
-        }
-        if timing {
-            eprintln!(
-                "[fused-agg] drain(join+scan+send): {:?}; workers done: {:?}; merge {} state-groups -> out: {:?}; worker busy sum: {:.1}ms; total: {:?}",
-                t_drained,
-                t_workers,
-                total_groups,
-                t_merged - t_workers,
-                busy_ns.load(AtomicOrdering::Relaxed) as f64 / 1e6,
-                t_start.elapsed()
-            );
-        }
-        if sj_trace {
-            let out_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-            eprintln!(
-                "[sj-trace] execute_fused_streaming OK call_id={} total_groups={} out_rows={} elapsed={:?}",
-                sj_call_id,
-                total_groups,
-                out_rows,
-                t_start.elapsed()
-            );
-        }
-        Ok(Some(Box::pin(stream::iter(batches.into_iter().map(Ok)))))
+        crate::physical::morsel_agg::live_spill::execute(
+            self.input.clone(),
+            &self.group_by,
+            &self.aggregates,
+            self.schema.clone(),
+            &self.memory_pool,
+            &self.config,
+            self.post_filter.as_ref(),
+        )
+        .await
     }
 }
 
@@ -3165,13 +3666,9 @@ impl PhysicalOperator for SpillableHashAggregateExec {
         // Aggregation always produces a single partition by collecting from all input partitions
         crate::physical::check_partition(self, partition)?;
 
-        // Fused streaming aggregation: input batches flow through a bounded
-        // channel into balanced aggregation workers — the input is never
-        // materialized (Q09 collected a 133M-row join output before a single
-        // group was aggregated) and aggregation overlaps with join output
-        // production. Bounded channel + group-count budget keep memory safe;
-        // ineligible shapes or a tripped budget fall through to the
-        // collect-then-decide path below.
+        // Bind the partial-state route before input is opened. A selected route
+        // consumes every partition once; memory pressure spills retained states.
+        // Only an unsupported capability can choose the ordinary route below.
         let fused_eligible = self.fused_streaming_eligible();
         if fused_eligible {
             if let Some(result) = self.execute_fused_streaming().await? {
@@ -3179,24 +3676,8 @@ impl PhysicalOperator for SpillableHashAggregateExec {
             }
         }
 
-        // QE_SPILL_DEBUG tracing (task 001, spill-join-correctness epic):
-        // reaching here after `fused_eligible` was true means
-        // `execute_fused_streaming` returned `Ok(None)` (see its own DONE/
-        // ABORTED trace lines) and its input is about to be driven a SECOND
-        // time by the streaming reservation below — for a child like
-        // `SpillableHashJoinExec`'s spill path, which has no cache of its
-        // own output, this reruns the ENTIRE join computation from scratch.
-        // Not proof of duplication by itself (this second run is the one
-        // whose results are actually returned), but a query whose log shows
-        // this line is a query where the join's expensive work happened
-        // twice, and a wrong answer that also shows two `execute_spill_path`
-        // DONE lines is direct evidence they share a cause.
         if std::env::var("QE_SPILL_DEBUG").is_ok() {
-            eprintln!(
-                "[sj-trace] agg fallback: fused_eligible={} -> (re-)executing input via \
-                 the streaming two-phase reservation (stream_merge_input_partitions)",
-                fused_eligible
-            );
+            eprintln!("[sj-trace] agg ordinary route: fused_eligible={fused_eligible}; no fused input was consumed");
         }
 
         // Phase 1: reserve, possibly spill (oom-safety-hardening task 002 —
@@ -3221,7 +3702,14 @@ impl PhysicalOperator for SpillableHashAggregateExec {
         // mid-stream instead of only after a full prior collection.
         let memory_threshold =
             (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
-        let mut input_stream = stream_merge_input_partitions(&self.input).await?;
+        let mut drain_trace = InputTrace::new("aggregate_drain", || {
+            serde_json::json!({
+                "scalar":self.group_by.is_empty(),"input":self.input.name(),"partitions":self.input.output_partitions()
+            })
+        });
+        let mut input_stream =
+            stream_merge_input_partitions(&self.input, &self.memory_pool, "aggregate input queue")
+                .await?;
         let mut flat_batches: Vec<RecordBatch> = Vec::new();
         let mut flat_size: usize = 0;
         let mut crossing_batch: Option<RecordBatch> = None;
@@ -3238,7 +3726,19 @@ impl PhysicalOperator for SpillableHashAggregateExec {
             flat_batches.push(batch);
         }
 
+        if let Some(t) = drain_trace.as_mut() {
+            t.detail["retained_batches"] = serde_json::json!(flat_batches.len());
+            t.detail["retained_bytes_estimate"] = serde_json::json!(flat_size);
+            t.detail["crossed_threshold"] = serde_json::json!(crossing_batch.is_some());
+        }
+        InputTrace::finish(&mut drain_trace);
+
         if crossing_batch.is_none() {
+            let mut reduce_trace = InputTrace::new("aggregate_delegate_execute", || {
+                serde_json::json!({
+                    "scalar":self.group_by.is_empty(),"batches":flat_batches.len()
+                })
+            });
             // Never crossed the threshold: the input genuinely fits — the
             // ordinary in-memory case, reached without ever risking an
             // unbounded collection to get here.
@@ -3268,8 +3768,10 @@ impl PhysicalOperator for SpillableHashAggregateExec {
                 self.group_by.clone(),
                 hash_aggs,
                 self.schema.clone(),
-            );
+            )
+            .with_memory_pool(self.memory_pool.clone());
             let stream = hash_agg.execute(0).await?;
+            InputTrace::finish(&mut reduce_trace);
             if let Some(pred) = &self.post_filter {
                 let batches: Vec<RecordBatch> = stream.try_collect().await?;
                 let batches = crate::physical::operators::filter_batches(batches, pred)?;
@@ -3286,9 +3788,7 @@ impl PhysicalOperator for SpillableHashAggregateExec {
             .config
             .spill_path
             .join(format!("agg_{}_{}", partition, spill_id));
-        std::fs::create_dir_all(&spill_dir).map_err(|e| {
-            QueryError::Execution(format!("Failed to create spill directory: {}", e))
-        })?;
+        let spill_directory = SpillDirectoryOwner::create(spill_dir.clone())?;
 
         if std::env::var("QE_SPILL_DEBUG").is_ok() {
             eprintln!(
@@ -3419,12 +3919,14 @@ impl PhysicalOperator for SpillableHashAggregateExec {
                 if batches.is_empty() {
                     continue;
                 }
-                let result = crate::physical::operators::hash_agg::aggregate_batches_external(
-                    &batches,
-                    &self.group_by,
-                    &agg_exprs,
-                    &self.schema,
-                )?;
+                let result =
+                    crate::physical::operators::hash_agg::aggregate_batches_external_with_pool(
+                        &batches,
+                        &self.group_by,
+                        &agg_exprs,
+                        &self.schema,
+                        &self.memory_pool,
+                    )?;
                 if result.num_rows() > 0 {
                     vec![result]
                 } else {
@@ -3434,8 +3936,9 @@ impl PhysicalOperator for SpillableHashAggregateExec {
             all_results.extend(result_batches);
         }
 
-        // Clean up spill directory
-        let _ = std::fs::remove_dir_all(&spill_dir);
+        // All aggregate outputs are materialized; no returned stream reads
+        // these files. Errors/cancellation before this point also own cleanup.
+        drop(spill_directory);
 
         if all_results.is_empty() {
             // Return empty result with correct schema
@@ -3711,12 +4214,14 @@ impl SpillableHashAggregateExec {
             if batches.is_empty() {
                 continue;
             }
-            let result = crate::physical::operators::hash_agg::aggregate_batches_external(
-                &batches,
-                &self.group_by,
-                agg_exprs,
-                &self.schema,
-            )?;
+            let result =
+                crate::physical::operators::hash_agg::aggregate_batches_external_with_pool(
+                    &batches,
+                    &self.group_by,
+                    agg_exprs,
+                    &self.schema,
+                    &self.memory_pool,
+                )?;
             if result.num_rows() > 0 {
                 results.push(result);
             }
@@ -3824,7 +4329,9 @@ impl PhysicalOperator for ExternalSortExec {
         // checked as each batch arrives.
         let memory_threshold =
             (self.config.memory_limit as f64 * self.config.spill_threshold) as usize;
-        let mut input_stream = stream_merge_input_partitions(&self.input).await?;
+        let mut input_stream =
+            stream_merge_input_partitions(&self.input, &self.memory_pool, "sort input queue")
+                .await?;
         let mut flat_batches: Vec<RecordBatch> = Vec::new();
         let mut flat_size: usize = 0;
         let mut crossing_batch: Option<RecordBatch> = None;
@@ -3877,9 +4384,7 @@ impl PhysicalOperator for ExternalSortExec {
             .config
             .spill_path
             .join(format!("sort_{}_{}", partition, spill_id));
-        std::fs::create_dir_all(&spill_dir).map_err(|e| {
-            QueryError::Execution(format!("Failed to create spill directory: {}", e))
-        })?;
+        let spill_directory = SpillDirectoryOwner::create(spill_dir.clone())?;
 
         if std::env::var("QE_SPILL_DEBUG").is_ok() {
             eprintln!(
@@ -3913,7 +4418,7 @@ impl PhysicalOperator for ExternalSortExec {
         }
 
         if runs.is_empty() {
-            let _ = std::fs::remove_dir_all(&spill_dir);
+            drop(spill_directory);
             return Ok(Box::pin(stream::empty()));
         }
 
@@ -3934,8 +4439,11 @@ impl PhysicalOperator for ExternalSortExec {
         // returns).
         let merger = self.merger();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(4);
-        let cleanup_dir = spill_dir.clone();
-        tokio::task::spawn_blocking(move || {
+        let worker = tokio::task::spawn_blocking(move || {
+            // Capture the owner BEFORE work starts. Closure drop before start,
+            // normal return, error and unwind all clean up; started blocking
+            // work retains files until its own last use after consumer drop.
+            let _spill_directory = spill_directory;
             let batch_tx = tx.clone();
             let mut sink = move |batch: RecordBatch| -> Result<bool> {
                 Ok(batch_tx.blocking_send(Ok(batch)).is_ok())
@@ -3943,9 +4451,13 @@ impl PhysicalOperator for ExternalSortExec {
             if let Err(e) = merger.merge_runs_into(&runs, &mut sink) {
                 let _ = tx.blocking_send(Err(e));
             }
-            let _ = std::fs::remove_dir_all(&cleanup_dir);
         });
-        let merged = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let merged = OwnedTaskOutputStream {
+            label: "sort merge",
+            receiver: rx,
+            worker: Some(worker),
+            finished: false,
+        };
 
         // Apply the top-K `fetch` limit, mirroring the in-memory branch
         // above (`SortExec::with_fetch`). The top-k fusion rule in
@@ -3961,31 +4473,10 @@ impl PhysicalOperator for ExternalSortExec {
         // stream ends, the receiver drops, and the merge thread aborts
         // early instead of merging rows nobody will read.
         match self.fetch {
-            Some(fetch) => {
-                let limited = merged.scan(fetch, |remaining, item| {
-                    futures::future::ready(match item {
-                        Err(e) => {
-                            *remaining = 0;
-                            Some(Err(e))
-                        }
-                        Ok(batch) => {
-                            if *remaining == 0 {
-                                None
-                            } else {
-                                let mut kept = truncate_batches_to_limit(vec![batch], *remaining);
-                                match kept.pop() {
-                                    Some(b) => {
-                                        *remaining -= b.num_rows();
-                                        Some(Ok(b))
-                                    }
-                                    None => None,
-                                }
-                            }
-                        }
-                    })
-                });
-                Ok(Box::pin(limited))
-            }
+            Some(fetch) => Ok(Box::pin(SortFetchStream {
+                input: Some(merged),
+                remaining: fetch,
+            })),
             None => Ok(Box::pin(merged)),
         }
     }
@@ -4727,7 +5218,10 @@ fn batch_with_actual_types(declared: &SchemaRef, columns: Vec<ArrayRef>) -> Resu
                     if f.data_type() == c.data_type() {
                         f.as_ref().clone()
                     } else {
-                        arrow::datatypes::Field::new(f.name(), c.data_type().clone(), true)
+                        f.as_ref()
+                            .clone()
+                            .with_data_type(c.data_type().clone())
+                            .with_nullable(true)
                     }
                 })
                 .collect::<Vec<_>>(),
@@ -5487,19 +5981,10 @@ fn predicted_hash_table_bytes(rows: usize, key_cols: usize) -> usize {
     rows.saturating_mul(per_row)
 }
 
-/// Documented approximation of `hash_agg::AccumulatorState`'s size (private
-/// to `hash_agg.rs`, so not `size_of`-able from here): ~30 fields — counts,
-/// power sums, per-type min/max `Option`s, two `Option<String>`s, an
-/// `Option<HashSet>`, correlation sums, a `Vec` header — land it in the
-/// 350-400B range; 384 is the conservative round-up.
-const AGG_ACCUMULATOR_STATE_BYTES: usize = 384;
-/// `hash_agg::GroupValue` (enum whose largest variant holds a `String`
-/// header): 8B discriminant + 24B String ≈ 32B.
-const AGG_GROUP_VALUE_BYTES: usize = 32;
-/// Amortized hashbrown SET entry for one `GroupValue` in a
-/// `distinct_set: HashSet<GroupValue>`: 32B value + 1 control byte, times
-/// the 8/7 inverse load factor, rounded up to 48 to cover growth slack.
-const AGG_DISTINCT_ENTRY_BYTES: usize = 48;
+// Keep admission estimates coupled to the actual aggregate layouts.
+const AGG_ACCUMULATOR_STATE_BYTES: usize = super::hash_agg::ACCUMULATOR_STATE_BYTES;
+const AGG_GROUP_VALUE_BYTES: usize = super::hash_agg::GROUP_VALUE_BYTES;
+const AGG_DISTINCT_ENTRY_BYTES: usize = (AGG_GROUP_VALUE_BYTES + 1) * 2;
 
 /// Conservative PREDICTED heap footprint of the `HashMap<GroupKey,
 /// Vec<AccumulatorState>>` (plus DISTINCT value sets) that
@@ -9640,5 +10125,2164 @@ mod tests {
         // Zero-arg floors: a global aggregate (0 group cols) still prices
         // its single group's state per row (worst case).
         assert!(predicted_agg_state_bytes(1_000, 0, 0, 0) > 0);
+    }
+}
+#[cfg(test)]
+mod input_queue_memory_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::Notify;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_channel_waits_for_task_completion_without_busy_waking() {
+        struct WakeCount(AtomicUsize);
+        impl futures::task::ArcWake for WakeCount {
+            fn wake_by_ref(arc_self: &Arc<Self>) {
+                arc_self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let (tx, receiver) = tokio::sync::mpsc::channel::<QueuedInputBatch>(1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let mut producers = tokio::task::JoinSet::new();
+        producers.spawn(async move {
+            drop(tx);
+            started_tx.send(()).unwrap();
+            finish_rx.await.unwrap();
+            Ok(())
+        });
+        started_rx.await.unwrap();
+        let mut queue = InputQueueStream {
+            receiver,
+            producers,
+            label: "completion test queue",
+            finished: false,
+            pending_error: None,
+            envelope: None,
+            _queue_metadata: None,
+        };
+        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = futures::task::waker(wakes.clone());
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(futures::Stream::poll_next(std::pin::Pin::new(&mut queue), &mut cx).is_pending());
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        finish_tx.send(()).unwrap();
+        assert!(queue.try_next().await.unwrap().is_none());
+    }
+
+    #[test]
+    fn fixed_width_scan_target_fits_actual_nullable_decimal_copy_layout() {
+        use arrow::array::Decimal128Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int64, true),
+            Field::new("amount", DataType::Decimal128(20, 2), true),
+        ]));
+        let rows = input_queue_fixed_width_row_limit(&schema, 8192, 4096).unwrap();
+        assert!(rows > 1 && rows < 8192);
+        let keys: ArrayRef = Arc::new(Int64Array::from_iter((0..rows).map(|i| {
+            if i % 2 == 0 {
+                Some(i as i64)
+            } else {
+                None
+            }
+        })));
+        let values: ArrayRef = Arc::new(
+            Decimal128Array::from_iter((0..rows).map(|i| {
+                if i % 3 == 0 {
+                    None
+                } else {
+                    Some(-(i as i128))
+                }
+            }))
+            .with_precision_and_scale(20, 2)
+            .unwrap(),
+        );
+        let batch = RecordBatch::try_new(schema.clone(), vec![keys, values]).unwrap();
+        assert!(owned_input_batch_charge(&batch).unwrap() <= 4096);
+        assert_eq!(own_input_batch(batch.clone()).unwrap(), batch);
+        assert_eq!(
+            input_queue_fixed_width_row_limit(&schema, 17, 1 << 20),
+            Some(17)
+        );
+        assert_eq!(
+            input_queue_fixed_width_row_limit(&schema, usize::MAX, 4096),
+            Some(rows)
+        );
+        assert_eq!(input_queue_fixed_width_row_limit(&schema, 8192, 1), None);
+    }
+
+    #[test]
+    fn scan_row_target_does_not_invent_variable_width_bounds() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, true)]));
+        assert_eq!(input_queue_fixed_width_row_limit(&schema, 8192, 8192), None);
+        let schema = batch(1).schema();
+        let rows = input_queue_fixed_width_row_limit(&schema, 8192, 8192).unwrap();
+        assert!(rows < 1171);
+        let actual =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1; rows]))]).unwrap();
+        assert!(owned_input_batch_charge(&actual).unwrap() <= 8192);
+    }
+
+    #[derive(Debug, Default)]
+    struct Progress {
+        started: AtomicUsize,
+        dropped: AtomicUsize,
+        produced: AtomicUsize,
+        parked: AtomicUsize,
+        changed: Notify,
+    }
+    struct DropMark(Arc<Progress>);
+    impl Drop for DropMark {
+        fn drop(&mut self) {
+            self.0.dropped.fetch_add(1, Ordering::SeqCst);
+            self.0.changed.notify_one();
+        }
+    }
+    #[derive(Clone, Debug)]
+    enum Tail {
+        End,
+        Error,
+        Panic,
+        Park,
+    }
+    #[derive(Debug)]
+    struct MockInput {
+        partitions: Vec<(Vec<RecordBatch>, Tail)>,
+        progress: Arc<Progress>,
+        executed: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl PhysicalOperator for MockInput {
+        fn schema(&self) -> SchemaRef {
+            batch(0).schema()
+        }
+        fn children(&self) -> Vec<Arc<dyn PhysicalOperator>> {
+            vec![]
+        }
+        fn output_partitions(&self) -> usize {
+            self.partitions.len()
+        }
+        fn name(&self) -> &str {
+            "queue mock"
+        }
+        async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
+            self.executed.fetch_add(1, Ordering::SeqCst);
+            crate::physical::check_partition(self, partition)?;
+            let (batches, tail) = self.partitions[partition].clone();
+            let progress = self.progress.clone();
+            let mark = DropMark(progress.clone());
+            progress.started.fetch_add(1, Ordering::SeqCst);
+            progress.changed.notify_one();
+            Ok(Box::pin(stream::try_unfold(
+                (batches.into_iter(), tail, mark),
+                move |(mut batches, tail, mark)| {
+                    let progress = progress.clone();
+                    async move {
+                        if let Some(batch) = batches.next() {
+                            progress.produced.fetch_add(1, Ordering::SeqCst);
+                            progress.changed.notify_one();
+                            return Ok(Some((batch, (batches, tail, mark))));
+                        }
+                        match tail {
+                            Tail::End => Ok(None),
+                            Tail::Error => Err(QueryError::Execution("mock upstream error".into())),
+                            Tail::Panic => panic!("mock producer panic"),
+                            Tail::Park => {
+                                progress.parked.fetch_add(1, Ordering::SeqCst);
+                                progress.changed.notify_one();
+                                std::future::pending().await
+                            }
+                        }
+                    }
+                },
+            )))
+        }
+    }
+    fn batch(v: i64) -> RecordBatch {
+        RecordBatch::try_from_iter(vec![("v", Arc::new(Int64Array::from(vec![v])) as ArrayRef)])
+            .unwrap()
+    }
+    fn input(
+        partitions: Vec<(Vec<RecordBatch>, Tail)>,
+    ) -> (Arc<dyn PhysicalOperator>, Arc<Progress>, Arc<AtomicUsize>) {
+        let progress = Arc::new(Progress::default());
+        let executed = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(MockInput {
+                partitions,
+                progress: progress.clone(),
+                executed: executed.clone(),
+            }),
+            progress,
+            executed,
+        )
+    }
+    async fn wait_count(progress: &Progress, counter: &AtomicUsize, count: usize) {
+        // Timeout is only a deadlock guard, not a latency assertion. The
+        // acknowledgement proves that Tokio actually destroyed the producer.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let notified = progress.changed.notified();
+                if counter.load(Ordering::SeqCst) >= count {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("producer progress/cancellation acknowledgement timed out");
+    }
+    fn assert_pool_refusal(
+        error: &QueryError,
+        name: &str,
+        requested: usize,
+        used: usize,
+        limit: usize,
+    ) {
+        let QueryError::MemoryLimit {
+            pool,
+            requested: actual_requested,
+            used: actual_used,
+            limit: actual_limit,
+        } = error.root()
+        else {
+            panic!("unexpected refusal: {error}");
+        };
+        assert_eq!(pool, name);
+        assert_eq!(
+            (*actual_requested, *actual_used, *actual_limit),
+            (requested, used, limit)
+        );
+        assert_eq!(error.to_string(), format!("Execution error: Memory limit exceeded in '{name}': requested {requested} additional bytes, used {used}, limit {limit}"));
+    }
+    fn pool(bytes: usize) -> SharedMemoryPool {
+        Arc::new(crate::execution::MemoryPool::new_named("test query", bytes))
+    }
+
+    #[derive(Debug)]
+    struct BoundedInput {
+        input: Arc<dyn PhysicalOperator>,
+        bound: crate::physical::queue_layout::QueueCopyBound,
+        release: Option<Arc<tokio::sync::Semaphore>>,
+        progress: Arc<Progress>,
+    }
+    #[async_trait]
+    impl PhysicalOperator for BoundedInput {
+        fn schema(&self) -> SchemaRef {
+            self.input.schema()
+        }
+        fn children(&self) -> Vec<Arc<dyn PhysicalOperator>> {
+            vec![]
+        }
+        fn name(&self) -> &str {
+            "bounded queue fixture"
+        }
+        fn output_partitions(&self) -> usize {
+            self.input.output_partitions()
+        }
+        fn resident_queue_copy_bound(
+            &self,
+        ) -> Option<crate::physical::queue_layout::QueueCopyBound> {
+            Some(self.bound.clone())
+        }
+        async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
+            crate::physical::check_partition(self, partition)?;
+            let stream = self.input.execute(partition).await?;
+            let release = self.release.clone();
+            let progress = self.progress.clone();
+            Ok(Box::pin(stream.and_then(move |batch| {
+                let release = release.clone();
+                let progress = progress.clone();
+                async move {
+                    if let Some(release) = release {
+                        progress.parked.fetch_add(1, Ordering::SeqCst);
+                        progress.changed.notify_one();
+                        release.acquire().await.unwrap().forget();
+                    }
+                    Ok(batch)
+                }
+            })))
+        }
+    }
+    fn bounded_input(
+        partitions: Vec<(Vec<RecordBatch>, Tail)>,
+        release: Option<Arc<tokio::sync::Semaphore>>,
+    ) -> (Arc<dyn PhysicalOperator>, Arc<Progress>, usize) {
+        let expected = batch(7);
+        let bound = crate::physical::queue_layout::QueueCopyBound::from_batches(
+            &expected.schema(),
+            &[expected],
+        )
+        .unwrap();
+        let bytes = bound.max_bytes().unwrap();
+        let (input, progress, _) = input(partitions);
+        (
+            Arc::new(BoundedInput {
+                input,
+                bound,
+                release,
+                progress: progress.clone(),
+            }),
+            progress,
+            bytes,
+        )
+    }
+    fn bounded_queue(
+        input: &Arc<dyn PhysicalOperator>,
+        pool: &SharedMemoryPool,
+    ) -> RecordBatchStream {
+        // Use an explicit two-worker scheduling context so a caller's global
+        // RAYON_NUM_THREADS=1 does not disable this concurrency contract test.
+        let runtime = tokio::runtime::Handle::current();
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap()
+            .install(|| {
+                let _entered = runtime.enter();
+                futures::executor::block_on(stream_merge_input_partitions(
+                    input,
+                    pool,
+                    "bounded queue",
+                ))
+                .unwrap()
+            })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_fixed_width_queue_uses_general_bound_and_two_reserved_slots() {
+        use crate::physical::operators::StreamingParquetScanExec;
+        use arrow::array::Int64Array;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("raw-input.parquet");
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let source = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..95))],
+        )
+        .unwrap();
+        let properties = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(23))
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            File::create(&path).unwrap(),
+            schema.clone(),
+            Some(properties),
+        )
+        .unwrap();
+        writer.write(&source).unwrap();
+        writer.close().unwrap();
+        let input: Arc<dyn PhysicalOperator> = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(3)
+                .build()
+                .unwrap()
+                .install(|| {
+                    StreamingParquetScanExec::try_new_with_batch_size(
+                        "raw",
+                        &[path],
+                        schema.clone(),
+                        None,
+                        None,
+                        &schema,
+                        17,
+                        true,
+                    )
+                    .unwrap()
+                }),
+        );
+        assert_eq!(input.output_partitions(), 3);
+        assert!(input.resident_queue_copy_bound().is_none());
+        assert!(input.resident_gather_copy_bound().is_none());
+        let bytes = input
+            .pool_independent_queue_copy_bound()
+            .unwrap()
+            .max_bytes()
+            .unwrap();
+        assert!(input.pool_independent_gather_copy_bound().is_some());
+        let pool = pool(bytes.checked_mul(2).unwrap());
+        let mut queue = bounded_queue(&input, &pool);
+        // This current-thread runtime has not yielded to producers. The exact
+        // two-slot envelope must already be reserved BEFORE any upstream pull.
+        // Using only the resident getter produces zero here and fails directly.
+        assert_eq!(pool.used(), bytes * 2);
+        assert_eq!(pool.reserved_peak(), bytes * 2);
+        let mut ids = Vec::new();
+        while let Some(batch) = queue.try_next().await.unwrap() {
+            assert!(batch.num_rows() <= 17);
+            let array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            ids.extend(
+                array
+                    .iter()
+                    .map(|value| value.expect("source id is non-NULL")),
+            );
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, (0..95).collect::<Vec<i64>>());
+        drop(queue);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while pool.used() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("raw queue producer reservation cleanup stalled");
+        assert_eq!(pool.used(), 0);
+        assert_eq!(pool.reserved_peak(), bytes * 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn admitted_parallel_slots_overlap_upstream_polls_and_bound_queued_copies() {
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (input, progress, bytes) = bounded_input(
+            vec![
+                (vec![batch(7), batch(8)], Tail::End),
+                (vec![batch(9), batch(10)], Tail::End),
+            ],
+            Some(release.clone()),
+        );
+        let pool = pool(bytes * 2);
+        INPUT_QUEUE_COPY_ATTEMPTS.with(|count| count.set(0));
+        let mut queue = bounded_queue(&input, &pool);
+        // Both upstream polls must enter before either is released. Serial
+        // demand fails this barrier deterministically, not on a speed threshold.
+        wait_count(&progress, &progress.parked, 2).await;
+        assert_eq!(pool.used(), bytes * 2);
+        assert_eq!(progress.produced.load(Ordering::SeqCst), 2);
+        release.add_permits(4);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while INPUT_QUEUE_COPY_ATTEMPTS.with(|count| count.get()) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both admitted copies must become queued");
+        // Each fixture has one buffer. Both copies now exist without a
+        // consumer handoff, and neither producer may pull its second batch.
+        assert_eq!(progress.produced.load(Ordering::SeqCst), 2);
+        assert_eq!(pool.used(), bytes * 2);
+        let mut values = vec![];
+        while let Some(batch) = queue.try_next().await.unwrap() {
+            values.push(
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+            );
+        }
+        values.sort_unstable();
+        assert_eq!(values, [7, 8, 9, 10]);
+        assert_eq!(pool.reserved_peak(), bytes * 2);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bounded_envelope_denial_falls_back_without_prefetch_or_budget_wait() {
+        let (input, progress, bytes) = bounded_input(
+            vec![
+                (vec![batch(7), batch(8)], Tail::End),
+                (vec![batch(9)], Tail::End),
+            ],
+            None,
+        );
+        let pool = pool(bytes * 3 - 1);
+        let sibling = pool.allocate(bytes).unwrap();
+        let mut queue = bounded_queue(&input, &pool);
+        wait_count(&progress, &progress.produced, 1).await;
+        assert_eq!(progress.produced.load(Ordering::SeqCst), 1);
+        let mut count = 0;
+        while let Some(batch) = queue.try_next().await.unwrap() {
+            count += batch.num_rows();
+        }
+        assert_eq!(count, 3);
+        assert_eq!(pool.used(), bytes);
+        drop(sibling);
+        assert_eq!(pool.used(), 0);
+        assert!(pool.reserved_peak() <= pool.max());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parallel_envelope_survives_until_parked_producers_are_cancelled() {
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (input, progress, bytes) = bounded_input(
+            vec![(vec![batch(7)], Tail::End), (vec![batch(8)], Tail::End)],
+            Some(release),
+        );
+        let pool = pool(bytes * 2);
+        let queue = bounded_queue(&input, &pool);
+        wait_count(&progress, &progress.parked, 2).await;
+        drop(queue);
+        // This current-thread runtime cannot service abort until we yield.
+        assert_eq!(pool.used(), bytes * 2);
+        wait_count(&progress, &progress.dropped, 2).await;
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lying_resident_bound_fails_before_copy_and_releases_envelope() {
+        let large = RecordBatch::try_from_iter(vec![(
+            "v",
+            Arc::new(Int64Array::from(vec![7; 4096])) as ArrayRef,
+        )])
+        .unwrap();
+        let (input, progress, bytes) =
+            bounded_input(vec![(vec![large], Tail::End), (vec![], Tail::Park)], None);
+        let pool = pool(bytes * 2);
+        INPUT_QUEUE_COPY_ATTEMPTS.with(|count| count.set(0));
+        let mut queue = bounded_queue(&input, &pool);
+        let error = queue.try_next().await.unwrap_err();
+        assert!(
+            error.to_string().contains("copy-bound contract violated"),
+            "{error}"
+        );
+        INPUT_QUEUE_COPY_ATTEMPTS.with(|count| assert_eq!(count.get(), 0));
+        drop(queue);
+        // Both execute futures start before polling tasks in the current test
+        // setup, but cancellation can prevent an unstarted producer entirely.
+        tokio::task::yield_now().await;
+        assert_eq!(pool.used(), 0);
+        assert!(progress.dropped.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[derive(Debug)]
+    struct PreparedBounded {
+        input: Arc<dyn PhysicalOperator>,
+        preparations: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl PhysicalOperator for PreparedBounded {
+        fn name(&self) -> &str {
+            "prepared bounded only"
+        }
+        fn schema(&self) -> SchemaRef {
+            self.input.schema()
+        }
+        fn children(&self) -> Vec<Arc<dyn PhysicalOperator>> {
+            vec![]
+        }
+        fn output_partitions(&self) -> usize {
+            self.input.output_partitions()
+        }
+        async fn execute(&self, _: usize) -> Result<RecordBatchStream> {
+            panic!("prepared wrapper reexecuted source")
+        }
+        async fn prepare_queue_input(&self) -> Result<Option<crate::physical::PreparedQueueInput>> {
+            self.preparations.fetch_add(1, Ordering::SeqCst);
+            let bound = self.input.resident_queue_copy_bound().unwrap();
+            let mut streams = Vec::new();
+            for partition in 0..self.input.output_partitions() {
+                streams.push(self.input.execute(partition).await?);
+            }
+            Ok(Some(crate::physical::PreparedQueueInput {
+                streams,
+                output: crate::physical::PreparedOutputBound::Layouts(
+                    crate::physical::queue_layout::PreparedOutputLayouts::from_bound(bound)
+                        .unwrap(),
+                ),
+            }))
+        }
+    }
+    fn prepared_wrapped_input(
+        predicate_error: bool,
+        release: Arc<tokio::sync::Semaphore>,
+    ) -> (
+        Arc<dyn PhysicalOperator>,
+        Arc<Progress>,
+        Arc<AtomicUsize>,
+        usize,
+    ) {
+        let (input, progress, _) = bounded_input(
+            vec![
+                (vec![batch(7), batch(8)], Tail::End),
+                (vec![batch(9), batch(10)], Tail::End),
+            ],
+            Some(release),
+        );
+        let name = input.schema().field(0).name().clone();
+        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "alias",
+            arrow::datatypes::DataType::Int64,
+            true,
+        )]));
+        let bound = input
+            .resident_queue_copy_bound()
+            .unwrap()
+            .filtered()
+            .unwrap()
+            .projected(&[Expr::column(name.clone()).alias("alias")], &schema)
+            .unwrap()
+            .max_bytes()
+            .unwrap();
+        let preparations = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(PreparedBounded {
+            input,
+            preparations: preparations.clone(),
+        });
+        let predicate = if predicate_error {
+            Expr::column("missing_runtime_column")
+        } else {
+            Expr::literal(crate::planner::ScalarValue::Boolean(true))
+        };
+        let filter = Arc::new(crate::physical::FilterExec::new(source, predicate));
+        let project = Arc::new(crate::physical::ProjectExec::new(
+            filter,
+            vec![Expr::column(name).alias("alias")],
+            schema,
+        ));
+        (project, progress, preparations, bound)
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepared_wrappers_overlap_pulls_and_hold_two_copies_without_consumer() {
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (input, progress, preparations, bytes) = prepared_wrapped_input(false, release.clone());
+        let pool = pool(2 * bytes);
+        INPUT_QUEUE_COPY_ATTEMPTS.with(|c| c.set(0));
+        let mut queue = bounded_queue(&input, &pool);
+        assert_eq!(progress.produced.load(Ordering::SeqCst), 0);
+        wait_count(&progress, &progress.parked, 2).await;
+        assert_eq!(preparations.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.used(), 2 * bytes);
+        release.add_permits(4);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while INPUT_QUEUE_COPY_ATTEMPTS.with(|c| c.get()) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("two wrapped copies not queued");
+        assert_eq!(progress.produced.load(Ordering::SeqCst), 2);
+        let mut values = Vec::new();
+        while let Some(batch) = queue.try_next().await.unwrap() {
+            values.push(
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+            );
+        }
+        values.sort_unstable();
+        assert_eq!(values, [7, 8, 9, 10]);
+        assert_eq!(pool.used(), 0);
+        assert_eq!(pool.reserved_peak(), 2 * bytes);
+        assert_eq!(preparations.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepared_wrapper_runtime_predicate_error_cancels_parked_sibling() {
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (input, progress, preparations, bytes) = prepared_wrapped_input(true, release.clone());
+        let pool = pool(2 * bytes);
+        let mut queue = bounded_queue(&input, &pool);
+        wait_count(&progress, &progress.parked, 2).await;
+        release.add_permits(1);
+        let error = queue.try_next().await.unwrap_err();
+        assert!(
+            error.to_string().contains("missing_runtime_column"),
+            "{error}"
+        );
+        wait_count(&progress, &progress.dropped, 2).await;
+        assert_eq!(pool.used(), 0);
+        assert_eq!(preparations.load(Ordering::SeqCst), 1);
+        assert_eq!(progress.produced.load(Ordering::SeqCst), 2);
+        assert!(queue.try_next().await.unwrap().is_none());
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepared_wrapper_consumer_drop_cancels_both_parked_streams() {
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (input, progress, preparations, bytes) = prepared_wrapped_input(false, release);
+        let pool = pool(2 * bytes);
+        let queue = bounded_queue(&input, &pool);
+        wait_count(&progress, &progress.parked, 2).await;
+        drop(queue);
+        wait_count(&progress, &progress.dropped, 2).await;
+        assert_eq!(pool.used(), 0);
+        assert_eq!(preparations.load(Ordering::SeqCst), 1);
+        assert_eq!(progress.produced.load(Ordering::SeqCst), 2);
+    }
+
+    #[derive(Debug)]
+    struct PreparedFixture {
+        pool: SharedMemoryPool,
+        layout: bool,
+        bound: crate::physical::queue_layout::QueueCopyBound,
+        declared: usize,
+        supplied: usize,
+        ordinary_calls: Arc<AtomicUsize>,
+        pulls: Arc<AtomicUsize>,
+        preparations: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl PhysicalOperator for PreparedFixture {
+        fn schema(&self) -> SchemaRef {
+            batch(7).schema()
+        }
+        fn children(&self) -> Vec<Arc<dyn PhysicalOperator>> {
+            vec![]
+        }
+        fn output_partitions(&self) -> usize {
+            self.declared
+        }
+        fn name(&self) -> &str {
+            "prepared fixture"
+        }
+        async fn execute(&self, _: usize) -> Result<RecordBatchStream> {
+            self.ordinary_calls.fetch_add(1, Ordering::SeqCst);
+            Err(QueryError::Execution(
+                "prepared stream executed twice".into(),
+            ))
+        }
+        async fn prepare_queue_input(
+            &self,
+        ) -> Result<Option<crate::physical::plan::PreparedQueueInput>> {
+            self.preparations.fetch_add(1, Ordering::SeqCst);
+            // Initialization requires the complete available pool. Reserving an
+            // outer output envelope before this phase would make it fail.
+            let initialization = self.pool.allocate(self.pool.max())?;
+            let streams = (0..self.supplied)
+                .map(|partition| {
+                    let pulls = self.pulls.clone();
+                    Box::pin(stream::once(async move {
+                        pulls.fetch_add(1, Ordering::SeqCst);
+                        Ok(batch(partition as i64))
+                    })) as RecordBatchStream
+                })
+                .collect();
+            assert_eq!(self.pulls.load(Ordering::SeqCst), 0);
+            drop(initialization);
+            Ok(Some(crate::physical::plan::PreparedQueueInput {
+                streams,
+                output: if self.layout {
+                    crate::physical::PreparedOutputBound::Layouts(
+                        crate::physical::queue_layout::PreparedOutputLayouts::from_bound(
+                            self.bound.clone(),
+                        )
+                        .unwrap(),
+                    )
+                } else {
+                    crate::physical::PreparedOutputBound::Bytes(self.bound.max_bytes().unwrap())
+                },
+            }))
+        }
+    }
+    fn prepared_fixture(limit_multiplier: usize, supplied: usize) -> Arc<PreparedFixture> {
+        let expected = batch(7);
+        let bound = crate::physical::queue_layout::QueueCopyBound::from_batches(
+            &expected.schema(),
+            &[expected],
+        )
+        .unwrap();
+        Arc::new(PreparedFixture {
+            pool: pool(bound.max_bytes().unwrap() * limit_multiplier),
+            layout: false,
+            bound,
+            declared: 2,
+            supplied,
+            ordinary_calls: Arc::new(AtomicUsize::new(0)),
+            pulls: Arc::new(AtomicUsize::new(0)),
+            preparations: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepared_streams_initialize_before_admission_and_fallback_executes_once() {
+        for slots in [1, 2] {
+            let fixture = prepared_fixture(slots, 2);
+            let input: Arc<dyn PhysicalOperator> = fixture.clone();
+            let mut queue = bounded_queue(&input, &fixture.pool);
+            assert_eq!(fixture.pulls.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.preparations.load(Ordering::SeqCst), 1);
+            let mut values = vec![];
+            while let Some(batch) = queue.try_next().await.unwrap() {
+                values.push(
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0),
+                );
+            }
+            values.sort_unstable();
+            assert_eq!(values, [0, 1]);
+            assert_eq!(fixture.ordinary_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.pulls.load(Ordering::SeqCst), 2);
+            assert_eq!(fixture.pool.used(), 0);
+            assert!(fixture.pool.reserved_peak() <= fixture.pool.max());
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepared_filter_layout_retains_parallel_envelope() {
+        let mut fixture = prepared_fixture(4, 2);
+        Arc::get_mut(&mut fixture).unwrap().layout = true;
+        let transformed = fixture.bound.filtered().unwrap().max_bytes().unwrap();
+        let input: Arc<dyn PhysicalOperator> = Arc::new(crate::physical::FilterExec::new(
+            fixture.clone(),
+            Expr::literal(crate::planner::ScalarValue::Boolean(true)),
+        ));
+        let mut queue = bounded_queue(&input, &fixture.pool);
+        assert_eq!(fixture.pool.used(), 2 * transformed);
+        assert_eq!(fixture.pulls.load(Ordering::SeqCst), 0);
+        let mut values = Vec::new();
+        while let Some(batch) = queue.try_next().await.unwrap() {
+            values.push(
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+            );
+        }
+        values.sort_unstable();
+        assert_eq!(values, [0, 1]);
+        assert_eq!(fixture.ordinary_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.pool.used(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepared_filter_unknown_keeps_streams_in_serial_queue() {
+        let fixture = prepared_fixture(2, 2);
+        // Byte-only certificates cannot prove Filter's new bitmap layout.
+        let input: Arc<dyn PhysicalOperator> = Arc::new(crate::physical::FilterExec::new(
+            fixture.clone(),
+            Expr::literal(crate::planner::ScalarValue::Boolean(true)),
+        ));
+        let mut queue = bounded_queue(&input, &fixture.pool);
+        assert_eq!(fixture.preparations.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.pulls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fixture.pool.used(),
+            0,
+            "unknown transformed layout must not reserve an envelope"
+        );
+        let mut values = Vec::new();
+        while let Some(batch) = queue.try_next().await.unwrap() {
+            values.push(
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+            );
+        }
+        values.sort_unstable();
+        assert_eq!(values, [0, 1]);
+        assert_eq!(fixture.ordinary_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.pulls.load(Ordering::SeqCst), 2);
+        assert_eq!(fixture.pool.used(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepared_project_unknown_keeps_streams_and_computed_preflight_declines() {
+        let fixture = prepared_fixture(3, 2);
+        let name = fixture.schema().field(0).name().clone();
+        let input: Arc<dyn PhysicalOperator> = Arc::new(crate::physical::ProjectExec::new(
+            fixture.clone(),
+            vec![Expr::column(name).alias("renamed")],
+            Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+                "renamed",
+                arrow::datatypes::DataType::Int64,
+                true,
+            )])),
+        ));
+        let mut queue = bounded_queue(&input, &fixture.pool);
+        assert_eq!(fixture.preparations.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.pool.used(), 0);
+        let mut values = Vec::new();
+        while let Some(batch) = queue.try_next().await.unwrap() {
+            values.push(
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+            );
+        }
+        values.sort_unstable();
+        assert_eq!(values, [0, 1]);
+        assert_eq!(fixture.ordinary_calls.load(Ordering::SeqCst), 0);
+        let other = prepared_fixture(2, 2);
+        let computed = crate::physical::ProjectExec::new(
+            other.clone(),
+            vec![Expr::literal(crate::planner::ScalarValue::Int64(1))],
+            other.schema(),
+        );
+        assert!(computed.prepare_queue_input().await.unwrap().is_none());
+        assert_eq!(other.preparations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepared_filter_subquery_declines_before_any_child_initialization() {
+        let fixture = prepared_fixture(2, 2);
+        let predicate = Expr::Exists {
+            subquery: Arc::new(crate::planner::LogicalPlan::EmptyRelation(
+                crate::planner::EmptyRelationNode {
+                    produce_one_row: true,
+                    schema: crate::planner::PlanSchema::empty(),
+                },
+            )),
+            negated: false,
+        };
+        let filter = crate::physical::FilterExec::new(fixture.clone(), predicate);
+        assert!(filter.prepare_queue_input().await.unwrap().is_none());
+        assert_eq!(fixture.preparations.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.ordinary_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.pulls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.pool.used(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepared_partition_mismatch_fails_before_output_pulls() {
+        for supplied in [1, 3] {
+            let fixture = prepared_fixture(2, supplied);
+            let input: Arc<dyn PhysicalOperator> = fixture.clone();
+            let result =
+                stream_merge_input_partitions(&input, &fixture.pool, "prepared test").await;
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("invalid prepared partitions accepted"),
+            };
+            assert!(error
+                .to_string()
+                .contains("prepared partition contract violated"));
+            assert_eq!(fixture.pulls.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.ordinary_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.pool.used(), 0);
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn zero_partitions_skip_preparation_entirely() {
+        let mut fixture = prepared_fixture(2, 0);
+        Arc::get_mut(&mut fixture).unwrap().declared = 0;
+        let input: Arc<dyn PhysicalOperator> = fixture.clone();
+        let mut queue = stream_merge_input_partitions(&input, &fixture.pool, "zero prepared")
+            .await
+            .unwrap();
+        assert!(queue.try_next().await.unwrap().is_none());
+        assert_eq!(fixture.preparations.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.ordinary_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[derive(Debug)]
+    struct ExternalOwner(Vec<u128>);
+
+    fn external_buffer(
+        buffer: &arrow::buffer::Buffer,
+        owners: &mut Vec<std::sync::Weak<ExternalOwner>>,
+    ) -> arrow::buffer::Buffer {
+        let mut words = vec![0u128; 4096.max((buffer.len() + 15) / 16)];
+        for (word, chunk) in words.iter_mut().zip(buffer.as_slice().chunks(16)) {
+            let mut bytes = [0; 16];
+            bytes[..chunk.len()].copy_from_slice(chunk);
+            *word = u128::from_ne_bytes(bytes);
+        }
+        let owner = Arc::new(ExternalOwner(words));
+        owners.push(Arc::downgrade(&owner));
+        let ptr = std::ptr::NonNull::new(owner.0.as_ptr() as *mut u8).unwrap();
+        // SAFETY: the aligned, immutable Vec is retained by this exact owner.
+        // Its allocation exceeds the exposed extent; no mutation occurs.
+        unsafe { arrow::buffer::Buffer::from_custom_allocation(ptr, buffer.len(), owner) }
+    }
+
+    fn external_data(
+        data: arrow::array::ArrayData,
+        owners: &mut Vec<std::sync::Weak<ExternalOwner>>,
+    ) -> arrow::array::ArrayData {
+        let buffers = data
+            .buffers()
+            .iter()
+            .map(|b| external_buffer(b, owners))
+            .collect();
+        let children = data
+            .child_data()
+            .iter()
+            .map(|d| external_data(d.clone(), owners))
+            .collect();
+        let nulls = data.nulls().map(|n| {
+            arrow::buffer::NullBuffer::new(arrow::buffer::BooleanBuffer::new(
+                external_buffer(n.buffer(), owners),
+                n.inner().offset(),
+                n.len(),
+            ))
+        });
+        data.into_builder()
+            .buffers(buffers)
+            .child_data(children)
+            .nulls(nulls)
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_owners_are_detached_with_exact_decimal_dictionary_and_null_values() {
+        use arrow::array::{Array, Decimal128Array, Decimal256Array, DictionaryArray, Int32Array};
+        use arrow::datatypes::{i256, Int32Type};
+        let d128: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(999), None, Some(-123)])
+                .with_precision_and_scale(20, 2)
+                .unwrap(),
+        );
+        let d256: ArrayRef = Arc::new(
+            Decimal256Array::from(vec![
+                Some(i256::from_i128(999)),
+                Some(i256::from_i128(-456)),
+                None,
+            ])
+            .with_precision_and_scale(50, 4)
+            .unwrap(),
+        );
+        let dictionary: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![Some(0), Some(1), Some(2)]),
+                Arc::new(StringArray::from(vec![
+                    Some("discard"),
+                    None,
+                    Some("retained"),
+                ])),
+            )
+            .unwrap(),
+        );
+        let expected =
+            RecordBatch::try_from_iter(vec![("d128", d128), ("d256", d256), ("dict", dictionary)])
+                .unwrap()
+                .slice(1, 2);
+        let mut owners = vec![];
+        let columns = expected
+            .columns()
+            .iter()
+            .map(|a| arrow::array::make_array(external_data(a.to_data(), &mut owners)))
+            .collect();
+        let external = RecordBatch::try_new(expected.schema(), columns).unwrap();
+        assert!(owners.iter().all(|w| w.upgrade().is_some()));
+        let bytes = owned_input_batch_charge(&external).unwrap();
+        let pool = pool(bytes * 2);
+        let (input, progress, _) = input(vec![(vec![external], Tail::End), (vec![], Tail::End)]);
+        let mut queue = stream_merge_input_partitions(&input, &pool, "external queue")
+            .await
+            .unwrap();
+        wait_count(&progress, &progress.started, 2).await;
+        wait_count(&progress, &progress.produced, 1).await;
+        drop(input);
+        // Queued data itself must no longer pin ANY large external owner.
+        assert!(owners.iter().all(|w| w.upgrade().is_none()));
+        assert_eq!(pool.used(), bytes);
+        let actual = queue.try_next().await.unwrap().unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual
+                .column(0)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![None, Some(-123)]
+        );
+        assert_eq!(
+            actual
+                .column(1)
+                .as_any()
+                .downcast_ref::<Decimal256Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(i256::from_i128(-456)), None]
+        );
+        let decoded =
+            arrow::compute::cast(actual.column(2), &arrow::datatypes::DataType::Utf8).unwrap();
+        assert_eq!(
+            decoded
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![None, Some("retained")]
+        );
+        assert!(queue.try_next().await.unwrap().is_none());
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_copy_is_not_attempted_before_budget_admission() {
+        let mut owners = vec![];
+        let expected = batch(7);
+        let external = RecordBatch::try_from_iter(vec![(
+            "v",
+            arrow::array::make_array(external_data(expected.column(0).to_data(), &mut owners)),
+        )])
+        .unwrap();
+        let bytes = owned_input_batch_charge(&external).unwrap();
+        let pool = pool(bytes - 1);
+        let before = INPUT_QUEUE_COPY_ATTEMPTS.with(|count| count.get());
+        let (input, progress, _) = input(vec![(vec![external], Tail::End), (vec![], Tail::End)]);
+        let mut queue = stream_merge_input_partitions(&input, &pool, "copy budget queue")
+            .await
+            .unwrap();
+        wait_count(&progress, &progress.started, 2).await;
+        assert_pool_refusal(
+            &queue.try_next().await.unwrap_err(),
+            "copy budget queue",
+            bytes,
+            0,
+            bytes - 1,
+        );
+        assert_eq!(INPUT_QUEUE_COPY_ATTEMPTS.with(|count| count.get()), before);
+        drop(queue);
+        wait_count(&progress, &progress.dropped, 2).await;
+        drop(input);
+        assert!(owners.iter().all(|w| w.upgrade().is_none()));
+        assert_eq!(pool.used(), 0);
+    }
+    #[derive(Debug)]
+    struct ImpossiblePartitions(usize);
+    #[async_trait]
+    impl PhysicalOperator for ImpossiblePartitions {
+        fn schema(&self) -> SchemaRef {
+            batch(0).schema()
+        }
+        fn children(&self) -> Vec<Arc<dyn PhysicalOperator>> {
+            vec![]
+        }
+        fn output_partitions(&self) -> usize {
+            self.0
+        }
+        fn name(&self) -> &str {
+            "impossible partitions"
+        }
+        async fn execute(&self, _: usize) -> Result<RecordBatchStream> {
+            panic!("capacity refusal must happen before any execute");
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn capacity_overflow_and_runtime_limit_refuse_before_execution() {
+        for (count, expected) in [
+            (usize::MAX, "capacity overflow"),
+            (
+                tokio::sync::Semaphore::MAX_PERMITS / 4 + 1,
+                "capacity exceeds runtime limit",
+            ),
+        ] {
+            let input: Arc<dyn PhysicalOperator> = Arc::new(ImpossiblePartitions(count));
+            let result = stream_merge_input_partitions(&input, &pool(1024), "capacity queue").await;
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("invalid queue capacity accepted"),
+            };
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sliced_copy_layout_is_refused_before_enqueue() {
+        let large = RecordBatch::try_from_iter(vec![(
+            "v",
+            Arc::new(Int64Array::from(vec![7; 8192])) as ArrayRef,
+        )])
+        .unwrap();
+        let sliced = large.slice(0, 1);
+        let bytes = owned_input_batch_charge(&sliced).unwrap();
+        assert!(
+            bytes < 8192 * 8,
+            "copy detaches the large original allocation"
+        );
+        let pool = pool(bytes - 1);
+        let (input, progress, _) = input(vec![(vec![sliced], Tail::End), (vec![], Tail::End)]);
+        let mut stream = stream_merge_input_partitions(&input, &pool, "slice test queue")
+            .await
+            .unwrap();
+        wait_count(&progress, &progress.started, 2).await;
+        let error = stream.try_next().await.unwrap_err();
+        assert_pool_refusal(&error, "slice test queue", bytes, 0, bytes - 1);
+        assert!(stream.try_next().await.unwrap().is_none());
+        drop(stream);
+        wait_count(&progress, &progress.dropped, 2).await;
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sibling_queues_and_held_owner_share_admission() {
+        let bytes = owned_input_batch_charge(&batch(7)).unwrap();
+        let pool = pool(bytes * 2 - 1);
+        let (first, progress, _) = input(vec![(vec![batch(7)], Tail::End), (vec![], Tail::End)]);
+        let first_queue = stream_merge_input_partitions(&first, &pool, "first queue")
+            .await
+            .unwrap();
+        wait_count(&progress, &progress.started, 2).await;
+        wait_count(&progress, &progress.produced, 1).await;
+        assert_eq!(pool.used(), bytes);
+        let (second, _, _) = input(vec![(vec![batch(8)], Tail::End), (vec![], Tail::End)]);
+        let mut second_queue = stream_merge_input_partitions(&second, &pool, "second queue")
+            .await
+            .unwrap();
+        assert_pool_refusal(
+            &second_queue.try_next().await.unwrap_err(),
+            "test query",
+            bytes,
+            bytes,
+            bytes * 2 - 1,
+        );
+        drop(second_queue);
+        drop(first_queue);
+        assert_eq!(pool.used(), 0);
+        // This is a held owned guard, not a claim of DenseAccumulators execution.
+        let owner = pool.allocate(bytes).unwrap();
+        let mut denied = stream_merge_input_partitions(&second, &pool, "held owner queue")
+            .await
+            .unwrap();
+        assert_pool_refusal(
+            &denied.try_next().await.unwrap_err(),
+            "test query",
+            bytes,
+            bytes,
+            bytes * 2 - 1,
+        );
+        drop(denied);
+        drop(owner);
+        let mut accepted = stream_merge_input_partitions(&second, &pool, "released owner queue")
+            .await
+            .unwrap();
+        assert_eq!(accepted.try_next().await.unwrap().unwrap().num_rows(), 1);
+        assert!(accepted.try_next().await.unwrap().is_none());
+        assert_eq!(pool.used(), 0);
+        assert!(pool.reserved_peak() <= pool.max());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drop_cancels_pre_poll_backpressure_and_parked_upstream() {
+        let bytes = owned_input_batch_charge(&batch(1)).unwrap();
+        let pool = pool(bytes * 32);
+        let (input, progress, _) = input(vec![
+            (vec![batch(1); 10], Tail::Park),
+            (vec![batch(1); 10], Tail::Park),
+        ]);
+        let queue = stream_merge_input_partitions(&input, &pool, "drop queue")
+            .await
+            .unwrap();
+        // One batch owns demand. Other producers must await demand BEFORE
+        // polling another upstream batch, even though channel capacity is eight.
+        wait_count(&progress, &progress.started, 2).await;
+        wait_count(&progress, &progress.produced, 1).await;
+        assert_eq!(progress.produced.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.used(), bytes);
+        drop(queue);
+        wait_count(&progress, &progress.dropped, 2).await;
+        assert_eq!(pool.used(), 0);
+        assert_eq!(progress.produced.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn low_budget_delivers_all_partitions_without_prefetch_refusal() {
+        let bytes = owned_input_batch_charge(&batch(7)).unwrap();
+        let pool = pool(bytes * 2 - 1);
+        let (input, progress, executed) = input(vec![
+            (vec![batch(7), batch(7)], Tail::End),
+            (vec![], Tail::End),
+            (vec![batch(8), batch(9)], Tail::End),
+        ]);
+        let mut queue = stream_merge_input_partitions(&input, &pool, "one batch queue")
+            .await
+            .unwrap();
+        wait_count(&progress, &progress.started, 3).await;
+        wait_count(&progress, &progress.produced, 1).await;
+        assert_eq!(progress.produced.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.used(), bytes);
+        let mut values = Vec::new();
+        while let Some(batch) = queue.try_next().await.unwrap() {
+            values.extend(
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied(),
+            );
+        }
+        values.sort_unstable();
+        assert_eq!(values, [7, 7, 8, 9]);
+        assert_eq!(executed.load(Ordering::SeqCst), 3);
+        assert_eq!(pool.reserved_peak(), bytes);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_queue_cancels_upstream_holding_demand_forever() {
+        let pool = pool(4096);
+        let (input, progress, _) = input(vec![(vec![], Tail::Park), (vec![], Tail::Park)]);
+        let queue = stream_merge_input_partitions(&input, &pool, "parked queue")
+            .await
+            .unwrap();
+        wait_count(&progress, &progress.started, 2).await;
+        wait_count(&progress, &progress.parked, 1).await;
+        assert_eq!(progress.produced.load(Ordering::SeqCst), 0);
+        drop(queue);
+        wait_count(&progress, &progress.dropped, 2).await;
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn all_partitions_duplicates_empty_and_direct_bypass() {
+        let pool = pool(1 << 20);
+        let (input, _, executed) = input(vec![
+            (vec![batch(1), batch(1)], Tail::End),
+            (vec![], Tail::End),
+            (vec![batch(2)], Tail::End),
+        ]);
+        let batches: Vec<_> = stream_merge_input_partitions(&input, &pool, "all queue")
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut ids: Vec<_> = batches
+            .iter()
+            .map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0)
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, [1, 1, 2]);
+        assert_eq!(executed.load(Ordering::SeqCst), 3);
+        assert_eq!(pool.used(), 0);
+        let (empty, _, executed) = self::input(vec![]);
+        assert!(stream_merge_input_partitions(&empty, &pool, "zero queue")
+            .await
+            .unwrap()
+            .try_next()
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(executed.load(Ordering::SeqCst), 0);
+        let (single, _, _) = self::input(vec![(vec![batch(3)], Tail::End)]);
+        let no_budget = self::pool(0);
+        assert!(
+            stream_merge_input_partitions(&single, &no_budget, "direct queue")
+                .await
+                .unwrap()
+                .try_next()
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(no_budget.reserved_peak(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn upstream_error_and_task_panic_are_terminal_not_partial_success() {
+        for tail in [Tail::Error, Tail::Panic] {
+            let is_panic = matches!(tail, Tail::Panic);
+            let pool = pool(1 << 20);
+            let (input, progress, _) = input(vec![(vec![batch(1)], tail), (vec![], Tail::Park)]);
+            let mut queue = stream_merge_input_partitions(&input, &pool, "failure queue")
+                .await
+                .unwrap();
+            wait_count(&progress, &progress.started, 2).await;
+            let error = loop {
+                match queue.try_next().await {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => panic!("producer failure became successful end-of-stream"),
+                    Err(error) => break error.to_string(),
+                }
+            };
+            assert!(
+                error.contains(if is_panic {
+                    "producer task failed"
+                } else {
+                    "mock upstream error"
+                }),
+                "{error}"
+            );
+            assert!(queue.try_next().await.unwrap().is_none());
+            drop(queue);
+            wait_count(&progress, &progress.dropped, 2).await;
+            assert_eq!(pool.used(), 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod join_spill_init_ownership_tests {
+    use super::*;
+    use crate::physical::operators::MemoryTableExec;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    fn fixture(root: &std::path::Path) -> (Arc<SpillableHashJoinExec>, Vec<RecordBatch>) {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "k",
+            Arc::new(arrow::array::Int64Array::from(vec![1; 1024])) as ArrayRef,
+        )])
+        .unwrap();
+        let input = Arc::new(MemoryTableExec::new("init", batch.schema(), vec![], None));
+        let op = Arc::new(SpillableHashJoinExec::new(
+            input.clone(),
+            input,
+            vec![(Expr::column("k"), Expr::column("k"))],
+            JoinType::Inner,
+            crate::execution::create_memory_pool(1024),
+            ExecutionConfig::new()
+                .with_memory_limit(1024)
+                .with_spill_path(root.to_path_buf()),
+        ));
+        (op, vec![batch.clone(), batch])
+    }
+    fn only_directory(root: &std::path::Path) -> PathBuf {
+        let entries = std::fs::read_dir(root)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].is_dir());
+        entries[0].clone()
+    }
+    #[tokio::test]
+    async fn build_stream_error_removes_incomplete_directory_and_files() {
+        let root = tempfile::tempdir().unwrap();
+        let (op, prefix) = fixture(root.path());
+        let root_path = root.path().to_path_buf();
+        let rest = Box::pin(stream::once(async move {
+            let directory = only_directory(&root_path);
+            assert!(
+                std::fs::read_dir(directory).unwrap().next().is_some(),
+                "real spill writer must exist before failure"
+            );
+            Err(QueryError::Execution("injected build stream error".into()))
+        }));
+        let result = op
+            .finish_via_spill(prefix, rest, &[Expr::column("k")], false)
+            .await;
+        assert!(
+            matches!(result, Err(QueryError::Execution(message)) if message == "injected build stream error")
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+    #[tokio::test]
+    async fn cancellation_drops_writer_before_initialization_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let (op, prefix) = fixture(root.path());
+        let root_path = root.path().to_path_buf();
+        let (started, ready) = oneshot::channel();
+        let rest = Box::pin(stream::once(async move {
+            let directory = only_directory(&root_path);
+            assert!(std::fs::read_dir(directory).unwrap().next().is_some());
+            started.send(()).unwrap();
+            futures::future::pending::<Result<RecordBatch>>().await
+        }));
+        let task = tokio::spawn(async move {
+            op.finish_via_spill(prefix, rest, &[Expr::column("k")], false)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        match task.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("initializer completed before cancellation"),
+        }
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+    #[tokio::test]
+    async fn successful_initialization_transfers_cleanup_to_last_spill_state_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let (op, prefix) = fixture(root.path());
+        let decision = op
+            .finish_via_spill(
+                prefix,
+                Box::pin(stream::empty()),
+                &[Expr::column("k")],
+                false,
+            )
+            .await
+            .unwrap();
+        let state = match decision {
+            BuildDecision::Spill(state) => state,
+            _ => panic!("expected spill"),
+        };
+        let directory = state.spill_dir.clone();
+        assert!(state.spilled.iter().any(Option::is_some));
+        assert!(directory.exists());
+        let retained = state.clone();
+        drop(state);
+        drop(op);
+        assert!(directory.exists());
+        drop(retained);
+        assert!(!directory.exists());
+    }
+    #[test]
+    fn initialization_never_adopts_an_existing_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("already_owned");
+        std::fs::create_dir(&directory).unwrap();
+        let sentinel = directory.join("sentinel");
+        std::fs::write(&sentinel, b"owned elsewhere").unwrap();
+        assert!(SpillDirectoryOwner::create(directory).is_err());
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"owned elsewhere");
+    }
+}
+
+#[cfg(test)]
+mod agg_sort_directory_ownership_tests {
+    use super::*;
+    use crate::planner::SortExpr;
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+    #[derive(Clone, Copy, Debug)]
+    enum Tail {
+        Error,
+        Pending,
+        End,
+    }
+    #[derive(Debug)]
+    struct Source {
+        batch: RecordBatch,
+        root: PathBuf,
+        tail: Tail,
+        reached: Arc<Semaphore>,
+    }
+    #[async_trait::async_trait]
+    impl PhysicalOperator for Source {
+        fn schema(&self) -> SchemaRef {
+            self.batch.schema()
+        }
+        fn children(&self) -> Vec<Arc<dyn PhysicalOperator>> {
+            vec![]
+        }
+        fn name(&self) -> &str {
+            "SpillDirectoryFailureSource"
+        }
+        async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
+            crate::physical::check_partition(self, partition)?;
+            let root = self.root.clone();
+            let tail = self.tail;
+            let reached = self.reached.clone();
+            let suffix = stream::once(async move {
+                let paths = std::fs::read_dir(root)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    paths.len(),
+                    1,
+                    "operator must have entered spill initialization"
+                );
+                assert!(
+                    std::fs::read_dir(&paths[0]).unwrap().next().is_some(),
+                    "real spill files must precede injected outcome"
+                );
+                reached.add_permits(1);
+                match tail {
+                    Tail::Error => Some(Err(QueryError::Execution(
+                        "injected ingestion failure".into(),
+                    ))),
+                    Tail::Pending => {
+                        futures::future::pending::<Option<Result<RecordBatch>>>().await
+                    }
+                    Tail::End => None,
+                }
+            })
+            .filter_map(futures::future::ready);
+            Ok(Box::pin(
+                stream::iter(vec![Ok(self.batch.clone()), Ok(self.batch.clone())]).chain(suffix),
+            ))
+        }
+    }
+    fn operator(
+        root: &std::path::Path,
+        sort: bool,
+        tail: Tail,
+    ) -> (Arc<dyn PhysicalOperator>, Arc<Semaphore>, SharedMemoryPool) {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(arrow::array::Int64Array::from_iter_values((0..1024).rev())) as ArrayRef,
+        )])
+        .unwrap();
+        let reached = Arc::new(Semaphore::new(0));
+        let input = Arc::new(Source {
+            batch,
+            root: root.to_path_buf(),
+            tail,
+            reached: reached.clone(),
+        });
+        let pool = crate::execution::create_memory_pool(4096);
+        let config = ExecutionConfig::new()
+            .with_memory_limit(4096)
+            .with_spill_path(root.to_path_buf());
+        let op: Arc<dyn PhysicalOperator> = if sort {
+            Arc::new(ExternalSortExec::new(
+                input,
+                vec![SortExpr::new(Expr::column("id")).asc()],
+                pool.clone(),
+                config,
+            ))
+        } else {
+            Arc::new(SpillableHashAggregateExec::new(
+                input,
+                vec![],
+                vec![AggregateExpr {
+                    func: crate::planner::AggregateFunction::Count,
+                    input: Expr::column("id"),
+                    distinct: false,
+                    second_arg: None,
+                }],
+                Arc::new(arrow::datatypes::Schema::new(vec![
+                    arrow::datatypes::Field::new("count", arrow::datatypes::DataType::Int64, true),
+                ])),
+                pool.clone(),
+                config,
+            ))
+        };
+        (op, reached, pool)
+    }
+    #[tokio::test]
+    async fn aggregate_and_sort_error_remove_real_ingestion_files() {
+        for sort in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (op, reached, _) = operator(root.path(), sort, Tail::Error);
+            let result = op.execute(0).await;
+            assert!(
+                matches!(result,Err(QueryError::Execution(message)) if message=="injected ingestion failure")
+            );
+            assert_eq!(reached.available_permits(), 1);
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        }
+    }
+    #[tokio::test]
+    async fn aggregate_and_sort_cancel_remove_real_ingestion_files() {
+        for sort in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (op, reached, _) = operator(root.path(), sort, Tail::Pending);
+            let task = tokio::spawn(async move { op.execute(0).await });
+            tokio::time::timeout(Duration::from_secs(10), reached.acquire())
+                .await
+                .unwrap()
+                .unwrap()
+                .forget();
+            task.abort();
+            match task.await {
+                Err(error) => assert!(error.is_cancelled()),
+                Ok(_) => panic!("parked initialization completed"),
+            }
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        }
+    }
+    #[tokio::test]
+    async fn top_k_spill_remains_successful_and_releases_merge_files() {
+        let root = tempfile::tempdir().unwrap();
+        let (full, _, pool) = operator(root.path(), true, Tail::End);
+        let input = full.children()[0].clone();
+        drop(full);
+        let sort = ExternalSortExec::with_fetch(
+            input,
+            vec![SortExpr::new(Expr::column("id")).asc()],
+            pool.clone(),
+            ExecutionConfig::new()
+                .with_memory_limit(4096)
+                .with_spill_path(root.path().to_path_buf()),
+            3,
+        );
+        let mut output = sort.execute(0).await.unwrap();
+        let mut values = Vec::new();
+        while let Some(batch) = output.try_next().await.unwrap() {
+            values.extend(
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.unwrap()),
+            );
+        }
+        assert_eq!(values, vec![0, 0, 1]);
+        assert!(pool.spilled() > 0);
+        drop(output);
+        drop(sort);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while std::fs::read_dir(root.path()).unwrap().count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("top-K merge cleanup stalled");
+    }
+
+    #[tokio::test]
+    async fn successful_spill_outputs_survive_cleanup_transfer() {
+        for sort in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (op, _, pool) = operator(root.path(), sort, Tail::End);
+            let mut output = op.execute(0).await.unwrap();
+            drop(op); // Sort blocking merge must retain its own directory owner.
+            let mut values = Vec::new();
+            while let Some(batch) = output.try_next().await.unwrap() {
+                let array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .unwrap();
+                values.extend(array.iter().map(|v| v.unwrap()));
+            }
+            if sort {
+                assert_eq!(values, (0..1024).flat_map(|i| [i, i]).collect::<Vec<i64>>());
+            } else {
+                assert_eq!(values, vec![2048]);
+            }
+            assert!(pool.spilled() > 0);
+            drop(output);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while std::fs::read_dir(root.path()).unwrap().count() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("spill worker directory cleanup stalled");
+        }
+    }
+}
+
+#[cfg(test)]
+mod sort_merge_task_ownership_tests {
+    use super::*;
+    use std::time::Duration;
+    fn batch() -> RecordBatch {
+        RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+        )])
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn panic_after_valid_prefix_is_error_and_cleans_worker_owned_files() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("sort_test");
+        let owner = SpillDirectoryOwner::create(path.clone()).unwrap();
+        std::fs::write(path.join("run.parquet"), b"lifetime sentinel").unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (release, parked) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _owner = owner;
+            tx.blocking_send(Ok(batch())).unwrap();
+            parked.recv().unwrap();
+            panic!("injected blocking sort panic after output");
+        });
+        let mut output = OwnedTaskOutputStream {
+            label: "sort merge",
+            receiver: rx,
+            worker: Some(worker),
+            finished: false,
+        };
+        assert_eq!(output.try_next().await.unwrap().unwrap().num_rows(), 1);
+        assert!(path.exists());
+        release.send(()).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(10), output.try_next())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("sort merge task failed"));
+        assert!(!path.exists());
+        assert!(output.try_next().await.unwrap().is_none());
+    }
+    #[tokio::test]
+    async fn channel_close_waits_for_worker_success_instead_of_early_eof() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (closed, ready) = tokio::sync::oneshot::channel();
+        let (release, parked) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            drop(tx);
+            closed.send(()).unwrap();
+            parked.recv().unwrap();
+        });
+        let mut output = OwnedTaskOutputStream {
+            label: "sort merge",
+            receiver: rx,
+            worker: Some(worker),
+            finished: false,
+        };
+        ready.await.unwrap();
+        assert!(matches!(
+            futures::poll!(output.next()),
+            std::task::Poll::Pending
+        ));
+        release.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), output.try_next())
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+    }
+    #[tokio::test]
+    async fn consumer_drop_keeps_started_blocking_worker_directory_until_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("sort_test");
+        let owner = SpillDirectoryOwner::create(path.clone()).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (finished, done) = tokio::sync::oneshot::channel();
+        let (release, parked) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let owner = owner;
+            started.send(()).unwrap();
+            parked.recv().unwrap();
+            assert!(tx.blocking_send(Ok(batch())).is_err());
+            drop(owner);
+            finished.send(()).unwrap();
+        });
+        let output = OwnedTaskOutputStream {
+            label: "sort merge",
+            receiver: rx,
+            worker: Some(worker),
+            finished: false,
+        };
+        ready.await.unwrap();
+        drop(output);
+        assert!(
+            path.exists(),
+            "started blocking worker still owns its files"
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), done)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!path.exists());
+    }
+    #[tokio::test]
+    async fn ordinary_merge_error_preserves_diagnostic_and_is_terminal() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let worker = tokio::task::spawn_blocking(move || {
+            let _ = tx.blocking_send(Err(QueryError::Execution(
+                "injected merge read error".into(),
+            )));
+        });
+        let mut output = OwnedTaskOutputStream {
+            label: "sort merge",
+            receiver: rx,
+            worker: Some(worker),
+            finished: false,
+        };
+        assert!(
+            matches!(output.try_next().await,Err(QueryError::Execution(message)) if message=="injected merge read error")
+        );
+        assert!(output.try_next().await.unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod sort_fetch_boundary_tests {
+    use super::*;
+    #[tokio::test]
+    async fn exact_fetch_boundary_never_requests_later_error() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (release, parked) = std::sync::mpsc::channel();
+        let (finished, done) = tokio::sync::oneshot::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let batch = RecordBatch::try_from_iter(vec![(
+                "id",
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+            )])
+            .unwrap();
+            tx.blocking_send(Ok(batch)).unwrap();
+            parked.recv().unwrap();
+            // A fulfilled fetch must already have closed its input stream.
+            assert!(tx
+                .blocking_send(Err(QueryError::Execution(
+                    "must not be pulled past fetch".into()
+                )))
+                .is_err());
+            finished.send(()).unwrap();
+        });
+        let input = OwnedTaskOutputStream {
+            label: "sort merge",
+            receiver: rx,
+            worker: Some(worker),
+            finished: false,
+        };
+        let mut output = SortFetchStream {
+            input: Some(input),
+            remaining: 1,
+        };
+        assert_eq!(output.try_next().await.unwrap().unwrap().num_rows(), 1);
+        // This is immediate even though the worker has not finished. Full-drain
+        // OwnedTaskOutputStream must instead wait for the task and observe panic.
+        assert!(matches!(
+            futures::poll!(output.next()),
+            std::task::Poll::Ready(None)
+        ));
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), done)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod spilled_join_output_ownership_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+    #[derive(Clone, Copy, Debug)]
+    enum Outcome {
+        Panic,
+        Error,
+        Park,
+        Complete,
+    }
+    #[derive(Debug)]
+    struct Probe {
+        schema: SchemaRef,
+        root: PathBuf,
+        outcome: Outcome,
+        started: Arc<Semaphore>,
+        released: Arc<Semaphore>,
+    }
+    struct Ack(Arc<Semaphore>);
+    impl Drop for Ack {
+        fn drop(&mut self) {
+            self.0.add_permits(1);
+        }
+    }
+    #[async_trait::async_trait]
+    impl PhysicalOperator for Probe {
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+        fn children(&self) -> Vec<Arc<dyn PhysicalOperator>> {
+            vec![]
+        }
+        fn name(&self) -> &str {
+            "SpilledJoinOutputProbe"
+        }
+        async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
+            crate::physical::check_partition(self, partition)?;
+            let root = self.root.clone();
+            let schema = self.schema.clone();
+            let outcome = self.outcome;
+            let started = self.started.clone();
+            let ack = Ack(self.released.clone());
+            // A complete phase-A group with unmatched keys creates probe files
+            // without filling the output channel before the deterministic tail.
+            let prefix = if matches!(outcome, Outcome::Complete) {
+                Vec::new()
+            } else {
+                (0..PHASE_A_GROUP_BATCHES)
+                    .map(|_| {
+                        Ok(RecordBatch::try_new(
+                            schema.clone(),
+                            vec![Arc::new(Int64Array::from_iter_values(9000..9064))],
+                        )
+                        .unwrap())
+                    })
+                    .collect::<Vec<Result<RecordBatch>>>()
+            };
+            Ok(Box::pin(stream::iter(prefix).chain(stream::once(
+                async move {
+                    let _ack = ack;
+                    let directories = std::fs::read_dir(&root)
+                        .unwrap()
+                        .map(|e| e.unwrap().path())
+                        .collect::<Vec<_>>();
+                    assert_eq!(directories.len(), 1);
+                    assert!(
+                        std::fs::read_dir(&directories[0]).unwrap().next().is_some(),
+                        "actual build files must exist before probe outcome"
+                    );
+                    if !matches!(outcome, Outcome::Complete) {
+                        assert!(
+                            std::fs::read_dir(&directories[0]).unwrap().any(|e| e
+                                .unwrap()
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with("probe_")),
+                            "actual per-call probe files must exist before failure/cancellation"
+                        );
+                    }
+                    started.add_permits(1);
+                    match outcome {
+                        Outcome::Panic => panic!("injected spilled-join producer probe panic"),
+                        Outcome::Error => Err(QueryError::Execution(
+                            "injected spilled-join probe error".into(),
+                        )),
+                        Outcome::Park => futures::future::pending::<Result<RecordBatch>>().await,
+                        Outcome::Complete => Ok(RecordBatch::try_new(
+                            schema,
+                            vec![Arc::new(Int64Array::from(vec![0, 4095, 9000]))],
+                        )
+                        .unwrap()),
+                    }
+                },
+            ))))
+        }
+    }
+    fn fixture(
+        root: &Path,
+        outcome: Outcome,
+    ) -> (Arc<SpillableHashJoinExec>, Arc<Probe>, SharedMemoryPool) {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "bk",
+            Arc::new(Int64Array::from_iter_values(0..4096)) as ArrayRef,
+        )])
+        .unwrap();
+        let build = Arc::new(crate::physical::MemoryTableExec::new(
+            "build",
+            batch.schema(),
+            vec![batch],
+            None,
+        ));
+        let probe = Arc::new(Probe {
+            schema: Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+                "pk",
+                arrow::datatypes::DataType::Int64,
+                false,
+            )])),
+            root: root.to_path_buf(),
+            outcome,
+            started: Arc::new(Semaphore::new(0)),
+            released: Arc::new(Semaphore::new(0)),
+        });
+        let pool = crate::execution::create_memory_pool(4096);
+        let op = Arc::new(SpillableHashJoinExec::new(
+            build,
+            probe.clone(),
+            vec![(Expr::column("bk"), Expr::column("pk"))],
+            JoinType::Inner,
+            pool.clone(),
+            ExecutionConfig::new()
+                .with_memory_limit(4096)
+                .with_spill_path(root.to_path_buf()),
+        ));
+        (op, probe, pool)
+    }
+    async fn wait(sem: &Semaphore) {
+        tokio::time::timeout(Duration::from_secs(10), sem.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+    }
+    async fn cleaned(root: &Path) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while std::fs::read_dir(root).unwrap().count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("spill state cleanup stalled");
+    }
+    #[tokio::test]
+    async fn public_spilled_join_producer_panic_is_error_not_empty_success() {
+        let root = tempfile::tempdir().unwrap();
+        let (op, probe, pool) = fixture(root.path(), Outcome::Panic);
+        let mut output = op.execute(0).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), output.try_next())
+            .await
+            .unwrap();
+        assert!(
+            matches!(result,Err(QueryError::Execution(message)) if message.contains("spill join output task failed"))
+        );
+        wait(&probe.released).await;
+        assert!(pool.spilled() > 0);
+        assert!(output.try_next().await.unwrap().is_none());
+        drop(output);
+        drop(op);
+        cleaned(root.path()).await;
+    }
+    #[tokio::test]
+    async fn public_spilled_join_source_error_preserves_diagnostic() {
+        let root = tempfile::tempdir().unwrap();
+        let (op, probe, _) = fixture(root.path(), Outcome::Error);
+        let mut output = op.execute(0).await.unwrap();
+        assert!(
+            matches!(output.try_next().await,Err(QueryError::Execution(message)) if message=="injected spilled-join probe error")
+        );
+        wait(&probe.released).await;
+        drop(output);
+        drop(op);
+        cleaned(root.path()).await;
+    }
+    #[tokio::test]
+    async fn public_spilled_join_drop_cancels_parked_probe_and_keeps_memoized_build_files() {
+        let root = tempfile::tempdir().unwrap();
+        let (op, probe, _) = fixture(root.path(), Outcome::Park);
+        let output = op.execute(0).await.unwrap();
+        wait(&probe.started).await;
+        drop(output);
+        wait(&probe.released).await; // actual async task destruction, no sleep
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            1,
+            "operator retains memoized SpillState"
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let memo = std::fs::read_dir(root.path())
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                if !std::fs::read_dir(memo).unwrap().any(|e| {
+                    e.unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("probe_")
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("per-call files retained after source cancellation with live operator");
+        drop(op);
+        cleaned(root.path()).await;
+    }
+    #[tokio::test]
+    async fn public_spilled_join_full_drain_keeps_files_after_operator_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let (op, _, pool) = fixture(root.path(), Outcome::Complete);
+        let mut output = op.execute(0).await.unwrap();
+        drop(op);
+        let mut rows = Vec::new();
+        while let Some(batch) = output.try_next().await.unwrap() {
+            let left = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let right = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            rows.extend((0..batch.num_rows()).map(|i| (left.value(i), right.value(i))));
+        }
+        rows.sort_unstable();
+        assert_eq!(rows, vec![(0, 0), (4095, 4095)]);
+        assert!(pool.spilled() > 0);
+        drop(output);
+        cleaned(root.path()).await;
     }
 }

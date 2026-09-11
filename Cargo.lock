@@ -4795,6 +4795,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
+ "snap",
  "sqlparser",
  "statrs",
  "tempfile",
@@ -4809,6 +4810,7 @@ dependencies = [
  "url",
  "uuid",
  "xxhash-rust",
+ "zstd-sys",
 ]
 
 [[package]]

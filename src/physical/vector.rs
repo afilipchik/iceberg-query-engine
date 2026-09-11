@@ -301,10 +301,7 @@ pub fn query_vector_from_scalar(v: &crate::planner::ScalarValue) -> Option<Vec<f
             SV::UInt16(i) => *i as f64,
             SV::UInt32(i) => *i as f64,
             SV::UInt64(i) => *i as f64,
-            SV::Decimal128(d) => {
-                use rust_decimal::prelude::ToPrimitive;
-                d.to_f64()?
-            }
+            SV::Decimal128(d) => d.to_f64(),
             _ => return None,
         };
         out.push(f as f32);

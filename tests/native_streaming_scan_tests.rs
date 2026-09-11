@@ -19,7 +19,7 @@
 //! shapes over an over-budget table now COMPLETE (cell-exact tests below)
 //! instead of refusing.
 
-use arrow::array::Int64Array;
+use arrow::array::{Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use query_engine::storage::native_write::{
@@ -185,6 +185,32 @@ async fn join_over_oversized_table_completes_and_is_cell_exact() {
         .expect("a join over an over-budget native table must COMPLETE via the streaming scan");
     let big = big_ctx(&dir, &["t"]).sql(sql).await.unwrap();
     assert_eq!(small.row_count, 9);
+    let actual: Vec<_> = small
+        .batches
+        .iter()
+        .flat_map(|batch| {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let groups = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            (0..batch.num_rows()).map(move |row| {
+                assert!(!ids.is_null(row) && !groups.is_null(row));
+                (ids.value(row), groups.value(row))
+            })
+        })
+        .collect();
+    assert_eq!(actual, (0..9).map(|i| (2 + i * 5, 2)).collect::<Vec<_>>());
+    assert!(small
+        .metrics
+        .spill_metrics
+        .as_ref()
+        .is_some_and(|m| m.bytes_spilled > 0));
     assert_eq!(fmt(&small), fmt(&big), "streaming path must be cell-exact");
 }
 
@@ -351,4 +377,22 @@ async fn in_budget_tables_are_unaffected() {
         .await
         .unwrap();
     assert_eq!(agg.row_count, 5);
+}
+
+/// Optional shared caching must not force a scan that the provider already
+/// knows cannot materialize. Verify routing before any execution allocation.
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_over_budget_scan_plans_streaming_before_reading() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("t");
+    write_fixture(&dir).await;
+    assert_over_budget(&dir).await;
+    let ctx = small_ctx(&dir, &["t"]);
+    let plan = ctx.physical_plan("SELECT a.id, b.grp FROM t a JOIN t b ON a.id = b.id WHERE a.grp = 2 ORDER BY a.id LIMIT 9")
+        .expect("optional prescan must decline before invoking an over-budget provider");
+    fn scan_count(plan: &Arc<dyn query_engine::physical::PhysicalOperator>) -> usize {
+        usize::from(plan.name() == "NativeStreamingScanExec")
+            + plan.children().iter().map(scan_count).sum::<usize>()
+    }
+    assert_eq!(scan_count(&plan), 2, "both shared occurrences must stream");
 }

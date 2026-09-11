@@ -177,10 +177,13 @@ impl ProjectionPushdown {
                 self.extract_columns_from_expr(low, required);
                 self.extract_columns_from_expr(high, required);
             }
-            Expr::InSubquery { expr, .. } => {
+            Expr::InSubquery { expr, subquery, .. } => {
                 // Extract columns from the left side of the IN expression
                 self.extract_columns_from_expr(expr, required);
-                // Don't recurse into the subquery - it has its own scope
+                // Inner-local columns have their own scope, but correlated
+                // references still require columns from this input, just as
+                // they do for EXISTS and scalar subqueries.
+                self.extract_outer_columns_from_subquery(subquery, required);
             }
             Expr::Exists { subquery, .. } => {
                 // For EXISTS, we need to extract outer column references from the subquery
@@ -508,11 +511,22 @@ impl ProjectionPushdown {
 
             LogicalPlan::Project(node) => {
                 let input = self.pushdown(&node.input, required, keep_all)?;
-                // Collapse the identical column-passthrough Project the
-                // scan-level filter-column pruning re-creates on repeated
-                // optimizer passes (it would otherwise stack once per pass).
+                // Collapse only an actual outer identity mapping. Equal Exprs
+                // are not a composition proof: repeated x+1 applies twice, and
+                // a renamed/reordered inner schema changes column resolution.
                 if let LogicalPlan::Project(inner) = &input {
-                    if inner.exprs == node.exprs {
+                    let identity = node.schema == inner.schema
+                        && node.exprs.len() == inner.schema.fields().len()
+                        && node.exprs.iter().enumerate().all(|(i, expr)| {
+                            let Expr::Column(column) = expr else {
+                                return false;
+                            };
+                            inner
+                                .schema
+                                .resolve_column(column)
+                                .is_some_and(|(resolved, _)| resolved == i)
+                        });
+                    if identity {
                         return Ok(input);
                     }
                 }
@@ -668,5 +682,208 @@ mod tests {
         // Should only include id (0) and amount (2)
         let proj = proj.unwrap();
         assert_eq!(proj.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod projection_composition_contract_tests {
+    use super::*;
+    use crate::physical::{FilterExec, MemoryTableExec, PhysicalOperator, ProjectExec};
+    use crate::planner::{BinaryOp, ScalarValue, SchemaField};
+    use arrow::{
+        array::{Array, Int64Array},
+        datatypes::DataType,
+        record_batch::RecordBatch,
+    };
+    use futures::TryStreamExt;
+    fn schema(names: &[&str]) -> PlanSchema {
+        PlanSchema::new(
+            names
+                .iter()
+                .map(|n| SchemaField::new(*n, DataType::Int64))
+                .collect(),
+        )
+    }
+    fn scan(names: &[&str]) -> LogicalPlan {
+        LogicalPlan::Scan(ScanNode {
+            table_name: "fixture".into(),
+            schema: schema(names),
+            projection: None,
+            filter: None,
+        })
+    }
+    fn project(input: LogicalPlan, exprs: Vec<Expr>, names: &[&str]) -> LogicalPlan {
+        LogicalPlan::Project(ProjectNode {
+            input: Arc::new(input),
+            exprs,
+            schema: schema(names),
+        })
+    }
+    fn add_one() -> Expr {
+        Expr::Alias {
+            name: "x".into(),
+            expr: Box::new(Expr::BinaryExpr {
+                left: Box::new(Expr::column("x")),
+                op: BinaryOp::Add,
+                right: Box::new(Expr::Literal(ScalarValue::Int64(1))),
+            }),
+        }
+    }
+    fn physical(plan: &LogicalPlan, batch: &RecordBatch) -> Arc<dyn PhysicalOperator> {
+        match plan {
+            LogicalPlan::Scan(node) => {
+                let mut input: Arc<dyn PhysicalOperator> = Arc::new(MemoryTableExec::new(
+                    "fixture",
+                    batch.schema(),
+                    vec![batch.clone()],
+                    None,
+                ));
+                if let Some(predicate) = &node.filter {
+                    input = Arc::new(FilterExec::new(input, predicate.clone()));
+                }
+                if let Some(projection) = &node.projection {
+                    let exprs = projection
+                        .iter()
+                        .map(|i| Expr::column(&node.schema.fields()[*i].name))
+                        .collect();
+                    let output =
+                        Arc::new(node.schema.to_arrow_schema().project(projection).unwrap());
+                    input = Arc::new(ProjectExec::new(input, exprs, output));
+                }
+                input
+            }
+            LogicalPlan::Project(node) => Arc::new(ProjectExec::new(
+                physical(&node.input, batch),
+                node.exprs.clone(),
+                node.schema.to_arrow_schema_ref(),
+            )),
+            other => panic!("unexpected fixture plan {other:?}"),
+        }
+    }
+    async fn rows(
+        plan: &LogicalPlan,
+        names: &[&str],
+        values: Vec<Vec<i64>>,
+    ) -> (Vec<String>, Vec<Vec<i64>>) {
+        let arrays = names
+            .iter()
+            .zip(values)
+            .map(|(name, v)| {
+                (
+                    *name,
+                    Arc::new(Int64Array::from(v)) as arrow::array::ArrayRef,
+                )
+            })
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_from_iter(arrays).unwrap();
+        let op = physical(plan, &batch);
+        let mut result = Vec::new();
+        let mut fields = None;
+        for part in 0..op.output_partitions() {
+            let batches = op
+                .execute(part)
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            for b in batches {
+                let names = b
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect::<Vec<_>>();
+                if let Some(prior) = &fields {
+                    assert_eq!(prior, &names);
+                } else {
+                    fields = Some(names);
+                }
+                for row in 0..b.num_rows() {
+                    result.push(
+                        b.columns()
+                            .iter()
+                            .map(|a| {
+                                let a = a.as_any().downcast_ref::<Int64Array>().unwrap();
+                                assert!(!a.is_null(row));
+                                a.value(row)
+                            })
+                            .collect(),
+                    );
+                }
+            }
+        }
+        (fields.unwrap(), result)
+    }
+    #[tokio::test]
+    async fn repeated_computed_projection_is_not_idempotent() {
+        let plan = project(
+            project(scan(&["x"]), vec![add_one()], &["x"]),
+            vec![add_one()],
+            &["x"],
+        );
+        let optimized = ProjectionPushdown.optimize(&plan).unwrap();
+        let (fields, actual) = rows(&optimized, &["x"], vec![vec![1]]).await;
+        assert_eq!(fields, vec!["x"]);
+        assert_eq!(actual, vec![vec![3]]);
+    }
+    #[tokio::test]
+    async fn equal_column_expressions_require_identity_indices_and_exact_schema() {
+        for output_names in [["b", "a"], ["a", "b"]] {
+            let exprs = vec![Expr::column("a"), Expr::column("b")];
+            let inner = project(scan(&["a", "b"]), exprs.clone(), &["b", "a"]);
+            let plan = project(inner, exprs, &output_names);
+            let optimized = ProjectionPushdown.optimize(&plan).unwrap();
+            let (fields, actual) = rows(&optimized, &["a", "b"], vec![vec![10], vec![20]]).await;
+            assert_eq!(fields, output_names);
+            assert_eq!(actual, vec![vec![20, 10]]);
+        }
+    }
+    #[tokio::test]
+    async fn repeated_filter_scan_pruning_still_collapses_passthrough() {
+        let mut source = scan(&["x", "hidden"]);
+        let LogicalPlan::Scan(ref mut node) = source else {
+            unreachable!()
+        };
+        node.filter = Some(Expr::BinaryExpr {
+            left: Box::new(Expr::column("hidden")),
+            op: BinaryOp::Gt,
+            right: Box::new(Expr::Literal(ScalarValue::Int64(0))),
+        });
+        let mut plan = project(source, vec![Expr::column("x")], &["x"]);
+        for _ in 0..4 {
+            plan = ProjectionPushdown.optimize(&plan).unwrap();
+        }
+        fn counts(plan: &LogicalPlan) -> usize {
+            match plan {
+                LogicalPlan::Project(p) => 1 + counts(&p.input),
+                _ => 0,
+            }
+        }
+        assert_eq!(counts(&plan), 1, "scan-pruning identity must not stack");
+        let (fields, actual) = rows(&plan, &["x", "hidden"], vec![vec![7, 9], vec![1, 0]]).await;
+        assert_eq!(fields, vec!["x"]);
+        assert_eq!(actual, vec![vec![7]]);
+    }
+    #[test]
+    fn ambiguous_identity_is_not_collapsed() {
+        let inner = project(
+            scan(&["x"]),
+            vec![Expr::column("x"), Expr::column("x")],
+            &["x", "x"],
+        );
+        let plan = project(
+            inner,
+            vec![Expr::column("x"), Expr::column("x")],
+            &["x", "x"],
+        );
+        let optimized = ProjectionPushdown.optimize(&plan).unwrap();
+        let LogicalPlan::Project(outer) = optimized else {
+            panic!("outer required")
+        };
+        assert!(
+            matches!(outer.input.as_ref(), LogicalPlan::Project(_)),
+            "ambiguous passthrough is not a proof"
+        );
     }
 }

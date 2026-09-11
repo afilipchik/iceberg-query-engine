@@ -7,7 +7,7 @@
 use crate::error::Result;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Opt this process out of transparent huge pages (2MB), keeping 4KB pages.
 ///
@@ -182,153 +182,328 @@ pub fn enforce_process_memory_cap() {
     }
 }
 
-/// Memory pool for tracking memory usage
-#[derive(Debug)]
+/// A bounded accounting domain. Clones of the internal state share ownership;
+/// reservations keep it alive independently of operator or query lifetimes.
+#[derive(Debug, Clone)]
 pub struct MemoryPool {
-    /// Maximum memory allowed
+    state: Arc<PoolState>,
+}
+
+#[derive(Debug)]
+struct PoolState {
+    name: String,
     max_memory: usize,
-    /// Current memory usage
     used: AtomicUsize,
-    /// High-water mark of `used` since construction or the last
-    /// [`MemoryPool::reset_peak`] (query-ui epic, task 001). Updated with a
-    /// `fetch_max` on every growth, so it is a true peak rather than the
-    /// residual `used()` reads after reservations are released.
-    peak: AtomicUsize,
-    /// Total bytes that have been spilled to disk
+    reserved_peak: AtomicUsize,
+    observed_peak: AtomicUsize,
     spilled: AtomicUsize,
+    parent: Option<Arc<PoolState>>,
+    // One lock per hierarchy makes admission transactional across all ancestors.
+    // No callbacks or allocation occur while accounting is being changed.
+    admission: Arc<Mutex<()>>,
+    // Hard prepaid domains stop accounting here. Progress-credit domains
+    // propagate usage above the prepaid floor to their parent.
+    // Drop the capacity BEFORE returning an optional scheduling credit.
+    prepaid: Option<MemoryReservation>,
+    grow_past_prepaid: bool,
+    _owner: Option<PoolOwner>,
+}
+struct PoolOwner {
+    _value: Box<dyn Send + Sync>,
+}
+impl std::fmt::Debug for PoolOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("retained pool owner")
+    }
 }
 
 impl MemoryPool {
     pub fn new(max_memory: usize) -> Self {
-        Self {
+        Self::new_named("memory", max_memory)
+    }
+
+    pub fn new_named(name: impl Into<String>, max_memory: usize) -> Self {
+        Self::build(name.into(), max_memory, None)
+    }
+
+    /// A query/operator domain constrained by both its own limit and every
+    /// ancestor's limit. Sibling reservations consume the same parent budget.
+    pub fn new_child(parent: &MemoryPool, name: impl Into<String>, max_memory: usize) -> Self {
+        Self::build(name.into(), max_memory, Some(Arc::clone(&parent.state)))
+    }
+
+    fn build(name: String, max_memory: usize, parent: Option<Arc<PoolState>>) -> Self {
+        Self::build_owned(name, max_memory, parent, None, None)
+    }
+
+    /// Reserve the whole child capacity now. Descendant buffers keep that
+    /// reservation alive; sibling allocations cannot steal future input space.
+    pub(crate) fn prepaid_child(
+        parent: &MemoryPool,
+        name: impl Into<String>,
+        max_memory: usize,
+    ) -> Result<Self> {
+        Self::prepaid_child_with_owner(parent, name, max_memory, ())
+    }
+    pub(crate) fn prepaid_child_with_owner(
+        parent: &MemoryPool,
+        name: impl Into<String>,
+        max_memory: usize,
+        owner: impl Send + Sync + 'static,
+    ) -> Result<Self> {
+        let reservation = parent.allocate(max_memory)?;
+        Ok(Self::build_owned(
+            name.into(),
             max_memory,
-            used: AtomicUsize::new(0),
-            peak: AtomicUsize::new(0),
-            spilled: AtomicUsize::new(0),
+            Some(parent.state.clone()),
+            Some(reservation),
+            Some(PoolOwner {
+                _value: Box::new(owner),
+            }),
+        ))
+    }
+
+    /// Preserve a minimum input-progress reservation while allowing retained
+    /// output to grow against the same query budget. Parent charge is exactly
+    /// max(credit, child usage); unused credit survives sibling allocations.
+    pub(crate) fn child_with_progress_credit(
+        parent: &MemoryPool,
+        name: impl Into<String>,
+        credit: usize,
+    ) -> Result<Self> {
+        let reservation = parent.allocate(credit)?;
+        let mut pool = Self::build_owned(
+            name.into(),
+            parent.max(),
+            Some(parent.state.clone()),
+            Some(reservation),
+            None,
+        );
+        Arc::get_mut(&mut pool.state).unwrap().grow_past_prepaid = true;
+        Ok(pool)
+    }
+    fn build_owned(
+        name: String,
+        max_memory: usize,
+        parent: Option<Arc<PoolState>>,
+        prepaid: Option<MemoryReservation>,
+        owner: Option<PoolOwner>,
+    ) -> Self {
+        let admission = parent
+            .as_ref()
+            .map(|p| Arc::clone(&p.admission))
+            .unwrap_or_else(|| Arc::new(Mutex::new(())));
+        Self {
+            state: Arc::new(PoolState {
+                name,
+                max_memory,
+                used: AtomicUsize::new(0),
+                reserved_peak: AtomicUsize::new(0),
+                observed_peak: AtomicUsize::new(0),
+                spilled: AtomicUsize::new(0),
+                parent,
+                admission,
+                prepaid,
+                grow_past_prepaid: false,
+                _owner: owner,
+            }),
         }
     }
 
-    /// Create a pool with no limit
-    pub fn unbounded() -> Self {
-        Self::new(usize::MAX)
+    pub(crate) fn is_within(&self, ancestor: &MemoryPool) -> bool {
+        let mut node = Some(&self.state);
+        while let Some(pool) = node {
+            if Arc::ptr_eq(pool, &ancestor.state) {
+                return true;
+            }
+            node = pool.parent.as_ref();
+        }
+        false
     }
 
-    /// Record that bytes were spilled to disk
+    /// Record bytes written to spill storage (not a memory reservation).
     pub fn record_spill(&self, bytes: usize) {
-        self.spilled.fetch_add(bytes, Ordering::SeqCst);
+        self.state.spilled.fetch_add(bytes, Ordering::SeqCst);
     }
 
-    /// Get total bytes spilled
     pub fn spilled(&self) -> usize {
-        self.spilled.load(Ordering::Relaxed)
+        self.state.spilled.load(Ordering::Relaxed)
     }
 
-    /// Try to allocate memory
-    pub fn try_allocate(&self, size: usize) -> Option<MemoryReservation<'_>> {
-        let mut current = self.used.load(Ordering::Relaxed);
-        loop {
-            let new_usage = current.checked_add(size)?;
-            if new_usage > self.max_memory {
-                return None;
-            }
+    /// Reserve before allocating. Failure leaves usage and peaks unchanged.
+    /// The returned guard owns its pool reference and can cross async/thread
+    /// boundaries. This reserves accounting capacity, not an allocator buffer.
+    pub fn allocate(&self, size: usize) -> Result<MemoryReservation> {
+        self.state.grow(size)?;
+        Ok(MemoryReservation {
+            pool: Arc::clone(&self.state),
+            size,
+        })
+    }
 
-            match self.used.compare_exchange_weak(
-                current,
-                new_usage,
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    self.peak.fetch_max(new_usage, Ordering::SeqCst);
-                    return Some(MemoryReservation { pool: self, size });
-                }
-                Err(actual) => current = actual,
-            }
+    /// Convenience admission probe for consumers that spill on failure.
+    pub fn try_allocate(&self, size: usize) -> Option<MemoryReservation> {
+        self.allocate(size).ok()
+    }
+
+    pub fn used(&self) -> usize {
+        self.state.used.load(Ordering::Relaxed)
+    }
+
+    /// Legacy high-water telemetry: the larger of reserved usage and the
+    /// largest reported local estimate. This is not a query-wide RSS measure.
+    pub fn peak(&self) -> usize {
+        self.reserved_peak().max(self.observed_peak())
+    }
+
+    /// High-water mark of admitted reservations only.
+    pub fn reserved_peak(&self) -> usize {
+        self.state.reserved_peak.load(Ordering::Relaxed)
+    }
+
+    /// High-water mark of local footprint estimates, not reservations.
+    pub fn observed_peak(&self) -> usize {
+        self.state.observed_peak.load(Ordering::Relaxed)
+    }
+
+    pub fn observe(&self, bytes: usize) {
+        self.state.observed_peak.fetch_max(bytes, Ordering::SeqCst);
+    }
+
+    /// Reset telemetry for this domain. Call only at the domain's query/window
+    /// boundary; a shared parent's window is not a per-query metric.
+    pub fn reset_peak(&self) {
+        let _guard = self
+            .state
+            .admission
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.state
+            .reserved_peak
+            .store(self.used(), Ordering::SeqCst);
+        self.state.observed_peak.store(0, Ordering::SeqCst);
+    }
+
+    pub fn max(&self) -> usize {
+        self.state.max_memory
+    }
+
+    /// Capacity currently available across this domain and all ancestors.
+    pub fn available(&self) -> usize {
+        let _guard = self
+            .state
+            .admission
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.state.available_locked()
+    }
+}
+
+impl PoolState {
+    fn accounting_parent(&self) -> Option<&PoolState> {
+        if self.prepaid.is_some() && !self.grow_past_prepaid {
+            None
+        } else {
+            self.parent.as_deref()
         }
     }
-
-    /// Force allocate memory (may exceed limit)
-    pub fn allocate(&self, size: usize) -> MemoryReservation<'_> {
-        let prev = self.used.fetch_add(size, Ordering::SeqCst);
-        self.peak
-            .fetch_max(prev.saturating_add(size), Ordering::SeqCst);
-        MemoryReservation { pool: self, size }
+    fn credit(&self) -> usize {
+        if self.grow_past_prepaid {
+            self.prepaid.as_ref().unwrap().size()
+        } else {
+            0
+        }
     }
-
-    /// Current memory usage
-    pub fn used(&self) -> usize {
-        self.used.load(Ordering::Relaxed)
+    fn available_locked(&self) -> usize {
+        let used = self.used.load(Ordering::Relaxed);
+        let local = self.max_memory - used;
+        match self.accounting_parent() {
+            Some(parent) => local.min(
+                parent
+                    .available_locked()
+                    .saturating_add(self.credit().saturating_sub(used)),
+            ),
+            None => local,
+        }
     }
-
-    /// High-water mark of [`MemoryPool::used`] since construction or the
-    /// last [`MemoryPool::reset_peak`]. Pool-wide: with concurrent queries
-    /// sharing one pool this is the peak of their sum, not of any one of
-    /// them (the query log reports how many were running so overlap is
-    /// visible rather than hidden).
-    pub fn peak(&self) -> usize {
-        self.peak.load(Ordering::Relaxed)
-    }
-
-    /// Raise the high-water mark to `bytes` if it is higher. For operators
-    /// that budget their own footprint against `memory_limit *
-    /// spill_threshold` without reserving from the pool (the spillable
-    /// join/aggregate/sort): they report their running size here so
-    /// `peak()` reflects the memory the query actually held.
-    pub fn observe(&self, bytes: usize) {
-        self.peak.fetch_max(bytes, Ordering::SeqCst);
-    }
-
-    /// Start a new peak window at the current usage. `ExecutionContext::sql`
-    /// calls this on entry so `QueryMetrics::peak_memory_bytes` describes
-    /// THIS query's window instead of the process lifetime.
-    pub fn reset_peak(&self) {
-        self.peak.store(self.used(), Ordering::SeqCst);
-    }
-
-    /// Maximum memory
-    pub fn max(&self) -> usize {
-        self.max_memory
-    }
-
-    /// Available memory
-    pub fn available(&self) -> usize {
-        self.max_memory.saturating_sub(self.used())
+    fn grow(&self, size: usize) -> Result<()> {
+        let guard = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        let mut node = Some(self);
+        let mut increment = size;
+        while let Some(pool) = node {
+            let used = pool.used.load(Ordering::Relaxed);
+            if increment > pool.max_memory - used {
+                // Build the owned error outside the critical section. Keep the
+                // limiting ancestor and its admission snapshot as typed data.
+                drop(guard);
+                return Err(crate::error::QueryError::MemoryLimit {
+                    pool: pool.name.clone(),
+                    requested: increment,
+                    used,
+                    limit: pool.max_memory,
+                });
+            }
+            increment = (used + increment).saturating_sub(pool.credit())
+                - used.saturating_sub(pool.credit());
+            node = pool.accounting_parent();
+        }
+        // All levels fit; no counter or peak changes on failed admission.
+        let mut node = Some(self);
+        let mut increment = size;
+        while let Some(pool) = node {
+            let used = pool.used.load(Ordering::Relaxed);
+            let new_usage = used + increment;
+            pool.used.store(new_usage, Ordering::SeqCst);
+            pool.reserved_peak.fetch_max(new_usage, Ordering::SeqCst);
+            increment =
+                new_usage.saturating_sub(pool.credit()) - used.saturating_sub(pool.credit());
+            node = pool.accounting_parent();
+        }
+        Ok(())
     }
 
     fn release(&self, size: usize) {
-        self.used.fetch_sub(size, Ordering::SeqCst);
+        let _guard = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        let mut node = Some(self);
+        let mut decrement = size;
+        while let Some(pool) = node {
+            let used = pool.used.load(Ordering::Relaxed);
+            let new_usage = used - decrement;
+            pool.used.store(new_usage, Ordering::SeqCst);
+            decrement =
+                used.saturating_sub(pool.credit()) - new_usage.saturating_sub(pool.credit());
+            node = pool.accounting_parent();
+        }
     }
 }
 
-/// RAII guard for memory reservation
-pub struct MemoryReservation<'a> {
-    pool: &'a MemoryPool,
+/// Owned RAII accounting guard. Dropping it releases capacity at every level,
+/// including when a query errors, a task is cancelled, or a consumer unwinds.
+#[derive(Debug)]
+pub struct MemoryReservation {
+    pool: Arc<PoolState>,
     size: usize,
 }
 
-impl<'a> MemoryReservation<'a> {
-    /// Size of this reservation
+impl MemoryReservation {
     pub fn size(&self) -> usize {
         self.size
     }
 
-    /// Resize the reservation
-    pub fn resize(&mut self, new_size: usize) {
+    /// Grow before allocating; shrink after releasing the corresponding buffer.
+    /// Failed growth leaves the guard, every counter and every peak unchanged.
+    pub fn resize(&mut self, new_size: usize) -> Result<()> {
         if new_size > self.size {
-            let diff = new_size - self.size;
-            let prev = self.pool.used.fetch_add(diff, Ordering::SeqCst);
-            self.pool
-                .peak
-                .fetch_max(prev.saturating_add(diff), Ordering::SeqCst);
+            self.pool.grow(new_size - self.size)?;
         } else {
-            let diff = self.size - new_size;
-            self.pool.used.fetch_sub(diff, Ordering::SeqCst);
+            self.pool.release(self.size - new_size);
         }
         self.size = new_size;
+        Ok(())
     }
 }
 
-impl<'a> Drop for MemoryReservation<'a> {
+impl Drop for MemoryReservation {
     fn drop(&mut self) {
         self.pool.release(self.size);
     }
@@ -340,6 +515,21 @@ pub type SharedMemoryPool = Arc<MemoryPool>;
 /// Create a shared memory pool
 pub fn create_memory_pool(max_memory: usize) -> SharedMemoryPool {
     Arc::new(MemoryPool::new(max_memory))
+}
+
+/// Shared process accounting root. Its limit follows the startup process-cap
+/// configuration, but this tracks explicit reservations, not OS allocations.
+/// Initialize the environment before creating any execution context.
+pub fn process_memory_pool() -> SharedMemoryPool {
+    static PROCESS_POOL: OnceLock<SharedMemoryPool> = OnceLock::new();
+    Arc::clone(PROCESS_POOL.get_or_init(|| {
+        let raw = std::env::var("QE_MEM_CAP").ok();
+        let (limit, _) = resolve_process_mem_cap(raw.as_deref());
+        Arc::new(MemoryPool::new_named(
+            "process",
+            usize::try_from(limit).unwrap_or(usize::MAX),
+        ))
+    }))
 }
 
 /// Trait for operators that consume memory and can spill to disk
@@ -675,11 +865,11 @@ mod tests {
         {
             let mut a = pool.try_allocate(300).expect("fits");
             assert_eq!(pool.peak(), 300);
-            let _b = pool.allocate(500);
+            let _b = pool.allocate(500).unwrap();
             assert_eq!(pool.peak(), 800);
-            a.resize(400);
+            a.resize(400).unwrap();
             assert_eq!(pool.peak(), 900);
-            a.resize(100);
+            a.resize(100).unwrap();
             assert_eq!(pool.used(), 600);
             assert_eq!(pool.peak(), 900, "shrinking never lowers the peak");
         }
@@ -687,7 +877,7 @@ mod tests {
         assert_eq!(pool.peak(), 900, "release never lowers the peak");
         pool.reset_peak();
         assert_eq!(pool.peak(), 0, "reset starts a new window at used()");
-        let _c = pool.allocate(50);
+        let _c = pool.allocate(50).unwrap();
         pool.reset_peak();
         assert_eq!(pool.peak(), 50);
     }
@@ -721,13 +911,13 @@ mod tests {
     fn test_resize_reservation() {
         let pool = MemoryPool::new(1000);
 
-        let mut r = pool.allocate(100);
+        let mut r = pool.allocate(100).unwrap();
         assert_eq!(pool.used(), 100);
 
-        r.resize(200);
+        r.resize(200).unwrap();
         assert_eq!(pool.used(), 200);
 
-        r.resize(50);
+        r.resize(50).unwrap();
         assert_eq!(pool.used(), 50);
 
         drop(r);
@@ -844,5 +1034,175 @@ mod tests {
         assert_eq!(config.memory_limit, 512 * 1024 * 1024);
         assert_eq!(config.spill_partitions, 32);
         assert_eq!(config.batch_size, 4096);
+    }
+}
+
+#[cfg(test)]
+mod prepaid_tests {
+    use super::*;
+    #[test]
+    fn progress_credit_grows_releases_and_preserves_minimum() {
+        let parent = MemoryPool::new(1024);
+        let input = MemoryPool::child_with_progress_credit(&parent, "input", 384).unwrap();
+        assert_eq!(parent.used(), 384);
+        assert_eq!(input.available(), 1024);
+        let sibling = parent.allocate(640).unwrap();
+        let mut output = input.allocate(300).unwrap();
+        assert_eq!(input.available(), 84);
+        let peak = input.reserved_peak();
+        let error = output.resize(385).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::QueryError::MemoryLimit {
+                requested: 1,
+                used: 1024,
+                limit: 1024,
+                ..
+            }
+        ));
+        assert_eq!(output.size(), 300);
+        assert_eq!(input.reserved_peak(), peak);
+        drop(sibling);
+        output.resize(700).unwrap();
+        assert_eq!(parent.used(), 700);
+        output.resize(200).unwrap();
+        assert_eq!(parent.used(), 384);
+        drop(input);
+        assert_eq!(parent.used(), 384);
+        drop(output);
+        assert_eq!(parent.used(), 0);
+    }
+
+    #[test]
+    fn nested_progress_credit_composes_with_hard_prepaid_limits() {
+        let root = MemoryPool::new(2048);
+        let outer = MemoryPool::child_with_progress_credit(&root, "outer", 512).unwrap();
+        let inner = MemoryPool::child_with_progress_credit(&outer, "inner", 256).unwrap();
+        let hard = MemoryPool::prepaid_child(&inner, "hard", 128).unwrap();
+        let held = hard.allocate(128).unwrap();
+        assert!(hard.allocate(1).unwrap_err().is_memory_limit());
+        let mut output = inner.allocate(700).unwrap();
+        assert_eq!(inner.used(), 828);
+        assert_eq!(outer.used(), 828);
+        assert_eq!(root.used(), 828);
+        output.resize(1900).unwrap();
+        assert_eq!(inner.available(), 20);
+        assert!(output.resize(1921).unwrap_err().is_memory_limit());
+        assert_eq!(root.used(), 2028);
+        drop(output);
+        drop(outer);
+        drop(inner);
+        drop(hard);
+        assert_eq!(root.used(), 512);
+        drop(held);
+        assert_eq!(root.used(), 0);
+    }
+
+    #[test]
+    fn progress_credit_concurrent_growth_and_release_is_exact() {
+        let root = MemoryPool::new(8192);
+        let input = Arc::new(MemoryPool::child_with_progress_credit(&root, "input", 512).unwrap());
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let input = input.clone();
+                scope.spawn(move || {
+                    let child = MemoryPool::new_child(&input, "output", 900);
+                    for _ in 0..2000 {
+                        let mut first = child.allocate(200).unwrap();
+                        let second = child.allocate(300).unwrap();
+                        first.resize(600).unwrap();
+                        drop(second);
+                        first.resize(1).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(input.used(), 0);
+        assert_eq!(root.used(), 512);
+        assert!(root.reserved_peak() <= root.max());
+        drop(input);
+        assert_eq!(root.used(), 0);
+    }
+    #[test]
+    fn prepaid_input_capacity_survives_full_sibling_usage_and_buffer_lifetime() {
+        let parent = MemoryPool::new(1024);
+        let input = MemoryPool::prepaid_child(&parent, "input", 384).unwrap();
+        assert!(input.is_within(&parent));
+        assert_eq!(parent.used(), 384);
+        let sibling = parent.allocate(640).unwrap();
+        assert_eq!(parent.available(), 0);
+        assert_eq!(input.available(), 384);
+        let mut values = input.allocate(300).unwrap();
+        let nested = MemoryPool::new_child(&input, "nested", 128);
+        let other = nested.allocate(50).unwrap();
+        assert_eq!(parent.used(), 1024);
+        assert_eq!(input.used(), 350);
+        assert!(values.resize(335).unwrap_err().is_memory_limit());
+        assert_eq!(values.size(), 300);
+        assert_eq!(input.used(), 350);
+        assert_eq!(parent.reserved_peak(), 1024);
+        drop(sibling);
+        drop(input);
+        drop(nested);
+        assert_eq!(
+            parent.used(),
+            384,
+            "descendant reservations retain the prepaid domain"
+        );
+        drop(other);
+        assert_eq!(parent.used(), 384);
+        drop(values);
+        assert_eq!(parent.used(), 0);
+    }
+    #[test]
+    fn prepaid_refusal_is_transactional_and_releases_the_lifetime_owner() {
+        struct Owner(Arc<AtomicUsize>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let parent = MemoryPool::new(100);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        assert!(MemoryPool::prepaid_child_with_owner(
+            &parent,
+            "too large",
+            101,
+            Owner(dropped.clone())
+        )
+        .unwrap_err()
+        .is_memory_limit());
+        assert_eq!(parent.used(), 0);
+        assert_eq!(parent.reserved_peak(), 0);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn output_credit_returns_only_after_prepaid_capacity_is_available() {
+        let parent = Arc::new(MemoryPool::new(1024));
+        let credits = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = credits.clone().acquire_owned().await.unwrap();
+        let input = MemoryPool::prepaid_child_with_owner(&parent, "frame", 1024, permit).unwrap();
+        let mut values =
+            crate::execution::ReservedBufferBuilder::<i64>::with_capacity(&input, 8).unwrap();
+        values.extend_reserved(8, 0..8).unwrap();
+        let buffer = values.finish();
+        drop(input);
+        let parent2 = parent.clone();
+        let waiter = tokio::spawn(async move {
+            let _permit = credits.acquire_owned().await.unwrap();
+            parent2
+                .allocate(1024)
+                .expect("credit returned before capacity")
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(parent.used(), 1024);
+        drop(buffer);
+        let next = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.used(), 1024);
+        drop(next);
+        assert_eq!(parent.used(), 0);
     }
 }

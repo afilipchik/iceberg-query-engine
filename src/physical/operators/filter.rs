@@ -20,8 +20,21 @@ use futures::stream::TryStreamExt;
 use std::fmt;
 use std::sync::Arc;
 
+mod admitted_batch;
+mod admitted_input;
+pub(crate) mod temporal;
+pub(crate) use admitted_batch::AdmittedBatchFilter;
+
+#[derive(Clone, Copy)]
+enum MembershipMode {
+    Ordinary,
+    Certified,
+    Generic,
+}
+
 /// Filter execution operator
 pub struct FilterExec {
+    initialized_membership: Option<Arc<super::initialized_membership::InitializedMembership>>,
     input: Arc<dyn PhysicalOperator>,
     predicate: Expr,
     schema: SchemaRef,
@@ -51,8 +64,17 @@ impl FilterExec {
             predicate,
             schema,
             subquery_executor: None,
+            initialized_membership: None,
             evaluator,
         }
+    }
+
+    pub(crate) fn with_initialized_membership(
+        mut self,
+        owner: Arc<super::initialized_membership::InitializedMembership>,
+    ) -> Self {
+        self.initialized_membership = Some(owner);
+        self
     }
 
     /// Set the subquery executor for this filter
@@ -69,6 +91,88 @@ impl FilterExec {
 
 #[async_trait]
 impl PhysicalOperator for FilterExec {
+    async fn prepare_admitted_queue_input(
+        &self,
+        pool: crate::execution::SharedMemoryPool,
+    ) -> Result<Option<crate::physical::PreparedAdmittedInput>> {
+        admitted_input::prepare(self, pool).await
+    }
+
+    async fn prepare_queue_input(&self) -> Result<Option<crate::physical::PreparedQueueInput>> {
+        let prepared = if let Some(owner) = &self.initialized_membership {
+            let Some(prepared) = owner.prepare_child(&self.input).await? else {
+                return Ok(None);
+            };
+            prepared
+        } else {
+            if self.predicate.contains_subquery() {
+                return Ok(None);
+            }
+            let Some(prepared) = self.input.prepare_queue_input().await? else {
+                return Ok(None);
+            };
+            prepared
+        };
+        let membership_mode = self.initialized_membership.as_ref().map(|owner| {
+            if owner.eligible_output(&prepared.output) {
+                MembershipMode::Certified
+            } else {
+                MembershipMode::Generic
+            }
+        });
+        let output = prepared.output.filtered();
+        let mut streams = Vec::new();
+        streams
+            .try_reserve_exact(prepared.streams.len())
+            .map_err(|e| {
+                crate::error::QueryError::Execution(format!(
+                    "prepared wrapper stream allocation failed: {e}"
+                ))
+            })?;
+        for stream in prepared.streams {
+            streams.push(self.wrap_stream_with_membership_mode(
+                stream,
+                membership_mode.unwrap_or(MembershipMode::Ordinary),
+            )?);
+        }
+        Ok(Some(crate::physical::PreparedQueueInput {
+            streams,
+            output,
+        }))
+    }
+
+    fn resident_queue_copy_bound(&self) -> Option<crate::physical::queue_layout::QueueCopyBound> {
+        if self.predicate.contains_subquery() {
+            return None;
+        }
+        self.input.resident_queue_copy_bound()?.filtered()
+    }
+
+    fn resident_gather_copy_bound(&self) -> Option<crate::physical::queue_layout::GatherCopyBound> {
+        if self.predicate.contains_subquery() {
+            return None;
+        }
+        self.input.resident_gather_copy_bound()?.filtered()
+    }
+
+    fn pool_independent_queue_copy_bound(
+        &self,
+    ) -> Option<crate::physical::queue_layout::QueueCopyBound> {
+        if self.predicate.contains_subquery() {
+            return None;
+        }
+        self.input.pool_independent_queue_copy_bound()?.filtered()
+    }
+
+    fn pool_independent_gather_copy_bound(
+        &self,
+    ) -> Option<crate::physical::queue_layout::GatherCopyBound> {
+        if self.predicate.contains_subquery() {
+            return None;
+        }
+        self.input.pool_independent_gather_copy_bound()?.filtered()
+    }
+
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -81,42 +185,7 @@ impl PhysicalOperator for FilterExec {
         crate::physical::check_partition(self, partition)?;
 
         let input_stream = self.input.execute(partition).await?;
-        let predicate = self.predicate.clone();
-        let schema = self.schema.clone();
-        let has_subqueries = predicate.contains_subquery();
-        let subquery_exec = self.subquery_executor.clone();
-        let evaluator = self.evaluator.clone();
-
-        let filtered_stream = input_stream.and_then(move |batch| {
-            let pred = predicate.clone();
-            let schema = schema.clone();
-            let subquery_exec = subquery_exec.clone();
-            let evaluator = evaluator.clone();
-            async move {
-                if has_subqueries {
-                    if let Some(exec) = subquery_exec {
-                        evaluate_filter_with_subquery(&batch, &pred, &schema, &exec)
-                    } else {
-                        Err(QueryError::Execution(
-                            "Subquery in filter but no executor available".into(),
-                        ))
-                    }
-                } else {
-                    // Fused mask when the predicate compiled; interpreter
-                    // otherwise — identical masks either way (compiled_expr
-                    // equivalence tests).
-                    let mask = evaluator.evaluate(&batch)?;
-                    let filtered: Result<Vec<ArrayRef>> = batch
-                        .columns()
-                        .iter()
-                        .map(|col| compute::filter(col.as_ref(), &mask).map_err(Into::into))
-                        .collect();
-                    RecordBatch::try_new(batch.schema(), filtered?).map_err(Into::into)
-                }
-            }
-        });
-
-        Ok(Box::pin(filtered_stream))
+        self.wrap_stream(input_stream)
     }
 
     fn name(&self) -> &str {
@@ -158,7 +227,7 @@ fn evaluate_filter(
 }
 
 /// Evaluate a filter predicate on a batch with subquery support
-fn evaluate_filter_with_subquery(
+pub(super) fn evaluate_filter_with_subquery(
     batch: &RecordBatch,
     predicate: &Expr,
     _schema: &SchemaRef,
@@ -185,6 +254,107 @@ pub fn evaluate_expr(batch: &RecordBatch, expr: &Expr) -> Result<ArrayRef> {
     evaluate_expr_internal(batch, expr, None)
 }
 
+/// Batch-local reuse of earlier successful Decimal128 aggregate roots. No
+/// intermediate is retained beyond the existing normalized aggregate outputs.
+/// Runtime type/identity checks prevent a normalizer from changing cached values.
+pub(crate) fn evaluate_aggregate_inputs<'e>(
+    batch: &RecordBatch,
+    count: usize,
+    expr_at: impl Fn(usize) -> &'e Expr,
+    normalize: fn(ArrayRef) -> Result<ArrayRef>,
+) -> Result<Vec<ArrayRef>> {
+    fn exact_type(t: &DataType) -> bool {
+        t.is_integer() || matches!(t, DataType::Decimal128(..))
+    }
+    fn eligible(batch: &RecordBatch, expr: &Expr) -> bool {
+        match expr {
+            Expr::Column(c) => find_column_index(batch, c)
+                .ok()
+                .is_some_and(|i| exact_type(batch.column(i).data_type())),
+            Expr::Literal(v) => exact_type(&v.data_type()),
+            Expr::Alias { expr, .. } => eligible(batch, expr),
+            Expr::BinaryExpr { left, op, right }
+                if matches!(
+                    op,
+                    BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Modulo
+                ) =>
+            {
+                eligible(batch, left) && eligible(batch, right)
+            }
+            // Decimal division currently returns Float64. Casts, CASE, NULL
+            // literals, functions, dictionaries and floating inputs stay on the
+            // old evaluator, without descending into selected/volatile contexts.
+            _ => false,
+        }
+    }
+    fn eval<'e>(
+        batch: &RecordBatch,
+        expr: &Expr,
+        expr_at: &impl Fn(usize) -> &'e Expr,
+        outputs: &[ArrayRef],
+        reusable: &[bool],
+    ) -> Result<ArrayRef> {
+        for (i, array) in outputs.iter().enumerate() {
+            if reusable[i] && expr == expr_at(i) {
+                #[cfg(test)]
+                AGGREGATE_REUSE_COUNTS.with(|counts| {
+                    let (computed, reused) = counts.get();
+                    counts.set((computed, reused + 1));
+                });
+                return Ok(Arc::clone(array));
+            }
+        }
+        match expr {
+            Expr::BinaryExpr { left, op, right } => {
+                let left = eval(batch, left, expr_at, outputs, reusable)?;
+                let right = eval(batch, right, expr_at, outputs, reusable)?;
+                #[cfg(test)]
+                AGGREGATE_REUSE_COUNTS.with(|counts| {
+                    let (computed, reused) = counts.get();
+                    counts.set((computed + 1, reused));
+                });
+                evaluate_binary_op(&left, *op, &right)
+            }
+            Expr::Alias { expr, .. } => eval(batch, expr, expr_at, outputs, reusable),
+            _ => evaluate_expr(batch, expr),
+        }
+    }
+    let mut outputs = Vec::new();
+    outputs.try_reserve_exact(count).map_err(|e| {
+        QueryError::Execution(format!(
+            "aggregate input array metadata allocation failed: {e}"
+        ))
+    })?;
+    let mut reusable = Vec::new();
+    // This is the only additional per-batch container. If it cannot be admitted
+    // by the allocator, choose the original evaluation before doing any work.
+    let enable_reuse = reusable.try_reserve_exact(count).is_ok();
+    for i in 0..count {
+        let expr = expr_at(i);
+        let is_eligible = enable_reuse && eligible(batch, expr);
+        let raw = if is_eligible {
+            eval(batch, expr, &expr_at, &outputs, &reusable)?
+        } else {
+            evaluate_expr(batch, expr)?
+        };
+        let normalized = normalize(Arc::clone(&raw))?;
+        if enable_reuse {
+            reusable.push(
+                is_eligible
+                    && matches!(raw.data_type(), DataType::Decimal128(..))
+                    && Arc::ptr_eq(&raw, &normalized),
+            );
+        }
+        outputs.push(normalized);
+    }
+    Ok(outputs)
+}
+
+#[cfg(test)]
+thread_local! {
+    static AGGREGATE_REUSE_COUNTS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 /// Evaluate an expression with optional subquery executor support
 pub fn evaluate_expr_with_subquery(
     batch: &RecordBatch,
@@ -206,9 +376,28 @@ fn evaluate_expr_internal(
             Ok(batch.column(idx).clone())
         }
 
-        Expr::Literal(value) => Ok(scalar_to_array(value, batch.num_rows())),
+        Expr::Literal(value) => scalar_to_array(value, batch.num_rows()),
 
         Expr::BinaryExpr { left, op, right } => {
+            if is_comparison(*op) {
+                let left = comparison_operand(batch, left, subquery_executor)?;
+                // Preserve the dictionary-values shortcut before decoding.
+                if !left.scalar {
+                    if let (Some(dict), Expr::Literal(ScalarValue::Utf8(lit))) = (
+                    left.array
+                        .as_any()
+                        .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int32Type>>(
+                        ),
+                    &**right,
+                ) {
+                    if let Some(mask) = dict_literal_mask(dict, *op, lit)? {
+                        return Ok(mask);
+                    }
+                }
+                }
+                let right = comparison_operand(batch, right, subquery_executor)?;
+                return compare_operands(&left, *op, &right, batch.num_rows());
+            }
             let left_arr = evaluate_expr_internal(batch, left, subquery_executor)?;
             // Dictionary-string comparisons against literals evaluate once
             // over the (tiny) values array, then expand by keys — instead
@@ -252,9 +441,13 @@ fn evaluate_expr_internal(
             evaluate_unary_op(*op, &arr)
         }
 
-        Expr::Cast { expr, data_type } => {
+        Expr::Cast {
+            expr,
+            data_type,
+            mode,
+        } => {
             let arr = evaluate_expr_internal(batch, expr, subquery_executor)?;
-            arrow::compute::cast(&arr, data_type).map_err(Into::into)
+            crate::planner::numeric::cast_array(&arr, data_type, *mode)
         }
 
         Expr::Alias { expr, .. } => evaluate_expr_internal(batch, expr, subquery_executor),
@@ -277,6 +470,9 @@ fn evaluate_expr_internal(
             negated,
         } => {
             let value = evaluate_expr_internal(batch, expr, subquery_executor)?;
+            if list.is_empty() {
+                return Ok(Arc::new(BooleanArray::from(vec![*negated; value.len()])));
+            }
             // Dictionary input: membership over the values array, expanded
             // by keys.
             if let Some(dict) = value
@@ -294,9 +490,10 @@ fn evaluate_expr_internal(
                 if all_utf8 {
                     let set: std::collections::HashSet<&str> = literals.into_iter().collect();
                     if let Some(values) = dict.values().as_any().downcast_ref::<StringArray>() {
-                        let vmask: Vec<bool> = (0..values.len())
+                        let vmask: Vec<Option<bool>> = (0..values.len())
                             .map(|i| {
-                                !values.is_null(i) && (set.contains(values.value(i)) != *negated)
+                                (!values.is_null(i))
+                                    .then(|| set.contains(values.value(i)) != *negated)
                             })
                             .collect();
                         let keys = dict.keys();
@@ -305,7 +502,7 @@ fn evaluate_expr_internal(
                                 if dict.is_null(i) {
                                     None
                                 } else {
-                                    Some(vmask[keys.value(i) as usize])
+                                    vmask[keys.value(i) as usize]
                                 }
                             })
                             .collect();
@@ -352,16 +549,16 @@ fn evaluate_expr_internal(
             high,
             negated,
         } => {
-            let value = evaluate_expr_internal(batch, expr, subquery_executor)?;
-            let low_val = evaluate_expr_internal(batch, low, subquery_executor)?;
-            let high_val = evaluate_expr_internal(batch, high, subquery_executor)?;
+            let value = comparison_operand(batch, expr, subquery_executor)?;
+            let low_val = comparison_operand(batch, low, subquery_executor)?;
+            let high_val = comparison_operand(batch, high, subquery_executor)?;
 
-            let ge_low = evaluate_binary_op(&value, BinaryOp::GtEq, &low_val)?;
-            let le_high = evaluate_binary_op(&value, BinaryOp::LtEq, &high_val)?;
+            let ge_low = compare_operands(&value, BinaryOp::GtEq, &low_val, batch.num_rows())?;
+            let le_high = compare_operands(&value, BinaryOp::LtEq, &high_val, batch.num_rows())?;
 
             let ge_low_bool = ge_low.as_any().downcast_ref::<BooleanArray>().unwrap();
             let le_high_bool = le_high.as_any().downcast_ref::<BooleanArray>().unwrap();
-            let result = boolean::and(ge_low_bool, le_high_bool)?;
+            let result = boolean::and_kleene(ge_low_bool, le_high_bool)?;
 
             if *negated {
                 Ok(Arc::new(boolean::not(&result)?))
@@ -405,36 +602,21 @@ fn evaluate_expr_internal(
 }
 
 fn find_column_index(batch: &RecordBatch, col: &Column) -> Result<usize> {
-    let schema = batch.schema();
-
-    // Try qualified name first (e.g., "n1.n_nationkey")
-    if let Some(relation) = &col.relation {
-        let qualified = format!("{}.{}", relation, col.name);
-        if let Ok(idx) = schema.index_of(&qualified) {
-            return Ok(idx);
-        }
-    }
-
-    // Try unqualified name exactly (e.g., "n_nationkey")
-    if let Ok(idx) = schema.index_of(&col.name) {
-        return Ok(idx);
-    }
-
-    // Try to find a field that ends with ".{column_name}" (for unqualified lookups on qualified schema)
-    let suffix = format!(".{}", col.name);
-    for (i, field) in schema.fields().iter().enumerate() {
-        if field.name().ends_with(&suffix) || field.name() == &col.name {
-            return Ok(i);
-        }
-    }
-
-    Err(QueryError::ColumnNotFound(col.qualified_name()))
+    find_column_index_in_schema(&batch.schema(), col)
 }
 
-fn scalar_to_array(value: &ScalarValue, num_rows: usize) -> ArrayRef {
+pub(crate) fn find_column_index_in_schema(schema: &SchemaRef, col: &Column) -> Result<usize> {
+    crate::planner::resolve_arrow_column(schema.as_ref(), col)
+        .ok_or_else(|| QueryError::ColumnNotFound(col.qualified_name()))
+}
+
+pub(crate) fn scalar_to_array(value: &ScalarValue, num_rows: usize) -> Result<ArrayRef> {
     use arrow::array::*;
 
-    match value {
+    if let Some(pool) = crate::execution::expression_memory::expression_pool() {
+        return crate::planner::reserved_literal::expand(&pool, value, num_rows);
+    }
+    Ok(match value {
         ScalarValue::Null => Arc::new(NullArray::new(num_rows)),
         ScalarValue::Boolean(v) => Arc::new(BooleanArray::from(vec![*v; num_rows])),
         ScalarValue::Int8(v) => Arc::new(Int8Array::from(vec![*v; num_rows])),
@@ -450,16 +632,12 @@ fn scalar_to_array(value: &ScalarValue, num_rows: usize) -> ArrayRef {
         ScalarValue::Utf8(v) => Arc::new(StringArray::from(vec![v.as_str(); num_rows])),
         ScalarValue::Date32(v) => Arc::new(Date32Array::from(vec![*v; num_rows])),
         ScalarValue::Date64(v) => Arc::new(arrow::array::Date64Array::from(vec![*v; num_rows])),
-        ScalarValue::Timestamp(v) => Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
-                *v;
-                num_rows
-            ])),
+        ScalarValue::Timestamp(v) => v.expand(num_rows),
         ScalarValue::Decimal128(d) => {
             let scaled = d.mantissa();
             Arc::new(
                 arrow::array::Decimal128Array::from(vec![scaled; num_rows])
-                    .with_precision_and_scale(38, 10)
-                    .unwrap(),
+                    .with_precision_and_scale(38, d.scale())?,
             )
         }
         ScalarValue::Interval(v) => {
@@ -493,7 +671,7 @@ fn scalar_to_array(value: &ScalarValue, num_rows: usize) -> ArrayRef {
             let json_str = serde_json::to_string(&json_arr).unwrap_or_else(|_| "[]".to_string());
             Arc::new(StringArray::from(vec![json_str.as_str(); num_rows]))
         }
-    }
+    })
 }
 
 /// Evaluate `dict_col <op> 'literal'` at the dictionary-values level and
@@ -542,17 +720,25 @@ fn evaluate_binary_op(left: &ArrayRef, op: BinaryOp, right: &ArrayRef) -> Result
     // concrete type, so normalize dictionaries to their value type first;
     // the cast is per-batch and only on expressions that actually touch an
     // encoded column.
-    let normalize = |a: &ArrayRef| -> Result<ArrayRef> {
-        if let arrow::datatypes::DataType::Dictionary(_, value_type) = a.data_type() {
-            arrow::compute::cast(a.as_ref(), value_type).map_err(Into::into)
-        } else {
-            Ok(a.clone())
-        }
-    };
-    let left = &normalize(left)?;
-    let right = &normalize(right)?;
+    let left = &normalize_comparison_array(left)?;
+    let right = &normalize_comparison_array(right)?;
+    if matches!(
+        op,
+        BinaryOp::Add
+            | BinaryOp::Subtract
+            | BinaryOp::Multiply
+            | BinaryOp::Divide
+            | BinaryOp::Modulo
+    ) {
+        return crate::planner::numeric::arithmetic(op, left, right);
+    }
     // Handle type coercion
     let (left, right) = coerce_arrays(left, right)?;
+    if let Some(result) =
+        crate::planner::numeric::compare_float_arrays(&left, false, op, &right, false, left.len())
+    {
+        return Ok(Arc::new(result?));
+    }
 
     match op {
         BinaryOp::Eq => compare_arrays(&left, &right, |l, r| cmp::eq(l, r)),
@@ -570,7 +756,7 @@ fn evaluate_binary_op(left: &ArrayRef, op: BinaryOp, right: &ArrayRef) -> Result
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| QueryError::Type("AND requires boolean operands".into()))?;
-            Ok(Arc::new(boolean::and(l, r)?))
+            Ok(Arc::new(boolean::and_kleene(l, r)?))
         }
         BinaryOp::Or => {
             let l = left
@@ -581,7 +767,7 @@ fn evaluate_binary_op(left: &ArrayRef, op: BinaryOp, right: &ArrayRef) -> Result
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| QueryError::Type("OR requires boolean operands".into()))?;
-            Ok(Arc::new(boolean::or(l, r)?))
+            Ok(Arc::new(boolean::or_kleene(l, r)?))
         }
         BinaryOp::Add => arithmetic_op(&left, &right, |a, b| numeric::add(a, b)),
         BinaryOp::Subtract => arithmetic_op(&left, &right, |a, b| numeric::sub(a, b)),
@@ -654,6 +840,123 @@ fn evaluate_binary_op(left: &ArrayRef, op: BinaryOp, right: &ArrayRef) -> Result
     }
 }
 
+/// Comparisons retain constants as one value through coercion and Arrow kernels.
+/// Other expression families continue to receive batch-sized arrays.
+struct ComparisonOperand {
+    array: ArrayRef,
+    scalar: bool,
+}
+
+impl Datum for ComparisonOperand {
+    fn get(&self) -> (&dyn Array, bool) {
+        (self.array.as_ref(), self.scalar)
+    }
+}
+
+fn is_comparison(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq
+    )
+}
+
+fn literal_chain(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) => true,
+        Expr::Alias { expr, .. } | Expr::Cast { expr, .. } => literal_chain(expr),
+        _ => false,
+    }
+}
+
+fn evaluate_literal_chain(expr: &Expr) -> Result<ArrayRef> {
+    match expr {
+        Expr::Literal(value) => scalar_to_array(value, 1),
+        Expr::Alias { expr, .. } => evaluate_literal_chain(expr),
+        Expr::Cast {
+            expr,
+            data_type,
+            mode,
+        } => crate::planner::numeric::cast_array(&evaluate_literal_chain(expr)?, data_type, *mode),
+        _ => Err(QueryError::Internal(
+            "nonliteral comparison constant".into(),
+        )),
+    }
+}
+
+fn comparison_operand(
+    batch: &RecordBatch,
+    expr: &Expr,
+    executor: Option<&SubqueryExecutor>,
+) -> Result<ComparisonOperand> {
+    // Empty input must not execute a cast of a value that has no input row.
+    // Restrict this to literal-only chains: functions and arbitrary expressions
+    // may be volatile, fallible or depend on the current selected CASE rows.
+    let scalar = batch.num_rows() != 0 && literal_chain(expr);
+    let array = if scalar {
+        evaluate_literal_chain(expr)?
+    } else {
+        evaluate_expr_internal(batch, expr, executor)?
+    };
+    Ok(ComparisonOperand { array, scalar })
+}
+
+fn normalize_comparison_array(array: &ArrayRef) -> Result<ArrayRef> {
+    if let DataType::Dictionary(_, value_type) = array.data_type() {
+        arrow::compute::cast(array.as_ref(), value_type).map_err(Into::into)
+    } else {
+        Ok(array.clone())
+    }
+}
+
+fn compare_operands(
+    left: &ComparisonOperand,
+    op: BinaryOp,
+    right: &ComparisonOperand,
+    rows: usize,
+) -> Result<ArrayRef> {
+    let (l, r) = coerce_arrays(
+        &normalize_comparison_array(&left.array)?,
+        &normalize_comparison_array(&right.array)?,
+    )?;
+    if let Some(result) =
+        crate::planner::numeric::compare_float_arrays(&l, left.scalar, op, &r, right.scalar, rows)
+    {
+        return Ok(Arc::new(result?));
+    }
+    let l = ComparisonOperand {
+        array: l,
+        scalar: left.scalar,
+    };
+    let r = ComparisonOperand {
+        array: r,
+        scalar: right.scalar,
+    };
+    let result = match op {
+        BinaryOp::Eq => cmp::eq(&l, &r)?,
+        BinaryOp::NotEq => cmp::neq(&l, &r)?,
+        BinaryOp::Lt => cmp::lt(&l, &r)?,
+        BinaryOp::LtEq => cmp::lt_eq(&l, &r)?,
+        BinaryOp::Gt => cmp::gt(&l, &r)?,
+        BinaryOp::GtEq => cmp::gt_eq(&l, &r)?,
+        _ => {
+            return Err(QueryError::Internal(
+                "non-comparison scalar operation".into(),
+            ))
+        }
+    };
+    if l.scalar && r.scalar {
+        let value = (!result.is_null(0)).then(|| result.value(0));
+        Ok(Arc::new(BooleanArray::from(vec![value; rows])))
+    } else {
+        Ok(Arc::new(result))
+    }
+}
+
 fn coerce_arrays(left: &ArrayRef, right: &ArrayRef) -> Result<(ArrayRef, ArrayRef)> {
     let left_type = left.data_type();
     let right_type = right.data_type();
@@ -666,13 +969,13 @@ fn coerce_arrays(left: &ArrayRef, right: &ArrayRef) -> Result<(ArrayRef, ArrayRe
     let common_type = coerce_numeric_types(left_type, right_type)?;
 
     let left = if left_type != &common_type {
-        compute::cast(left, &common_type)?
+        crate::planner::numeric::cast_strict(left, &common_type)?
     } else {
         left.clone()
     };
 
     let right = if right_type != &common_type {
-        compute::cast(right, &common_type)?
+        crate::planner::numeric::cast_strict(right, &common_type)?
     } else {
         right.clone()
     };
@@ -681,37 +984,7 @@ fn coerce_arrays(left: &ArrayRef, right: &ArrayRef) -> Result<(ArrayRef, ArrayRe
 }
 
 fn coerce_numeric_types(left: &DataType, right: &DataType) -> Result<DataType> {
-    use DataType::*;
-
-    match (left, right) {
-        // Same types
-        (a, b) if a == b => Ok(a.clone()),
-
-        // Float64 dominates
-        (Float64, _) | (_, Float64) => Ok(Float64),
-        (Float32, _) | (_, Float32) => Ok(Float64),
-
-        // Int64 for integers
-        (Int64, _) | (_, Int64) => Ok(Int64),
-        (Int32, _) | (_, Int32) => Ok(Int64),
-        (Int16, _) | (_, Int16) => Ok(Int32),
-        (Int8, _) | (_, Int8) => Ok(Int16),
-
-        // UInt64 for unsigned
-        (UInt64, _) | (_, UInt64) => Ok(UInt64),
-        (UInt32, _) | (_, UInt32) => Ok(UInt64),
-
-        // Date/String coercion
-        (Date32, Utf8) | (Utf8, Date32) => Ok(Date32),
-
-        // Default to string
-        (Utf8, _) | (_, Utf8) => Ok(Utf8),
-
-        _ => Err(QueryError::Type(format!(
-            "Cannot coerce {:?} and {:?}",
-            left, right
-        ))),
-    }
+    crate::planner::numeric::common_type(left, right)
 }
 
 fn compare_arrays<F>(left: &ArrayRef, right: &ArrayRef, f: F) -> Result<ArrayRef>
@@ -746,57 +1019,98 @@ fn evaluate_unary_op(op: UnaryOp, arr: &ArrayRef) -> Result<ArrayRef> {
 
 fn evaluate_case(
     batch: &RecordBatch,
-    _operand: Option<&Expr>,
+    operand: Option<&Expr>,
     when_then: &[(Expr, Expr)],
     else_expr: Option<&Expr>,
     subquery_executor: Option<&SubqueryExecutor>,
 ) -> Result<ArrayRef> {
-    let num_rows = batch.num_rows();
-
-    // Start with else value or null
-    let mut result: Option<ArrayRef> = else_expr
-        .map(|e| evaluate_expr_internal(batch, e, subquery_executor))
+    use arrow::array::UInt64Array;
+    use arrow::compute::{concat, take, take_record_batch};
+    let schema = crate::planner::PlanSchema::from_qualified_arrow(batch.schema().as_ref());
+    let target = when_then
+        .iter()
+        .map(|(_, then)| then)
+        .chain(else_expr.iter().copied())
+        .try_fold(DataType::Null, |result, branch| {
+            crate::planner::numeric::common_type(&result, &branch.data_type(&schema)?)
+        })?;
+    if batch.num_rows() == 0 {
+        return Ok(arrow::array::new_empty_array(&target));
+    }
+    // Evaluate only selected rows. Eager evaluation would make an untaken
+    // strict CAST/division fail, and would execute unneeded subqueries.
+    let base = operand
+        .map(|expr| evaluate_expr_internal(batch, expr, subquery_executor))
         .transpose()?;
-
-    // Process WHEN clauses in reverse order
-    for (when, then) in when_then.iter().rev() {
-        let condition = evaluate_expr_internal(batch, when, subquery_executor)?;
+    let mut remaining: Vec<u64> = (0..batch.num_rows() as u64).collect();
+    let mut output_order = vec![0_u64; batch.num_rows()];
+    let mut output_len = 0_u64;
+    let mut pieces: Vec<ArrayRef> = Vec::new();
+    for (when, then) in when_then {
+        if remaining.is_empty() {
+            break;
+        }
+        let indices = UInt64Array::from(remaining.clone());
+        let active = if remaining.len() == batch.num_rows() {
+            batch.clone()
+        } else {
+            take_record_batch(batch, &indices)?
+        };
+        let condition = evaluate_expr_internal(&active, when, subquery_executor)?;
+        let condition = match &base {
+            Some(base) => {
+                evaluate_binary_op(&take(base, &indices, None)?, BinaryOp::Eq, &condition)?
+            }
+            None => condition,
+        };
         let condition = condition
             .as_any()
             .downcast_ref::<BooleanArray>()
             .ok_or_else(|| QueryError::Type("CASE WHEN requires boolean condition".into()))?;
-
-        let then_value = evaluate_expr_internal(batch, then, subquery_executor)?;
-
-        result = Some(match result {
-            Some(else_val) => {
-                // Coerce types if they differ (e.g., Int64 ELSE vs Float64 THEN)
-                let (then_arr, else_arr) = if then_value.data_type() != else_val.data_type() {
-                    let target = if then_value.data_type() == &arrow::datatypes::DataType::Float64
-                        || else_val.data_type() == &arrow::datatypes::DataType::Float64
-                    {
-                        arrow::datatypes::DataType::Float64
-                    } else {
-                        then_value.data_type().clone()
-                    };
-                    (
-                        arrow::compute::cast(&then_value, &target)?,
-                        arrow::compute::cast(&else_val, &target)?,
-                    )
-                } else {
-                    (then_value, else_val)
-                };
-                zip(condition, &then_arr, &else_arr)?
+        let (selected, rest): (Vec<(usize, u64)>, Vec<(usize, u64)>) = remaining
+            .into_iter()
+            .enumerate()
+            .partition::<Vec<_>, _>(|(i, _)| !condition.is_null(*i) && condition.value(*i));
+        let selected: Vec<u64> = selected.into_iter().map(|(_, row)| row).collect();
+        remaining = rest.into_iter().map(|(_, row)| row).collect();
+        if !selected.is_empty() {
+            let selected_batch = if selected.len() == batch.num_rows() {
+                batch.clone()
+            } else {
+                take_record_batch(batch, &UInt64Array::from(selected.clone()))?
+            };
+            let values = evaluate_expr_internal(&selected_batch, then, subquery_executor)?;
+            pieces.push(crate::planner::numeric::cast_strict(&values, &target)?);
+            for row in selected {
+                output_order[row as usize] = output_len;
+                output_len += 1;
             }
-            None => {
-                // No else, use null for false conditions
-                let null_arr = arrow::array::new_null_array(then_value.data_type(), num_rows);
-                zip(condition, &then_value, &null_arr)?
-            }
-        });
+        }
     }
-
-    result.ok_or_else(|| QueryError::Execution("CASE must have at least one WHEN clause".into()))
+    if !remaining.is_empty() {
+        let values = match else_expr {
+            Some(expr) => {
+                let active = if remaining.len() == batch.num_rows() {
+                    batch.clone()
+                } else {
+                    take_record_batch(batch, &UInt64Array::from(remaining.clone()))?
+                };
+                crate::planner::numeric::cast_strict(
+                    &evaluate_expr_internal(&active, expr, subquery_executor)?,
+                    &target,
+                )?
+            }
+            None => arrow::array::new_null_array(&target, remaining.len()),
+        };
+        pieces.push(values);
+        for row in remaining {
+            output_order[row as usize] = output_len;
+            output_len += 1;
+        }
+    }
+    let refs: Vec<_> = pieces.iter().map(|piece| piece.as_ref()).collect();
+    let values = concat(&refs)?;
+    Ok(take(&values, &UInt64Array::from(output_order), None)?)
 }
 
 fn evaluate_in_list(value: &ArrayRef, list: &[ArrayRef], negated: bool) -> Result<ArrayRef> {
@@ -817,7 +1131,7 @@ fn evaluate_in_list(value: &ArrayRef, list: &[ArrayRef], negated: bool) -> Resul
             .ok_or_else(|| QueryError::Type("IN comparison must return boolean".into()))?;
 
         result = Some(match result {
-            Some(prev) => boolean::or(&prev, eq_bool)?,
+            Some(prev) => boolean::or_kleene(&prev, eq_bool)?,
             None => eq_bool.clone(),
         });
     }
@@ -905,6 +1219,10 @@ fn evaluate_scalar_func(
     use crate::planner::ScalarFunction;
     use arrow::array::{BinaryArray, Float64Array};
 
+    if matches!(func, ScalarFunction::Extract) {
+        return temporal::extract(batch, args, subquery_executor);
+    }
+
     // Vector distances are handled before the generic argument evaluation.
     // A 384-float query vector must NOT go through `scalar_to_array`, which
     // renders a `ScalarValue::List` as a JSON string once per row — that would
@@ -970,80 +1288,47 @@ fn evaluate_scalar_func(
             Ok(Arc::new(result))
         }
 
-        ScalarFunction::Length => {
+        ScalarFunction::Length | ScalarFunction::OctetLength => {
             let arr = evaluated_args
                 .first()
                 .ok_or_else(|| QueryError::InvalidArgument("LENGTH requires 1 argument".into()))?;
-            let str_arr = arr
+            let mut logical_type = arr.data_type();
+            while let arrow::datatypes::DataType::Dictionary(_, value) = logical_type {
+                logical_type = value;
+            }
+            if !matches!(
+                logical_type,
+                arrow::datatypes::DataType::Utf8
+                    | arrow::datatypes::DataType::LargeUtf8
+                    | arrow::datatypes::DataType::Utf8View
+            ) {
+                return Err(QueryError::Type(
+                    "String length requires a string argument".into(),
+                ));
+            }
+            let normalized =
+                crate::planner::numeric::cast_strict(arr, &arrow::datatypes::DataType::Utf8)?;
+            let str_arr = normalized
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| QueryError::Type("LENGTH requires string argument".into()))?;
 
             let result: Int64Array = str_arr
                 .iter()
-                .map(|opt| opt.map(|s| s.len() as i64))
-                .collect();
-            Ok(Arc::new(result))
-        }
-
-        ScalarFunction::Substring => {
-            if evaluated_args.len() < 2 {
-                return Err(QueryError::InvalidArgument(
-                    "SUBSTRING requires at least 2 arguments".into(),
-                ));
-            }
-
-            let str_arr = evaluated_args[0]
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| QueryError::Type("SUBSTRING requires string argument".into()))?;
-
-            let start_arr = &evaluated_args[1];
-            let len_arr = evaluated_args.get(2);
-
-            // Vectorized path: constant start (and optional constant length)
-            // via arrow's substring_by_char kernel — one output buffer instead
-            // of a String allocation per row.
-            let const_start = constant_int_value(&args[1], start_arr);
-            let const_len = match (args.get(2), len_arr) {
-                (Some(a), Some(arr)) => match constant_int_value(a, arr) {
-                    Some(v) => Some(Some(v)),
-                    None => None, // non-constant length: fall back
-                },
-                _ => Some(None), // no length argument
-            };
-            // Only the well-defined case (start >= 1, len >= 0) — negative or
-            // zero start/len keep the row loop's exact legacy semantics.
-            if let (Some(start), Some(len)) = (const_start, const_len) {
-                if start >= 1 && len.map(|l| l >= 0).unwrap_or(true) {
-                    let result = arrow::compute::kernels::substring::substring_by_char(
-                        str_arr,
-                        start - 1,
-                        len.map(|l| l as u64),
-                    )
-                    .map_err(QueryError::Arrow)?;
-                    return Ok(Arc::new(result));
-                }
-            }
-
-            let result: StringArray = (0..str_arr.len())
-                .map(|i| {
-                    let s = str_arr.value(i);
-                    let start = get_int_value(start_arr, i).unwrap_or(1) as usize;
-                    let start = start.saturating_sub(1); // SQL is 1-indexed
-
-                    match len_arr {
-                        Some(len) => {
-                            let len = get_int_value(len, i).unwrap_or(s.len() as i64) as usize;
-                            Some(s.chars().skip(start).take(len).collect::<String>())
+                .map(|opt| {
+                    opt.map(|s| {
+                        if matches!(func, ScalarFunction::OctetLength) {
+                            s.len() as i64
+                        } else {
+                            s.chars().count() as i64
                         }
-                        None => Some(s.chars().skip(start).collect::<String>()),
-                    }
+                    })
                 })
                 .collect();
-
             Ok(Arc::new(result))
         }
+
+        ScalarFunction::Substring => super::substring::evaluate(args, &evaluated_args),
 
         ScalarFunction::Coalesce => {
             if evaluated_args.is_empty() {
@@ -1090,45 +1375,7 @@ fn evaluate_scalar_func(
             Ok(result)
         }
 
-        ScalarFunction::Extract => {
-            // EXTRACT(field FROM date)
-            if evaluated_args.len() != 2 {
-                return Err(QueryError::InvalidArgument(
-                    "EXTRACT requires 2 arguments".into(),
-                ));
-            }
-
-            let field = evaluated_args[0]
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| QueryError::Type("EXTRACT field must be string".into()))?;
-
-            let date_arr = &evaluated_args[1];
-
-            if let Some(date32) = date_arr.as_any().downcast_ref::<Date32Array>() {
-                let field_name = field.value(0).to_uppercase();
-                let result: Int32Array = date32
-                    .iter()
-                    .map(|opt| {
-                        opt.map(|days| {
-                            let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719163)
-                                .unwrap_or_default();
-                            match field_name.as_str() {
-                                "YEAR" => date.year(),
-                                "MONTH" => date.month() as i32,
-                                "DAY" => date.day() as i32,
-                                _ => 0,
-                            }
-                        })
-                    })
-                    .collect();
-                return Ok(Arc::new(result));
-            }
-
-            Err(QueryError::NotImplemented(
-                "EXTRACT for this type not implemented".into(),
-            ))
-        }
+        ScalarFunction::Extract => unreachable!("EXTRACT handled before argument expansion"),
 
         ScalarFunction::Year | ScalarFunction::Month | ScalarFunction::Day => {
             let date_arr = evaluated_args.first().ok_or_else(|| {
@@ -2697,46 +2944,7 @@ fn evaluate_scalar_func(
             Ok(Arc::new(result))
         }
 
-        ScalarFunction::RegexpReplace => {
-            if evaluated_args.len() != 3 {
-                return Err(QueryError::InvalidArgument(
-                    "REGEXP_REPLACE requires 3 arguments".into(),
-                ));
-            }
-            let str_arr = evaluated_args[0]
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    QueryError::Type("REGEXP_REPLACE requires string argument".into())
-                })?;
-            let pattern_arr = evaluated_args[1]
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| QueryError::Type("REGEXP_REPLACE requires string pattern".into()))?;
-            let replacement_arr = evaluated_args[2]
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    QueryError::Type("REGEXP_REPLACE requires string replacement".into())
-                })?;
-
-            let result: StringArray = (0..str_arr.len())
-                .map(|i| {
-                    if str_arr.is_null(i) || pattern_arr.is_null(i) || replacement_arr.is_null(i) {
-                        None
-                    } else {
-                        let s = str_arr.value(i);
-                        let pattern = pattern_arr.value(i);
-                        let replacement = replacement_arr.value(i);
-                        match regex::Regex::new(pattern) {
-                            Ok(re) => Some(re.replace_all(s, replacement).to_string()),
-                            Err(_) => Some(s.to_string()),
-                        }
-                    }
-                })
-                .collect();
-            Ok(Arc::new(result))
-        }
+        ScalarFunction::RegexpReplace => super::regex_replace::evaluate(&evaluated_args),
 
         ScalarFunction::RegexpCount => {
             if evaluated_args.len() != 2 {
@@ -4433,13 +4641,9 @@ fn evaluate_scalar_func(
         }
 
         // ========== NEW CONDITIONAL/FORMATTING FUNCTIONS ==========
-        ScalarFunction::TryCast => {
-            // For now, just return the input (actual casting requires type info)
-            evaluated_args
-                .first()
-                .cloned()
-                .ok_or_else(|| QueryError::InvalidArgument("TRY_CAST requires 1 argument".into()))
-        }
+        ScalarFunction::TryCast => Err(QueryError::InvalidArgument(
+            "TRY_CAST requires SQL TRY_CAST(expression AS type) syntax".into(),
+        )),
 
         ScalarFunction::Try => {
             // For now, just return the input
@@ -5737,23 +5941,6 @@ fn get_float_array(arr: &ArrayRef) -> Result<Vec<Option<f64>>> {
     Err(QueryError::Type("Expected numeric array".into()))
 }
 
-/// Extract a compile-time-constant integer from a function argument:
-/// either the expression is a literal, or the evaluated array is a
-/// single-value literal broadcast. Returns None for row-varying args.
-fn constant_int_value(expr: &crate::planner::Expr, arr: &ArrayRef) -> Option<i64> {
-    if let crate::planner::Expr::Literal(sv) = expr {
-        return match sv {
-            ScalarValue::Int64(v) => Some(*v),
-            ScalarValue::Int32(v) => Some(*v as i64),
-            _ => None,
-        };
-    }
-    if arr.len() == 1 {
-        return get_int_value(arr, 0);
-    }
-    None
-}
-
 fn get_int_value(arr: &ArrayRef, idx: usize) -> Option<i64> {
     if let Some(i64_arr) = arr.as_any().downcast_ref::<Int64Array>() {
         return Some(i64_arr.value(idx));
@@ -6393,4 +6580,395 @@ pub fn filter_batches(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod scalar_operand_tests {
+    use super::*;
+
+    #[test]
+    fn literal_cast_operand_retains_one_value_for_large_and_empty_batches() {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "v",
+            Arc::new(Int64Array::from(vec![7; 8192])) as ArrayRef,
+        )])
+        .unwrap();
+        let expr = Expr::Cast {
+            expr: Box::new(Expr::Literal(ScalarValue::Int64(24))),
+            data_type: DataType::Decimal128(20, 2),
+            mode: crate::planner::CastMode::Strict,
+        };
+        let operand = comparison_operand(&batch, &expr, None).unwrap();
+        assert!(operand.scalar);
+        assert_eq!(operand.array.len(), 1);
+        assert_eq!(operand.array.data_type(), &DataType::Decimal128(20, 2));
+        let empty = comparison_operand(&batch.slice(0, 0), &expr, None).unwrap();
+        assert!(!empty.scalar);
+        assert_eq!(empty.array.len(), 0);
+    }
+}
+
+impl FilterExec {
+    fn wrap_stream(&self, input_stream: RecordBatchStream) -> Result<RecordBatchStream> {
+        self.wrap_stream_with_membership_mode(input_stream, MembershipMode::Ordinary)
+    }
+    fn wrap_stream_with_membership_mode(
+        &self,
+        input_stream: RecordBatchStream,
+        mode: MembershipMode,
+    ) -> Result<RecordBatchStream> {
+        if let Some(owner) = &self.initialized_membership {
+            let owner = owner.clone();
+            let predicate = self.predicate.clone();
+            return Ok(Box::pin(input_stream.and_then(move |batch| {
+                let owner = owner.clone();
+                let predicate = predicate.clone();
+                async move {
+                    match mode {
+                        MembershipMode::Ordinary => owner.evaluate(&batch, &predicate).await,
+                        MembershipMode::Certified => {
+                            owner.evaluate_certified(&batch, &predicate).await
+                        }
+                        MembershipMode::Generic => owner.evaluate_generic(&batch, &predicate),
+                    }
+                }
+            })));
+        }
+
+        let predicate = self.predicate.clone();
+        let schema = self.schema.clone();
+        let has_subqueries = predicate.contains_subquery();
+        let subquery_exec = self.subquery_executor.clone();
+        let evaluator = self.evaluator.clone();
+
+        let filtered_stream = input_stream.and_then(move |batch| {
+            let pred = predicate.clone();
+            let schema = schema.clone();
+            let subquery_exec = subquery_exec.clone();
+            let evaluator = evaluator.clone();
+            async move {
+                if has_subqueries {
+                    if let Some(exec) = subquery_exec {
+                        evaluate_filter_with_subquery(&batch, &pred, &schema, &exec)
+                    } else {
+                        Err(QueryError::Execution(
+                            "Subquery in filter but no executor available".into(),
+                        ))
+                    }
+                } else {
+                    // Fused mask when the predicate compiled; interpreter
+                    // otherwise — identical masks either way (compiled_expr
+                    // equivalence tests).
+                    let mask = evaluator.evaluate(&batch)?;
+                    let filtered: Result<Vec<ArrayRef>> = batch
+                        .columns()
+                        .iter()
+                        .map(|col| compute::filter(col.as_ref(), &mask).map_err(Into::into))
+                        .collect();
+                    RecordBatch::try_new(batch.schema(), filtered?).map_err(Into::into)
+                }
+            }
+        });
+
+        Ok(Box::pin(filtered_stream))
+    }
+}
+
+#[cfg(test)]
+mod aggregate_root_reuse_tests {
+    use super::*;
+    use crate::planner::CastMode;
+    use arrow::array::{Decimal128Array, DictionaryArray, Float64Array, Int32Array};
+    use arrow::datatypes::Int32Type;
+
+    fn bin(l: Expr, op: BinaryOp, r: Expr) -> Expr {
+        Expr::BinaryExpr {
+            left: Box::new(l),
+            op,
+            right: Box::new(r),
+        }
+    }
+    fn one() -> Expr {
+        Expr::Literal(ScalarValue::Int8(1))
+    }
+    fn decimal(values: Vec<Option<i128>>, p: u8, s: i8) -> ArrayRef {
+        Arc::new(
+            Decimal128Array::from(values)
+                .with_precision_and_scale(p, s)
+                .unwrap(),
+        )
+    }
+    fn run(batch: &RecordBatch, exprs: &[Expr]) -> Result<Vec<ArrayRef>> {
+        AGGREGATE_REUSE_COUNTS.with(|c| c.set((0, 0)));
+        evaluate_aggregate_inputs(
+            batch,
+            exprs.len(),
+            |i| &exprs[i],
+            crate::physical::morsel_agg::normalize_aggregate_array,
+        )
+    }
+    fn counts() -> (usize, usize) {
+        AGGREGATE_REUSE_COUNTS.with(|c| c.get())
+    }
+    fn assert_decimal(array: &ArrayRef, precision: u8, scale: i8, expected: &[Option<i128>]) {
+        assert_eq!(array.data_type(), &DataType::Decimal128(precision, scale));
+        let a = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+        assert_eq!(a.iter().collect::<Vec<_>>(), expected);
+    }
+    #[test]
+    fn decimal_roots_reuse_exact_nullable_arithmetic_without_new_payload() {
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "p",
+                decimal(
+                    vec![Some(12345), None, Some(-2500), Some(1000), Some(1000)],
+                    8,
+                    2,
+                ),
+            ),
+            (
+                "d",
+                decimal(vec![Some(10), Some(10), Some(25), None, Some(10)], 8, 2),
+            ),
+            (
+                "t",
+                decimal(vec![Some(5), Some(5), Some(10), Some(5), None], 8, 2),
+            ),
+        ])
+        .unwrap();
+        let root = bin(
+            Expr::column("p"),
+            BinaryOp::Multiply,
+            bin(one(), BinaryOp::Subtract, Expr::column("d")),
+        );
+        let charge = bin(
+            root.clone(),
+            BinaryOp::Multiply,
+            bin(one(), BinaryOp::Add, Expr::column("t")),
+        );
+        let out = run(&batch, &[root.clone(), charge, root]).unwrap();
+        assert_decimal(
+            &out[0],
+            18,
+            4,
+            &[Some(1_111_050), None, Some(-187_500), None, Some(90_000)],
+        );
+        assert_decimal(
+            &out[1],
+            28,
+            6,
+            &[Some(116_660_250), None, Some(-20_625_000), None, None],
+        );
+        assert!(Arc::ptr_eq(&out[0], &out[2]));
+        assert_eq!(counts(), (4, 2)); // Eight arithmetic nodes without subtree reuse.
+                                      // Reusing the same expressions in a different batch cannot reuse values.
+        let empty = batch.slice(0, 0);
+        let out = run(&empty, &[bin(Expr::column("p"), BinaryOp::Add, one())]).unwrap();
+        assert_eq!(out[0].len(), 0);
+    }
+    #[test]
+    fn negative_and_mixed_scales_and_batch_boundaries_are_exact() {
+        let make = |v| {
+            RecordBatch::try_from_iter(vec![
+                ("a", decimal(vec![Some(v), None], 8, -2)),
+                ("b", decimal(vec![Some(7), None], 8, 1)),
+            ])
+            .unwrap()
+        };
+        let root = bin(Expr::column("a"), BinaryOp::Add, Expr::column("b"));
+        let twice = bin(
+            root.clone(),
+            BinaryOp::Multiply,
+            Expr::Literal(ScalarValue::Int8(2)),
+        );
+        for (v, want) in [(2, 2007), (-3, -2993)] {
+            let out = run(&make(v), &[root.clone(), twice.clone()]).unwrap();
+            assert_decimal(&out[0], 12, 1, &[Some(want), None]);
+            assert_decimal(&out[1], 16, 1, &[Some(want * 2), None]);
+            assert_eq!(counts(), (2, 1));
+        }
+    }
+    #[test]
+    fn decimal_literal_scales_are_part_of_reuse_identity() {
+        let batch = RecordBatch::try_from_iter(vec![("a", decimal(vec![Some(2)], 8, 0))]).unwrap();
+        let root = |coefficient, scale| {
+            bin(
+                Expr::column("a"),
+                BinaryOp::Add,
+                Expr::Literal(ScalarValue::Decimal128(crate::planner::DecimalValue::new(
+                    coefficient,
+                    scale,
+                ))),
+            )
+        };
+        let out = run(&batch, &[root(10, 1), root(100, 2)]).unwrap();
+        assert_decimal(&out[0], 38, 1, &[Some(30)]);
+        assert_decimal(&out[1], 38, 2, &[Some(300)]);
+        assert_eq!(counts(), (2, 0));
+    }
+
+    #[test]
+    fn aliases_and_literal_types_are_structural_not_textual() {
+        let batch =
+            RecordBatch::try_from_iter(vec![("a", decimal(vec![Some(100)], 8, 2))]).unwrap();
+        let root = bin(Expr::column("a"), BinaryOp::Add, one());
+        let alias = Expr::Alias {
+            expr: Box::new(root.clone()),
+            name: "aliased".into(),
+        };
+        let out = run(&batch, &[alias.clone(), bin(alias, BinaryOp::Add, one())]).unwrap();
+        assert_decimal(&out[1], 10, 2, &[Some(300)]);
+        assert_eq!(counts(), (2, 1));
+        let distinct = bin(
+            Expr::column("a"),
+            BinaryOp::Add,
+            Expr::Literal(ScalarValue::Int16(1)),
+        );
+        let out = run(&batch, &[root, distinct]).unwrap();
+        assert_decimal(&out[0], 9, 2, &[Some(200)]);
+        assert_decimal(&out[1], 9, 2, &[Some(200)]);
+        assert_eq!(counts(), (2, 0));
+    }
+    #[test]
+    fn precision_overflow_and_scale_domain_fail_before_later_work() {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "a",
+            decimal(vec![Some(10_i128.pow(38) - 1)], 38, 0),
+        )])
+        .unwrap();
+        let root = bin(Expr::column("a"), BinaryOp::Add, one());
+        let error = run(
+            &batch,
+            &[root.clone(), bin(root, BinaryOp::Subtract, one())],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("precision"), "{error}");
+        assert_eq!(counts(), (1, 0));
+        let batch = RecordBatch::try_from_iter(vec![
+            ("a", decimal(vec![Some(1)], 38, 38)),
+            ("b", decimal(vec![Some(1)], 2, 1)),
+        ])
+        .unwrap();
+        let error = run(
+            &batch,
+            &[bin(
+                Expr::column("a"),
+                BinaryOp::Multiply,
+                Expr::column("b"),
+            )],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("scale exceeds"), "{error}");
+    }
+    #[test]
+    fn cast_case_float_and_dictionary_barriers_keep_original_domains() {
+        let batch = RecordBatch::try_from_iter(vec![
+            ("a", decimal(vec![Some(100), None], 8, 2)),
+            (
+                "f",
+                Arc::new(Float64Array::from(vec![Some(1.5), None])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let strict = Expr::Cast {
+            expr: Box::new(Expr::Literal(ScalarValue::Utf8("bad".into()))),
+            data_type: DataType::Int64,
+            mode: CastMode::Strict,
+        };
+        let try_cast = Expr::Cast {
+            expr: Box::new(Expr::Literal(ScalarValue::Utf8("bad".into()))),
+            data_type: DataType::Int64,
+            mode: CastMode::Try,
+        };
+        let case = Expr::Case {
+            operand: None,
+            when_then: vec![(Expr::Literal(ScalarValue::Boolean(true)), Expr::column("a"))],
+            else_expr: Some(Box::new(Expr::Cast {
+                expr: Box::new(Expr::Literal(ScalarValue::Utf8("bad".into()))),
+                data_type: DataType::Decimal128(8, 2),
+                mode: CastMode::Strict,
+            })),
+        };
+        let out = run(&batch, &[case, try_cast]).unwrap();
+        assert_decimal(&out[0], 8, 2, &[Some(100), None]);
+        assert_eq!(out[1].null_count(), 2);
+        assert_eq!(out[1].data_type(), &DataType::Int64);
+        assert_eq!(counts(), (0, 0));
+        assert!(run(&batch, &[strict]).is_err());
+        let float = bin(
+            Expr::column("f"),
+            BinaryOp::Multiply,
+            Expr::Literal(ScalarValue::Int8(2)),
+        );
+        let out = run(&batch, &[float.clone(), float]).unwrap();
+        assert_eq!(
+            out[0]
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(3.0), None]
+        );
+        assert_eq!(counts(), (0, 0));
+        let dict = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![Some(0), Some(1), None]),
+                decimal(vec![Some(100), None], 8, 2),
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let batch = RecordBatch::try_from_iter(vec![("a", dict)]).unwrap();
+        let root = bin(Expr::column("a"), BinaryOp::Add, one());
+        let out = run(&batch, &[root.clone(), root]).unwrap();
+        assert_decimal(&out[0], 9, 2, &[Some(200), None, None]);
+        assert_eq!(counts(), (0, 0));
+    }
+    #[test]
+    fn normalization_is_ordered_and_only_identity_results_are_reusable() {
+        fn replaced(a: ArrayRef) -> Result<ArrayRef> {
+            // An arbitrary normalizer must not silently become a cached input.
+            Ok(Arc::new(
+                a.as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .unwrap()
+                    .clone(),
+            ))
+        }
+        fn refuse(_: ArrayRef) -> Result<ArrayRef> {
+            Err(QueryError::Execution("normalizer first".into()))
+        }
+        let batch =
+            RecordBatch::try_from_iter(vec![("a", decimal(vec![Some(100)], 8, 2))]).unwrap();
+        let root = bin(Expr::column("a"), BinaryOp::Add, one());
+        let exprs = [root.clone(), root];
+        AGGREGATE_REUSE_COUNTS.with(|c| c.set((0, 0)));
+        let out = evaluate_aggregate_inputs(&batch, 2, |i| &exprs[i], replaced).unwrap();
+        assert_decimal(&out[1], 9, 2, &[Some(200)]);
+        assert_eq!(counts(), (2, 0));
+        let exprs = [exprs[0].clone(), Expr::column("missing")];
+        let error = evaluate_aggregate_inputs(&batch, 2, |i| &exprs[i], refuse).unwrap_err();
+        assert!(error.to_string().contains("normalizer first"), "{error}");
+    }
+    #[test]
+    fn all_null_roots_and_metadata_overflow_do_not_invent_values_or_evaluate() {
+        let batch =
+            RecordBatch::try_from_iter(vec![("a", decimal(vec![None, None], 8, 2))]).unwrap();
+        let root = bin(Expr::column("a"), BinaryOp::Add, one());
+        let out = run(&batch, &[root.clone(), root.clone()]).unwrap();
+        assert_decimal(&out[0], 9, 2, &[None, None]);
+        assert!(Arc::ptr_eq(&out[0], &out[1]));
+        assert_eq!(counts(), (1, 1));
+        let error = evaluate_aggregate_inputs(
+            &batch,
+            usize::MAX,
+            |_| panic!("must fail before expression lookup"),
+            Ok,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("metadata allocation failed"),
+            "{error}"
+        );
+    }
 }

@@ -37,6 +37,16 @@ impl ConstantFolding {
 
         // Then optimize expressions in this node
         match plan {
+            LogicalPlan::Scan(mut node) => {
+                node.filter = node.filter.as_ref().map(|e| self.fold_expr(e));
+                Ok(LogicalPlan::Scan(node))
+            }
+            LogicalPlan::Sort(mut node) => {
+                for sort in &mut node.order_by {
+                    sort.expr = self.fold_expr(&sort.expr);
+                }
+                Ok(LogicalPlan::Sort(node))
+            }
             LogicalPlan::Filter(mut node) => {
                 node.predicate = self.fold_expr(&node.predicate);
                 Ok(LogicalPlan::Filter(node))
@@ -136,13 +146,43 @@ impl ConstantFolding {
                     expr: Box::new(folded),
                 }
             }
-            Expr::Cast { expr, data_type } => {
+            Expr::Cast {
+                expr,
+                data_type,
+                mode,
+            } => {
                 let folded = self.fold_expr(expr);
+                if let Expr::Literal(value) = &folded {
+                    if let Some(value) = self.eval_cast(value, data_type, *mode) {
+                        return Expr::Literal(value);
+                    }
+                }
                 Expr::Cast {
                     expr: Box::new(folded),
                     data_type: data_type.clone(),
+                    mode: *mode,
                 }
             }
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => Expr::InList {
+                expr: Box::new(self.fold_expr(expr)),
+                list: list.iter().map(|e| self.fold_expr(e)).collect(),
+                negated: *negated,
+            },
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => Expr::Between {
+                expr: Box::new(self.fold_expr(expr)),
+                low: Box::new(self.fold_expr(low)),
+                high: Box::new(self.fold_expr(high)),
+                negated: *negated,
+            },
             Expr::Alias { expr, name } => Expr::Alias {
                 expr: Box::new(self.fold_expr(expr)),
                 name: name.clone(),
@@ -176,6 +216,37 @@ impl ConstantFolding {
         }
     }
 
+    /// Use the execution cast kernel, but never introduce a planning error or
+    /// erase a type that ScalarValue cannot represent (notably typed NULL,
+    /// decimal precision, timezone, and nested field metadata).
+    fn eval_cast(
+        &self,
+        value: &ScalarValue,
+        target: &arrow::datatypes::DataType,
+        mode: crate::planner::CastMode,
+    ) -> Option<ScalarValue> {
+        use arrow::array::{Array, Date64Array};
+        use arrow::datatypes::DataType;
+        if matches!(value, ScalarValue::List(..)) {
+            return None;
+        }
+        let input = crate::physical::operators::scalar_to_array(value, 1).ok()?;
+        let output = crate::planner::numeric::cast_array(&input, target, mode).ok()?;
+        if output.is_null(0) {
+            return None;
+        }
+        let value = match target {
+            DataType::Date64 => {
+                ScalarValue::Date64(output.as_any().downcast_ref::<Date64Array>()?.value(0))
+            }
+            DataType::Timestamp(_, _) => ScalarValue::Timestamp(
+                crate::planner::TimestampValue::from_array(output.as_ref(), 0)?,
+            ),
+            _ => crate::physical::morsel_agg::extract_scalar(&output, 0),
+        };
+        (value.data_type() == *target && !value.is_null()).then_some(value)
+    }
+
     fn eval_binary(
         &self,
         left: &ScalarValue,
@@ -193,23 +264,11 @@ impl ConstantFolding {
 
     fn eval_int64(&self, left: i64, op: BinaryOp, right: i64) -> Option<ScalarValue> {
         match op {
-            BinaryOp::Add => Some(ScalarValue::Int64(left.checked_add(right)?)),
-            BinaryOp::Subtract => Some(ScalarValue::Int64(left.checked_sub(right)?)),
-            BinaryOp::Multiply => Some(ScalarValue::Int64(left.checked_mul(right)?)),
-            BinaryOp::Divide => {
-                if right == 0 {
-                    None
-                } else {
-                    Some(ScalarValue::Int64(left / right))
-                }
-            }
-            BinaryOp::Modulo => {
-                if right == 0 {
-                    None
-                } else {
-                    Some(ScalarValue::Int64(left % right))
-                }
-            }
+            BinaryOp::Add => left.checked_add(right).map(ScalarValue::Int64),
+            BinaryOp::Subtract => left.checked_sub(right).map(ScalarValue::Int64),
+            BinaryOp::Multiply => left.checked_mul(right).map(ScalarValue::Int64),
+            BinaryOp::Divide => left.checked_div(right).map(ScalarValue::Int64),
+            BinaryOp::Modulo => left.checked_rem(right).map(ScalarValue::Int64),
             BinaryOp::Eq => Some(ScalarValue::Boolean(left == right)),
             BinaryOp::NotEq => Some(ScalarValue::Boolean(left != right)),
             BinaryOp::Lt => Some(ScalarValue::Boolean(left < right)),
@@ -232,12 +291,14 @@ impl ConstantFolding {
                     Some(ScalarValue::Float64(OrderedFloat(left / right)))
                 }
             }
-            BinaryOp::Eq => Some(ScalarValue::Boolean(left == right)),
-            BinaryOp::NotEq => Some(ScalarValue::Boolean(left != right)),
-            BinaryOp::Lt => Some(ScalarValue::Boolean(left < right)),
-            BinaryOp::LtEq => Some(ScalarValue::Boolean(left <= right)),
-            BinaryOp::Gt => Some(ScalarValue::Boolean(left > right)),
-            BinaryOp::GtEq => Some(ScalarValue::Boolean(left >= right)),
+            BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq => Some(ScalarValue::Boolean(
+                crate::planner::numeric::sql_float_compare(left, op, right),
+            )),
             _ => None,
         }
     }
@@ -269,6 +330,69 @@ impl ConstantFolding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constant_casts_use_execution_types_and_preserve_failures() {
+        use crate::planner::CastMode;
+        use arrow::datatypes::DataType;
+        let cast = |value, data_type, mode| Expr::Cast {
+            expr: Box::new(Expr::Literal(value)),
+            data_type,
+            mode,
+        };
+        let rule = ConstantFolding;
+        assert_eq!(
+            rule.fold_expr(&cast(
+                ScalarValue::Utf8("1995-10-01".into()),
+                DataType::Date32,
+                CastMode::Strict
+            )),
+            Expr::Literal(ScalarValue::Date32(9404))
+        );
+        assert_eq!(
+            rule.fold_expr(&cast(
+                ScalarValue::Utf8("18446744073709551615".into()),
+                DataType::UInt64,
+                CastMode::Strict
+            )),
+            Expr::Literal(ScalarValue::UInt64(u64::MAX))
+        );
+        for expr in [
+            cast(
+                ScalarValue::Utf8("bad".into()),
+                DataType::Int64,
+                CastMode::Strict,
+            ),
+            cast(
+                ScalarValue::Utf8("bad".into()),
+                DataType::Int64,
+                CastMode::Try,
+            ),
+            cast(ScalarValue::Null, DataType::Date32, CastMode::Strict),
+            cast(
+                ScalarValue::Int64(1),
+                DataType::Decimal128(12, 2),
+                CastMode::Strict,
+            ),
+        ] {
+            assert_eq!(rule.fold_expr(&expr), expr);
+        }
+    }
+
+    #[test]
+    fn constant_integer_overflow_is_deferred_without_panicking() {
+        let rule = ConstantFolding;
+        for (a, op, b) in [
+            (i64::MAX, BinaryOp::Add, 1),
+            (i64::MIN, BinaryOp::Subtract, 1),
+            (i64::MAX, BinaryOp::Multiply, 2),
+            (i64::MIN, BinaryOp::Divide, -1),
+            (i64::MIN, BinaryOp::Modulo, -1),
+            (1, BinaryOp::Divide, 0),
+        ] {
+            assert_eq!(rule.eval_int64(a, op, b), None);
+        }
+    }
 
     #[test]
     fn test_fold_arithmetic() {

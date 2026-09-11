@@ -3,6 +3,7 @@
 //! Implements rule-based and cost-based optimization
 
 mod cost;
+mod properties;
 pub(crate) mod rules;
 
 pub use cost::*;
@@ -165,32 +166,23 @@ impl Optimizer {
         let mut current = plan;
 
         for iter in 0..max_iterations {
-            let mut changed = false;
-
+            // Rules can introduce and remove an intermediate representation
+            // within one round. Convergence concerns the complete pipeline.
+            let round_start = current.clone();
             for rule in &loop_rules {
-                // A failing rule must say WHICH rule failed: "Column not
-                // found: x" alone points at the user's SQL, when the defect is
-                // in whatever transformation manufactured the reference.
                 let new_plan = rule.optimize(&current).map_err(|e| {
                     crate::error::QueryError::Internal(format!(
                         "optimizer rule `{}` failed: {e}",
                         rule.name()
                     ))
                 })?;
-
-                // Simple check if plan changed (by string representation)
-                // A proper implementation would use plan hashing
-                if format!("{:?}", new_plan) != format!("{:?}", current) {
-                    changed = true;
-                    if diag {
-                        eprintln!("[OPT iter={} rule={}] Plan changed", iter, rule.name());
-                        Self::print_plan_summary(&new_plan, 0);
-                    }
-                    current = new_plan;
+                if diag && new_plan != current {
+                    eprintln!("[OPT iter={} rule={}] Plan changed", iter, rule.name());
+                    Self::print_plan_summary(&new_plan, 0);
                 }
+                current = new_plan;
             }
-
-            if !changed {
+            if current == round_start {
                 break;
             }
         }
@@ -202,7 +194,7 @@ impl Optimizer {
                     rule.name()
                 ))
             })?;
-            if diag && format!("{:?}", new_plan) != format!("{:?}", current) {
+            if diag && new_plan != current {
                 eprintln!("[OPT final rule={}] Plan changed", rule.name());
                 Self::print_plan_summary(&new_plan, 0);
             }
@@ -316,5 +308,86 @@ mod tests {
 
         // Plan should still be valid after optimization
         assert!(!optimized.schema().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod round_convergence_contract_tests {
+    use super::*;
+    use crate::planner::{EmptyRelationNode, PlanSchema};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct SetEmptyFlag {
+        name: &'static str,
+        flag: bool,
+        calls: Arc<AtomicUsize>,
+    }
+    impl OptimizerRule for SetEmptyFlag {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn optimize(&self, plan: &LogicalPlan) -> Result<LogicalPlan> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let LogicalPlan::EmptyRelation(node) = plan else {
+                panic!("fixture plan")
+            };
+            Ok(LogicalPlan::EmptyRelation(EmptyRelationNode {
+                produce_one_row: self.flag,
+                schema: node.schema.clone(),
+            }))
+        }
+    }
+    fn input() -> LogicalPlan {
+        LogicalPlan::EmptyRelation(EmptyRelationNode {
+            produce_one_row: true,
+            schema: PlanSchema::empty(),
+        })
+    }
+    #[test]
+    fn inverse_rules_stop_after_a_complete_unchanged_round_and_final_rule_runs_once() {
+        let calls: Vec<_> = (0..3).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+        let rules: Vec<Arc<dyn OptimizerRule>> = vec![
+            Arc::new(SetEmptyFlag {
+                name: "Intermediate",
+                flag: false,
+                calls: calls[0].clone(),
+            }),
+            Arc::new(SetEmptyFlag {
+                name: "Restore",
+                flag: true,
+                calls: calls[1].clone(),
+            }),
+            Arc::new(SetEmptyFlag {
+                name: "PackedJoinKeys",
+                flag: true,
+                calls: calls[2].clone(),
+            }),
+        ];
+        assert_eq!(
+            Optimizer::optimize_with_rules(input(), &rules, 10, false).unwrap(),
+            input()
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .map(|c| c.load(Ordering::Relaxed))
+                .collect::<Vec<_>>(),
+            vec![1, 1, 1]
+        );
+    }
+    #[test]
+    fn a_real_round_change_requires_another_round() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rules: Vec<Arc<dyn OptimizerRule>> = vec![Arc::new(SetEmptyFlag {
+            name: "Set",
+            flag: false,
+            calls: calls.clone(),
+        })];
+        let result = Optimizer::optimize_with_rules(input(), &rules, 10, false).unwrap();
+        let LogicalPlan::EmptyRelation(node) = result else {
+            panic!("fixture plan")
+        };
+        assert!(!node.produce_one_row);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 }

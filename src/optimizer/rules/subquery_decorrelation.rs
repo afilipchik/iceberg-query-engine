@@ -6,8 +6,10 @@
 //! - EXISTS subquery → Semi Join
 //! - NOT EXISTS subquery → Anti Join
 //! - IN subquery → Semi Join
-//! - NOT IN subquery → Anti Join
+//! - NOT IN stays a subquery until a NULL-aware anti join is available
 //! - Scalar subquery → Left Join with aggregation
+
+mod empty_result;
 
 use crate::error::Result;
 use crate::optimizer::OptimizerRule;
@@ -379,17 +381,35 @@ fn decorrelate_in_subquery(
     subquery: &LogicalPlan,
     negated: bool,
 ) -> Result<Option<LogicalPlan>> {
+    // An ordinary anti join cannot implement NOT IN: RHS NULLs poison
+    // unmatched rows, while NULL IN an empty RHS is false. Schema nullability
+    // alone is insufficient unless proven through every intervening operator.
+    if negated || crate::physical::operators::is_correlated_subquery_plan(subquery) {
+        return Ok(None);
+    }
+
     // Get the output column from the subquery
     let subquery_schema = subquery.schema();
-    if subquery_schema.fields().is_empty() {
+    if subquery_schema.fields().len() != 1 {
         return Ok(None);
     }
 
     let subquery_col = &subquery_schema.fields()[0];
+    // Membership coercion must not disappear at the rewrite boundary. Until
+    // join-key casts are inserted here, retain the typed evaluator for mixed
+    // domains (including dictionary/plain pairs).
+    if in_expr.data_type(&outer.schema())? != subquery_col.data_type {
+        return Ok(None);
+    }
 
     // Extract correlation predicates
     let (mut correlation_predicates, decorrelated_subquery) =
         extract_correlation_predicates(subquery, outer)?;
+    // Correlation removal below LIMIT/aggregate changes the RHS set per outer
+    // row. Use substitution until those shapes have proven rewrite rules.
+    if !correlation_predicates.is_empty() {
+        return Ok(None);
+    }
 
     // Add the IN condition as a correlation predicate
     // The IN expr should match the first column of the subquery
@@ -472,6 +492,12 @@ fn decorrelate_scalar_subquery(
         return Ok(None);
     }
 
+    // Reconstruct the scalar value for an empty correlated input before
+    // introducing grouping. Unsupported shapes retain scalar execution.
+    let Some(empty_value) = empty_result::scalar(&decorrelated_subquery) else {
+        return Ok(None);
+    };
+
     // The scalar value column - this is what the subquery computes
     let scalar_col_name = subquery_schema.fields()[0].name.clone();
 
@@ -499,22 +525,22 @@ fn decorrelate_scalar_subquery(
 
     // Find the scalar result column - the original scalar column from the subquery
     // After ensure_grouped_by_correlation, correlation columns are prepended
-    let scalar_field_idx = join_right_schema
+    let mut scalar_fields = join_right_schema
         .fields()
         .iter()
-        .position(|f| {
-            f.name == scalar_col_name
-                || f.name.contains("AVG")
-                || f.name.contains("SUM")
-                || f.name.contains("COUNT")
-                || f.name.contains("MAX")
-                || f.name.contains("MIN")
-        })
-        .unwrap_or(join_right_schema.fields().len() - 1);
-    let scalar_field = &join_right_schema.fields()[scalar_field_idx];
-
-    // Create a sanitized name for the result column
-    let result_col_name = "__scalar_result".to_string();
+        .enumerate()
+        .filter(|(_, field)| field.name == scalar_col_name);
+    let Some((scalar_field_idx, _)) = scalar_fields.next() else {
+        return Ok(None);
+    };
+    if scalar_fields.next().is_some() {
+        return Ok(None);
+    }
+    let outer_schema = outer.schema();
+    let result_col_name =
+        empty_result::fresh("__scalar_result", &[&outer_schema, &join_right_schema]);
+    let presence_name =
+        empty_result::fresh("__scalar_present", &[&outer_schema, &join_right_schema]);
 
     // Wrap join_right with a projection that renames the scalar column to a safe name
     let mut wrapper_exprs = Vec::new();
@@ -538,6 +564,15 @@ fn decorrelate_scalar_subquery(
         }
     }
 
+    wrapper_exprs.push(Expr::Alias {
+        expr: Box::new(Expr::Literal(crate::planner::ScalarValue::Boolean(true))),
+        name: presence_name.clone(),
+    });
+    wrapper_fields.push(crate::planner::SchemaField::new(
+        &presence_name,
+        arrow::datatypes::DataType::Boolean,
+    ));
+
     let wrapped_right = LogicalPlan::Project(ProjectNode {
         input: Arc::new(join_right),
         exprs: wrapper_exprs,
@@ -560,7 +595,17 @@ fn decorrelate_scalar_subquery(
     });
 
     // Create the new comparison predicate using the join result column
-    let scalar_col_expr = Expr::column(&result_col_name);
+    let scalar_col_expr = Expr::Case {
+        operand: None,
+        when_then: vec![(
+            Expr::UnaryExpr {
+                op: crate::planner::UnaryOp::IsNull,
+                expr: Box::new(Expr::column(&presence_name)),
+            },
+            empty_value,
+        )],
+        else_expr: Some(Box::new(Expr::column(&result_col_name))),
+    };
 
     let new_predicate = if subquery_on_left {
         Expr::BinaryExpr {
@@ -876,28 +921,17 @@ fn add_semi_join_reduction(
     }
 
     if let (Some(source_plan), true) = (source, !semi_on.is_empty()) {
-        // Use Inner Join instead of Semi Join because the physical planner's
-        // should_swap logic correctly builds from the smaller (right) side.
-        // The aggregate above ignores the extra columns from the source table.
-        let agg_input_schema = agg.input.schema();
-        let source_schema = source_plan.schema();
-        // Reduction source LEFT: the physical planner builds the hash table
-        // from the left side, and the filtered dimension source is orders of
-        // magnitude smaller than the aggregate's input (Q20 built an 8.5M-row
-        // lineitem table to probe 1.1M partsupp rows when oriented the other
-        // way — the old orientation relied on the now-disabled should_swap).
-        let mut join_fields = source_schema.fields().to_vec();
-        join_fields.extend(agg_input_schema.fields().iter().cloned());
-        let join_schema = PlanSchema::new(join_fields);
-
-        let swapped_on: Vec<(Expr, Expr)> = semi_on.into_iter().map(|(i, o)| (o, i)).collect();
+        // This is a membership reduction, not a multiplicity-producing join.
+        // Filtered sources may contain duplicate correlation keys. Only the
+        // aggregate input's rows and schema may survive this boundary.
+        // Physical build orientation is independent of these SQL semantics.
         let inner_join = LogicalPlan::Join(JoinNode {
-            left: Arc::new(source_plan),
-            right: agg.input.clone(),
-            join_type: JoinType::Inner,
-            on: swapped_on,
+            left: agg.input.clone(),
+            right: Arc::new(source_plan),
+            join_type: JoinType::Semi,
+            on: semi_on,
             filter: None,
-            schema: join_schema,
+            schema: agg.input.schema(),
         });
 
         return LogicalPlan::Aggregate(AggregateNode {

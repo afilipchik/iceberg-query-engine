@@ -1,10 +1,13 @@
 //! Spill-path integration tests.
 //!
 //! These are the first tests that actually exercise the spill machinery:
-//! each test runs a query twice — once with an effectively unlimited memory
+//! Most historical tests run a query twice — once with an effectively unlimited memory
 //! budget and once with a budget tiny enough that the spillable operator
 //! MUST take its disk path — and asserts both that spilling really happened
 //! (via QueryMetrics::spill_metrics) and that the results are identical.
+//!
+//! The retained aggregate pair instead checks an independent typed oracle with
+//! actual spill bytes, and typed refusal when the result cannot fit its budget.
 //!
 //! Uses data/tpch-10mb (SF=0.01) rather than tpch-1mb: at SF=0.001 the whole
 //! input fits in a single Arrow batch, and the partition-eviction logic in the
@@ -170,20 +173,201 @@ async fn join_spill_matches_in_memory() {
     .await;
 }
 
-/// High-cardinality aggregation over a join input → SpillableHashAggregateExec
-/// (bare scan-aggregates route to the morsel path instead, so a join input is
-/// required to exercise the spillable operator).
+// Independent oracle for the fixture-backed retained aggregate contract. Read
+// every actual join key/date, preserving duplicate orders and nullable values.
+type JoinedGroups = std::collections::BTreeMap<(i64, Option<i32>), (Option<f64>, f64, usize, i64)>;
+const RETAINED_AGG_SQL: &str = "SELECT l_orderkey, o_orderdate, SUM(l_quantity) AS qty, COUNT(*) AS cnt FROM lineitem, orders WHERE l_orderkey = o_orderkey GROUP BY l_orderkey, o_orderdate";
+fn joined_groups_oracle() -> JoinedGroups {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let read = |table: &str| {
+        ParquetRecordBatchReaderBuilder::try_new(
+            std::fs::File::open(format!(
+                "{}/data/tpch-10mb/{table}.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+    };
+    let mut orders: std::collections::BTreeMap<i64, Vec<Option<i32>>> = Default::default();
+    for batch in read("orders") {
+        let batch = batch.unwrap();
+        let keys = batch
+            .column_by_name("o_orderkey")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let dates = batch
+            .column_by_name("o_orderdate")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            if !keys.is_null(row) {
+                orders
+                    .entry(keys.value(row))
+                    .or_default()
+                    .push((!dates.is_null(row)).then(|| dates.value(row)));
+            }
+        }
+    }
+    let mut expected = JoinedGroups::new();
+    for batch in read("lineitem") {
+        let batch = batch.unwrap();
+        let keys = batch
+            .column_by_name("l_orderkey")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let quantities = batch
+            .column_by_name("l_quantity")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            if keys.is_null(row) {
+                continue;
+            }
+            let quantity = (!quantities.is_null(row)).then(|| {
+                let value = quantities.value(row);
+                assert!(
+                    value.is_finite(),
+                    "fixture oracle requires finite quantities"
+                );
+                value
+            });
+            for date in orders.get(&keys.value(row)).into_iter().flatten() {
+                let (sum, abs_sum, additions, count) = expected
+                    .entry((keys.value(row), *date))
+                    .or_insert((None, 0.0, 0, 0));
+                *count += 1;
+                if let Some(q) = quantity {
+                    let total = sum.unwrap_or(0.0) + q;
+                    *abs_sum += q.abs();
+                    assert!(total.is_finite() && abs_sum.is_finite());
+                    *sum = Some(total);
+                    *additions += 1;
+                }
+            }
+        }
+    }
+    expected
+}
+
 #[tokio::test]
-async fn agg_spill_matches_in_memory() {
-    assert_spill_matches(
-        "SELECT l_orderkey, o_orderdate, SUM(l_quantity) AS qty, COUNT(*) AS cnt \
-         FROM lineitem, orders WHERE l_orderkey = o_orderkey \
-         GROUP BY l_orderkey, o_orderdate",
-        256 * 1024,
-        "agg_spill",
-        false,
-    )
-    .await;
+async fn retained_aggregate_over_budget_is_typed_refusal() {
+    let expected = joined_groups_oracle();
+    // Key/date/COUNT buffers alone, excluding SUM and all overhead. This is
+    // specific to the current retained, separately encoded Arrow result API.
+    assert!(expected.len() * (8 + 4 + 8) > 256 * 1024);
+    let ctx = spilling_ctx(256 * 1024, "retained_agg_refusal");
+    let baseline = ctx.memory_pool().used();
+    let error = ctx.sql(RETAINED_AGG_SQL).await.unwrap_err();
+    assert!(
+        error.is_memory_limit(),
+        "must refuse by typed admission, not unrelated failure: {error}"
+    );
+    assert_eq!(ctx.memory_pool().used(), baseline);
+}
+
+#[tokio::test]
+async fn retained_aggregate_actual_spill_matches_independent_typed_oracle() {
+    let expected = joined_groups_oracle();
+    let spill_dir = tempfile::tempdir().unwrap();
+    let budget = 16 * 1024 * 1024;
+    let mut config = ExecutionConfig::new()
+        .with_memory_limit(budget)
+        .with_spill_path(spill_dir.path().to_path_buf());
+    // Deliberately separate spilling policy from the budget needed to retain
+    // the complete result; do not claim the old 256KiB query now completes.
+    config.spill_threshold = 0.02;
+    let mut ctx = ExecutionContext::with_config(config);
+    register_tables(&mut ctx);
+    let baseline = ctx.memory_pool().used();
+    let result = ctx.sql(RETAINED_AGG_SQL).await.unwrap();
+    let spilled = result.metrics.spill_metrics.as_ref().unwrap().bytes_spilled;
+    assert!(
+        spilled > 0,
+        "require actual disk bytes, not presence of metrics"
+    );
+    assert!(result.metrics.reserved_peak_memory_bytes <= budget);
+    let mut actual = std::collections::BTreeMap::new();
+    for batch in &result.batches {
+        assert_eq!(batch.num_columns(), 4);
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let dates = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+        let sums = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let counts = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            assert!(!keys.is_null(row) && !counts.is_null(row));
+            let key = (
+                keys.value(row),
+                (!dates.is_null(row)).then(|| dates.value(row)),
+            );
+            let value = (
+                (!sums.is_null(row)).then(|| sums.value(row)),
+                counts.value(row),
+            );
+            assert!(
+                actual.insert(key, value).is_none(),
+                "duplicate emitted group"
+            );
+        }
+    }
+    assert_eq!(
+        actual.keys().collect::<Vec<_>>(),
+        expected.keys().collect::<Vec<_>>()
+    );
+    for (key, (expected_sum, abs_sum, additions, expected_count)) in expected {
+        let (actual_sum, count) = actual[&key];
+        assert_eq!(count, expected_count, "COUNT for {key:?}");
+        match (actual_sum, expected_sum) {
+            (None, None) => (),
+            (Some(actual), Some(expected)) => {
+                // Both arbitrary spill-tree summation and this independent
+                // sequential sum obey the finite floating-point forward-error
+                // bound gamma_n * sum(abs(x)). Use epsilon (twice unit roundoff)
+                // and correct the independently accumulated absolute sum.
+                let neps = additions as f64 * f64::EPSILON;
+                assert!(neps < 0.5);
+                let gamma = neps / (1.0 - neps);
+                let bound = 2.0 * gamma * abs_sum / (1.0 - gamma);
+                assert!(
+                    actual.is_finite() && (actual - expected).abs() <= bound,
+                    "SUM for {key:?}: actual={actual}, expected={expected}, bound={bound}"
+                );
+            }
+            values => panic!("SUM NULL mismatch for {key:?}: {values:?}"),
+        }
+    }
+    assert_eq!(result.row_count, actual.len());
+    let retained = ctx.memory_pool().used() - baseline;
+    assert!(retained > 0, "returned Arrow output remains admitted");
+    eprintln!("retained aggregate: groups={}, spilled_bytes={}, reserved_peak={}, retained_bytes={retained}", actual.len(), spilled, result.metrics.reserved_peak_memory_bytes);
+    drop(result);
+    assert_eq!(ctx.memory_pool().used(), baseline);
 }
 
 /// Full sort with input exceeding the budget → ExternalSortExec merge-sort path.
@@ -367,18 +551,19 @@ async fn anti_join_not_exists_spill_matches_in_memory() {
     .await;
 }
 
-/// spill-join-correctness-3 task 004: `NOT IN` over a subquery (Q16's own
-/// shape) through the spill path.
+/// NOT IN retains its NULL-aware evaluator rather than an ordinary anti join.
+/// Compare both budgets without demanding a join spill from this fallback;
+/// the preceding NOT EXISTS test independently asserts actual anti-join spill.
 #[tokio::test]
-async fn anti_join_not_in_spill_matches_in_memory() {
-    assert_spill_matches(
-        "SELECT COUNT(*) AS cnt, MIN(o_orderkey) AS mn, MAX(o_orderkey) AS mx FROM orders \
-         WHERE o_orderkey NOT IN (SELECT l_orderkey FROM lineitem WHERE l_shipmode = 'AIR')",
-        8 * 1024,
-        "anti_not_in_spill",
-        true,
-    )
-    .await;
+async fn not_in_membership_matches_across_budgets() {
+    let sql = "SELECT COUNT(*) AS cnt, MIN(o_orderkey) AS mn, MAX(o_orderkey) AS mx FROM orders \
+         WHERE o_orderkey NOT IN (SELECT l_orderkey FROM lineitem WHERE l_shipmode = 'AIR')";
+    let baseline = unlimited_ctx().sql(sql).await.unwrap();
+    let limited = spilling_ctx(8 * 1024, "not_in_membership_budget")
+        .sql(sql)
+        .await
+        .unwrap();
+    assert_eq!(result_rows(&baseline), result_rows(&limited));
 }
 
 /// spill-boundaries task 002: a SEMI join (EXISTS) and an ANTI join

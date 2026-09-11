@@ -3,6 +3,8 @@
 //! Converts logical plans to physical plans and executes them
 
 pub mod compiled_expr;
+pub(crate) mod dense_domain;
+pub(crate) mod fixed_width_output;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod morsel;
@@ -10,6 +12,7 @@ pub mod morsel_agg;
 pub mod operators;
 mod plan;
 mod planner;
+pub mod queue_layout;
 pub mod vector;
 pub mod vectorized_agg;
 

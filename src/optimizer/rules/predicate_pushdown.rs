@@ -157,11 +157,20 @@ impl PredicatePushdown {
                     .partition(|p| self.can_push_to_scan(p, &scan_cols));
 
                 let scan_filter = if !pushable.is_empty() {
-                    let combined = self.combine_predicates(pushable);
-                    match &node.filter {
-                        Some(existing) => Some(existing.clone().and(combined)),
-                        None => Some(combined),
+                    let mut conjuncts = Vec::new();
+                    if let Some(existing) = &node.filter {
+                        self.split_conjunction_into(existing, &mut conjuncts);
                     }
+                    for predicate in pushable {
+                        self.split_conjunction_into(&predicate, &mut conjuncts);
+                    }
+                    let mut unique = Vec::with_capacity(conjuncts.len());
+                    for predicate in conjuncts {
+                        if !safe_idempotent_atom(&predicate) || !unique.contains(&predicate) {
+                            unique.push(predicate);
+                        }
+                    }
+                    Some(self.combine_predicates(unique))
                 } else {
                     node.filter.clone()
                 };
@@ -334,9 +343,16 @@ impl PredicatePushdown {
                         }
                     }
                     JoinType::Left => {
-                        // Can only push to left side
+                        // WHERE predicates can move only to the preserved side.
+                        // Right-only ON predicates instead filter candidate matches.
+                        let (on_right, on_remaining) = self.outer_on_predicates(
+                            node.filter.as_ref(),
+                            &right_cols,
+                            &left_cols,
+                            &node.schema,
+                        );
                         let left = self.pushdown(&node.left, left_predicates)?;
-                        let right = self.pushdown(&node.right, vec![])?;
+                        let right = self.pushdown(&node.right, on_right)?;
                         remaining.extend(right_predicates);
 
                         let join = LogicalPlan::Join(crate::planner::JoinNode {
@@ -344,7 +360,7 @@ impl PredicatePushdown {
                             right: Arc::new(right),
                             join_type: node.join_type,
                             on: node.on.clone(),
-                            filter: node.filter.clone(),
+                            filter: on_remaining,
                             schema: node.schema.clone(),
                         });
 
@@ -359,8 +375,13 @@ impl PredicatePushdown {
                         }
                     }
                     JoinType::Right => {
-                        // Can only push to right side
-                        let left = self.pushdown(&node.left, vec![])?;
+                        let (on_left, on_remaining) = self.outer_on_predicates(
+                            node.filter.as_ref(),
+                            &left_cols,
+                            &right_cols,
+                            &node.schema,
+                        );
+                        let left = self.pushdown(&node.left, on_left)?;
                         let right = self.pushdown(&node.right, right_predicates)?;
                         remaining.extend(left_predicates);
 
@@ -369,7 +390,7 @@ impl PredicatePushdown {
                             right: Arc::new(right),
                             join_type: node.join_type,
                             on: node.on.clone(),
-                            filter: node.filter.clone(),
+                            filter: on_remaining,
                             schema: node.schema.clone(),
                         });
 
@@ -490,7 +511,20 @@ impl PredicatePushdown {
                 // result, so pushing one consumer's predicate inside would
                 // specialize (and corrupt) the shared plan — materialize-once
                 // collects the FIRST alias's input for every reference.
-                if node.cte_name.is_some() {
+                // An alias that changes bound identities is also a namespace
+                // boundary. Pushing an unchanged predicate beneath it leaves
+                // references to the outer alias in the child's namespace.
+                // Until expressions are explicitly rebound, retain those
+                // predicates above it. Ordinary already-aliased scans still
+                // allow pushdown because their column identities are equal.
+                let input_schema = node.input.schema();
+                let same_namespace = node.schema.fields().len() == input_schema.fields().len()
+                    && node.schema.fields().iter().zip(input_schema.fields()).all(
+                        |(alias, input)| {
+                            alias.name == input.name && alias.relation == input.relation
+                        },
+                    );
+                if node.cte_name.is_some() || !same_namespace {
                     let input = self.pushdown(&node.input, vec![])?;
                     let alias = LogicalPlan::SubqueryAlias(crate::planner::SubqueryAliasNode {
                         input: Arc::new(input),
@@ -1005,6 +1039,34 @@ impl PredicatePushdown {
         cols.iter().all(|c| self.column_in_schema(c, target))
     }
 
+    fn outer_on_predicates(
+        &self,
+        filter: Option<&Expr>,
+        target: &[(Option<String>, String)],
+        preserved: &[(Option<String>, String)],
+        schema: &crate::planner::PlanSchema,
+    ) -> (Vec<Expr>, Option<Expr>) {
+        let mut predicates = Vec::new();
+        if let Some(filter) = filter {
+            self.split_conjunction(filter, &mut predicates);
+        }
+        let (mut pushed, mut remaining) = (Vec::new(), Vec::new());
+        for predicate in predicates {
+            let columns = self.extract_columns(&predicate);
+            if !columns.is_empty()
+                && self.columns_subset(&columns, target)
+                && !self.columns_overlap(&columns, preserved)
+                && total_outer_on_atom(&predicate, schema)
+            {
+                pushed.push(predicate);
+            } else {
+                remaining.push(predicate);
+            }
+        }
+        let remaining = (!remaining.is_empty()).then(|| self.combine_predicates(remaining));
+        (pushed, remaining)
+    }
+
     fn columns_overlap(&self, cols: &HashSet<Column>, target: &[(Option<String>, String)]) -> bool {
         cols.iter().any(|c| self.column_in_schema(c, target))
     }
@@ -1110,5 +1172,152 @@ mod tests {
         }
 
         assert!(find_scan_filter(&optimized).is_some());
+    }
+}
+
+/// Narrow whitelist: no functions, casts, arithmetic, subqueries or volatile
+/// expressions. SQL three-valued logic preserves p AND p = p for these atoms.
+fn safe_idempotent_atom(expr: &Expr) -> bool {
+    let value = |expr: &Expr| matches!(expr, Expr::Column(_) | Expr::Literal(_));
+    match expr {
+        Expr::InList { expr, list, .. } => {
+            matches!(expr.as_ref(), Expr::Column(_))
+                && list.iter().all(|v| matches!(v, Expr::Literal(_)))
+        }
+        Expr::BinaryExpr { left, op, right } => {
+            matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq
+            ) && value(left)
+                && value(right)
+        }
+        Expr::UnaryExpr {
+            op: crate::planner::UnaryOp::IsNull | crate::planner::UnaryOp::IsNotNull,
+            expr,
+        } => matches!(expr.as_ref(), Expr::Column(_)),
+        _ => false,
+    }
+}
+
+/// Moving ON evaluation can change its count and expose unmatched input rows.
+/// Admit only total typed atoms; retain functions, arithmetic, casts, subqueries,
+/// ambiguous coercions and potentially invalid LIKE escapes at the join.
+fn total_outer_on_atom(expr: &Expr, schema: &crate::planner::PlanSchema) -> bool {
+    use crate::planner::{ScalarValue, UnaryOp};
+    use arrow::datatypes::DataType;
+    match expr {
+        Expr::UnaryExpr {
+            op: UnaryOp::IsNull | UnaryOp::IsNotNull,
+            expr,
+        } => matches!(expr.as_ref(), Expr::Column(_)),
+        Expr::BinaryExpr { left, op, right } => {
+            if !matches!(left.as_ref(), Expr::Column(_) | Expr::Literal(_))
+                || !matches!(right.as_ref(), Expr::Column(_) | Expr::Literal(_))
+            {
+                return false;
+            }
+            let (Ok(a), Ok(b)) = (left.data_type(schema), right.data_type(schema)) else {
+                return false;
+            };
+            if a != b {
+                return false;
+            }
+            match op {
+                BinaryOp::Like | BinaryOp::NotLike => {
+                    a == DataType::Utf8
+                        && matches!(right.as_ref(), Expr::Literal(ScalarValue::Utf8(pattern)) if !pattern.contains('\\'))
+                }
+                BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq => matches!(
+                    a,
+                    DataType::Boolean
+                        | DataType::Int8
+                        | DataType::Int16
+                        | DataType::Int32
+                        | DataType::Int64
+                        | DataType::UInt8
+                        | DataType::UInt16
+                        | DataType::UInt32
+                        | DataType::UInt64
+                        | DataType::Float32
+                        | DataType::Float64
+                        | DataType::Utf8
+                        | DataType::Date32
+                        | DataType::Date64
+                        | DataType::Decimal128(_, _)
+                        | DataType::Timestamp(_, _)
+                ),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod idempotent_destination_contract_tests {
+    use super::*;
+    use crate::planner::{
+        LogicalPlanBuilder, PlanSchema, ScalarFunction, ScalarValue, SchemaField,
+    };
+    use arrow::datatypes::DataType;
+
+    fn pushed(predicate: Expr) -> Expr {
+        let schema = PlanSchema::new(vec![SchemaField::new("x", DataType::Int64)]);
+        let input = LogicalPlanBuilder::scan("t", schema)
+            .filter(predicate)
+            .build();
+        let output = PredicatePushdown.optimize(&input).unwrap();
+        let LogicalPlan::Scan(scan) = output else {
+            panic!("expected scan")
+        };
+        scan.filter.unwrap()
+    }
+    fn parts(expr: &Expr) -> Vec<Expr> {
+        let mut out = vec![];
+        PredicatePushdown.split_conjunction_into(expr, &mut out);
+        out
+    }
+    #[test]
+    fn volatile_occurrences_are_not_merged() {
+        let random = Expr::ScalarFunc {
+            func: ScalarFunction::Random,
+            args: vec![],
+        };
+        let predicate = random.gt(Expr::literal(ScalarValue::Float64(0.5.into())));
+        let output = pushed(predicate.clone().and(predicate));
+        assert_eq!(parts(&output).len(), 2);
+    }
+    #[test]
+    fn equal_display_different_literal_types_are_not_merged() {
+        let integer = Expr::column("x").eq(Expr::literal(ScalarValue::Int64(1)));
+        let float = Expr::column("x").eq(Expr::literal(ScalarValue::Float64(1.0.into())));
+        let output = pushed(
+            integer
+                .clone()
+                .and(float.clone())
+                .and(integer.clone())
+                .and(float.clone()),
+        );
+        assert_eq!(parts(&output), vec![integer, float]);
+    }
+    #[test]
+    fn nullable_atom_dedup_preserves_first_occurrence_order() {
+        let null = Expr::UnaryExpr {
+            op: crate::planner::UnaryOp::IsNull,
+            expr: Box::new(Expr::column("x")),
+        };
+        let equal = Expr::column("x").eq(Expr::literal(ScalarValue::Int64(1)));
+        let output = pushed(null.clone().and(equal.clone()).and(null.clone()));
+        assert_eq!(parts(&output), vec![null, equal]);
     }
 }

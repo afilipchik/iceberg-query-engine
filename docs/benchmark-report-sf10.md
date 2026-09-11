@@ -1,3 +1,5 @@
+> **Historical report — superseded.** These January 2026 timings and row-count comparisons are not current performance or correctness evidence. See the [2026-09-05 audit](project-audit-2026-09-05.md) and [latest recorded comparison](../.claude/plans/research/2026-09-05-sf10-eightway-benchmark.md), including their cache, dataset and oracle qualifications.
+
 # TPC-H Benchmark Report: Query Engine vs DuckDB
 
 **Date**: 2026-01-28

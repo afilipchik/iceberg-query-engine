@@ -430,12 +430,64 @@ pub fn sidecar_dict_cols(dir: &Path) -> std::collections::HashSet<String> {
     cols
 }
 
+/// Collecting compatibility API. Native streaming uses `open_row_group` directly.
 pub fn read_row_group(
     dir: &Path,
     rg_idx: usize,
     projection: Option<&[usize]>,
     slice: Option<usize>,
 ) -> Result<Vec<RecordBatch>> {
+    let mut out = open_row_group(dir, rg_idx, projection)?.collect::<Result<Vec<_>>>()?;
+    if let Some(n) = slice.map(|v| slice_rows().unwrap_or(v)) {
+        out = reslice_large(out, n, n);
+    }
+    Ok(out)
+}
+
+/// A mapped IPC file with one record batch decoded per pull. Dictionaries and
+/// footer descriptors live with the reader; arrays independently retain the mmap.
+/// This is incremental decoding, not a query-pool admission capability.
+pub struct RowGroupReader {
+    buffer: arrow::buffer::Buffer,
+    decoder: arrow::ipc::reader::FileDecoder,
+    blocks: std::vec::IntoIter<arrow::ipc::Block>,
+    footer_start: usize,
+    path: PathBuf,
+    failed: bool,
+}
+
+impl Iterator for RowGroupReader {
+    type Item = Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        for block in self.blocks.by_ref() {
+            let result = checked_ipc_block(&self.buffer, &block, self.footer_start, &self.path)
+                .and_then(|data| {
+                    self.decoder
+                        .read_record_batch(&block, &data)
+                        .map_err(|e| QueryError::Execution(format!("{}: {e}", self.path.display())))
+                });
+            match result {
+                Ok(Some(batch)) => return Some(Ok(batch)),
+                Ok(None) => continue,
+                Err(error) => {
+                    self.failed = true;
+                    return Some(Err(error));
+                }
+            }
+        }
+        None
+    }
+}
+
+pub fn open_row_group(
+    dir: &Path,
+    rg_idx: usize,
+    projection: Option<&[usize]>,
+) -> Result<RowGroupReader> {
     use arrow::buffer::Buffer;
     use arrow::ipc::reader::{read_footer_length, FileDecoder};
 
@@ -475,10 +527,14 @@ pub fn read_row_group(
             .expect("10-byte trailer"),
     )
     .map_err(|e| QueryError::Execution(format!("{}: {e}", path.display())))?;
-    let footer = arrow::ipc::root_as_footer(
-        &buffer.as_slice()[trailer_start - footer_len..trailer_start],
-    )
-    .map_err(|e| QueryError::Execution(format!("{}: bad IPC footer: {e}", path.display())))?;
+    let footer_start = trailer_start.checked_sub(footer_len).ok_or_else(|| {
+        QueryError::Execution(format!(
+            "{}: IPC footer exceeds file extent",
+            path.display()
+        ))
+    })?;
+    let footer = arrow::ipc::root_as_footer(&buffer.as_slice()[footer_start..trailer_start])
+        .map_err(|e| QueryError::Execution(format!("{}: bad IPC footer: {e}", path.display())))?;
 
     let schema = arrow::ipc::convert::fb_to_schema(
         footer
@@ -491,28 +547,60 @@ pub fn read_row_group(
     }
 
     for block in footer.dictionaries().iter().flat_map(|d| d.iter()) {
-        let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
-        let data = buffer.slice_with_length(block.offset() as usize, block_len);
+        let data = checked_ipc_block(&buffer, block, footer_start, &path)?;
         decoder
             .read_dictionary(&block, &data)
             .map_err(|e| QueryError::Execution(format!("{}: {e}", path.display())))?;
     }
 
-    let mut out = Vec::new();
-    for block in footer.recordBatches().iter().flat_map(|b| b.iter()) {
-        let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
-        let data = buffer.slice_with_length(block.offset() as usize, block_len);
-        if let Some(batch) = decoder
-            .read_record_batch(&block, &data)
-            .map_err(|e| QueryError::Execution(format!("{}: {e}", path.display())))?
-        {
-            out.push(batch);
-        }
+    let blocks = footer
+        .recordBatches()
+        .iter()
+        .flat_map(|b| b.iter())
+        .copied()
+        .collect::<Vec<_>>()
+        .into_iter();
+    Ok(RowGroupReader {
+        buffer,
+        decoder,
+        blocks,
+        footer_start,
+        path,
+        failed: false,
+    })
+}
+
+/// Validate descriptor extents and the framing prefix required by FileDecoder
+/// before creating a zero-copy view. Footer verification alone does not validate
+/// these signed offsets and lengths against the containing file.
+fn checked_ipc_block(
+    buffer: &arrow::buffer::Buffer,
+    block: &arrow::ipc::Block,
+    footer_start: usize,
+    path: &Path,
+) -> Result<arrow::buffer::Buffer> {
+    let invalid =
+        |reason| QueryError::Execution(format!("{}: invalid IPC block: {reason}", path.display()));
+    let offset = usize::try_from(block.offset()).map_err(|_| invalid("invalid offset"))?;
+    let metadata =
+        usize::try_from(block.metaDataLength()).map_err(|_| invalid("invalid metadata length"))?;
+    let body = usize::try_from(block.bodyLength()).map_err(|_| invalid("invalid body length"))?;
+    let length = metadata
+        .checked_add(body)
+        .ok_or_else(|| invalid("length overflow"))?;
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| invalid("extent overflow"))?;
+    if end > footer_start || end > buffer.len() {
+        return Err(invalid("extent overlaps footer or exceeds file"));
     }
-    if let Some(n) = slice.map(|v| slice_rows().unwrap_or(v)) {
-        out = reslice_large(out, n, n);
+    if metadata < 4 {
+        return Err(invalid("missing message prefix"));
     }
-    Ok(out)
+    if buffer.as_slice()[offset..offset + 4] == [255; 4] && metadata < 8 {
+        return Err(invalid("truncated continuation prefix"));
+    }
+    Ok(buffer.slice_with_length(offset, length))
 }
 
 /// Re-slice batches of >= `min` rows into `to`-row zero-copy views. 64k IPC

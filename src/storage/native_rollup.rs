@@ -195,8 +195,12 @@ pub fn canonical_expr_key(e: &Expr) -> String {
                 .collect::<Vec<_>>()
                 .join(",")
         ),
-        Expr::Cast { expr, data_type } => {
-            format!("cast:{data_type:?}({})", canonical_expr_key(expr))
+        Expr::Cast {
+            expr,
+            data_type,
+            mode,
+        } => {
+            format!("{mode}:{data_type:?}({})", canonical_expr_key(expr))
         }
         Expr::Case {
             operand,

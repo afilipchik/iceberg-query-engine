@@ -188,11 +188,31 @@ pub trait TableProvider: Send + Sync + fmt::Debug {
 pub struct MemoryTable {
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
+    statistics: Arc<std::sync::OnceLock<TableStatistics>>,
 }
 
 impl MemoryTable {
+    /// Positive physical-schema check over immutable provider-owned batches.
+    pub(crate) fn has_exact_physical_schema(&self) -> bool {
+        self.batches.iter().all(|batch| {
+            batch.schema().as_ref() == self.schema.as_ref()
+                && batch
+                    .columns()
+                    .iter()
+                    .zip(self.schema.fields())
+                    .all(|(array, field)| {
+                        array.data_type() == field.data_type()
+                            && (field.is_nullable() || array.logical_null_count() == 0)
+                    })
+        })
+    }
+
     pub fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
-        Self { schema, batches }
+        Self {
+            schema,
+            batches,
+            statistics: Arc::new(std::sync::OnceLock::new()),
+        }
     }
 
     pub fn try_new(batches: Vec<RecordBatch>) -> Result<Self> {
@@ -201,7 +221,115 @@ impl MemoryTable {
         } else {
             batches[0].schema()
         };
-        Ok(Self { schema, batches })
+        Ok(Self::new(schema, batches))
+    }
+}
+
+impl MemoryTable {
+    /// Cached costing estimates for immutable batches. These statistics are
+    /// not a semantic proof of uniqueness, expression bounds, or join lineage.
+    fn compute_statistics(&self) -> TableStatistics {
+        let row_count: usize = self.batches.iter().map(RecordBatch::num_rows).sum();
+        let mut column_stats = std::collections::HashMap::new();
+        for (ordinal, field) in self.schema.fields().iter().enumerate() {
+            let name = field.name().to_lowercase();
+            // Name-keyed statistics cannot describe ambiguous duplicate fields.
+            if self
+                .schema
+                .fields()
+                .iter()
+                .filter(|f| f.name().eq_ignore_ascii_case(field.name()))
+                .count()
+                != 1
+            {
+                continue;
+            }
+            let mut null_count = 0u64;
+            let mut lo: Option<i64> = None;
+            let mut hi: Option<i64> = None;
+            let mut supported = true;
+            for batch in &self.batches {
+                let Some(array) = batch.columns().get(ordinal) else {
+                    supported = false;
+                    break;
+                };
+                null_count += array.logical_null_count() as u64;
+                if array.data_type() != field.data_type() {
+                    supported = false;
+                    continue;
+                }
+                match integer_date_range(array.as_ref()) {
+                    Some(Some((min, max))) => {
+                        lo = Some(lo.map_or(min, |v| v.min(min)));
+                        hi = Some(hi.map_or(max, |v| v.max(max)));
+                    }
+                    Some(None) => {}
+                    None => supported = false,
+                }
+            }
+            // Existing consumers use signed subtraction. Do not expose a range
+            // they cannot represent, including full i64/unsigned domains.
+            let range = lo.zip(hi).and_then(|(l, h)| h.checked_sub(l));
+            if !supported || (lo.is_some() && range.is_none()) {
+                lo = None;
+                hi = None;
+            }
+            let ndv_est = if supported {
+                range.map(|width| {
+                    (width as u64 + 1).min((row_count as u64).saturating_sub(null_count))
+                })
+            } else {
+                None
+            };
+            column_stats.insert(
+                name,
+                ColumnStatistics {
+                    min_i64: lo,
+                    max_i64: hi,
+                    null_count: Some(null_count),
+                    ndv_est,
+                    ..Default::default()
+                },
+            );
+        }
+        TableStatistics {
+            row_count,
+            total_byte_size: self
+                .batches
+                .iter()
+                .map(|b| b.get_array_memory_size() as u64)
+                .sum(),
+            column_stats,
+        }
+    }
+}
+
+/// None declines an unsupported/unrepresentable domain; Some(None) is all NULL.
+fn integer_date_range(array: &dyn arrow::array::Array) -> Option<Option<(i64, i64)>> {
+    use arrow::array::*;
+    use arrow::datatypes::DataType;
+    macro_rules! range {
+        ($ty:ty) => {{
+            let array = array.as_any().downcast_ref::<$ty>()?;
+            match (arrow::compute::min(array), arrow::compute::max(array)) {
+                (Some(lo), Some(hi)) => {
+                    Some(Some((i64::try_from(lo).ok()?, i64::try_from(hi).ok()?)))
+                }
+                _ => Some(None),
+            }
+        }};
+    }
+    match array.data_type() {
+        DataType::Int8 => range!(Int8Array),
+        DataType::Int16 => range!(Int16Array),
+        DataType::Int32 => range!(Int32Array),
+        DataType::Int64 => range!(Int64Array),
+        DataType::UInt8 => range!(UInt8Array),
+        DataType::UInt16 => range!(UInt16Array),
+        DataType::UInt32 => range!(UInt32Array),
+        DataType::UInt64 => range!(UInt64Array),
+        DataType::Date32 => range!(Date32Array),
+        _ => None,
     }
 }
 
@@ -251,11 +379,7 @@ impl TableProvider for MemoryTable {
                             if f.data_type() == c.data_type() {
                                 f.clone()
                             } else {
-                                arrow::datatypes::Field::new(
-                                    f.name(),
-                                    c.data_type().clone(),
-                                    f.is_nullable(),
-                                )
+                                f.clone().with_data_type(c.data_type().clone())
                             }
                         })
                         .collect();
@@ -268,17 +392,11 @@ impl TableProvider for MemoryTable {
     }
 
     fn statistics(&self) -> Option<TableStatistics> {
-        let row_count: usize = self.batches.iter().map(|b| b.num_rows()).sum();
-        let total_byte_size: u64 = self
-            .batches
-            .iter()
-            .map(|b| b.get_array_memory_size() as u64)
-            .sum();
-        Some(TableStatistics {
-            row_count,
-            total_byte_size,
-            column_stats: std::collections::HashMap::new(),
-        })
+        Some(
+            self.statistics
+                .get_or_init(|| self.compute_statistics())
+                .clone(),
+        )
     }
 }
 
@@ -287,9 +405,13 @@ impl TableProvider for MemoryTable {
 pub struct MemoryTableExec {
     table_name: String,
     schema: SchemaRef,
-    batches: Vec<RecordBatch>,
+    batches: Arc<Vec<RecordBatch>>,
     projection: Option<Vec<usize>>,
+    queue_copy_bound: std::sync::OnceLock<Option<crate::physical::queue_layout::QueueCopyBound>>,
+    gather_copy_bound: std::sync::OnceLock<Option<crate::physical::queue_layout::GatherCopyBound>>,
 }
+
+mod admitted_memory;
 
 impl MemoryTableExec {
     pub fn new(
@@ -309,8 +431,10 @@ impl MemoryTableExec {
         Self {
             table_name: table_name.into(),
             schema: projected_schema,
-            batches,
+            batches: Arc::new(batches),
             projection,
+            queue_copy_bound: std::sync::OnceLock::new(),
+            gather_copy_bound: std::sync::OnceLock::new(),
         }
     }
 
@@ -335,8 +459,10 @@ impl MemoryTableExec {
         Ok(Self {
             table_name: table_name.into(),
             schema,
-            batches,
+            batches: Arc::new(batches),
             projection: None, // Already projected
+            queue_copy_bound: std::sync::OnceLock::new(),
+            gather_copy_bound: std::sync::OnceLock::new(),
         })
     }
 
@@ -364,14 +490,149 @@ impl MemoryTableExec {
         Ok(Self {
             table_name: table_name.into(),
             schema,
-            batches,
+            batches: Arc::new(batches),
             projection: None, // Already projected
+            queue_copy_bound: std::sync::OnceLock::new(),
+            gather_copy_bound: std::sync::OnceLock::new(),
         })
     }
 }
 
 #[async_trait]
 impl PhysicalOperator for MemoryTableExec {
+    async fn prepare_admitted_queue_input(
+        &self,
+        pool: crate::execution::SharedMemoryPool,
+    ) -> Result<Option<crate::physical::PreparedAdmittedInput>> {
+        admitted_memory::prepare(self, pool)
+    }
+
+    fn resident_queue_copy_bound(&self) -> Option<crate::physical::queue_layout::QueueCopyBound> {
+        self.queue_copy_bound
+            .get_or_init(|| {
+                let mut bound: Option<crate::physical::queue_layout::QueueCopyBound> = None;
+                for batch in self.batches.iter() {
+                    let columns: Vec<_> = match &self.projection {
+                        Some(indices) => indices
+                            .iter()
+                            .map(|i| batch.columns().get(*i).cloned())
+                            .collect::<Option<_>>()?,
+                        None => batch.columns().to_vec(),
+                    };
+                    if columns.len() != self.schema.fields().len() {
+                        return None;
+                    }
+                    let matches = columns
+                        .iter()
+                        .zip(self.schema.fields())
+                        .all(|(a, f)| a.data_type() == f.data_type());
+                    let schema = if matches {
+                        self.schema.clone()
+                    } else {
+                        Arc::new(arrow::datatypes::Schema::new(
+                            self.schema
+                                .fields()
+                                .iter()
+                                .zip(&columns)
+                                .map(|(f, a)| {
+                                    if f.data_type() == a.data_type() {
+                                        f.as_ref().clone()
+                                    } else {
+                                        f.as_ref()
+                                            .clone()
+                                            .with_data_type(a.data_type().clone())
+                                            .with_nullable(true)
+                                    }
+                                })
+                                .collect::<Vec<_>>(),
+                        ))
+                    };
+                    let emitted = RecordBatch::try_new_with_options(
+                        schema.clone(),
+                        columns,
+                        &arrow::record_batch::RecordBatchOptions::new()
+                            .with_row_count(Some(batch.num_rows())),
+                    )
+                    .ok()?;
+                    let current = crate::physical::queue_layout::QueueCopyBound::from_batches(
+                        &schema,
+                        std::slice::from_ref(&emitted),
+                    )?;
+                    match &mut bound {
+                        Some(previous) => previous.merge(current)?,
+                        None => bound = Some(current),
+                    }
+                }
+                bound.or_else(|| {
+                    crate::physical::queue_layout::QueueCopyBound::from_batches(&self.schema, &[])
+                })
+            })
+            .clone()
+    }
+
+    fn resident_gather_copy_bound(&self) -> Option<crate::physical::queue_layout::GatherCopyBound> {
+        self.gather_copy_bound
+            .get_or_init(|| {
+                let mut bound: Option<crate::physical::queue_layout::GatherCopyBound> = None;
+                for batch in self.batches.iter() {
+                    let columns: Vec<_> = match &self.projection {
+                        Some(indices) => indices
+                            .iter()
+                            .map(|i| batch.columns().get(*i).cloned())
+                            .collect::<Option<_>>()?,
+                        None => batch.columns().to_vec(),
+                    };
+                    if columns.len() != self.schema.fields().len() {
+                        return None;
+                    }
+                    let matches = columns
+                        .iter()
+                        .zip(self.schema.fields())
+                        .all(|(a, f)| a.data_type() == f.data_type());
+                    let schema = if matches {
+                        self.schema.clone()
+                    } else {
+                        Arc::new(arrow::datatypes::Schema::new(
+                            self.schema
+                                .fields()
+                                .iter()
+                                .zip(&columns)
+                                .map(|(f, a)| {
+                                    if f.data_type() == a.data_type() {
+                                        f.as_ref().clone()
+                                    } else {
+                                        f.as_ref()
+                                            .clone()
+                                            .with_data_type(a.data_type().clone())
+                                            .with_nullable(true)
+                                    }
+                                })
+                                .collect::<Vec<_>>(),
+                        ))
+                    };
+                    let emitted = RecordBatch::try_new_with_options(
+                        schema.clone(),
+                        columns,
+                        &arrow::record_batch::RecordBatchOptions::new()
+                            .with_row_count(Some(batch.num_rows())),
+                    )
+                    .ok()?;
+                    let current = crate::physical::queue_layout::GatherCopyBound::from_batches(
+                        &schema,
+                        std::slice::from_ref(&emitted),
+                    )?;
+                    match &mut bound {
+                        Some(previous) => previous.merge(current)?,
+                        None => bound = Some(current),
+                    }
+                }
+                bound.or_else(|| {
+                    crate::physical::queue_layout::GatherCopyBound::from_batches(&self.schema, &[])
+                })
+            })
+            .clone()
+    }
+
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -418,7 +679,10 @@ impl PhysicalOperator for MemoryTableExec {
                             if f.data_type() == c.data_type() {
                                 f.as_ref().clone()
                             } else {
-                                arrow::datatypes::Field::new(f.name(), c.data_type().clone(), true)
+                                f.as_ref()
+                                    .clone()
+                                    .with_data_type(c.data_type().clone())
+                                    .with_nullable(true)
                             }
                         })
                         .collect::<Vec<_>>(),
@@ -605,5 +869,38 @@ mod tests {
         let id_only = TableProvider::scan(&table, Some(&[0])).expect("projected scan of id");
         assert_eq!(id_only[0].schema().field(0).data_type(), &DataType::Int64);
         assert!(!id_only[0].schema().field(0).is_nullable());
+    }
+}
+
+#[cfg(test)]
+mod gather_cache_tests {
+    use super::*;
+    #[test]
+    fn ordinary_queue_metadata_does_not_initialize_gather_analysis() {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "text",
+            Arc::new(arrow::array::StringArray::from(vec!["long".repeat(1000)]))
+                as arrow::array::ArrayRef,
+        )])
+        .unwrap();
+        let scan = MemoryTableExec::new("resident", batch.schema(), vec![batch], None);
+        assert!(scan.gather_copy_bound.get().is_none());
+        assert!(scan.resident_queue_copy_bound().is_some());
+        assert!(scan.gather_copy_bound.get().is_none());
+        let first = scan
+            .resident_gather_copy_bound()
+            .unwrap()
+            .gather(19)
+            .unwrap()
+            .max_bytes();
+        assert!(scan.gather_copy_bound.get().unwrap().is_some());
+        assert_eq!(
+            first,
+            scan.resident_gather_copy_bound()
+                .unwrap()
+                .gather(19)
+                .unwrap()
+                .max_bytes()
+        );
     }
 }

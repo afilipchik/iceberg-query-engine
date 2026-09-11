@@ -1,0 +1,56 @@
+# First-batch reader refusal: ownership ledger — 2026-09-11
+
+Contained diagnostic65075 reproduces the existing COUNT(DISTINCT) spill-test refusal
+on source526. The selected query pool has262144bytes. Crucially, the live
+SpillableHashJoin::compute_build_decision frame reports flat_size=0,flat_rows=0,
+flat_batches.len=0,with threshold209715. The refusal occurs while producing the first
+build batch; accumulated join input is not the cause in this reproduction.
+
+The first two denials request66048then33280bytes with236553used. They are the
+existing fixed-output decoder's quantum halving. The final denial requests9512bytes
+for a9000-byte encoded body at offset86424,with254089used. Only8055bytes remain.
+The current batch reader has3columns,15000remaining rows,requested max_rows8192 and
+value_bytes65536. Directly observed reservation fields are:
+
+| Live owner | Reservation bytes |
+|---|---:|
+| Reader schema |37376|
+| Runtime-filter vector |512|
+| Output-position vector |536|
+| Batch column vector |4088|
+| Batch pending vector |608|
+| Provisional handoff vector |560|
+| Provisional handoff metadata |12288|
+
+These fields account for55968bytes; they are a partial ledger, not a complete
+reconciliation of254089used. Page/decoder/dictionary owners and pending output
+buffers still need separation. Unavailable symbols in unrelated generic wrapper
+frames are retained explicitly rather than reported as zeros.
+
+Source next_batch pulls columns sequentially and retains successful chunks in
+pending state. Per-column fixed output halving chooses a locally affordable quantum;
+it does not reserve the next column's encoded/decoded page requirement. The measured
+first-batch boundary therefore requires investigation of coordinated reader working
+space and output sizing. Lowering a join spill threshold or spilling already retained
+join batches cannot repair this case, because there are no retained batches.
+No speculative retry of a terminated selected stream is justified. Existing cursor
+state preserves pending pages/chunks across internal memory refusals; changing that
+contract requires separate tests for exact cursor progress, errors and ownership.
+
+One possible design to evaluate is to prepare each selected column's next page or
+chunk requirements before allocating the batch's output chunks, then budget output
+across the selected columns. This is a hypothesis, not an implemented or validated
+solution. First capture the remaining live page/output allocation composition and
+reproduce the issue with a small multi-column reader test. Keep actual budget limits
+and all existing refusal assertions; do not guess smaller reservation constants.
+
+The probe ran during optimized compilation after checking approximately87GiB host
+availability. Its separate16GiB scope plus the48GiB build scope fit the128GiB host.
+A30second watchdog bounded the owned test process; before/after sequence checks prove
+that the release step was still running, so no benchmark overlapped the probe.
+The inferior's expected test exit101 is preserved; diagnostic exit0 is not a passing
+resource test. Scope peak2,513,014,784bytes,swap0,zero max/OOM events.
+
+[11-file verified archive](benchmarks/2026-09-11-first-batch-refusal-ledger/manifest.json)
+retains all3denial stacks,selected-field ledgers,fixture hashes,source526 and a hash
+of the separately frozen debug test executable. [Previous allocation-site evidence](incremental-header-refusal-results-2026-09-11.md).

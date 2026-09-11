@@ -1,0 +1,62 @@
+# Runtime byte-bounded variable outputs: feasibility and blockers
+
+Source-only design, 2026-09-06. No implementation/jobs. A scanner-only quantum cannot be claimed to fix Q12/Q10. Their reported ratios motivate investigation, not causal proof.
+
+## Contract that is feasible
+
+A producer can promise that every successful emitted batch has `owned_input_batch_charge(batch) <= B`, where B is a fixed, checked, predeclared copied-output quantum. This is an enforced postcondition, not a footer/NDV/average-width estimate. It says nothing about source residency, decoder scratch, expression scratch or downstream retained state. `spillable.rs:257–324` copies every exposed Buffer.len(), including null buffers and recursive dictionary children; `owned_input_batch_charge` at 394 composes actual headers/schema/column charges. Capacity/custom-allocation detection is neither needed nor sound as an ownership test.
+
+A merely post-allocation check is insufficient to prevent a too-wide gather allocation. It can establish the successful-output postcondition, but cannot honestly establish bounded producer allocation or guaranteed completion under process cap. Distinguish those contracts throughout.
+
+The scanner currently retains a Parquet reader (and optionally an IPC row-group batch iterator) in its unfold state (`streaming_parquet_scan.rs:382–449`), emits configured-row-count reader batches, then wraps/normalizes output. Row count does not bound variable payload bytes. IPC may retain an entire mmap row-group collection; retain the existing IPC-sidecar capability decline initially. A runtime quantum needs to intercept every raw emission, including first-reader and subsequent-reader paths, after read dependencies/projection and before any unbounded encoding expansion.
+
+## Scanner mechanics and their limits
+
+For supported ordinary Utf8/Binary plus fixed-width outputs, inspect actual offsets, validity and exposed buffers before allocating compact output:
+
+1. Compute schema/header charges and a nonempty prefix's exact compact copied charge with checked arithmetic. Walk actual selected rows' lengths, preserve NULLs and empty strings distinctly, account offset entries, alignment rounding, validity and field metadata. Duplicate output columns count twice, matching the existing queue copy.
+2. Select the largest fitting prefix, never silently discard a row. If a single logical row plus schema cannot fit, return a named byte-quantum refusal before allocating that output. This is a legitimate completion failure; do not pass it as a successful query or raise the cap.
+3. Normalize values to exposed extents: zero-copy slicing the string values buffer to the prefix range is possible, but offsets must be rebased into a bounded newly allocated buffer. Fixed/Boolean/null offsets must follow the already audited normalizer rules. A plain RecordBatch.slice is insufficient: it retains/exposes the full string values or dictionary child buffers and may still exceed copied charge.
+4. Only after compact-layout size proof allocate/rebuild the prefix, then check the actual common charge authoritatively. Safe Arrow validation remains required. The consuming queue still makes its owned copy; normalizer offset scratch and copy overlap are distinct costs. A future trusted-owned-buffer transfer would require an ownership token, not an unchecked zero-copy optimization.
+5. Retain a cursor into the remaining decoded batch and stop reading another batch until it is consumed. Drop must destroy this cursor/reader; errors must be terminal or leave documented retry behavior. Cooperative yields must bound offset scanning/candidate work even when no rows are emitted.
+
+**Important unresolved ownership boundary:** a cursor retains the entire decoded batch while the consumer waits. This is query-produced decoder output, not an immutable provider-resident fixture. Calling it “decoder scratch” accurately excludes it from a narrow copied-output capability but does not admit its prolonged byte lifetime to the query pool. The existing scanner already retains reader decode state, yet splitting adds explicit tail retention. This cannot be advertised as satisfying the earlier “no unreserved pulled remainder waits” resource goal. A stronger design needs an upstream decoder allocation contract or separately admitted/spilled tail ownership; it cannot reserve unknown bytes before a row-count-only Parquet decoder allocation. Copying or spilling a tail after an oversized decode does not prevent the initial allocation. A single huge value can still abort during decode before the output check. This is a real broader-safety blocker, not fixed by B.
+
+Dictionary outputs require special treatment. Their full values child is charged even for unused entries; arbitrary row splitting does not shrink it. Options are (a) account full child and refuse a batch that cannot fit, preserving all values but potentially rejecting a small logical projection; or (b) premeasure exact referenced values and construct a compact dictionary with remapped keys / plain logical values. Option (b) must preserve dictionary-value NULLs, key NULLs, duplicates and actual output schema variants, and must plan both temporary metadata and output before expansion. Blind decode/cast-before-size-check recreates the allocation hazard. No dictionary/Utf8View/nested extension should be silently certified by a schema-width shortcut.
+
+## Why the current prepared join still blocks
+
+`HashJoinExec::prepare_queue_input` at `hash_join.rs:1486–1510` requires `probe.pool_independent_gather_copy_bound()`. A copied-output B does not imply a useful repeated-take bound: a single value might consume nearly B, and 4,096 duplicate matches can copy it 4,096 times. Such a conservative rows×B declaration may reserve an enormous envelope and restore serialization. It is sound arithmetic but not a practical fix.
+
+Current Inner emits up to 4,096 candidate pairs (`hash_join.rs:1897,1991–2005`). That bounds index vectors, not string output. `create_joined_batch` at 4440 and its u32 counterpart at 4610 may Arrow-take, preserve whole probe arrays on identity mappings (4525/4643), concatenate build batches, or expose small-build Utf8 as Dictionary(Int32,Utf8). These variants must all be priced or explicitly declined. A scanner-only guarantee cannot certify arbitrary gathers or ancestor queue parallelism.
+
+A bounded next join design would support a **runtime byte-bounded gather producer**, not infer a small max string length:
+
+- After build initialization and probe-stream initialization complete, promise fixed B for successful outputs; keep the existing <=4,096 index cursor bound.
+- Before constructing an output, inspect actual referenced build/probe values and choose a fitting candidate prefix. Retain unconsumed candidate indices/cursor in bounded metadata; preserve pair order, multiplicity and exact collision checks. Do not materialize an oversized joined batch then split it.
+- Exact charge must include the selected physical variant. Identity reuse is allowed only when its actual exposed buffer charge fits; otherwise force compact take. A retained dictionary child that prevents fitting must trigger safe remap/plain representation or a named refusal. Do not depend on QE_DICT_GATHER being constant or on average string lengths.
+- Residual ON filters are an additional hazard: current `filter_candidate_pairs` runs before final emission (`hash_join.rs:2060` vicinity) and can itself gather a full candidate chunk, including columns later pruned. Budgeting only final retained columns misses this allocation. Bound/pre-admit filter-gather intermediates separately or evaluate the predicate in smaller exact prefixes before large gathers. A false predicate does not make an oversized intermediate safe.
+- A single joined row may exceed B even when each child row fits, due to duplicated columns/build payload. Refuse before output allocation by name. No query-specific split exceptions and no output truncation.
+
+## Preparation and compositional API
+
+The current `QueueCopyBound` is schema/column-aware; a new opaque “every emission <=B” promise cannot safely be forged into per-column metadata. Filters add validity; projections can duplicate columns; physical dictionary variants change schema charge. Return an explicit runtime-enforced descriptor distinct from static layout variants. A wrapper must either (a) derive a sound transformed layout, (b) apply its own bounded-emission normalizer with a separately selected B, or (c) retain already prepared streams under Unknown/serial fallback. Never drop/re-execute initialized children on bound failure.
+
+Nested joins require recursive two-phase preparation: initialize the child's build before outer admission, consume its already prepared probe/output streams exactly once, and only then promise pool-independent future pulls. The existing static gather route can remain the fast path. Runtime-bounded output mode can avoid needing a static repeated-value maximum by enforcing its own pre-gather output B. Do not declare a join pool-independent before those phases, and do not start its output producer during preparation. Errors/cancellation must drop previously initialized streams and owned initialization tasks with the existing ownership protocol. A prepared spilled child currently has different runtime pool dependencies and must decline absent a separate proof.
+
+B must be selected from a documented query-budget and desired-slot policy, fixed before producers start. It is a batching parameter, not semantic proof. For example, a caller may request a share of remaining admission headroom after initialization divided by desired slots, keeping explicit downstream headroom; all arithmetic is checked and exact queue admission remains authoritative. Do not hardcode a string-length limit or manipulate query budgets to pass tests. Choosing B from transient pool availability requires passing an explicit preparation request; a no-argument static trait cannot safely pretend that value is immutable per operator. A planner-configured fixed quantum is simpler but can waste headroom. The policy/performance tradeoff must be measured, not assumed.
+
+## Minimum tests before any claim
+
+- Exact lengths just below/at/above B, many tiny values plus one huge value, a single oversized row, zero rows, NULL versus empty values, long sliced parents, independent null bitmap offsets, duplicated projections and physical schema metadata capacities.
+- Dictionary unused huge value, logical value NULL, repeated keys, compact remap correctness and named single-row refusal before copy/gather. Unsupported views/nested types decline explicitly.
+- Two upstream polls overlap under a pre-funded 2×B envelope; actual copied peak stays within that envelope; no third pull until handoff. Track decoder/tail bytes separately so the test does not falsely call total producer memory bounded.
+- Real Inner hot-key duplicate strings with 4,096 potential matches but variable-byte chunks, identity path, both orientations, retained masks, residual filters using hidden columns, multiple batches, exact NULL/multiplicity oracle, early drop and error after earlier successful chunks.
+- Nested prepared joins and Filter/Project wrappers: same-pool initialization before envelope, exactly-once child execute, Unknown fallback retains streams, cancellation destroys tails/indices and owned tasks. A source failure must not turn into EOF.
+- Single huge Parquet value remains an explicit decoder-allocation limitation until addressed; no test that only checks successful emissions can certify its predecode memory safety.
+
+Conclusion: runtime-enforced copied-output quantum is feasible as a narrow capability and may enable more parallel queues, but scanner-only enforcement is insufficient for the current prepared-join requirement. Practical extension needs join-side pre-gather byte planning and recursive preparation; complete resource safety additionally needs admitted decoder/tail ownership. No implementation or performance result is claimed here.
+
+## Prepared sizing component
+
+A scratch-only allocation-free prefix selector and independent unrun tests now exist. See [the component design](variable-output-prefix-component-2026-09-06.md) for the concrete caller-budget API, compact NULL payload requirement, and remaining allocator/decoder/tail ownership boundaries. No production capability or performance claim follows from this unintegrated helper.

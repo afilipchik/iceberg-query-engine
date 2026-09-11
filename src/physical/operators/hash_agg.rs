@@ -1,6 +1,11 @@
 //! Hash aggregate operator
 
+#[cfg(test)]
+#[path = "aggregate_fallback_pool_tests.rs"]
+mod aggregate_fallback_pool_tests;
+
 use crate::error::{QueryError, Result};
+use crate::physical::morsel_agg::{extract_scalar, normalize_aggregate_array};
 use crate::physical::operators::filter::evaluate_expr;
 use crate::physical::operators::vectorized_hash;
 use crate::physical::{PhysicalOperator, RecordBatchStream};
@@ -26,6 +31,7 @@ pub struct HashAggregateExec {
     group_by: Vec<Expr>,
     aggregates: Vec<AggregateExpr>,
     schema: SchemaRef,
+    memory_pool: crate::execution::SharedMemoryPool,
 }
 
 /// Aggregate expression with function and input
@@ -50,7 +56,13 @@ impl HashAggregateExec {
             group_by,
             aggregates,
             schema,
+            memory_pool: crate::execution::process_memory_pool(),
         }
+    }
+
+    pub fn with_memory_pool(mut self, pool: crate::execution::SharedMemoryPool) -> Self {
+        self.memory_pool = pool;
+        self
     }
 
     pub fn try_new(
@@ -59,7 +71,7 @@ impl HashAggregateExec {
         aggregates: Vec<AggregateExpr>,
     ) -> Result<Self> {
         let input_schema = input.schema();
-        let plan_schema = crate::planner::PlanSchema::from(input_schema.as_ref());
+        let plan_schema = crate::planner::PlanSchema::from_qualified_arrow(input_schema.as_ref());
 
         let mut fields = Vec::new();
 
@@ -67,14 +79,19 @@ impl HashAggregateExec {
         for expr in &group_by {
             let name = expr.output_name();
             let dt = expr.data_type(&plan_schema)?;
-            fields.push(Field::new(name, dt, true));
+            let mut field = crate::planner::SchemaField::new(name, dt);
+            if let Expr::Column(column) = expr {
+                field.name = column.name.clone();
+                field.relation = column.relation.clone();
+            }
+            fields.push(field.to_arrow_field());
         }
 
         // Aggregate columns
         for agg in &aggregates {
             let name = format!("{}({})", agg.func, agg.input.output_name());
             let dt = agg.output_type(&plan_schema)?;
-            fields.push(Field::new(name, dt, true));
+            fields.push(crate::planner::SchemaField::new(name, dt).to_arrow_field());
         }
 
         let schema = Arc::new(Schema::new(fields));
@@ -84,6 +101,7 @@ impl HashAggregateExec {
             group_by,
             aggregates,
             schema,
+            memory_pool: crate::execution::process_memory_pool(),
         })
     }
 }
@@ -145,7 +163,7 @@ fn promote_sum_type(input: &DataType) -> DataType {
             DataType::UInt64
         }
         DataType::Float32 | DataType::Float64 => DataType::Float64,
-        DataType::Decimal128(p, s) => DataType::Decimal128(*p, *s),
+        DataType::Decimal128(_, s) => DataType::Decimal128(38, *s),
         _ => DataType::Float64,
     }
 }
@@ -197,9 +215,16 @@ impl PhysicalOperator for HashAggregateExec {
                 &self.group_by,
                 &self.aggregates,
                 &self.schema,
+                &self.memory_pool,
             )?
         } else {
-            aggregate_batches(&all_batches, &self.group_by, &self.aggregates, &self.schema)?
+            aggregate_batches_with_pool(
+                &all_batches,
+                &self.group_by,
+                &self.aggregates,
+                &self.schema,
+                &self.memory_pool,
+            )?
         };
 
         Ok(Box::pin(stream::once(async { Ok(result) })))
@@ -246,6 +271,8 @@ enum GroupValue {
     Float64(ordered_float::OrderedFloat<f64>),
     String(String),
     Date32(i32),
+    UInt64(u64),
+    Decimal(crate::planner::DecimalValue),
 }
 
 impl PartialEq for GroupKey {
@@ -260,9 +287,11 @@ impl PartialEq for GroupKey {
                 (GroupValue::Null, GroupValue::Null) => true,
                 (GroupValue::Bool(a), GroupValue::Bool(b)) => a == b,
                 (GroupValue::Int64(a), GroupValue::Int64(b)) => a == b,
+                (GroupValue::UInt64(a), GroupValue::UInt64(b)) => a == b,
                 (GroupValue::Float64(a), GroupValue::Float64(b)) => a == b,
                 (GroupValue::String(a), GroupValue::String(b)) => a == b,
                 (GroupValue::Date32(a), GroupValue::Date32(b)) => a == b,
+                (GroupValue::Decimal(a), GroupValue::Decimal(b)) => a == b,
                 _ => false,
             })
     }
@@ -275,9 +304,17 @@ impl Hash for GroupKey {
         for v in &self.values {
             match v {
                 GroupValue::Null => 0u8.hash(state),
+                GroupValue::Decimal(v) => {
+                    6u8.hash(state);
+                    v.hash(state);
+                }
                 GroupValue::Bool(b) => {
                     1u8.hash(state);
                     b.hash(state);
+                }
+                GroupValue::UInt64(i) => {
+                    7u8.hash(state);
+                    i.hash(state);
                 }
                 GroupValue::Int64(i) => {
                     2u8.hash(state);
@@ -302,9 +339,12 @@ impl Hash for GroupKey {
 
 /// Accumulator state for each group
 struct AccumulatorState {
+    /// Shared typed extrema/average state, including physical encodings.
+    typed: Option<crate::physical::morsel_agg::AccumulatorState>,
     count: i64,
     sum: f64,
     sum_i64: i64,
+    decimal: Option<crate::physical::morsel_agg::AccumulatorState>,
     sum_squares: f64, // For variance/stddev calculation
     min_f64: Option<f64>,
     max_f64: Option<f64>,
@@ -345,12 +385,17 @@ struct AccumulatorState {
     percentile: f64,
 }
 
+pub(crate) const ACCUMULATOR_STATE_BYTES: usize = std::mem::size_of::<AccumulatorState>();
+pub(crate) const GROUP_VALUE_BYTES: usize = std::mem::size_of::<GroupValue>();
+
 impl Default for AccumulatorState {
     fn default() -> Self {
         Self {
+            typed: None,
             count: 0,
             sum: 0.0,
             sum_i64: 0,
+            decimal: None,
             sum_squares: 0.0,
             min_f64: None,
             max_f64: None,
@@ -387,12 +432,117 @@ impl Default for AccumulatorState {
     }
 }
 
+// Decimal aggregation uses the same exact state as streaming/spill aggregation.
+// The older SIMD/vector tables store sums in i64 or f64 and cannot represent it.
+fn aggregate_exact_decimals(
+    batches: &[RecordBatch],
+    group_by: &[Expr],
+    aggregates: &[AggregateExpr],
+    schema: &SchemaRef,
+    pool: &crate::execution::MemoryPool,
+) -> Result<Option<RecordBatch>> {
+    let Some(first) = batches.first() else {
+        return Ok(None);
+    };
+    let input_schema = crate::planner::PlanSchema::from_qualified_arrow(first.schema().as_ref());
+    let types = aggregates
+        .iter()
+        .map(|a| {
+            if a.func == AggregateFunction::Count
+                && matches!(a.input, Expr::Wildcard | Expr::QualifiedWildcard(_))
+            {
+                Ok(DataType::Int64)
+            } else {
+                a.input.data_type(&input_schema)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let has_decimal = types.iter().any(|t| matches!(t, DataType::Decimal128(..)));
+    if !has_decimal
+        && !aggregates.iter().any(|a| {
+            matches!(
+                a.func,
+                AggregateFunction::Min | AggregateFunction::Max | AggregateFunction::Avg
+            )
+        })
+    {
+        return Ok(None);
+    }
+    if aggregates.iter().any(|a| {
+        (a.distinct && !matches!(a.func, AggregateFunction::Min | AggregateFunction::Max))
+            || a.func == AggregateFunction::CountDistinct
+    }) {
+        return Ok(None);
+    }
+    let supported = aggregates.iter().all(|a| {
+        matches!(
+            a.func,
+            AggregateFunction::Count
+                | AggregateFunction::Sum
+                | AggregateFunction::Avg
+                | AggregateFunction::Min
+                | AggregateFunction::Max
+                | AggregateFunction::AnyValue
+                | AggregateFunction::Arbitrary
+                | AggregateFunction::BoolAnd
+                | AggregateFunction::BoolOr
+                | AggregateFunction::Stddev
+                | AggregateFunction::StddevPop
+                | AggregateFunction::StddevSamp
+                | AggregateFunction::Variance
+                | AggregateFunction::VarPop
+                | AggregateFunction::VarSamp
+        )
+    });
+    if !supported && !has_decimal {
+        return Ok(None);
+    }
+    if !supported {
+        return Err(QueryError::Execution(
+            "Unsupported aggregate over decimal input".into(),
+        ));
+    }
+    let mut state = crate::physical::morsel_agg::AggregationState::new_with_pool(
+        aggregates.iter().map(|a| a.func).collect(),
+        types,
+        pool,
+    );
+    let inputs = aggregates
+        .iter()
+        .map(|a| a.input.clone())
+        .collect::<Vec<_>>();
+    for batch in batches {
+        state.process_batch(batch, group_by, &inputs)?;
+    }
+    Ok(Some(state.build_output_with_pool(schema, pool)?))
+}
+
 fn aggregate_batches(
     batches: &[RecordBatch],
     group_by: &[Expr],
     aggregates: &[AggregateExpr],
     schema: &SchemaRef,
 ) -> Result<RecordBatch> {
+    aggregate_batches_with_pool(
+        batches,
+        group_by,
+        aggregates,
+        schema,
+        &crate::execution::process_memory_pool(),
+    )
+}
+
+fn aggregate_batches_with_pool(
+    batches: &[RecordBatch],
+    group_by: &[Expr],
+    aggregates: &[AggregateExpr],
+    schema: &SchemaRef,
+    pool: &crate::execution::MemoryPool,
+) -> Result<RecordBatch> {
+    if let Some(result) = aggregate_exact_decimals(batches, group_by, aggregates, schema, pool)? {
+        return Ok(result);
+    }
+
     // Special case: scalar aggregate (no GROUP BY) - use Arrow's SIMD kernels
     // Note: DISTINCT aggregates require the hash-based path for tracking distinct values
     let has_distinct = aggregates
@@ -562,18 +712,22 @@ fn aggregate_batches_vectorized(
             all_agg_inputs.push(Vec::new());
             continue;
         }
-        let key_arrays: Result<Vec<ArrayRef>> =
-            group_by.iter().map(|e| evaluate_expr(batch, e)).collect();
+        let key_arrays: Result<Vec<ArrayRef>> = group_by
+            .iter()
+            .map(|e| evaluate_expr(batch, e).and_then(normalize_aggregate_array))
+            .collect();
         let key_arrays = key_arrays?;
         if !vectorized_hash::can_vectorize_arrays(&key_arrays) {
             return Err(QueryError::Execution("Cannot vectorize group keys".into()));
         }
         all_key_arrays.push(key_arrays);
 
-        let agg_inputs: Result<Vec<ArrayRef>> = aggregates
-            .iter()
-            .map(|a| evaluate_expr(batch, &a.input))
-            .collect();
+        let agg_inputs = crate::physical::operators::evaluate_aggregate_inputs(
+            batch,
+            aggregates.len(),
+            |i| &aggregates[i].input,
+            normalize_hash_input,
+        );
         all_agg_inputs.push(agg_inputs?);
     }
 
@@ -593,7 +747,7 @@ fn aggregate_batches_vectorized(
 
             for &gid in &gt.buckets[bucket] {
                 let (ref_batch, ref_row) = gt.group_key_refs[gid as usize];
-                if vectorized_hash::compare_row(
+                if vectorized_hash::compare_group_row(
                     &all_key_arrays[ref_batch],
                     ref_row,
                     &all_key_arrays[batch_idx],
@@ -715,7 +869,9 @@ fn aggregate_batches_vectorized(
                             if nulls.map_or(true, |n| n.is_valid(row)) {
                                 let gid = group_ids[row];
                                 let val = values[row];
-                                mins[gid] = Some(mins[gid].map_or(val, |m: f64| m.min(val)));
+                                mins[gid] = Some(mins[gid].map_or(val, |m: f64| {
+                                    crate::planner::numeric::sql_float_min(m, val)
+                                }));
                             }
                         }
                     } else if let Some(arr) =
@@ -772,7 +928,9 @@ fn aggregate_batches_vectorized(
                             if nulls.map_or(true, |n| n.is_valid(row)) {
                                 let gid = group_ids[row];
                                 let val = values[row];
-                                maxs[gid] = Some(maxs[gid].map_or(val, |m: f64| m.max(val)));
+                                maxs[gid] = Some(maxs[gid].map_or(val, |m: f64| {
+                                    crate::planner::numeric::sql_float_max(m, val)
+                                }));
                             }
                         }
                     } else if let Some(arr) =
@@ -964,10 +1122,15 @@ fn build_vectorized_group_column(
             }
             Ok(Arc::new(builder.finish()))
         }
-        _ => Err(QueryError::NotImplemented(format!(
-            "Vectorized group by type not supported: {:?}",
-            data_type
-        ))),
+        _ => {
+            let values = (0..num_groups)
+                .map(|gid| {
+                    let (batch_idx, row_idx) = gt.group_key_refs[gid];
+                    extract_scalar(&all_key_arrays[batch_idx][col_idx], row_idx)
+                })
+                .collect::<Vec<_>>();
+            crate::physical::morsel_agg::build_scalar_array(&values, data_type)
+        }
     }
 }
 
@@ -1125,6 +1288,7 @@ fn aggregate_batches_morsel_parallel(
     group_by: &[Expr],
     aggregates: &[AggregateExpr],
     schema: &SchemaRef,
+    pool: &crate::execution::MemoryPool,
 ) -> Result<RecordBatch> {
     use crate::physical::morsel_agg::{self, AggregationState};
 
@@ -1167,7 +1331,8 @@ fn aggregate_batches_morsel_parallel(
     let states: Vec<AggregationState> = work
         .par_chunks(chunk_size)
         .map(|chunk| {
-            let mut state = AggregationState::new(agg_funcs.clone(), input_types.clone());
+            let mut state =
+                AggregationState::new_with_pool(agg_funcs.clone(), input_types.clone(), pool);
             for batch in chunk {
                 state.process_batch(batch, group_by, &agg_inputs)?;
             }
@@ -1176,7 +1341,7 @@ fn aggregate_batches_morsel_parallel(
         .collect::<Result<Vec<_>>>()?;
 
     let shard_batches =
-        morsel_agg::merge_states_to_batches(states, &agg_funcs, &input_types, schema)?;
+        morsel_agg::merge_states_to_batches(states, &agg_funcs, &input_types, schema, pool)?;
     if shard_batches.is_empty() {
         return Ok(RecordBatch::new_empty(schema.clone()));
     }
@@ -1189,7 +1354,12 @@ fn aggregate_batches_parallel(
     group_by: &[Expr],
     aggregates: &[AggregateExpr],
     schema: &SchemaRef,
+    pool: &crate::execution::MemoryPool,
 ) -> Result<RecordBatch> {
+    if let Some(result) = aggregate_exact_decimals(batches, group_by, aggregates, schema, pool)? {
+        return Ok(result);
+    }
+
     // Use scalar SIMD path for simple cases
     let has_distinct = aggregates
         .iter()
@@ -1211,7 +1381,7 @@ fn aggregate_batches_parallel(
         && can_vectorize_aggregation(group_by, aggregates, batches)
     {
         let t = std::time::Instant::now();
-        let result = aggregate_batches_morsel_parallel(batches, group_by, aggregates, schema);
+        let result = aggregate_batches_morsel_parallel(batches, group_by, aggregates, schema, pool);
         if timing {
             eprintln!(
                 "[agg] morsel-parallel over {} rows: ok={} in {:?}",
@@ -1220,9 +1390,9 @@ fn aggregate_batches_parallel(
                 t.elapsed()
             );
         }
-        if let Ok(result) = result {
-            return Ok(result);
-        }
+        // Eligibility was established before ingestion. Preserve semantic and
+        // admission failures instead of retrying in unreserved vectorized state.
+        return result;
     }
 
     // Try vectorized path for supported aggregate functions
@@ -1322,15 +1492,19 @@ fn build_partial_hash_table(
 
     for batch in batches {
         // Evaluate group by expressions
-        let group_arrays: Result<Vec<ArrayRef>> =
-            group_by.iter().map(|e| evaluate_expr(batch, e)).collect();
+        let group_arrays: Result<Vec<ArrayRef>> = group_by
+            .iter()
+            .map(|e| evaluate_expr(batch, e).and_then(normalize_aggregate_array))
+            .collect();
         let group_arrays = group_arrays?;
 
         // Evaluate aggregate inputs
-        let agg_inputs: Result<Vec<ArrayRef>> = aggregates
-            .iter()
-            .map(|a| evaluate_expr(batch, &a.input))
-            .collect();
+        let agg_inputs = crate::physical::operators::evaluate_aggregate_inputs(
+            batch,
+            aggregates.len(),
+            |i| &aggregates[i].input,
+            normalize_hash_input,
+        );
         let agg_inputs = agg_inputs?;
 
         // Process each row
@@ -1361,6 +1535,20 @@ fn merge_accumulator_states(
     source: &AccumulatorState,
     func: &AggregateFunction,
 ) {
+    if let Some(source) = &source.typed {
+        if let Some(target) = &mut target.typed {
+            target.merge(source);
+        } else {
+            target.typed = Some(source.clone());
+        }
+    }
+    if let Some(source) = &source.decimal {
+        if let Some(target) = &mut target.decimal {
+            target.merge(source);
+        } else {
+            target.decimal = Some(source.clone());
+        }
+    }
     // DISTINCT-tracking aggregates (COUNT(DISTINCT), SUM(DISTINCT),
     // APPROX_DISTINCT) carry their value set here; it must be UNIONED across
     // partial states. Finalization reads distinct_set.len(), so merging only
@@ -1389,7 +1577,7 @@ fn merge_accumulator_states(
         }
         AggregateFunction::Min => {
             if let (Some(t), Some(s)) = (&mut target.min_f64, &source.min_f64) {
-                *t = t.min(*s);
+                *t = crate::planner::numeric::sql_float_min(*t, *s);
             } else if source.min_f64.is_some() {
                 target.min_f64 = source.min_f64;
             }
@@ -1408,7 +1596,7 @@ fn merge_accumulator_states(
         }
         AggregateFunction::Max => {
             if let (Some(t), Some(s)) = (&mut target.max_f64, &source.max_f64) {
-                *t = t.max(*s);
+                *t = crate::planner::numeric::sql_float_max(*t, *s);
             } else if source.max_f64.is_some() {
                 target.max_f64 = source.max_f64;
             }
@@ -1497,6 +1685,19 @@ pub fn aggregate_batches_external(
     schema: &SchemaRef,
 ) -> Result<RecordBatch> {
     aggregate_batches(batches, group_by, aggregates, schema)
+}
+
+/// Query-owned entry point for spill partition finalization. Decimal output
+/// buffers retain this pool's leases across all returned partitions. Other
+/// materialized aggregate allocations are not yet fully reservation-backed.
+pub(crate) fn aggregate_batches_external_with_pool(
+    batches: &[RecordBatch],
+    group_by: &[Expr],
+    aggregates: &[AggregateExpr],
+    schema: &SchemaRef,
+    pool: &crate::execution::MemoryPool,
+) -> Result<RecordBatch> {
+    aggregate_batches_with_pool(batches, group_by, aggregates, schema, pool)
 }
 
 /// Fast scalar aggregate using optimized iterators (for queries without GROUP BY)
@@ -2015,15 +2216,19 @@ fn aggregate_batches_hash(
 
     for batch in batches {
         // Evaluate group by expressions
-        let group_arrays: Result<Vec<ArrayRef>> =
-            group_by.iter().map(|e| evaluate_expr(batch, e)).collect();
+        let group_arrays: Result<Vec<ArrayRef>> = group_by
+            .iter()
+            .map(|e| evaluate_expr(batch, e).and_then(normalize_aggregate_array))
+            .collect();
         let group_arrays = group_arrays?;
 
         // Evaluate aggregate inputs
-        let agg_inputs: Result<Vec<ArrayRef>> = aggregates
-            .iter()
-            .map(|a| evaluate_expr(batch, &a.input))
-            .collect();
+        let agg_inputs = crate::physical::operators::evaluate_aggregate_inputs(
+            batch,
+            aggregates.len(),
+            |i| &aggregates[i].input,
+            normalize_hash_input,
+        );
         let agg_inputs = agg_inputs?;
 
         // Process each row
@@ -2113,6 +2318,16 @@ fn aggregate_batches_hash(
     RecordBatch::try_new(schema.clone(), output_arrays).map_err(Into::into)
 }
 
+fn normalize_hash_input(array: ArrayRef) -> Result<ArrayRef> {
+    let array = normalize_aggregate_array(array)?;
+    match array.data_type() {
+        DataType::Int8 | DataType::Int16 => {
+            Ok(arrow::compute::cast(array.as_ref(), &DataType::Int64)?)
+        }
+        _ => Ok(array),
+    }
+}
+
 fn extract_group_key(arrays: &[ArrayRef], row: usize) -> GroupKey {
     let values: Vec<GroupValue> = arrays
         .iter()
@@ -2126,6 +2341,25 @@ fn extract_group_value(arr: &ArrayRef, row: usize) -> GroupValue {
         return GroupValue::Null;
     }
 
+    macro_rules! primitive_key {
+        ($array:ty, $variant:ident, $native:ty) => {
+            if let Some(array) = arr.as_any().downcast_ref::<$array>() {
+                return GroupValue::$variant(array.value(row) as $native);
+            }
+        };
+    }
+    primitive_key!(arrow::array::Int8Array, Int64, i64);
+    primitive_key!(arrow::array::Int16Array, Int64, i64);
+    primitive_key!(arrow::array::UInt8Array, UInt64, u64);
+    primitive_key!(arrow::array::UInt16Array, UInt64, u64);
+    primitive_key!(arrow::array::UInt32Array, UInt64, u64);
+    primitive_key!(arrow::array::UInt64Array, UInt64, u64);
+    if let Some(array) = arr.as_any().downcast_ref::<arrow::array::Float32Array>() {
+        return GroupValue::Float64(ordered_float::OrderedFloat(array.value(row) as f64));
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<arrow::array::Decimal128Array>() {
+        return GroupValue::Decimal(crate::planner::DecimalValue::new(a.value(row), a.scale()));
+    }
     if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
         return GroupValue::Int64(a.value(row));
     }
@@ -2174,6 +2408,44 @@ fn update_accumulator(
     row: usize,
     distinct: bool,
 ) {
+    if matches!(func, AggregateFunction::Min | AggregateFunction::Max)
+        || (func == AggregateFunction::Avg && !distinct)
+    {
+        let accumulator = state.typed.get_or_insert_with(|| {
+            crate::physical::morsel_agg::AccumulatorState::new(&func, input.data_type())
+        });
+        accumulator.update(&extract_scalar(input, row));
+        return;
+    }
+    if let Some(array) = input
+        .as_any()
+        .downcast_ref::<arrow::array::Decimal128Array>()
+    {
+        if func != AggregateFunction::CountDistinct {
+            let accumulator = state.decimal.get_or_insert_with(|| {
+                crate::physical::morsel_agg::AccumulatorState::new(&func, input.data_type())
+            });
+            let value = if array.is_null(row) {
+                crate::planner::ScalarValue::Null
+            } else {
+                crate::planner::ScalarValue::Decimal128(crate::planner::DecimalValue::new(
+                    array.value(row),
+                    array.scale(),
+                ))
+            };
+            if distinct {
+                if !array.is_null(row) {
+                    state
+                        .distinct_set
+                        .get_or_insert_with(HashSet::new)
+                        .insert(extract_group_value(input, row));
+                }
+            } else {
+                accumulator.update(&value);
+            }
+            return;
+        }
+    }
     match func {
         AggregateFunction::Count => {
             if !input.is_null(row) {
@@ -2235,7 +2507,11 @@ fn update_accumulator(
                     state.min_i64 = Some(state.min_i64.map_or(val, |m| m.min(val)));
                 } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
                     let val = a.value(row);
-                    state.min_f64 = Some(state.min_f64.map_or(val, |m| m.min(val)));
+                    state.min_f64 = Some(
+                        state
+                            .min_f64
+                            .map_or(val, |m| crate::planner::numeric::sql_float_min(m, val)),
+                    );
                 } else if let Some(a) = input.as_any().downcast_ref::<arrow::array::StringArray>() {
                     let val = a.value(row).to_string();
                     state.min_str = Some(state.min_str.as_ref().map_or(val.clone(), |m| {
@@ -2258,7 +2534,11 @@ fn update_accumulator(
                     state.max_i64 = Some(state.max_i64.map_or(val, |m| m.max(val)));
                 } else if let Some(a) = input.as_any().downcast_ref::<Float64Array>() {
                     let val = a.value(row);
-                    state.max_f64 = Some(state.max_f64.map_or(val, |m| m.max(val)));
+                    state.max_f64 = Some(
+                        state
+                            .max_f64
+                            .map_or(val, |m| crate::planner::numeric::sql_float_max(m, val)),
+                    );
                 } else if let Some(a) = input.as_any().downcast_ref::<arrow::array::StringArray>() {
                     let val = a.value(row).to_string();
                     state.max_str = Some(state.max_str.as_ref().map_or(val.clone(), |m| {
@@ -2466,71 +2746,26 @@ fn update_accumulator(
 fn build_group_array(
     groups: &HashMap<GroupKey, Vec<AccumulatorState>>,
     col_idx: usize,
-    num_groups: usize,
+    _num_groups: usize,
     data_type: &DataType,
 ) -> Result<ArrayRef> {
-    match data_type {
-        DataType::Int32 => {
-            let mut builder = arrow::array::Int32Builder::with_capacity(num_groups);
-            for key in groups.keys() {
-                match &key.values[col_idx] {
-                    GroupValue::Int64(v) => builder.append_value(*v as i32),
-                    GroupValue::Null => builder.append_null(),
-                    _ => builder.append_null(),
-                }
+    let values = groups
+        .keys()
+        .map(|key| match &key.values[col_idx] {
+            GroupValue::Null => ScalarValue::Null,
+            GroupValue::Int64(value) => ScalarValue::Int64(*value),
+            GroupValue::UInt64(value) => ScalarValue::UInt64(*value),
+            GroupValue::Float64(value) if data_type == &DataType::Float32 => {
+                ScalarValue::Float32(ordered_float::OrderedFloat(value.into_inner() as f32))
             }
-            Ok(Arc::new(builder.finish()))
-        }
-        DataType::Int64 => {
-            let mut builder = Int64Builder::with_capacity(num_groups);
-            for key in groups.keys() {
-                match &key.values[col_idx] {
-                    GroupValue::Int64(v) => builder.append_value(*v),
-                    GroupValue::Null => builder.append_null(),
-                    _ => builder.append_null(),
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        DataType::Float64 => {
-            let mut builder = Float64Builder::with_capacity(num_groups);
-            for key in groups.keys() {
-                match &key.values[col_idx] {
-                    GroupValue::Float64(v) => builder.append_value(v.0),
-                    GroupValue::Null => builder.append_null(),
-                    _ => builder.append_null(),
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        DataType::Utf8 => {
-            let mut builder = StringBuilder::with_capacity(num_groups, num_groups * 16);
-            for key in groups.keys() {
-                match &key.values[col_idx] {
-                    GroupValue::String(v) => builder.append_value(v),
-                    GroupValue::Null => builder.append_null(),
-                    _ => builder.append_null(),
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        DataType::Date32 => {
-            let mut builder = arrow::array::Date32Builder::with_capacity(num_groups);
-            for key in groups.keys() {
-                match &key.values[col_idx] {
-                    GroupValue::Date32(v) => builder.append_value(*v),
-                    GroupValue::Int64(v) => builder.append_value(*v as i32),
-                    GroupValue::Null => builder.append_null(),
-                    _ => builder.append_null(),
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        _ => Err(QueryError::NotImplemented(format!(
-            "Group by type not supported: {:?}",
-            data_type
-        ))),
-    }
+            GroupValue::Float64(value) => ScalarValue::Float64(*value),
+            GroupValue::String(value) => ScalarValue::Utf8(value.clone()),
+            GroupValue::Bool(value) => ScalarValue::Boolean(*value),
+            GroupValue::Date32(value) => ScalarValue::Date32(*value),
+            GroupValue::Decimal(value) => ScalarValue::Decimal128(*value),
+        })
+        .collect::<Vec<_>>();
+    crate::physical::morsel_agg::build_scalar_array(&values, data_type)
 }
 
 fn build_agg_array(
@@ -2541,12 +2776,88 @@ fn build_agg_array(
     data_type: &DataType,
     distinct: bool,
 ) -> Result<ArrayRef> {
+    if matches!(func, AggregateFunction::Min | AggregateFunction::Max)
+        || (func == AggregateFunction::Avg && !distinct)
+    {
+        let values = groups
+            .values()
+            .map(|states| match &states[agg_idx].typed {
+                Some(state) => state.finalize(&func),
+                None => Ok(crate::planner::ScalarValue::Null),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return crate::physical::morsel_agg::build_scalar_array(&values, data_type);
+    }
+    if groups.values().any(|s| s[agg_idx].decimal.is_some()) {
+        let values = groups
+            .values()
+            .map(|s| match &s[agg_idx].decimal {
+                Some(state) => {
+                    let mut state = state.clone();
+                    if distinct {
+                        if let Some(set) = &s[agg_idx].distinct_set {
+                            for value in set {
+                                if let GroupValue::Decimal(value) = value {
+                                    state.update(&crate::planner::ScalarValue::Decimal128(*value));
+                                } else {
+                                    return Err(QueryError::Type(
+                                        "Invalid decimal DISTINCT input".into(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    state.finalize(&func)
+                }
+                None => Ok(if func == AggregateFunction::Count {
+                    crate::planner::ScalarValue::Int64(0)
+                } else {
+                    crate::planner::ScalarValue::Null
+                }),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return crate::physical::morsel_agg::build_scalar_array(&values, data_type);
+    }
+    if distinct && func == AggregateFunction::Sum && matches!(data_type, DataType::Decimal128(..)) {
+        let values = groups
+            .values()
+            .map(|states| {
+                let mut accumulator =
+                    crate::physical::morsel_agg::AccumulatorState::new(&func, data_type);
+                if let Some(set) = &states[agg_idx].distinct_set {
+                    for value in set {
+                        match value {
+                            GroupValue::Decimal(value) => {
+                                accumulator.update(&crate::planner::ScalarValue::Decimal128(*value))
+                            }
+                            GroupValue::Null => {}
+                            _ => {
+                                return Err(QueryError::Type(
+                                    "Invalid decimal DISTINCT input".into(),
+                                ))
+                            }
+                        }
+                    }
+                }
+                accumulator.finalize(&func)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return crate::physical::morsel_agg::build_scalar_array(&values, data_type);
+    }
     // Handle SUM(DISTINCT) by computing sum from distinct_set
     if distinct && func == AggregateFunction::Sum {
         match data_type {
             DataType::Float64 => {
                 let mut builder = Float64Builder::with_capacity(num_groups);
                 for states in groups.values() {
+                    if states[agg_idx]
+                        .distinct_set
+                        .as_ref()
+                        .is_none_or(|set| set.is_empty())
+                    {
+                        builder.append_null();
+                        continue;
+                    }
                     let sum: f64 = states[agg_idx]
                         .distinct_set
                         .as_ref()
@@ -2569,6 +2880,14 @@ fn build_agg_array(
                 // Int64 and other integer types
                 let mut builder = Int64Builder::with_capacity(num_groups);
                 for states in groups.values() {
+                    if states[agg_idx]
+                        .distinct_set
+                        .as_ref()
+                        .is_none_or(|set| set.is_empty())
+                    {
+                        builder.append_null();
+                        continue;
+                    }
                     let sum: i64 = states[agg_idx]
                         .distinct_set
                         .as_ref()
@@ -3120,6 +3439,57 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use futures::TryStreamExt;
 
+    #[test]
+    fn vectorized_float_extrema_obey_sql_order() {
+        for values in [vec![f64::NAN, -7.0], vec![-7.0, f64::NAN]] {
+            let batch = RecordBatch::try_from_iter(vec![
+                ("g", Arc::new(Int64Array::from(vec![1, 1])) as ArrayRef),
+                ("v", Arc::new(Float64Array::from(values)) as ArrayRef),
+            ])
+            .unwrap();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("g", DataType::Int64, false),
+                Field::new("min", DataType::Float64, true),
+                Field::new("max", DataType::Float64, true),
+            ]));
+            let aggregates: Vec<_> = [AggregateFunction::Min, AggregateFunction::Max]
+                .into_iter()
+                .map(|func| AggregateExpr {
+                    func,
+                    input: Expr::column("v"),
+                    distinct: false,
+                    second_arg: None,
+                })
+                .collect();
+            for batches in [
+                vec![batch.clone()],
+                vec![batch.slice(0, 1), batch.slice(1, 1)],
+            ] {
+                let output = aggregate_batches_vectorized(
+                    &batches,
+                    &[Expr::column("g")],
+                    &aggregates,
+                    &schema,
+                )
+                .unwrap();
+                assert_eq!(output.num_rows(), 1);
+                let min = output
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap();
+                let max = output
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap();
+                assert!(!min.is_null(0) && !max.is_null(0));
+                assert_eq!(min.value(0), -7.0);
+                assert!(max.value(0).is_nan());
+            }
+        }
+    }
+
     fn create_test_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("category", DataType::Utf8, false),
@@ -3231,5 +3601,70 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!(count, 5);
+    }
+}
+
+#[cfg(test)]
+mod distinct_sum_empty_contract_tests {
+    use super::*;
+    use ordered_float::OrderedFloat;
+    fn output(state: AccumulatorState, dt: DataType) -> ArrayRef {
+        let mut groups = HashMap::new();
+        groups.insert(GroupKey { values: vec![] }, vec![state]);
+        build_agg_array(&groups, 0, AggregateFunction::Sum, 1, &dt, true).unwrap()
+    }
+    #[test]
+    fn absent_and_explicitly_empty_distinct_sets_finalize_null() {
+        for dt in [
+            DataType::Int64,
+            DataType::Float64,
+            DataType::Decimal128(38, 2),
+        ] {
+            for allocated in [false, true] {
+                let mut state = AccumulatorState::default();
+                if allocated {
+                    state.distinct_set = Some(HashSet::new());
+                }
+                let a = output(state, dt.clone());
+                assert_eq!(a.data_type(), &dt);
+                assert_eq!(a.len(), 1);
+                assert!(a.is_null(0), "Empty DISTINCT SUM must be NULL for {dt:?}");
+            }
+        }
+    }
+    #[test]
+    fn a_nonempty_zero_distinct_sum_is_valid_zero() {
+        for float in [false, true] {
+            let mut state = AccumulatorState::default();
+            state.distinct_set = Some(if float {
+                [
+                    GroupValue::Float64(OrderedFloat(-1.0)),
+                    GroupValue::Float64(OrderedFloat(1.0)),
+                ]
+                .into_iter()
+                .collect()
+            } else {
+                [GroupValue::Int64(-1), GroupValue::Int64(1)]
+                    .into_iter()
+                    .collect()
+            });
+            let a = output(
+                state,
+                if float {
+                    DataType::Float64
+                } else {
+                    DataType::Int64
+                },
+            );
+            assert!(!a.is_null(0));
+            if float {
+                assert_eq!(
+                    a.as_any().downcast_ref::<Float64Array>().unwrap().value(0),
+                    0.0
+                );
+            } else {
+                assert_eq!(a.as_any().downcast_ref::<Int64Array>().unwrap().value(0), 0);
+            }
+        }
     }
 }

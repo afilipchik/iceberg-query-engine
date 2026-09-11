@@ -1,0 +1,32 @@
+{
+  "status": "terminal",
+  "steps": [
+    {
+      "name": "routes",
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/audit_admitted_quantum_routes.py"
+      ],
+      "status": "terminal",
+      "exit_code": 0
+    },
+    {
+      "name": "triage",
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/finish_admitted_quantum_triage.py"
+      ],
+      "status": "terminal",
+      "exit_code": 0
+    },
+    {
+      "name": "full",
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/finish_admitted_quantum_full_evidence.py"
+      ],
+      "status": "terminal",
+      "exit_code": 0
+    }
+  ]
+}

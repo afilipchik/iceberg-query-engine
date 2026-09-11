@@ -1,30 +1,8 @@
-//! Pack a two-integer-column equi-join key into one Int64 — when footer
-//! statistics PROVE the pack collision-free.
-//!
-//! # Why
-//!
-//! The hash join's single-int64 path (VHT, direct hashing) is measured ~10x
-//! faster per probe than the generic composite-key path: Q9 at SF=100 probes
-//! partsupp's 80M-entry `(ps_suppkey, ps_partkey)` table at 12-15.7s per
-//! partition while the LARGER 150M-entry single-key orders table probes in
-//! 0.6-1.3s. At small scale EagerAggregation happened to deliver the same
-//! packing as a side effect of its `__ea_key`; its own gates keep it out of
-//! SF=100, and the join was left on the slow path.
-//!
-//! # The proof obligation (identical to EagerAggregation's dual-key gate)
-//!
-//! `pack(a, b) = a * K + b` is injective iff `0 <= b < K` and `a >= 0` on
-//! BOTH sides, with `max(a) * K + max(b)` inside i64. K is the next power of
-//! two above the larger side's second-key maximum, read from parquet footer
-//! statistics. If any bound is missing or violated, the rule declines —
-//! packing on hope would alias different key pairs onto one slot and return
-//! wrong JOIN matches, the worst class of bug this engine knows.
-//!
-//! NULL semantics survive the rewrite: an SQL equi-join never matches NULL
-//! keys, and `CAST(NULL) * K + x` is NULL, which the hash join also never
-//! matches. INNER joins only — they are where the cost lives (Q9), and outer
-//! joins' NULL-extension paths are not worth the review surface yet.
+//! Pack dual integer inner-join keys using structural/type/predicate proofs.
+//! Table statistics are costing hints and cannot establish collision freedom.
+//! NULLs propagate through packing and remain non-matching for inner equijoins.
 
+use super::packed_group_keys::{integer_domain, packing_radix, IntegerDomain};
 use crate::error::Result;
 use crate::optimizer::OptimizerRule;
 use crate::physical::operators::TableStatistics;
@@ -33,38 +11,16 @@ use arrow::datatypes::DataType;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub struct PackedJoinKeys {
-    table_stats: HashMap<String, TableStatistics>,
-}
+pub struct PackedJoinKeys;
 
 impl PackedJoinKeys {
     pub fn new() -> Self {
-        Self {
-            table_stats: HashMap::new(),
-        }
+        Self
     }
 
-    pub fn with_table_statistics(table_stats: HashMap<String, TableStatistics>) -> Self {
-        Self { table_stats }
-    }
-
-    /// (min, max) of a plain integer column, by unqualified name, from any
-    /// table that has it. Ambiguity across tables is safe: bounds only ever
-    /// WIDEN the proof obligation, so take the widest.
-    fn column_bounds(&self, name: &str) -> Option<(i64, i64)> {
-        let key = name.to_lowercase();
-        let mut out: Option<(i64, i64)> = None;
-        for stats in self.table_stats.values() {
-            if let Some(cs) = stats.column_stats.get(&key) {
-                if let (Some(lo), Some(hi)) = (cs.min_i64, cs.max_i64) {
-                    out = Some(match out {
-                        None => (lo, hi),
-                        Some((a, b)) => (a.min(lo), b.max(hi)),
-                    });
-                }
-            }
-        }
-        out
+    /// Retained constructor compatibility. Estimates are never packing proofs.
+    pub fn with_table_statistics(_table_stats: HashMap<String, TableStatistics>) -> Self {
+        Self
     }
 
     fn as_int_column(e: &Expr) -> Option<&crate::planner::Column> {
@@ -81,6 +37,7 @@ impl PackedJoinKeys {
         let int64 = |e: &Expr| Expr::Cast {
             expr: Box::new(e.clone()),
             data_type: DataType::Int64,
+            mode: crate::planner::CastMode::Strict,
         };
         Expr::BinaryExpr {
             left: Box::new(Expr::BinaryExpr {
@@ -105,23 +62,19 @@ impl PackedJoinKeys {
             Self::as_int_column(l2)?,
             Self::as_int_column(r2)?,
         ];
-        let bounds: Vec<(i64, i64)> = cols
-            .iter()
-            .map(|c| self.column_bounds(&c.name))
-            .collect::<Option<Vec<_>>>()?;
-        // Non-negative firsts and seconds on both sides.
-        if bounds.iter().any(|(lo, _)| *lo < 0) {
-            return None;
-        }
-        // K covers the SECOND key of both sides.
-        let max2 = bounds[2].1.max(bounds[3].1);
-        let k = (max2 as u64 + 1).checked_next_power_of_two()? as i128;
-        let max1 = bounds[0].1.max(bounds[1].1) as i128;
-        let max2 = max2 as i128;
-        if max1 * k + max2 > i64::MAX as i128 {
-            return None;
-        }
-        let k = k as i64;
+        let first_left = integer_domain(&node.left, cols[0])?;
+        let first_right = integer_domain(&node.right, cols[1])?;
+        let second_left = integer_domain(&node.left, cols[2])?;
+        let second_right = integer_domain(&node.right, cols[3])?;
+        let union = |a: IntegerDomain, b: IntegerDomain| IntegerDomain {
+            min: a.min.min(b.min),
+            max: a.max.max(b.max),
+            nullable: a.nullable || b.nullable,
+        };
+        let k = packing_radix(
+            union(first_left, first_right),
+            union(second_left, second_right),
+        )?;
         Some((Self::pack_expr(l1, l2, k), Self::pack_expr(r1, r2, k)))
     }
 
@@ -161,10 +114,6 @@ impl OptimizerRule for PackedJoinKeys {
     }
 
     fn optimize(&self, plan: &LogicalPlan) -> Result<LogicalPlan> {
-        if self.table_stats.is_empty() {
-            // No stats, no proof, no rewrite.
-            return Ok(plan.clone());
-        }
         self.rewrite(plan)
     }
 }
@@ -225,23 +174,29 @@ mod tests {
     }
 
     #[test]
-    fn packs_a_bounded_dual_int_inner_join() {
-        let r = PackedJoinKeys::with_table_statistics(stats(&[
-            ("ps_suppkey", 1, 1_000_000),
-            ("l_suppkey", 1, 1_000_000),
-            ("ps_partkey", 1, 20_000_000),
-            ("l_partkey", 1, 20_000_000),
-        ]));
-        let n = join(
-            vec![
-                (col("ps_suppkey"), col("l_suppkey")),
-                (col("ps_partkey"), col("l_partkey")),
-            ],
+    fn packs_integer_type_domains_without_statistics() {
+        use crate::planner::{PlanSchema, ScanNode, SchemaField};
+        let scan = |table: &str| {
+            Arc::new(LogicalPlan::Scan(ScanNode {
+                table_name: table.into(),
+                schema: PlanSchema::new(vec![
+                    SchemaField::new("a", DataType::UInt16),
+                    SchemaField::new("b", DataType::UInt16),
+                ]),
+                projection: None,
+                filter: None,
+            }))
+        };
+        let mut node = join(
+            vec![(col("a"), col("a")), (col("b"), col("b"))],
             JoinType::Inner,
         );
-        let packed = r.try_pack(&n).expect("must pack");
-        let s = format!("{:?}", packed.0);
-        assert!(s.contains("33554432"), "K must be 2^25: {s}");
+        node.left = scan("left");
+        node.right = scan("right");
+        let packed = PackedJoinKeys::new()
+            .try_pack(&node)
+            .expect("unsigned type domains fit");
+        assert!(format!("{:?}", packed.0).contains("65536"));
     }
 
     #[test]
@@ -295,5 +250,61 @@ mod tests {
         assert!(r.try_pack(&left).is_none(), "LEFT join must not pack");
         let single = join(vec![(col("a1"), col("b1"))], JoinType::Inner);
         assert!(r.try_pack(&single).is_none(), "single key needs no pack");
+    }
+
+    #[test]
+    fn name_only_statistics_are_not_proof_for_an_unresolved_column() {
+        let rule = PackedJoinKeys::with_table_statistics(stats(&[("a", 0, 1), ("b", 0, 1)]));
+        let node = join(
+            vec![(col("a"), col("a")), (col("b"), col("b"))],
+            JoinType::Inner,
+        );
+        assert!(rule.try_pack(&node).is_none());
+    }
+
+    #[test]
+    fn computed_alias_and_outer_subtree_do_not_inherit_named_stats() {
+        use crate::planner::{PlanSchema, ProjectNode, ScalarValue, ScanNode, SchemaField};
+        let scan = || {
+            Arc::new(LogicalPlan::Scan(ScanNode {
+                table_name: "t".into(),
+                schema: PlanSchema::new(vec![
+                    SchemaField::new("a", DataType::UInt16),
+                    SchemaField::new("b", DataType::UInt16),
+                ]),
+                projection: None,
+                filter: None,
+            }))
+        };
+        let base = scan();
+        let projected = Arc::new(LogicalPlan::Project(ProjectNode {
+            schema: base.schema(),
+            input: base,
+            exprs: vec![
+                col("a"),
+                Expr::Alias {
+                    name: "b".into(),
+                    expr: Box::new(Expr::BinaryExpr {
+                        left: Box::new(col("b")),
+                        op: BinaryOp::Multiply,
+                        right: Box::new(Expr::Literal(ScalarValue::UInt16(2))),
+                    }),
+                },
+            ],
+        }));
+        let mut node = join(
+            vec![(col("a"), col("a")), (col("b"), col("b"))],
+            JoinType::Inner,
+        );
+        node.left = projected;
+        node.right = scan();
+        let rule = PackedJoinKeys::with_table_statistics(stats(&[("a", 0, 1), ("b", 0, 1)]));
+        assert!(rule.try_pack(&node).is_none());
+        let mut outer = node.clone();
+        outer.left = scan();
+        outer.join_type = JoinType::Left;
+        outer.schema = outer.left.schema();
+        node.left = Arc::new(LogicalPlan::Join(outer));
+        assert!(rule.try_pack(&node).is_none());
     }
 }

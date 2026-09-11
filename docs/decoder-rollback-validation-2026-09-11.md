@@ -1,0 +1,5 @@
+# Decoder rollback and native test repair: validation — 2026-09-11
+
+Validation79575 is terminal1. Each ownership mode passes1095library tests/11ignored,125contract integrations and28spill/numeric/focused tests. Default disjoint native/IPC passes63/0; experimental partial passes62/1. The two stale Anti plan failures are removed by the separately validated test-contract repair; no failure names were added. Partial native aggregate rendering differs in final Float64 bits. Six legacy spill tests refuse memory in each mode. These remain unresolved gates, not successful spill coverage.
+
+Production hybrid code matches measured240cd5e2 exactly; independent widths0–32 tests and native membership/operator coverage remain. All521 source inputs verify after the locked/offline lance,gpu run, under48GiB with one build job,Rayon16 and repository TMPDIR. Exact suite commands and environments are retained in the [archive](benchmarks/2026-09-11-decoder-rollback-validation/manifest.json). The packed-word optimization and its negative measurement remain archived; no new optimized performance claim follows from these tests.

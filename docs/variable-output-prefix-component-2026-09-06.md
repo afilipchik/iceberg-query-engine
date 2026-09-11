@@ -1,0 +1,35 @@
+# Variable-output prefix sizing component
+
+Scratch-only source candidate, 2026-09-06. No main integration, compilation, tests, engine or benchmark execution. The Rust file is intended as a future internal physical module; its unit tests reference the existing crate-private queue charge function and would require module wiring before compilation.
+
+## API and boundary
+
+`ByteInput::new(&dyn Array, Rows)` accepts actual ordinary Utf8/Binary/LargeUtf8/LargeBinary arrays only. `Rows::Range` serves a scanner; `Rows::Indices(&[u32])` serves an Inner join's non-null candidate indices, including duplicates and arbitrary order. Each input may have a different row mapping (build versus probe), but mappings must have equal candidate counts. No dictionaries, views, nested arrays, null/sentinel indices or provider metadata estimates are accepted.
+
+`select_prefix(inputs, caller_scratch, base_bytes, budget_B, max_rows, other_bytes)` scans actual lengths and returns a prefix count, conservative copied-layout bytes and stop reason: exhausted, byte limit, offset representation limit, or caller work limit. The caller supplies one fixed-size accumulator per output byte column; the helper itself allocates nothing and clones no buffers. Duplicate projections are listed twice. There is no query-specific constant or implicit byte budget; caller policy supplies B and the maximum rows inspected in one cooperative step.
+
+`base_bytes` includes actual output schema/header/array/data/buffer metadata but excludes these byte columns' values/offset/validity buffer payloads. `other_bytes(n)` supplies a checked, monotone bound for all other output payloads (e.g. normalized fixed-width columns). The function must include every emitted column exactly once. This is an explicit caller proof requirement, not a way to convert an estimate into a guarantee. Tests derive headers independently from real empty-batch queue charges, subtracting each byte column's rounded one-entry offset payload. Future integration should expose a shared structural layout constructor rather than duplicate metadata formulas.
+
+The helper uses the queue's current 16-byte rounded exposed-buffer copy model, with checked arithmetic. It accounts (n+1) offsets, summed referenced non-NULL logical payload bytes, and compact validity bytes whenever the input has NULLs. Validity may be conservatively charged even when a chosen prefix is entirely valid. Accordingly the prefix is maximal for this specified conservative charge, not necessarily maximal among all possible physical encodings. Cumulative i32/i64 offset-domain limits split before an unrepresentable prefix. A single oversized row returns an explicit error with required and available bytes; no rows are silently dropped. An empty batch separately checks the minimum empty layout. Arithmetic/selection errors fail before constructing output; mutable scratch is unspecified on error.
+
+## Arrow source proof
+
+Arrow58.4 `arrow-select/src/take.rs:494–598`, `take_bytes`, sums only valid referenced payload spans when source NULLs exist, emits compact offsets and values, and preserves duplicates. `take_nulls:414–426` creates a compact bitmap from source NULLs for non-null indices. Restricting the API to a borrowed u32 slice deliberately excludes independently sliced index validity, which Arrow can retain. Input validity may have an independent bit offset; `Array::is_null` resolves it correctly. `value_offsets()` reflects the sliced logical input while offset values still address the original values buffer; lengths are obtained with checked subtraction and extent checks.
+
+This certifies a future compact take/copy layout, NOT `array.slice`. For a contiguous scanner prefix, a zero-copy values extent still contains physical bytes hidden behind NULL slots. Since this helper omits those bytes, that scanner must compact valid values (or use a separate physical-span charging mode before zero-copy normalization). The supplied sliced-parent and hidden-NULL-payload tests explicitly exercise this difference. ArrayData safe validation remains mandatory when constructing outputs.
+
+`spillable.rs::owned_input_column_charge` charges each exposed Buffer.len rounded to16, fixed Arrow metadata and recursively retained children. The helper's accepted ordinary byte arrays have no children. `fixed_width_output.rs` already normalizes fixed/Boolean/validity extents; callers may combine its checked fixed-column size contract through other_bytes. Existing `GatherCopyBound` is an actual-source static maximum; this new helper instead prices exact candidate prefixes and is not a replacement static capability.
+
+## Independent unrun tests
+
+Five tests compare actual Arrow take output and the production whole-batch copied charge against selected prefixes: sliced nullable UTF8 with parent bytes outside the prefix; duplicate build/probe index mappings combining strings, binary and fixed Int64; zero rows, too-small empty layout and an oversized single row; independent validity offset and a NULL slot containing hidden bytes; LargeUtf8/LargeBinary and all NULLs. Separate boundary assertions cover checked arithmetic, offset representation overflow, invalid indices/ranges, malformed synthetic offsets without unsafe Arrow construction, unsupported types and a caller work bound. Expected logical values and multiplicities are asserted independently.
+
+## Integration intentionally absent
+
+There is no output allocator, buffer normalization, reservation, queue descriptor, scanner tail owner, join candidate cursor change or residual-filter gather change in this tranche. Callers must reserve before allocating compact output and validate actual copied charge afterward. Arrow take currently allocates through infallible Vec growth; measuring its output size alone does not make that allocation fallible or admitted. Normalizer/copy overlap, allocator capacity rounding, schema metadata creation and index-vector allocation need explicit ownership.
+
+Scanner decoded batches/tails remain query-produced, unreserved source lifetime. Splitting a batch adds tail retention and cannot be advertised as no-unreserved-remainder ownership. A huge value can still abort during Parquet decoding before this helper sees it. Join filter intermediates, identity reuse, string-to-dictionary alternatives, dictionary child retention/remapping and multi-batch concatenation need separate actual-layout proofs; none may reuse this narrow byte-column result unchecked. Unsupported paths must retain safe existing behavior or a named refusal, never truncate output.
+
+The helper scans each included row's offsets twice to avoid per-row allocations/rollback storage. Work is bounded by caller max_rows × output-byte-column count. The surrounding async producer must yield between calls. This is a small correctness-oriented candidate; performance remains unmeasured.
+
+[Source593 integration review](variable-output-ownership-integration-review-2026-09-06.md) identifies decoder allocation and stream lease prerequisites. The sizing helper alone cannot certify raw decoder/tail ownership; no integration or performance acceptance is claimed.

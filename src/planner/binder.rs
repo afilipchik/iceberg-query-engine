@@ -8,13 +8,42 @@ use crate::planner::{
     ScalarValue, ScanNode, SchemaField, SortDirection, SortExpr, SortNode, SubqueryAliasNode,
     UnaryOp,
 };
+use crate::planner::{CastMode, DecimalValue};
 use arrow::datatypes::DataType as ArrowDataType;
 use ordered_float::OrderedFloat;
-use rust_decimal::Decimal;
 use sqlparser::ast::{self, Expr as SqlExpr, SelectItem, SetExpr, Statement, TableFactor};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+
+/// Give aggregate outputs collision-free internal names; group identities are unchanged.
+/// Every candidate is checked against all fields, including user-provided aliases.
+fn uniquify_aggregate_fields(fields: &mut [SchemaField], group_count: usize) -> Result<()> {
+    for i in group_count..fields.len() {
+        if !fields.iter().enumerate().any(|(j, field)| {
+            j != i
+                && (field.name == fields[i].name
+                    || field.qualified_name() == fields[i].qualified_name())
+        }) {
+            continue;
+        }
+        let mut suffix = 0_usize;
+        loop {
+            let candidate = format!("__qe_aggregate_{i}_{suffix}");
+            if fields
+                .iter()
+                .all(|field| field.name != candidate && field.qualified_name() != candidate)
+            {
+                fields[i].name = candidate;
+                break;
+            }
+            suffix = suffix.checked_add(1).ok_or_else(|| {
+                QueryError::Bind("Cannot allocate a unique aggregate output name".into())
+            })?;
+        }
+    }
+    Ok(())
+}
 
 /// Catalog for table schemas
 pub trait Catalog: Send + Sync {
@@ -1263,7 +1292,14 @@ impl<'a> Binder<'a> {
         }
 
         // Start with the body (SELECT, UNION, etc.)
-        let mut plan = self.bind_set_expr(&query.body)?;
+        let order_exprs = match query.order_by.as_ref().map(|order| &order.kind) {
+            Some(ast::OrderByKind::Expressions(exprs)) => exprs.as_slice(),
+            _ => &[],
+        };
+        let mut plan = match query.body.as_ref() {
+            SetExpr::Select(select) => self.bind_select_with_order(select, order_exprs)?,
+            _ => self.bind_set_expr(&query.body)?,
+        };
 
         // Apply ORDER BY.
         //
@@ -1283,7 +1319,44 @@ impl<'a> Binder<'a> {
                 }
             };
             if !order_exprs.is_empty() {
-                let order_by = self.bind_order_by(order_exprs, &plan.schema())?;
+                let mut order_by = self.bind_order_by(order_exprs, &plan.schema())?;
+                for (sort, sql_sort) in order_by.iter_mut().zip(order_exprs) {
+                    let has_aggregate = sort.expr.contains_aggregate();
+                    let mut columns = Vec::new();
+                    collect_expr_columns(&sort.expr, &mut columns);
+                    let output_schema = plan.schema();
+                    let needs_group_output = columns
+                        .iter()
+                        .any(|column| output_schema.resolve_column(column).is_none());
+                    // Output aliases and ordinals already resolve in the final
+                    // projection. Expressions over missing source columns may
+                    // instead name a computed GROUP BY key; map the whole key
+                    // before attempting to resurrect its pre-group operands.
+                    if has_aggregate || needs_group_output {
+                        let Some(aggregate) = sort_aggregate_scope(&plan) else {
+                            if has_aggregate {
+                                return Err(QueryError::Bind(
+                                    "ORDER BY aggregate has no aggregate scope".into(),
+                                ));
+                            }
+                            continue;
+                        };
+                        let input_schema = aggregate.input.schema();
+                        let bound = self.bind_expr(&sql_sort.expr, &input_schema)?;
+                        sort.expr = self.convert_expr_with_aggregates(
+                            &bound,
+                            &aggregate.schema,
+                            &aggregate.group_by,
+                            &aggregate.aggregates,
+                            &input_schema,
+                        )?;
+                        if sort.expr.contains_aggregate() {
+                            return Err(QueryError::Bind(
+                                "ORDER BY aggregate was not resolved to its output".into(),
+                            ));
+                        }
+                    }
+                }
                 let (extended, trim) = extend_projection_for_sort(plan, &order_by)?;
                 trim_to = trim;
                 plan = LogicalPlan::Sort(SortNode {
@@ -1330,14 +1403,24 @@ impl<'a> Binder<'a> {
         }
 
         if let Some(schema) = trim_to {
+            // The widened input may give colliding display labels distinct
+            // internal names. Restore each original output by its known position.
+            let input_schema = plan.schema();
             let exprs: Vec<Expr> = schema
                 .fields()
                 .iter()
-                .map(|f| {
-                    Expr::Column(Column {
-                        relation: f.relation.clone(),
-                        name: f.name.clone(),
-                    })
+                .enumerate()
+                .map(|(i, output)| {
+                    let input = &input_schema.fields()[i];
+                    let expr = Expr::Column(Column {
+                        relation: input.relation.clone(),
+                        name: input.name.clone(),
+                    });
+                    if input.name != output.name {
+                        expr.alias(output.name.clone())
+                    } else {
+                        expr
+                    }
                 })
                 .collect();
             plan = LogicalPlan::Project(ProjectNode {
@@ -1490,22 +1573,32 @@ impl<'a> Binder<'a> {
                     rows.push(exprs?);
                 }
 
-                // Infer schema from first row
-                let schema = if let Some(first_row) = rows.first() {
-                    let fields: Vec<SchemaField> = first_row
-                        .iter()
+                // VALUES has one common type per column, across every row.
+                // A NULL or narrower value in the first row cannot determine
+                // the type of all subsequent rows.
+                let width = rows.first().map_or(0, Vec::len);
+                let mut types = vec![ArrowDataType::Null; width];
+                for row in &rows {
+                    if row.len() != width {
+                        return Err(QueryError::Plan(format!(
+                            "VALUES rows must have equal width: expected {width}, got {}",
+                            row.len()
+                        )));
+                    }
+                    for (i, expr) in row.iter().enumerate() {
+                        types[i] = crate::planner::numeric::common_type(
+                            &types[i],
+                            &expr.data_type(&PlanSchema::empty())?,
+                        )?;
+                    }
+                }
+                let schema = PlanSchema::new(
+                    types
+                        .into_iter()
                         .enumerate()
-                        .map(|(i, e)| {
-                            let dt = e
-                                .data_type(&PlanSchema::empty())
-                                .unwrap_or(ArrowDataType::Utf8);
-                            SchemaField::new(format!("column{}", i), dt)
-                        })
-                        .collect();
-                    PlanSchema::new(fields)
-                } else {
-                    PlanSchema::empty()
-                };
+                        .map(|(i, ty)| SchemaField::new(format!("column{i}"), ty))
+                        .collect(),
+                );
 
                 Ok(LogicalPlan::Values(crate::planner::ValuesNode {
                     values: rows,
@@ -1520,6 +1613,14 @@ impl<'a> Binder<'a> {
     }
 
     fn bind_select(&mut self, select: &ast::Select) -> Result<LogicalPlan> {
+        self.bind_select_with_order(select, &[])
+    }
+
+    fn bind_select_with_order(
+        &mut self,
+        select: &ast::Select,
+        order_by: &[ast::OrderByExpr],
+    ) -> Result<LogicalPlan> {
         // Named WINDOW definitions for this SELECT; windows are allowed only
         // while the SELECT list binds (set below), never in FROM/WHERE.
         self.allow_window = false;
@@ -1589,6 +1690,17 @@ impl<'a> Binder<'a> {
             }
         }
 
+        // ORDER BY aggregates belong to this SELECT's aggregation even when
+        // absent from its visible projection. Collect before constructing the
+        // aggregate; sorting later references these scalar outputs.
+        for sort in order_by {
+            let expression = self.bind_expr(&sort.expr, &input_schema)?;
+            if expression.contains_aggregate() {
+                self.collect_aggregates(&expression, &mut aggregates);
+                has_aggregates = true;
+            }
+        }
+
         if has_aggregates || !group_by.is_empty() {
             let mut agg_fields = Vec::new();
             for expr in &group_by {
@@ -1616,6 +1728,7 @@ impl<'a> Binder<'a> {
                 agg_fields.push(SchemaField::new(field_name, data_type));
             }
 
+            uniquify_aggregate_fields(&mut agg_fields, group_by.len())?;
             plan = LogicalPlan::Aggregate(AggregateNode {
                 input: Arc::new(plan),
                 group_by: group_by.clone(),
@@ -2050,6 +2163,7 @@ impl<'a> Binder<'a> {
                     a.data_type(&input_schema)?,
                 ));
             }
+            uniquify_aggregate_fields(&mut agg_fields, bound.len())?;
             let agg_plan = LogicalPlan::Aggregate(AggregateNode {
                 input: input.clone(),
                 group_by: bound.clone(),
@@ -2070,10 +2184,13 @@ impl<'a> Binder<'a> {
                             Expr::Cast {
                                 expr: Box::new(Expr::Literal(ScalarValue::Null)),
                                 data_type: union_exprs[*gi].data_type(&input_schema)?,
+                                mode: crate::planner::CastMode::Strict,
                             }
                         }
                     }
-                    Item::Agg(ai) => Expr::Column(Column::new(aggregates[*ai].output_name())),
+                    Item::Agg(ai) => Expr::Column(Column::new(
+                        agg_schema.fields()[bound.len() + *ai].name.clone(),
+                    )),
                     Item::Grouping(ci) => {
                         let mut v: i64 = 0;
                         for a in &grouping_calls[*ci] {
@@ -2155,6 +2272,55 @@ impl<'a> Binder<'a> {
     }
 
     fn bind_table_factor(&mut self, factor: &TableFactor) -> Result<LogicalPlan> {
+        let plan = self.bind_table_factor_inner(factor)?;
+        let alias = match factor {
+            TableFactor::Table { alias, .. } | TableFactor::Derived { alias, .. } => alias.as_ref(),
+            _ => None,
+        };
+        let Some(alias) = alias.filter(|a| !a.columns.is_empty()) else {
+            return Ok(plan);
+        };
+        let input_schema = plan.schema();
+        if alias.columns.len() > input_schema.fields().len() {
+            return Err(QueryError::Bind(
+                "table alias has more columns than its input".into(),
+            ));
+        }
+        // Renaming must be an executable projection, not only a binder schema
+        // edit: derived tables and cached CTEs otherwise still emit old names.
+        let mut source_names = std::collections::HashSet::new();
+        if input_schema
+            .fields()
+            .iter()
+            .any(|field| !source_names.insert(field.qualified_name()))
+        {
+            return Err(QueryError::NotImplemented(
+                "Column alias lists over duplicate source names require ordinal binding".into(),
+            ));
+        }
+        let mut fields = input_schema.fields().to_vec();
+        let mut exprs = Vec::with_capacity(fields.len());
+        for (i, field) in fields.iter_mut().enumerate() {
+            let source = Expr::Column(Column {
+                name: field.name.clone(),
+                relation: field.relation.clone(),
+            });
+            if let Some(column) = alias.columns.get(i) {
+                field.name = column.name.value.clone();
+            }
+            exprs.push(Expr::Alias {
+                expr: Box::new(source),
+                name: field.qualified_name(),
+            });
+        }
+        Ok(LogicalPlan::Project(ProjectNode {
+            input: Arc::new(plan),
+            exprs,
+            schema: PlanSchema::new(fields),
+        }))
+    }
+
+    fn bind_table_factor_inner(&mut self, factor: &TableFactor) -> Result<LogicalPlan> {
         match factor {
             TableFactor::Table { name, alias, .. } => {
                 let table_name = name.table_name();
@@ -2477,13 +2643,23 @@ impl<'a> Binder<'a> {
                     // Bind against the original input schema to get the full expression
                     let bound = self.bind_expr(expr, input_schema)?;
                     // Convert to a reference to the aggregate output
-                    let (converted, field) = self.convert_to_agg_output(
+                    let (mut converted, mut field) = self.convert_to_agg_output(
                         &bound,
                         agg_schema,
                         group_by,
                         aggregates,
                         input_schema,
                     )?;
+                    // Internal aggregate symbols must not leak into SELECT labels.
+                    // Keep group-column qualifiers and existing nonaggregate behavior.
+                    if bound.contains_aggregate() {
+                        let display_name = bound.output_name();
+                        if field.name != display_name {
+                            converted = converted.alias(display_name.clone());
+                            field.name = display_name;
+                            field.relation = None;
+                        }
+                    }
                     exprs.push(converted);
                     fields.push(field);
                 }
@@ -2573,14 +2749,6 @@ impl<'a> Binder<'a> {
 
         // If it contains aggregates, we need to recursively convert
         if expr.contains_aggregate() {
-            let output_name = expr.output_name();
-            // Try to find a matching aggregate output column
-            for (i, agg) in aggregates.iter().enumerate() {
-                if agg.output_name() == output_name || expr == agg {
-                    let field = &agg_schema.fields()[group_by_len + i];
-                    return Ok((Expr::Column(Column::new(field.name.clone())), field.clone()));
-                }
-            }
             // If it's an expression containing an aggregate (like SUM(x) + 1),
             // we need to recursively convert
             let converted = self.convert_expr_with_aggregates(
@@ -2688,6 +2856,7 @@ impl<'a> Binder<'a> {
             Expr::Cast {
                 expr: inner,
                 data_type,
+                mode,
             } => {
                 let inner_conv = self.convert_expr_with_aggregates(
                     inner,
@@ -2699,6 +2868,7 @@ impl<'a> Binder<'a> {
                 Ok(Expr::Cast {
                     expr: Box::new(inner_conv),
                     data_type: data_type.clone(),
+                    mode: *mode,
                 })
             }
             // A scalar function OVER an aggregate — ROUND(SUM(x), 2) — must
@@ -2789,21 +2959,28 @@ impl<'a> Binder<'a> {
             }
             // For columns and literals, return as-is
             Expr::Column(_) | Expr::Literal(_) => Ok(expr.clone()),
-            // For aggregates that weren't matched above, find by output name
-            Expr::Aggregate { .. } => {
-                let output_name = expr.output_name();
-                for (i, agg) in aggregates.iter().enumerate() {
-                    if agg.output_name() == output_name {
-                        let field = &agg_schema.fields()[group_by_len + i];
-                        return Ok(Expr::Column(Column::new(field.name.clone())));
-                    }
-                }
-                // If not found in aggregates, keep as-is (shouldn't happen in well-formed queries)
-                Ok(expr.clone())
-            }
+            // An aggregate may only reference an output of the exact bound expression.
+            // Presentation names are not semantic or physical-type identity.
+            Expr::Aggregate { .. } => Err(QueryError::Bind(format!(
+                "Aggregate expression {expr} is not present in the aggregate output"
+            ))),
             // For other expressions, return as-is
             _ => Ok(expr.clone()),
         }
+    }
+
+    fn bind_group_key(&mut self, expr: &SqlExpr, schema: &PlanSchema) -> Result<Expr> {
+        let allow_window = self.allow_window;
+        self.allow_window = false;
+        let bound = self.bind_expr(expr, schema);
+        self.allow_window = allow_window;
+        let bound = bound?;
+        if bound.contains_aggregate() {
+            return Err(QueryError::Bind(
+                "GROUP BY cannot contain aggregates".into(),
+            ));
+        }
+        Ok(bound)
     }
 
     #[allow(clippy::type_complexity)]
@@ -2845,11 +3022,43 @@ impl<'a> Binder<'a> {
                                 )))
                             }
                         };
-                        group_by_exprs.push(self.bind_expr(target, schema)?);
+                        group_by_exprs.push(self.bind_group_key(target, schema)?);
                         continue;
                     }
                 }
-                group_by_exprs.push(self.bind_expr(expr, schema)?);
+                // Input names take precedence. Only a bare, unresolved name
+                // may resolve to a SELECT alias; aliases are not general scope.
+                let target = if let SqlExpr::Identifier(id) = expr {
+                    if !schema
+                        .fields()
+                        .iter()
+                        .any(|field| field.name.eq_ignore_ascii_case(&id.value))
+                    {
+                        let matches = projection
+                            .iter()
+                            .filter_map(|item| match item {
+                                SelectItem::ExprWithAlias { expr, alias }
+                                    if alias.value.eq_ignore_ascii_case(&id.value) =>
+                                {
+                                    Some(expr)
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        if matches.len() > 1 {
+                            return Err(QueryError::Bind(format!(
+                                "ambiguous GROUP BY alias {}",
+                                id.value
+                            )));
+                        }
+                        matches.first().copied().unwrap_or(expr)
+                    } else {
+                        expr
+                    }
+                } else {
+                    expr
+                };
+                group_by_exprs.push(self.bind_group_key(target, schema)?);
             }
         }
 
@@ -3206,13 +3415,24 @@ impl<'a> Binder<'a> {
                 })
             }
             SqlExpr::Cast {
-                expr, data_type, ..
+                expr,
+                data_type,
+                kind,
+                ..
             } => {
                 let bound_expr = self.bind_expr(expr, schema)?;
                 let arrow_type = self.convert_data_type(data_type)?;
                 Ok(Expr::Cast {
                     expr: Box::new(bound_expr),
                     data_type: arrow_type,
+                    mode: match kind {
+                        sqlparser::ast::CastKind::TryCast | sqlparser::ast::CastKind::SafeCast => {
+                            CastMode::Try
+                        }
+                        sqlparser::ast::CastKind::Cast | sqlparser::ast::CastKind::DoubleColon => {
+                            CastMode::Strict
+                        }
+                    },
                 })
             }
             SqlExpr::Extract { field, expr, .. } => {
@@ -3229,6 +3449,11 @@ impl<'a> Binder<'a> {
                 substring_for,
                 ..
             } => {
+                if substring_from.is_none() && substring_for.is_none() {
+                    return Err(QueryError::InvalidArgument(
+                        "SUBSTRING requires a position or FOR length".into(),
+                    ));
+                }
                 let bound_expr = self.bind_expr(expr, schema)?;
                 let mut args = vec![bound_expr];
 
@@ -3377,25 +3602,15 @@ impl<'a> Binder<'a> {
             SqlExpr::TypedString(ast::TypedString {
                 data_type, value, ..
             }) => {
-                if data_type == &ast::DataType::Date {
-                    // Parse date string
-                    let value = match &value.value {
-                        ast::Value::SingleQuotedString(s) | ast::Value::DoubleQuotedString(s) => {
-                            s.clone()
-                        }
-                        other => other.to_string(),
-                    };
-                    let value = value.as_str();
-                    if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
-                        let days = date
-                            .signed_duration_since(
-                                chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-                            )
-                            .num_days() as i32;
-                        return Ok(Expr::Literal(ScalarValue::Date32(days)));
-                    }
-                }
-                Ok(Expr::Literal(ScalarValue::Utf8(value.to_string())))
+                // Typed literals share the strict CAST contract. Keeping the
+                // declared type here also lets constant folding use the same
+                // execution conversion instead of a second date-only parser.
+                let expr = self.bind_expr(&SqlExpr::Value(value.clone()), schema)?;
+                Ok(Expr::Cast {
+                    expr: Box::new(expr),
+                    data_type: self.convert_data_type(data_type)?,
+                    mode: CastMode::Strict,
+                })
             }
             SqlExpr::Ceil { expr, .. } => {
                 let arg = self.bind_expr(expr, schema)?;
@@ -3457,10 +3672,20 @@ impl<'a> Binder<'a> {
                 if let Ok(i) = n.parse::<i64>() {
                     return Ok(Expr::Literal(ScalarValue::Int64(i)));
                 }
+                if !n.contains(['.', 'e', 'E']) {
+                    if let Ok(d) = DecimalValue::from_str(n) {
+                        return Ok(Expr::Literal(ScalarValue::Decimal128(d)));
+                    }
+                }
                 if let Ok(f) = n.parse::<f64>() {
+                    if !f.is_finite() {
+                        return Err(QueryError::Parse(format!(
+                            "numeric literal out of range: {n}"
+                        )));
+                    }
                     return Ok(Expr::Literal(ScalarValue::Float64(OrderedFloat(f))));
                 }
-                if let Ok(d) = Decimal::from_str(n) {
+                if let Ok(d) = DecimalValue::from_str(n) {
                     return Ok(Expr::Literal(ScalarValue::Decimal128(d)));
                 }
                 Err(QueryError::Parse(format!("Cannot parse number: {}", n)))
@@ -3714,9 +3939,14 @@ impl<'a> Binder<'a> {
                 op,
                 expr: Box::new(Self::extract_windows(*expr, acc)),
             },
-            Expr::Cast { expr, data_type } => Expr::Cast {
+            Expr::Cast {
+                expr,
+                data_type,
+                mode,
+            } => Expr::Cast {
                 expr: Box::new(Self::extract_windows(*expr, acc)),
                 data_type,
+                mode,
             },
             Expr::Alias { expr, name } => Expr::Alias {
                 expr: Box::new(Self::extract_windows(*expr, acc)),
@@ -4058,6 +4288,10 @@ impl<'a> Binder<'a> {
             }),
             "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" => Ok(Expr::ScalarFunc {
                 func: ScalarFunction::Length,
+                args,
+            }),
+            "STRLEN" | "OCTET_LENGTH" => Ok(Expr::ScalarFunc {
+                func: ScalarFunction::OctetLength,
                 args,
             }),
             "SUBSTRING" | "SUBSTR" => Ok(Expr::ScalarFunc {
@@ -5042,25 +5276,78 @@ impl<'a> Binder<'a> {
             ast::DataType::SmallInt(_) => Ok(ArrowDataType::Int16),
             ast::DataType::Int(_) | ast::DataType::Integer(_) => Ok(ArrowDataType::Int32),
             ast::DataType::BigInt(_) => Ok(ArrowDataType::Int64),
+            ast::DataType::UTinyInt | ast::DataType::UInt8 | ast::DataType::TinyIntUnsigned(_) => {
+                Ok(ArrowDataType::UInt8)
+            }
+            ast::DataType::USmallInt
+            | ast::DataType::UInt16
+            | ast::DataType::SmallIntUnsigned(_) => Ok(ArrowDataType::UInt16),
+            ast::DataType::UInt32
+            | ast::DataType::IntUnsigned(_)
+            | ast::DataType::IntegerUnsigned(_) => Ok(ArrowDataType::UInt32),
+            ast::DataType::UBigInt | ast::DataType::UInt64 | ast::DataType::BigIntUnsigned(_) => {
+                Ok(ArrowDataType::UInt64)
+            }
+            // GenericDialect parses this DuckDB spelling as a custom type.
+            ast::DataType::Custom(name, args)
+                if args.is_empty() && name.to_string().eq_ignore_ascii_case("UINTEGER") =>
+            {
+                Ok(ArrowDataType::UInt32)
+            }
             ast::DataType::Real => Ok(ArrowDataType::Float32),
             ast::DataType::Float(_) | ast::DataType::Double(_) | ast::DataType::DoublePrecision => {
                 Ok(ArrowDataType::Float64)
             }
-            ast::DataType::Decimal(info) | ast::DataType::Numeric(info) => match info {
-                ast::ExactNumberInfo::PrecisionAndScale(p, s) => {
-                    Ok(ArrowDataType::Decimal128(*p as u8, *s as i8))
+            ast::DataType::Decimal(info) | ast::DataType::Numeric(info) => {
+                let (precision, scale) = match info {
+                    ast::ExactNumberInfo::PrecisionAndScale(p, s) => (*p, *s),
+                    ast::ExactNumberInfo::Precision(p) => (*p, 0),
+                    ast::ExactNumberInfo::None => (38, 10),
+                };
+                // Validate SQL metadata before narrowing to Arrow's u8/i8.
+                // Otherwise DECIMAL(294,256) silently becomes DECIMAL(38,0).
+                if !(1..=38).contains(&precision)
+                    || scale < i64::from(i8::MIN)
+                    || scale > 38
+                    || scale > precision as i64
+                {
+                    return Err(QueryError::Type(format!(
+                        "invalid decimal precision/scale ({precision},{scale}): require 1 <= precision <= 38 and -128 <= scale <= precision"
+                    )));
                 }
-                ast::ExactNumberInfo::Precision(p) => Ok(ArrowDataType::Decimal128(*p as u8, 0)),
-                ast::ExactNumberInfo::None => Ok(ArrowDataType::Decimal128(38, 10)),
-            },
+                Ok(ArrowDataType::Decimal128(precision as u8, scale as i8))
+            }
             ast::DataType::Char(_) | ast::DataType::Varchar(_) | ast::DataType::Text => {
                 Ok(ArrowDataType::Utf8)
             }
             ast::DataType::Date => Ok(ArrowDataType::Date32),
-            ast::DataType::Timestamp(_, _) => Ok(ArrowDataType::Timestamp(
-                arrow::datatypes::TimeUnit::Microsecond,
-                None,
-            )),
+            ast::DataType::Timestamp(precision, timezone) => {
+                use arrow::datatypes::TimeUnit;
+                let aware = matches!(
+                    timezone,
+                    ast::TimezoneInfo::WithTimeZone | ast::TimezoneInfo::Tz
+                );
+                if aware && precision.is_some() {
+                    return Err(QueryError::Type(
+                        "TIMESTAMP WITH TIME ZONE does not support precision modifiers".into(),
+                    ));
+                }
+                let unit = match precision {
+                    None | Some(4..=6) => TimeUnit::Microsecond,
+                    Some(0) => TimeUnit::Second,
+                    Some(1..=3) => TimeUnit::Millisecond,
+                    Some(7..=9) => TimeUnit::Nanosecond,
+                    Some(p) => {
+                        return Err(QueryError::Type(format!(
+                            "timestamp precision {p} exceeds supported range 0..=9"
+                        )))
+                    }
+                };
+                Ok(ArrowDataType::Timestamp(
+                    unit,
+                    aware.then(|| Arc::<str>::from("UTC")),
+                ))
+            }
             _ => Err(QueryError::NotImplemented(format!(
                 "Data type not supported: {:?}",
                 dt
@@ -5202,6 +5489,17 @@ fn collect_expr_columns(e: &Expr, out: &mut Vec<Column>) {
     }
 }
 
+fn sort_aggregate_scope(plan: &LogicalPlan) -> Option<&AggregateNode> {
+    match plan {
+        LogicalPlan::Aggregate(aggregate) => Some(aggregate),
+        LogicalPlan::Project(project) => sort_aggregate_scope(&project.input),
+        LogicalPlan::Filter(filter) => sort_aggregate_scope(&filter.input),
+        // DISTINCT does not permit resurrecting hidden aggregate outputs;
+        // aliases/subqueries and set operations also establish another scope.
+        _ => None,
+    }
+}
+
 /// Make every column an ORDER BY needs visible to the Sort operator.
 ///
 /// `SELECT id FROM t ORDER BY price` is valid SQL, but the plan is
@@ -5217,10 +5515,9 @@ fn collect_expr_columns(e: &Expr, out: &mut Vec<Column>) {
 ///
 /// Deliberately conservative. Widening happens only when:
 ///   * the node under the Sort is a plain `Project`, and
-///   * every missing column resolves unambiguously in that Project's input, and
-///   * the Project's input is not an `Aggregate` — after grouping, a column
-///     that was projected away genuinely no longer exists, and inventing it
-///     would answer a different question.
+///   * every missing column resolves unambiguously in that Project's input.
+/// After aggregation this permits only group keys and computed aggregate outputs,
+/// never ungrouped source columns.
 /// Anything else is left exactly as it was.
 fn extend_projection_for_sort(
     plan: LogicalPlan,
@@ -5317,6 +5614,34 @@ fn extend_projection_for_sort(
     exprs.extend(extra_exprs);
     let mut fields = project.schema.fields().to_vec();
     fields.extend(extra_fields);
+
+    // Output labels can repeat. Keep appended sort-key symbols unchanged and
+    // give colliding visible outputs unique internal names until final trimming.
+    for i in 0..original_schema.len() {
+        if !fields.iter().enumerate().any(|(j, field)| {
+            j != i
+                && (field.name == fields[i].name
+                    || field.qualified_name() == fields[i].qualified_name())
+        }) {
+            continue;
+        }
+        let mut suffix = 0_usize;
+        loop {
+            let name = format!("__qe_sort_output_{i}_{suffix}");
+            if fields
+                .iter()
+                .all(|field| field.name != name && field.qualified_name() != name)
+            {
+                exprs[i] = exprs[i].clone().alias(name.clone());
+                fields[i].name = name;
+                fields[i].relation = None;
+                break;
+            }
+            suffix = suffix.checked_add(1).ok_or_else(|| {
+                QueryError::Bind("Cannot allocate a unique sort output name".into())
+            })?;
+        }
+    }
 
     Ok((
         LogicalPlan::Project(ProjectNode {
@@ -6108,5 +6433,130 @@ mod tests {
         let err = binder.bind_update(update).unwrap_err();
         assert!(matches!(err, QueryError::NotImplemented(_)), "{err:?}");
         assert!(err.to_string().contains("subquery"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod typed_decimal_substitution_contract_tests {
+    use super::*;
+    fn literal(scale: i8) -> Expr {
+        Expr::Literal(ScalarValue::Decimal128(DecimalValue::new(
+            10_i128.pow(scale as u32),
+            scale,
+        )))
+    }
+    fn sum(scale: i8) -> Expr {
+        Expr::Aggregate {
+            func: AggregateFunction::Sum,
+            args: vec![literal(scale)],
+            distinct: false,
+        }
+    }
+    #[test]
+    fn collect_aggregates_keeps_distinct_physical_decimal_scales() {
+        let catalog = InMemoryCatalog::new();
+        let binder = Binder::new(&catalog);
+        let mut aggregates = Vec::new();
+        binder.collect_aggregates(&sum(1), &mut aggregates);
+        binder.collect_aggregates(&sum(2), &mut aggregates);
+        binder.collect_aggregates(&sum(1), &mut aggregates);
+        let types = aggregates
+            .iter()
+            .map(|a| a.data_type(&PlanSchema::new(vec![])).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            vec![
+                ArrowDataType::Decimal128(38, 1),
+                ArrowDataType::Decimal128(38, 2)
+            ]
+        );
+    }
+    #[test]
+    fn aggregate_output_substitution_chooses_its_own_typed_field() {
+        let catalog = InMemoryCatalog::new();
+        let binder = Binder::new(&catalog);
+        let input = PlanSchema::new(vec![]);
+        let output = PlanSchema::new(vec![
+            SchemaField::new("sum_scale_one", ArrowDataType::Decimal128(38, 1)),
+            SchemaField::new("sum_scale_two", ArrowDataType::Decimal128(38, 2)),
+        ]);
+        let aggregates = vec![sum(1), sum(2)];
+        let (expr, field) = binder
+            .convert_to_agg_output(&sum(2), &output, &[], &aggregates, &input)
+            .unwrap();
+        assert_eq!(field.name, "sum_scale_two");
+        assert_eq!(field.data_type, ArrowDataType::Decimal128(38, 2));
+        assert_eq!(
+            expr.data_type(&output).unwrap(),
+            ArrowDataType::Decimal128(38, 2)
+        );
+        let recursive = binder
+            .convert_expr_with_aggregates(&sum(2), &output, &[], &aggregates, &input)
+            .unwrap();
+        assert_eq!(
+            recursive.data_type(&output).unwrap(),
+            ArrowDataType::Decimal128(38, 2)
+        );
+    }
+    #[test]
+    fn grouping_output_substitution_preserves_literal_scale() {
+        let catalog = InMemoryCatalog::new();
+        let binder = Binder::new(&catalog);
+        let input = PlanSchema::new(vec![]);
+        let output = PlanSchema::new(vec![
+            SchemaField::new("group_one", ArrowDataType::Decimal128(38, 1)),
+            SchemaField::new("group_two", ArrowDataType::Decimal128(38, 2)),
+        ]);
+        let groups = vec![literal(1), literal(2)];
+        let (expr, field) = binder
+            .convert_to_agg_output(&literal(2), &output, &groups, &[], &input)
+            .unwrap();
+        assert_eq!(field.name, "group_two");
+        assert_eq!(field.data_type, ArrowDataType::Decimal128(38, 2));
+        assert_eq!(
+            expr.data_type(&output).unwrap(),
+            ArrowDataType::Decimal128(38, 2)
+        );
+    }
+}
+
+#[cfg(test)]
+mod aggregate_output_name_collision_contract_tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_alias_name_cannot_replace_computed_expression_with_bare_sum() {
+        let catalog = InMemoryCatalog::new();
+        let binder = Binder::new(&catalog);
+        let input = PlanSchema::new(vec![SchemaField::new("x", ArrowDataType::Int64)]);
+        let sum = Expr::Aggregate {
+            func: AggregateFunction::Sum,
+            args: vec![Expr::column("x")],
+            distinct: false,
+        };
+        let output = PlanSchema::new(vec![SchemaField::new("sum_x", ArrowDataType::Int64)]);
+        // A legal output alias is presentation metadata, not a proof that x+1 == x.
+        let requested = sum
+            .clone()
+            .add(Expr::Literal(ScalarValue::Int64(1)))
+            .alias(sum.output_name());
+        let (converted, field) = binder
+            .convert_to_agg_output(&requested, &output, &[], &[sum], &input)
+            .unwrap();
+        assert_eq!(field.data_type, ArrowDataType::Int64);
+        let Expr::Alias { expr, .. } = converted else {
+            panic!("Computed aggregate alias was replaced with a bare aggregate output")
+        };
+        let Expr::BinaryExpr {
+            left,
+            op: BinaryOp::Add,
+            right,
+        } = *expr
+        else {
+            panic!("Independent +1 arithmetic must remain")
+        };
+        assert!(matches!(*left, Expr::Column(ref c) if c.name == "sum_x"));
+        assert!(matches!(*right, Expr::Literal(ScalarValue::Int64(1))));
     }
 }

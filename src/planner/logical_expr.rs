@@ -1,9 +1,9 @@
 //! Logical expression types
 
 use crate::planner::schema::{Column, PlanSchema, SchemaField};
+use crate::planner::{DecimalValue, TimestampValue};
 use arrow::datatypes::DataType as ArrowDataType;
 use ordered_float::OrderedFloat;
-use rust_decimal::Decimal;
 use std::fmt;
 use std::sync::Arc;
 
@@ -22,12 +22,12 @@ pub enum ScalarValue {
     UInt64(u64),
     Float32(OrderedFloat<f32>),
     Float64(OrderedFloat<f64>),
-    Decimal128(Decimal),
+    Decimal128(DecimalValue),
     Utf8(String),
     Date32(i32),
     Date64(i64),
-    Timestamp(i64), // microseconds
-    Interval(i64),  // days
+    Timestamp(TimestampValue),
+    Interval(i64), // days
     /// List/Array type - stores elements and the element data type
     List(Vec<ScalarValue>, Box<ArrowDataType>),
 }
@@ -47,13 +47,11 @@ impl ScalarValue {
             ScalarValue::UInt64(_) => ArrowDataType::UInt64,
             ScalarValue::Float32(_) => ArrowDataType::Float32,
             ScalarValue::Float64(_) => ArrowDataType::Float64,
-            ScalarValue::Decimal128(_) => ArrowDataType::Decimal128(38, 10),
+            ScalarValue::Decimal128(v) => ArrowDataType::Decimal128(38, v.scale()),
             ScalarValue::Utf8(_) => ArrowDataType::Utf8,
             ScalarValue::Date32(_) => ArrowDataType::Date32,
             ScalarValue::Date64(_) => ArrowDataType::Date64,
-            ScalarValue::Timestamp(_) => {
-                ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
-            }
+            ScalarValue::Timestamp(v) => v.data_type(),
             ScalarValue::Interval(_) => {
                 ArrowDataType::Interval(arrow::datatypes::IntervalUnit::DayTime)
             }
@@ -339,6 +337,7 @@ pub enum ScalarFunction {
     Ltrim,
     Rtrim,
     Length,
+    OctetLength,
     Substring,
     Concat,
     Replace,
@@ -610,6 +609,7 @@ impl fmt::Display for ScalarFunction {
             ScalarFunction::Ltrim => write!(f, "LTRIM"),
             ScalarFunction::Rtrim => write!(f, "RTRIM"),
             ScalarFunction::Length => write!(f, "LENGTH"),
+            ScalarFunction::OctetLength => write!(f, "OCTET_LENGTH"),
             ScalarFunction::Substring => write!(f, "SUBSTRING"),
             ScalarFunction::Concat => write!(f, "CONCAT"),
             ScalarFunction::Replace => write!(f, "REPLACE"),
@@ -1006,7 +1006,23 @@ impl fmt::Display for WindowExpr {
 }
 
 /// Logical expression
-#[derive(Debug, Clone, PartialEq)]
+/// Failure behavior for an explicitly typed SQL conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CastMode {
+    Strict,
+    Try,
+}
+
+impl std::fmt::Display for CastMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Strict => "CAST",
+            Self::Try => "TRY_CAST",
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum Expr {
     /// Column reference
     Column(Column),
@@ -1037,10 +1053,11 @@ pub enum Expr {
         args: Vec<Expr>,
     },
 
-    /// CAST expression
+    /// Typed conversion; the failure policy is part of expression identity.
     Cast {
         expr: Box<Expr>,
         data_type: ArrowDataType,
+        mode: CastMode,
     },
 
     /// CASE expression
@@ -1095,6 +1112,178 @@ pub enum Expr {
 
     /// Qualified wildcard (table.*)
     QualifiedWildcard(String),
+}
+
+impl PartialEq for Expr {
+    fn eq(&self, other: &Self) -> bool {
+        // ScalarValue equality is SQL numeric equality. AST substitution also
+        // requires exact literal representation, including scale and float bits.
+        fn literal_eq(a: &ScalarValue, b: &ScalarValue) -> bool {
+            match a {
+                ScalarValue::Decimal128(a) => {
+                    matches!(b, ScalarValue::Decimal128(b) if a.mantissa() == b.mantissa() && a.scale() == b.scale())
+                }
+                ScalarValue::Float32(a) => {
+                    matches!(b, ScalarValue::Float32(b) if a.0.to_bits() == b.0.to_bits())
+                }
+                ScalarValue::Float64(a) => {
+                    matches!(b, ScalarValue::Float64(b) if a.0.to_bits() == b.0.to_bits())
+                }
+                ScalarValue::List(a, at) => {
+                    matches!(b, ScalarValue::List(b, bt) if at == bt && a.len() == b.len() && a.iter().zip(b).all(|(a,b)| literal_eq(a,b)))
+                }
+                ScalarValue::Null
+                | ScalarValue::Boolean(_)
+                | ScalarValue::Int8(_)
+                | ScalarValue::Int16(_)
+                | ScalarValue::Int32(_)
+                | ScalarValue::Int64(_)
+                | ScalarValue::UInt8(_)
+                | ScalarValue::UInt16(_)
+                | ScalarValue::UInt32(_)
+                | ScalarValue::UInt64(_)
+                | ScalarValue::Utf8(_)
+                | ScalarValue::Date32(_)
+                | ScalarValue::Date64(_)
+                | ScalarValue::Timestamp(_)
+                | ScalarValue::Interval(_) => a == b,
+            }
+        }
+        match self {
+            Self::Column(a) => match other {
+                Self::Column(b) => a == b,
+                _ => false,
+            },
+            Self::Literal(a) => match other {
+                Self::Literal(b) => literal_eq(a, b),
+                _ => false,
+            },
+            Self::BinaryExpr {
+                left: al,
+                op: ao,
+                right: ar,
+            } => match other {
+                Self::BinaryExpr {
+                    left: bl,
+                    op: bo,
+                    right: br,
+                } => al == bl && ao == bo && ar == br,
+                _ => false,
+            },
+            Self::UnaryExpr { op: ao, expr: a } => match other {
+                Self::UnaryExpr { op: bo, expr: b } => ao == bo && a == b,
+                _ => false,
+            },
+            Self::Aggregate {
+                func: af,
+                args: a,
+                distinct: ad,
+            } => match other {
+                Self::Aggregate {
+                    func: bf,
+                    args: b,
+                    distinct: bd,
+                } => af == bf && a == b && ad == bd,
+                _ => false,
+            },
+            Self::ScalarFunc { func: af, args: a } => match other {
+                Self::ScalarFunc { func: bf, args: b } => af == bf && a == b,
+                _ => false,
+            },
+            Self::Cast {
+                expr: a,
+                data_type: at,
+                mode: am,
+            } => match other {
+                Self::Cast {
+                    expr: b,
+                    data_type: bt,
+                    mode: bm,
+                } => a == b && at == bt && am == bm,
+                _ => false,
+            },
+            Self::Case {
+                operand: a,
+                when_then: aw,
+                else_expr: ae,
+            } => match other {
+                Self::Case {
+                    operand: b,
+                    when_then: bw,
+                    else_expr: be,
+                } => a == b && aw == bw && ae == be,
+                _ => false,
+            },
+            Self::InList {
+                expr: a,
+                list: al,
+                negated: an,
+            } => match other {
+                Self::InList {
+                    expr: b,
+                    list: bl,
+                    negated: bn,
+                } => a == b && al == bl && an == bn,
+                _ => false,
+            },
+            Self::Between {
+                expr: a,
+                low: al,
+                high: ah,
+                negated: an,
+            } => match other {
+                Self::Between {
+                    expr: b,
+                    low: bl,
+                    high: bh,
+                    negated: bn,
+                } => a == b && al == bl && ah == bh && an == bn,
+                _ => false,
+            },
+            Self::ScalarSubquery(a) => match other {
+                Self::ScalarSubquery(b) => a == b,
+                _ => false,
+            },
+            Self::Exists {
+                subquery: a,
+                negated: an,
+            } => match other {
+                Self::Exists {
+                    subquery: b,
+                    negated: bn,
+                } => a == b && an == bn,
+                _ => false,
+            },
+            Self::InSubquery {
+                expr: a,
+                subquery: aq,
+                negated: an,
+            } => match other {
+                Self::InSubquery {
+                    expr: b,
+                    subquery: bq,
+                    negated: bn,
+                } => a == b && aq == bq && an == bn,
+                _ => false,
+            },
+            Self::Alias { expr: a, name: an } => match other {
+                Self::Alias { expr: b, name: bn } => a == b && an == bn,
+                _ => false,
+            },
+            Self::WindowFunction(a) => match other {
+                Self::WindowFunction(b) => a == b,
+                _ => false,
+            },
+            Self::Wildcard => match other {
+                Self::Wildcard => true,
+                _ => false,
+            },
+            Self::QualifiedWildcard(a) => match other {
+                Self::QualifiedWildcard(b) => a == b,
+                _ => false,
+            },
+        }
+    }
 }
 
 impl Expr {
@@ -1237,8 +1426,12 @@ impl Expr {
                 let arg_names: Vec<_> = args.iter().map(|a| a.output_name()).collect();
                 format!("{}({})", func, arg_names.join(", "))
             }
-            Expr::Cast { expr, data_type } => {
-                format!("CAST({} AS {:?})", expr.output_name(), data_type)
+            Expr::Cast {
+                expr,
+                data_type,
+                mode,
+            } => {
+                format!("{mode}({} AS {:?})", expr.output_name(), data_type)
             }
             Expr::Case { .. } => "CASE".to_string(),
             Expr::InList { expr, .. } => format!("{} IN (...)", expr.output_name()),
@@ -1281,8 +1474,7 @@ impl Expr {
                     | BinaryOp::Multiply
                     | BinaryOp::Divide
                     | BinaryOp::Modulo => {
-                        // Return the wider type
-                        Ok(coerce_numeric_types(&left_type, &right_type))
+                        crate::planner::numeric::arithmetic_type(*op, &left_type, &right_type)
                     }
                     BinaryOp::StringConcat => Ok(ArrowDataType::Utf8),
                 }
@@ -1351,6 +1543,7 @@ impl Expr {
                 match func {
                     // String functions returning Int64
                     ScalarFunction::Length
+                    | ScalarFunction::OctetLength
                     | ScalarFunction::Position
                     | ScalarFunction::Strpos
                     | ScalarFunction::Ascii => Ok(ArrowDataType::Int64),
@@ -1706,15 +1899,13 @@ impl Expr {
                 when_then,
                 else_expr,
                 ..
-            } => {
-                if let Some((_, then_expr)) = when_then.first() {
-                    then_expr.data_type(schema)
-                } else if let Some(else_expr) = else_expr {
-                    else_expr.data_type(schema)
-                } else {
-                    Ok(ArrowDataType::Null)
-                }
-            }
+            } => when_then
+                .iter()
+                .map(|(_, then)| then)
+                .chain(else_expr.iter().map(|e| e.as_ref()))
+                .try_fold(ArrowDataType::Null, |result, branch| {
+                    crate::planner::numeric::common_type(&result, &branch.data_type(schema)?)
+                }),
             Expr::InList { .. }
             | Expr::Between { .. }
             | Expr::Exists { .. }
@@ -1854,7 +2045,11 @@ impl fmt::Display for Expr {
                 let args_str: Vec<String> = args.iter().map(|a| a.to_string()).collect();
                 write!(f, "{}({})", func, args_str.join(", "))
             }
-            Expr::Cast { expr, data_type } => write!(f, "CAST({} AS {:?})", expr, data_type),
+            Expr::Cast {
+                expr,
+                data_type,
+                mode,
+            } => write!(f, "{mode}({} AS {:?})", expr, data_type),
             Expr::Case {
                 operand,
                 when_then,
@@ -1907,22 +2102,6 @@ impl fmt::Display for Expr {
     }
 }
 
-/// Coerce numeric types for binary operations
-fn coerce_numeric_types(left: &ArrowDataType, right: &ArrowDataType) -> ArrowDataType {
-    use ArrowDataType::*;
-
-    match (left, right) {
-        (Float64, _) | (_, Float64) => Float64,
-        (Float32, _) | (_, Float32) => Float64,
-        (Decimal128(_, _), _) | (_, Decimal128(_, _)) => Decimal128(38, 10),
-        (Int64, _) | (_, Int64) => Int64,
-        (Int32, _) | (_, Int32) => Int64,
-        (Int16, _) | (_, Int16) => Int32,
-        (Int8, _) | (_, Int8) => Int16,
-        _ => Float64,
-    }
-}
-
 /// Promote type for SUM aggregation
 fn promote_sum_type(input: &ArrowDataType) -> ArrowDataType {
     use ArrowDataType::*;
@@ -1931,7 +2110,7 @@ fn promote_sum_type(input: &ArrowDataType) -> ArrowDataType {
         Int8 | Int16 | Int32 | Int64 => Int64,
         UInt8 | UInt16 | UInt32 | UInt64 => UInt64,
         Float32 | Float64 => Float64,
-        Decimal128(p, s) => Decimal128(*p, *s),
+        Decimal128(_, s) => Decimal128(38, *s),
         _ => Float64,
     }
 }
@@ -1972,5 +2151,89 @@ mod tests {
 
         let col = Expr::column("id");
         assert!(!col.contains_aggregate());
+    }
+}
+
+#[cfg(test)]
+mod representation_identity_contract_tests {
+    use super::*;
+
+    #[test]
+    fn decimal_scalar_numeric_equality_remains_but_expression_scale_is_exact() {
+        let a = ScalarValue::Decimal128(DecimalValue::new(10, 1));
+        let b = ScalarValue::Decimal128(DecimalValue::new(100, 2));
+        assert_eq!(a, b);
+        let a = Expr::Literal(a);
+        let b = Expr::Literal(b);
+        assert_ne!(a, b);
+        let schema = PlanSchema::new(vec![]);
+        assert_eq!(
+            a.data_type(&schema).unwrap(),
+            ArrowDataType::Decimal128(38, 1)
+        );
+        assert_eq!(
+            b.data_type(&schema).unwrap(),
+            ArrowDataType::Decimal128(38, 2)
+        );
+        assert_eq!(a, a.clone());
+    }
+
+    #[test]
+    fn float_identity_preserves_zero_sign_and_nan_payload_for_both_widths() {
+        for (a, b) in [
+            (0.0_f32, -0.0_f32),
+            (f32::from_bits(0x7fc00001), f32::from_bits(0x7fc00002)),
+        ] {
+            let a = ScalarValue::Float32(OrderedFloat(a));
+            let b = ScalarValue::Float32(OrderedFloat(b));
+            assert_eq!(a, b);
+            assert_ne!(Expr::Literal(a.clone()), Expr::Literal(b));
+            assert_eq!(Expr::Literal(a.clone()), Expr::Literal(a));
+        }
+        for (a, b) in [
+            (0.0_f64, -0.0_f64),
+            (
+                f64::from_bits(0x7ff8000000000001),
+                f64::from_bits(0x7ff8000000000002),
+            ),
+        ] {
+            let a = ScalarValue::Float64(OrderedFloat(a));
+            let b = ScalarValue::Float64(OrderedFloat(b));
+            assert_eq!(a, b);
+            assert_ne!(Expr::Literal(a.clone()), Expr::Literal(b));
+            assert_eq!(Expr::Literal(a.clone()), Expr::Literal(a));
+        }
+    }
+
+    #[test]
+    fn recursive_lists_retain_element_representations_types_and_order() {
+        fn nested(value: ScalarValue) -> ScalarValue {
+            let inner = ScalarValue::List(
+                vec![ScalarValue::Null, value],
+                Box::new(ArrowDataType::Decimal128(38, 2)),
+            );
+            let dtype = inner.data_type();
+            ScalarValue::List(vec![inner], Box::new(dtype))
+        }
+        let a = nested(ScalarValue::Decimal128(DecimalValue::new(10, 1)));
+        let b = nested(ScalarValue::Decimal128(DecimalValue::new(100, 2)));
+        assert_eq!(a, b); // Numeric equality still recursively applies to values.
+        assert_ne!(Expr::Literal(a.clone()), Expr::Literal(b));
+        assert_eq!(Expr::Literal(a.clone()), Expr::Literal(a));
+        let list = |items, ty| Expr::Literal(ScalarValue::List(items, Box::new(ty)));
+        assert_ne!(
+            list(vec![], ArrowDataType::Int32),
+            list(vec![], ArrowDataType::Int64)
+        );
+        assert_ne!(
+            list(
+                vec![ScalarValue::Int64(1), ScalarValue::Int64(2)],
+                ArrowDataType::Int64
+            ),
+            list(
+                vec![ScalarValue::Int64(2), ScalarValue::Int64(1)],
+                ArrowDataType::Int64
+            )
+        );
     }
 }

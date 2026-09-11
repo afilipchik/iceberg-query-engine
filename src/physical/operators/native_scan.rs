@@ -22,8 +22,8 @@
 //! # What it preserves from the materializing path — deliberately identical
 //!
 //! - **Deletion vectors**: every segment read goes through
-//!   `NativeTable::read_segment_batches`, which applies
-//!   `filter_deleted_rows` exactly as `scan()`/`scan_with_filter` do — a
+//!   `NativeTable::open_segment_batches`, which applies
+//!   the shared deletion cursor used by `scan()`/`scan_with_filter` — a
 //!   tombstoned row can never reach a consumer through either path.
 //! - **Segment pruning**: the segment list is
 //!   `NativeTable::streaming_segment_ids(filter)`, the SAME
@@ -41,18 +41,11 @@
 //!
 //! # Memory shape
 //!
-//! One partition holds at most one segment's decoded batches at a time
-//! (`VecDeque` drained before the next segment is opened), and segment
-//! bytes are mmap-backed (`Buffer::from_custom_allocation` over the IPC
-//! file), i.e. reclaimable page cache rather than anonymous memory — under
-//! a cgroup `MemoryMax` the kernel evicts clean file pages instead of
-//! OOM-killing, and under `QE_MEM_CAP` (`RLIMIT_DATA`, private-anonymous
-//! only) they do not count at all. The only materialized copies are the
-//! per-batch survivors of `filter_deleted_rows` on segments with non-empty
-//! deletion vectors, which are transient (one batch in flight per
-//! partition). Partition count is capped (`MAX_PARTITIONS`) so at most that
-//! many segments are concurrently resident even when a consumer drives
-//! every partition at once (the fused-streaming aggregate does).
+//! Each partition holds one mapped segment reader and decodes/filters one batch
+//! per pull. It never queues survivor copies for later batches. Mmap buffers keep
+//! their mapping alive even after the reader drops. Footer metadata, dictionaries
+//! and deletion vectors remain reader-owned; allocations and retained outputs are
+//! not yet query-pool admitted. Partition count is capped (`MAX_PARTITIONS`).
 
 use crate::error::{QueryError, Result};
 use crate::physical::{check_partition, PhysicalOperator, RecordBatchStream};
@@ -61,7 +54,6 @@ use crate::storage::NativeTable;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// Upper bound on concurrently-driven partitions (and therefore on
@@ -161,7 +153,10 @@ fn rewrap_batch(declared: &SchemaRef, batch: RecordBatch) -> Result<RecordBatch>
                     if f.data_type() == c.data_type() {
                         f.as_ref().clone()
                     } else {
-                        arrow::datatypes::Field::new(f.name(), c.data_type().clone(), true)
+                        f.as_ref()
+                            .clone()
+                            .with_data_type(c.data_type().clone())
+                            .with_nullable(true)
                     }
                 })
                 .collect::<Vec<_>>(),
@@ -206,41 +201,41 @@ impl PhysicalOperator for NativeStreamingScanExec {
 
         struct State {
             ids: std::vec::IntoIter<u32>,
-            pending: VecDeque<RecordBatch>,
+            reader: Option<crate::storage::native_table::NativeSegmentReader>,
         }
         let stream = futures::stream::try_unfold(
             State {
                 ids: ids.into_iter(),
-                pending: VecDeque::new(),
+                reader: None,
             },
             move |mut st| {
                 let table = Arc::clone(&table);
                 let projection = projection.clone();
                 let declared = declared.clone();
                 async move {
-                    loop {
-                        if let Some(batch) = st.pending.pop_front() {
-                            let batch = rewrap_batch(&declared, batch)?;
-                            return Ok(Some((batch, st)));
+                    // Opening, decoding and deletion filtering stay off reactor
+                    // threads. Exactly one output is produced by each blocking job.
+                    tokio::task::spawn_blocking(move || -> Result<_> {
+                        loop {
+                            if let Some(reader) = &mut st.reader {
+                                if let Some(batch) = reader.next() {
+                                    return Ok(Some((rewrap_batch(&declared, batch?)?, st)));
+                                }
+                                st.reader = None;
+                            }
+                            let Some(seg_id) = st.ids.next() else {
+                                return Ok(None);
+                            };
+                            st.reader =
+                                Some(table.open_segment_batches(seg_id, projection.as_deref())?);
                         }
-                        let Some(seg_id) = st.ids.next() else {
-                            return Ok(None);
-                        };
-                        // The mmap/decode is blocking filesystem work; keep
-                        // it off the async reactor threads.
-                        let t = Arc::clone(&table);
-                        let proj = projection.clone();
-                        let batches = tokio::task::spawn_blocking(move || {
-                            t.read_segment_batches(seg_id, proj.as_deref())
-                        })
-                        .await
-                        .map_err(|e| {
-                            QueryError::Execution(format!(
-                                "NativeStreamingScanExec: segment read task failed: {e}"
-                            ))
-                        })??;
-                        st.pending = batches.into();
-                    }
+                    })
+                    .await
+                    .map_err(|e| {
+                        QueryError::Execution(format!(
+                            "NativeStreamingScanExec: segment read task failed: {e}"
+                        ))
+                    })?
                 }
             },
         );
@@ -285,6 +280,68 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// A later malformed block must fail when pulled, without eagerly decoding
+    /// the whole segment before the first valid output or replaying after error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn segment_decoding_is_incremental_and_late_errors_are_terminal() {
+        use arrow::ipc::{reader::read_footer_length, writer::FileWriter, Block};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t");
+        write_table(&path, 1, 100).await;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let mut bytes = Vec::new();
+        {
+            let mut writer = FileWriter::try_new(&mut bytes, &schema).unwrap();
+            for start in [0, 50] {
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int64Array::from_iter_values(start..start + 50))],
+                )
+                .unwrap();
+                writer.write(&batch).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        let trailer = bytes.len() - 10;
+        let footer_start =
+            trailer - read_footer_length(bytes[trailer..].try_into().unwrap()).unwrap();
+        let footer = arrow::ipc::root_as_footer(&bytes[footer_start..trailer]).unwrap();
+        let block = footer.recordBatches().unwrap().get(1);
+        let descriptor = block.0.as_ptr() as usize - bytes.as_ptr() as usize;
+        let bad = Block::new(-1, block.metaDataLength(), block.bodyLength());
+        bytes[descriptor..descriptor + 24].copy_from_slice(&bad.0);
+        std::fs::write(path.join("rg_00000.arrow"), bytes).unwrap();
+        let table = NativeTable::try_new(&path).unwrap();
+        let exec = NativeStreamingScanExec::new("t", &table, table.schema(), None, None);
+        let mut stream = exec.execute(0).await.unwrap();
+        let first = stream
+            .try_next()
+            .await
+            .expect("first valid block must precede late error")
+            .unwrap();
+        let ids = first
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ids.values().as_ref(), &(0..50).collect::<Vec<i64>>());
+        let held = first.column(0).clone();
+        drop(first);
+        let error = stream.try_next().await.unwrap_err();
+        assert!(error.to_string().contains("invalid offset"), "{error}");
+        assert!(stream.try_next().await.unwrap().is_none());
+        drop(stream);
+        drop(exec);
+        drop(table);
+        assert_eq!(
+            held.as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(49),
+            49
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

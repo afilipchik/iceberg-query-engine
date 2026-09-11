@@ -1,0 +1,11 @@
+{"args": ["abcabc", "(a)(b)", "\\2\\1", ""], "expected": "bacabc"}
+{"args": ["abcabc", "(a)(b)", "\\2\\1", "g"], "expected": "bacbac"}
+{"args": ["abc", "(b)", "$1-\\0-\\1", ""], "expected": "a$1-b-bc"}
+{"args": ["AbA", "a", "X", "i"], "expected": "XbA"}
+{"args": ["AbA", "a", "X", "ic"], "expected": "AbA"}
+{"args": ["a.b.a", "a.b", "X", "l"], "expected": "X.a"}
+{"args": ["a\nb", "a.b", "X", "s"], "expected": "X"}
+{"args": ["éé", "é", "X", "g"], "expected": "XX"}
+{"args": ["ab", "", "X", "g"], "expected": "XaXbX"}
+{"args": ["ab", "(a)?b", "\\1", ""], "expected": "a"}
+{"args": ["abc", "b", "\\\\", ""], "expected": "a\\c"}
