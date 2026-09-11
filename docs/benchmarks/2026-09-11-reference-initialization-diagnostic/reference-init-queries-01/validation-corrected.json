@@ -1,0 +1,98 @@
+[
+  {
+    "run": "iceberg-construction-0",
+    "validation": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "c_count: int64\ncustdist: int64",
+      "expected_schema": "c_count: int64\ncustdist: int64",
+      "actual_rows": 45,
+      "expected_rows": 45
+    }
+  },
+  {
+    "run": "iceberg-construction-1",
+    "validation": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "c_count: int64\ncustdist: int64",
+      "expected_schema": "c_count: int64\ncustdist: int64",
+      "actual_rows": 45,
+      "expected_rows": 45
+    }
+  },
+  {
+    "run": "iceberg-default-0",
+    "validation": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "c_count: int64\ncustdist: int64",
+      "expected_schema": "c_count: int64\ncustdist: int64",
+      "actual_rows": 45,
+      "expected_rows": 45
+    }
+  },
+  {
+    "run": "iceberg-default-1",
+    "validation": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "c_count: int64\ncustdist: int64",
+      "expected_schema": "c_count: int64\ncustdist: int64",
+      "actual_rows": 45,
+      "expected_rows": 45
+    }
+  },
+  {
+    "run": "lance-construction-0",
+    "validation": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "expected_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "actual_rows": 175,
+      "expected_rows": 175
+    }
+  },
+  {
+    "run": "lance-construction-1",
+    "validation": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "expected_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "actual_rows": 175,
+      "expected_rows": 175
+    }
+  },
+  {
+    "run": "lance-default-0",
+    "validation": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "expected_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "actual_rows": 175,
+      "expected_rows": 175
+    }
+  },
+  {
+    "run": "lance-default-1",
+    "validation": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "expected_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "actual_rows": 175,
+      "expected_rows": 175
+    }
+  }
+]

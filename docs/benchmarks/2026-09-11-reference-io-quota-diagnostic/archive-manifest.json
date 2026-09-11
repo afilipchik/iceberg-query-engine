@@ -1,0 +1,28 @@
+{
+  "files": {
+    "boundary-validation.json": "a5cd31b6d670af230ce9d98572935dec609ef607830a57e0d777820744abbf7a",
+    "reference_mapping_probe.py": "7be09b8fe1bef684ef63344164e4547a61f9531b9805a969c0ab1b82987cb7e1",
+    "reference-mappings-01/control.json": "ec711342011308c583c4a6a1b5127979ad875fc271750a7056c7594bb14be337",
+    "reference-mappings-01/manifest.json": "6d7392325f2a6dbbb2c9d14a01803a9bdd3f7504903be5e40bd68cc9484bd5dc",
+    "reference-mappings-01/worker.py": "c1cb22971ee85ae0cdba5f002890d9da984aa4aafef3949b0b002c1429e4f7a2",
+    "reference-mappings-io16-01/control.json": "38435a93a96e428d4860b1559e7a04e5e33f4a8d758879670407719768a737f8",
+    "reference-mappings-io16-01/manifest.json": "d0bfc52ed4700bfb4dffc191a4fd1370784ab69c2410671670d20ee11b4fd31a",
+    "reference-mappings-io16-01/worker.py": "c1cb22971ee85ae0cdba5f002890d9da984aa4aafef3949b0b002c1429e4f7a2",
+    "reference-mappings-01/lance/requests.json": "20c555bd2eb5a1ec3fe7ba770d4f5cdeff5c4170e019d725d2d250c6e7f6eec2",
+    "reference-mappings-01/lance/s1-q09-duckdb-warmup.arrow": "cd8c22cc0c4823e76d0a843a1ca764fcd74c128d15e716134756f77488a94a67",
+    "reference-mappings-01/lance/s1-q09-oracle.arrow": "cd8c22cc0c4823e76d0a843a1ca764fcd74c128d15e716134756f77488a94a67",
+    "reference-mappings-01/lance/setup.json": "4aa9f018464c8bdfa4ddfeadb313f30aa6acf8eba37a68ebc06c1bbb6662d3ae",
+    "reference-mappings-01/lance/stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reference-mappings-01/lance/stdout.jsonl.gz": "d8dad3efe1eeae465526f0a575f7f2350cb000d0f7935d5ff3089d927d522174",
+    "reference-mappings-io16-01/lance/requests.json": "2ae2f10fa8eeb6f45f3dc69d0fcab4de39f444507b381861ea1828987c3d4b87",
+    "reference-mappings-io16-01/lance/s1-q09-cal0.arrow": "cd8c22cc0c4823e76d0a843a1ca764fcd74c128d15e716134756f77488a94a67",
+    "reference-mappings-io16-01/lance/s1-q09-duckdb-warmup.arrow": "cd8c22cc0c4823e76d0a843a1ca764fcd74c128d15e716134756f77488a94a67",
+    "reference-mappings-io16-01/lance/s1-q09-oracle.arrow": "cd8c22cc0c4823e76d0a843a1ca764fcd74c128d15e716134756f77488a94a67",
+    "reference-mappings-io16-01/lance/setup.json": "2065b0144f91a0b742cad37302f1e2eee529b0fca61ca71b427ba12794eef8e6",
+    "reference-mappings-io16-01/lance/stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reference-mappings-io16-01/lance/stdout.jsonl.gz": "63b02c03c76cab709e70c247dbb29b7da69d902e5c3953d408c934f55efadcac"
+  },
+  "source_commit": "bf88b95a5f14ceb87104feb39361a7a34ed8608b",
+  "qualification": "Single default/quota pair; five independently typed-validated Q9 outputs; preceding query completion is not independent correctness certification.",
+  "compression": "gzip, lossless verified against scratch traces"
+}

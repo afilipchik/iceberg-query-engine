@@ -1,0 +1,25 @@
+{
+  "files": {
+    "boundary-validation.json": "ddcf4ad495c19f4fe3f10d4d28ca17a564cd16254b0636849c115fa939b9fb91",
+    "manifest.json": "dc76cd154e742014cf2de29895487b3ab5aa21574c1748c170f7ba72fee4ec35",
+    "output-hashes.json": "69c348edfeb21e45d33f9ecb01edf088bbebeb3446b88af2b64db4ced7986bd0",
+    "reference_sequence_probe.py": "2f14a12945c50a9cdca0c8f7ae618dae4e6a3690fdff41545ceebdc0a421da16",
+    "worker.py": "50ae8da2c149146f058ffedff2f0bbbba693f95d9719964e721bd537af99322c",
+    "iceberg/requests.json": "b2ec2bf714ea7892fb96b2c9583ec2704c904b0ee48bf907703d9b3c2110704d",
+    "iceberg/s1-q13-cal0.arrow": "dbbc125715871bfee9109500a9a8b339358dc90e8345413569d2ee5f71d91489",
+    "iceberg/s1-q13-duckdb-warmup.arrow": "dbbc125715871bfee9109500a9a8b339358dc90e8345413569d2ee5f71d91489",
+    "iceberg/s1-q13-oracle.arrow": "dbbc125715871bfee9109500a9a8b339358dc90e8345413569d2ee5f71d91489",
+    "iceberg/setup.json": "ade0412d0177c69e34deb588516597fe1463d96996e3f5dc7fbe22640200756f",
+    "iceberg/stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "iceberg/stdout.jsonl": "857b341e46421420e9daaa20766b506b5753f9290b4e06b54f322c36aaed66a5",
+    "lance/requests.json": "053b77d195e109ca7658781f6dfd9b68ce96c0205a38155f54cad8c61e2fabf7",
+    "lance/s1-q09-duckdb-warmup.arrow": "cd8c22cc0c4823e76d0a843a1ca764fcd74c128d15e716134756f77488a94a67",
+    "lance/s1-q09-oracle.arrow": "cd8c22cc0c4823e76d0a843a1ca764fcd74c128d15e716134756f77488a94a67",
+    "lance/setup.json": "8fcff0b8de09892243e2ce371d9a5b1868c4d445b6cf6ac5a4f38878446cabd7",
+    "lance/stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "lance/stdout.jsonl": "34b98f531c3b59793bf74bcc2157fc600e491d268dd9390b0bc4d94077354bca"
+  },
+  "source_commit": "bf88b95a5f14ceb87104feb39361a7a34ed8608b",
+  "output_count": 304,
+  "qualified_validation": "Only five boundary outputs independently validated; other completed replay outputs are not correctness certification."
+}

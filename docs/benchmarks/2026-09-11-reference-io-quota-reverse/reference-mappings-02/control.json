@@ -1,0 +1,28 @@
+{
+  "quota": null,
+  "variable": "LANCE_PROCESS_IO_THREADS_LIMIT",
+  "query_limit_bytes": 4294967296,
+  "process_limit_bytes": 12884901888,
+  "cgroup_limit_bytes": 17179869184,
+  "threads": 16,
+  "affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "extension_sha256": "d597883c5fdf1a13b0037847984b4ec6416d6e5f87628369326f43e2d802423a",
+  "qualification": "I/O concurrency control only; no production harness changes; smaps instrumentation changes timing."
+}

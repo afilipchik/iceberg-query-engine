@@ -1,0 +1,67 @@
+[
+  {
+    "track": "iceberg",
+    "id": "s1-q13-oracle",
+    "validation": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "c_count: int64\ncustdist: int64",
+      "expected_schema": "c_count: int64\ncustdist: int64",
+      "actual_rows": 45,
+      "expected_rows": 45
+    }
+  },
+  {
+    "track": "iceberg",
+    "id": "s1-q13-duckdb-warmup",
+    "validation": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "c_count: int64\ncustdist: int64",
+      "expected_schema": "c_count: int64\ncustdist: int64",
+      "actual_rows": 45,
+      "expected_rows": 45
+    }
+  },
+  {
+    "track": "iceberg",
+    "id": "s1-q13-cal0",
+    "validation": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "c_count: int64\ncustdist: int64",
+      "expected_schema": "c_count: int64\ncustdist: int64",
+      "actual_rows": 45,
+      "expected_rows": 45
+    }
+  },
+  {
+    "track": "lance",
+    "id": "s1-q09-oracle",
+    "validation": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "expected_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "actual_rows": 175,
+      "expected_rows": 175
+    }
+  },
+  {
+    "track": "lance",
+    "id": "s1-q09-duckdb-warmup",
+    "validation": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "expected_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "actual_rows": 175,
+      "expected_rows": 175
+    }
+  }
+]

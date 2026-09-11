@@ -1,0 +1,66 @@
+[
+  {
+    "track": "iceberg",
+    "mode": "default",
+    "repeat": 0,
+    "exit_code": 0,
+    "timeout": false,
+    "seconds": 0.21416599536314607
+  },
+  {
+    "track": "iceberg",
+    "mode": "construction",
+    "repeat": 0,
+    "exit_code": 0,
+    "timeout": false,
+    "seconds": 0.21475947462022305
+  },
+  {
+    "track": "lance",
+    "mode": "default",
+    "repeat": 0,
+    "exit_code": 0,
+    "timeout": false,
+    "seconds": 0.42574010509997606
+  },
+  {
+    "track": "lance",
+    "mode": "construction",
+    "repeat": 0,
+    "exit_code": 0,
+    "timeout": false,
+    "seconds": 0.41538070095703006
+  },
+  {
+    "track": "iceberg",
+    "mode": "construction",
+    "repeat": 1,
+    "exit_code": 0,
+    "timeout": false,
+    "seconds": 0.2198858535848558
+  },
+  {
+    "track": "iceberg",
+    "mode": "default",
+    "repeat": 1,
+    "exit_code": 0,
+    "timeout": false,
+    "seconds": 0.22069669701159
+  },
+  {
+    "track": "lance",
+    "mode": "construction",
+    "repeat": 1,
+    "exit_code": 0,
+    "timeout": false,
+    "seconds": 0.4153898940421641
+  },
+  {
+    "track": "lance",
+    "mode": "default",
+    "repeat": 1,
+    "exit_code": 0,
+    "timeout": false,
+    "seconds": 0.41890776017680764
+  }
+]

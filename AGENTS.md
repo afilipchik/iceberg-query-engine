@@ -39,7 +39,7 @@ needed; this is not proof that every viable working-space policy fails.
 Release5788 is terminal0 in 8m49s, freezing `7ddbf9ce`. Checkpoint98921 is
 terminal1; independent evidence72426 is terminal0. All jobs are terminal. Archives
 verify 452 diagnostic, 1,425 provider and 1,097 residency files and all 531 inputs.
-The candidate is ready for the user-required intermediate commit/push.
+The cycle is committed and pushed as `bf88b95`; the remote branch hash is verified.
 
 Latest completed SF10 candidate `7ddbf9ce`:
 
@@ -74,8 +74,21 @@ stays disjoint; partial-mode gains do not clear its numeric/resource failures or
 historical four-thread Q18 regression. Preserve the failed identical-binary custom
 Q6 precision control (upper95%1.130588) and its dependent comparison NOTRUN.
 
-After committing/pushing this completed cycle, run the same-cap reference setup
-diagnostic and continue systemic native/page ownership and shared CPU work. Detailed prior experiments and active-state
+Same-cap fresh reference controls pass8typed outputs. Persistent sequence49356
+completes Iceberg121/121 but reproduces LanceQ9cal0 128MiB refusal after183
+completed requests;431threads and VmData near12GiB cap, zero cgroupOOM/max.
+Five boundary outputs are typed-verified; earlier replay outputs only hashed.
+Mapping13207 repeats Lance refusal with349Tokio-named threads. I/O quota16
+control1762 completes184requests with123Tokio-named threads and five Q9 outputs
+across both runs typed-verified; one pair only, no harness change or rebaseline.
+Reverse quota39397 completes184; default2125 refuses all three Q9 requests
+(181complete). Harness adds explicit reference-only quota with27tests/no skips.
+Full matched LanceSF10 screen75607 terminal1: referenceQ9 completes, engineQ9
+warmup join-index allocation fails, three measured requests NOTRUN;21other
+queries typed-correct.531source/binary/harness hashes verify. Archive then
+commit/push this cycle and continue
+systemic native/page ownership and shared CPU work. See
+[reference diagnostics](docs/reference-worker-initialization-follow-up-2026-09-11.md). Detailed prior experiments and active-state
 snapshots are preserved in the [September11 history](docs/agent-checkpoint-history-2026-09-11.md)
 and linked reports; historical results certify only their frozen candidates.
 

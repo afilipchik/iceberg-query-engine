@@ -1,0 +1,67 @@
+[
+  {
+    "run": "reference-mappings-01",
+    "output": "s1-q09-duckdb-warmup.arrow",
+    "result": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "expected_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "actual_rows": 175,
+      "expected_rows": 175
+    }
+  },
+  {
+    "run": "reference-mappings-01",
+    "output": "s1-q09-oracle.arrow",
+    "result": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "expected_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "actual_rows": 175,
+      "expected_rows": 175
+    }
+  },
+  {
+    "run": "reference-mappings-io16-01",
+    "output": "s1-q09-cal0.arrow",
+    "result": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "expected_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "actual_rows": 175,
+      "expected_rows": 175
+    }
+  },
+  {
+    "run": "reference-mappings-io16-01",
+    "output": "s1-q09-duckdb-warmup.arrow",
+    "result": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "expected_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "actual_rows": 175,
+      "expected_rows": 175
+    }
+  },
+  {
+    "run": "reference-mappings-io16-01",
+    "output": "s1-q09-oracle.arrow",
+    "result": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "expected_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "actual_rows": 175,
+      "expected_rows": 175
+    }
+  }
+]

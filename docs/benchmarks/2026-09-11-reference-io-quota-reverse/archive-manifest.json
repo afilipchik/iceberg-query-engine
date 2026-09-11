@@ -1,0 +1,19 @@
+{
+  "files": {
+    "reference-mappings-02/control.json": "ec711342011308c583c4a6a1b5127979ad875fc271750a7056c7594bb14be337",
+    "reference-mappings-02/manifest.json": "3773de2a01a08cf23c9bc7795be58fc02ff8a45b483d7696e36721f9cc61d9e5",
+    "reference-mappings-02/worker.py": "c1cb22971ee85ae0cdba5f002890d9da984aa4aafef3949b0b002c1429e4f7a2",
+    "reference-mappings-io16-02/control.json": "38435a93a96e428d4860b1559e7a04e5e33f4a8d758879670407719768a737f8",
+    "reference-mappings-io16-02/manifest.json": "8880d6d132400111b8013a75c0eea6288a56d625f598e66c2ae37ccec7aa2456",
+    "reference-mappings-io16-02/worker.py": "c1cb22971ee85ae0cdba5f002890d9da984aa4aafef3949b0b002c1429e4f7a2",
+    "reference-mappings-02/lance/requests.json": "f8e3912e84fc9f89732e2fc7dbbe99259b8eeb26e2e902ae6f2117d1b27e1f07",
+    "reference-mappings-02/lance/setup.json": "0415aca3bd18d135716ff919e2676c5dc6e1ab486a17bafa5b655b54ed514ec3",
+    "reference-mappings-02/lance/stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reference-mappings-02/lance/stdout.jsonl.gz": "f0f405d8cc473619bbea6e8729ccb9cf7c893a5b47d184ee63590ac939611920",
+    "reference-mappings-io16-02/lance/requests.json": "dbcd6fa1e5891dfec4511e16da4e90977982ef960bce9efaf850c3b5416d1caf",
+    "reference-mappings-io16-02/lance/setup.json": "72e627340984a508c52004f2be86d0e20e803a5d0bbdf1dcce20a31162b3bb4d",
+    "reference-mappings-io16-02/lance/stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reference-mappings-io16-02/lance/stdout.jsonl.gz": "3b047f1531545c3eabfa986865518d2a3654a76afe8b3222e8ce6c0389259cae"
+  },
+  "compression": "gzip, lossless verified against scratch traces"
+}

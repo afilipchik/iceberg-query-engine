@@ -1,0 +1,66 @@
+[
+  {
+    "track": "iceberg",
+    "mode": "default",
+    "repeat": 0,
+    "exit_code": 0,
+    "timeout": false,
+    "seconds": 2.4194640377536416
+  },
+  {
+    "track": "iceberg",
+    "mode": "construction",
+    "repeat": 0,
+    "exit_code": 0,
+    "timeout": false,
+    "seconds": 2.4704887149855494
+  },
+  {
+    "track": "lance",
+    "mode": "default",
+    "repeat": 0,
+    "exit_code": 0,
+    "timeout": false,
+    "seconds": 1.2181236799806356
+  },
+  {
+    "track": "lance",
+    "mode": "construction",
+    "repeat": 0,
+    "exit_code": 0,
+    "timeout": false,
+    "seconds": 1.170605419203639
+  },
+  {
+    "track": "iceberg",
+    "mode": "construction",
+    "repeat": 1,
+    "exit_code": 0,
+    "timeout": false,
+    "seconds": 2.4214148628525436
+  },
+  {
+    "track": "iceberg",
+    "mode": "default",
+    "repeat": 1,
+    "exit_code": 0,
+    "timeout": false,
+    "seconds": 2.4177119778469205
+  },
+  {
+    "track": "lance",
+    "mode": "construction",
+    "repeat": 1,
+    "exit_code": 0,
+    "timeout": false,
+    "seconds": 1.1806113650090992
+  },
+  {
+    "track": "lance",
+    "mode": "default",
+    "repeat": 1,
+    "exit_code": 0,
+    "timeout": false,
+    "seconds": 1.172743170056492
+  }
+]

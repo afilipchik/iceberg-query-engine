@@ -1,0 +1,922 @@
+[
+  {
+    "id": "s1-q08-duckdb-plan",
+    "sql": "EXPLAIN SELECT\n    o_year,\n    sum(\n        CASE WHEN nation = 'BRAZIL' THEN\n            volume\n        ELSE\n            0\n        END) / sum(volume) AS mkt_share\nFROM (\n    SELECT\n        extract(year FROM o_orderdate) AS o_year,\n        l_extendedprice * (1 - l_discount) AS volume,\n        n2.n_name AS nation\n    FROM\n        part,\n        supplier,\n        lineitem,\n        orders,\n        customer,\n        nation n1,\n        nation n2,\n        region\n    WHERE\n        p_partkey = l_partkey\n        AND s_suppkey = l_suppkey\n        AND l_orderkey = o_orderkey\n        AND o_custkey = c_custkey\n        AND c_nationkey = n1.n_nationkey\n        AND n1.n_regionkey = r_regionkey\n        AND r_name = 'AMERICA'\n        AND s_nationkey = n2.n_nationkey\n        AND o_orderdate BETWEEN CAST('1995-01-01' AS date)\n        AND CAST('1996-12-31' AS date)\n        AND p_type = 'ECONOMY ANODIZED STEEL') AS all_nations\nGROUP BY\n    o_year\nORDER BY\n    o_year;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q08-duckdb-plan.arrow"
+  },
+  {
+    "id": "s1-q08-oracle",
+    "sql": "SELECT\n    o_year,\n    sum(\n        CASE WHEN nation = 'BRAZIL' THEN\n            volume\n        ELSE\n            0\n        END) / sum(volume) AS mkt_share\nFROM (\n    SELECT\n        extract(year FROM o_orderdate) AS o_year,\n        l_extendedprice * (1 - l_discount) AS volume,\n        n2.n_name AS nation\n    FROM\n        part,\n        supplier,\n        lineitem,\n        orders,\n        customer,\n        nation n1,\n        nation n2,\n        region\n    WHERE\n        p_partkey = l_partkey\n        AND s_suppkey = l_suppkey\n        AND l_orderkey = o_orderkey\n        AND o_custkey = c_custkey\n        AND c_nationkey = n1.n_nationkey\n        AND n1.n_regionkey = r_regionkey\n        AND r_name = 'AMERICA'\n        AND s_nationkey = n2.n_nationkey\n        AND o_orderdate BETWEEN CAST('1995-01-01' AS date)\n        AND CAST('1996-12-31' AS date)\n        AND p_type = 'ECONOMY ANODIZED STEEL') AS all_nations\nGROUP BY\n    o_year\nORDER BY\n    o_year;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q08-oracle.arrow"
+  },
+  {
+    "id": "s1-q08-duckdb-warmup",
+    "sql": "SELECT\n    o_year,\n    sum(\n        CASE WHEN nation = 'BRAZIL' THEN\n            volume\n        ELSE\n            0\n        END) / sum(volume) AS mkt_share\nFROM (\n    SELECT\n        extract(year FROM o_orderdate) AS o_year,\n        l_extendedprice * (1 - l_discount) AS volume,\n        n2.n_name AS nation\n    FROM\n        part,\n        supplier,\n        lineitem,\n        orders,\n        customer,\n        nation n1,\n        nation n2,\n        region\n    WHERE\n        p_partkey = l_partkey\n        AND s_suppkey = l_suppkey\n        AND l_orderkey = o_orderkey\n        AND o_custkey = c_custkey\n        AND c_nationkey = n1.n_nationkey\n        AND n1.n_regionkey = r_regionkey\n        AND r_name = 'AMERICA'\n        AND s_nationkey = n2.n_nationkey\n        AND o_orderdate BETWEEN CAST('1995-01-01' AS date)\n        AND CAST('1996-12-31' AS date)\n        AND p_type = 'ECONOMY ANODIZED STEEL') AS all_nations\nGROUP BY\n    o_year\nORDER BY\n    o_year;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q08-duckdb-warmup.arrow"
+  },
+  {
+    "id": "s1-q08-cal0",
+    "sql": "SELECT\n    o_year,\n    sum(\n        CASE WHEN nation = 'BRAZIL' THEN\n            volume\n        ELSE\n            0\n        END) / sum(volume) AS mkt_share\nFROM (\n    SELECT\n        extract(year FROM o_orderdate) AS o_year,\n        l_extendedprice * (1 - l_discount) AS volume,\n        n2.n_name AS nation\n    FROM\n        part,\n        supplier,\n        lineitem,\n        orders,\n        customer,\n        nation n1,\n        nation n2,\n        region\n    WHERE\n        p_partkey = l_partkey\n        AND s_suppkey = l_suppkey\n        AND l_orderkey = o_orderkey\n        AND o_custkey = c_custkey\n        AND c_nationkey = n1.n_nationkey\n        AND n1.n_regionkey = r_regionkey\n        AND r_name = 'AMERICA'\n        AND s_nationkey = n2.n_nationkey\n        AND o_orderdate BETWEEN CAST('1995-01-01' AS date)\n        AND CAST('1996-12-31' AS date)\n        AND p_type = 'ECONOMY ANODIZED STEEL') AS all_nations\nGROUP BY\n    o_year\nORDER BY\n    o_year;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q08-cal0.arrow"
+  },
+  {
+    "id": "s1-q08-cal1",
+    "sql": "SELECT\n    o_year,\n    sum(\n        CASE WHEN nation = 'BRAZIL' THEN\n            volume\n        ELSE\n            0\n        END) / sum(volume) AS mkt_share\nFROM (\n    SELECT\n        extract(year FROM o_orderdate) AS o_year,\n        l_extendedprice * (1 - l_discount) AS volume,\n        n2.n_name AS nation\n    FROM\n        part,\n        supplier,\n        lineitem,\n        orders,\n        customer,\n        nation n1,\n        nation n2,\n        region\n    WHERE\n        p_partkey = l_partkey\n        AND s_suppkey = l_suppkey\n        AND l_orderkey = o_orderkey\n        AND o_custkey = c_custkey\n        AND c_nationkey = n1.n_nationkey\n        AND n1.n_regionkey = r_regionkey\n        AND r_name = 'AMERICA'\n        AND s_nationkey = n2.n_nationkey\n        AND o_orderdate BETWEEN CAST('1995-01-01' AS date)\n        AND CAST('1996-12-31' AS date)\n        AND p_type = 'ECONOMY ANODIZED STEEL') AS all_nations\nGROUP BY\n    o_year\nORDER BY\n    o_year;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q08-cal1.arrow"
+  },
+  {
+    "id": "s1-q08-cal2",
+    "sql": "SELECT\n    o_year,\n    sum(\n        CASE WHEN nation = 'BRAZIL' THEN\n            volume\n        ELSE\n            0\n        END) / sum(volume) AS mkt_share\nFROM (\n    SELECT\n        extract(year FROM o_orderdate) AS o_year,\n        l_extendedprice * (1 - l_discount) AS volume,\n        n2.n_name AS nation\n    FROM\n        part,\n        supplier,\n        lineitem,\n        orders,\n        customer,\n        nation n1,\n        nation n2,\n        region\n    WHERE\n        p_partkey = l_partkey\n        AND s_suppkey = l_suppkey\n        AND l_orderkey = o_orderkey\n        AND o_custkey = c_custkey\n        AND c_nationkey = n1.n_nationkey\n        AND n1.n_regionkey = r_regionkey\n        AND r_name = 'AMERICA'\n        AND s_nationkey = n2.n_nationkey\n        AND o_orderdate BETWEEN CAST('1995-01-01' AS date)\n        AND CAST('1996-12-31' AS date)\n        AND p_type = 'ECONOMY ANODIZED STEEL') AS all_nations\nGROUP BY\n    o_year\nORDER BY\n    o_year;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q08-cal2.arrow"
+  },
+  {
+    "id": "s1-q08-1-duckdb",
+    "sql": "SELECT\n    o_year,\n    sum(\n        CASE WHEN nation = 'BRAZIL' THEN\n            volume\n        ELSE\n            0\n        END) / sum(volume) AS mkt_share\nFROM (\n    SELECT\n        extract(year FROM o_orderdate) AS o_year,\n        l_extendedprice * (1 - l_discount) AS volume,\n        n2.n_name AS nation\n    FROM\n        part,\n        supplier,\n        lineitem,\n        orders,\n        customer,\n        nation n1,\n        nation n2,\n        region\n    WHERE\n        p_partkey = l_partkey\n        AND s_suppkey = l_suppkey\n        AND l_orderkey = o_orderkey\n        AND o_custkey = c_custkey\n        AND c_nationkey = n1.n_nationkey\n        AND n1.n_regionkey = r_regionkey\n        AND r_name = 'AMERICA'\n        AND s_nationkey = n2.n_nationkey\n        AND o_orderdate BETWEEN CAST('1995-01-01' AS date)\n        AND CAST('1996-12-31' AS date)\n        AND p_type = 'ECONOMY ANODIZED STEEL') AS all_nations\nGROUP BY\n    o_year\nORDER BY\n    o_year;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q08-1-duckdb.arrow"
+  },
+  {
+    "id": "s1-q08-2-duckdb",
+    "sql": "SELECT\n    o_year,\n    sum(\n        CASE WHEN nation = 'BRAZIL' THEN\n            volume\n        ELSE\n            0\n        END) / sum(volume) AS mkt_share\nFROM (\n    SELECT\n        extract(year FROM o_orderdate) AS o_year,\n        l_extendedprice * (1 - l_discount) AS volume,\n        n2.n_name AS nation\n    FROM\n        part,\n        supplier,\n        lineitem,\n        orders,\n        customer,\n        nation n1,\n        nation n2,\n        region\n    WHERE\n        p_partkey = l_partkey\n        AND s_suppkey = l_suppkey\n        AND l_orderkey = o_orderkey\n        AND o_custkey = c_custkey\n        AND c_nationkey = n1.n_nationkey\n        AND n1.n_regionkey = r_regionkey\n        AND r_name = 'AMERICA'\n        AND s_nationkey = n2.n_nationkey\n        AND o_orderdate BETWEEN CAST('1995-01-01' AS date)\n        AND CAST('1996-12-31' AS date)\n        AND p_type = 'ECONOMY ANODIZED STEEL') AS all_nations\nGROUP BY\n    o_year\nORDER BY\n    o_year;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q08-2-duckdb.arrow"
+  },
+  {
+    "id": "s1-q08-3-duckdb",
+    "sql": "SELECT\n    o_year,\n    sum(\n        CASE WHEN nation = 'BRAZIL' THEN\n            volume\n        ELSE\n            0\n        END) / sum(volume) AS mkt_share\nFROM (\n    SELECT\n        extract(year FROM o_orderdate) AS o_year,\n        l_extendedprice * (1 - l_discount) AS volume,\n        n2.n_name AS nation\n    FROM\n        part,\n        supplier,\n        lineitem,\n        orders,\n        customer,\n        nation n1,\n        nation n2,\n        region\n    WHERE\n        p_partkey = l_partkey\n        AND s_suppkey = l_suppkey\n        AND l_orderkey = o_orderkey\n        AND o_custkey = c_custkey\n        AND c_nationkey = n1.n_nationkey\n        AND n1.n_regionkey = r_regionkey\n        AND r_name = 'AMERICA'\n        AND s_nationkey = n2.n_nationkey\n        AND o_orderdate BETWEEN CAST('1995-01-01' AS date)\n        AND CAST('1996-12-31' AS date)\n        AND p_type = 'ECONOMY ANODIZED STEEL') AS all_nations\nGROUP BY\n    o_year\nORDER BY\n    o_year;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q08-3-duckdb.arrow"
+  },
+  {
+    "id": "s1-q20-duckdb-plan",
+    "sql": "EXPLAIN SELECT\n    s_name,\n    s_address\nFROM\n    supplier,\n    nation\nWHERE\n    s_suppkey IN (\n        SELECT\n            ps_suppkey\n        FROM\n            partsupp\n        WHERE\n            ps_partkey IN (\n                SELECT\n                    p_partkey\n                FROM\n                    part\n                WHERE\n                    p_name LIKE 'forest%')\n                AND ps_availqty > (\n                    SELECT\n                        0.5 * sum(l_quantity)\n                    FROM\n                        lineitem\n                    WHERE\n                        l_partkey = ps_partkey\n                        AND l_suppkey = ps_suppkey\n                        AND l_shipdate >= CAST('1994-01-01' AS date)\n                        AND l_shipdate < CAST('1995-01-01' AS date)))\n            AND s_nationkey = n_nationkey\n            AND n_name = 'CANADA'\n        ORDER BY\n            s_name;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q20-duckdb-plan.arrow"
+  },
+  {
+    "id": "s1-q20-oracle",
+    "sql": "SELECT\n    s_name,\n    s_address\nFROM\n    supplier,\n    nation\nWHERE\n    s_suppkey IN (\n        SELECT\n            ps_suppkey\n        FROM\n            partsupp\n        WHERE\n            ps_partkey IN (\n                SELECT\n                    p_partkey\n                FROM\n                    part\n                WHERE\n                    p_name LIKE 'forest%')\n                AND ps_availqty > (\n                    SELECT\n                        0.5 * sum(l_quantity)\n                    FROM\n                        lineitem\n                    WHERE\n                        l_partkey = ps_partkey\n                        AND l_suppkey = ps_suppkey\n                        AND l_shipdate >= CAST('1994-01-01' AS date)\n                        AND l_shipdate < CAST('1995-01-01' AS date)))\n            AND s_nationkey = n_nationkey\n            AND n_name = 'CANADA'\n        ORDER BY\n            s_name;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q20-oracle.arrow"
+  },
+  {
+    "id": "s1-q20-duckdb-warmup",
+    "sql": "SELECT\n    s_name,\n    s_address\nFROM\n    supplier,\n    nation\nWHERE\n    s_suppkey IN (\n        SELECT\n            ps_suppkey\n        FROM\n            partsupp\n        WHERE\n            ps_partkey IN (\n                SELECT\n                    p_partkey\n                FROM\n                    part\n                WHERE\n                    p_name LIKE 'forest%')\n                AND ps_availqty > (\n                    SELECT\n                        0.5 * sum(l_quantity)\n                    FROM\n                        lineitem\n                    WHERE\n                        l_partkey = ps_partkey\n                        AND l_suppkey = ps_suppkey\n                        AND l_shipdate >= CAST('1994-01-01' AS date)\n                        AND l_shipdate < CAST('1995-01-01' AS date)))\n            AND s_nationkey = n_nationkey\n            AND n_name = 'CANADA'\n        ORDER BY\n            s_name;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q20-duckdb-warmup.arrow"
+  },
+  {
+    "id": "s1-q20-cal0",
+    "sql": "SELECT\n    s_name,\n    s_address\nFROM\n    supplier,\n    nation\nWHERE\n    s_suppkey IN (\n        SELECT\n            ps_suppkey\n        FROM\n            partsupp\n        WHERE\n            ps_partkey IN (\n                SELECT\n                    p_partkey\n                FROM\n                    part\n                WHERE\n                    p_name LIKE 'forest%')\n                AND ps_availqty > (\n                    SELECT\n                        0.5 * sum(l_quantity)\n                    FROM\n                        lineitem\n                    WHERE\n                        l_partkey = ps_partkey\n                        AND l_suppkey = ps_suppkey\n                        AND l_shipdate >= CAST('1994-01-01' AS date)\n                        AND l_shipdate < CAST('1995-01-01' AS date)))\n            AND s_nationkey = n_nationkey\n            AND n_name = 'CANADA'\n        ORDER BY\n            s_name;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q20-cal0.arrow"
+  },
+  {
+    "id": "s1-q20-cal1",
+    "sql": "SELECT\n    s_name,\n    s_address\nFROM\n    supplier,\n    nation\nWHERE\n    s_suppkey IN (\n        SELECT\n            ps_suppkey\n        FROM\n            partsupp\n        WHERE\n            ps_partkey IN (\n                SELECT\n                    p_partkey\n                FROM\n                    part\n                WHERE\n                    p_name LIKE 'forest%')\n                AND ps_availqty > (\n                    SELECT\n                        0.5 * sum(l_quantity)\n                    FROM\n                        lineitem\n                    WHERE\n                        l_partkey = ps_partkey\n                        AND l_suppkey = ps_suppkey\n                        AND l_shipdate >= CAST('1994-01-01' AS date)\n                        AND l_shipdate < CAST('1995-01-01' AS date)))\n            AND s_nationkey = n_nationkey\n            AND n_name = 'CANADA'\n        ORDER BY\n            s_name;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q20-cal1.arrow"
+  },
+  {
+    "id": "s1-q20-cal2",
+    "sql": "SELECT\n    s_name,\n    s_address\nFROM\n    supplier,\n    nation\nWHERE\n    s_suppkey IN (\n        SELECT\n            ps_suppkey\n        FROM\n            partsupp\n        WHERE\n            ps_partkey IN (\n                SELECT\n                    p_partkey\n                FROM\n                    part\n                WHERE\n                    p_name LIKE 'forest%')\n                AND ps_availqty > (\n                    SELECT\n                        0.5 * sum(l_quantity)\n                    FROM\n                        lineitem\n                    WHERE\n                        l_partkey = ps_partkey\n                        AND l_suppkey = ps_suppkey\n                        AND l_shipdate >= CAST('1994-01-01' AS date)\n                        AND l_shipdate < CAST('1995-01-01' AS date)))\n            AND s_nationkey = n_nationkey\n            AND n_name = 'CANADA'\n        ORDER BY\n            s_name;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q20-cal2.arrow"
+  },
+  {
+    "id": "s1-q20-1-duckdb",
+    "sql": "SELECT\n    s_name,\n    s_address\nFROM\n    supplier,\n    nation\nWHERE\n    s_suppkey IN (\n        SELECT\n            ps_suppkey\n        FROM\n            partsupp\n        WHERE\n            ps_partkey IN (\n                SELECT\n                    p_partkey\n                FROM\n                    part\n                WHERE\n                    p_name LIKE 'forest%')\n                AND ps_availqty > (\n                    SELECT\n                        0.5 * sum(l_quantity)\n                    FROM\n                        lineitem\n                    WHERE\n                        l_partkey = ps_partkey\n                        AND l_suppkey = ps_suppkey\n                        AND l_shipdate >= CAST('1994-01-01' AS date)\n                        AND l_shipdate < CAST('1995-01-01' AS date)))\n            AND s_nationkey = n_nationkey\n            AND n_name = 'CANADA'\n        ORDER BY\n            s_name;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q20-1-duckdb.arrow"
+  },
+  {
+    "id": "s1-q20-2-duckdb",
+    "sql": "SELECT\n    s_name,\n    s_address\nFROM\n    supplier,\n    nation\nWHERE\n    s_suppkey IN (\n        SELECT\n            ps_suppkey\n        FROM\n            partsupp\n        WHERE\n            ps_partkey IN (\n                SELECT\n                    p_partkey\n                FROM\n                    part\n                WHERE\n                    p_name LIKE 'forest%')\n                AND ps_availqty > (\n                    SELECT\n                        0.5 * sum(l_quantity)\n                    FROM\n                        lineitem\n                    WHERE\n                        l_partkey = ps_partkey\n                        AND l_suppkey = ps_suppkey\n                        AND l_shipdate >= CAST('1994-01-01' AS date)\n                        AND l_shipdate < CAST('1995-01-01' AS date)))\n            AND s_nationkey = n_nationkey\n            AND n_name = 'CANADA'\n        ORDER BY\n            s_name;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q20-2-duckdb.arrow"
+  },
+  {
+    "id": "s1-q20-3-duckdb",
+    "sql": "SELECT\n    s_name,\n    s_address\nFROM\n    supplier,\n    nation\nWHERE\n    s_suppkey IN (\n        SELECT\n            ps_suppkey\n        FROM\n            partsupp\n        WHERE\n            ps_partkey IN (\n                SELECT\n                    p_partkey\n                FROM\n                    part\n                WHERE\n                    p_name LIKE 'forest%')\n                AND ps_availqty > (\n                    SELECT\n                        0.5 * sum(l_quantity)\n                    FROM\n                        lineitem\n                    WHERE\n                        l_partkey = ps_partkey\n                        AND l_suppkey = ps_suppkey\n                        AND l_shipdate >= CAST('1994-01-01' AS date)\n                        AND l_shipdate < CAST('1995-01-01' AS date)))\n            AND s_nationkey = n_nationkey\n            AND n_name = 'CANADA'\n        ORDER BY\n            s_name;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q20-3-duckdb.arrow"
+  },
+  {
+    "id": "s1-q06-duckdb-plan",
+    "sql": "EXPLAIN SELECT\n    sum(l_extendedprice * l_discount) AS revenue\nFROM\n    lineitem\nWHERE\n    l_shipdate >= CAST('1994-01-01' AS date)\n    AND l_shipdate < CAST('1995-01-01' AS date)\n    AND l_discount BETWEEN 0.05\n    AND 0.07\n    AND l_quantity < 24;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q06-duckdb-plan.arrow"
+  },
+  {
+    "id": "s1-q06-oracle",
+    "sql": "SELECT\n    sum(l_extendedprice * l_discount) AS revenue\nFROM\n    lineitem\nWHERE\n    l_shipdate >= CAST('1994-01-01' AS date)\n    AND l_shipdate < CAST('1995-01-01' AS date)\n    AND l_discount BETWEEN 0.05\n    AND 0.07\n    AND l_quantity < 24;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q06-oracle.arrow"
+  },
+  {
+    "id": "s1-q06-duckdb-warmup",
+    "sql": "SELECT\n    sum(l_extendedprice * l_discount) AS revenue\nFROM\n    lineitem\nWHERE\n    l_shipdate >= CAST('1994-01-01' AS date)\n    AND l_shipdate < CAST('1995-01-01' AS date)\n    AND l_discount BETWEEN 0.05\n    AND 0.07\n    AND l_quantity < 24;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q06-duckdb-warmup.arrow"
+  },
+  {
+    "id": "s1-q06-cal0",
+    "sql": "SELECT\n    sum(l_extendedprice * l_discount) AS revenue\nFROM\n    lineitem\nWHERE\n    l_shipdate >= CAST('1994-01-01' AS date)\n    AND l_shipdate < CAST('1995-01-01' AS date)\n    AND l_discount BETWEEN 0.05\n    AND 0.07\n    AND l_quantity < 24;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q06-cal0.arrow"
+  },
+  {
+    "id": "s1-q06-cal1",
+    "sql": "SELECT\n    sum(l_extendedprice * l_discount) AS revenue\nFROM\n    lineitem\nWHERE\n    l_shipdate >= CAST('1994-01-01' AS date)\n    AND l_shipdate < CAST('1995-01-01' AS date)\n    AND l_discount BETWEEN 0.05\n    AND 0.07\n    AND l_quantity < 24;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q06-cal1.arrow"
+  },
+  {
+    "id": "s1-q06-cal2",
+    "sql": "SELECT\n    sum(l_extendedprice * l_discount) AS revenue\nFROM\n    lineitem\nWHERE\n    l_shipdate >= CAST('1994-01-01' AS date)\n    AND l_shipdate < CAST('1995-01-01' AS date)\n    AND l_discount BETWEEN 0.05\n    AND 0.07\n    AND l_quantity < 24;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q06-cal2.arrow"
+  },
+  {
+    "id": "s1-q06-1-duckdb",
+    "sql": "SELECT\n    sum(l_extendedprice * l_discount) AS revenue\nFROM\n    lineitem\nWHERE\n    l_shipdate >= CAST('1994-01-01' AS date)\n    AND l_shipdate < CAST('1995-01-01' AS date)\n    AND l_discount BETWEEN 0.05\n    AND 0.07\n    AND l_quantity < 24;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q06-1-duckdb.arrow"
+  },
+  {
+    "id": "s1-q06-2-duckdb",
+    "sql": "SELECT\n    sum(l_extendedprice * l_discount) AS revenue\nFROM\n    lineitem\nWHERE\n    l_shipdate >= CAST('1994-01-01' AS date)\n    AND l_shipdate < CAST('1995-01-01' AS date)\n    AND l_discount BETWEEN 0.05\n    AND 0.07\n    AND l_quantity < 24;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q06-2-duckdb.arrow"
+  },
+  {
+    "id": "s1-q06-3-duckdb",
+    "sql": "SELECT\n    sum(l_extendedprice * l_discount) AS revenue\nFROM\n    lineitem\nWHERE\n    l_shipdate >= CAST('1994-01-01' AS date)\n    AND l_shipdate < CAST('1995-01-01' AS date)\n    AND l_discount BETWEEN 0.05\n    AND 0.07\n    AND l_quantity < 24;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q06-3-duckdb.arrow"
+  },
+  {
+    "id": "s1-q07-duckdb-plan",
+    "sql": "EXPLAIN SELECT\n    supp_nation,\n    cust_nation,\n    l_year,\n    sum(volume) AS revenue\nFROM (\n    SELECT\n        n1.n_name AS supp_nation,\n        n2.n_name AS cust_nation,\n        extract(year FROM l_shipdate) AS l_year,\n        l_extendedprice * (1 - l_discount) AS volume\n    FROM\n        supplier,\n        lineitem,\n        orders,\n        customer,\n        nation n1,\n        nation n2\n    WHERE\n        s_suppkey = l_suppkey\n        AND o_orderkey = l_orderkey\n        AND c_custkey = o_custkey\n        AND s_nationkey = n1.n_nationkey\n        AND c_nationkey = n2.n_nationkey\n        AND ((n1.n_name = 'FRANCE'\n                AND n2.n_name = 'GERMANY')\n            OR (n1.n_name = 'GERMANY'\n                AND n2.n_name = 'FRANCE'))\n        AND l_shipdate BETWEEN CAST('1995-01-01' AS date)\n        AND CAST('1996-12-31' AS date)) AS shipping\nGROUP BY\n    supp_nation,\n    cust_nation,\n    l_year\nORDER BY\n    supp_nation,\n    cust_nation,\n    l_year;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q07-duckdb-plan.arrow"
+  },
+  {
+    "id": "s1-q07-oracle",
+    "sql": "SELECT\n    supp_nation,\n    cust_nation,\n    l_year,\n    sum(volume) AS revenue\nFROM (\n    SELECT\n        n1.n_name AS supp_nation,\n        n2.n_name AS cust_nation,\n        extract(year FROM l_shipdate) AS l_year,\n        l_extendedprice * (1 - l_discount) AS volume\n    FROM\n        supplier,\n        lineitem,\n        orders,\n        customer,\n        nation n1,\n        nation n2\n    WHERE\n        s_suppkey = l_suppkey\n        AND o_orderkey = l_orderkey\n        AND c_custkey = o_custkey\n        AND s_nationkey = n1.n_nationkey\n        AND c_nationkey = n2.n_nationkey\n        AND ((n1.n_name = 'FRANCE'\n                AND n2.n_name = 'GERMANY')\n            OR (n1.n_name = 'GERMANY'\n                AND n2.n_name = 'FRANCE'))\n        AND l_shipdate BETWEEN CAST('1995-01-01' AS date)\n        AND CAST('1996-12-31' AS date)) AS shipping\nGROUP BY\n    supp_nation,\n    cust_nation,\n    l_year\nORDER BY\n    supp_nation,\n    cust_nation,\n    l_year;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q07-oracle.arrow"
+  },
+  {
+    "id": "s1-q07-duckdb-warmup",
+    "sql": "SELECT\n    supp_nation,\n    cust_nation,\n    l_year,\n    sum(volume) AS revenue\nFROM (\n    SELECT\n        n1.n_name AS supp_nation,\n        n2.n_name AS cust_nation,\n        extract(year FROM l_shipdate) AS l_year,\n        l_extendedprice * (1 - l_discount) AS volume\n    FROM\n        supplier,\n        lineitem,\n        orders,\n        customer,\n        nation n1,\n        nation n2\n    WHERE\n        s_suppkey = l_suppkey\n        AND o_orderkey = l_orderkey\n        AND c_custkey = o_custkey\n        AND s_nationkey = n1.n_nationkey\n        AND c_nationkey = n2.n_nationkey\n        AND ((n1.n_name = 'FRANCE'\n                AND n2.n_name = 'GERMANY')\n            OR (n1.n_name = 'GERMANY'\n                AND n2.n_name = 'FRANCE'))\n        AND l_shipdate BETWEEN CAST('1995-01-01' AS date)\n        AND CAST('1996-12-31' AS date)) AS shipping\nGROUP BY\n    supp_nation,\n    cust_nation,\n    l_year\nORDER BY\n    supp_nation,\n    cust_nation,\n    l_year;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q07-duckdb-warmup.arrow"
+  },
+  {
+    "id": "s1-q07-cal0",
+    "sql": "SELECT\n    supp_nation,\n    cust_nation,\n    l_year,\n    sum(volume) AS revenue\nFROM (\n    SELECT\n        n1.n_name AS supp_nation,\n        n2.n_name AS cust_nation,\n        extract(year FROM l_shipdate) AS l_year,\n        l_extendedprice * (1 - l_discount) AS volume\n    FROM\n        supplier,\n        lineitem,\n        orders,\n        customer,\n        nation n1,\n        nation n2\n    WHERE\n        s_suppkey = l_suppkey\n        AND o_orderkey = l_orderkey\n        AND c_custkey = o_custkey\n        AND s_nationkey = n1.n_nationkey\n        AND c_nationkey = n2.n_nationkey\n        AND ((n1.n_name = 'FRANCE'\n                AND n2.n_name = 'GERMANY')\n            OR (n1.n_name = 'GERMANY'\n                AND n2.n_name = 'FRANCE'))\n        AND l_shipdate BETWEEN CAST('1995-01-01' AS date)\n        AND CAST('1996-12-31' AS date)) AS shipping\nGROUP BY\n    supp_nation,\n    cust_nation,\n    l_year\nORDER BY\n    supp_nation,\n    cust_nation,\n    l_year;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q07-cal0.arrow"
+  },
+  {
+    "id": "s1-q07-cal1",
+    "sql": "SELECT\n    supp_nation,\n    cust_nation,\n    l_year,\n    sum(volume) AS revenue\nFROM (\n    SELECT\n        n1.n_name AS supp_nation,\n        n2.n_name AS cust_nation,\n        extract(year FROM l_shipdate) AS l_year,\n        l_extendedprice * (1 - l_discount) AS volume\n    FROM\n        supplier,\n        lineitem,\n        orders,\n        customer,\n        nation n1,\n        nation n2\n    WHERE\n        s_suppkey = l_suppkey\n        AND o_orderkey = l_orderkey\n        AND c_custkey = o_custkey\n        AND s_nationkey = n1.n_nationkey\n        AND c_nationkey = n2.n_nationkey\n        AND ((n1.n_name = 'FRANCE'\n                AND n2.n_name = 'GERMANY')\n            OR (n1.n_name = 'GERMANY'\n                AND n2.n_name = 'FRANCE'))\n        AND l_shipdate BETWEEN CAST('1995-01-01' AS date)\n        AND CAST('1996-12-31' AS date)) AS shipping\nGROUP BY\n    supp_nation,\n    cust_nation,\n    l_year\nORDER BY\n    supp_nation,\n    cust_nation,\n    l_year;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q07-cal1.arrow"
+  },
+  {
+    "id": "s1-q07-cal2",
+    "sql": "SELECT\n    supp_nation,\n    cust_nation,\n    l_year,\n    sum(volume) AS revenue\nFROM (\n    SELECT\n        n1.n_name AS supp_nation,\n        n2.n_name AS cust_nation,\n        extract(year FROM l_shipdate) AS l_year,\n        l_extendedprice * (1 - l_discount) AS volume\n    FROM\n        supplier,\n        lineitem,\n        orders,\n        customer,\n        nation n1,\n        nation n2\n    WHERE\n        s_suppkey = l_suppkey\n        AND o_orderkey = l_orderkey\n        AND c_custkey = o_custkey\n        AND s_nationkey = n1.n_nationkey\n        AND c_nationkey = n2.n_nationkey\n        AND ((n1.n_name = 'FRANCE'\n                AND n2.n_name = 'GERMANY')\n            OR (n1.n_name = 'GERMANY'\n                AND n2.n_name = 'FRANCE'))\n        AND l_shipdate BETWEEN CAST('1995-01-01' AS date)\n        AND CAST('1996-12-31' AS date)) AS shipping\nGROUP BY\n    supp_nation,\n    cust_nation,\n    l_year\nORDER BY\n    supp_nation,\n    cust_nation,\n    l_year;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q07-cal2.arrow"
+  },
+  {
+    "id": "s1-q07-1-duckdb",
+    "sql": "SELECT\n    supp_nation,\n    cust_nation,\n    l_year,\n    sum(volume) AS revenue\nFROM (\n    SELECT\n        n1.n_name AS supp_nation,\n        n2.n_name AS cust_nation,\n        extract(year FROM l_shipdate) AS l_year,\n        l_extendedprice * (1 - l_discount) AS volume\n    FROM\n        supplier,\n        lineitem,\n        orders,\n        customer,\n        nation n1,\n        nation n2\n    WHERE\n        s_suppkey = l_suppkey\n        AND o_orderkey = l_orderkey\n        AND c_custkey = o_custkey\n        AND s_nationkey = n1.n_nationkey\n        AND c_nationkey = n2.n_nationkey\n        AND ((n1.n_name = 'FRANCE'\n                AND n2.n_name = 'GERMANY')\n            OR (n1.n_name = 'GERMANY'\n                AND n2.n_name = 'FRANCE'))\n        AND l_shipdate BETWEEN CAST('1995-01-01' AS date)\n        AND CAST('1996-12-31' AS date)) AS shipping\nGROUP BY\n    supp_nation,\n    cust_nation,\n    l_year\nORDER BY\n    supp_nation,\n    cust_nation,\n    l_year;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q07-1-duckdb.arrow"
+  },
+  {
+    "id": "s1-q07-2-duckdb",
+    "sql": "SELECT\n    supp_nation,\n    cust_nation,\n    l_year,\n    sum(volume) AS revenue\nFROM (\n    SELECT\n        n1.n_name AS supp_nation,\n        n2.n_name AS cust_nation,\n        extract(year FROM l_shipdate) AS l_year,\n        l_extendedprice * (1 - l_discount) AS volume\n    FROM\n        supplier,\n        lineitem,\n        orders,\n        customer,\n        nation n1,\n        nation n2\n    WHERE\n        s_suppkey = l_suppkey\n        AND o_orderkey = l_orderkey\n        AND c_custkey = o_custkey\n        AND s_nationkey = n1.n_nationkey\n        AND c_nationkey = n2.n_nationkey\n        AND ((n1.n_name = 'FRANCE'\n                AND n2.n_name = 'GERMANY')\n            OR (n1.n_name = 'GERMANY'\n                AND n2.n_name = 'FRANCE'))\n        AND l_shipdate BETWEEN CAST('1995-01-01' AS date)\n        AND CAST('1996-12-31' AS date)) AS shipping\nGROUP BY\n    supp_nation,\n    cust_nation,\n    l_year\nORDER BY\n    supp_nation,\n    cust_nation,\n    l_year;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q07-2-duckdb.arrow"
+  },
+  {
+    "id": "s1-q07-3-duckdb",
+    "sql": "SELECT\n    supp_nation,\n    cust_nation,\n    l_year,\n    sum(volume) AS revenue\nFROM (\n    SELECT\n        n1.n_name AS supp_nation,\n        n2.n_name AS cust_nation,\n        extract(year FROM l_shipdate) AS l_year,\n        l_extendedprice * (1 - l_discount) AS volume\n    FROM\n        supplier,\n        lineitem,\n        orders,\n        customer,\n        nation n1,\n        nation n2\n    WHERE\n        s_suppkey = l_suppkey\n        AND o_orderkey = l_orderkey\n        AND c_custkey = o_custkey\n        AND s_nationkey = n1.n_nationkey\n        AND c_nationkey = n2.n_nationkey\n        AND ((n1.n_name = 'FRANCE'\n                AND n2.n_name = 'GERMANY')\n            OR (n1.n_name = 'GERMANY'\n                AND n2.n_name = 'FRANCE'))\n        AND l_shipdate BETWEEN CAST('1995-01-01' AS date)\n        AND CAST('1996-12-31' AS date)) AS shipping\nGROUP BY\n    supp_nation,\n    cust_nation,\n    l_year\nORDER BY\n    supp_nation,\n    cust_nation,\n    l_year;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q07-3-duckdb.arrow"
+  },
+  {
+    "id": "s1-q21-duckdb-plan",
+    "sql": "EXPLAIN SELECT\n    s_name,\n    count(*) AS numwait\nFROM\n    supplier,\n    lineitem l1,\n    orders,\n    nation\nWHERE\n    s_suppkey = l1.l_suppkey\n    AND o_orderkey = l1.l_orderkey\n    AND o_orderstatus = 'F'\n    AND l1.l_receiptdate > l1.l_commitdate\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l2\n        WHERE\n            l2.l_orderkey = l1.l_orderkey\n            AND l2.l_suppkey <> l1.l_suppkey)\n    AND NOT EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l3\n        WHERE\n            l3.l_orderkey = l1.l_orderkey\n            AND l3.l_suppkey <> l1.l_suppkey\n            AND l3.l_receiptdate > l3.l_commitdate)\n    AND s_nationkey = n_nationkey\n    AND n_name = 'SAUDI ARABIA'\nGROUP BY\n    s_name\nORDER BY\n    numwait DESC,\n    s_name\nLIMIT 100;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q21-duckdb-plan.arrow"
+  },
+  {
+    "id": "s1-q21-oracle",
+    "sql": "SELECT\n    s_name,\n    count(*) AS numwait\nFROM\n    supplier,\n    lineitem l1,\n    orders,\n    nation\nWHERE\n    s_suppkey = l1.l_suppkey\n    AND o_orderkey = l1.l_orderkey\n    AND o_orderstatus = 'F'\n    AND l1.l_receiptdate > l1.l_commitdate\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l2\n        WHERE\n            l2.l_orderkey = l1.l_orderkey\n            AND l2.l_suppkey <> l1.l_suppkey)\n    AND NOT EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l3\n        WHERE\n            l3.l_orderkey = l1.l_orderkey\n            AND l3.l_suppkey <> l1.l_suppkey\n            AND l3.l_receiptdate > l3.l_commitdate)\n    AND s_nationkey = n_nationkey\n    AND n_name = 'SAUDI ARABIA'\nGROUP BY\n    s_name\nORDER BY\n    numwait DESC,\n    s_name;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q21-oracle.arrow"
+  },
+  {
+    "id": "s1-q21-duckdb-warmup",
+    "sql": "SELECT\n    s_name,\n    count(*) AS numwait\nFROM\n    supplier,\n    lineitem l1,\n    orders,\n    nation\nWHERE\n    s_suppkey = l1.l_suppkey\n    AND o_orderkey = l1.l_orderkey\n    AND o_orderstatus = 'F'\n    AND l1.l_receiptdate > l1.l_commitdate\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l2\n        WHERE\n            l2.l_orderkey = l1.l_orderkey\n            AND l2.l_suppkey <> l1.l_suppkey)\n    AND NOT EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l3\n        WHERE\n            l3.l_orderkey = l1.l_orderkey\n            AND l3.l_suppkey <> l1.l_suppkey\n            AND l3.l_receiptdate > l3.l_commitdate)\n    AND s_nationkey = n_nationkey\n    AND n_name = 'SAUDI ARABIA'\nGROUP BY\n    s_name\nORDER BY\n    numwait DESC,\n    s_name\nLIMIT 100;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q21-duckdb-warmup.arrow"
+  },
+  {
+    "id": "s1-q21-cal0",
+    "sql": "SELECT\n    s_name,\n    count(*) AS numwait\nFROM\n    supplier,\n    lineitem l1,\n    orders,\n    nation\nWHERE\n    s_suppkey = l1.l_suppkey\n    AND o_orderkey = l1.l_orderkey\n    AND o_orderstatus = 'F'\n    AND l1.l_receiptdate > l1.l_commitdate\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l2\n        WHERE\n            l2.l_orderkey = l1.l_orderkey\n            AND l2.l_suppkey <> l1.l_suppkey)\n    AND NOT EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l3\n        WHERE\n            l3.l_orderkey = l1.l_orderkey\n            AND l3.l_suppkey <> l1.l_suppkey\n            AND l3.l_receiptdate > l3.l_commitdate)\n    AND s_nationkey = n_nationkey\n    AND n_name = 'SAUDI ARABIA'\nGROUP BY\n    s_name\nORDER BY\n    numwait DESC,\n    s_name\nLIMIT 100;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q21-cal0.arrow"
+  },
+  {
+    "id": "s1-q21-cal1",
+    "sql": "SELECT\n    s_name,\n    count(*) AS numwait\nFROM\n    supplier,\n    lineitem l1,\n    orders,\n    nation\nWHERE\n    s_suppkey = l1.l_suppkey\n    AND o_orderkey = l1.l_orderkey\n    AND o_orderstatus = 'F'\n    AND l1.l_receiptdate > l1.l_commitdate\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l2\n        WHERE\n            l2.l_orderkey = l1.l_orderkey\n            AND l2.l_suppkey <> l1.l_suppkey)\n    AND NOT EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l3\n        WHERE\n            l3.l_orderkey = l1.l_orderkey\n            AND l3.l_suppkey <> l1.l_suppkey\n            AND l3.l_receiptdate > l3.l_commitdate)\n    AND s_nationkey = n_nationkey\n    AND n_name = 'SAUDI ARABIA'\nGROUP BY\n    s_name\nORDER BY\n    numwait DESC,\n    s_name\nLIMIT 100;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q21-cal1.arrow"
+  },
+  {
+    "id": "s1-q21-cal2",
+    "sql": "SELECT\n    s_name,\n    count(*) AS numwait\nFROM\n    supplier,\n    lineitem l1,\n    orders,\n    nation\nWHERE\n    s_suppkey = l1.l_suppkey\n    AND o_orderkey = l1.l_orderkey\n    AND o_orderstatus = 'F'\n    AND l1.l_receiptdate > l1.l_commitdate\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l2\n        WHERE\n            l2.l_orderkey = l1.l_orderkey\n            AND l2.l_suppkey <> l1.l_suppkey)\n    AND NOT EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l3\n        WHERE\n            l3.l_orderkey = l1.l_orderkey\n            AND l3.l_suppkey <> l1.l_suppkey\n            AND l3.l_receiptdate > l3.l_commitdate)\n    AND s_nationkey = n_nationkey\n    AND n_name = 'SAUDI ARABIA'\nGROUP BY\n    s_name\nORDER BY\n    numwait DESC,\n    s_name\nLIMIT 100;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q21-cal2.arrow"
+  },
+  {
+    "id": "s1-q21-1-duckdb",
+    "sql": "SELECT\n    s_name,\n    count(*) AS numwait\nFROM\n    supplier,\n    lineitem l1,\n    orders,\n    nation\nWHERE\n    s_suppkey = l1.l_suppkey\n    AND o_orderkey = l1.l_orderkey\n    AND o_orderstatus = 'F'\n    AND l1.l_receiptdate > l1.l_commitdate\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l2\n        WHERE\n            l2.l_orderkey = l1.l_orderkey\n            AND l2.l_suppkey <> l1.l_suppkey)\n    AND NOT EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l3\n        WHERE\n            l3.l_orderkey = l1.l_orderkey\n            AND l3.l_suppkey <> l1.l_suppkey\n            AND l3.l_receiptdate > l3.l_commitdate)\n    AND s_nationkey = n_nationkey\n    AND n_name = 'SAUDI ARABIA'\nGROUP BY\n    s_name\nORDER BY\n    numwait DESC,\n    s_name\nLIMIT 100;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q21-1-duckdb.arrow"
+  },
+  {
+    "id": "s1-q21-2-duckdb",
+    "sql": "SELECT\n    s_name,\n    count(*) AS numwait\nFROM\n    supplier,\n    lineitem l1,\n    orders,\n    nation\nWHERE\n    s_suppkey = l1.l_suppkey\n    AND o_orderkey = l1.l_orderkey\n    AND o_orderstatus = 'F'\n    AND l1.l_receiptdate > l1.l_commitdate\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l2\n        WHERE\n            l2.l_orderkey = l1.l_orderkey\n            AND l2.l_suppkey <> l1.l_suppkey)\n    AND NOT EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l3\n        WHERE\n            l3.l_orderkey = l1.l_orderkey\n            AND l3.l_suppkey <> l1.l_suppkey\n            AND l3.l_receiptdate > l3.l_commitdate)\n    AND s_nationkey = n_nationkey\n    AND n_name = 'SAUDI ARABIA'\nGROUP BY\n    s_name\nORDER BY\n    numwait DESC,\n    s_name\nLIMIT 100;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q21-2-duckdb.arrow"
+  },
+  {
+    "id": "s1-q21-3-duckdb",
+    "sql": "SELECT\n    s_name,\n    count(*) AS numwait\nFROM\n    supplier,\n    lineitem l1,\n    orders,\n    nation\nWHERE\n    s_suppkey = l1.l_suppkey\n    AND o_orderkey = l1.l_orderkey\n    AND o_orderstatus = 'F'\n    AND l1.l_receiptdate > l1.l_commitdate\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l2\n        WHERE\n            l2.l_orderkey = l1.l_orderkey\n            AND l2.l_suppkey <> l1.l_suppkey)\n    AND NOT EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l3\n        WHERE\n            l3.l_orderkey = l1.l_orderkey\n            AND l3.l_suppkey <> l1.l_suppkey\n            AND l3.l_receiptdate > l3.l_commitdate)\n    AND s_nationkey = n_nationkey\n    AND n_name = 'SAUDI ARABIA'\nGROUP BY\n    s_name\nORDER BY\n    numwait DESC,\n    s_name\nLIMIT 100;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q21-3-duckdb.arrow"
+  },
+  {
+    "id": "s1-q10-duckdb-plan",
+    "sql": "EXPLAIN SELECT\n    c_custkey,\n    c_name,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue,\n    c_acctbal,\n    n_name,\n    c_address,\n    c_phone,\n    c_comment\nFROM\n    customer,\n    orders,\n    lineitem,\n    nation\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate >= CAST('1993-10-01' AS date)\n    AND o_orderdate < CAST('1994-01-01' AS date)\n    AND l_returnflag = 'R'\n    AND c_nationkey = n_nationkey\nGROUP BY\n    c_custkey,\n    c_name,\n    c_acctbal,\n    c_phone,\n    n_name,\n    c_address,\n    c_comment\nORDER BY\n    revenue DESC\nLIMIT 20;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q10-duckdb-plan.arrow"
+  },
+  {
+    "id": "s1-q10-oracle",
+    "sql": "SELECT\n    c_custkey,\n    c_name,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue,\n    c_acctbal,\n    n_name,\n    c_address,\n    c_phone,\n    c_comment\nFROM\n    customer,\n    orders,\n    lineitem,\n    nation\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate >= CAST('1993-10-01' AS date)\n    AND o_orderdate < CAST('1994-01-01' AS date)\n    AND l_returnflag = 'R'\n    AND c_nationkey = n_nationkey\nGROUP BY\n    c_custkey,\n    c_name,\n    c_acctbal,\n    c_phone,\n    n_name,\n    c_address,\n    c_comment\nORDER BY\n    revenue DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q10-oracle.arrow"
+  },
+  {
+    "id": "s1-q10-duckdb-warmup",
+    "sql": "SELECT\n    c_custkey,\n    c_name,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue,\n    c_acctbal,\n    n_name,\n    c_address,\n    c_phone,\n    c_comment\nFROM\n    customer,\n    orders,\n    lineitem,\n    nation\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate >= CAST('1993-10-01' AS date)\n    AND o_orderdate < CAST('1994-01-01' AS date)\n    AND l_returnflag = 'R'\n    AND c_nationkey = n_nationkey\nGROUP BY\n    c_custkey,\n    c_name,\n    c_acctbal,\n    c_phone,\n    n_name,\n    c_address,\n    c_comment\nORDER BY\n    revenue DESC\nLIMIT 20;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q10-duckdb-warmup.arrow"
+  },
+  {
+    "id": "s1-q10-cal0",
+    "sql": "SELECT\n    c_custkey,\n    c_name,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue,\n    c_acctbal,\n    n_name,\n    c_address,\n    c_phone,\n    c_comment\nFROM\n    customer,\n    orders,\n    lineitem,\n    nation\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate >= CAST('1993-10-01' AS date)\n    AND o_orderdate < CAST('1994-01-01' AS date)\n    AND l_returnflag = 'R'\n    AND c_nationkey = n_nationkey\nGROUP BY\n    c_custkey,\n    c_name,\n    c_acctbal,\n    c_phone,\n    n_name,\n    c_address,\n    c_comment\nORDER BY\n    revenue DESC\nLIMIT 20;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q10-cal0.arrow"
+  },
+  {
+    "id": "s1-q10-cal1",
+    "sql": "SELECT\n    c_custkey,\n    c_name,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue,\n    c_acctbal,\n    n_name,\n    c_address,\n    c_phone,\n    c_comment\nFROM\n    customer,\n    orders,\n    lineitem,\n    nation\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate >= CAST('1993-10-01' AS date)\n    AND o_orderdate < CAST('1994-01-01' AS date)\n    AND l_returnflag = 'R'\n    AND c_nationkey = n_nationkey\nGROUP BY\n    c_custkey,\n    c_name,\n    c_acctbal,\n    c_phone,\n    n_name,\n    c_address,\n    c_comment\nORDER BY\n    revenue DESC\nLIMIT 20;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q10-cal1.arrow"
+  },
+  {
+    "id": "s1-q10-cal2",
+    "sql": "SELECT\n    c_custkey,\n    c_name,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue,\n    c_acctbal,\n    n_name,\n    c_address,\n    c_phone,\n    c_comment\nFROM\n    customer,\n    orders,\n    lineitem,\n    nation\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate >= CAST('1993-10-01' AS date)\n    AND o_orderdate < CAST('1994-01-01' AS date)\n    AND l_returnflag = 'R'\n    AND c_nationkey = n_nationkey\nGROUP BY\n    c_custkey,\n    c_name,\n    c_acctbal,\n    c_phone,\n    n_name,\n    c_address,\n    c_comment\nORDER BY\n    revenue DESC\nLIMIT 20;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q10-cal2.arrow"
+  },
+  {
+    "id": "s1-q10-1-duckdb",
+    "sql": "SELECT\n    c_custkey,\n    c_name,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue,\n    c_acctbal,\n    n_name,\n    c_address,\n    c_phone,\n    c_comment\nFROM\n    customer,\n    orders,\n    lineitem,\n    nation\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate >= CAST('1993-10-01' AS date)\n    AND o_orderdate < CAST('1994-01-01' AS date)\n    AND l_returnflag = 'R'\n    AND c_nationkey = n_nationkey\nGROUP BY\n    c_custkey,\n    c_name,\n    c_acctbal,\n    c_phone,\n    n_name,\n    c_address,\n    c_comment\nORDER BY\n    revenue DESC\nLIMIT 20;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q10-1-duckdb.arrow"
+  },
+  {
+    "id": "s1-q10-2-duckdb",
+    "sql": "SELECT\n    c_custkey,\n    c_name,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue,\n    c_acctbal,\n    n_name,\n    c_address,\n    c_phone,\n    c_comment\nFROM\n    customer,\n    orders,\n    lineitem,\n    nation\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate >= CAST('1993-10-01' AS date)\n    AND o_orderdate < CAST('1994-01-01' AS date)\n    AND l_returnflag = 'R'\n    AND c_nationkey = n_nationkey\nGROUP BY\n    c_custkey,\n    c_name,\n    c_acctbal,\n    c_phone,\n    n_name,\n    c_address,\n    c_comment\nORDER BY\n    revenue DESC\nLIMIT 20;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q10-2-duckdb.arrow"
+  },
+  {
+    "id": "s1-q10-3-duckdb",
+    "sql": "SELECT\n    c_custkey,\n    c_name,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue,\n    c_acctbal,\n    n_name,\n    c_address,\n    c_phone,\n    c_comment\nFROM\n    customer,\n    orders,\n    lineitem,\n    nation\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate >= CAST('1993-10-01' AS date)\n    AND o_orderdate < CAST('1994-01-01' AS date)\n    AND l_returnflag = 'R'\n    AND c_nationkey = n_nationkey\nGROUP BY\n    c_custkey,\n    c_name,\n    c_acctbal,\n    c_phone,\n    n_name,\n    c_address,\n    c_comment\nORDER BY\n    revenue DESC\nLIMIT 20;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q10-3-duckdb.arrow"
+  },
+  {
+    "id": "s1-q15-duckdb-plan",
+    "sql": "EXPLAIN WITH revenue AS (\n    SELECT\n        l_suppkey AS supplier_no,\n        sum(l_extendedprice * (1 - l_discount)) AS total_revenue\n    FROM\n        lineitem\n    WHERE\n        l_shipdate >= CAST('1996-01-01' AS date)\n      AND l_shipdate < CAST('1996-04-01' AS date)\n    GROUP BY\n        supplier_no\n)\nSELECT\n    s_suppkey,\n    s_name,\n    s_address,\n    s_phone,\n    total_revenue\nFROM\n    supplier,\n    revenue\nWHERE\n    s_suppkey = supplier_no\n    AND total_revenue = (\n        SELECT\n            max(total_revenue)\n        FROM revenue)\nORDER BY\n    s_suppkey;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q15-duckdb-plan.arrow"
+  },
+  {
+    "id": "s1-q15-oracle",
+    "sql": "WITH revenue AS (\n    SELECT\n        l_suppkey AS supplier_no,\n        sum(l_extendedprice * (1 - l_discount)) AS total_revenue\n    FROM\n        lineitem\n    WHERE\n        l_shipdate >= CAST('1996-01-01' AS date)\n      AND l_shipdate < CAST('1996-04-01' AS date)\n    GROUP BY\n        supplier_no\n)\nSELECT\n    s_suppkey,\n    s_name,\n    s_address,\n    s_phone,\n    total_revenue\nFROM\n    supplier,\n    revenue\nWHERE\n    s_suppkey = supplier_no\n    AND total_revenue = (\n        SELECT\n            max(total_revenue)\n        FROM revenue)\nORDER BY\n    s_suppkey;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q15-oracle.arrow"
+  },
+  {
+    "id": "s1-q15-duckdb-warmup",
+    "sql": "WITH revenue AS (\n    SELECT\n        l_suppkey AS supplier_no,\n        sum(l_extendedprice * (1 - l_discount)) AS total_revenue\n    FROM\n        lineitem\n    WHERE\n        l_shipdate >= CAST('1996-01-01' AS date)\n      AND l_shipdate < CAST('1996-04-01' AS date)\n    GROUP BY\n        supplier_no\n)\nSELECT\n    s_suppkey,\n    s_name,\n    s_address,\n    s_phone,\n    total_revenue\nFROM\n    supplier,\n    revenue\nWHERE\n    s_suppkey = supplier_no\n    AND total_revenue = (\n        SELECT\n            max(total_revenue)\n        FROM revenue)\nORDER BY\n    s_suppkey;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q15-duckdb-warmup.arrow"
+  },
+  {
+    "id": "s1-q15-cal0",
+    "sql": "WITH revenue AS (\n    SELECT\n        l_suppkey AS supplier_no,\n        sum(l_extendedprice * (1 - l_discount)) AS total_revenue\n    FROM\n        lineitem\n    WHERE\n        l_shipdate >= CAST('1996-01-01' AS date)\n      AND l_shipdate < CAST('1996-04-01' AS date)\n    GROUP BY\n        supplier_no\n)\nSELECT\n    s_suppkey,\n    s_name,\n    s_address,\n    s_phone,\n    total_revenue\nFROM\n    supplier,\n    revenue\nWHERE\n    s_suppkey = supplier_no\n    AND total_revenue = (\n        SELECT\n            max(total_revenue)\n        FROM revenue)\nORDER BY\n    s_suppkey;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q15-cal0.arrow"
+  },
+  {
+    "id": "s1-q15-cal1",
+    "sql": "WITH revenue AS (\n    SELECT\n        l_suppkey AS supplier_no,\n        sum(l_extendedprice * (1 - l_discount)) AS total_revenue\n    FROM\n        lineitem\n    WHERE\n        l_shipdate >= CAST('1996-01-01' AS date)\n      AND l_shipdate < CAST('1996-04-01' AS date)\n    GROUP BY\n        supplier_no\n)\nSELECT\n    s_suppkey,\n    s_name,\n    s_address,\n    s_phone,\n    total_revenue\nFROM\n    supplier,\n    revenue\nWHERE\n    s_suppkey = supplier_no\n    AND total_revenue = (\n        SELECT\n            max(total_revenue)\n        FROM revenue)\nORDER BY\n    s_suppkey;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q15-cal1.arrow"
+  },
+  {
+    "id": "s1-q15-cal2",
+    "sql": "WITH revenue AS (\n    SELECT\n        l_suppkey AS supplier_no,\n        sum(l_extendedprice * (1 - l_discount)) AS total_revenue\n    FROM\n        lineitem\n    WHERE\n        l_shipdate >= CAST('1996-01-01' AS date)\n      AND l_shipdate < CAST('1996-04-01' AS date)\n    GROUP BY\n        supplier_no\n)\nSELECT\n    s_suppkey,\n    s_name,\n    s_address,\n    s_phone,\n    total_revenue\nFROM\n    supplier,\n    revenue\nWHERE\n    s_suppkey = supplier_no\n    AND total_revenue = (\n        SELECT\n            max(total_revenue)\n        FROM revenue)\nORDER BY\n    s_suppkey;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q15-cal2.arrow"
+  },
+  {
+    "id": "s1-q15-1-duckdb",
+    "sql": "WITH revenue AS (\n    SELECT\n        l_suppkey AS supplier_no,\n        sum(l_extendedprice * (1 - l_discount)) AS total_revenue\n    FROM\n        lineitem\n    WHERE\n        l_shipdate >= CAST('1996-01-01' AS date)\n      AND l_shipdate < CAST('1996-04-01' AS date)\n    GROUP BY\n        supplier_no\n)\nSELECT\n    s_suppkey,\n    s_name,\n    s_address,\n    s_phone,\n    total_revenue\nFROM\n    supplier,\n    revenue\nWHERE\n    s_suppkey = supplier_no\n    AND total_revenue = (\n        SELECT\n            max(total_revenue)\n        FROM revenue)\nORDER BY\n    s_suppkey;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q15-1-duckdb.arrow"
+  },
+  {
+    "id": "s1-q15-2-duckdb",
+    "sql": "WITH revenue AS (\n    SELECT\n        l_suppkey AS supplier_no,\n        sum(l_extendedprice * (1 - l_discount)) AS total_revenue\n    FROM\n        lineitem\n    WHERE\n        l_shipdate >= CAST('1996-01-01' AS date)\n      AND l_shipdate < CAST('1996-04-01' AS date)\n    GROUP BY\n        supplier_no\n)\nSELECT\n    s_suppkey,\n    s_name,\n    s_address,\n    s_phone,\n    total_revenue\nFROM\n    supplier,\n    revenue\nWHERE\n    s_suppkey = supplier_no\n    AND total_revenue = (\n        SELECT\n            max(total_revenue)\n        FROM revenue)\nORDER BY\n    s_suppkey;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q15-2-duckdb.arrow"
+  },
+  {
+    "id": "s1-q15-3-duckdb",
+    "sql": "WITH revenue AS (\n    SELECT\n        l_suppkey AS supplier_no,\n        sum(l_extendedprice * (1 - l_discount)) AS total_revenue\n    FROM\n        lineitem\n    WHERE\n        l_shipdate >= CAST('1996-01-01' AS date)\n      AND l_shipdate < CAST('1996-04-01' AS date)\n    GROUP BY\n        supplier_no\n)\nSELECT\n    s_suppkey,\n    s_name,\n    s_address,\n    s_phone,\n    total_revenue\nFROM\n    supplier,\n    revenue\nWHERE\n    s_suppkey = supplier_no\n    AND total_revenue = (\n        SELECT\n            max(total_revenue)\n        FROM revenue)\nORDER BY\n    s_suppkey;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q15-3-duckdb.arrow"
+  },
+  {
+    "id": "s1-q14-duckdb-plan",
+    "sql": "EXPLAIN SELECT\n    100.00 * sum(\n        CASE WHEN p_type LIKE 'PROMO%' THEN\n            l_extendedprice * (1 - l_discount)\n        ELSE\n            0\n        END) / sum(l_extendedprice * (1 - l_discount)) AS promo_revenue\nFROM\n    lineitem,\n    part\nWHERE\n    l_partkey = p_partkey\n    AND l_shipdate >= date '1995-09-01'\n    AND l_shipdate < CAST('1995-10-01' AS date);\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q14-duckdb-plan.arrow"
+  },
+  {
+    "id": "s1-q14-oracle",
+    "sql": "SELECT\n    100.00 * sum(\n        CASE WHEN p_type LIKE 'PROMO%' THEN\n            l_extendedprice * (1 - l_discount)\n        ELSE\n            0\n        END) / sum(l_extendedprice * (1 - l_discount)) AS promo_revenue\nFROM\n    lineitem,\n    part\nWHERE\n    l_partkey = p_partkey\n    AND l_shipdate >= date '1995-09-01'\n    AND l_shipdate < CAST('1995-10-01' AS date);\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q14-oracle.arrow"
+  },
+  {
+    "id": "s1-q14-duckdb-warmup",
+    "sql": "SELECT\n    100.00 * sum(\n        CASE WHEN p_type LIKE 'PROMO%' THEN\n            l_extendedprice * (1 - l_discount)\n        ELSE\n            0\n        END) / sum(l_extendedprice * (1 - l_discount)) AS promo_revenue\nFROM\n    lineitem,\n    part\nWHERE\n    l_partkey = p_partkey\n    AND l_shipdate >= date '1995-09-01'\n    AND l_shipdate < CAST('1995-10-01' AS date);\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q14-duckdb-warmup.arrow"
+  },
+  {
+    "id": "s1-q14-cal0",
+    "sql": "SELECT\n    100.00 * sum(\n        CASE WHEN p_type LIKE 'PROMO%' THEN\n            l_extendedprice * (1 - l_discount)\n        ELSE\n            0\n        END) / sum(l_extendedprice * (1 - l_discount)) AS promo_revenue\nFROM\n    lineitem,\n    part\nWHERE\n    l_partkey = p_partkey\n    AND l_shipdate >= date '1995-09-01'\n    AND l_shipdate < CAST('1995-10-01' AS date);\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q14-cal0.arrow"
+  },
+  {
+    "id": "s1-q14-cal1",
+    "sql": "SELECT\n    100.00 * sum(\n        CASE WHEN p_type LIKE 'PROMO%' THEN\n            l_extendedprice * (1 - l_discount)\n        ELSE\n            0\n        END) / sum(l_extendedprice * (1 - l_discount)) AS promo_revenue\nFROM\n    lineitem,\n    part\nWHERE\n    l_partkey = p_partkey\n    AND l_shipdate >= date '1995-09-01'\n    AND l_shipdate < CAST('1995-10-01' AS date);\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q14-cal1.arrow"
+  },
+  {
+    "id": "s1-q14-cal2",
+    "sql": "SELECT\n    100.00 * sum(\n        CASE WHEN p_type LIKE 'PROMO%' THEN\n            l_extendedprice * (1 - l_discount)\n        ELSE\n            0\n        END) / sum(l_extendedprice * (1 - l_discount)) AS promo_revenue\nFROM\n    lineitem,\n    part\nWHERE\n    l_partkey = p_partkey\n    AND l_shipdate >= date '1995-09-01'\n    AND l_shipdate < CAST('1995-10-01' AS date);\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q14-cal2.arrow"
+  },
+  {
+    "id": "s1-q14-1-duckdb",
+    "sql": "SELECT\n    100.00 * sum(\n        CASE WHEN p_type LIKE 'PROMO%' THEN\n            l_extendedprice * (1 - l_discount)\n        ELSE\n            0\n        END) / sum(l_extendedprice * (1 - l_discount)) AS promo_revenue\nFROM\n    lineitem,\n    part\nWHERE\n    l_partkey = p_partkey\n    AND l_shipdate >= date '1995-09-01'\n    AND l_shipdate < CAST('1995-10-01' AS date);\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q14-1-duckdb.arrow"
+  },
+  {
+    "id": "s1-q14-2-duckdb",
+    "sql": "SELECT\n    100.00 * sum(\n        CASE WHEN p_type LIKE 'PROMO%' THEN\n            l_extendedprice * (1 - l_discount)\n        ELSE\n            0\n        END) / sum(l_extendedprice * (1 - l_discount)) AS promo_revenue\nFROM\n    lineitem,\n    part\nWHERE\n    l_partkey = p_partkey\n    AND l_shipdate >= date '1995-09-01'\n    AND l_shipdate < CAST('1995-10-01' AS date);\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q14-2-duckdb.arrow"
+  },
+  {
+    "id": "s1-q14-3-duckdb",
+    "sql": "SELECT\n    100.00 * sum(\n        CASE WHEN p_type LIKE 'PROMO%' THEN\n            l_extendedprice * (1 - l_discount)\n        ELSE\n            0\n        END) / sum(l_extendedprice * (1 - l_discount)) AS promo_revenue\nFROM\n    lineitem,\n    part\nWHERE\n    l_partkey = p_partkey\n    AND l_shipdate >= date '1995-09-01'\n    AND l_shipdate < CAST('1995-10-01' AS date);\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q14-3-duckdb.arrow"
+  },
+  {
+    "id": "s1-q05-duckdb-plan",
+    "sql": "EXPLAIN SELECT\n    n_name,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue\nFROM\n    customer,\n    orders,\n    lineitem,\n    supplier,\n    nation,\n    region\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND l_suppkey = s_suppkey\n    AND c_nationkey = s_nationkey\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'ASIA'\n    AND o_orderdate >= CAST('1994-01-01' AS date)\n    AND o_orderdate < CAST('1995-01-01' AS date)\nGROUP BY\n    n_name\nORDER BY\n    revenue DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q05-duckdb-plan.arrow"
+  },
+  {
+    "id": "s1-q05-oracle",
+    "sql": "SELECT\n    n_name,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue\nFROM\n    customer,\n    orders,\n    lineitem,\n    supplier,\n    nation,\n    region\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND l_suppkey = s_suppkey\n    AND c_nationkey = s_nationkey\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'ASIA'\n    AND o_orderdate >= CAST('1994-01-01' AS date)\n    AND o_orderdate < CAST('1995-01-01' AS date)\nGROUP BY\n    n_name\nORDER BY\n    revenue DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q05-oracle.arrow"
+  },
+  {
+    "id": "s1-q05-duckdb-warmup",
+    "sql": "SELECT\n    n_name,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue\nFROM\n    customer,\n    orders,\n    lineitem,\n    supplier,\n    nation,\n    region\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND l_suppkey = s_suppkey\n    AND c_nationkey = s_nationkey\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'ASIA'\n    AND o_orderdate >= CAST('1994-01-01' AS date)\n    AND o_orderdate < CAST('1995-01-01' AS date)\nGROUP BY\n    n_name\nORDER BY\n    revenue DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q05-duckdb-warmup.arrow"
+  },
+  {
+    "id": "s1-q05-cal0",
+    "sql": "SELECT\n    n_name,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue\nFROM\n    customer,\n    orders,\n    lineitem,\n    supplier,\n    nation,\n    region\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND l_suppkey = s_suppkey\n    AND c_nationkey = s_nationkey\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'ASIA'\n    AND o_orderdate >= CAST('1994-01-01' AS date)\n    AND o_orderdate < CAST('1995-01-01' AS date)\nGROUP BY\n    n_name\nORDER BY\n    revenue DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q05-cal0.arrow"
+  },
+  {
+    "id": "s1-q05-cal1",
+    "sql": "SELECT\n    n_name,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue\nFROM\n    customer,\n    orders,\n    lineitem,\n    supplier,\n    nation,\n    region\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND l_suppkey = s_suppkey\n    AND c_nationkey = s_nationkey\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'ASIA'\n    AND o_orderdate >= CAST('1994-01-01' AS date)\n    AND o_orderdate < CAST('1995-01-01' AS date)\nGROUP BY\n    n_name\nORDER BY\n    revenue DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q05-cal1.arrow"
+  },
+  {
+    "id": "s1-q05-cal2",
+    "sql": "SELECT\n    n_name,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue\nFROM\n    customer,\n    orders,\n    lineitem,\n    supplier,\n    nation,\n    region\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND l_suppkey = s_suppkey\n    AND c_nationkey = s_nationkey\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'ASIA'\n    AND o_orderdate >= CAST('1994-01-01' AS date)\n    AND o_orderdate < CAST('1995-01-01' AS date)\nGROUP BY\n    n_name\nORDER BY\n    revenue DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q05-cal2.arrow"
+  },
+  {
+    "id": "s1-q05-1-duckdb",
+    "sql": "SELECT\n    n_name,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue\nFROM\n    customer,\n    orders,\n    lineitem,\n    supplier,\n    nation,\n    region\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND l_suppkey = s_suppkey\n    AND c_nationkey = s_nationkey\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'ASIA'\n    AND o_orderdate >= CAST('1994-01-01' AS date)\n    AND o_orderdate < CAST('1995-01-01' AS date)\nGROUP BY\n    n_name\nORDER BY\n    revenue DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q05-1-duckdb.arrow"
+  },
+  {
+    "id": "s1-q05-2-duckdb",
+    "sql": "SELECT\n    n_name,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue\nFROM\n    customer,\n    orders,\n    lineitem,\n    supplier,\n    nation,\n    region\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND l_suppkey = s_suppkey\n    AND c_nationkey = s_nationkey\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'ASIA'\n    AND o_orderdate >= CAST('1994-01-01' AS date)\n    AND o_orderdate < CAST('1995-01-01' AS date)\nGROUP BY\n    n_name\nORDER BY\n    revenue DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q05-2-duckdb.arrow"
+  },
+  {
+    "id": "s1-q05-3-duckdb",
+    "sql": "SELECT\n    n_name,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue\nFROM\n    customer,\n    orders,\n    lineitem,\n    supplier,\n    nation,\n    region\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND l_suppkey = s_suppkey\n    AND c_nationkey = s_nationkey\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'ASIA'\n    AND o_orderdate >= CAST('1994-01-01' AS date)\n    AND o_orderdate < CAST('1995-01-01' AS date)\nGROUP BY\n    n_name\nORDER BY\n    revenue DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q05-3-duckdb.arrow"
+  },
+  {
+    "id": "s1-q01-duckdb-plan",
+    "sql": "EXPLAIN SELECT\n    l_returnflag,\n    l_linestatus,\n    sum(l_quantity) AS sum_qty,\n    sum(l_extendedprice) AS sum_base_price,\n    sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price,\n    sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,\n    avg(l_quantity) AS avg_qty,\n    avg(l_extendedprice) AS avg_price,\n    avg(l_discount) AS avg_disc,\n    count(*) AS count_order\nFROM\n    lineitem\nWHERE\n    l_shipdate <= CAST('1998-09-02' AS date)\nGROUP BY\n    l_returnflag,\n    l_linestatus\nORDER BY\n    l_returnflag,\n    l_linestatus;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q01-duckdb-plan.arrow"
+  },
+  {
+    "id": "s1-q01-oracle",
+    "sql": "SELECT\n    l_returnflag,\n    l_linestatus,\n    sum(l_quantity) AS sum_qty,\n    sum(l_extendedprice) AS sum_base_price,\n    sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price,\n    sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,\n    avg(l_quantity) AS avg_qty,\n    avg(l_extendedprice) AS avg_price,\n    avg(l_discount) AS avg_disc,\n    count(*) AS count_order\nFROM\n    lineitem\nWHERE\n    l_shipdate <= CAST('1998-09-02' AS date)\nGROUP BY\n    l_returnflag,\n    l_linestatus\nORDER BY\n    l_returnflag,\n    l_linestatus;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q01-oracle.arrow"
+  },
+  {
+    "id": "s1-q01-duckdb-warmup",
+    "sql": "SELECT\n    l_returnflag,\n    l_linestatus,\n    sum(l_quantity) AS sum_qty,\n    sum(l_extendedprice) AS sum_base_price,\n    sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price,\n    sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,\n    avg(l_quantity) AS avg_qty,\n    avg(l_extendedprice) AS avg_price,\n    avg(l_discount) AS avg_disc,\n    count(*) AS count_order\nFROM\n    lineitem\nWHERE\n    l_shipdate <= CAST('1998-09-02' AS date)\nGROUP BY\n    l_returnflag,\n    l_linestatus\nORDER BY\n    l_returnflag,\n    l_linestatus;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q01-duckdb-warmup.arrow"
+  },
+  {
+    "id": "s1-q01-cal0",
+    "sql": "SELECT\n    l_returnflag,\n    l_linestatus,\n    sum(l_quantity) AS sum_qty,\n    sum(l_extendedprice) AS sum_base_price,\n    sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price,\n    sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,\n    avg(l_quantity) AS avg_qty,\n    avg(l_extendedprice) AS avg_price,\n    avg(l_discount) AS avg_disc,\n    count(*) AS count_order\nFROM\n    lineitem\nWHERE\n    l_shipdate <= CAST('1998-09-02' AS date)\nGROUP BY\n    l_returnflag,\n    l_linestatus\nORDER BY\n    l_returnflag,\n    l_linestatus;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q01-cal0.arrow"
+  },
+  {
+    "id": "s1-q01-cal1",
+    "sql": "SELECT\n    l_returnflag,\n    l_linestatus,\n    sum(l_quantity) AS sum_qty,\n    sum(l_extendedprice) AS sum_base_price,\n    sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price,\n    sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,\n    avg(l_quantity) AS avg_qty,\n    avg(l_extendedprice) AS avg_price,\n    avg(l_discount) AS avg_disc,\n    count(*) AS count_order\nFROM\n    lineitem\nWHERE\n    l_shipdate <= CAST('1998-09-02' AS date)\nGROUP BY\n    l_returnflag,\n    l_linestatus\nORDER BY\n    l_returnflag,\n    l_linestatus;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q01-cal1.arrow"
+  },
+  {
+    "id": "s1-q01-cal2",
+    "sql": "SELECT\n    l_returnflag,\n    l_linestatus,\n    sum(l_quantity) AS sum_qty,\n    sum(l_extendedprice) AS sum_base_price,\n    sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price,\n    sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,\n    avg(l_quantity) AS avg_qty,\n    avg(l_extendedprice) AS avg_price,\n    avg(l_discount) AS avg_disc,\n    count(*) AS count_order\nFROM\n    lineitem\nWHERE\n    l_shipdate <= CAST('1998-09-02' AS date)\nGROUP BY\n    l_returnflag,\n    l_linestatus\nORDER BY\n    l_returnflag,\n    l_linestatus;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q01-cal2.arrow"
+  },
+  {
+    "id": "s1-q01-1-duckdb",
+    "sql": "SELECT\n    l_returnflag,\n    l_linestatus,\n    sum(l_quantity) AS sum_qty,\n    sum(l_extendedprice) AS sum_base_price,\n    sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price,\n    sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,\n    avg(l_quantity) AS avg_qty,\n    avg(l_extendedprice) AS avg_price,\n    avg(l_discount) AS avg_disc,\n    count(*) AS count_order\nFROM\n    lineitem\nWHERE\n    l_shipdate <= CAST('1998-09-02' AS date)\nGROUP BY\n    l_returnflag,\n    l_linestatus\nORDER BY\n    l_returnflag,\n    l_linestatus;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q01-1-duckdb.arrow"
+  },
+  {
+    "id": "s1-q01-2-duckdb",
+    "sql": "SELECT\n    l_returnflag,\n    l_linestatus,\n    sum(l_quantity) AS sum_qty,\n    sum(l_extendedprice) AS sum_base_price,\n    sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price,\n    sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,\n    avg(l_quantity) AS avg_qty,\n    avg(l_extendedprice) AS avg_price,\n    avg(l_discount) AS avg_disc,\n    count(*) AS count_order\nFROM\n    lineitem\nWHERE\n    l_shipdate <= CAST('1998-09-02' AS date)\nGROUP BY\n    l_returnflag,\n    l_linestatus\nORDER BY\n    l_returnflag,\n    l_linestatus;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q01-2-duckdb.arrow"
+  },
+  {
+    "id": "s1-q01-3-duckdb",
+    "sql": "SELECT\n    l_returnflag,\n    l_linestatus,\n    sum(l_quantity) AS sum_qty,\n    sum(l_extendedprice) AS sum_base_price,\n    sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price,\n    sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,\n    avg(l_quantity) AS avg_qty,\n    avg(l_extendedprice) AS avg_price,\n    avg(l_discount) AS avg_disc,\n    count(*) AS count_order\nFROM\n    lineitem\nWHERE\n    l_shipdate <= CAST('1998-09-02' AS date)\nGROUP BY\n    l_returnflag,\n    l_linestatus\nORDER BY\n    l_returnflag,\n    l_linestatus;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q01-3-duckdb.arrow"
+  },
+  {
+    "id": "s1-q04-duckdb-plan",
+    "sql": "EXPLAIN SELECT\n    o_orderpriority,\n    count(*) AS order_count\nFROM\n    orders\nWHERE\n    o_orderdate >= CAST('1993-07-01' AS date)\n    AND o_orderdate < CAST('1993-10-01' AS date)\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem\n        WHERE\n            l_orderkey = o_orderkey\n            AND l_commitdate < l_receiptdate)\nGROUP BY\n    o_orderpriority\nORDER BY\n    o_orderpriority;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q04-duckdb-plan.arrow"
+  },
+  {
+    "id": "s1-q04-oracle",
+    "sql": "SELECT\n    o_orderpriority,\n    count(*) AS order_count\nFROM\n    orders\nWHERE\n    o_orderdate >= CAST('1993-07-01' AS date)\n    AND o_orderdate < CAST('1993-10-01' AS date)\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem\n        WHERE\n            l_orderkey = o_orderkey\n            AND l_commitdate < l_receiptdate)\nGROUP BY\n    o_orderpriority\nORDER BY\n    o_orderpriority;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q04-oracle.arrow"
+  },
+  {
+    "id": "s1-q04-duckdb-warmup",
+    "sql": "SELECT\n    o_orderpriority,\n    count(*) AS order_count\nFROM\n    orders\nWHERE\n    o_orderdate >= CAST('1993-07-01' AS date)\n    AND o_orderdate < CAST('1993-10-01' AS date)\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem\n        WHERE\n            l_orderkey = o_orderkey\n            AND l_commitdate < l_receiptdate)\nGROUP BY\n    o_orderpriority\nORDER BY\n    o_orderpriority;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q04-duckdb-warmup.arrow"
+  },
+  {
+    "id": "s1-q04-cal0",
+    "sql": "SELECT\n    o_orderpriority,\n    count(*) AS order_count\nFROM\n    orders\nWHERE\n    o_orderdate >= CAST('1993-07-01' AS date)\n    AND o_orderdate < CAST('1993-10-01' AS date)\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem\n        WHERE\n            l_orderkey = o_orderkey\n            AND l_commitdate < l_receiptdate)\nGROUP BY\n    o_orderpriority\nORDER BY\n    o_orderpriority;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q04-cal0.arrow"
+  },
+  {
+    "id": "s1-q04-cal1",
+    "sql": "SELECT\n    o_orderpriority,\n    count(*) AS order_count\nFROM\n    orders\nWHERE\n    o_orderdate >= CAST('1993-07-01' AS date)\n    AND o_orderdate < CAST('1993-10-01' AS date)\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem\n        WHERE\n            l_orderkey = o_orderkey\n            AND l_commitdate < l_receiptdate)\nGROUP BY\n    o_orderpriority\nORDER BY\n    o_orderpriority;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q04-cal1.arrow"
+  },
+  {
+    "id": "s1-q04-cal2",
+    "sql": "SELECT\n    o_orderpriority,\n    count(*) AS order_count\nFROM\n    orders\nWHERE\n    o_orderdate >= CAST('1993-07-01' AS date)\n    AND o_orderdate < CAST('1993-10-01' AS date)\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem\n        WHERE\n            l_orderkey = o_orderkey\n            AND l_commitdate < l_receiptdate)\nGROUP BY\n    o_orderpriority\nORDER BY\n    o_orderpriority;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q04-cal2.arrow"
+  },
+  {
+    "id": "s1-q04-1-duckdb",
+    "sql": "SELECT\n    o_orderpriority,\n    count(*) AS order_count\nFROM\n    orders\nWHERE\n    o_orderdate >= CAST('1993-07-01' AS date)\n    AND o_orderdate < CAST('1993-10-01' AS date)\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem\n        WHERE\n            l_orderkey = o_orderkey\n            AND l_commitdate < l_receiptdate)\nGROUP BY\n    o_orderpriority\nORDER BY\n    o_orderpriority;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q04-1-duckdb.arrow"
+  },
+  {
+    "id": "s1-q04-2-duckdb",
+    "sql": "SELECT\n    o_orderpriority,\n    count(*) AS order_count\nFROM\n    orders\nWHERE\n    o_orderdate >= CAST('1993-07-01' AS date)\n    AND o_orderdate < CAST('1993-10-01' AS date)\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem\n        WHERE\n            l_orderkey = o_orderkey\n            AND l_commitdate < l_receiptdate)\nGROUP BY\n    o_orderpriority\nORDER BY\n    o_orderpriority;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q04-2-duckdb.arrow"
+  },
+  {
+    "id": "s1-q04-3-duckdb",
+    "sql": "SELECT\n    o_orderpriority,\n    count(*) AS order_count\nFROM\n    orders\nWHERE\n    o_orderdate >= CAST('1993-07-01' AS date)\n    AND o_orderdate < CAST('1993-10-01' AS date)\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem\n        WHERE\n            l_orderkey = o_orderkey\n            AND l_commitdate < l_receiptdate)\nGROUP BY\n    o_orderpriority\nORDER BY\n    o_orderpriority;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q04-3-duckdb.arrow"
+  },
+  {
+    "id": "s1-q18-duckdb-plan",
+    "sql": "EXPLAIN SELECT\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice,\n    sum(l_quantity)\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    o_orderkey IN (\n        SELECT\n            l_orderkey\n        FROM\n            lineitem\n        GROUP BY\n            l_orderkey\n        HAVING\n            sum(l_quantity) > 300)\n    AND c_custkey = o_custkey\n    AND o_orderkey = l_orderkey\nGROUP BY\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice\nORDER BY\n    o_totalprice DESC,\n    o_orderdate\nLIMIT 100;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q18-duckdb-plan.arrow"
+  },
+  {
+    "id": "s1-q18-oracle",
+    "sql": "SELECT\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice,\n    sum(l_quantity)\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    o_orderkey IN (\n        SELECT\n            l_orderkey\n        FROM\n            lineitem\n        GROUP BY\n            l_orderkey\n        HAVING\n            sum(l_quantity) > 300)\n    AND c_custkey = o_custkey\n    AND o_orderkey = l_orderkey\nGROUP BY\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice\nORDER BY\n    o_totalprice DESC,\n    o_orderdate;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q18-oracle.arrow"
+  },
+  {
+    "id": "s1-q18-duckdb-warmup",
+    "sql": "SELECT\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice,\n    sum(l_quantity)\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    o_orderkey IN (\n        SELECT\n            l_orderkey\n        FROM\n            lineitem\n        GROUP BY\n            l_orderkey\n        HAVING\n            sum(l_quantity) > 300)\n    AND c_custkey = o_custkey\n    AND o_orderkey = l_orderkey\nGROUP BY\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice\nORDER BY\n    o_totalprice DESC,\n    o_orderdate\nLIMIT 100;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q18-duckdb-warmup.arrow"
+  },
+  {
+    "id": "s1-q18-cal0",
+    "sql": "SELECT\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice,\n    sum(l_quantity)\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    o_orderkey IN (\n        SELECT\n            l_orderkey\n        FROM\n            lineitem\n        GROUP BY\n            l_orderkey\n        HAVING\n            sum(l_quantity) > 300)\n    AND c_custkey = o_custkey\n    AND o_orderkey = l_orderkey\nGROUP BY\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice\nORDER BY\n    o_totalprice DESC,\n    o_orderdate\nLIMIT 100;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q18-cal0.arrow"
+  },
+  {
+    "id": "s1-q18-cal1",
+    "sql": "SELECT\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice,\n    sum(l_quantity)\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    o_orderkey IN (\n        SELECT\n            l_orderkey\n        FROM\n            lineitem\n        GROUP BY\n            l_orderkey\n        HAVING\n            sum(l_quantity) > 300)\n    AND c_custkey = o_custkey\n    AND o_orderkey = l_orderkey\nGROUP BY\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice\nORDER BY\n    o_totalprice DESC,\n    o_orderdate\nLIMIT 100;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q18-cal1.arrow"
+  },
+  {
+    "id": "s1-q18-cal2",
+    "sql": "SELECT\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice,\n    sum(l_quantity)\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    o_orderkey IN (\n        SELECT\n            l_orderkey\n        FROM\n            lineitem\n        GROUP BY\n            l_orderkey\n        HAVING\n            sum(l_quantity) > 300)\n    AND c_custkey = o_custkey\n    AND o_orderkey = l_orderkey\nGROUP BY\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice\nORDER BY\n    o_totalprice DESC,\n    o_orderdate\nLIMIT 100;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q18-cal2.arrow"
+  },
+  {
+    "id": "s1-q18-1-duckdb",
+    "sql": "SELECT\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice,\n    sum(l_quantity)\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    o_orderkey IN (\n        SELECT\n            l_orderkey\n        FROM\n            lineitem\n        GROUP BY\n            l_orderkey\n        HAVING\n            sum(l_quantity) > 300)\n    AND c_custkey = o_custkey\n    AND o_orderkey = l_orderkey\nGROUP BY\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice\nORDER BY\n    o_totalprice DESC,\n    o_orderdate\nLIMIT 100;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q18-1-duckdb.arrow"
+  },
+  {
+    "id": "s1-q18-2-duckdb",
+    "sql": "SELECT\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice,\n    sum(l_quantity)\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    o_orderkey IN (\n        SELECT\n            l_orderkey\n        FROM\n            lineitem\n        GROUP BY\n            l_orderkey\n        HAVING\n            sum(l_quantity) > 300)\n    AND c_custkey = o_custkey\n    AND o_orderkey = l_orderkey\nGROUP BY\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice\nORDER BY\n    o_totalprice DESC,\n    o_orderdate\nLIMIT 100;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q18-2-duckdb.arrow"
+  },
+  {
+    "id": "s1-q18-3-duckdb",
+    "sql": "SELECT\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice,\n    sum(l_quantity)\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    o_orderkey IN (\n        SELECT\n            l_orderkey\n        FROM\n            lineitem\n        GROUP BY\n            l_orderkey\n        HAVING\n            sum(l_quantity) > 300)\n    AND c_custkey = o_custkey\n    AND o_orderkey = l_orderkey\nGROUP BY\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice\nORDER BY\n    o_totalprice DESC,\n    o_orderdate\nLIMIT 100;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q18-3-duckdb.arrow"
+  },
+  {
+    "id": "s1-q12-duckdb-plan",
+    "sql": "EXPLAIN SELECT\n    l_shipmode,\n    sum(\n        CASE WHEN o_orderpriority = '1-URGENT'\n            OR o_orderpriority = '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS high_line_count,\n    sum(\n        CASE WHEN o_orderpriority <> '1-URGENT'\n            AND o_orderpriority <> '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS low_line_count\nFROM\n    orders,\n    lineitem\nWHERE\n    o_orderkey = l_orderkey\n    AND l_shipmode IN ('MAIL', 'SHIP')\n    AND l_commitdate < l_receiptdate\n    AND l_shipdate < l_commitdate\n    AND l_receiptdate >= CAST('1994-01-01' AS date)\n    AND l_receiptdate < CAST('1995-01-01' AS date)\nGROUP BY\n    l_shipmode\nORDER BY\n    l_shipmode;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q12-duckdb-plan.arrow"
+  },
+  {
+    "id": "s1-q12-oracle",
+    "sql": "SELECT\n    l_shipmode,\n    sum(\n        CASE WHEN o_orderpriority = '1-URGENT'\n            OR o_orderpriority = '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS high_line_count,\n    sum(\n        CASE WHEN o_orderpriority <> '1-URGENT'\n            AND o_orderpriority <> '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS low_line_count\nFROM\n    orders,\n    lineitem\nWHERE\n    o_orderkey = l_orderkey\n    AND l_shipmode IN ('MAIL', 'SHIP')\n    AND l_commitdate < l_receiptdate\n    AND l_shipdate < l_commitdate\n    AND l_receiptdate >= CAST('1994-01-01' AS date)\n    AND l_receiptdate < CAST('1995-01-01' AS date)\nGROUP BY\n    l_shipmode\nORDER BY\n    l_shipmode;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q12-oracle.arrow"
+  },
+  {
+    "id": "s1-q12-duckdb-warmup",
+    "sql": "SELECT\n    l_shipmode,\n    sum(\n        CASE WHEN o_orderpriority = '1-URGENT'\n            OR o_orderpriority = '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS high_line_count,\n    sum(\n        CASE WHEN o_orderpriority <> '1-URGENT'\n            AND o_orderpriority <> '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS low_line_count\nFROM\n    orders,\n    lineitem\nWHERE\n    o_orderkey = l_orderkey\n    AND l_shipmode IN ('MAIL', 'SHIP')\n    AND l_commitdate < l_receiptdate\n    AND l_shipdate < l_commitdate\n    AND l_receiptdate >= CAST('1994-01-01' AS date)\n    AND l_receiptdate < CAST('1995-01-01' AS date)\nGROUP BY\n    l_shipmode\nORDER BY\n    l_shipmode;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q12-duckdb-warmup.arrow"
+  },
+  {
+    "id": "s1-q12-cal0",
+    "sql": "SELECT\n    l_shipmode,\n    sum(\n        CASE WHEN o_orderpriority = '1-URGENT'\n            OR o_orderpriority = '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS high_line_count,\n    sum(\n        CASE WHEN o_orderpriority <> '1-URGENT'\n            AND o_orderpriority <> '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS low_line_count\nFROM\n    orders,\n    lineitem\nWHERE\n    o_orderkey = l_orderkey\n    AND l_shipmode IN ('MAIL', 'SHIP')\n    AND l_commitdate < l_receiptdate\n    AND l_shipdate < l_commitdate\n    AND l_receiptdate >= CAST('1994-01-01' AS date)\n    AND l_receiptdate < CAST('1995-01-01' AS date)\nGROUP BY\n    l_shipmode\nORDER BY\n    l_shipmode;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q12-cal0.arrow"
+  },
+  {
+    "id": "s1-q12-cal1",
+    "sql": "SELECT\n    l_shipmode,\n    sum(\n        CASE WHEN o_orderpriority = '1-URGENT'\n            OR o_orderpriority = '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS high_line_count,\n    sum(\n        CASE WHEN o_orderpriority <> '1-URGENT'\n            AND o_orderpriority <> '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS low_line_count\nFROM\n    orders,\n    lineitem\nWHERE\n    o_orderkey = l_orderkey\n    AND l_shipmode IN ('MAIL', 'SHIP')\n    AND l_commitdate < l_receiptdate\n    AND l_shipdate < l_commitdate\n    AND l_receiptdate >= CAST('1994-01-01' AS date)\n    AND l_receiptdate < CAST('1995-01-01' AS date)\nGROUP BY\n    l_shipmode\nORDER BY\n    l_shipmode;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q12-cal1.arrow"
+  },
+  {
+    "id": "s1-q12-cal2",
+    "sql": "SELECT\n    l_shipmode,\n    sum(\n        CASE WHEN o_orderpriority = '1-URGENT'\n            OR o_orderpriority = '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS high_line_count,\n    sum(\n        CASE WHEN o_orderpriority <> '1-URGENT'\n            AND o_orderpriority <> '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS low_line_count\nFROM\n    orders,\n    lineitem\nWHERE\n    o_orderkey = l_orderkey\n    AND l_shipmode IN ('MAIL', 'SHIP')\n    AND l_commitdate < l_receiptdate\n    AND l_shipdate < l_commitdate\n    AND l_receiptdate >= CAST('1994-01-01' AS date)\n    AND l_receiptdate < CAST('1995-01-01' AS date)\nGROUP BY\n    l_shipmode\nORDER BY\n    l_shipmode;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q12-cal2.arrow"
+  },
+  {
+    "id": "s1-q12-1-duckdb",
+    "sql": "SELECT\n    l_shipmode,\n    sum(\n        CASE WHEN o_orderpriority = '1-URGENT'\n            OR o_orderpriority = '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS high_line_count,\n    sum(\n        CASE WHEN o_orderpriority <> '1-URGENT'\n            AND o_orderpriority <> '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS low_line_count\nFROM\n    orders,\n    lineitem\nWHERE\n    o_orderkey = l_orderkey\n    AND l_shipmode IN ('MAIL', 'SHIP')\n    AND l_commitdate < l_receiptdate\n    AND l_shipdate < l_commitdate\n    AND l_receiptdate >= CAST('1994-01-01' AS date)\n    AND l_receiptdate < CAST('1995-01-01' AS date)\nGROUP BY\n    l_shipmode\nORDER BY\n    l_shipmode;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q12-1-duckdb.arrow"
+  },
+  {
+    "id": "s1-q12-2-duckdb",
+    "sql": "SELECT\n    l_shipmode,\n    sum(\n        CASE WHEN o_orderpriority = '1-URGENT'\n            OR o_orderpriority = '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS high_line_count,\n    sum(\n        CASE WHEN o_orderpriority <> '1-URGENT'\n            AND o_orderpriority <> '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS low_line_count\nFROM\n    orders,\n    lineitem\nWHERE\n    o_orderkey = l_orderkey\n    AND l_shipmode IN ('MAIL', 'SHIP')\n    AND l_commitdate < l_receiptdate\n    AND l_shipdate < l_commitdate\n    AND l_receiptdate >= CAST('1994-01-01' AS date)\n    AND l_receiptdate < CAST('1995-01-01' AS date)\nGROUP BY\n    l_shipmode\nORDER BY\n    l_shipmode;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q12-2-duckdb.arrow"
+  },
+  {
+    "id": "s1-q12-3-duckdb",
+    "sql": "SELECT\n    l_shipmode,\n    sum(\n        CASE WHEN o_orderpriority = '1-URGENT'\n            OR o_orderpriority = '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS high_line_count,\n    sum(\n        CASE WHEN o_orderpriority <> '1-URGENT'\n            AND o_orderpriority <> '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS low_line_count\nFROM\n    orders,\n    lineitem\nWHERE\n    o_orderkey = l_orderkey\n    AND l_shipmode IN ('MAIL', 'SHIP')\n    AND l_commitdate < l_receiptdate\n    AND l_shipdate < l_commitdate\n    AND l_receiptdate >= CAST('1994-01-01' AS date)\n    AND l_receiptdate < CAST('1995-01-01' AS date)\nGROUP BY\n    l_shipmode\nORDER BY\n    l_shipmode;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q12-3-duckdb.arrow"
+  },
+  {
+    "id": "s1-q13-duckdb-plan",
+    "sql": "EXPLAIN SELECT\n    c_count,\n    count(*) AS custdist\nFROM (\n    SELECT\n        c_custkey,\n        count(o_orderkey)\n    FROM\n        customer\n    LEFT OUTER JOIN orders ON c_custkey = o_custkey\n    AND o_comment NOT LIKE '%special%requests%'\nGROUP BY\n    c_custkey) AS c_orders (c_custkey,\n        c_count)\nGROUP BY\n    c_count\nORDER BY\n    custdist DESC,\n    c_count DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q13-duckdb-plan.arrow"
+  },
+  {
+    "id": "s1-q13-oracle",
+    "sql": "SELECT\n    c_count,\n    count(*) AS custdist\nFROM (\n    SELECT\n        c_custkey,\n        count(o_orderkey)\n    FROM\n        customer\n    LEFT OUTER JOIN orders ON c_custkey = o_custkey\n    AND o_comment NOT LIKE '%special%requests%'\nGROUP BY\n    c_custkey) AS c_orders (c_custkey,\n        c_count)\nGROUP BY\n    c_count\nORDER BY\n    custdist DESC,\n    c_count DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q13-oracle.arrow"
+  },
+  {
+    "id": "s1-q13-duckdb-warmup",
+    "sql": "SELECT\n    c_count,\n    count(*) AS custdist\nFROM (\n    SELECT\n        c_custkey,\n        count(o_orderkey)\n    FROM\n        customer\n    LEFT OUTER JOIN orders ON c_custkey = o_custkey\n    AND o_comment NOT LIKE '%special%requests%'\nGROUP BY\n    c_custkey) AS c_orders (c_custkey,\n        c_count)\nGROUP BY\n    c_count\nORDER BY\n    custdist DESC,\n    c_count DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q13-duckdb-warmup.arrow"
+  },
+  {
+    "id": "s1-q13-cal0",
+    "sql": "SELECT\n    c_count,\n    count(*) AS custdist\nFROM (\n    SELECT\n        c_custkey,\n        count(o_orderkey)\n    FROM\n        customer\n    LEFT OUTER JOIN orders ON c_custkey = o_custkey\n    AND o_comment NOT LIKE '%special%requests%'\nGROUP BY\n    c_custkey) AS c_orders (c_custkey,\n        c_count)\nGROUP BY\n    c_count\nORDER BY\n    custdist DESC,\n    c_count DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q13-cal0.arrow"
+  },
+  {
+    "id": "s1-q13-cal1",
+    "sql": "SELECT\n    c_count,\n    count(*) AS custdist\nFROM (\n    SELECT\n        c_custkey,\n        count(o_orderkey)\n    FROM\n        customer\n    LEFT OUTER JOIN orders ON c_custkey = o_custkey\n    AND o_comment NOT LIKE '%special%requests%'\nGROUP BY\n    c_custkey) AS c_orders (c_custkey,\n        c_count)\nGROUP BY\n    c_count\nORDER BY\n    custdist DESC,\n    c_count DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q13-cal1.arrow"
+  },
+  {
+    "id": "s1-q13-cal2",
+    "sql": "SELECT\n    c_count,\n    count(*) AS custdist\nFROM (\n    SELECT\n        c_custkey,\n        count(o_orderkey)\n    FROM\n        customer\n    LEFT OUTER JOIN orders ON c_custkey = o_custkey\n    AND o_comment NOT LIKE '%special%requests%'\nGROUP BY\n    c_custkey) AS c_orders (c_custkey,\n        c_count)\nGROUP BY\n    c_count\nORDER BY\n    custdist DESC,\n    c_count DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q13-cal2.arrow"
+  },
+  {
+    "id": "s1-q13-1-duckdb",
+    "sql": "SELECT\n    c_count,\n    count(*) AS custdist\nFROM (\n    SELECT\n        c_custkey,\n        count(o_orderkey)\n    FROM\n        customer\n    LEFT OUTER JOIN orders ON c_custkey = o_custkey\n    AND o_comment NOT LIKE '%special%requests%'\nGROUP BY\n    c_custkey) AS c_orders (c_custkey,\n        c_count)\nGROUP BY\n    c_count\nORDER BY\n    custdist DESC,\n    c_count DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q13-1-duckdb.arrow"
+  },
+  {
+    "id": "s1-q13-2-duckdb",
+    "sql": "SELECT\n    c_count,\n    count(*) AS custdist\nFROM (\n    SELECT\n        c_custkey,\n        count(o_orderkey)\n    FROM\n        customer\n    LEFT OUTER JOIN orders ON c_custkey = o_custkey\n    AND o_comment NOT LIKE '%special%requests%'\nGROUP BY\n    c_custkey) AS c_orders (c_custkey,\n        c_count)\nGROUP BY\n    c_count\nORDER BY\n    custdist DESC,\n    c_count DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q13-2-duckdb.arrow"
+  },
+  {
+    "id": "s1-q13-3-duckdb",
+    "sql": "SELECT\n    c_count,\n    count(*) AS custdist\nFROM (\n    SELECT\n        c_custkey,\n        count(o_orderkey)\n    FROM\n        customer\n    LEFT OUTER JOIN orders ON c_custkey = o_custkey\n    AND o_comment NOT LIKE '%special%requests%'\nGROUP BY\n    c_custkey) AS c_orders (c_custkey,\n        c_count)\nGROUP BY\n    c_count\nORDER BY\n    custdist DESC,\n    c_count DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q13-3-duckdb.arrow"
+  },
+  {
+    "id": "s1-q02-duckdb-plan",
+    "sql": "EXPLAIN SELECT\n    s_acctbal,\n    s_name,\n    n_name,\n    p_partkey,\n    p_mfgr,\n    s_address,\n    s_phone,\n    s_comment\nFROM\n    part,\n    supplier,\n    partsupp,\n    nation,\n    region\nWHERE\n    p_partkey = ps_partkey\n    AND s_suppkey = ps_suppkey\n    AND p_size = 15\n    AND p_type LIKE '%BRASS'\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'EUROPE'\n    AND ps_supplycost = (\n        SELECT\n            min(ps_supplycost)\n        FROM\n            partsupp,\n            supplier,\n            nation,\n            region\n        WHERE\n            p_partkey = ps_partkey\n            AND s_suppkey = ps_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_regionkey = r_regionkey\n            AND r_name = 'EUROPE')\nORDER BY\n    s_acctbal DESC,\n    n_name,\n    s_name,\n    p_partkey\nLIMIT 100;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q02-duckdb-plan.arrow"
+  },
+  {
+    "id": "s1-q02-oracle",
+    "sql": "SELECT\n    s_acctbal,\n    s_name,\n    n_name,\n    p_partkey,\n    p_mfgr,\n    s_address,\n    s_phone,\n    s_comment\nFROM\n    part,\n    supplier,\n    partsupp,\n    nation,\n    region\nWHERE\n    p_partkey = ps_partkey\n    AND s_suppkey = ps_suppkey\n    AND p_size = 15\n    AND p_type LIKE '%BRASS'\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'EUROPE'\n    AND ps_supplycost = (\n        SELECT\n            min(ps_supplycost)\n        FROM\n            partsupp,\n            supplier,\n            nation,\n            region\n        WHERE\n            p_partkey = ps_partkey\n            AND s_suppkey = ps_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_regionkey = r_regionkey\n            AND r_name = 'EUROPE')\nORDER BY\n    s_acctbal DESC,\n    n_name,\n    s_name,\n    p_partkey;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q02-oracle.arrow"
+  },
+  {
+    "id": "s1-q02-duckdb-warmup",
+    "sql": "SELECT\n    s_acctbal,\n    s_name,\n    n_name,\n    p_partkey,\n    p_mfgr,\n    s_address,\n    s_phone,\n    s_comment\nFROM\n    part,\n    supplier,\n    partsupp,\n    nation,\n    region\nWHERE\n    p_partkey = ps_partkey\n    AND s_suppkey = ps_suppkey\n    AND p_size = 15\n    AND p_type LIKE '%BRASS'\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'EUROPE'\n    AND ps_supplycost = (\n        SELECT\n            min(ps_supplycost)\n        FROM\n            partsupp,\n            supplier,\n            nation,\n            region\n        WHERE\n            p_partkey = ps_partkey\n            AND s_suppkey = ps_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_regionkey = r_regionkey\n            AND r_name = 'EUROPE')\nORDER BY\n    s_acctbal DESC,\n    n_name,\n    s_name,\n    p_partkey\nLIMIT 100;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q02-duckdb-warmup.arrow"
+  },
+  {
+    "id": "s1-q02-cal0",
+    "sql": "SELECT\n    s_acctbal,\n    s_name,\n    n_name,\n    p_partkey,\n    p_mfgr,\n    s_address,\n    s_phone,\n    s_comment\nFROM\n    part,\n    supplier,\n    partsupp,\n    nation,\n    region\nWHERE\n    p_partkey = ps_partkey\n    AND s_suppkey = ps_suppkey\n    AND p_size = 15\n    AND p_type LIKE '%BRASS'\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'EUROPE'\n    AND ps_supplycost = (\n        SELECT\n            min(ps_supplycost)\n        FROM\n            partsupp,\n            supplier,\n            nation,\n            region\n        WHERE\n            p_partkey = ps_partkey\n            AND s_suppkey = ps_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_regionkey = r_regionkey\n            AND r_name = 'EUROPE')\nORDER BY\n    s_acctbal DESC,\n    n_name,\n    s_name,\n    p_partkey\nLIMIT 100;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q02-cal0.arrow"
+  },
+  {
+    "id": "s1-q02-cal1",
+    "sql": "SELECT\n    s_acctbal,\n    s_name,\n    n_name,\n    p_partkey,\n    p_mfgr,\n    s_address,\n    s_phone,\n    s_comment\nFROM\n    part,\n    supplier,\n    partsupp,\n    nation,\n    region\nWHERE\n    p_partkey = ps_partkey\n    AND s_suppkey = ps_suppkey\n    AND p_size = 15\n    AND p_type LIKE '%BRASS'\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'EUROPE'\n    AND ps_supplycost = (\n        SELECT\n            min(ps_supplycost)\n        FROM\n            partsupp,\n            supplier,\n            nation,\n            region\n        WHERE\n            p_partkey = ps_partkey\n            AND s_suppkey = ps_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_regionkey = r_regionkey\n            AND r_name = 'EUROPE')\nORDER BY\n    s_acctbal DESC,\n    n_name,\n    s_name,\n    p_partkey\nLIMIT 100;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q02-cal1.arrow"
+  },
+  {
+    "id": "s1-q02-cal2",
+    "sql": "SELECT\n    s_acctbal,\n    s_name,\n    n_name,\n    p_partkey,\n    p_mfgr,\n    s_address,\n    s_phone,\n    s_comment\nFROM\n    part,\n    supplier,\n    partsupp,\n    nation,\n    region\nWHERE\n    p_partkey = ps_partkey\n    AND s_suppkey = ps_suppkey\n    AND p_size = 15\n    AND p_type LIKE '%BRASS'\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'EUROPE'\n    AND ps_supplycost = (\n        SELECT\n            min(ps_supplycost)\n        FROM\n            partsupp,\n            supplier,\n            nation,\n            region\n        WHERE\n            p_partkey = ps_partkey\n            AND s_suppkey = ps_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_regionkey = r_regionkey\n            AND r_name = 'EUROPE')\nORDER BY\n    s_acctbal DESC,\n    n_name,\n    s_name,\n    p_partkey\nLIMIT 100;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q02-cal2.arrow"
+  },
+  {
+    "id": "s1-q02-1-duckdb",
+    "sql": "SELECT\n    s_acctbal,\n    s_name,\n    n_name,\n    p_partkey,\n    p_mfgr,\n    s_address,\n    s_phone,\n    s_comment\nFROM\n    part,\n    supplier,\n    partsupp,\n    nation,\n    region\nWHERE\n    p_partkey = ps_partkey\n    AND s_suppkey = ps_suppkey\n    AND p_size = 15\n    AND p_type LIKE '%BRASS'\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'EUROPE'\n    AND ps_supplycost = (\n        SELECT\n            min(ps_supplycost)\n        FROM\n            partsupp,\n            supplier,\n            nation,\n            region\n        WHERE\n            p_partkey = ps_partkey\n            AND s_suppkey = ps_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_regionkey = r_regionkey\n            AND r_name = 'EUROPE')\nORDER BY\n    s_acctbal DESC,\n    n_name,\n    s_name,\n    p_partkey\nLIMIT 100;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q02-1-duckdb.arrow"
+  },
+  {
+    "id": "s1-q02-2-duckdb",
+    "sql": "SELECT\n    s_acctbal,\n    s_name,\n    n_name,\n    p_partkey,\n    p_mfgr,\n    s_address,\n    s_phone,\n    s_comment\nFROM\n    part,\n    supplier,\n    partsupp,\n    nation,\n    region\nWHERE\n    p_partkey = ps_partkey\n    AND s_suppkey = ps_suppkey\n    AND p_size = 15\n    AND p_type LIKE '%BRASS'\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'EUROPE'\n    AND ps_supplycost = (\n        SELECT\n            min(ps_supplycost)\n        FROM\n            partsupp,\n            supplier,\n            nation,\n            region\n        WHERE\n            p_partkey = ps_partkey\n            AND s_suppkey = ps_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_regionkey = r_regionkey\n            AND r_name = 'EUROPE')\nORDER BY\n    s_acctbal DESC,\n    n_name,\n    s_name,\n    p_partkey\nLIMIT 100;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q02-2-duckdb.arrow"
+  },
+  {
+    "id": "s1-q02-3-duckdb",
+    "sql": "SELECT\n    s_acctbal,\n    s_name,\n    n_name,\n    p_partkey,\n    p_mfgr,\n    s_address,\n    s_phone,\n    s_comment\nFROM\n    part,\n    supplier,\n    partsupp,\n    nation,\n    region\nWHERE\n    p_partkey = ps_partkey\n    AND s_suppkey = ps_suppkey\n    AND p_size = 15\n    AND p_type LIKE '%BRASS'\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'EUROPE'\n    AND ps_supplycost = (\n        SELECT\n            min(ps_supplycost)\n        FROM\n            partsupp,\n            supplier,\n            nation,\n            region\n        WHERE\n            p_partkey = ps_partkey\n            AND s_suppkey = ps_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_regionkey = r_regionkey\n            AND r_name = 'EUROPE')\nORDER BY\n    s_acctbal DESC,\n    n_name,\n    s_name,\n    p_partkey\nLIMIT 100;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q02-3-duckdb.arrow"
+  },
+  {
+    "id": "s1-q16-duckdb-plan",
+    "sql": "EXPLAIN SELECT\n    p_brand,\n    p_type,\n    p_size,\n    count(DISTINCT ps_suppkey) AS supplier_cnt\nFROM\n    partsupp,\n    part\nWHERE\n    p_partkey = ps_partkey\n    AND p_brand <> 'Brand#45'\n    AND p_type NOT LIKE 'MEDIUM POLISHED%'\n    AND p_size IN (49, 14, 23, 45, 19, 3, 36, 9)\n    AND ps_suppkey NOT IN (\n        SELECT\n            s_suppkey\n        FROM\n            supplier\n        WHERE\n            s_comment LIKE '%Customer%Complaints%')\nGROUP BY\n    p_brand,\n    p_type,\n    p_size\nORDER BY\n    supplier_cnt DESC,\n    p_brand,\n    p_type,\n    p_size;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q16-duckdb-plan.arrow"
+  },
+  {
+    "id": "s1-q16-oracle",
+    "sql": "SELECT\n    p_brand,\n    p_type,\n    p_size,\n    count(DISTINCT ps_suppkey) AS supplier_cnt\nFROM\n    partsupp,\n    part\nWHERE\n    p_partkey = ps_partkey\n    AND p_brand <> 'Brand#45'\n    AND p_type NOT LIKE 'MEDIUM POLISHED%'\n    AND p_size IN (49, 14, 23, 45, 19, 3, 36, 9)\n    AND ps_suppkey NOT IN (\n        SELECT\n            s_suppkey\n        FROM\n            supplier\n        WHERE\n            s_comment LIKE '%Customer%Complaints%')\nGROUP BY\n    p_brand,\n    p_type,\n    p_size\nORDER BY\n    supplier_cnt DESC,\n    p_brand,\n    p_type,\n    p_size;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q16-oracle.arrow"
+  },
+  {
+    "id": "s1-q16-duckdb-warmup",
+    "sql": "SELECT\n    p_brand,\n    p_type,\n    p_size,\n    count(DISTINCT ps_suppkey) AS supplier_cnt\nFROM\n    partsupp,\n    part\nWHERE\n    p_partkey = ps_partkey\n    AND p_brand <> 'Brand#45'\n    AND p_type NOT LIKE 'MEDIUM POLISHED%'\n    AND p_size IN (49, 14, 23, 45, 19, 3, 36, 9)\n    AND ps_suppkey NOT IN (\n        SELECT\n            s_suppkey\n        FROM\n            supplier\n        WHERE\n            s_comment LIKE '%Customer%Complaints%')\nGROUP BY\n    p_brand,\n    p_type,\n    p_size\nORDER BY\n    supplier_cnt DESC,\n    p_brand,\n    p_type,\n    p_size;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q16-duckdb-warmup.arrow"
+  },
+  {
+    "id": "s1-q16-cal0",
+    "sql": "SELECT\n    p_brand,\n    p_type,\n    p_size,\n    count(DISTINCT ps_suppkey) AS supplier_cnt\nFROM\n    partsupp,\n    part\nWHERE\n    p_partkey = ps_partkey\n    AND p_brand <> 'Brand#45'\n    AND p_type NOT LIKE 'MEDIUM POLISHED%'\n    AND p_size IN (49, 14, 23, 45, 19, 3, 36, 9)\n    AND ps_suppkey NOT IN (\n        SELECT\n            s_suppkey\n        FROM\n            supplier\n        WHERE\n            s_comment LIKE '%Customer%Complaints%')\nGROUP BY\n    p_brand,\n    p_type,\n    p_size\nORDER BY\n    supplier_cnt DESC,\n    p_brand,\n    p_type,\n    p_size;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q16-cal0.arrow"
+  },
+  {
+    "id": "s1-q16-cal1",
+    "sql": "SELECT\n    p_brand,\n    p_type,\n    p_size,\n    count(DISTINCT ps_suppkey) AS supplier_cnt\nFROM\n    partsupp,\n    part\nWHERE\n    p_partkey = ps_partkey\n    AND p_brand <> 'Brand#45'\n    AND p_type NOT LIKE 'MEDIUM POLISHED%'\n    AND p_size IN (49, 14, 23, 45, 19, 3, 36, 9)\n    AND ps_suppkey NOT IN (\n        SELECT\n            s_suppkey\n        FROM\n            supplier\n        WHERE\n            s_comment LIKE '%Customer%Complaints%')\nGROUP BY\n    p_brand,\n    p_type,\n    p_size\nORDER BY\n    supplier_cnt DESC,\n    p_brand,\n    p_type,\n    p_size;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q16-cal1.arrow"
+  },
+  {
+    "id": "s1-q16-cal2",
+    "sql": "SELECT\n    p_brand,\n    p_type,\n    p_size,\n    count(DISTINCT ps_suppkey) AS supplier_cnt\nFROM\n    partsupp,\n    part\nWHERE\n    p_partkey = ps_partkey\n    AND p_brand <> 'Brand#45'\n    AND p_type NOT LIKE 'MEDIUM POLISHED%'\n    AND p_size IN (49, 14, 23, 45, 19, 3, 36, 9)\n    AND ps_suppkey NOT IN (\n        SELECT\n            s_suppkey\n        FROM\n            supplier\n        WHERE\n            s_comment LIKE '%Customer%Complaints%')\nGROUP BY\n    p_brand,\n    p_type,\n    p_size\nORDER BY\n    supplier_cnt DESC,\n    p_brand,\n    p_type,\n    p_size;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q16-cal2.arrow"
+  },
+  {
+    "id": "s1-q16-1-duckdb",
+    "sql": "SELECT\n    p_brand,\n    p_type,\n    p_size,\n    count(DISTINCT ps_suppkey) AS supplier_cnt\nFROM\n    partsupp,\n    part\nWHERE\n    p_partkey = ps_partkey\n    AND p_brand <> 'Brand#45'\n    AND p_type NOT LIKE 'MEDIUM POLISHED%'\n    AND p_size IN (49, 14, 23, 45, 19, 3, 36, 9)\n    AND ps_suppkey NOT IN (\n        SELECT\n            s_suppkey\n        FROM\n            supplier\n        WHERE\n            s_comment LIKE '%Customer%Complaints%')\nGROUP BY\n    p_brand,\n    p_type,\n    p_size\nORDER BY\n    supplier_cnt DESC,\n    p_brand,\n    p_type,\n    p_size;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q16-1-duckdb.arrow"
+  },
+  {
+    "id": "s1-q16-2-duckdb",
+    "sql": "SELECT\n    p_brand,\n    p_type,\n    p_size,\n    count(DISTINCT ps_suppkey) AS supplier_cnt\nFROM\n    partsupp,\n    part\nWHERE\n    p_partkey = ps_partkey\n    AND p_brand <> 'Brand#45'\n    AND p_type NOT LIKE 'MEDIUM POLISHED%'\n    AND p_size IN (49, 14, 23, 45, 19, 3, 36, 9)\n    AND ps_suppkey NOT IN (\n        SELECT\n            s_suppkey\n        FROM\n            supplier\n        WHERE\n            s_comment LIKE '%Customer%Complaints%')\nGROUP BY\n    p_brand,\n    p_type,\n    p_size\nORDER BY\n    supplier_cnt DESC,\n    p_brand,\n    p_type,\n    p_size;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q16-2-duckdb.arrow"
+  },
+  {
+    "id": "s1-q16-3-duckdb",
+    "sql": "SELECT\n    p_brand,\n    p_type,\n    p_size,\n    count(DISTINCT ps_suppkey) AS supplier_cnt\nFROM\n    partsupp,\n    part\nWHERE\n    p_partkey = ps_partkey\n    AND p_brand <> 'Brand#45'\n    AND p_type NOT LIKE 'MEDIUM POLISHED%'\n    AND p_size IN (49, 14, 23, 45, 19, 3, 36, 9)\n    AND ps_suppkey NOT IN (\n        SELECT\n            s_suppkey\n        FROM\n            supplier\n        WHERE\n            s_comment LIKE '%Customer%Complaints%')\nGROUP BY\n    p_brand,\n    p_type,\n    p_size\nORDER BY\n    supplier_cnt DESC,\n    p_brand,\n    p_type,\n    p_size;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q16-3-duckdb.arrow"
+  },
+  {
+    "id": "s1-q11-duckdb-plan",
+    "sql": "EXPLAIN SELECT\n    ps_partkey,\n    sum(ps_supplycost * ps_availqty) AS value\nFROM\n    partsupp,\n    supplier,\n    nation\nWHERE\n    ps_suppkey = s_suppkey\n    AND s_nationkey = n_nationkey\n    AND n_name = 'GERMANY'\nGROUP BY\n    ps_partkey\nHAVING\n    sum(ps_supplycost * ps_availqty) > (\n        SELECT\n            sum(ps_supplycost * ps_availqty) * 0.00001\n        FROM\n            partsupp,\n            supplier,\n            nation\n        WHERE\n            ps_suppkey = s_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_name = 'GERMANY')\nORDER BY\n    value DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q11-duckdb-plan.arrow"
+  },
+  {
+    "id": "s1-q11-oracle",
+    "sql": "SELECT\n    ps_partkey,\n    sum(ps_supplycost * ps_availqty) AS value\nFROM\n    partsupp,\n    supplier,\n    nation\nWHERE\n    ps_suppkey = s_suppkey\n    AND s_nationkey = n_nationkey\n    AND n_name = 'GERMANY'\nGROUP BY\n    ps_partkey\nHAVING\n    sum(ps_supplycost * ps_availqty) > (\n        SELECT\n            sum(ps_supplycost * ps_availqty) * 0.00001\n        FROM\n            partsupp,\n            supplier,\n            nation\n        WHERE\n            ps_suppkey = s_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_name = 'GERMANY')\nORDER BY\n    value DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q11-oracle.arrow"
+  },
+  {
+    "id": "s1-q11-duckdb-warmup",
+    "sql": "SELECT\n    ps_partkey,\n    sum(ps_supplycost * ps_availqty) AS value\nFROM\n    partsupp,\n    supplier,\n    nation\nWHERE\n    ps_suppkey = s_suppkey\n    AND s_nationkey = n_nationkey\n    AND n_name = 'GERMANY'\nGROUP BY\n    ps_partkey\nHAVING\n    sum(ps_supplycost * ps_availqty) > (\n        SELECT\n            sum(ps_supplycost * ps_availqty) * 0.00001\n        FROM\n            partsupp,\n            supplier,\n            nation\n        WHERE\n            ps_suppkey = s_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_name = 'GERMANY')\nORDER BY\n    value DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q11-duckdb-warmup.arrow"
+  },
+  {
+    "id": "s1-q11-cal0",
+    "sql": "SELECT\n    ps_partkey,\n    sum(ps_supplycost * ps_availqty) AS value\nFROM\n    partsupp,\n    supplier,\n    nation\nWHERE\n    ps_suppkey = s_suppkey\n    AND s_nationkey = n_nationkey\n    AND n_name = 'GERMANY'\nGROUP BY\n    ps_partkey\nHAVING\n    sum(ps_supplycost * ps_availqty) > (\n        SELECT\n            sum(ps_supplycost * ps_availqty) * 0.00001\n        FROM\n            partsupp,\n            supplier,\n            nation\n        WHERE\n            ps_suppkey = s_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_name = 'GERMANY')\nORDER BY\n    value DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q11-cal0.arrow"
+  },
+  {
+    "id": "s1-q11-cal1",
+    "sql": "SELECT\n    ps_partkey,\n    sum(ps_supplycost * ps_availqty) AS value\nFROM\n    partsupp,\n    supplier,\n    nation\nWHERE\n    ps_suppkey = s_suppkey\n    AND s_nationkey = n_nationkey\n    AND n_name = 'GERMANY'\nGROUP BY\n    ps_partkey\nHAVING\n    sum(ps_supplycost * ps_availqty) > (\n        SELECT\n            sum(ps_supplycost * ps_availqty) * 0.00001\n        FROM\n            partsupp,\n            supplier,\n            nation\n        WHERE\n            ps_suppkey = s_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_name = 'GERMANY')\nORDER BY\n    value DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q11-cal1.arrow"
+  },
+  {
+    "id": "s1-q11-cal2",
+    "sql": "SELECT\n    ps_partkey,\n    sum(ps_supplycost * ps_availqty) AS value\nFROM\n    partsupp,\n    supplier,\n    nation\nWHERE\n    ps_suppkey = s_suppkey\n    AND s_nationkey = n_nationkey\n    AND n_name = 'GERMANY'\nGROUP BY\n    ps_partkey\nHAVING\n    sum(ps_supplycost * ps_availqty) > (\n        SELECT\n            sum(ps_supplycost * ps_availqty) * 0.00001\n        FROM\n            partsupp,\n            supplier,\n            nation\n        WHERE\n            ps_suppkey = s_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_name = 'GERMANY')\nORDER BY\n    value DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q11-cal2.arrow"
+  },
+  {
+    "id": "s1-q11-1-duckdb",
+    "sql": "SELECT\n    ps_partkey,\n    sum(ps_supplycost * ps_availqty) AS value\nFROM\n    partsupp,\n    supplier,\n    nation\nWHERE\n    ps_suppkey = s_suppkey\n    AND s_nationkey = n_nationkey\n    AND n_name = 'GERMANY'\nGROUP BY\n    ps_partkey\nHAVING\n    sum(ps_supplycost * ps_availqty) > (\n        SELECT\n            sum(ps_supplycost * ps_availqty) * 0.00001\n        FROM\n            partsupp,\n            supplier,\n            nation\n        WHERE\n            ps_suppkey = s_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_name = 'GERMANY')\nORDER BY\n    value DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q11-1-duckdb.arrow"
+  },
+  {
+    "id": "s1-q11-2-duckdb",
+    "sql": "SELECT\n    ps_partkey,\n    sum(ps_supplycost * ps_availqty) AS value\nFROM\n    partsupp,\n    supplier,\n    nation\nWHERE\n    ps_suppkey = s_suppkey\n    AND s_nationkey = n_nationkey\n    AND n_name = 'GERMANY'\nGROUP BY\n    ps_partkey\nHAVING\n    sum(ps_supplycost * ps_availqty) > (\n        SELECT\n            sum(ps_supplycost * ps_availqty) * 0.00001\n        FROM\n            partsupp,\n            supplier,\n            nation\n        WHERE\n            ps_suppkey = s_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_name = 'GERMANY')\nORDER BY\n    value DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q11-2-duckdb.arrow"
+  },
+  {
+    "id": "s1-q11-3-duckdb",
+    "sql": "SELECT\n    ps_partkey,\n    sum(ps_supplycost * ps_availqty) AS value\nFROM\n    partsupp,\n    supplier,\n    nation\nWHERE\n    ps_suppkey = s_suppkey\n    AND s_nationkey = n_nationkey\n    AND n_name = 'GERMANY'\nGROUP BY\n    ps_partkey\nHAVING\n    sum(ps_supplycost * ps_availqty) > (\n        SELECT\n            sum(ps_supplycost * ps_availqty) * 0.00001\n        FROM\n            partsupp,\n            supplier,\n            nation\n        WHERE\n            ps_suppkey = s_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_name = 'GERMANY')\nORDER BY\n    value DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q11-3-duckdb.arrow"
+  },
+  {
+    "id": "s1-q17-duckdb-plan",
+    "sql": "EXPLAIN SELECT\n    sum(l_extendedprice) / 7.0 AS avg_yearly\nFROM\n    lineitem,\n    part\nWHERE\n    p_partkey = l_partkey\n    AND p_brand = 'Brand#23'\n    AND p_container = 'MED BOX'\n    AND l_quantity < (\n        SELECT\n            0.2 * avg(l_quantity)\n        FROM\n            lineitem\n        WHERE\n            l_partkey = p_partkey);\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q17-duckdb-plan.arrow"
+  },
+  {
+    "id": "s1-q17-oracle",
+    "sql": "SELECT\n    sum(l_extendedprice) / 7.0 AS avg_yearly\nFROM\n    lineitem,\n    part\nWHERE\n    p_partkey = l_partkey\n    AND p_brand = 'Brand#23'\n    AND p_container = 'MED BOX'\n    AND l_quantity < (\n        SELECT\n            0.2 * avg(l_quantity)\n        FROM\n            lineitem\n        WHERE\n            l_partkey = p_partkey);\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q17-oracle.arrow"
+  },
+  {
+    "id": "s1-q17-duckdb-warmup",
+    "sql": "SELECT\n    sum(l_extendedprice) / 7.0 AS avg_yearly\nFROM\n    lineitem,\n    part\nWHERE\n    p_partkey = l_partkey\n    AND p_brand = 'Brand#23'\n    AND p_container = 'MED BOX'\n    AND l_quantity < (\n        SELECT\n            0.2 * avg(l_quantity)\n        FROM\n            lineitem\n        WHERE\n            l_partkey = p_partkey);\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q17-duckdb-warmup.arrow"
+  },
+  {
+    "id": "s1-q17-cal0",
+    "sql": "SELECT\n    sum(l_extendedprice) / 7.0 AS avg_yearly\nFROM\n    lineitem,\n    part\nWHERE\n    p_partkey = l_partkey\n    AND p_brand = 'Brand#23'\n    AND p_container = 'MED BOX'\n    AND l_quantity < (\n        SELECT\n            0.2 * avg(l_quantity)\n        FROM\n            lineitem\n        WHERE\n            l_partkey = p_partkey);\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q17-cal0.arrow"
+  },
+  {
+    "id": "s1-q17-cal1",
+    "sql": "SELECT\n    sum(l_extendedprice) / 7.0 AS avg_yearly\nFROM\n    lineitem,\n    part\nWHERE\n    p_partkey = l_partkey\n    AND p_brand = 'Brand#23'\n    AND p_container = 'MED BOX'\n    AND l_quantity < (\n        SELECT\n            0.2 * avg(l_quantity)\n        FROM\n            lineitem\n        WHERE\n            l_partkey = p_partkey);\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q17-cal1.arrow"
+  },
+  {
+    "id": "s1-q17-cal2",
+    "sql": "SELECT\n    sum(l_extendedprice) / 7.0 AS avg_yearly\nFROM\n    lineitem,\n    part\nWHERE\n    p_partkey = l_partkey\n    AND p_brand = 'Brand#23'\n    AND p_container = 'MED BOX'\n    AND l_quantity < (\n        SELECT\n            0.2 * avg(l_quantity)\n        FROM\n            lineitem\n        WHERE\n            l_partkey = p_partkey);\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q17-cal2.arrow"
+  },
+  {
+    "id": "s1-q17-1-duckdb",
+    "sql": "SELECT\n    sum(l_extendedprice) / 7.0 AS avg_yearly\nFROM\n    lineitem,\n    part\nWHERE\n    p_partkey = l_partkey\n    AND p_brand = 'Brand#23'\n    AND p_container = 'MED BOX'\n    AND l_quantity < (\n        SELECT\n            0.2 * avg(l_quantity)\n        FROM\n            lineitem\n        WHERE\n            l_partkey = p_partkey);\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q17-1-duckdb.arrow"
+  },
+  {
+    "id": "s1-q17-2-duckdb",
+    "sql": "SELECT\n    sum(l_extendedprice) / 7.0 AS avg_yearly\nFROM\n    lineitem,\n    part\nWHERE\n    p_partkey = l_partkey\n    AND p_brand = 'Brand#23'\n    AND p_container = 'MED BOX'\n    AND l_quantity < (\n        SELECT\n            0.2 * avg(l_quantity)\n        FROM\n            lineitem\n        WHERE\n            l_partkey = p_partkey);\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q17-2-duckdb.arrow"
+  },
+  {
+    "id": "s1-q17-3-duckdb",
+    "sql": "SELECT\n    sum(l_extendedprice) / 7.0 AS avg_yearly\nFROM\n    lineitem,\n    part\nWHERE\n    p_partkey = l_partkey\n    AND p_brand = 'Brand#23'\n    AND p_container = 'MED BOX'\n    AND l_quantity < (\n        SELECT\n            0.2 * avg(l_quantity)\n        FROM\n            lineitem\n        WHERE\n            l_partkey = p_partkey);\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q17-3-duckdb.arrow"
+  },
+  {
+    "id": "s1-q22-duckdb-plan",
+    "sql": "EXPLAIN SELECT\n    cntrycode,\n    count(*) AS numcust,\n    sum(c_acctbal) AS totacctbal\nFROM (\n    SELECT\n        substring(c_phone FROM 1 FOR 2) AS cntrycode,\n        c_acctbal\n    FROM\n        customer\n    WHERE\n        substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')\n        AND c_acctbal > (\n            SELECT\n                avg(c_acctbal)\n            FROM\n                customer\n            WHERE\n                c_acctbal > 0.00\n                AND substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17'))\n            AND NOT EXISTS (\n                SELECT\n                    *\n                FROM\n                    orders\n                WHERE\n                    o_custkey = c_custkey)) AS custsale\nGROUP BY\n    cntrycode\nORDER BY\n    cntrycode;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q22-duckdb-plan.arrow"
+  },
+  {
+    "id": "s1-q22-oracle",
+    "sql": "SELECT\n    cntrycode,\n    count(*) AS numcust,\n    sum(c_acctbal) AS totacctbal\nFROM (\n    SELECT\n        substring(c_phone FROM 1 FOR 2) AS cntrycode,\n        c_acctbal\n    FROM\n        customer\n    WHERE\n        substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')\n        AND c_acctbal > (\n            SELECT\n                avg(c_acctbal)\n            FROM\n                customer\n            WHERE\n                c_acctbal > 0.00\n                AND substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17'))\n            AND NOT EXISTS (\n                SELECT\n                    *\n                FROM\n                    orders\n                WHERE\n                    o_custkey = c_custkey)) AS custsale\nGROUP BY\n    cntrycode\nORDER BY\n    cntrycode;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q22-oracle.arrow"
+  },
+  {
+    "id": "s1-q22-duckdb-warmup",
+    "sql": "SELECT\n    cntrycode,\n    count(*) AS numcust,\n    sum(c_acctbal) AS totacctbal\nFROM (\n    SELECT\n        substring(c_phone FROM 1 FOR 2) AS cntrycode,\n        c_acctbal\n    FROM\n        customer\n    WHERE\n        substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')\n        AND c_acctbal > (\n            SELECT\n                avg(c_acctbal)\n            FROM\n                customer\n            WHERE\n                c_acctbal > 0.00\n                AND substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17'))\n            AND NOT EXISTS (\n                SELECT\n                    *\n                FROM\n                    orders\n                WHERE\n                    o_custkey = c_custkey)) AS custsale\nGROUP BY\n    cntrycode\nORDER BY\n    cntrycode;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q22-duckdb-warmup.arrow"
+  },
+  {
+    "id": "s1-q22-cal0",
+    "sql": "SELECT\n    cntrycode,\n    count(*) AS numcust,\n    sum(c_acctbal) AS totacctbal\nFROM (\n    SELECT\n        substring(c_phone FROM 1 FOR 2) AS cntrycode,\n        c_acctbal\n    FROM\n        customer\n    WHERE\n        substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')\n        AND c_acctbal > (\n            SELECT\n                avg(c_acctbal)\n            FROM\n                customer\n            WHERE\n                c_acctbal > 0.00\n                AND substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17'))\n            AND NOT EXISTS (\n                SELECT\n                    *\n                FROM\n                    orders\n                WHERE\n                    o_custkey = c_custkey)) AS custsale\nGROUP BY\n    cntrycode\nORDER BY\n    cntrycode;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q22-cal0.arrow"
+  },
+  {
+    "id": "s1-q22-cal1",
+    "sql": "SELECT\n    cntrycode,\n    count(*) AS numcust,\n    sum(c_acctbal) AS totacctbal\nFROM (\n    SELECT\n        substring(c_phone FROM 1 FOR 2) AS cntrycode,\n        c_acctbal\n    FROM\n        customer\n    WHERE\n        substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')\n        AND c_acctbal > (\n            SELECT\n                avg(c_acctbal)\n            FROM\n                customer\n            WHERE\n                c_acctbal > 0.00\n                AND substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17'))\n            AND NOT EXISTS (\n                SELECT\n                    *\n                FROM\n                    orders\n                WHERE\n                    o_custkey = c_custkey)) AS custsale\nGROUP BY\n    cntrycode\nORDER BY\n    cntrycode;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q22-cal1.arrow"
+  },
+  {
+    "id": "s1-q22-cal2",
+    "sql": "SELECT\n    cntrycode,\n    count(*) AS numcust,\n    sum(c_acctbal) AS totacctbal\nFROM (\n    SELECT\n        substring(c_phone FROM 1 FOR 2) AS cntrycode,\n        c_acctbal\n    FROM\n        customer\n    WHERE\n        substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')\n        AND c_acctbal > (\n            SELECT\n                avg(c_acctbal)\n            FROM\n                customer\n            WHERE\n                c_acctbal > 0.00\n                AND substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17'))\n            AND NOT EXISTS (\n                SELECT\n                    *\n                FROM\n                    orders\n                WHERE\n                    o_custkey = c_custkey)) AS custsale\nGROUP BY\n    cntrycode\nORDER BY\n    cntrycode;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q22-cal2.arrow"
+  },
+  {
+    "id": "s1-q22-1-duckdb",
+    "sql": "SELECT\n    cntrycode,\n    count(*) AS numcust,\n    sum(c_acctbal) AS totacctbal\nFROM (\n    SELECT\n        substring(c_phone FROM 1 FOR 2) AS cntrycode,\n        c_acctbal\n    FROM\n        customer\n    WHERE\n        substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')\n        AND c_acctbal > (\n            SELECT\n                avg(c_acctbal)\n            FROM\n                customer\n            WHERE\n                c_acctbal > 0.00\n                AND substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17'))\n            AND NOT EXISTS (\n                SELECT\n                    *\n                FROM\n                    orders\n                WHERE\n                    o_custkey = c_custkey)) AS custsale\nGROUP BY\n    cntrycode\nORDER BY\n    cntrycode;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q22-1-duckdb.arrow"
+  },
+  {
+    "id": "s1-q22-2-duckdb",
+    "sql": "SELECT\n    cntrycode,\n    count(*) AS numcust,\n    sum(c_acctbal) AS totacctbal\nFROM (\n    SELECT\n        substring(c_phone FROM 1 FOR 2) AS cntrycode,\n        c_acctbal\n    FROM\n        customer\n    WHERE\n        substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')\n        AND c_acctbal > (\n            SELECT\n                avg(c_acctbal)\n            FROM\n                customer\n            WHERE\n                c_acctbal > 0.00\n                AND substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17'))\n            AND NOT EXISTS (\n                SELECT\n                    *\n                FROM\n                    orders\n                WHERE\n                    o_custkey = c_custkey)) AS custsale\nGROUP BY\n    cntrycode\nORDER BY\n    cntrycode;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q22-2-duckdb.arrow"
+  },
+  {
+    "id": "s1-q22-3-duckdb",
+    "sql": "SELECT\n    cntrycode,\n    count(*) AS numcust,\n    sum(c_acctbal) AS totacctbal\nFROM (\n    SELECT\n        substring(c_phone FROM 1 FOR 2) AS cntrycode,\n        c_acctbal\n    FROM\n        customer\n    WHERE\n        substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')\n        AND c_acctbal > (\n            SELECT\n                avg(c_acctbal)\n            FROM\n                customer\n            WHERE\n                c_acctbal > 0.00\n                AND substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17'))\n            AND NOT EXISTS (\n                SELECT\n                    *\n                FROM\n                    orders\n                WHERE\n                    o_custkey = c_custkey)) AS custsale\nGROUP BY\n    cntrycode\nORDER BY\n    cntrycode;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q22-3-duckdb.arrow"
+  },
+  {
+    "id": "s1-q03-duckdb-plan",
+    "sql": "EXPLAIN SELECT\n    l_orderkey,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue,\n    o_orderdate,\n    o_shippriority\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    c_mktsegment = 'BUILDING'\n    AND c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate < CAST('1995-03-15' AS date)\n    AND l_shipdate > CAST('1995-03-15' AS date)\nGROUP BY\n    l_orderkey,\n    o_orderdate,\n    o_shippriority\nORDER BY\n    revenue DESC,\n    o_orderdate\nLIMIT 10;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q03-duckdb-plan.arrow"
+  },
+  {
+    "id": "s1-q03-oracle",
+    "sql": "SELECT\n    l_orderkey,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue,\n    o_orderdate,\n    o_shippriority\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    c_mktsegment = 'BUILDING'\n    AND c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate < CAST('1995-03-15' AS date)\n    AND l_shipdate > CAST('1995-03-15' AS date)\nGROUP BY\n    l_orderkey,\n    o_orderdate,\n    o_shippriority\nORDER BY\n    revenue DESC,\n    o_orderdate;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q03-oracle.arrow"
+  },
+  {
+    "id": "s1-q03-duckdb-warmup",
+    "sql": "SELECT\n    l_orderkey,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue,\n    o_orderdate,\n    o_shippriority\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    c_mktsegment = 'BUILDING'\n    AND c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate < CAST('1995-03-15' AS date)\n    AND l_shipdate > CAST('1995-03-15' AS date)\nGROUP BY\n    l_orderkey,\n    o_orderdate,\n    o_shippriority\nORDER BY\n    revenue DESC,\n    o_orderdate\nLIMIT 10;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q03-duckdb-warmup.arrow"
+  },
+  {
+    "id": "s1-q03-cal0",
+    "sql": "SELECT\n    l_orderkey,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue,\n    o_orderdate,\n    o_shippriority\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    c_mktsegment = 'BUILDING'\n    AND c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate < CAST('1995-03-15' AS date)\n    AND l_shipdate > CAST('1995-03-15' AS date)\nGROUP BY\n    l_orderkey,\n    o_orderdate,\n    o_shippriority\nORDER BY\n    revenue DESC,\n    o_orderdate\nLIMIT 10;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q03-cal0.arrow"
+  },
+  {
+    "id": "s1-q03-cal1",
+    "sql": "SELECT\n    l_orderkey,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue,\n    o_orderdate,\n    o_shippriority\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    c_mktsegment = 'BUILDING'\n    AND c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate < CAST('1995-03-15' AS date)\n    AND l_shipdate > CAST('1995-03-15' AS date)\nGROUP BY\n    l_orderkey,\n    o_orderdate,\n    o_shippriority\nORDER BY\n    revenue DESC,\n    o_orderdate\nLIMIT 10;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q03-cal1.arrow"
+  },
+  {
+    "id": "s1-q03-cal2",
+    "sql": "SELECT\n    l_orderkey,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue,\n    o_orderdate,\n    o_shippriority\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    c_mktsegment = 'BUILDING'\n    AND c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate < CAST('1995-03-15' AS date)\n    AND l_shipdate > CAST('1995-03-15' AS date)\nGROUP BY\n    l_orderkey,\n    o_orderdate,\n    o_shippriority\nORDER BY\n    revenue DESC,\n    o_orderdate\nLIMIT 10;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q03-cal2.arrow"
+  },
+  {
+    "id": "s1-q03-1-duckdb",
+    "sql": "SELECT\n    l_orderkey,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue,\n    o_orderdate,\n    o_shippriority\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    c_mktsegment = 'BUILDING'\n    AND c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate < CAST('1995-03-15' AS date)\n    AND l_shipdate > CAST('1995-03-15' AS date)\nGROUP BY\n    l_orderkey,\n    o_orderdate,\n    o_shippriority\nORDER BY\n    revenue DESC,\n    o_orderdate\nLIMIT 10;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q03-1-duckdb.arrow"
+  },
+  {
+    "id": "s1-q03-2-duckdb",
+    "sql": "SELECT\n    l_orderkey,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue,\n    o_orderdate,\n    o_shippriority\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    c_mktsegment = 'BUILDING'\n    AND c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate < CAST('1995-03-15' AS date)\n    AND l_shipdate > CAST('1995-03-15' AS date)\nGROUP BY\n    l_orderkey,\n    o_orderdate,\n    o_shippriority\nORDER BY\n    revenue DESC,\n    o_orderdate\nLIMIT 10;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q03-2-duckdb.arrow"
+  },
+  {
+    "id": "s1-q03-3-duckdb",
+    "sql": "SELECT\n    l_orderkey,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue,\n    o_orderdate,\n    o_shippriority\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    c_mktsegment = 'BUILDING'\n    AND c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate < CAST('1995-03-15' AS date)\n    AND l_shipdate > CAST('1995-03-15' AS date)\nGROUP BY\n    l_orderkey,\n    o_orderdate,\n    o_shippriority\nORDER BY\n    revenue DESC,\n    o_orderdate\nLIMIT 10;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q03-3-duckdb.arrow"
+  },
+  {
+    "id": "s1-q09-duckdb-plan",
+    "sql": "EXPLAIN SELECT\n    nation,\n    o_year,\n    sum(amount) AS sum_profit\nFROM (\n    SELECT\n        n_name AS nation,\n        extract(year FROM o_orderdate) AS o_year,\n        l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity AS amount\n    FROM\n        part,\n        supplier,\n        lineitem,\n        partsupp,\n        orders,\n        nation\n    WHERE\n        s_suppkey = l_suppkey\n        AND ps_suppkey = l_suppkey\n        AND ps_partkey = l_partkey\n        AND p_partkey = l_partkey\n        AND o_orderkey = l_orderkey\n        AND s_nationkey = n_nationkey\n        AND p_name LIKE '%green%') AS profit\nGROUP BY\n    nation,\n    o_year\nORDER BY\n    nation,\n    o_year DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q09-duckdb-plan.arrow"
+  },
+  {
+    "id": "s1-q09-oracle",
+    "sql": "SELECT\n    nation,\n    o_year,\n    sum(amount) AS sum_profit\nFROM (\n    SELECT\n        n_name AS nation,\n        extract(year FROM o_orderdate) AS o_year,\n        l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity AS amount\n    FROM\n        part,\n        supplier,\n        lineitem,\n        partsupp,\n        orders,\n        nation\n    WHERE\n        s_suppkey = l_suppkey\n        AND ps_suppkey = l_suppkey\n        AND ps_partkey = l_partkey\n        AND p_partkey = l_partkey\n        AND o_orderkey = l_orderkey\n        AND s_nationkey = n_nationkey\n        AND p_name LIKE '%green%') AS profit\nGROUP BY\n    nation,\n    o_year\nORDER BY\n    nation,\n    o_year DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q09-oracle.arrow"
+  },
+  {
+    "id": "s1-q09-duckdb-warmup",
+    "sql": "SELECT\n    nation,\n    o_year,\n    sum(amount) AS sum_profit\nFROM (\n    SELECT\n        n_name AS nation,\n        extract(year FROM o_orderdate) AS o_year,\n        l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity AS amount\n    FROM\n        part,\n        supplier,\n        lineitem,\n        partsupp,\n        orders,\n        nation\n    WHERE\n        s_suppkey = l_suppkey\n        AND ps_suppkey = l_suppkey\n        AND ps_partkey = l_partkey\n        AND p_partkey = l_partkey\n        AND o_orderkey = l_orderkey\n        AND s_nationkey = n_nationkey\n        AND p_name LIKE '%green%') AS profit\nGROUP BY\n    nation,\n    o_year\nORDER BY\n    nation,\n    o_year DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q09-duckdb-warmup.arrow"
+  },
+  {
+    "id": "s1-q09-cal0",
+    "sql": "SELECT\n    nation,\n    o_year,\n    sum(amount) AS sum_profit\nFROM (\n    SELECT\n        n_name AS nation,\n        extract(year FROM o_orderdate) AS o_year,\n        l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity AS amount\n    FROM\n        part,\n        supplier,\n        lineitem,\n        partsupp,\n        orders,\n        nation\n    WHERE\n        s_suppkey = l_suppkey\n        AND ps_suppkey = l_suppkey\n        AND ps_partkey = l_partkey\n        AND p_partkey = l_partkey\n        AND o_orderkey = l_orderkey\n        AND s_nationkey = n_nationkey\n        AND p_name LIKE '%green%') AS profit\nGROUP BY\n    nation,\n    o_year\nORDER BY\n    nation,\n    o_year DESC;\n",
+    "output": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/reference-mappings-io16-02/lance/s1-q09-cal0.arrow"
+  }
+]

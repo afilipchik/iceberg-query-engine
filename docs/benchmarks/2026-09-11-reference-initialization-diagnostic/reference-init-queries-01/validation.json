@@ -1,0 +1,90 @@
+[
+  {
+    "run": "iceberg-construction-0",
+    "validation": {
+      "ok": false,
+      "policy": "ordered",
+      "status": "validation_error",
+      "actual_schema": "c_count: int64\ncustdist: int64",
+      "expected_schema": "c_count: int64\ncustdist: int64",
+      "reason": "invalid order key"
+    }
+  },
+  {
+    "run": "iceberg-construction-1",
+    "validation": {
+      "ok": false,
+      "policy": "ordered",
+      "status": "validation_error",
+      "actual_schema": "c_count: int64\ncustdist: int64",
+      "expected_schema": "c_count: int64\ncustdist: int64",
+      "reason": "invalid order key"
+    }
+  },
+  {
+    "run": "iceberg-default-0",
+    "validation": {
+      "ok": false,
+      "policy": "ordered",
+      "status": "validation_error",
+      "actual_schema": "c_count: int64\ncustdist: int64",
+      "expected_schema": "c_count: int64\ncustdist: int64",
+      "reason": "invalid order key"
+    }
+  },
+  {
+    "run": "iceberg-default-1",
+    "validation": {
+      "ok": false,
+      "policy": "ordered",
+      "status": "validation_error",
+      "actual_schema": "c_count: int64\ncustdist: int64",
+      "expected_schema": "c_count: int64\ncustdist: int64",
+      "reason": "invalid order key"
+    }
+  },
+  {
+    "run": "lance-construction-0",
+    "validation": {
+      "ok": false,
+      "policy": "ordered",
+      "status": "validation_error",
+      "actual_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "expected_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "reason": "invalid order key"
+    }
+  },
+  {
+    "run": "lance-construction-1",
+    "validation": {
+      "ok": false,
+      "policy": "ordered",
+      "status": "validation_error",
+      "actual_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "expected_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "reason": "invalid order key"
+    }
+  },
+  {
+    "run": "lance-default-0",
+    "validation": {
+      "ok": false,
+      "policy": "ordered",
+      "status": "validation_error",
+      "actual_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "expected_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "reason": "invalid order key"
+    }
+  },
+  {
+    "run": "lance-default-1",
+    "validation": {
+      "ok": false,
+      "policy": "ordered",
+      "status": "validation_error",
+      "actual_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "expected_schema": "nation: string\no_year: int64\nsum_profit: decimal128(38, 4)",
+      "reason": "invalid order key"
+    }
+  }
+]

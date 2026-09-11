@@ -1,0 +1,48 @@
+{
+  "lance": {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark",
+      "run",
+      "--dataset",
+      ".scratch/public-bench/tpch-sf10/dataset.json",
+      "--engine-binary",
+      ".scratch/parallel-aggregate-input/coordinated_output_benchmark_embedded",
+      "--output",
+      ".scratch/public-bench/reference-io-quota-sf10-01/lance",
+      "--track",
+      "lance",
+      "--samples",
+      "3",
+      "--sessions",
+      "1",
+      "--threads",
+      "16",
+      "--memory-gib",
+      "4",
+      "--process-cap-gib",
+      "12",
+      "--provider-manifest",
+      ".scratch/public-bench/canonical-sf10-providers-02/lance/provider.json",
+      "--reference-lance-io-limit",
+      "16"
+    ],
+    "started_unix": 1789151662.5953774,
+    "status": "terminal",
+    "exit_code": 1,
+    "finished_unix": 1789151850.9497516,
+    "report": {
+      "version": 1,
+      "complete": false,
+      "issues": [
+        "row 61 ('tpch_sf10', 'q09', 'lance', 's1')/1: answer not validated; engine: not_run",
+        "row 62 ('tpch_sf10', 'q09', 'lance', 's1')/2: answer not validated; engine: not_run",
+        "row 63 ('tpch_sf10', 'q09', 'lance', 's1')/3: answer not validated; engine: not_run"
+      ],
+      "groups": [],
+      "latency_leadership": false,
+      "certification": "incomplete: resource, concurrency and regression gates are separate"
+    }
+  }
+}

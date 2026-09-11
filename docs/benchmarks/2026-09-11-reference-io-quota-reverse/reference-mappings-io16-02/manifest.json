@@ -1,0 +1,26 @@
+{
+  "original_sha256": "d05b9815b9807ae07feaa12df705f726254a1d0facdfae352681c1871966fe4a",
+  "worker_sha256": "c1cb22971ee85ae0cdba5f002890d9da984aa4aafef3949b0b002c1429e4f7a2",
+  "qualification": "Exact reference request prefix; no engine interleaving or original idle delays. Diagnostic only.",
+  "before": {
+    "memory.max": "17179869184",
+    "memory.peak": "7503872",
+    "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0",
+    "memory.swap.max": "0"
+  },
+  "runs": [
+    {
+      "track": "lance",
+      "requests": 184,
+      "exit_code": 0,
+      "timeout": false,
+      "seconds": 79.16192102432251,
+      "memory": {
+        "memory.max": "17179869184",
+        "memory.peak": "5425360896",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0",
+        "memory.swap.max": "0"
+      }
+    }
+  ]
+}
