@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "complete": false,
+  "issues": [
+    "row 61 ('tpch_sf10', 'q09', 'lance', 's1')/1: answer not validated; engine: not_run",
+    "row 62 ('tpch_sf10', 'q09', 'lance', 's1')/2: answer not validated; engine: not_run",
+    "row 63 ('tpch_sf10', 'q09', 'lance', 's1')/3: answer not validated; engine: not_run"
+  ],
+  "groups": [],
+  "latency_leadership": false,
+  "certification": "incomplete: resource, concurrency and regression gates are separate"
+}

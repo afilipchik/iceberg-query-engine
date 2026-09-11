@@ -1,0 +1,232 @@
+{
+  "raw_parquet": {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark",
+      "run",
+      "--dataset",
+      ".scratch/public-bench/tpch-sf10/dataset.json",
+      "--engine-binary",
+      ".scratch/parallel-aggregate-input/lance_fragment_benchmark_embedded",
+      "--output",
+      ".scratch/public-bench/lance-fragment-sf10-providers-01/raw_parquet",
+      "--track",
+      "raw_parquet",
+      "--samples",
+      "3",
+      "--sessions",
+      "1",
+      "--threads",
+      "16",
+      "--memory-gib",
+      "4",
+      "--process-cap-gib",
+      "12"
+    ],
+    "started_unix": 1789153224.5047066,
+    "status": "terminal",
+    "exit_code": 0,
+    "finished_unix": 1789153339.387485,
+    "report": {
+      "version": 1,
+      "complete": true,
+      "issues": [],
+      "groups": [
+        {
+          "geomean": 2.433311664648154,
+          "suite_ratio": 2.639173358016188,
+          "engine_total_ms": 12280.749819999999,
+          "duckdb_total_ms": 4653.256210964173,
+          "wins": 0,
+          "queries": 22,
+          "worst_ratio": 8.54033562709194,
+          "query_ratios": {
+            "q01": 2.9968869686891706,
+            "q02": 1.229417119834717,
+            "q03": 2.1920431424832327,
+            "q04": 1.694080094867996,
+            "q05": 1.7697977683916233,
+            "q06": 2.060004461143179,
+            "q07": 1.9918860132553287,
+            "q08": 1.288087510216053,
+            "q09": 2.6343485683355086,
+            "q10": 3.6762746257493255,
+            "q11": 2.2095572496255245,
+            "q12": 4.889940630887847,
+            "q13": 2.159348916054926,
+            "q14": 2.3986278167748827,
+            "q15": 1.7218655028157128,
+            "q16": 7.7403488572657535,
+            "q17": 8.54033562709194,
+            "q18": 3.4409007179459565,
+            "q19": 3.5507542135807872,
+            "q20": 1.517143331855314,
+            "q21": 1.3873339058930678,
+            "q22": 1.5444901422110227
+          },
+          "ci95": {
+            "geomean": [
+              2.360224870475582,
+              2.4736746255955726
+            ],
+            "suite_ratio": [
+              2.542189524537172,
+              2.6832585806751847
+            ]
+          },
+          "per_session": {
+            "s1": {
+              "geomean": 2.433311664648154,
+              "suite_ratio": 2.639173358016188,
+              "engine_total_ms": 12280.749819999999,
+              "duckdb_total_ms": 4653.256210964173,
+              "wins": 0,
+              "queries": 22,
+              "worst_ratio": 8.54033562709194
+            }
+          },
+          "workload": "tpch_sf10",
+          "track": "raw_parquet",
+          "leadership": false
+        }
+      ],
+      "latency_leadership": false,
+      "certification": "incomplete: resource, concurrency and regression gates are separate"
+    }
+  },
+  "native": {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark",
+      "run",
+      "--dataset",
+      ".scratch/public-bench/tpch-sf10/dataset.json",
+      "--engine-binary",
+      ".scratch/parallel-aggregate-input/lance_fragment_benchmark_embedded",
+      "--output",
+      ".scratch/public-bench/lance-fragment-sf10-providers-01/native",
+      "--track",
+      "native",
+      "--samples",
+      "3",
+      "--sessions",
+      "1",
+      "--threads",
+      "16",
+      "--memory-gib",
+      "4",
+      "--process-cap-gib",
+      "12",
+      "--provider-manifest",
+      ".scratch/public-bench/canonical-sf10-providers-02/native/provider.json"
+    ],
+    "started_unix": 1789153339.3877695,
+    "status": "terminal",
+    "exit_code": 1,
+    "finished_unix": 1789153525.8326836,
+    "report": {
+      "version": 1,
+      "complete": false,
+      "issues": [
+        "row 28 ('tpch_sf10', 'q01', 'native', 's1')/1: answer not validated; engine: not_run",
+        "row 29 ('tpch_sf10', 'q01', 'native', 's1')/2: answer not validated; engine: not_run",
+        "row 30 ('tpch_sf10', 'q01', 'native', 's1')/3: answer not validated; engine: not_run"
+      ],
+      "groups": [],
+      "latency_leadership": false,
+      "certification": "incomplete: resource, concurrency and regression gates are separate"
+    }
+  },
+  "iceberg": {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark",
+      "run",
+      "--dataset",
+      ".scratch/public-bench/tpch-sf10/dataset.json",
+      "--engine-binary",
+      ".scratch/parallel-aggregate-input/lance_fragment_benchmark_embedded",
+      "--output",
+      ".scratch/public-bench/lance-fragment-sf10-providers-01/iceberg",
+      "--track",
+      "iceberg",
+      "--samples",
+      "3",
+      "--sessions",
+      "1",
+      "--threads",
+      "16",
+      "--memory-gib",
+      "4",
+      "--process-cap-gib",
+      "12",
+      "--provider-manifest",
+      ".scratch/public-bench/canonical-sf10-providers-02/iceberg/provider.json"
+    ],
+    "started_unix": 1789153525.8329406,
+    "status": "terminal",
+    "exit_code": 1,
+    "finished_unix": 1789153845.8825052,
+    "report": {
+      "version": 1,
+      "complete": false,
+      "issues": [
+        "row 61 ('tpch_sf10', 'q09', 'iceberg', 's1')/1: answer not validated; engine: not_run; duckdb: not_run; invalid fresh calibration",
+        "row 62 ('tpch_sf10', 'q09', 'iceberg', 's1')/2: answer not validated; engine: not_run; duckdb: not_run; invalid fresh calibration",
+        "row 63 ('tpch_sf10', 'q09', 'iceberg', 's1')/3: answer not validated; engine: not_run; duckdb: not_run; invalid fresh calibration"
+      ],
+      "groups": [],
+      "latency_leadership": false,
+      "certification": "incomplete: resource, concurrency and regression gates are separate"
+    }
+  },
+  "lance": {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark",
+      "run",
+      "--dataset",
+      ".scratch/public-bench/tpch-sf10/dataset.json",
+      "--engine-binary",
+      ".scratch/parallel-aggregate-input/lance_fragment_benchmark_embedded",
+      "--output",
+      ".scratch/public-bench/lance-fragment-sf10-providers-01/lance",
+      "--track",
+      "lance",
+      "--samples",
+      "3",
+      "--sessions",
+      "1",
+      "--threads",
+      "16",
+      "--memory-gib",
+      "4",
+      "--process-cap-gib",
+      "12",
+      "--provider-manifest",
+      ".scratch/public-bench/canonical-sf10-providers-02/lance/provider.json",
+      "--reference-lance-io-limit",
+      "16"
+    ],
+    "started_unix": 1789153845.8827815,
+    "status": "terminal",
+    "exit_code": 1,
+    "finished_unix": 1789154036.2895787,
+    "report": {
+      "version": 1,
+      "complete": false,
+      "issues": [
+        "row 61 ('tpch_sf10', 'q09', 'lance', 's1')/1: answer not validated; engine: not_run",
+        "row 62 ('tpch_sf10', 'q09', 'lance', 's1')/2: answer not validated; engine: not_run",
+        "row 63 ('tpch_sf10', 'q09', 'lance', 's1')/3: answer not validated; engine: not_run"
+      ],
+      "groups": [],
+      "latency_leadership": false,
+      "certification": "incomplete: resource, concurrency and regression gates are separate"
+    }
+  }
+}

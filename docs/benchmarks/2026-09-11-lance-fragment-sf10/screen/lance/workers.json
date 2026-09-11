@@ -1,0 +1,98 @@
+[
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/lance_fragment_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/lance-fragment-sf10-providers-01/lance/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 1016.2720119999999,
+      "status": "ready",
+      "threads": 16,
+      "track": "lance"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/lance-fragment-sf10-providers-01/lance/s1-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/lance-fragment-sf10-providers-01/lance/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 242.93890735134482,
+      "version": "1.4.4",
+      "threads": 16,
+      "track": "lance",
+      "reference": {
+        "reader": "lance",
+        "extension": {
+          "version": "892b224",
+          "sha256": "d597883c5fdf1a13b0037847984b4ec6416d6e5f87628369326f43e2d802423a"
+        },
+        "settings": {
+          "disabled_optimizers": "extension"
+        },
+        "compatibility": {
+          "reason": "Lance extension aggregate pushdown truncates decimal AVG",
+          "verified_affected_extension": "892b224",
+          "execution": "direct Lance scan with DuckDB aggregation",
+          "limitation": "extension optimizer disabled for every query; not stock extension pushdown performance"
+        }
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": "16",
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/lance-fragment-sf10-providers-01/lance/s1-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/lance_fragment_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/lance-fragment-sf10-providers-01/lance/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 1057.205044,
+      "status": "ready",
+      "threads": 16,
+      "track": "lance"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/lance-fragment-sf10-providers-01/lance/s1-q19-engine-restart.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  }
+]

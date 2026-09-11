@@ -1,0 +1,33 @@
+{
+  "parent_commit": "864e645c89819557222f553033d5fb21618401df",
+  "red": {
+    "session": 71040,
+    "exit_code": 101,
+    "tests": 1,
+    "failure": "failed scan retained a sibling task",
+    "qualification": "extracted production collection boundary, original detached-handle behavior"
+  },
+  "green": {
+    "session": 46458,
+    "exit_code": 0,
+    "passed": 4
+  },
+  "library": {
+    "passed": 31,
+    "failed": 0,
+    "ignored": 0,
+    "log": "lance-fragment-cleanup-validation.log"
+  },
+  "integration_session": null,
+  "source_sha256": "0d7c120eb3d1e4e0bc7b878474fa63c720746bf3a5a3415fdb3b43aa98153342",
+  "next": [
+    "Complete broader required validation",
+    "Freeze/build release and run matched SF10; archive/commit/push",
+    "Continue engine Q9 retained allocation diagnosis"
+  ],
+  "integration": {
+    "session": 89065,
+    "exit_code": 0,
+    "passed": 31
+  }
+}

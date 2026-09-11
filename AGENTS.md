@@ -85,12 +85,22 @@ Reverse quota39397 completes184; default2125 refuses all three Q9 requests
 (181complete). Harness adds explicit reference-only quota with27tests/no skips.
 Full matched LanceSF10 screen75607 terminal1: referenceQ9 completes, engineQ9
 warmup join-index allocation fails, three measured requests NOTRUN;21other
-queries typed-correct.531source/binary/harness hashes verify. Archive then
-commit/push this cycle and continue
+queries typed-correct.531source/binary/harness hashes verify. Checkpoint `864e645` committed/pushed, exact remote hash verified. Continue
 systemic native/page ownership and shared CPU work. See
 [reference diagnostics](docs/reference-worker-initialization-follow-up-2026-09-11.md). Detailed prior experiments and active-state
 snapshots are preserved in the [September11 history](docs/agent-checkpoint-history-2026-09-11.md)
 and linked reports; historical results certify only their frozen candidates.
+
+Current source repairs detached Lance fragment tasks: error/panic collection
+abort/drains siblings; collector drop requests cooperative cancellation. Red71040
+reproduces retention; focused4/Lance library31/integration31pass. Broad89208
+retains known failures with1135library passes each,531inputs verified. Release
+9ba109ec and pipeline99427 are terminal; audit86235 verifies340typed outputs and
+255/264pairs. Raw completes (geomean2.433312/suite2.639173,0wins); nativeQ1timeout,
+Iceberg referenceQ9warmup256KiB refusal, LanceengineQ9join-index refusal remain.
+1271-file archive verifies; combined release/screenpeak27.743GB,zeroOOM/max.
+No new residency/concurrency acceptance. Commit/push this cycle then engine
+sequence allocation diagnostic. See [Lance task ownership](docs/lance-fragment-task-ownership-2026-09-11.md).
 
 ## Start here
 

@@ -1769,3 +1769,17 @@ prefixes, page ownership, source-error termination and final handoff leases rema
 Dictionary ID decoding can repeat within a refused trial; no file read is replayed.
 This is a candidate resource-progress repair, not full spill or performance
 acceptance. See [contracts and evidence](coordinated-reader-output-2026-09-11.md).
+
+Benchmark reference runtime controls now live in `scripts/benchmark/reference_runtime.py`.
+The opt-in `--reference-lance-io-limit` is validated as a positive Lance-only quota,
+recorded in setup, and applied in the DuckDB worker before provider imports. Ready
+provenance explicitly excludes engine control. Inherited Lance quota values are
+rejected to prevent unrecorded configuration. This does not change production
+engine scheduling or memory limits. See
+[reference diagnostics and SF10 checkpoint](reference-worker-initialization-follow-up-2026-09-11.md).
+
+Lance fragment collection now owns JoinHandles through `FragmentTasks`. Ordered
+collection aborts and drains siblings on errors/panics; dropping the collector
+requests cooperative cancellation even before its first poll. This changes task
+lifetime, not fragment fanout, provider admission or collected-output budgeting.
+See [reproduction and validation](lance-fragment-task-ownership-2026-09-11.md).

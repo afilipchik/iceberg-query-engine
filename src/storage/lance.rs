@@ -1003,15 +1003,146 @@ async fn scan_fragments_inner(
         }));
     }
 
-    // Collect in fragment order so results are deterministic across runs.
-    let mut out = Vec::new();
-    for task in tasks {
-        let batches = task
-            .await
-            .map_err(|e| QueryError::Execution(format!("Lance fragment task failed: {}", e)))??;
-        out.extend(batches);
+    collect_fragment_tasks(tasks).await
+}
+
+struct FragmentTasks(Vec<tokio::task::JoinHandle<Result<Vec<RecordBatch>>>>);
+
+impl Drop for FragmentTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
     }
-    Ok(out)
+}
+
+fn collect_fragment_tasks(
+    tasks: Vec<tokio::task::JoinHandle<Result<Vec<RecordBatch>>>>,
+) -> impl std::future::Future<Output = Result<Vec<RecordBatch>>> {
+    // Establish ownership before polling, so dropping even an unpolled
+    // collector cancels its tasks instead of detaching their resources.
+    let mut tasks = FragmentTasks(tasks);
+    async move {
+        let mut out = Vec::new();
+        for index in 0..tasks.0.len() {
+            let result = (&mut tasks.0[index])
+                .await
+                .map_err(|e| QueryError::Execution(format!("Lance fragment task failed: {e}")));
+            match result.and_then(|batches| batches) {
+                Ok(batches) => out.extend(batches),
+                Err(error) => {
+                    for task in &tasks.0[index + 1..] {
+                        task.abort();
+                    }
+                    // Cancellation is cooperative. Drain before returning an
+                    // error, retaining the original cause if a sibling fails.
+                    for task in &mut tasks.0[index + 1..] {
+                        let _ = task.await;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod fragment_task_tests {
+    use super::*;
+
+    struct Released(Option<tokio::sync::oneshot::Sender<()>>);
+    impl Drop for Released {
+        fn drop(&mut self) {
+            let _ = self.0.take().unwrap().send(());
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_fragment_releases_pending_sibling_before_return() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (released_tx, mut released_rx) = tokio::sync::oneshot::channel();
+        let pending = tokio::spawn(async move {
+            let _owned = Released(Some(released_tx));
+            started_tx.send(()).unwrap();
+            std::future::pending::<Result<Vec<RecordBatch>>>().await
+        });
+        started_rx.await.unwrap();
+        let failed = tokio::spawn(async { Err(QueryError::Execution("fragment failure".into())) });
+        let result = collect_fragment_tasks(vec![failed, pending]).await;
+        assert!(result.unwrap_err().to_string().contains("fragment failure"));
+        assert!(
+            released_rx.try_recv().is_ok(),
+            "failed scan retained a sibling task"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_unpolled_fragment_collection_cancels_tasks() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (released_tx, released_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _owned = Released(Some(released_tx));
+            started_tx.send(()).unwrap();
+            std::future::pending::<Result<Vec<RecordBatch>>>().await
+        });
+        started_rx.await.unwrap();
+        drop(collect_fragment_tasks(vec![task]));
+        tokio::time::timeout(std::time::Duration::from_secs(1), released_rx)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn panicked_fragment_drains_siblings() {
+        let (released_tx, mut released_rx) = tokio::sync::oneshot::channel();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let sibling = tokio::spawn(async move {
+            let _owned = Released(Some(released_tx));
+            started_tx.send(()).unwrap();
+            std::future::pending::<Result<Vec<RecordBatch>>>().await
+        });
+        started_rx.await.unwrap();
+        let failed = tokio::spawn(async {
+            panic!("fragment panic");
+        });
+        let result = collect_fragment_tasks(vec![failed, sibling]).await;
+        assert!(result.unwrap_err().to_string().contains("fragment panic"));
+        assert!(released_rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn fragment_collection_preserves_order_and_empty_batches() {
+        let schema = Arc::new(ArrowSchema::new(vec![arrow::datatypes::Field::new(
+            "key",
+            DataType::Int64,
+            true,
+        )]));
+        let first = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(2), None, Some(2)]))],
+        )
+        .unwrap();
+        let empty = RecordBatch::new_empty(schema.clone());
+        let last =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![Some(1)]))]).unwrap();
+        let expected = vec![first.clone(), empty.clone(), last.clone()];
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let slow = tokio::spawn(async move {
+            ready_rx.await.unwrap();
+            Ok(vec![first, empty])
+        });
+        let fast = tokio::spawn(async move {
+            ready_tx.send(()).unwrap();
+            Ok(vec![last])
+        });
+        assert_eq!(
+            collect_fragment_tasks(vec![slow, fast]).await.unwrap(),
+            expected
+        );
+        assert!(collect_fragment_tasks(Vec::new()).await.unwrap().is_empty());
+    }
 }
 
 async fn scan_one(
