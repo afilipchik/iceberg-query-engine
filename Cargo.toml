@@ -206,3 +206,7 @@ debug = false
 lto = true
 codegen-units = 1
 opt-level = 3
+
+# Keep refinement within Lance's bounded decode window; see vendor/lance/PATCHES.md.
+[patch.crates-io]
+lance = { path = "vendor/lance" }

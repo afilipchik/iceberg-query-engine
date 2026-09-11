@@ -1,0 +1,950 @@
+warning: unused doc comment
+  --> src/execution/alloc_profile.rs:68:1
+   |
+68 | / /// Guards against re-entrant backtrace capture (backtrace capture itself
+69 | | /// allocates) causing infinite recursion/deadlock.
+   | |_--------------------------------------------------^
+   |   |
+   |   rustdoc does not generate documentation for macro invocations
+   |
+   = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+   = note: `#[warn(unused_doc_comments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `AtomicBool`
+  --> src/execution/alloc_profile.rs:25:25
+   |
+25 | use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+   |                         ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `LaunchConfig`
+    --> src/physical/gpu.rs:1288:39
+     |
+1288 |     use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+     |                                       ^^^^^^^^^^^^
+
+warning: unused import: `Field`
+  --> src/physical/operators/hash_agg.rs:17:34
+   |
+17 | use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+   |                                  ^^^^^
+
+warning: unused import: `std::sync::Arc`
+  --> src/storage/admitted_coalesce.rs:13:5
+   |
+13 | use std::sync::Arc;
+   |     ^^^^^^^^^^^^^^
+
+warning: use of deprecated unit variant `parquet::basic::Encoding::BIT_PACKED`: Please see documentation for compatibility issues and use the RLE/bit-packing hybrid encoding instead
+   --> src/storage/admitted_row_group.rs:125:49
+    |
+125 |                     | parquet::basic::Encoding::BIT_PACKED
+    |                                                 ^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated unit variant `parquet::basic::Encoding::BIT_PACKED`: Please see documentation for compatibility issues and use the RLE/bit-packing hybrid encoding instead
+  --> src/storage/bounded_page_header.rs:56:14
+   |
+56 |         4 => BIT_PACKED,
+   |              ^^^^^^^^^^
+
+warning: use of deprecated unit variant `parquet::basic::Encoding::BIT_PACKED`: Please see documentation for compatibility issues and use the RLE/bit-packing hybrid encoding instead
+   --> src/storage/bounded_page_header.rs:459:79
+    |
+459 |                     parquet::basic::Encoding::RLE | parquet::basic::Encoding::BIT_PACKED
+    |                                                                               ^^^^^^^^^^
+
+warning: use of deprecated unit variant `parquet::basic::Encoding::BIT_PACKED`: Please see documentation for compatibility issues and use the RLE/bit-packing hybrid encoding instead
+   --> src/storage/bounded_page_header.rs:462:79
+    |
+462 |                     parquet::basic::Encoding::RLE | parquet::basic::Encoding::BIT_PACKED
+    |                                                                               ^^^^^^^^^^
+
+warning: use of deprecated method `arrow::arrow_ipc::writer::IpcDataGenerator::encoded_batch`: Use `encode` instead
+   --> src/distributed/flight.rs:186:18
+    |
+186 |                 .encoded_batch(&slice, &mut tracker, &opts)
+    |                  ^^^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1672:29
+     |
+1672 |         let d_ptrs = stream.memcpy_stod(&ptrs).map_err(gpu_err)?;
+     |                             ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1674:14
+     |
+1674 |             .memcpy_stod(
+     |              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1683:14
+     |
+1683 |             .memcpy_stod(&spec.preds.iter().map(|p| p.op).collect::<Vec<_>>())
+     |              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1686:14
+     |
+1686 |             .memcpy_stod(&spec.preds.iter().map(|p| p.value).collect::<Vec<_>>())
+     |              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1688:29
+     |
+1688 |         let d_kind = stream.memcpy_stod(&slot_kind).map_err(gpu_err)?;
+     |                             ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1689:30
+     |
+1689 |         let d_input = stream.memcpy_stod(&slot_input).map_err(gpu_err)?;
+     |                              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1691:14
+     |
+1691 |             .memcpy_stod(&slot_c.iter().map(|c| c[0]).collect::<Vec<_>>())
+     |              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1694:14
+     |
+1694 |             .memcpy_stod(&slot_c.iter().map(|c| c[1]).collect::<Vec<_>>())
+     |              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1697:14
+     |
+1697 |             .memcpy_stod(&slot_c.iter().map(|c| c[2]).collect::<Vec<_>>())
+     |              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_dtov`: Use clone_dtoh
+    --> src/physical/gpu.rs:1738:41
+     |
+1738 |         let partials: Vec<f64> = stream.memcpy_dtov(&d_out).map_err(gpu_err)?;
+     |                                         ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:2562:10
+     |
+2562 |         .memcpy_stod(&values)
+     |          ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:2610:10
+     |
+2610 |         .memcpy_stod(&codes)
+     |          ^^^^^^^^^^^
+
+warning: use of deprecated method `lance::dataset::scanner::Scanner::nprobs`: Use nprobes instead
+    --> src/storage/lance.rs:1840:29
+     |
+1840 |                     scanner.nprobs(n);
+     |                             ^^^^^^
+
+warning: unused import: `PushKernelArg`
+    --> src/physical/gpu.rs:1288:53
+     |
+1288 |     use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+     |                                                     ^^^^^^^^^^^^^
+
+warning: unused import: `std::hash::Hash`
+    --> src/physical/gpu.rs:3536:13
+     |
+3536 |         use std::hash::Hash;
+     |             ^^^^^^^^^^^^^^^
+
+warning: value assigned to `result_plan` is never read
+   --> src/optimizer/rules/join_reorder.rs:550:52
+    |
+550 |         let mut result_plan: Option<LogicalPlan> = None;
+    |                                                    ^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `result_plan` is never read
+    --> src/optimizer/rules/join_reorder.rs:1422:52
+     |
+1422 |         let mut result_plan: Option<LogicalPlan> = None;
+     |                                                    ^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: value assigned to `result_columns` is never read
+    --> src/optimizer/rules/join_reorder.rs:1423:51
+     |
+1423 |         let mut result_columns: HashSet<String> = HashSet::new();
+     |                                                   ^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: variable `total` is assigned to, but never used
+   --> src/physical/vectorized_agg.rs:232:13
+    |
+232 |         let mut total = 0;
+    |             ^^^^^^^^^
+    |
+    = note: consider using `_total` instead
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `total` is never read
+   --> src/physical/vectorized_agg.rs:241:17
+    |
+241 |                 total += 1;
+    |                 ^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: variable does not need to be mutable
+    --> src/planner/binder.rs:2077:13
+     |
+2077 |         let mut out_items: Vec<(Expr, String)> = Vec::new(); // shape of final projection
+     |             ----^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: type `RawRows` is more private than the item `AggregationState::into_range_shards`
+    --> src/physical/morsel_agg.rs:2727:5
+     |
+2727 |     pub(crate) fn into_range_shards(mut self, p: usize, min: i64, w: u64) -> Result<Vec<RawRows>> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method `AggregationState::into_range_shards` is reachable at visibility `pub(crate)`
+     |
+note: but type `RawRows` is only usable at visibility `pub(in crate::physical::morsel_agg)`
+    --> src/physical/morsel_agg/raw_state.rs:14:1
+     |
+  14 | pub(super) struct RawRows {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^
+     = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `RawRows` is more private than the item `AggregationState::into_raw_shards`
+    --> src/physical/morsel_agg.rs:2735:5
+     |
+2735 |     pub(crate) fn into_raw_shards(mut self, p: usize) -> Result<Vec<RawRows>> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method `AggregationState::into_raw_shards` is reachable at visibility `pub(crate)`
+     |
+note: but type `RawRows` is only usable at visibility `pub(in crate::physical::morsel_agg)`
+    --> src/physical/morsel_agg/raw_state.rs:14:1
+     |
+  14 | pub(super) struct RawRows {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated functions `prepaid_child` and `prepaid_child_with_owner` are never used
+   --> src/execution/memory.rs:241:19
+    |
+220 | impl MemoryPool {
+    | --------------- associated functions in this implementation
+...
+241 |     pub(crate) fn prepaid_child(
+    |                   ^^^^^^^^^^^^^
+...
+248 |     pub(crate) fn prepaid_child_with_owner(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `flatten_plan` is never used
+  --> src/optimizer/rules/flatten_dependent_join.rs:46:4
+   |
+46 | fn flatten_plan(plan: &LogicalPlan) -> Result<LogicalPlan> {
+   |    ^^^^^^^^^^^^
+
+warning: function `try_flatten_filter` is never used
+   --> src/optimizer/rules/flatten_dependent_join.rs:150:4
+    |
+150 | fn try_flatten_filter(node: &FilterNode) -> Result<Option<LogicalPlan>> {
+    |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `flatten_exists` is never used
+   --> src/optimizer/rules/flatten_dependent_join.rs:190:4
+    |
+190 | fn flatten_exists(
+    |    ^^^^^^^^^^^^^^
+
+warning: function `extract_subquery_predicates` is never used
+   --> src/optimizer/rules/flatten_dependent_join.rs:844:4
+    |
+844 | fn extract_subquery_predicates(predicate: &Expr) -> (Vec<Expr>, Vec<Expr>) {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `extract_predicates_recursive` is never used
+   --> src/optimizer/rules/flatten_dependent_join.rs:851:4
+    |
+851 | fn extract_predicates_recursive(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `combine_predicates` is never used
+   --> src/optimizer/rules/flatten_dependent_join.rs:878:4
+    |
+878 | fn combine_predicates(predicates: Vec<Expr>) -> Expr {
+    |    ^^^^^^^^^^^^^^^^^^
+
+warning: associated function `compile_for_admitted_evaluation` is never used
+   --> src/physical/compiled_expr.rs:660:19
+    |
+652 | impl CompiledPredicate {
+    | ---------------------- associated function in this implementation
+...
+660 |     pub(crate) fn compile_for_admitted_evaluation(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `attempted` and `completed` are never read
+    --> src/physical/gpu.rs:2336:9
+     |
+2335 | pub(crate) struct ResidentRunCounters {
+     |                   ------------------- fields in this struct
+2336 |     pub attempted: u64,
+     |         ^^^^^^^^^
+2337 |     pub completed: u64,
+     |         ^^^^^^^^^
+     |
+     = note: `ResidentRunCounters` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `counters` is never read
+    --> src/physical/gpu.rs:2341:9
+     |
+2339 | pub(crate) struct ResidentRun {
+     |                   ----------- field in this struct
+2340 |     pub batch: RecordBatch,
+2341 |     pub counters: ResidentRunCounters,
+     |         ^^^^^^^^
+
+warning: field `ack` is never read
+    --> src/physical/gpu.rs:2370:5
+     |
+2366 | struct ResidentSession {
+     |        --------------- field in this struct
+...
+2370 |     ack: ResidentAck,
+     |     ^^^
+
+warning: function `finalize_disjoint_states` is never used
+   --> src/physical/morsel_agg.rs:265:15
+    |
+265 | pub(crate) fn finalize_disjoint_states(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `update_count` is never used
+    --> src/physical/morsel_agg.rs:1118:8
+     |
+ 847 | impl AccumulatorState {
+     | --------------------- method in this implementation
+...
+1118 |     fn update_count(&mut self) {
+     |        ^^^^^^^^^^^^
+
+warning: method `scalar_to_raw` is never used
+    --> src/physical/morsel_agg.rs:2511:8
+     |
+1854 | impl AggregationState {
+     | --------------------- method in this implementation
+...
+2511 |     fn scalar_to_raw(&self, key: &GroupKey) -> Option<RawKey> {
+     |        ^^^^^^^^^^^^^
+
+warning: methods `prepare_update`, `prepare_hashed`, `process_evaluated_from`, `prepare`, and `prepare_merge` are never used
+   --> src/physical/morsel_agg/group_rows.rs:291:19
+    |
+ 77 | impl GroupRows {
+    | -------------- methods in this implementation
+...
+291 |     pub(super) fn prepare_update<'a>(
+    |                   ^^^^^^^^^^^^^^
+...
+301 |     fn prepare_hashed<'a>(
+    |        ^^^^^^^^^^^^^^
+...
+336 |     pub(super) fn process_evaluated_from(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^
+...
+598 |     fn prepare<'a>(
+    |        ^^^^^^^
+...
+606 |     pub(super) fn prepare_merge<'a>(
+    |                   ^^^^^^^^^^^^^
+
+warning: methods `ingest_selected` and `ingest_prepared_selected` are never used
+   --> src/physical/morsel_agg/ingestion_controller.rs:105:19
+    |
+ 62 | impl IngestionController {
+    | ------------------------ methods in this implementation
+...
+105 |     pub(super) fn ingest_selected(
+    |                   ^^^^^^^^^^^^^^^
+...
+122 |     pub(super) fn ingest_prepared_selected(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `read_encoded` is never used
+   --> src/physical/morsel_agg/key_rows.rs:185:19
+    |
+113 | impl KeyWorkspace {
+    | ----------------- method in this implementation
+...
+185 |     pub(super) fn read_encoded(&mut self, reader: &mut impl Read, length: usize) -> Result<()> {
+    |                   ^^^^^^^^^^^^
+
+warning: struct `PreparedRepartition` is never constructed
+  --> src/physical/morsel_agg/repartition.rs:42:19
+   |
+42 | pub(super) struct PreparedRepartition<'a> {
+   |                   ^^^^^^^^^^^^^^^^^^^
+
+warning: struct `SplitPlan` is never constructed
+  --> src/physical/morsel_agg/repartition.rs:53:19
+   |
+53 | pub(super) struct SplitPlan<'a> {
+   |                   ^^^^^^^^^
+
+warning: associated items `scan` and `counts` are never used
+  --> src/physical/morsel_agg/repartition.rs:59:19
+   |
+58 | impl<'a> SplitPlan<'a> {
+   | ---------------------- associated items in this implementation
+59 |     pub(super) fn scan(
+   |                   ^^^^
+...
+74 |     pub(super) fn counts(&self) -> [u64; 2] {
+   |                   ^^^^^^
+
+warning: associated items `from_plan`, `new`, and `finish` are never used
+   --> src/physical/morsel_agg/repartition.rs:213:19
+    |
+212 | impl<'a> PreparedRepartition<'a> {
+    | -------------------------------- associated items in this implementation
+213 |     pub(super) fn from_plan(
+    |                   ^^^^^^^^^
+...
+223 |     fn new(
+    |        ^^^
+...
+247 |     pub(super) fn finish(mut self) -> Result<[SpillRun; 2]> {
+    |                   ^^^^^^
+
+warning: function `route` is never used
+ --> src/physical/morsel_agg/row_router.rs:9:15
+  |
+9 | pub(super) fn route(
+  |               ^^^^^
+
+warning: method `step` is never used
+  --> src/physical/morsel_agg/run_merge.rs:49:19
+   |
+30 | impl RunMerge {
+   | ------------- method in this implementation
+...
+49 |     pub(super) fn step(&mut self, target: &mut GroupRows) -> Result<bool> {
+   |                   ^^^^
+
+warning: struct `PreparedSelection` is never constructed
+   --> src/physical/morsel_agg/selected_state.rs:204:19
+    |
+204 | pub(super) struct PreparedSelection<'a> {
+    |                   ^^^^^^^^^^^^^^^^^
+
+warning: method `commit` is never used
+   --> src/physical/morsel_agg/selected_state.rs:210:19
+    |
+209 | impl PreparedSelection<'_> {
+    | -------------------------- method in this implementation
+210 |     pub(super) fn commit(self) {
+    |                   ^^^^^^
+
+warning: methods `prepare` and `prepare_merge` are never used
+   --> src/physical/morsel_agg/selected_state.rs:333:19
+    |
+217 | impl SelectedState {
+    | ------------------ methods in this implementation
+...
+333 |     pub(super) fn prepare(&mut self, value: &ScalarValue) -> Result<PreparedSelection<'_>> {
+    |                   ^^^^^^^
+...
+341 |     pub(super) fn prepare_merge(&mut self, source: &Self) -> Result<PreparedSelection<'_>> {
+    |                   ^^^^^^^^^^^^^
+
+warning: method `empty` is never used
+  --> src/physical/morsel_agg/state_codec.rs:31:19
+   |
+30 | impl FixedStateCodec {
+   | -------------------- method in this implementation
+31 |     pub(super) fn empty(self) -> AccumulatorState {
+   |                   ^^^^^
+
+warning: struct `FixedStateWorkspace` is never constructed
+   --> src/physical/morsel_agg/state_codec.rs:212:19
+    |
+212 | pub(super) struct FixedStateWorkspace {
+    |                   ^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `new`, `encode`, `write_to`, and `read_from` are never used
+   --> src/physical/morsel_agg/state_codec.rs:219:19
+    |
+218 | impl FixedStateWorkspace {
+    | ------------------------ associated items in this implementation
+219 |     pub(super) fn new(pool: &MemoryPool, codecs: &[FixedStateCodec]) -> Result<Self> {
+    |                   ^^^
+...
+240 |     fn encode(&mut self, states: &[AccumulatorState]) -> Result<&[u8]> {
+    |        ^^^^^^
+...
+257 |     pub(super) fn write_to(
+    |                   ^^^^^^^^
+...
+268 |     pub(super) fn read_from(&mut self, reader: &mut impl Read) -> Result<&[AccumulatorState]> {
+    |                   ^^^^^^^^^
+
+warning: methods `prepare`, `prepare_indexed`, and `prepare_merge` are never used
+   --> src/physical/morsel_agg/state_rows.rs:415:19
+    |
+202 | impl StateRows {
+    | -------------- methods in this implementation
+...
+415 |     pub(super) fn prepare<'a>(
+    |                   ^^^^^^^
+...
+425 |     pub(super) fn prepare_indexed<'a>(
+    |                   ^^^^^^^^^^^^^^^
+...
+555 |     pub(super) fn prepare_merge<'a>(
+    |                   ^^^^^^^^^^^^^
+
+warning: method `commit` is never used
+   --> src/physical/morsel_agg/state_rows.rs:616:19
+    |
+615 | impl PreparedRow<'_> {
+    | -------------------- method in this implementation
+616 |     pub(super) fn commit(mut self) {
+    |                   ^^^^^^
+
+warning: fields `join_type`, `delim_columns`, and `on` are never read
+  --> src/physical/operators/delim_join.rs:76:5
+   |
+70 | pub struct DelimJoinExec {
+   |            ------------- fields in this struct
+...
+76 |     join_type: JoinType,
+   |     ^^^^^^^^^
+77 |     /// Expressions for correlation columns (from outer)
+78 |     delim_columns: Vec<Expr>,
+   |     ^^^^^^^^^^^^^
+79 |     /// Join conditions (outer_col, inner_col)
+80 |     on: Vec<(Expr, Expr)>,
+   |     ^^
+   |
+   = note: `DelimJoinExec` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `extract_distinct_values` is never used
+   --> src/physical/operators/delim_join.rs:218:4
+    |
+218 | fn extract_distinct_values(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `evaluate_expr_to_array` is never used
+   --> src/physical/operators/delim_join.rs:279:4
+    |
+279 | fn evaluate_expr_to_array(expr: &Expr, batch: &RecordBatch) -> Result<ArrayRef> {
+    |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `scalar_to_array` is never used
+   --> src/physical/operators/delim_join.rs:314:4
+    |
+314 | fn scalar_to_array(scalar: &ScalarValue, num_rows: usize) -> Result<ArrayRef> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `deduplicate_batch` is never used
+   --> src/physical/operators/delim_join.rs:336:4
+    |
+336 | fn deduplicate_batch(batch: &RecordBatch) -> Result<RecordBatch> {
+    |    ^^^^^^^^^^^^^^^^^
+
+warning: function `hash_row` is never used
+   --> src/physical/operators/delim_join.rs:371:4
+    |
+371 | fn hash_row(batch: &RecordBatch, row_idx: usize) -> u64 {
+    |    ^^^^^^^^
+
+warning: function `hash_array_value` is never used
+   --> src/physical/operators/delim_join.rs:382:4
+    |
+382 | fn hash_array_value<H: Hasher>(array: &dyn Array, idx: usize, hasher: &mut H) {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: struct `InnerEntry` is never constructed
+   --> src/physical/operators/delim_join.rs:404:8
+    |
+404 | struct InnerEntry {
+    |        ^^^^^^^^^^
+
+warning: function `build_hash_table` is never used
+   --> src/physical/operators/delim_join.rs:410:4
+    |
+410 | fn build_hash_table(
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `hash_join_key` is never used
+   --> src/physical/operators/delim_join.rs:430:4
+    |
+430 | fn hash_join_key(
+    |    ^^^^^^^^^^^^^
+
+warning: function `produce_semi_output` is never used
+   --> src/physical/operators/delim_join.rs:462:4
+    |
+462 | fn produce_semi_output(
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `produce_anti_output` is never used
+   --> src/physical/operators/delim_join.rs:503:4
+    |
+503 | fn produce_anti_output(
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `produce_single_output` is never used
+   --> src/physical/operators/delim_join.rs:545:4
+    |
+545 | fn produce_single_output(
+    |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `produce_mark_output` is never used
+   --> src/physical/operators/delim_join.rs:655:4
+    |
+655 | fn produce_mark_output(
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `evaluate_filter` is never used
+   --> src/physical/operators/filter.rs:208:4
+    |
+208 | fn evaluate_filter(
+    |    ^^^^^^^^^^^^^^^
+
+warning: multiple fields are never read
+   --> src/physical/operators/hash_agg.rs:369:5
+    |
+341 | struct AccumulatorState {
+    |        ---------------- fields in this struct
+...
+369 |     sum_x: f64,         // For correlation
+    |     ^^^^^
+370 |     sum_y: f64,         // For correlation
+    |     ^^^^^
+371 |     sum_xy: f64,        // For correlation
+    |     ^^^^^^
+372 |     sum_x_squares: f64, // For correlation
+    |     ^^^^^^^^^^^^^
+373 |     sum_y_squares: f64, // For correlation
+    |     ^^^^^^^^^^^^^
+...
+378 |     max_by_value: Option<f64>,         // The max value of the second arg
+    |     ^^^^^^^^^^^^
+379 |     max_by_result: Option<GroupValue>, // The value to return
+    |     ^^^^^^^^^^^^^
+380 |     min_by_value: Option<f64>,         // The min value of the second arg
+    |     ^^^^^^^^^^^^
+381 |     min_by_result: Option<GroupValue>, // The value to return
+    |     ^^^^^^^^^^^^^
+
+warning: constant `DIST_COL` is never used
+  --> src/physical/operators/vector_search.rs:41:7
+   |
+41 | const DIST_COL: &str = "_distance";
+   |       ^^^^^^^^
+
+warning: function `without_distance_column` is never used
+   --> src/physical/operators/vector_search.rs:250:15
+    |
+250 | pub(crate) fn without_distance_column(schema: &ArrowSchema) -> Vec<usize> {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `reserved_bytes` is never used
+   --> src/physical/operators/int64_membership.rs:115:19
+    |
+ 96 | impl Int64Membership {
+    | -------------------- method in this implementation
+...
+115 |     pub(crate) fn reserved_bytes(&self) -> usize {
+    |                   ^^^^^^^^^^^^^^
+
+warning: function `take` is never used
+   --> src/storage/admitted_gather.rs:146:15
+    |
+146 | pub(crate) fn take(
+    |               ^^^^
+
+warning: function `filter` is never used
+   --> src/storage/admitted_gather.rs:181:15
+    |
+181 | pub(crate) fn filter(
+    |               ^^^^^^
+
+warning: variant `Borrowed` is never constructed
+  --> src/storage/admitted_hybrid.rs:13:5
+   |
+12 | enum HybridInput<'a> {
+   |      ----------- variant in this enum
+13 |     Borrowed(&'a [u8]),
+   |     ^^^^^^^^
+   |
+   = note: `HybridInput` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: associated function `new` is never used
+   --> src/storage/admitted_hybrid.rs:136:19
+    |
+ 50 | impl<'a> HybridDecoder<'a> {
+    | -------------------------- associated function in this implementation
+...
+136 |     pub(crate) fn new(data: &'a [u8], width: u8, values: usize) -> Result<Self> {
+    |                   ^^^
+
+warning: variant `Borrowed` is never constructed
+  --> src/storage/admitted_plain_utf8.rs:39:5
+   |
+38 | enum PlainInput<'a> {
+   |      ---------- variant in this enum
+39 |     Borrowed(&'a [u8]),
+   |     ^^^^^^^^
+   |
+   = note: `PlainInput` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: associated function `new` is never used
+  --> src/storage/admitted_plain_utf8.rs:64:19
+   |
+60 | impl<'a> PlainUtf8Decoder<'a> {
+   | ----------------------------- associated function in this implementation
+...
+64 |     pub(crate) fn new(
+   |                   ^^^
+
+warning: function `parse_page_header` is never used
+   --> src/storage/bounded_page_header.rs:278:15
+    |
+278 | pub(crate) fn parse_page_header(
+    |               ^^^^^^^^^^^^^^^^^
+
+warning: field `row_group_filter` is never read
+   --> src/storage/parquet.rs:887:5
+    |
+881 | pub struct StreamingParquetScanBuilder {
+    |            --------------------------- field in this struct
+...
+887 |     row_group_filter: Option<Box<dyn Fn(usize, &ParquetFileInfo) -> bool + Send + Sync>>,
+    |     ^^^^^^^^^^^^^^^^
+
+warning: struct `AsyncParquetReader` is never constructed
+   --> src/storage/parquet.rs:929:12
+    |
+929 | pub struct AsyncParquetReader {
+    |            ^^^^^^^^^^^^^^^^^^
+
+warning: associated items `new`, `from_table`, `schema`, `into_stream`, and `read_all_parallel` are never used
+    --> src/storage/parquet.rs:951:12
+     |
+ 949 | impl AsyncParquetReader {
+     | ----------------------- associated items in this implementation
+ 950 |     /// Create a new async reader for a list of Parquet files
+ 951 |     pub fn new(
+     |            ^^^
+...
+ 966 |     pub fn from_table(
+     |            ^^^^^^^^^^
+...
+ 980 |     pub fn schema(&self) -> SchemaRef {
+     |            ^^^^^^
+...
+ 985 |     pub fn into_stream(self) -> BoxStream<'static, Result<RecordBatch>> {
+     |            ^^^^^^^^^^^
+...
+1096 |     pub async fn read_all_parallel(&self, max_concurrent: usize) -> Result<Vec<RecordBatch>> {
+     |                  ^^^^^^^^^^^^^^^^^
+
+warning: struct `AsyncParquetScanBuilder` is never constructed
+    --> src/storage/parquet.rs:1153:12
+     |
+1153 | pub struct AsyncParquetScanBuilder {
+     |            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `new`, `with_projection`, `with_batch_size`, `build`, and `build_stream` are never used
+    --> src/storage/parquet.rs:1162:12
+     |
+1160 | impl AsyncParquetScanBuilder {
+     | ---------------------------- associated items in this implementation
+1161 |     /// Create a new builder from a ParquetTable
+1162 |     pub fn new(table: &ParquetTable) -> Self {
+     |            ^^^
+...
+1172 |     pub fn with_projection(mut self, projection: Vec<usize>) -> Self {
+     |            ^^^^^^^^^^^^^^^
+...
+1178 |     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+     |            ^^^^^^^^^^^^^^^
+...
+1184 |     pub fn build(self) -> AsyncParquetReader {
+     |            ^^^^^
+...
+1189 |     pub fn build_stream(self) -> BoxStream<'static, Result<RecordBatch>> {
+     |            ^^^^^^^^^^^^
+
+warning: `query_engine` (lib) generated 95 warnings (run `cargo fix --lib -p query_engine` to apply 5 suggestions)
+warning: unused variable: `pulsar_namespace`
+    --> src/main.rs:1519:5
+     |
+1519 |     pulsar_namespace: &str,
+     |     ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_pulsar_namespace`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `unregister_table` and `clear_tables` are never used
+   --> src/cli/helper.rs:221:12
+    |
+200 | impl ReplHelper {
+    | --------------- methods in this implementation
+...
+221 |     pub fn unregister_table(&self, name: &str) {
+    |            ^^^^^^^^^^^^^^^^
+...
+231 |     pub fn clear_tables(&self) {
+    |            ^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `with_max_rows` and `format_to_string` are never used
+   --> src/cli/output.rs:72:12
+    |
+ 62 | impl OutputFormatter {
+    | -------------------- methods in this implementation
+...
+ 72 |     pub fn with_max_rows(mut self, max: usize) -> Self {
+    |            ^^^^^^^^^^^^^
+...
+104 |     pub fn format_to_string(&self, batches: &[RecordBatch]) -> String {
+    |            ^^^^^^^^^^^^^^^^
+
+warning: `query_engine` (bin "query_engine") generated 3 warnings (run `cargo fix --bin "query_engine" -p query_engine` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running tests/ipc_extent_contract.rs (target/debug/deps/ipc_extent_contract-963c6267b83e501a)
+
+running 3 tests
+test footer_extent_errors_do_not_unwind ... ok
+test valid_dictionary_batches_projection_and_slicing_preserve_values ... ok
+test dictionary_and_record_extents_and_frames_do_not_unwind ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/native_delete_tests.rs (target/debug/deps/native_delete_tests-b0142edf9d694285)
+
+running 10 tests
+test delete_from_an_unregistered_table_is_a_clean_table_not_found_error ... ok
+test delete_from_a_non_native_table_is_a_clean_invalid_argument_error ... ok
+test sql_refuses_delete_and_points_at_delete_from_native_table ... ok
+test statistics_reflect_post_delete_row_count ... ok
+test delete_all_rows_leaves_the_table_existing_but_logically_empty ... ok
+test no_regression_insert_and_ctas_still_work_after_a_delete_in_the_same_session ... ok
+test repeated_overlapping_deletes_are_idempotent_and_never_double_count ... ok
+test delete_a_subset_matches_the_independently_computed_complement_cell_exact ... ok
+test delete_from_a_multi_segment_table_applies_to_the_correct_segments_only ... ok
+test delete_matching_zero_rows_is_a_clean_no_op ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/native_dictionary_semi_anti.rs (target/debug/deps/native_dictionary_semi_anti-4dc3b3f031ec5218)
+
+running 7 tests
+test dictionary_semi_anti_preserve_every_left_row_with_independent_null_oracle ... ok
+test native_membership_and_exists_have_independent_null_and_empty_results ... ok
+test anti_join_on_dictionary_key_with_build_left_is_cell_exact ... ok
+test anti_join_on_dictionary_key_with_build_right_is_cell_exact ... ok
+test semi_join_on_dictionary_key_with_build_left_is_cell_exact ... ok
+test semi_join_on_dictionary_key_with_build_right_is_cell_exact ... ok
+test native_not_in_matches_source_without_requiring_an_ordinary_anti_join ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.54s
+
+     Running tests/native_insert_tests.rs (target/debug/deps/native_insert_tests-32599eee629a7d8a)
+
+running 9 tests
+test insert_into_an_unregistered_table_is_a_clean_table_not_found_error ... ok
+test insert_into_a_non_native_table_is_a_clean_invalid_argument_error ... ok
+test insert_values_literal_rows_end_to_end ... ok
+test insert_of_an_empty_result_set_is_a_no_op_not_an_error ... ok
+test statistics_and_distributed_splits_reflect_post_insert_state ... ok
+test sql_refuses_insert_and_points_at_insert_into_native_table ... ok
+test insert_with_a_wildcard_select_star_source_is_positionally_correct ... ok
+test insert_with_a_column_count_schema_mismatch_is_a_clean_named_error_not_corruption ... ok
+test insert_into_a_table_with_existing_ctas_data_matches_the_combined_source_cell_exact ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/native_streaming_scan_tests.rs (target/debug/deps/native_streaming_scan_tests-90310bfd59ad698a)
+
+running 10 tests
+test other_materializing_shapes_still_refuse ... ok
+test oversized_select_star_still_refuses_by_name ... ok
+test in_budget_tables_are_unaffected ... ok
+test shared_over_budget_scan_plans_streaming_before_reading ... ok
+test filtered_aggregate_over_oversized_table_prunes_and_is_cell_exact ... ok
+test aggregate_over_oversized_table_completes_and_is_cell_exact ... ok
+test deletion_vector_is_cell_exact_on_the_streaming_path ... ok
+test sort_over_oversized_table_completes_and_is_cell_exact ... ok
+test join_over_oversized_table_completes_and_is_cell_exact ... ok
+test aggregate_over_join_of_oversized_tables_completes_and_is_cell_exact ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+
+     Running tests/native_table_validation.rs (target/debug/deps/native_table_validation-bac1101e3c5cf120)
+
+running 12 tests
+test unsupported_create_table_clauses_are_refused_by_name ... ok
+test ctas_creates_a_table_immediately_queryable_in_the_same_session ... ok
+test native_table_statistics_row_count_matches_a_full_scan ... ok
+test create_table_as_select_replaces_an_existing_native_table_wholesale ... ok
+test sql_refuses_create_table_and_points_at_the_ddl_entrypoint ... ok
+test columns_only_create_table_is_refused_by_name ... ok
+test native_table_matches_source_on_a_filter_cell_exact ... ok
+test native_table_matches_source_on_a_join_cell_exact ... ok
+test native_table_matches_source_on_an_aggregate_cell_exact ... FAILED
+test native_table_matches_source_on_a_plain_scan_cell_exact ... ok
+test native_table_matches_source_on_a_dense_direct_group_by_cell_exact ... ok
+test native_table_matches_source_on_a_filtered_group_by_cell_exact ... ok
+
+failures:
+
+---- native_table_matches_source_on_an_aggregate_cell_exact stdout ----
+
+thread 'native_table_matches_source_on_an_aggregate_cell_exact' (3763186) panicked at tests/native_table_validation.rs:128:5:
+assertion `left == right` failed
+  left: "+---------------+-----+--------------------+--------------------+\n| o_orderstatus | n   | total              | avg_price          |\n+---------------+-----+--------------------+--------------------+\n| F             | 500 | 129155765.54607832 | 258311.53109215666 |\n| O             | 500 | 129000850.70827657 | 258001.70141655314 |\n| P             | 500 | 119702737.23286004 | 239405.4744657201  |\n+---------------+-----+--------------------+--------------------+"
+ right: "+---------------+-----+--------------------+--------------------+\n| o_orderstatus | n   | total              | avg_price          |\n+---------------+-----+--------------------+--------------------+\n| F             | 500 | 129155765.5460783  | 258311.5310921566  |\n| O             | 500 | 129000850.70827654 | 258001.70141655309 |\n| P             | 500 | 119702737.23286001 | 239405.47446572004 |\n+---------------+-----+--------------------+--------------------+"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    native_table_matches_source_on_an_aggregate_cell_exact
+
+test result: FAILED. 11 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+error: test failed, to rerun pass `--test native_table_validation`
+     Running tests/native_update_tests.rs (target/debug/deps/native_update_tests-bf3e49d02dc04a94)
+
+running 12 tests
+test update_of_an_unregistered_table_is_a_clean_table_not_found_error ... ok
+test update_of_a_non_native_table_is_a_clean_invalid_argument_error ... ok
+test sql_refuses_update_and_points_at_update_native_table ... ok
+test update_matching_all_rows_via_no_where_clause ... ok
+test each_update_bumps_the_version_by_exactly_one_never_two ... ok
+test update_on_a_dictionary_encoded_column_round_trips_correctly ... ok
+test update_across_a_multi_segment_table_applies_to_the_correct_segments_only ... ok
+test no_regression_insert_delete_and_ctas_still_work_after_an_update_in_the_same_session ... ok
+test update_self_referential_set_expression_matches_independently_computed_reference ... ok
+test overlapping_sequential_updates_have_a_well_defined_correct_order ... ok
+test update_matching_zero_rows_is_a_clean_no_op ... ok
+test no_partial_state_visibility_during_a_concurrent_update ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+error: 1 target failed:
+    `--test native_table_validation`

@@ -1,0 +1,29 @@
+[
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/ordered_scanner_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/paired-lance-refinement-attribution-01/b2-parent-q19/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 1058.29537,
+      "status": "ready",
+      "threads": 16,
+      "track": "lance"
+    },
+    "stderr": ".scratch/parallel-aggregate-input/paired-lance-refinement-attribution-01/b2-parent-q19/engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  }
+]

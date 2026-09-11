@@ -1,0 +1,7 @@
+{
+  "protoc_path": ".scratch/tools/protoc/bin/protoc",
+  "protoc_sha256": "e718992c5733ece01264f160c0890229770791e51c9612a2b34dc17f83ab3773",
+  "dependency_versions_and_edges_unchanged": true,
+  "only_lock_change": "Lance10registry source/checksum removed for local path patch",
+  "protoc_version": "libprotoc 25.3"
+}

@@ -1,0 +1,67 @@
+{
+  "completed_outputs": 176,
+  "sequence_end_process": [
+    {
+      "VmSize": "16823360 kB",
+      "VmRSS": "2725904 kB",
+      "RssAnon": "2678348 kB",
+      "RssFile": "47556 kB",
+      "VmData": "10690972 kB",
+      "Threads": "92",
+      "thread_names": {
+        "lance_refinemen": 1,
+        "qe-worker-0": 1,
+        "qe-worker-1": 1,
+        "qe-worker-2": 1,
+        "qe-worker-3": 1,
+        "qe-worker-4": 1,
+        "qe-worker-5": 1,
+        "qe-worker-6": 1,
+        "qe-worker-7": 1,
+        "qe-worker-8": 1,
+        "qe-worker-9": 1,
+        "qe-worker-10": 1,
+        "qe-worker-11": 1,
+        "qe-worker-12": 1,
+        "qe-worker-13": 1,
+        "qe-worker-14": 1,
+        "qe-worker-15": 1,
+        "tokio-rt-worker": 32,
+        "lance-io": 43
+      }
+    },
+    {
+      "VmSize": "17161424 kB",
+      "VmRSS": "2878668 kB",
+      "RssAnon": "2831112 kB",
+      "RssFile": "47556 kB",
+      "VmData": "10701976 kB",
+      "Threads": "97",
+      "thread_names": {
+        "lance_refinemen": 1,
+        "qe-worker-0": 1,
+        "qe-worker-1": 1,
+        "qe-worker-2": 1,
+        "qe-worker-3": 1,
+        "qe-worker-4": 1,
+        "qe-worker-5": 1,
+        "qe-worker-6": 1,
+        "qe-worker-7": 1,
+        "qe-worker-8": 1,
+        "qe-worker-9": 1,
+        "qe-worker-10": 1,
+        "qe-worker-11": 1,
+        "qe-worker-12": 1,
+        "qe-worker-13": 1,
+        "qe-worker-14": 1,
+        "qe-worker-15": 1,
+        "tokio-rt-worker": 32,
+        "lance-io": 48
+      }
+    }
+  ],
+  "max_observed_threads": 97,
+  "max_observed_io_threads": 48,
+  "vmdata_growth_kib": 11004,
+  "qualification": "Sampled at request boundaries; does not bound transient thread counts or query-wide memory."
+}

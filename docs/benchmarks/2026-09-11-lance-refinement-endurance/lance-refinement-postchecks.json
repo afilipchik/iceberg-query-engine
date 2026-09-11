@@ -1,0 +1,119 @@
+{
+  "driver_sha256": "09ff4651af282098e816f9d26f2acaa694cfbc56c5a11a8399751336d44a6901",
+  "qualification": "Sequential post-timing diagnostics and audits; cgroup peak is cumulative across stages, not per-query RSS.",
+  "stages": {
+    "sf10_audit": {
+      "status": "terminal",
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/audit_lance_refinement_sf10.py"
+      ],
+      "started": 1789161259.1980062,
+      "before": {
+        "memory.max": "17179869184\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "7282688\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      },
+      "exit_code": 0,
+      "finished": 1789161283.5351431,
+      "after": {
+        "memory.max": "17179869184\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "181248000\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      }
+    },
+    "paired": {
+      "status": "terminal",
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/paired_lance_refinement_attribution.py"
+      ],
+      "started": 1789161283.535382,
+      "before": {
+        "memory.max": "17179869184\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "181248000\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      },
+      "exit_code": 0,
+      "finished": 1789161460.286532,
+      "after": {
+        "memory.max": "17179869184\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "7213248512\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      }
+    },
+    "paired_audit": {
+      "status": "terminal",
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/audit_paired_lance_refinement_attribution.py"
+      ],
+      "started": 1789161460.286798,
+      "before": {
+        "memory.max": "17179869184\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "7213248512\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      },
+      "exit_code": 0,
+      "finished": 1789161460.8424997,
+      "after": {
+        "memory.max": "17179869184\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "7213248512\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      }
+    },
+    "endurance": {
+      "status": "terminal",
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/engine_lance_refinement_endurance.py",
+        ".scratch/parallel-aggregate-input/lance-refinement-endurance-01",
+        ".scratch/parallel-aggregate-input/lance_refinement_benchmark_embedded"
+      ],
+      "started": 1789161460.8427293,
+      "before": {
+        "memory.max": "17179869184\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "7213248512\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      },
+      "exit_code": 0,
+      "finished": 1789161638.9713643,
+      "after": {
+        "memory.max": "17179869184\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "8284438528\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      }
+    },
+    "endurance_audit": {
+      "status": "terminal",
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/audit_lance_refinement_endurance.py"
+      ],
+      "started": 1789161638.971621,
+      "before": {
+        "memory.max": "17179869184\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "8284438528\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      },
+      "exit_code": 0,
+      "finished": 1789161651.051422,
+      "after": {
+        "memory.max": "17179869184\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "8284438528\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      }
+    }
+  },
+  "verified_source_inputs_after": 800
+}

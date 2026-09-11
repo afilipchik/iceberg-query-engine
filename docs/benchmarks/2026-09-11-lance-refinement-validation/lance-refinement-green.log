@@ -1,0 +1,10 @@
+   Compiling lance v10.0.0 (/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/vendor/lance)
+error: failed to run custom build command for `lance v10.0.0 (/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/vendor/lance)`
+
+Caused by:
+  process didn't exit successfully: `/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/target/debug/build/lance-1935ca3b37299ca4/build-script-build` (exit status: 1)
+  --- stdout
+  cargo:rerun-if-changed=protos
+
+  --- stderr
+  Error: Custom { kind: NotFound, error: "Could not find `protoc`. If `protoc` is installed, try setting the `PROTOC` environment variable to the path of the `protoc` binary. To install it on Debian, run `apt-get install protobuf-compiler`. It is also available at https://github.com/protocolbuffers/protobuf/releases  For more information: https://docs.rs/prost-build/#sourcing-protoc" }

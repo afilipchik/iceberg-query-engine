@@ -1785,3 +1785,21 @@ and `FragmentTasks` guard are removed together. Collected output, internal Lance
 cancellation and query-wide admission remain open resource contracts. See the
 [scanner candidate](ordered-lance-scanner-2026-09-11.md) and the historical
 [task ownership repair](lance-fragment-task-ownership-2026-09-11.md).
+
+
+## Bounded Lance refinement candidate (September 11)
+
+`vendor/lance` is a local patch of the pinned Lance10.0.0 crate; dependency versions
+are unchanged. Its `FilteredReadStream::wrap_with_filter` puts decode completion
+and refinement into an owned SpawnedTask. The existing buffered decode window
+provides the intended admission count and preserves order. This targets the
+inline filter work serialized by the single scanner's consumer. CPU work already
+executing cannot be preempted by cancellation. This is not query-wide memory
+admission. The direct concurrency/typed-row regression is currently red against
+the original source; patched validation is pending.
+
+UPSTREAM.json records the original crate and265file checksums; PATCHES.md explains
+the change. The external Cargo registry remains untouched. Benchmark provenance
+now includes all vendor files, so a local dependency edit cannot hide behind an
+unchanged Cargo.lock or engine source hash. Rebuilding this crate on this sandbox
+requires PROTOC pointing to `.scratch/tools/protoc/bin/protoc`.

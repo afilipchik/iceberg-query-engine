@@ -6,7 +6,32 @@ linked reports and the existing epic rather than prepending another status block
 
 ## Current checkpoint — 2026-09-11
 
-Frozen candidate `835ae7ad` (531 verified source inputs, Lance/GPU features) uses
+Frozen candidate `8c4936d8` adds a local patch to pinned Lance10 in `vendor/lance`: refinement
+runs in an owned task within the existing decode window. Registry files and
+dependency versions are unchanged; UPSTREAM.json preserves all265original hashes.
+The benchmark source manifest now hashes vendor content as well as engine code.
+Red91654 reproduces serialized refinement with correct filtered rows. Initial
+patched rebuild fails only because protoc is absent from PATH; corrected24871
+passes with the existing `.scratch/tools/protoc/bin/protoc`. Strengthened11512
+passes3refinement contracts and31Lance integrations; provenance unit1passes.
+Broad36475 terminal1 retains unchanged failures,800source inputs:1132library
+passes/11ignored and128contracts each; source archive32files verifies. Scopepeak
+37.346GB,zeroOOM/max. Release3743 completed0 in11m28s; its SF10 provider
+screen is terminal1. Independent audit validates343outputs/257of264pairs: raw66,
+native62, Iceberg63, Lance66. Raw geomean2.422912/suite2.630356 (0wins), Lance
+2.021921/3.104834 (1win). NativeQ1warmup/Q6measured3 timeout; DuckDB IcebergQ9warmup
+refuses128MiB and engineQ9 is not run. Source/binary/harness verified; combined
+scopepeak25.882GB,zeroOOM/max. Sequential postchecks50101 terminal0:80paired typed
+outputs, unchanged plans, Q12 ratios0.358/0.242 and Q19 0.514/0.488 in reversed
+blocks (diagnostic only). Default-allocator endurance176/176typed-correct; maximum
+observed48I/Othreads/97total, sequence-end VmData growth11004KiB. Cumulative16GiB
+scopepeak8.284GB,zeroOOM/max. Binary and800source hashes verify. Archives32validation,
+1282SF10,173paired,197endurance plus174prior attribution verify. This intermediary
+cycle is ready for commit/push; next CPU target is shared aggregate execution,
+which still dominates Q1. See [refinement evidence](docs/lance-refinement-concurrency-2026-09-11.md).
+No leadership or full provider/resource/residency/concurrency acceptance is certified.
+
+Frozen parent `835ae7ad` (531 verified source inputs, Lance/GPU features) uses
 one ordered Lance scanner across selected fragments. This shares Lance's internal
 I/O/decode scheduling instead of spawning a scanner per fragment. Explicit empty
 subsets return no rows; provider subsets preserve dataset order. Projection,
@@ -38,9 +63,12 @@ validates all176outputs. Observed I/O threads peak46; end-of-sequence VmData gro
 only64KiB between sequences. Scopepeak7.944GB under16GiB,zeroOOM/max. Archive190files
 verifies after correcting a worker/archive manifest filename collision. This
 clears the reproduced two-sequence failure, not general query-wide admission or
-unbounded-duration acceptance. All jobs are terminal. Checkpoint commit/push is
-next, then paired generic scan attribution across multiple workload shapes.
-Last pushed checkpoint is `97cea5c`; current candidate is provisional pending
+unbounded-duration acceptance. The cycle is committed and pushed as `580aeca`; the exact remote hash is verified.
+Paired attribution96509 is terminal0; all80outputs independently validate. Both
+blocks reproduce Q12 at4.76×/4.64× and Q19 at1.93×/1.98×; added time is in provider
+scans during planning, with identical optimized/physical plans. Archive174files
+preserves this diagnostic and the first concurrency reproduction.
+Current candidate is provisional pending
 performance work. No new decoded IPC/GPU or concurrency acceptance.
 
 Earlier completed evidence belongs to its frozen binary:

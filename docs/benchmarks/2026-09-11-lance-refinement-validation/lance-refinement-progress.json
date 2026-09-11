@@ -1,0 +1,26 @@
+{
+  "parent_commit": "580aecafa7f9e97c926e92fea7ba2cbb2dbeaa15",
+  "previous_goal_turn": "progress: committed/pushed scanner cycle with SF10 and endurance evidence",
+  "paired_terminal": 96509,
+  "paired_typed_outputs": 80,
+  "paired_archive_files": 174,
+  "red_terminal": 91654,
+  "red_exit": 101,
+  "initial_green_failure": "protoc missing from PATH, no test run",
+  "green_terminal": 24871,
+  "green_passed": 1,
+  "contracts_terminal": 11512,
+  "contracts_passed": 3,
+  "lance_integration_passed": 31,
+  "provenance_passed": 1,
+  "broad_session": 36475,
+  "source_inputs": 800,
+  "next": [
+    "Finish broad and compare against ordered-scanner parent with one added test executable/3contracts; no retired tests this cycle",
+    "Consider multi-fragment coverage of bounded refinement before final release; existing ordered/deletion fixture and SF10 cover real fragments",
+    "Freeze release including all vendor files and protoc version/hash",
+    "Run paired five-shape attribution and canonical SF10 raw/native/Iceberg/Lance",
+    "Repeat default-allocator two-sequence Lance workload and typed audit",
+    "Archive, exact commit/push, continue goal"
+  ]
+}

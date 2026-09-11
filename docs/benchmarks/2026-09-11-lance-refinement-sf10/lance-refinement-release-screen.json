@@ -1,0 +1,38 @@
+{
+  "release": {
+    "status": "terminal",
+    "started": 1789159727.4211228,
+    "before": {
+      "memory.max": "51539607552\n",
+      "memory.swap.max": "0\n",
+      "memory.peak": "6778880\n",
+      "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+    },
+    "exit_code": 0,
+    "finished": 1789160415.7304833,
+    "after": {
+      "memory.max": "51539607552\n",
+      "memory.swap.max": "0\n",
+      "memory.peak": "11974340608\n",
+      "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+    }
+  },
+  "providers": {
+    "status": "terminal",
+    "started": 1789160415.7307034,
+    "before": {
+      "memory.max": "51539607552\n",
+      "memory.swap.max": "0\n",
+      "memory.peak": "11974340608\n",
+      "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+    },
+    "exit_code": 1,
+    "finished": 1789161235.412267,
+    "after": {
+      "memory.max": "51539607552\n",
+      "memory.swap.max": "0\n",
+      "memory.peak": "25882361856\n",
+      "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+    }
+  }
+}
