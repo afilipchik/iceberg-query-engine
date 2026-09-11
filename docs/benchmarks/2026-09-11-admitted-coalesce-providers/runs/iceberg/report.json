@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "complete": false,
+  "issues": [
+    "row 41 ('tpch_sf10', 'q13', 'iceberg', 's1')/2: answer not validated; duckdb: crash",
+    "row 42 ('tpch_sf10', 'q13', 'iceberg', 's1')/3: answer not validated; engine: not_run; duckdb: not_run"
+  ],
+  "groups": [],
+  "latency_leadership": false,
+  "certification": "incomplete: resource, concurrency and regression gates are separate"
+}

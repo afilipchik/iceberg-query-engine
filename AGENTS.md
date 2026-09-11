@@ -136,8 +136,34 @@ NativeQ1 warmup timeout,IcebergQ9 referenceSIGSEGV,LanceQ9 join-index refusal re
 Residency348typed-correct,278/278valid pairs at32/48GiB; canonicalGPU0device requests,
 custom required40measured device proofs. Peak23061450752bytes,zeroOOM/max. Genericraw
 Q6 still7323batches versus458baseline; no throughput recovery certified. All jobs
-terminal; intermediate commit/push is next, then systemic reader work. See
-[checkpoint](docs/admitted-quantum-checkpoint-2026-09-11.md).
+terminal. Intermediate commit0c554142 was pushed and exact remote branch hash verified.
+Next-cycle matrix78387 terminal101:2empty-selection passes and4fixed/string
+dense/sparse batching failures after independent values and ownership checks pass.
+Production is unchanged; source528/red evidence verifies. See
+[post-filter reproduction](docs/admitted-filter-batching-2026-09-11.md). Current
+source removes predicate-only survivor copies via filter_projected and reuses a
+static-only nullable mask directly. Gather5passes/scanner16passes with exactly4
+known batching failures; source528/component archive verifies. Current source now adds admitted_coalesce with typed fixed-capacity buffers, bounded
+UTF8 bytes and pre-reserved handoff. Reader retains one pending batch/exact offset;
+whole-chunk construction refusal may bypass packing, source errors stay terminal.
+Accumulator4/scanner23 passes, including the4batching regressions and post-prefix
+I/O failure. Source530 archive verifies; broad84021 terminal1:1125library/11ignored,125contracts,
+28spill/numeric passes each; native63/0disjoint,62/1partial and6spill failures each,
+no added/removed failures. Validation26files verify,peak21864136704,zeroOOM/max.
+Release63185 terminal0 in8m48s freezes1bba20b3/530inputs. Checkpoint11187 terminal1;
+evidence76516 terminal0 verifies452diagnostic/1436provider/1097residency files.
+Triage42typed-correct/792traces/14equal plan groups; genericrawQ6 restores458batches
+from7323,ratio0.897777 versusbeb0cdfd but1.828793 versuspre-coercion13210a20.
+Native/resident4Q9 regress versuscontrol in both blocks; no broad neutrality claim.
+Providers339typed-correct,253/264valid pairs; rawgeomean2.447789/suite2.629099,0wins.
+NativeQ1/Q6 warmup timeouts,IcebergQ13 referenceSIGSEGV,LanceQ9 join-index refusal.
+Residency256typed-correct,209/212emitted measured pairs; intended278 not complete:
+CPUcontrolQ1 timeout blocks all66canonical mixedGPU requests. DecodedIPC completes,
+geomean0.708858/suite1.002784,14wins at32/48GiB capacity,not16GiBpreload acceptance.
+CustomrequiredGPU40measured device proofs; canonicaldevice coverage0/notrun.
+Peak22185889792bytes,zeroOOM/max. All jobs terminal. Current cycle is ready for
+intermediate commit/push; then continue first-batch working-space reproduction.
+See [current checkpoint](docs/admitted-coalesce-checkpoint-2026-09-11.md).
 No performance or first-batch memory recovery claimed. See [quantum contract](docs/admitted-planned-quantum-2026-09-11.md).
 See [route audit](docs/admitted-route-cost-confound-2026-09-11.md). See [dispatch attribution](docs/compiled-coercion-attribution-2026-09-11.md). See [measurement](docs/compiled-coercion-measurement-2026-09-11.md).
 Trace69517/archive94698 terminal0: COUNTdistinct still fails,3stacks,13files/524inputs/

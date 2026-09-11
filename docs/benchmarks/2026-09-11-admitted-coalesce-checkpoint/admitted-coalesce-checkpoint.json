@@ -1,0 +1,27 @@
+{
+  "status": "terminal",
+  "steps": [
+    {
+      "name": "triage",
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/run_admitted_coalesce_triage.py"
+      ],
+      "status": "terminal",
+      "started_unix": 1789144572.5018644,
+      "exit_code": 0,
+      "finished_unix": 1789144725.435939
+    },
+    {
+      "name": "full_screens",
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/run_admitted_coalesce_full_screens.py"
+      ],
+      "status": "terminal",
+      "started_unix": 1789144725.4506996,
+      "exit_code": 1,
+      "finished_unix": 1789146190.4566712
+    }
+  ]
+}

@@ -4,7 +4,7 @@ Each completed implementation cycle runs canonical SF10 provider and residency
 screens before an intermediate Git commit and push. Failures remain recorded;
 a checkpoint is not a claim of DuckDB leadership or full acceptance.
 
-The September 11 planned-quantum checkpoint includes the current cycle's frozen
+The September 11 planned-quantum and bounded-output checkpoints include their frozen
 source, tests, complete provider/residency samples, typed outputs and independent
 oracles, plans, resource evidence, and exact drivers. The report distinguishes
 canonical GPU fallback from successful device execution, and the 32 GiB residency

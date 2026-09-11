@@ -1,0 +1,14 @@
+{
+  "files": {
+    "admitted-coalesce-checkpoint-evidence.json": "87870c97e9dba2351af046b2c59b45f670ab90850537702fef1e99d422f34fbb",
+    "admitted-coalesce-checkpoint.json": "fd3a5db852477f27bd02b7d6c76c3d44c067f487625baa780f4c6e336ec24e34",
+    "admitted-coalesce-full-evidence.json": "fc9c6f88cf6330a69c0a59344143a4eed2b31dbfcf956bc45dd2874cc51f1145",
+    "residency-ratios.json": "d8c6414abea98b4f41de2bb2d3de790e52834fba7fe6c2a72a919fc5fdb4131a",
+    "run_admitted_coalesce_checkpoint.py": "05e6a21a8b6cc70da1b872b6eb6447d81b42166d3ee5abdf1a7e5d9fbce31a88",
+    "run_admitted_coalesce_checkpoint_evidence.py": "4bb7718532c6c0fd8eec41165a1a74474bde2e206420bfae572946716729d6bf",
+    "supplement_admitted_coalesce_checkpoint.py": "e260ff678a0b36254128ae80da27ed81dc9f66b32497a0bbf2c28c5d645432d3"
+  },
+  "source_count": 530,
+  "release_sha256": "1bba20b347f3cad6b6afc53047848dacbb61f8a76393aed16b486058733fae70",
+  "note": "Supplement to immutable triage/provider/residency archives; all ratios use complete independently validated measured pairs."
+}

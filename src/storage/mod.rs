@@ -6,6 +6,7 @@
 //!   manifests resolved to a `ParquetTable`
 
 pub(crate) mod admitted_batch;
+pub(crate) mod admitted_coalesce;
 pub(crate) mod admitted_column_pages;
 pub(crate) mod admitted_dictionary_utf8;
 pub(crate) mod admitted_flat_column;

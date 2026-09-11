@@ -1,0 +1,434 @@
+[
+  {
+    "block": 1,
+    "mode": "raw_parquet_generic",
+    "label": "baseline",
+    "preparations": [
+      {
+        "admitted_buffers": false,
+        "declared_bound": 265649,
+        "envelope_bytes": 4250384,
+        "label": "aggregate input queue",
+        "max_slots": 16,
+        "operator": "Project",
+        "partitions": 16,
+        "prepared": false,
+        "slots": 16
+      }
+    ],
+    "producers": 16,
+    "producer_batches": 458,
+    "producer_rows": 1139264
+  },
+  {
+    "block": 1,
+    "mode": "raw_parquet_generic",
+    "label": "control",
+    "preparations": [
+      {
+        "admitted_buffers": true,
+        "declared_bound": null,
+        "envelope_bytes": null,
+        "label": "aggregate input queue",
+        "max_slots": 16,
+        "operator": "Project",
+        "partitions": 16,
+        "prepared": true,
+        "slots": 16
+      }
+    ],
+    "producers": 16,
+    "producer_batches": 7323,
+    "producer_rows": 1139264
+  },
+  {
+    "block": 1,
+    "mode": "raw_parquet_generic",
+    "label": "candidate",
+    "preparations": [
+      {
+        "admitted_buffers": true,
+        "declared_bound": null,
+        "envelope_bytes": null,
+        "label": "aggregate input queue",
+        "max_slots": 16,
+        "operator": "Project",
+        "partitions": 16,
+        "prepared": true,
+        "slots": 16
+      }
+    ],
+    "producers": 16,
+    "producer_batches": 458,
+    "producer_rows": 1139264
+  },
+  {
+    "block": 1,
+    "mode": "raw_parquet",
+    "label": "baseline",
+    "preparations": [],
+    "producers": 0,
+    "producer_batches": 0,
+    "producer_rows": 0
+  },
+  {
+    "block": 1,
+    "mode": "raw_parquet",
+    "label": "control",
+    "preparations": [],
+    "producers": 0,
+    "producer_batches": 0,
+    "producer_rows": 0
+  },
+  {
+    "block": 1,
+    "mode": "raw_parquet",
+    "label": "candidate",
+    "preparations": [],
+    "producers": 0,
+    "producer_batches": 0,
+    "producer_rows": 0
+  },
+  {
+    "block": 1,
+    "mode": "native",
+    "label": "baseline",
+    "preparations": [
+      {
+        "admitted_buffers": false,
+        "declared_bound": null,
+        "envelope_bytes": null,
+        "label": "aggregate input queue",
+        "max_slots": 8,
+        "operator": "Project",
+        "partitions": 8,
+        "prepared": false,
+        "slots": 1
+      }
+    ],
+    "producers": 8,
+    "producer_batches": 916,
+    "producer_rows": 1139264
+  },
+  {
+    "block": 1,
+    "mode": "native",
+    "label": "control",
+    "preparations": [
+      {
+        "admitted_buffers": false,
+        "declared_bound": null,
+        "envelope_bytes": null,
+        "label": "aggregate input queue",
+        "max_slots": 8,
+        "operator": "Project",
+        "partitions": 8,
+        "prepared": false,
+        "slots": 1
+      }
+    ],
+    "producers": 8,
+    "producer_batches": 916,
+    "producer_rows": 1139264
+  },
+  {
+    "block": 1,
+    "mode": "native",
+    "label": "candidate",
+    "preparations": [
+      {
+        "admitted_buffers": false,
+        "declared_bound": null,
+        "envelope_bytes": null,
+        "label": "aggregate input queue",
+        "max_slots": 8,
+        "operator": "Project",
+        "partitions": 8,
+        "prepared": false,
+        "slots": 1
+      }
+    ],
+    "producers": 8,
+    "producer_batches": 916,
+    "producer_rows": 1139264
+  },
+  {
+    "block": 1,
+    "mode": "cpu_resident_4t_32g",
+    "label": "baseline",
+    "preparations": [
+      {
+        "admitted_buffers": false,
+        "declared_bound": 2114961,
+        "envelope_bytes": 8459844,
+        "label": "aggregate input queue",
+        "max_slots": 4,
+        "operator": "Project",
+        "partitions": 4,
+        "prepared": false,
+        "slots": 4
+      }
+    ],
+    "producers": 4,
+    "producer_batches": 916,
+    "producer_rows": 1139264
+  },
+  {
+    "block": 1,
+    "mode": "cpu_resident_4t_32g",
+    "label": "control",
+    "preparations": [
+      {
+        "admitted_buffers": true,
+        "declared_bound": null,
+        "envelope_bytes": null,
+        "label": "aggregate input queue",
+        "max_slots": 4,
+        "operator": "Project",
+        "partitions": 4,
+        "prepared": true,
+        "slots": 4
+      }
+    ],
+    "producers": 4,
+    "producer_batches": 916,
+    "producer_rows": 1139264
+  },
+  {
+    "block": 1,
+    "mode": "cpu_resident_4t_32g",
+    "label": "candidate",
+    "preparations": [
+      {
+        "admitted_buffers": true,
+        "declared_bound": null,
+        "envelope_bytes": null,
+        "label": "aggregate input queue",
+        "max_slots": 4,
+        "operator": "Project",
+        "partitions": 4,
+        "prepared": true,
+        "slots": 4
+      }
+    ],
+    "producers": 4,
+    "producer_batches": 916,
+    "producer_rows": 1139264
+  },
+  {
+    "block": 2,
+    "mode": "raw_parquet_generic",
+    "label": "candidate",
+    "preparations": [
+      {
+        "admitted_buffers": true,
+        "declared_bound": null,
+        "envelope_bytes": null,
+        "label": "aggregate input queue",
+        "max_slots": 16,
+        "operator": "Project",
+        "partitions": 16,
+        "prepared": true,
+        "slots": 16
+      }
+    ],
+    "producers": 16,
+    "producer_batches": 458,
+    "producer_rows": 1139264
+  },
+  {
+    "block": 2,
+    "mode": "raw_parquet_generic",
+    "label": "control",
+    "preparations": [
+      {
+        "admitted_buffers": true,
+        "declared_bound": null,
+        "envelope_bytes": null,
+        "label": "aggregate input queue",
+        "max_slots": 16,
+        "operator": "Project",
+        "partitions": 16,
+        "prepared": true,
+        "slots": 16
+      }
+    ],
+    "producers": 16,
+    "producer_batches": 7323,
+    "producer_rows": 1139264
+  },
+  {
+    "block": 2,
+    "mode": "raw_parquet_generic",
+    "label": "baseline",
+    "preparations": [
+      {
+        "admitted_buffers": false,
+        "declared_bound": 265649,
+        "envelope_bytes": 4250384,
+        "label": "aggregate input queue",
+        "max_slots": 16,
+        "operator": "Project",
+        "partitions": 16,
+        "prepared": false,
+        "slots": 16
+      }
+    ],
+    "producers": 16,
+    "producer_batches": 458,
+    "producer_rows": 1139264
+  },
+  {
+    "block": 2,
+    "mode": "raw_parquet",
+    "label": "candidate",
+    "preparations": [],
+    "producers": 0,
+    "producer_batches": 0,
+    "producer_rows": 0
+  },
+  {
+    "block": 2,
+    "mode": "raw_parquet",
+    "label": "control",
+    "preparations": [],
+    "producers": 0,
+    "producer_batches": 0,
+    "producer_rows": 0
+  },
+  {
+    "block": 2,
+    "mode": "raw_parquet",
+    "label": "baseline",
+    "preparations": [],
+    "producers": 0,
+    "producer_batches": 0,
+    "producer_rows": 0
+  },
+  {
+    "block": 2,
+    "mode": "native",
+    "label": "candidate",
+    "preparations": [
+      {
+        "admitted_buffers": false,
+        "declared_bound": null,
+        "envelope_bytes": null,
+        "label": "aggregate input queue",
+        "max_slots": 8,
+        "operator": "Project",
+        "partitions": 8,
+        "prepared": false,
+        "slots": 1
+      }
+    ],
+    "producers": 8,
+    "producer_batches": 916,
+    "producer_rows": 1139264
+  },
+  {
+    "block": 2,
+    "mode": "native",
+    "label": "control",
+    "preparations": [
+      {
+        "admitted_buffers": false,
+        "declared_bound": null,
+        "envelope_bytes": null,
+        "label": "aggregate input queue",
+        "max_slots": 8,
+        "operator": "Project",
+        "partitions": 8,
+        "prepared": false,
+        "slots": 1
+      }
+    ],
+    "producers": 8,
+    "producer_batches": 916,
+    "producer_rows": 1139264
+  },
+  {
+    "block": 2,
+    "mode": "native",
+    "label": "baseline",
+    "preparations": [
+      {
+        "admitted_buffers": false,
+        "declared_bound": null,
+        "envelope_bytes": null,
+        "label": "aggregate input queue",
+        "max_slots": 8,
+        "operator": "Project",
+        "partitions": 8,
+        "prepared": false,
+        "slots": 1
+      }
+    ],
+    "producers": 8,
+    "producer_batches": 916,
+    "producer_rows": 1139264
+  },
+  {
+    "block": 2,
+    "mode": "cpu_resident_4t_32g",
+    "label": "candidate",
+    "preparations": [
+      {
+        "admitted_buffers": true,
+        "declared_bound": null,
+        "envelope_bytes": null,
+        "label": "aggregate input queue",
+        "max_slots": 4,
+        "operator": "Project",
+        "partitions": 4,
+        "prepared": true,
+        "slots": 4
+      }
+    ],
+    "producers": 4,
+    "producer_batches": 916,
+    "producer_rows": 1139264
+  },
+  {
+    "block": 2,
+    "mode": "cpu_resident_4t_32g",
+    "label": "control",
+    "preparations": [
+      {
+        "admitted_buffers": true,
+        "declared_bound": null,
+        "envelope_bytes": null,
+        "label": "aggregate input queue",
+        "max_slots": 4,
+        "operator": "Project",
+        "partitions": 4,
+        "prepared": true,
+        "slots": 4
+      }
+    ],
+    "producers": 4,
+    "producer_batches": 916,
+    "producer_rows": 1139264
+  },
+  {
+    "block": 2,
+    "mode": "cpu_resident_4t_32g",
+    "label": "baseline",
+    "preparations": [
+      {
+        "admitted_buffers": false,
+        "declared_bound": 2114961,
+        "envelope_bytes": 8459844,
+        "label": "aggregate input queue",
+        "max_slots": 4,
+        "operator": "Project",
+        "partitions": 4,
+        "prepared": false,
+        "slots": 4
+      }
+    ],
+    "producers": 4,
+    "producer_batches": 916,
+    "producer_rows": 1139264
+  }
+]

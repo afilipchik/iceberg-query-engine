@@ -1,0 +1,116 @@
+{
+  "raw_parquet": {
+    "requested_pairs": 66,
+    "valid_pairs": 66,
+    "engine_statuses": {
+      "completed": 66
+    },
+    "failures": {},
+    "completed_measured": 66,
+    "completed_measured_valid": true,
+    "completed_warmups": 22,
+    "warmups_valid": true,
+    "scope_after": {
+      "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0",
+      "memory.peak": "19520114688",
+      "memory.current": "4022382592"
+    }
+  },
+  "native": {
+    "requested_pairs": 66,
+    "valid_pairs": 60,
+    "engine_statuses": {
+      "completed": 60,
+      "not_run": 6
+    },
+    "failures": {
+      "q06": {
+        "engine_status": "not_run",
+        "reason": "engine warmup failed query-time gate; no measured retries",
+        "warmup_status": "timeout",
+        "calibration_ms": [
+          78.741823323071,
+          84.97101021930575,
+          80.0131973810494
+        ]
+      },
+      "q01": {
+        "engine_status": "not_run",
+        "reason": "engine warmup failed query-time gate; no measured retries",
+        "warmup_status": "timeout",
+        "calibration_ms": [
+          298.753569368273,
+          373.94025595858693,
+          270.31421195715666
+        ]
+      }
+    },
+    "completed_measured": 60,
+    "completed_measured_valid": true,
+    "completed_warmups": 20,
+    "warmups_valid": true,
+    "scope_after": {
+      "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0",
+      "memory.peak": "21025374208",
+      "memory.current": "649949184"
+    }
+  },
+  "iceberg": {
+    "requested_pairs": 66,
+    "valid_pairs": 64,
+    "engine_statuses": {
+      "completed": 65,
+      "not_run": 1
+    },
+    "failures": {
+      "q13": {
+        "engine_status": "not_run",
+        "reason": "measured reference failed; dependent requests not run",
+        "warmup_status": "completed",
+        "calibration_ms": [
+          2132.756216917187,
+          2132.8313569538295,
+          2125.16021868214
+        ]
+      }
+    },
+    "completed_measured": 65,
+    "completed_measured_valid": true,
+    "completed_warmups": 22,
+    "warmups_valid": true,
+    "scope_after": {
+      "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0",
+      "memory.peak": "21025374208",
+      "memory.current": "4150046720"
+    }
+  },
+  "lance": {
+    "requested_pairs": 66,
+    "valid_pairs": 63,
+    "engine_statuses": {
+      "completed": 63,
+      "not_run": 3
+    },
+    "failures": {
+      "q09": {
+        "engine_status": "not_run",
+        "reason": "engine warmup failed query-time gate; no measured retries",
+        "warmup_status": "query_error",
+        "calibration_ms": [
+          683.6677761748433,
+          690.1627690531313,
+          684.0225229971111
+        ]
+      }
+    },
+    "completed_measured": 63,
+    "completed_measured_valid": true,
+    "completed_warmups": 21,
+    "warmups_valid": true,
+    "scope_after": {
+      "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0",
+      "memory.peak": "21025374208",
+      "memory.current": "6826110976"
+    }
+  }
+}

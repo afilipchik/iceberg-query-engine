@@ -54,3 +54,22 @@ resource test. Scope peak2,513,014,784bytes,swap0,zero max/OOM events.
 [11-file verified archive](benchmarks/2026-09-11-first-batch-refusal-ledger/manifest.json)
 retains all3denial stacks,selected-field ledgers,fixture hashes,source526 and a hash
 of the separately frozen debug test executable. [Previous allocation-site evidence](incremental-header-refusal-results-2026-09-11.md).
+
+## Next controlled reproduction after the active SF10 cycle
+
+Use a small multi-column Parquet fixture and one unchanged query pool limit.
+First prove that a fresh admitted reader with a one-row target completes every row
+with an independent typed oracle. Then run an independently opened reader with a
+large target at the same limit and record whether it refuses before its first
+output. If it does, test whether lowering the target on that retained reader can
+recover; pending early-column arrays may retain the space needed by later columns.
+Keep all attempts and owner cleanup evidence. This comparison tests output
+allocation order rather than assuming that a small budget is intrinsically enough.
+
+Include a separate case where a single required page exceeds the pool: even the
+fresh one-row reader must refuse cleanly there. Do not count that as a scheduling
+bug or remove page/metadata ownership to make it pass. Inspect dictionary bodies,
+encoded/decoded pages, ID scratch and output buffers separately. A coordinated
+page-preparation phase and common output budget should be evaluated only after
+the feasible one-row versus large-target case is reproduced. No such new experiment
+has run while the current SF10 timing is active.

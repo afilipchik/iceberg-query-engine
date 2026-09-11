@@ -25,6 +25,7 @@ struct Reader {
     predicate: Option<CompiledPredicate>,
     runtime: ReservedVec<(usize, Arc<RuntimeFilterPayload>)>,
     output_positions: ReservedVec<usize>,
+    pending_output: Option<(RecordBatch, usize)>,
     // Drop input/schema/program owners before releasing construction admission.
     _schema_reservation: crate::execution::MemoryReservation,
 }
@@ -131,6 +132,7 @@ impl Reader {
             predicate,
             runtime,
             output_positions,
+            pending_output: None,
             _schema_reservation: schema_reservation,
         })
     }
@@ -141,8 +143,81 @@ impl Reader {
         pool: &SharedMemoryPool,
         max_rows: usize,
     ) -> Result<Option<RecordBatch>> {
+        if self.pending_output.is_none() {
+            self.pending_output = self
+                .next_chunk(output, pool, max_rows)?
+                .map(|batch| (batch, 0));
+        }
+        let Some((batch, offset)) = self.pending_output.as_ref() else {
+            return Ok(None);
+        };
+        if *offset == 0
+            && (batch.num_rows() == max_rows
+                || (self.predicate.is_none() && self.runtime.as_slice().is_empty()))
+        {
+            return Ok(self.pending_output.take().map(|(batch, _)| batch));
+        }
+        // Packing is optional construction after a complete admitted chunk. A
+        // construction-only refusal may hand that whole chunk off unchanged.
+        // It must never replay input or return an already-consumed prefix.
+        let mut accumulator = match crate::storage::admitted_coalesce::BatchAccumulator::new(
+            output.clone(),
+            max_rows,
+            VALUE_BYTES,
+            pool,
+        ) {
+            Ok(accumulator) => accumulator,
+            Err(error) if error.is_memory_limit() && *offset == 0 => {
+                return Ok(self.pending_output.take().map(|(batch, _)| batch));
+            }
+            Err(error) => return Err(error),
+        };
         loop {
-            let Some(mut batch) = self.input.next(max_rows, VALUE_BYTES, pool)? else {
+            let (batch, offset) = self
+                .pending_output
+                .as_mut()
+                .expect("pending admitted chunk");
+            let consumed = accumulator.append(batch, *offset)?;
+            *offset += consumed;
+            if consumed == 0 {
+                if accumulator.rows() > 0 {
+                    return accumulator.finish().map(Some);
+                }
+                if *offset == 0 {
+                    // A single already-admitted long UTF8 value may exceed the
+                    // packing byte target. Hand it off without copying or retry.
+                    drop(accumulator);
+                    return Ok(self.pending_output.take().map(|(batch, _)| batch));
+                }
+                return Err(unsupported(
+                    "remaining selected value exceeds packing capacity",
+                ));
+            }
+            if *offset == batch.num_rows() {
+                self.pending_output = None;
+            }
+            if accumulator.full() {
+                return accumulator.finish().map(Some);
+            }
+            if self.pending_output.is_none() {
+                // Source/decoder errors are terminal, even when a prefix exists.
+                // No error here is converted into replay or a different decoder.
+                match self.next_chunk(output, pool, max_rows)? {
+                    Some(batch) => self.pending_output = Some((batch, 0)),
+                    None => return accumulator.finish().map(Some),
+                }
+            }
+        }
+    }
+
+    fn next_chunk(
+        &mut self,
+        output: &SchemaRef,
+        pool: &SharedMemoryPool,
+        max_rows: usize,
+    ) -> Result<Option<RecordBatch>> {
+        loop {
+            let Some(batch) = self.input.next(max_rows, VALUE_BYTES, pool)? else {
                 return Ok(None);
             };
             if self.predicate.is_some() || !self.runtime.as_slice().is_empty() {
@@ -155,39 +230,57 @@ impl Reader {
                             .ok_or_else(|| unsupported("predicate runtime type mismatch"))
                     })
                     .transpose()?;
-                let rows = batch.num_rows();
-                let mut bits = ReservedBufferBuilder::<u8>::with_capacity(pool, rows.div_ceil(8))?;
-                bits.extend_reserved(rows.div_ceil(8), std::iter::repeat(0))?;
-                for row in 0..rows {
-                    let mut keep = static_mask
-                        .as_ref()
-                        .is_none_or(|mask| mask.is_valid(row) && mask.value(row));
-                    for (column, payload) in self.runtime.as_slice() {
-                        if !keep {
-                            break;
+                let mask = if self.runtime.as_slice().is_empty() {
+                    // The gather already implements WHERE's valid-and-true rule.
+                    // A static-only nullable bitmap needs no normalization copy.
+                    static_mask.expect("a predicate or runtime filter exists")
+                } else {
+                    let rows = batch.num_rows();
+                    let mut bits =
+                        ReservedBufferBuilder::<u8>::with_capacity(pool, rows.div_ceil(8))?;
+                    bits.extend_reserved(rows.div_ceil(8), std::iter::repeat(0))?;
+                    for row in 0..rows {
+                        let mut keep = static_mask
+                            .as_ref()
+                            .is_none_or(|mask| mask.is_valid(row) && mask.value(row));
+                        for (column, payload) in self.runtime.as_slice() {
+                            if !keep {
+                                break;
+                            }
+                            let array = batch.column(*column);
+                            if array.is_null(row) {
+                                keep = false;
+                                continue;
+                            }
+                            let value = if let Some(values) =
+                                array.as_any().downcast_ref::<Int64Array>()
+                            {
+                                values.value(row)
+                            } else if let Some(values) = array.as_any().downcast_ref::<Int32Array>()
+                            {
+                                i64::from(values.value(row))
+                            } else {
+                                return Err(unsupported("runtime key type changed"));
+                            };
+                            keep = payload.contains(value);
                         }
-                        let array = batch.column(*column);
-                        if array.is_null(row) {
-                            keep = false;
-                            continue;
+                        if keep {
+                            bits.as_mut_slice()[row / 8] |= 1 << (row % 8);
                         }
-                        let value = if let Some(values) =
-                            array.as_any().downcast_ref::<Int64Array>()
-                        {
-                            values.value(row)
-                        } else if let Some(values) = array.as_any().downcast_ref::<Int32Array>() {
-                            i64::from(values.value(row))
-                        } else {
-                            return Err(unsupported("runtime key type changed"));
-                        };
-                        keep = payload.contains(value);
                     }
-                    if keep {
-                        bits.as_mut_slice()[row / 8] |= 1 << (row % 8);
-                    }
+                    BooleanArray::new(BooleanBuffer::new(bits.finish(), 0, rows), None)
+                };
+                let filtered = admitted_gather::filter_projected(
+                    &batch,
+                    &mask,
+                    output.clone(),
+                    self.output_positions.as_slice(),
+                    pool,
+                )?;
+                if filtered.num_rows() == 0 {
+                    continue;
                 }
-                let mask = BooleanArray::new(BooleanBuffer::new(bits.finish(), 0, rows), None);
-                batch = admitted_gather::filter(&batch, &mask, pool)?;
+                return Ok(Some(filtered));
             }
             if batch.num_rows() == 0 {
                 continue;
@@ -854,3 +947,7 @@ mod tests {
 #[cfg(test)]
 #[path = "admitted_quantum_tests.rs"]
 mod quantum_tests;
+
+#[cfg(test)]
+#[path = "admitted_filter_quantum_tests.rs"]
+mod filter_quantum_tests;

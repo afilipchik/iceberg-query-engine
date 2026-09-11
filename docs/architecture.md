@@ -1735,3 +1735,25 @@ projection. Equal reported row targets therefore do not prove equal downstream
 batching or decoding work. Runtime generic-rawQ6 traces remain458versus7323producer
 batches across the earlier/current routes. See
 [planned quantum and next-cycle sequence](admitted-planned-quantum-2026-09-11.md).
+
+
+`storage/admitted_gather.rs::filter_projected` now builds admitted survivor buffers
+for only final output positions after evaluating the full input predicate. It
+validates position/type correspondence and preserves repeated output columns,
+SQL NULL-mask semantics and zero-column row counts. The admitted scanner reuses
+static-only predicate masks and returns the projected survivor handoff directly.
+This removes redundant intermediate copies; the bounded accumulator described
+below combines these filtered input quanta into larger output batches. See the
+[component status](admitted-filter-batching-2026-09-11.md).
+
+
+`storage/admitted_coalesce.rs::BatchAccumulator` constructs flat output across
+filtered input quanta using reserved typed column buffers and bounded UTF8 bytes.
+It reserves construction and final handoff metadata up front and transfers the
+latter through `admitted_batch::finish_reserved`. Append validates the input shape,
+computes a common row/byte prefix across columns, then advances only that prefix.
+The reader keeps one pending output batch and offset, without accumulating a list
+of batch owners. Whole unconsumed chunks may bypass optional packing allocation;
+partly consumed chunks cannot. Decoder errors remain terminal after any buffered
+prefix. Full first-batch page working-space coordination is still separate and open.
+See [candidate contracts and validation](admitted-filter-batching-2026-09-11.md).

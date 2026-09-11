@@ -1,0 +1,64 @@
+{
+  "canonical_decoded_ipc": {
+    "case_exit_code": 0,
+    "completed_outputs": 88,
+    "completed_warmups": 22,
+    "outputs_valid": true,
+    "engine_statuses": {
+      "completed": 66
+    },
+    "valid_pairs": 66,
+    "requested_pairs": 66,
+    "execution_absent": false
+  },
+  "canonical_gpu_control": {
+    "case_exit_code": 1,
+    "completed_outputs": 84,
+    "completed_warmups": 21,
+    "outputs_valid": true,
+    "engine_statuses": {
+      "completed": 63,
+      "not_run": 3
+    },
+    "valid_pairs": 63,
+    "requested_pairs": 66,
+    "execution_absent": false
+  },
+  "canonical_gpu_mixed": {
+    "case_exit_code": 2,
+    "completed_outputs": 0,
+    "completed_warmups": 0,
+    "outputs_valid": true,
+    "engine_statuses": {},
+    "valid_pairs": 0,
+    "requested_pairs": 0,
+    "execution_absent": true,
+    "reported_successful_device_requests": 0,
+    "resident_evidence_present_requests": 0
+  },
+  "smoke_gpu_control": {
+    "case_exit_code": 0,
+    "completed_outputs": 42,
+    "completed_warmups": 2,
+    "outputs_valid": true,
+    "engine_statuses": {
+      "completed": 40
+    },
+    "valid_pairs": 40,
+    "requested_pairs": 40,
+    "execution_absent": false
+  },
+  "smoke_gpu_required": {
+    "case_exit_code": 0,
+    "completed_outputs": 42,
+    "completed_warmups": 2,
+    "outputs_valid": true,
+    "engine_statuses": {
+      "completed": 40
+    },
+    "valid_pairs": 40,
+    "requested_pairs": 40,
+    "execution_absent": false,
+    "required_device_measured_valid": true
+  }
+}

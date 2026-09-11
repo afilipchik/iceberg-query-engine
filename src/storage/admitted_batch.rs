@@ -87,6 +87,24 @@ pub(crate) fn finish(
             .checked_mul(4096)
             .ok_or_else(|| invalid("metadata extent overflow"))?,
     )?;
+    finish_reserved(schema, rows, arrays, metadata)
+}
+
+/// A constructor may reserve final handoff storage before consuming input rows.
+pub(crate) fn finish_reserved(
+    schema: SchemaRef,
+    rows: usize,
+    arrays: ReservedVec<ArrayRef>,
+    metadata: MemoryReservation,
+) -> Result<RecordBatch> {
+    let required = arrays
+        .as_slice()
+        .len()
+        .checked_mul(4096)
+        .ok_or_else(|| invalid("metadata extent overflow"))?;
+    if metadata.size() < required || arrays.as_slice().iter().any(|a| a.len() != rows) {
+        return Err(invalid("invalid reserved handoff extent"));
+    }
     let (mut values, vector) = arrays.into_parts();
     let owner = Arc::new(Handoff {
         _vector: vector,

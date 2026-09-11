@@ -1,0 +1,104 @@
+[
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/admitted_coalesce_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/admitted-coalesce-residency-32g-01/smoke_gpu_control/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 31.513196,
+      "status": "ready",
+      "threads": 4,
+      "track": "gpu_control"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/admitted-coalesce-residency-32g-01/smoke_gpu_control/s1-q01-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/admitted-coalesce-residency-32g-01/smoke_gpu_control/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 15.673051122575998,
+      "version": "1.4.4",
+      "threads": 4,
+      "track": "gpu_control",
+      "reference": {
+        "reader": "decoded_ipc"
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/admitted-coalesce-residency-32g-01/smoke_gpu_control/s1-q01-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/admitted_coalesce_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/admitted-coalesce-residency-32g-01/smoke_gpu_control/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 34.227388999999995,
+      "status": "ready",
+      "threads": 4,
+      "track": "gpu_control"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/admitted-coalesce-residency-32g-01/smoke_gpu_control/s1-q06-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/admitted-coalesce-residency-32g-01/smoke_gpu_control/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 11.059483978897333,
+      "version": "1.4.4",
+      "threads": 4,
+      "track": "gpu_control",
+      "reference": {
+        "reader": "decoded_ipc"
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/admitted-coalesce-residency-32g-01/smoke_gpu_control/s1-q06-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  }
+]

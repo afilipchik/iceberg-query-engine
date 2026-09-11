@@ -158,11 +158,7 @@ pub(crate) fn take(
     super::admitted_batch::finish(batch.schema(), ids.len(), columns, pool)
 }
 /// SQL WHERE keeps only valid true mask rows. NULL mask rows are discarded.
-pub(crate) fn filter(
-    batch: &RecordBatch,
-    mask: &BooleanArray,
-    pool: &MemoryPool,
-) -> Result<RecordBatch> {
+fn selection(batch: &RecordBatch, mask: &BooleanArray, pool: &MemoryPool) -> Result<UInt32Array> {
     if mask.len() != batch.num_rows() || batch.num_rows() > u32::MAX as usize {
         return Err(invalid("mask length or row domain differs"));
     }
@@ -176,11 +172,46 @@ pub(crate) fn filter(
             .filter(|i| mask.is_valid(*i) && mask.value(*i))
             .map(|i| i as u32),
     )?;
-    take(
-        batch,
-        &UInt32Array::new(ScalarBuffer::new(ids.finish(), 0, count), None),
-        pool,
-    )
+    Ok(UInt32Array::new(
+        ScalarBuffer::new(ids.finish(), 0, count),
+        None,
+    ))
+}
+
+pub(crate) fn filter(
+    batch: &RecordBatch,
+    mask: &BooleanArray,
+    pool: &MemoryPool,
+) -> Result<RecordBatch> {
+    take(batch, &selection(batch, mask, pool)?, pool)
+}
+
+/// Evaluate masks against the complete input, then copy only final output columns.
+/// Repeated/reordered positions are intentional; no unreserved projection batch is
+/// constructed, and predicate-only payloads never enter the output allocation.
+pub(crate) fn filter_projected(
+    batch: &RecordBatch,
+    mask: &BooleanArray,
+    schema: SchemaRef,
+    positions: &[usize],
+    pool: &MemoryPool,
+) -> Result<RecordBatch> {
+    if schema.fields().len() != positions.len()
+        || positions.iter().zip(schema.fields()).any(|(&p, f)| {
+            batch
+                .columns()
+                .get(p)
+                .is_none_or(|a| a.data_type() != f.data_type())
+        })
+    {
+        return Err(invalid("projection schema or position differs"));
+    }
+    let ids = selection(batch, mask, pool)?;
+    let mut columns = ReservedVec::with_capacity(pool, positions.len())?;
+    for &position in positions {
+        columns.extend_reserved(1, [column(batch.column(position), &ids, pool)?])?;
+    }
+    super::admitted_batch::finish(schema, ids.len(), columns, pool)
 }
 
 #[cfg(test)]
@@ -281,6 +312,105 @@ mod tests {
         drop(filtered);
         assert_eq!(pool.used(), 0);
     }
+    #[test]
+    fn projected_filter_preserves_typed_values_and_does_not_copy_unused_payloads() {
+        let pool = MemoryPool::new(131072);
+        let batch = fixture();
+        let positions = [5, 1, 4, 1];
+        let schema = Arc::new(batch.schema().project(&positions).unwrap());
+        let mask = BooleanArray::from(vec![Some(true), Some(true), None, Some(false)]);
+        let output = filter_projected(&batch, &mask, schema.clone(), &positions, &pool).unwrap();
+        assert_eq!(output.schema(), schema);
+        for (column, &position) in output.columns().iter().zip(&positions) {
+            let expected = arrow::compute::filter(batch.column(position).as_ref(), &mask).unwrap();
+            assert_eq!(column.to_data(), expected.to_data());
+        }
+        let held = output.column(0).slice(1, 1);
+        drop(output);
+        assert!(pool.used() > 0);
+        drop(held);
+        assert_eq!(pool.used(), 0);
+
+        let large = "x".repeat(1 << 20);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("unused", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![large.as_str(); 3])),
+                Arc::new(Int64Array::from(vec![Some(7), None, Some(9)])),
+            ],
+        )
+        .unwrap();
+        let mask = BooleanArray::from(vec![Some(true), Some(true), None]);
+        let small = MemoryPool::new(32768);
+        assert!(filter(&batch, &mask, &small).unwrap_err().is_memory_limit());
+        assert_eq!(small.used(), 0);
+        let output = filter_projected(
+            &batch,
+            &mask,
+            Arc::new(schema.project(&[1, 1]).unwrap()),
+            &[1, 1],
+            &small,
+        )
+        .unwrap();
+        for column in output.columns() {
+            assert_eq!(
+                column.as_any().downcast_ref::<Int64Array>().unwrap(),
+                &Int64Array::from(vec![Some(7), None])
+            );
+        }
+        drop(batch);
+        assert!(small.used() > 0);
+        drop(output);
+        assert_eq!(small.used(), 0);
+    }
+
+    #[test]
+    fn projected_filter_validates_shape_and_supports_zero_column_results() {
+        let batch = fixture();
+        let pool = MemoryPool::new(131072);
+        let mask = BooleanArray::from(vec![Some(true), None, Some(false), Some(true)]);
+        let empty = filter_projected(&batch, &mask, Arc::new(Schema::empty()), &[], &pool).unwrap();
+        assert_eq!(empty.num_rows(), 2);
+        assert_eq!(empty.num_columns(), 0);
+        drop(empty);
+        assert_eq!(pool.used(), 0);
+        for positions in [vec![99], vec![0, 0]] {
+            assert!(filter_projected(
+                &batch,
+                &mask,
+                Arc::new(batch.schema().project(&[0]).unwrap()),
+                &positions,
+                &pool
+            )
+            .is_err());
+            assert_eq!(pool.used(), 0);
+        }
+        let wrong_type = Arc::new(Schema::new(vec![Field::new(
+            "wrong",
+            DataType::Boolean,
+            true,
+        )]));
+        assert!(filter_projected(&batch, &mask, wrong_type, &[0], &pool).is_err());
+        assert_eq!(pool.used(), 0);
+        let none = BooleanArray::from(vec![None, Some(false), None, Some(false)]);
+        let empty = filter_projected(
+            &batch,
+            &none,
+            Arc::new(batch.schema().project(&[4]).unwrap()),
+            &[4],
+            &pool,
+        )
+        .unwrap();
+        assert_eq!(empty.num_rows(), 0);
+        assert_eq!(empty.schema().field(0).data_type(), &DataType::Utf8);
+        drop(empty);
+        assert_eq!(pool.used(), 0);
+    }
+
     #[test]
     fn denial_after_partial_columns_releases_all_output_and_retry_is_exact() {
         let batch = fixture();

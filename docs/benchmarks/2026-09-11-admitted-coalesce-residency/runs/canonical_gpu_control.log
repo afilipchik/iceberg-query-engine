@@ -1,0 +1,23 @@
+{"session": "s1", "query": "q08", "engine": "completed", "correct": true}
+{"session": "s1", "query": "q20", "engine": "completed", "correct": true}
+{"session": "s1", "query": "q06", "engine": "completed", "correct": true}
+{"session": "s1", "query": "q07", "engine": "completed", "correct": true}
+{"session": "s1", "query": "q21", "engine": "completed", "correct": true}
+{"session": "s1", "query": "q10", "engine": "completed", "correct": true}
+{"session": "s1", "query": "q15", "engine": "completed", "correct": true}
+{"session": "s1", "query": "q14", "engine": "completed", "correct": true}
+{"session": "s1", "query": "q05", "engine": "completed", "correct": true}
+{"session": "s1", "query": "q01", "engine": "not_run", "correct": false}
+{"session": "s1", "query": "q04", "engine": "completed", "correct": true}
+{"session": "s1", "query": "q18", "engine": "completed", "correct": true}
+{"session": "s1", "query": "q12", "engine": "completed", "correct": true}
+{"session": "s1", "query": "q13", "engine": "completed", "correct": true}
+{"session": "s1", "query": "q02", "engine": "completed", "correct": true}
+{"session": "s1", "query": "q16", "engine": "completed", "correct": true}
+{"session": "s1", "query": "q11", "engine": "completed", "correct": true}
+{"session": "s1", "query": "q17", "engine": "completed", "correct": true}
+{"session": "s1", "query": "q22", "engine": "completed", "correct": true}
+{"session": "s1", "query": "q03", "engine": "completed", "correct": true}
+{"session": "s1", "query": "q09", "engine": "completed", "correct": true}
+{"session": "s1", "query": "q19", "engine": "completed", "correct": true}
+{"complete": false, "latency_leadership": false, "issues": 3}

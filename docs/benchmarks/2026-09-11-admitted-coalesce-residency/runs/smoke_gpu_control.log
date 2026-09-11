@@ -1,0 +1,3 @@
+{"session": "s1", "query": "q01", "engine": "completed", "correct": true}
+{"session": "s1", "query": "q06", "engine": "completed", "correct": true}
+{"complete": true, "latency_leadership": false, "issues": 0}

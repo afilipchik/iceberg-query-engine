@@ -1,6 +1,13 @@
 # Project documentation
 
-- [Active aggregate batch-view candidate](aggregate-batch-views-2026-09-11.md)
+- [Current bounded-output checkpoint and SF10 results](admitted-coalesce-checkpoint-2026-09-11.md)
+- [Bounded output implementation and tests](admitted-filter-batching-2026-09-11.md)
+- [Current provider screen](admitted-coalesce-providers-screen-2026-09-11.md)
+- [Current IPC/GPU screen](admitted-coalesce-residency-screen-2026-09-11.md)
+- [First-batch working-space investigation](first-batch-refusal-ledger-2026-09-11.md)
+- [Native admission follow-up](native-admission-follow-up-2026-09-11.md)
+
+- [Earlier aggregate batch-view candidate](aggregate-batch-views-2026-09-11.md)
 
 - [Current decoder rollback and validation](decoder-rollback-2026-09-11.md)
 - [Latest aggregate comparison](batch-views-measurement-2026-09-11.md)
@@ -9,8 +16,8 @@
 - [Native Anti/membership test repair](native-anti-test-contract-2026-09-11.md)
 - [Current repeated-validity decoder candidate](repeated-validity-decoding-2026-09-11.md)
 - [Current feature/resource validation](batch-views-validation-2026-09-11.md)
-- [Latest canonical provider screen](right-semi-provider-screen-2026-09-11.md)
-- [Latest IPC/GPU residency screen](right-semi-residency-2026-09-11.md)
+- [Earlier canonical provider screen](right-semi-provider-screen-2026-09-11.md)
+- [Earlier IPC/GPU residency screen](right-semi-residency-2026-09-11.md)
 - [Same-source aggregate route control](aggregate-route-control-2026-09-11.md)
 - [Current generic aggregate profile](generic-aggregate-profile-2026-09-11.md)
 - [Correlated aggregate multiplicity repair](correlated-reduction-proof-audit-2026-09-11.md)
