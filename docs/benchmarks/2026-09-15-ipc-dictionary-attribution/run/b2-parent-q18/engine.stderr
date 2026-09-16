@@ -1,0 +1,33 @@
+[mem-cap] process hard-capped at 12.0G anonymous memory (RLIMIT_DATA; the engine aborts if exceeded, the terminal survives; size with QE_MEM_CAP)
+[aggregate-frontier] {"admitted_buffers":false,"copy_bound":null,"envelope_bytes":null,"operator":"NativeStreamingScanExec","partitions":8,"slots":1}
+live_aggregate_routing key_preparation_ms=721.200 row_dispatch_ms=378.697 prepared_batches=7323 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=1100.190 processing_wall_ms=1520.601 serial_batches=0 parallel_batches=7323
+live_aggregate_profile input_rows=59986052 input_batches=916 evaluation_ms=5.992 ingestion_ms=2627.450 finish_ms=1032.578 output_ms=1032.370 output_rows=624 output_batches=613 spilled_bytes=0
+[aggregate-frontier] {"admitted_buffers":false,"copy_bound":null,"envelope_bytes":null,"operator":"SpillableHashJoin","partitions":8,"slots":1}
+live_aggregate_routing key_preparation_ms=1.287 row_dispatch_ms=0.366 prepared_batches=469 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=1.669 processing_wall_ms=0.648 serial_batches=469 parallel_batches=0
+live_aggregate_profile input_rows=4368 input_batches=469 evaluation_ms=0.996 ingestion_ms=2.487 finish_ms=0.246 output_ms=0.169 output_rows=624 output_batches=4 spilled_bytes=0
+[aggregate-frontier] {"admitted_buffers":false,"copy_bound":null,"envelope_bytes":null,"operator":"NativeStreamingScanExec","partitions":8,"slots":1}
+live_aggregate_routing key_preparation_ms=728.957 row_dispatch_ms=368.594 prepared_batches=7323 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=1097.847 processing_wall_ms=1558.526 serial_batches=0 parallel_batches=7323
+live_aggregate_profile input_rows=59986052 input_batches=916 evaluation_ms=6.213 ingestion_ms=2662.927 finish_ms=1038.165 output_ms=1037.959 output_rows=624 output_batches=617 spilled_bytes=0
+[aggregate-frontier] {"admitted_buffers":false,"copy_bound":null,"envelope_bytes":null,"operator":"SpillableHashJoin","partitions":8,"slots":1}
+live_aggregate_routing key_preparation_ms=1.288 row_dispatch_ms=0.345 prepared_batches=469 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=1.648 processing_wall_ms=0.672 serial_batches=469 parallel_batches=0
+live_aggregate_profile input_rows=4368 input_batches=469 evaluation_ms=0.959 ingestion_ms=2.484 finish_ms=0.245 output_ms=0.166 output_rows=624 output_batches=4 spilled_bytes=0
+[aggregate-frontier] {"admitted_buffers":false,"copy_bound":null,"envelope_bytes":null,"operator":"NativeStreamingScanExec","partitions":8,"slots":1}
+live_aggregate_routing key_preparation_ms=733.340 row_dispatch_ms=363.809 prepared_batches=7323 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=1097.443 processing_wall_ms=1589.705 serial_batches=0 parallel_batches=7323
+live_aggregate_profile input_rows=59986052 input_batches=916 evaluation_ms=6.333 ingestion_ms=2693.741 finish_ms=1003.625 output_ms=1003.424 output_rows=624 output_batches=612 spilled_bytes=0
+[aggregate-frontier] {"admitted_buffers":false,"copy_bound":null,"envelope_bytes":null,"operator":"SpillableHashJoin","partitions":8,"slots":1}
+live_aggregate_routing key_preparation_ms=1.345 row_dispatch_ms=0.367 prepared_batches=469 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=1.728 processing_wall_ms=0.700 serial_batches=469 parallel_batches=0
+live_aggregate_profile input_rows=4368 input_batches=469 evaluation_ms=1.086 ingestion_ms=2.594 finish_ms=0.233 output_ms=0.163 output_rows=624 output_batches=4 spilled_bytes=0
+[aggregate-frontier] {"admitted_buffers":false,"copy_bound":null,"envelope_bytes":null,"operator":"NativeStreamingScanExec","partitions":8,"slots":1}
+live_aggregate_routing key_preparation_ms=784.555 row_dispatch_ms=371.696 prepared_batches=7323 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=1156.552 processing_wall_ms=1629.212 serial_batches=0 parallel_batches=7323
+live_aggregate_profile input_rows=59986052 input_batches=916 evaluation_ms=6.905 ingestion_ms=2792.602 finish_ms=1018.065 output_ms=1017.854 output_rows=624 output_batches=616 spilled_bytes=0
+[aggregate-frontier] {"admitted_buffers":false,"copy_bound":null,"envelope_bytes":null,"operator":"SpillableHashJoin","partitions":8,"slots":1}
+live_aggregate_routing key_preparation_ms=1.216 row_dispatch_ms=0.334 prepared_batches=469 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=1.565 processing_wall_ms=0.633 serial_batches=469 parallel_batches=0
+live_aggregate_profile input_rows=4368 input_batches=469 evaluation_ms=0.926 ingestion_ms=2.361 finish_ms=0.231 output_ms=0.156 output_rows=624 output_batches=4 spilled_bytes=0

@@ -1,0 +1,693 @@
+{
+  "raw_parquet": {
+    "typed_engine_outputs": 88,
+    "valid_pairs": 66,
+    "planned_pairs": 66,
+    "complete": true,
+    "per_query": [
+      {
+        "query": "q01",
+        "engine_median_ms": 716.8413919999999,
+        "duckdb_median_ms": 205.92139195650816,
+        "ratio": 3.4811409596114284
+      },
+      {
+        "query": "q02",
+        "engine_median_ms": 79.616091,
+        "duckdb_median_ms": 67.89586367085576,
+        "ratio": 1.1726206383640883
+      },
+      {
+        "query": "q03",
+        "engine_median_ms": 435.805881,
+        "duckdb_median_ms": 196.2434840388596,
+        "ratio": 2.220740643361707
+      },
+      {
+        "query": "q04",
+        "engine_median_ms": 210.00388,
+        "duckdb_median_ms": 130.00603765249252,
+        "ratio": 1.615339439552358
+      },
+      {
+        "query": "q05",
+        "engine_median_ms": 443.91001600000004,
+        "duckdb_median_ms": 266.8289649300277,
+        "ratio": 1.6636500318337233
+      },
+      {
+        "query": "q06",
+        "engine_median_ms": 182.972735,
+        "duckdb_median_ms": 88.45146419480443,
+        "ratio": 2.0686230201573945
+      },
+      {
+        "query": "q07",
+        "engine_median_ms": 461.76202700000005,
+        "duckdb_median_ms": 233.92997728660703,
+        "ratio": 1.9739326800098693
+      },
+      {
+        "query": "q08",
+        "engine_median_ms": 449.521909,
+        "duckdb_median_ms": 344.2450403235853,
+        "ratio": 1.305819565555559
+      },
+      {
+        "query": "q09",
+        "engine_median_ms": 1263.314114,
+        "duckdb_median_ms": 511.07221841812134,
+        "ratio": 2.4718896243474737
+      },
+      {
+        "query": "q10",
+        "engine_median_ms": 874.1134940000001,
+        "duckdb_median_ms": 236.57942982390523,
+        "ratio": 3.6947992251508714
+      },
+      {
+        "query": "q11",
+        "engine_median_ms": 93.600139,
+        "duckdb_median_ms": 43.24513114988804,
+        "ratio": 2.164408720962853
+      },
+      {
+        "query": "q12",
+        "engine_median_ms": 549.459424,
+        "duckdb_median_ms": 113.26391715556383,
+        "ratio": 4.851142692207419
+      },
+      {
+        "query": "q13",
+        "engine_median_ms": 642.08158,
+        "duckdb_median_ms": 307.01000010594726,
+        "ratio": 2.091402820033294
+      },
+      {
+        "query": "q14",
+        "engine_median_ms": 337.66153199999997,
+        "duckdb_median_ms": 142.307223752141,
+        "ratio": 2.37276452380317
+      },
+      {
+        "query": "q15",
+        "engine_median_ms": 248.969272,
+        "duckdb_median_ms": 149.9362182803452,
+        "ratio": 1.660501210818099
+      },
+      {
+        "query": "q16",
+        "engine_median_ms": 546.0951120000001,
+        "duckdb_median_ms": 70.54037693887949,
+        "ratio": 7.741596170845109
+      },
+      {
+        "query": "q17",
+        "engine_median_ms": 1740.589334,
+        "duckdb_median_ms": 206.38653496280313,
+        "ratio": 8.433638048692009
+      },
+      {
+        "query": "q18",
+        "engine_median_ms": 1048.085581,
+        "duckdb_median_ms": 318.0933417752385,
+        "ratio": 3.294899463002802
+      },
+      {
+        "query": "q19",
+        "engine_median_ms": 665.629001,
+        "duckdb_median_ms": 195.47501811757684,
+        "ratio": 3.4051870536194495
+      },
+      {
+        "query": "q20",
+        "engine_median_ms": 256.199904,
+        "duckdb_median_ms": 169.87036913633347,
+        "ratio": 1.5082083196886489
+      },
+      {
+        "query": "q21",
+        "engine_median_ms": 881.064014,
+        "duckdb_median_ms": 705.2407218143344,
+        "ratio": 1.2493096140752262
+      },
+      {
+        "query": "q22",
+        "engine_median_ms": 104.16234800000001,
+        "duckdb_median_ms": 68.27632710337639,
+        "ratio": 1.5255997564469017
+      }
+    ],
+    "failures": [],
+    "geomean": 2.3924980468360957,
+    "suite_ratio": 2.5638068946178896,
+    "wins": 0
+  },
+  "native": {
+    "typed_engine_outputs": 80,
+    "valid_pairs": 60,
+    "planned_pairs": 66,
+    "complete": false,
+    "per_query": [
+      {
+        "query": "q02",
+        "engine_median_ms": 56.513085,
+        "duckdb_median_ms": 24.208934977650642,
+        "ratio": 2.3343895570859314
+      },
+      {
+        "query": "q03",
+        "engine_median_ms": 755.729616,
+        "duckdb_median_ms": 163.72758243232965,
+        "ratio": 4.615774598103231
+      },
+      {
+        "query": "q04",
+        "engine_median_ms": 220.229712,
+        "duckdb_median_ms": 125.83638215437531,
+        "ratio": 1.7501274927772759
+      },
+      {
+        "query": "q05",
+        "engine_median_ms": 1040.515023,
+        "duckdb_median_ms": 134.39853629097342,
+        "ratio": 7.742011570329012
+      },
+      {
+        "query": "q07",
+        "engine_median_ms": 765.1122660000001,
+        "duckdb_median_ms": 187.92214803397655,
+        "ratio": 4.071432101029767
+      },
+      {
+        "query": "q08",
+        "engine_median_ms": 940.716908,
+        "duckdb_median_ms": 193.63900600001216,
+        "ratio": 4.858096142054876
+      },
+      {
+        "query": "q09",
+        "engine_median_ms": 2530.703103,
+        "duckdb_median_ms": 608.5628350265324,
+        "ratio": 4.15849105029502
+      },
+      {
+        "query": "q10",
+        "engine_median_ms": 1645.374104,
+        "duckdb_median_ms": 248.85228322818875,
+        "ratio": 6.611850543043843
+      },
+      {
+        "query": "q11",
+        "engine_median_ms": 74.636072,
+        "duckdb_median_ms": 16.341962851583958,
+        "ratio": 4.567142434347526
+      },
+      {
+        "query": "q12",
+        "engine_median_ms": 879.605,
+        "duckdb_median_ms": 113.67282690480351,
+        "ratio": 7.738041042443982
+      },
+      {
+        "query": "q13",
+        "engine_median_ms": 1760.791413,
+        "duckdb_median_ms": 346.40445187687874,
+        "ratio": 5.0830507617893765
+      },
+      {
+        "query": "q14",
+        "engine_median_ms": 661.971928,
+        "duckdb_median_ms": 135.7784392312169,
+        "ratio": 4.875383247503155
+      },
+      {
+        "query": "q15",
+        "engine_median_ms": 375.097986,
+        "duckdb_median_ms": 131.16947980597615,
+        "ratio": 2.8596437719722534
+      },
+      {
+        "query": "q16",
+        "engine_median_ms": 432.507264,
+        "duckdb_median_ms": 59.6774872392416,
+        "ratio": 7.247410774286086
+      },
+      {
+        "query": "q17",
+        "engine_median_ms": 942.5159140000001,
+        "duckdb_median_ms": 230.53244780749083,
+        "ratio": 4.0884306003945285
+      },
+      {
+        "query": "q18",
+        "engine_median_ms": 4245.698494,
+        "duckdb_median_ms": 369.5093719288707,
+        "ratio": 11.490096913745623
+      },
+      {
+        "query": "q19",
+        "engine_median_ms": 1643.166254,
+        "duckdb_median_ms": 257.0799980312586,
+        "ratio": 6.3916534408881
+      },
+      {
+        "query": "q20",
+        "engine_median_ms": 180.85516700000002,
+        "duckdb_median_ms": 164.3779999576509,
+        "ratio": 1.100239490969559
+      },
+      {
+        "query": "q21",
+        "engine_median_ms": 1686.7150990000002,
+        "duckdb_median_ms": 635.3480177931488,
+        "ratio": 2.654789267870427
+      },
+      {
+        "query": "q22",
+        "engine_median_ms": 70.011916,
+        "duckdb_median_ms": 46.01383488625288,
+        "ratio": 1.5215405578142065
+      }
+    ],
+    "failures": [
+      {
+        "side": "engine",
+        "id": "s1-q06-warmup",
+        "result": {
+          "status": "timeout",
+          "error": "worker response deadline exceeded",
+          "phase": "query"
+        }
+      },
+      {
+        "side": "engine",
+        "id": "s1-q06-1-engine",
+        "result": {
+          "status": "not_run",
+          "executed": false,
+          "error": "engine warmup failed query-time gate; no measured retries"
+        }
+      },
+      {
+        "side": "engine",
+        "id": "s1-q06-2-engine",
+        "result": {
+          "status": "not_run",
+          "executed": false,
+          "error": "engine warmup failed query-time gate; no measured retries"
+        }
+      },
+      {
+        "side": "engine",
+        "id": "s1-q06-3-engine",
+        "result": {
+          "status": "not_run",
+          "executed": false,
+          "error": "engine warmup failed query-time gate; no measured retries"
+        }
+      },
+      {
+        "side": "engine",
+        "id": "s1-q01-warmup",
+        "result": {
+          "status": "timeout",
+          "error": "worker response deadline exceeded",
+          "phase": "query"
+        }
+      },
+      {
+        "side": "engine",
+        "id": "s1-q01-1-engine",
+        "result": {
+          "status": "not_run",
+          "executed": false,
+          "error": "engine warmup failed query-time gate; no measured retries"
+        }
+      },
+      {
+        "side": "engine",
+        "id": "s1-q01-2-engine",
+        "result": {
+          "status": "not_run",
+          "executed": false,
+          "error": "engine warmup failed query-time gate; no measured retries"
+        }
+      },
+      {
+        "side": "engine",
+        "id": "s1-q01-3-engine",
+        "result": {
+          "status": "not_run",
+          "executed": false,
+          "error": "engine warmup failed query-time gate; no measured retries"
+        }
+      }
+    ]
+  },
+  "iceberg": {
+    "typed_engine_outputs": 84,
+    "valid_pairs": 63,
+    "planned_pairs": 66,
+    "complete": false,
+    "per_query": [
+      {
+        "query": "q01",
+        "engine_median_ms": 628.296403,
+        "duckdb_median_ms": 1838.95133016631,
+        "ratio": 0.3416601585334934
+      },
+      {
+        "query": "q02",
+        "engine_median_ms": 74.230923,
+        "duckdb_median_ms": 327.37022126093507,
+        "ratio": 0.22674916097769685
+      },
+      {
+        "query": "q03",
+        "engine_median_ms": 428.28589900000003,
+        "duckdb_median_ms": 1509.680830873549,
+        "ratio": 0.283693009967001
+      },
+      {
+        "query": "q04",
+        "engine_median_ms": 227.386442,
+        "duckdb_median_ms": 990.4235899448395,
+        "ratio": 0.2295850425096034
+      },
+      {
+        "query": "q05",
+        "engine_median_ms": 441.786596,
+        "duckdb_median_ms": 1814.6934900432825,
+        "ratio": 0.24344970565219962
+      },
+      {
+        "query": "q06",
+        "engine_median_ms": 174.82447000000002,
+        "duckdb_median_ms": 784.8063670098782,
+        "ratio": 0.22276127889492459
+      },
+      {
+        "query": "q07",
+        "engine_median_ms": 468.01556,
+        "duckdb_median_ms": 1829.0088158100843,
+        "ratio": 0.2558848027163345
+      },
+      {
+        "query": "q08",
+        "engine_median_ms": 408.354555,
+        "duckdb_median_ms": 2419.1081458702683,
+        "ratio": 0.16880376170743513
+      },
+      {
+        "query": "q09",
+        "engine_median_ms": 1368.739927,
+        "duckdb_median_ms": 3362.1248938143253,
+        "ratio": 0.407105616307777
+      },
+      {
+        "query": "q10",
+        "engine_median_ms": 840.6326339999999,
+        "duckdb_median_ms": 1738.672501873225,
+        "ratio": 0.48349107327246066
+      },
+      {
+        "query": "q11",
+        "engine_median_ms": 95.2752,
+        "duckdb_median_ms": 295.51139287650585,
+        "ratio": 0.32240787427040246
+      },
+      {
+        "query": "q12",
+        "engine_median_ms": 558.4596710000001,
+        "duckdb_median_ms": 876.4126598834991,
+        "ratio": 0.6372108671664278
+      },
+      {
+        "query": "q13",
+        "engine_median_ms": 656.47473,
+        "duckdb_median_ms": 2170.3118910081685,
+        "ratio": 0.30247944211145145
+      },
+      {
+        "query": "q14",
+        "engine_median_ms": 356.969101,
+        "duckdb_median_ms": 1175.8299297653139,
+        "ratio": 0.30358905821630866
+      },
+      {
+        "query": "q15",
+        "engine_median_ms": 257.845971,
+        "duckdb_median_ms": 1108.720077201724,
+        "ratio": 0.2325618308011272
+      },
+      {
+        "query": "q16",
+        "engine_median_ms": 520.1667,
+        "duckdb_median_ms": 298.2979021035135,
+        "ratio": 1.74378262915002
+      },
+      {
+        "query": "q17",
+        "engine_median_ms": 1733.654074,
+        "duckdb_median_ms": 1738.0870999768376,
+        "ratio": 0.9974494799616793
+      },
+      {
+        "query": "q19",
+        "engine_median_ms": 669.45347,
+        "duckdb_median_ms": 1551.6382548958063,
+        "ratio": 0.43144944892129794
+      },
+      {
+        "query": "q20",
+        "engine_median_ms": 271.703473,
+        "duckdb_median_ms": 1342.8029417991638,
+        "ratio": 0.20234054047867678
+      },
+      {
+        "query": "q21",
+        "engine_median_ms": 867.52023,
+        "duckdb_median_ms": 4317.674294114113,
+        "ratio": 0.20092303654831267
+      },
+      {
+        "query": "q22",
+        "engine_median_ms": 101.11788,
+        "duckdb_median_ms": 446.9346380792558,
+        "ratio": 0.22624757936543857
+      }
+    ],
+    "failures": [
+      {
+        "side": "duckdb",
+        "id": "s1-q18-cal2",
+        "result": {
+          "id": "s1-q18-cal2",
+          "status": "refused",
+          "ms": 409.0413129888475,
+          "error_kind": "OutOfMemoryException",
+          "error": "Out of Memory Error: Failed to allocate block of 262144 bytes (bad allocation)\n\nPossible solutions:\n* Reducing the number of threads (SET threads=X)\n* Disabling insertion-order preservation (SET preserve_insertion_order=false)\n* Increasing the memory limit (SET memory_limit='...GB')\n\nSee also https://duckdb.org/docs/stable/guides/performance/how_to_tune_workloads"
+        }
+      },
+      {
+        "side": "engine",
+        "id": "s1-q18-1-engine",
+        "result": {
+          "status": "not_run",
+          "executed": false,
+          "error": "invalid reference calibration; no validated ceiling"
+        }
+      },
+      {
+        "side": "duckdb",
+        "id": "s1-q18-1-duckdb",
+        "result": {
+          "status": "not_run",
+          "executed": false,
+          "error": "invalid reference calibration; no validated ceiling"
+        }
+      },
+      {
+        "side": "duckdb",
+        "id": "s1-q18-2-duckdb",
+        "result": {
+          "status": "not_run",
+          "executed": false,
+          "error": "invalid reference calibration; no validated ceiling"
+        }
+      },
+      {
+        "side": "engine",
+        "id": "s1-q18-2-engine",
+        "result": {
+          "status": "not_run",
+          "executed": false,
+          "error": "invalid reference calibration; no validated ceiling"
+        }
+      },
+      {
+        "side": "engine",
+        "id": "s1-q18-3-engine",
+        "result": {
+          "status": "not_run",
+          "executed": false,
+          "error": "invalid reference calibration; no validated ceiling"
+        }
+      },
+      {
+        "side": "duckdb",
+        "id": "s1-q18-3-duckdb",
+        "result": {
+          "status": "not_run",
+          "executed": false,
+          "error": "invalid reference calibration; no validated ceiling"
+        }
+      }
+    ]
+  },
+  "lance": {
+    "typed_engine_outputs": 88,
+    "valid_pairs": 66,
+    "planned_pairs": 66,
+    "complete": true,
+    "per_query": [
+      {
+        "query": "q01",
+        "engine_median_ms": 5380.887527999999,
+        "duckdb_median_ms": 673.8774059340358,
+        "ratio": 7.984965040550301
+      },
+      {
+        "query": "q02",
+        "engine_median_ms": 77.729388,
+        "duckdb_median_ms": 75.73786424472928,
+        "ratio": 1.0262949553057843
+      },
+      {
+        "query": "q03",
+        "engine_median_ms": 670.712683,
+        "duckdb_median_ms": 382.6415869407356,
+        "ratio": 1.7528483727093718
+      },
+      {
+        "query": "q04",
+        "engine_median_ms": 220.820984,
+        "duckdb_median_ms": 155.04358196631074,
+        "ratio": 1.4242510473473322
+      },
+      {
+        "query": "q05",
+        "engine_median_ms": 685.372818,
+        "duckdb_median_ms": 330.70526784285903,
+        "ratio": 2.072458121004798
+      },
+      {
+        "query": "q06",
+        "engine_median_ms": 302.632275,
+        "duckdb_median_ms": 203.2933416776359,
+        "ratio": 1.4886482385630058
+      },
+      {
+        "query": "q07",
+        "engine_median_ms": 645.158877,
+        "duckdb_median_ms": 354.9662446603179,
+        "ratio": 1.8175217691963346
+      },
+      {
+        "query": "q08",
+        "engine_median_ms": 884.9319949999999,
+        "duckdb_median_ms": 461.6988552734256,
+        "ratio": 1.916686569378494
+      },
+      {
+        "query": "q09",
+        "engine_median_ms": 1661.946358,
+        "duckdb_median_ms": 671.9790119677782,
+        "ratio": 2.4732117051294025
+      },
+      {
+        "query": "q10",
+        "engine_median_ms": 1204.326548,
+        "duckdb_median_ms": 531.6128549166024,
+        "ratio": 2.2654202900886036
+      },
+      {
+        "query": "q11",
+        "engine_median_ms": 104.88738000000001,
+        "duckdb_median_ms": 66.31373288109899,
+        "ratio": 1.5816841466014868
+      },
+      {
+        "query": "q12",
+        "engine_median_ms": 337.90087800000003,
+        "duckdb_median_ms": 249.22978971153498,
+        "ratio": 1.3557804562251377
+      },
+      {
+        "query": "q13",
+        "engine_median_ms": 1775.575318,
+        "duckdb_median_ms": 302.55851335823536,
+        "ratio": 5.868535306748031
+      },
+      {
+        "query": "q14",
+        "engine_median_ms": 308.673805,
+        "duckdb_median_ms": 300.1985140144825,
+        "ratio": 1.0282322882687842
+      },
+      {
+        "query": "q15",
+        "engine_median_ms": 463.46443700000003,
+        "duckdb_median_ms": 177.08931304514408,
+        "ratio": 2.6171225639226035
+      },
+      {
+        "query": "q16",
+        "engine_median_ms": 474.087363,
+        "duckdb_median_ms": 106.00468283519149,
+        "ratio": 4.472324715475798
+      },
+      {
+        "query": "q17",
+        "engine_median_ms": 1117.390398,
+        "duckdb_median_ms": 487.719695083797,
+        "ratio": 2.2910503907536826
+      },
+      {
+        "query": "q18",
+        "engine_median_ms": 4117.424416000001,
+        "duckdb_median_ms": 489.52866811305285,
+        "ratio": 8.410997525172752
+      },
+      {
+        "query": "q19",
+        "engine_median_ms": 474.49248900000003,
+        "duckdb_median_ms": 419.8167407885194,
+        "ratio": 1.1302371794626058
+      },
+      {
+        "query": "q20",
+        "engine_median_ms": 262.087064,
+        "duckdb_median_ms": 223.9042199216783,
+        "ratio": 1.1705320430837707
+      },
+      {
+        "query": "q21",
+        "engine_median_ms": 964.846879,
+        "duckdb_median_ms": 697.0358761027455,
+        "ratio": 1.3842140872212123
+      },
+      {
+        "query": "q22",
+        "engine_median_ms": 72.949523,
+        "duckdb_median_ms": 120.27084222063422,
+        "ratio": 0.6065437112860297
+      }
+    ],
+    "failures": [],
+    "geomean": 1.9955510755429657,
+    "suite_ratio": 2.9685371906270697,
+    "wins": 1
+  }
+}

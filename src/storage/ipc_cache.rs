@@ -1,15 +1,15 @@
 //! Arrow IPC sidecar cache: the engine's owned storage format.
 //!
-//! Parquet decode is the largest residual cost against DuckDB's native
-//! tables (whose 2.94s prices in a decode-free format). Each parquet row
-//! group gets a sidecar Arrow IPC file (`<parquet>.qeipc/rg_NNNNN.arrow`),
-//! built once and read back with no decompression and no decode — a warm
-//! read is a page-cache memcpy. Row-group alignment keeps the parquet
+//! Each parquet row group gets a sidecar Arrow IPC file
+//! (`<parquet>.qeipc/rg_NNNNN.arrow`). Reads map the file and construct Arrow
+//! arrays through FileDecoder; dictionaries and alignment/compression handling
+//! can require decoding or allocation. Row-group alignment keeps the parquet
 //! footer's min/max statistics valid for pruning and the ALWAYS_TRUE
 //! zone-map proof.
 //!
-//! Memory safety: reads stream one row group at a time exactly like the
-//! parquet path; sidecar building is bounded by one row group per thread.
+//! Reads stream one row group at a time; sidecar building is bounded by one row
+//! group per thread. This alone does not establish query-pool admission for
+//! reader metadata, dictionaries, decode allocations or retained output.
 //!
 //! Default (QE_IPC_CACHE unset) is `Mode::Auto`: if a fresh sidecar already
 //! exists on disk, it is used silently — but the engine never BUILDS one on
@@ -29,6 +29,15 @@ use arrow::record_batch::RecordBatch;
 use rayon::prelude::*;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+
+mod dictionary_projection;
+
+#[cfg(test)]
+thread_local! {
+    static DICTIONARY_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+mod projection_tests;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Mode {
@@ -378,25 +387,6 @@ fn build_sidecar(parquet_path: &Path, dir: &Path, src_meta: &std::fs::Metadata) 
     Ok(())
 }
 
-/// Read one row group's batches from the sidecar, applying an optional
-/// projection (file-schema column indices).
-///
-/// # Zero-copy, and why it is the whole point
-///
-/// v0 read sidecars through `File` + `BufReader`, which copies and
-/// validates every buffer — for an UNCOMPRESSED format that is more memory
-/// traffic than the parquet decode it replaced, and the benchmark showed it:
-/// a net regression (Q06 97→558ms). This path instead mmaps the file and
-/// hands the arrays `Buffer`s that point INTO the mapping
-/// (`Buffer::from_custom_allocation` keeps the `Mmap` alive via its
-/// allocation handle). A warm read is then page-cache references, no
-/// allocation, no memcpy; alignment stays zero-copy because `FileWriter`
-/// pads buffers and an mmap base is page-aligned (misalignment would fall
-/// back to a copy inside `build_aligned`, not to an error).
-///
-/// Memory safety: the mapping is file-backed and read-only — reclaimable by
-/// the OS under pressure, never anonymous memory, so the engine's no-OOM
-/// guarantee is unaffected.
 /// Lowercased names of the DICTIONARY-typed columns a sidecar stores
 /// (from rg_00000's footer schema). Cached per directory. Read gates use
 /// it: a scan that wants dict coercion may take the IPC path only when
@@ -454,6 +444,7 @@ pub struct RowGroupReader {
     footer_start: usize,
     path: PathBuf,
     failed: bool,
+    output_projection: Option<Vec<usize>>,
 }
 
 impl Iterator for RowGroupReader {
@@ -469,6 +460,16 @@ impl Iterator for RowGroupReader {
                     self.decoder
                         .read_record_batch(&block, &data)
                         .map_err(|e| QueryError::Execution(format!("{}: {e}", self.path.display())))
+                })
+                .and_then(|batch| {
+                    batch
+                        .map(|batch| match &self.output_projection {
+                            Some(projection) => batch.project(projection).map_err(|e| {
+                                QueryError::Execution(format!("{}: {e}", self.path.display()))
+                            }),
+                            None => Ok(batch),
+                        })
+                        .transpose()
                 });
             match result {
                 Ok(Some(batch)) => return Some(Ok(batch)),
@@ -541,13 +542,74 @@ pub fn open_row_group(
             .schema()
             .ok_or_else(|| QueryError::Execution("IPC footer has no schema".into()))?,
     );
-    let mut decoder = FileDecoder::new(std::sync::Arc::new(schema), footer.version());
+    let schema = std::sync::Arc::new(schema);
+    if projection.is_some_and(|p| p.iter().any(|i| *i >= schema.fields().len())) {
+        return Err(QueryError::Execution(format!(
+            "{}: IPC projection index out of range",
+            path.display()
+        )));
+    }
+    let dictionaries = dictionary_projection::DictionaryProjection::bind(&schema, projection);
+    let mut decoder = FileDecoder::new(schema, footer.version());
+    let mut output_projection = None;
     if let Some(p) = projection {
-        decoder = decoder.with_projection(p.to_vec());
+        // Arrow decodes each source field once, but retains repeated fields in
+        // the projected schema. Decode a unique projection, then restore aliases
+        // by sharing arrays; do not decode unrequested columns as a workaround.
+        let mut unique = Vec::new();
+        unique.try_reserve_exact(p.len()).map_err(|e| {
+            QueryError::Execution(format!(
+                "{}: IPC projection allocation: {e}",
+                path.display()
+            ))
+        })?;
+        for &column in p {
+            if !unique.contains(&column) {
+                unique.push(column);
+            }
+        }
+        if unique.len() != p.len() {
+            let mut restore = Vec::new();
+            restore.try_reserve_exact(p.len()).map_err(|e| {
+                QueryError::Execution(format!(
+                    "{}: IPC projection allocation: {e}",
+                    path.display()
+                ))
+            })?;
+            for column in p {
+                restore.push(
+                    unique
+                        .iter()
+                        .position(|index| index == column)
+                        .ok_or_else(|| {
+                            QueryError::Execution(format!(
+                                "{}: invalid IPC projection map",
+                                path.display()
+                            ))
+                        })?,
+                );
+            }
+            output_projection = Some(restore);
+        }
+        decoder = decoder.with_projection(unique);
     }
 
     for block in footer.dictionaries().iter().flat_map(|d| d.iter()) {
         let data = checked_ipc_block(&buffer, block, footer_start, &path)?;
+        let id = checked_dictionary_id(&data, block, footer.version(), &path)?;
+        if let Some(projection) = &dictionaries {
+            let required = projection.required(id).ok_or_else(|| {
+                QueryError::Execution(format!(
+                    "{}: dictionary id {id} not found in schema",
+                    path.display()
+                ))
+            })?;
+            if !required {
+                continue;
+            }
+        }
+        #[cfg(test)]
+        DICTIONARY_DECODES.with(|count| count.set(count.get() + 1));
         decoder
             .read_dictionary(&block, &data)
             .map_err(|e| QueryError::Execution(format!("{}: {e}", path.display())))?;
@@ -567,7 +629,49 @@ pub fn open_row_group(
         footer_start,
         path,
         failed: false,
+        output_projection,
     })
+}
+
+/// Flatbuffer verification permits absent optional tables that FileDecoder
+/// subsequently assumes are present. Validate the dictionary envelope before
+/// delegating, including for projections that do not use dictionary values.
+fn checked_dictionary_id(
+    buffer: &arrow::buffer::Buffer,
+    block: &arrow::ipc::Block,
+    version: arrow::ipc::MetadataVersion,
+    path: &Path,
+) -> Result<i64> {
+    let invalid = |reason: &str| {
+        QueryError::Execution(format!(
+            "{}: invalid IPC dictionary message: {reason}",
+            path.display()
+        ))
+    };
+    let metadata =
+        usize::try_from(block.metaDataLength()).map_err(|_| invalid("invalid metadata length"))?;
+    let prefix = if buffer.as_slice().starts_with(&[255; 4]) {
+        8
+    } else {
+        4
+    };
+    let bytes = buffer
+        .as_slice()
+        .get(prefix..metadata)
+        .ok_or_else(|| invalid("invalid message extent"))?;
+    let message = arrow::ipc::root_as_message(bytes)
+        .map_err(|error| invalid(&format!("bad metadata: {error}")))?;
+    // Preserve the decoder's compatibility with legacy V1 footer metadata.
+    if version != arrow::ipc::MetadataVersion::V1 && message.version() != version {
+        return Err(invalid("metadata version mismatch"));
+    }
+    let dictionary = message
+        .header_as_dictionary_batch()
+        .ok_or_else(|| invalid("missing DictionaryBatch header"))?;
+    if dictionary.data().is_none() {
+        return Err(invalid("missing dictionary record batch"));
+    }
+    Ok(dictionary.id())
 }
 
 /// Validate descriptor extents and the framing prefix required by FileDecoder

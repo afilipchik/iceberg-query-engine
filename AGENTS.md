@@ -6,45 +6,54 @@ linked reports and the existing epic rather than prepending another status block
 
 ## Current checkpoint — 2026-09-15
 
-Frozen candidate `6d0b9317` binds decimal-to-float scale conversion once per
-aggregate batch view. Exact decimal SUM, dictionary fallback, row transactions,
-admission, ownership and dependencies are unchanged. Red5422 reproduces the
-missing binding; green61078 passes 11 state-row tests. Added tests cover all
-supported scales, NULLs, sliced/extreme values, exact SUM and dictionary fallback.
-The rejected process-wide cache and its timings remain in the evidence archive.
+Frozen IPC candidate `138199d2` on pushed/remote-verified parent `74a142f`
+validates dictionary envelopes before Arrow decoding, uses a bounded full-schema
+ID/dependency proof to skip unused dictionary payloads, and normalizes repeated
+projections before decoding then restores shared output aliases. The new
+`src/storage/ipc_cache/dictionary_projection.rs` follows first-definition IDs;
+cycles, more than64IDs or excessive depth decline pruning. Every skipped block's
+extent/envelope is still checked. No dependency, hash format, ownership default,
+query budget or native-admission capability changes.
 
-Cycle25275 was interrupted after default-mode validation. On September15 its
-handle was missing and no host build/benchmark process remained. Resume90400
-verified all 800 source inputs and preserved interrupted logs. Both modes pass
-1,135 library tests/11 ignored and 128 contracts; native/IPC is 63 default and
-62 partial plus the known numeric failure. Spill/numeric retains 28 passes and
-six failures per mode. Strict inventory/failure comparison passes; validation
-archive has 34 files. Release completes in 8m52s. Interrupted-scope final resource
-state is unavailable; the resumed provider/build scope peaks at 26.866 GB under
-48 GiB, zero OOM/max and no swap.
+Envelope red56444 reproduces4projection panics; green1639 passes4contracts.
+Unused-dictionary red75959/green35679 verifies actual decode calls. Domain38586
+exposes repeated-column schema mismatch;3247 passes3tests after normalization,
+and production-feature11041 passes5including shared/nonordinal IDs and deltas.
+Focused native/IPC15491 passes31tests. Broad cycle38590 is terminal1 with no new
+failures: both modes1,140library passes/11ignored and128contracts; native64default,
+63partial plus its known numeric failure; spill/numeric28passes plus the same6
+failures each. Strict executable/count/name/inventory comparison passes; archive33
+verifies802source inputs. Release completes0 in8m52s.
 
-Canonical SF10 validates 338 outputs/252 of 264 measured pairs: raw66/native57/
-Iceberg63/Lance66. Raw geometric mean/suite ratios are 2.432179/2.616286 (0 wins),
-Lance 1.986131/2.952229 (1 win). Native Q1/Q6 warmups time out; Q18 completes its
-warmup in 4.234s above its 4.155s ceiling, then measured requests are NOTRUN.
-Q12 completes. Iceberg DuckDB Q9 first measured request refuses 256 KiB; engine
-Q9 warmup is correct, measured requests NOTRUN. Preserve these exact phases.
+Canonical provider SF10 independently validates340outputs/255of264pairs:
+raw66/native60/Iceberg63/Lance66. Raw geomean2.392498/suite2.563807 (0wins), Lance
+1.995551/2.968537 (1win). NativeQ1/Q6 warmups timeout; Q18 completes this screen.
+IcebergDuckDBQ9 completes but Q18calibration2 refuses262144bytes; dependent samples
+are NOTRUN. No completed-but-late outputs. Validation/build/provider scopepeak
+35.167GB under48GiB,zeroOOM/max,no swap. Preserve all failures; archives1282SF10
+and173paired verify. No DuckDB leadership is certified.
 
-Postcheck86770 is terminal0: 80 paired typed outputs with identical plans. Q1
-candidate/parent ratios are 0.980169/0.991930, with lower ingestion time in both
-blocks. This is modest diagnostic support, not blanket regression freedom.
-Residency validates 348 outputs/278 pairs. Canonical decoded geometric mean/suite
-ratios are 0.655837/1.011982; GPU control 0.790456/1.247289; mixed 0.782244/1.238873.
-Canonical mixed records zero successful device executions. Custom required float
-smoke has 40/40 measured device proofs. Canonical 32/48 GiB capacity conditions do
-not clear 16 GiB preload. Postcheck scope peaks at 26.090 GB under 64 GiB with
-zero OOM/max and no swap. Decoded reference timing changed substantially; do not
-attribute its historical ratio change to the patch.
+Postcheck93724 is terminal0. Native paired comparison validates80outputs with identical
+plans. Q1 ratios0.966322/0.995801; Q6 0.537401/1.089459; Q12 1.636227/1.321530;
+Q18 1.000515/1.008473; Q9 1.016158/1.004052. Q6's apparent gain does not repeat;
+Q12 regresses in both blocks. Its aggregate input remains310803rows/229batches
+and aggregate timing is similar, so investigate upstream scan/join execution.
+**The optimization is provisional and has failed performance acceptance.**
+Decoded IPC completes at geomean0.803013/suite1.275933,14wins; engine suite time
+is close to the parent while reference timing changes. All5residency cases complete with348typed outputs/278pairs. GPU control
+geomean0.796917/suite1.288690 and mixed0.795504/1.276013 have14wins each.
+Canonical mixed records no successful device execution; custom required float
+smoke has40/40measured device proofs. Scopepeak20.542GB under64GiB,zeroOOM/max.
+These32/48GiB capacity screens do not clear16GiB preload or resource/concurrency
+acceptance. This intermediate checkpoint preserves failed performance acceptance.
+Next run the prepared Q12 phase/process-counter diagnostic and isolate pruning
+from the correctness fixes.
 
-See the [completed cycle and evidence](docs/decimal-scale-cache-2026-09-11.md).
-Next is the [native IPC dictionary contract/projection follow-up](docs/native-admission-follow-up-2026-09-11.md), starting with a prepared missing-table regression;
-it is not yet a reproduced failure or implemented reader change. Full provider,
-resource, concurrency and performance acceptance remain open.
+See [current cycle](docs/ipc-dictionary-projection-2026-09-15.md),
+[native admission](docs/native-admission-follow-up-2026-09-11.md) and the
+[previous decimal checkpoint](docs/decimal-scale-cache-2026-09-11.md).
+The decimal cycle's provider/residency results belong to its frozen `6d0b9317`
+binary and are not superseded by inferred historical speedups.
 
 Parent `8c89899` and residency checkpoint `d37e836` are pushed and remote-verified.
 Their UTF-8 binding, prior failures and residency results remain qualified in

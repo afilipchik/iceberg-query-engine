@@ -1,0 +1,1234 @@
+[
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/ipc_dictionary_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 5341.8077029999995,
+      "status": "ready",
+      "threads": 16,
+      "track": "gpu_control"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q08-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 45.28213199228048,
+      "version": "1.4.4",
+      "threads": 16,
+      "track": "gpu_control",
+      "reference": {
+        "reader": "decoded_ipc"
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": null,
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q08-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/ipc_dictionary_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 5365.095696,
+      "status": "ready",
+      "threads": 16,
+      "track": "gpu_control"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q20-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 45.603986363857985,
+      "version": "1.4.4",
+      "threads": 16,
+      "track": "gpu_control",
+      "reference": {
+        "reader": "decoded_ipc"
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": null,
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q20-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/ipc_dictionary_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 5364.019928000001,
+      "status": "ready",
+      "threads": 16,
+      "track": "gpu_control"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q06-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 33.2727050408721,
+      "version": "1.4.4",
+      "threads": 16,
+      "track": "gpu_control",
+      "reference": {
+        "reader": "decoded_ipc"
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": null,
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q06-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/ipc_dictionary_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 5350.562561000001,
+      "status": "ready",
+      "threads": 16,
+      "track": "gpu_control"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q07-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 30.63401998952031,
+      "version": "1.4.4",
+      "threads": 16,
+      "track": "gpu_control",
+      "reference": {
+        "reader": "decoded_ipc"
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": null,
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q07-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/ipc_dictionary_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 5427.015303,
+      "status": "ready",
+      "threads": 16,
+      "track": "gpu_control"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q21-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 43.819691985845566,
+      "version": "1.4.4",
+      "threads": 16,
+      "track": "gpu_control",
+      "reference": {
+        "reader": "decoded_ipc"
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": null,
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q21-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/ipc_dictionary_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 5378.917213000001,
+      "status": "ready",
+      "threads": 16,
+      "track": "gpu_control"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q10-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 39.00875523686409,
+      "version": "1.4.4",
+      "threads": 16,
+      "track": "gpu_control",
+      "reference": {
+        "reader": "decoded_ipc"
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": null,
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q10-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/ipc_dictionary_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 5364.28358,
+      "status": "ready",
+      "threads": 16,
+      "track": "gpu_control"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q15-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 52.72667435929179,
+      "version": "1.4.4",
+      "threads": 16,
+      "track": "gpu_control",
+      "reference": {
+        "reader": "decoded_ipc"
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": null,
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q15-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/ipc_dictionary_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 5438.571648,
+      "status": "ready",
+      "threads": 16,
+      "track": "gpu_control"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q14-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 45.10825825855136,
+      "version": "1.4.4",
+      "threads": 16,
+      "track": "gpu_control",
+      "reference": {
+        "reader": "decoded_ipc"
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": null,
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q14-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/ipc_dictionary_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 5384.378666,
+      "status": "ready",
+      "threads": 16,
+      "track": "gpu_control"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q05-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 37.516030948609114,
+      "version": "1.4.4",
+      "threads": 16,
+      "track": "gpu_control",
+      "reference": {
+        "reader": "decoded_ipc"
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": null,
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q05-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/ipc_dictionary_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 5380.8626779999995,
+      "status": "ready",
+      "threads": 16,
+      "track": "gpu_control"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q01-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 38.302557077258825,
+      "version": "1.4.4",
+      "threads": 16,
+      "track": "gpu_control",
+      "reference": {
+        "reader": "decoded_ipc"
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": null,
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q01-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/ipc_dictionary_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 5468.978969,
+      "status": "ready",
+      "threads": 16,
+      "track": "gpu_control"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q04-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 47.39441396668553,
+      "version": "1.4.4",
+      "threads": 16,
+      "track": "gpu_control",
+      "reference": {
+        "reader": "decoded_ipc"
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": null,
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q04-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/ipc_dictionary_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 5367.510232,
+      "status": "ready",
+      "threads": 16,
+      "track": "gpu_control"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q18-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 31.722066923975945,
+      "version": "1.4.4",
+      "threads": 16,
+      "track": "gpu_control",
+      "reference": {
+        "reader": "decoded_ipc"
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": null,
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q18-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/ipc_dictionary_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 5398.781676,
+      "status": "ready",
+      "threads": 16,
+      "track": "gpu_control"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q12-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 31.915432773530483,
+      "version": "1.4.4",
+      "threads": 16,
+      "track": "gpu_control",
+      "reference": {
+        "reader": "decoded_ipc"
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": null,
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q12-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/ipc_dictionary_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 5376.373482,
+      "status": "ready",
+      "threads": 16,
+      "track": "gpu_control"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q13-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 41.64090706035495,
+      "version": "1.4.4",
+      "threads": 16,
+      "track": "gpu_control",
+      "reference": {
+        "reader": "decoded_ipc"
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": null,
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q13-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/ipc_dictionary_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 5367.822763,
+      "status": "ready",
+      "threads": 16,
+      "track": "gpu_control"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q02-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 30.293939169496298,
+      "version": "1.4.4",
+      "threads": 16,
+      "track": "gpu_control",
+      "reference": {
+        "reader": "decoded_ipc"
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": null,
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q02-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/ipc_dictionary_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 5374.389716,
+      "status": "ready",
+      "threads": 16,
+      "track": "gpu_control"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q16-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 35.5342160910368,
+      "version": "1.4.4",
+      "threads": 16,
+      "track": "gpu_control",
+      "reference": {
+        "reader": "decoded_ipc"
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": null,
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q16-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/ipc_dictionary_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 5399.780921,
+      "status": "ready",
+      "threads": 16,
+      "track": "gpu_control"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q11-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 37.076173815876245,
+      "version": "1.4.4",
+      "threads": 16,
+      "track": "gpu_control",
+      "reference": {
+        "reader": "decoded_ipc"
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": null,
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q11-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/ipc_dictionary_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 5444.723496,
+      "status": "ready",
+      "threads": 16,
+      "track": "gpu_control"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q17-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 31.26912424340844,
+      "version": "1.4.4",
+      "threads": 16,
+      "track": "gpu_control",
+      "reference": {
+        "reader": "decoded_ipc"
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": null,
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q17-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/ipc_dictionary_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 5442.238976,
+      "status": "ready",
+      "threads": 16,
+      "track": "gpu_control"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q22-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 32.96235576272011,
+      "version": "1.4.4",
+      "threads": 16,
+      "track": "gpu_control",
+      "reference": {
+        "reader": "decoded_ipc"
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": null,
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q22-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/ipc_dictionary_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 5355.463302,
+      "status": "ready",
+      "threads": 16,
+      "track": "gpu_control"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q03-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 30.48567334190011,
+      "version": "1.4.4",
+      "threads": 16,
+      "track": "gpu_control",
+      "reference": {
+        "reader": "decoded_ipc"
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": null,
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q03-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/ipc_dictionary_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 5374.229324,
+      "status": "ready",
+      "threads": 16,
+      "track": "gpu_control"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q09-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 30.203063040971756,
+      "version": "1.4.4",
+      "threads": 16,
+      "track": "gpu_control",
+      "reference": {
+        "reader": "decoded_ipc"
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": null,
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q09-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/ipc_dictionary_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 5417.630323,
+      "status": "ready",
+      "threads": 16,
+      "track": "gpu_control"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q19-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 38.42429397627711,
+      "version": "1.4.4",
+      "threads": 16,
+      "track": "gpu_control",
+      "reference": {
+        "reader": "decoded_ipc"
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": null,
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_gpu_control/s1-q19-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  }
+]

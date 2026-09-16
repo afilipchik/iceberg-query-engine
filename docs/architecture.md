@@ -1426,6 +1426,20 @@ performance gates; this does not establish a batch-specialized update kernel.
 
 ## IPC extent validation (2026-09-08)
 
+The September15 dictionary-envelope candidate additionally validates the bounded
+message metadata, compatible version, DictionaryBatch header and required record
+batch before calling Arrow's dictionary decoder. An absent optional flatbuffer
+table previously reached an upstream unwrap for every projection, including an
+empty projection. The reader now returns a file-named execution error. This does
+not establish query-pool admission; retained mappings and ordinary decoder
+validation remain. `ipc_cache/dictionary_projection.rs` now binds a bounded
+64-ID schema dependency closure, following Arrow's first-definition rule.
+Only proven unused payloads are skipped; every envelope and extent is still
+checked. Cycles, excessive depth or more IDs retain ordinary decoding.
+The reader normalizes repeated source projections before Arrow decoding and
+restores repeated output columns through shared array references afterward.
+See the native IPC follow-up report for provisional validation.
+
 The shared mmap reader validates footer subtraction and signed dictionary/record
 block offsets, metadata/body lengths, checked extents and message framing before
 slicing. Blocks must fit before the footer. Both loops share checked_ipc_block;

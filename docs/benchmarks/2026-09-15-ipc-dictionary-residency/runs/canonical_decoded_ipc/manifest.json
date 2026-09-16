@@ -1,0 +1,1687 @@
+{
+  "version": 1,
+  "profile": "development",
+  "cache_state": "warm_host",
+  "gpu_residency_policy": "mixed",
+  "gpu_preparation_timeout_seconds": null,
+  "host_arrow_preloaded": false,
+  "tracks": [
+    "decoded_ipc"
+  ],
+  "sessions": [
+    "s1"
+  ],
+  "samples_per_query": 3,
+  "timing_boundary": "embedded_parse_to_arrow_consumed",
+  "source_revision": "74a142fab601061dde794c9ec568649c566f40bd",
+  "working_tree": " M .claude/epics/realistic-benchmarks-duckdb-leadership/005.md\n M AGENTS.md\n M docs/README.md\n M docs/architecture.md\n M docs/native-admission-follow-up-2026-09-11.md\n M src/storage/ipc_cache.rs\n M tests/ipc_extent_contract.rs\n?? docs/benchmarks/2026-09-05-canonical-sf1/\n?? docs/benchmarks/2026-09-05-public-extracts/\n?? docs/benchmarks/2026-09-05-sf10/\n?? docs/benchmarks/2026-09-05-systemic-correctness/\n?? docs/benchmarks/2026-09-06-admitted-construction/\n?? docs/benchmarks/2026-09-06-aggregate-input-trace/\n?? docs/benchmarks/2026-09-06-canonical-provider-sf10/\n?? docs/benchmarks/2026-09-06-canonical-sf10/\n?? docs/benchmarks/2026-09-06-cast-float-intermediate/\n?? docs/benchmarks/2026-09-06-coercion-memory/\n?? docs/benchmarks/2026-09-06-comparator-aligned/\n?? docs/benchmarks/2026-09-06-comparator-exact-bag/\n?? docs/benchmarks/2026-09-06-constant-cast-diagnostics/\n?? docs/benchmarks/2026-09-06-decimal-aggregation/\n?? docs/benchmarks/2026-09-06-decimal-root-reuse-draft/\n?? docs/benchmarks/2026-09-06-decimal-thread-scaling/\n?? docs/benchmarks/2026-09-06-dictionary-preservation/\n?? docs/benchmarks/2026-09-06-expression-substitution/\n?? docs/benchmarks/2026-09-06-gpu-count-star-preflight-red/\n?? docs/benchmarks/2026-09-06-gpu-integer-sum-red/\n?? docs/benchmarks/2026-09-06-gpu-partition-contract/\n?? docs/benchmarks/2026-09-06-gpu-resident-count-star/\n?? docs/benchmarks/2026-09-06-gpu-resident-identity-red/\n?? docs/benchmarks/2026-09-06-group-key-bitmap-full/\n?? docs/benchmarks/2026-09-06-group-key-bitmap/\n?? docs/benchmarks/2026-09-06-infallible-cast/\n?? docs/benchmarks/2026-09-06-initialized-membership/\n?? docs/benchmarks/2026-09-06-ipc-systemic-repair/\n?? docs/benchmarks/2026-09-06-join-index-ownership/\n?? docs/benchmarks/2026-09-06-join-initialization/\n?? docs/benchmarks/2026-09-06-lance-reference-avg/\n?? docs/benchmarks/2026-09-06-literal-memory/\n?? docs/benchmarks/2026-09-06-nested-decimal/\n?? docs/benchmarks/2026-09-06-nested-prepared-gather/\n?? docs/benchmarks/2026-09-06-parallel-queue/\n?? docs/benchmarks/2026-09-06-post-membership-plan-probe/\n?? docs/benchmarks/2026-09-06-prepared-inner/\n?? docs/benchmarks/2026-09-06-prepared-pipeline/\n?? docs/benchmarks/2026-09-06-prepared-plan-probe/\n?? docs/benchmarks/2026-09-06-prepared-rowstore/\n?? docs/benchmarks/2026-09-06-prepared-wrapper-draft/\n?? docs/benchmarks/2026-09-06-projection-memory/\n?? docs/benchmarks/2026-09-06-provider-smoke/\n?? docs/benchmarks/2026-09-06-public-contracts/\n?? docs/benchmarks/2026-09-06-public-gates/\n?? docs/benchmarks/2026-09-06-queue-ownership/\n?? docs/benchmarks/2026-09-06-resident-gather/\n?? docs/benchmarks/2026-09-06-result-memory-boundary/\n?? docs/benchmarks/2026-09-06-rowstore-layout/\n?? docs/benchmarks/2026-09-06-runtime-filter-domain/\n?? docs/benchmarks/2026-09-06-scalar-comparison/\n?? docs/benchmarks/2026-09-06-scalar-rhs-recheck/\n?? docs/benchmarks/2026-09-06-scalar-rhs-trace/\n?? docs/benchmarks/2026-09-06-spill-initialization/\n?? docs/benchmarks/2026-09-06-spill-output-ownership/\n?? docs/benchmarks/2026-09-06-sql-float-cast/\n?? docs/benchmarks/2026-09-06-streaming-fixed/\n?? docs/benchmarks/2026-09-06-streaming-project-pruning-draft/\n?? docs/benchmarks/2026-09-06-string-values-repair/\n?? docs/benchmarks/2026-09-06-subquery-projection/\n?? docs/benchmarks/2026-09-06-try-cast-memory/\n?? docs/benchmarks/2026-09-06-try-validity/\n?? docs/benchmarks/2026-09-07-admitted-group-output/\n?? docs/benchmarks/2026-09-07-aggregate-arena-domain-findings/\n?? docs/benchmarks/2026-09-07-aggregate-fallback-query-pool/\n?? docs/benchmarks/2026-09-07-aggregate-finalization-phases/\n?? docs/benchmarks/2026-09-07-aggregate-ingestion-cursor/\n?? docs/benchmarks/2026-09-07-aggregate-migration-admission/\n?? docs/benchmarks/2026-09-07-aggregate-state-codec/\n?? docs/benchmarks/2026-09-07-aggregate-state-rows/\n?? docs/benchmarks/2026-09-07-arrow-key-input/\n?? docs/benchmarks/2026-09-07-arrow-state-input/\n?? docs/benchmarks/2026-09-07-benchmark-startup-order/\n?? docs/benchmarks/2026-09-07-borrowed-key-output/\n?? docs/benchmarks/2026-09-07-canonical-group-storage/\n?? docs/benchmarks/2026-09-07-cast-construction/\n?? docs/benchmarks/2026-09-07-cast-preallocated/\n?? docs/benchmarks/2026-09-07-cast-whole-buffer/\n?? docs/benchmarks/2026-09-07-current-sf10/\n?? docs/benchmarks/2026-09-07-decimal-bound-codegen/\n?? docs/benchmarks/2026-09-07-decimal-output-ownership/\n?? docs/benchmarks/2026-09-07-dense-domain-and-arena/\n?? docs/benchmarks/2026-09-07-dense-domain-full/\n?? docs/benchmarks/2026-09-07-dense-domain-protected/\n?? docs/benchmarks/2026-09-07-float-extrema/\n?? docs/benchmarks/2026-09-07-fused-aggregate-error-lifecycle/\n?? docs/benchmarks/2026-09-07-fused-prepared-input/\n?? docs/benchmarks/2026-09-07-indexed-group-storage/\n?? docs/benchmarks/2026-09-07-ingestion-controller/\n?? docs/benchmarks/2026-09-07-key-read-validation/\n?? docs/benchmarks/2026-09-07-lance-bridge-long-controls/\n?? docs/benchmarks/2026-09-07-live-aggregate-profile/\n?? docs/benchmarks/2026-09-07-live-dictionary-boundary/\n?? docs/benchmarks/2026-09-07-live-spill-integration/\n?? docs/benchmarks/2026-09-07-local-engine-source-comparison/\n?? docs/benchmarks/2026-09-07-mimalloc-discard-stacks/\n?? docs/benchmarks/2026-09-07-optimizer-convergence/\n?? docs/benchmarks/2026-09-07-outer-on-predicate/\n?? docs/benchmarks/2026-09-07-parse-maintenance/\n?? docs/benchmarks/2026-09-07-partition-plan/\n?? docs/benchmarks/2026-09-07-partition-scheduler/\n?? docs/benchmarks/2026-09-07-repartition/\n?? docs/benchmarks/2026-09-07-reserved-state-storage/\n?? docs/benchmarks/2026-09-07-row-restoration/\n?? docs/benchmarks/2026-09-07-run-collection/\n?? docs/benchmarks/2026-09-07-run-compaction/\n?? docs/benchmarks/2026-09-07-run-merge/\n?? docs/benchmarks/2026-09-07-scalar-state-read/\n?? docs/benchmarks/2026-09-07-selected-scalar-ownership/\n?? docs/benchmarks/2026-09-07-selected-state-slots/\n?? docs/benchmarks/2026-09-07-spill-directory/\n?? docs/benchmarks/2026-09-07-spill-files/\n?? docs/benchmarks/2026-09-07-spill-frames/\n?? docs/benchmarks/2026-09-07-split-progress/\n?? docs/benchmarks/2026-09-07-state-row-write/\n?? docs/benchmarks/2026-09-07-timestamp-domain/\n?? docs/benchmarks/2026-09-07-try-bitmap/\n?? docs/benchmarks/2026-09-08-active-join-profile/\n?? docs/benchmarks/2026-09-08-admitted-batch/\n?? docs/benchmarks/2026-09-08-admitted-compiled-predicate/\n?? docs/benchmarks/2026-09-08-admitted-fixed-column/\n?? docs/benchmarks/2026-09-08-admitted-frontier/\n?? docs/benchmarks/2026-09-08-admitted-gather/\n?? docs/benchmarks/2026-09-08-admitted-hybrid/\n?? docs/benchmarks/2026-09-08-admitted-page-body/\n?? docs/benchmarks/2026-09-08-admitted-page-read/\n?? docs/benchmarks/2026-09-08-admitted-plain-utf8/\n?? docs/benchmarks/2026-09-08-admitted-protected-pairs/\n?? docs/benchmarks/2026-09-08-admitted-q12/\n?? docs/benchmarks/2026-09-08-admitted-queue-preparation/\n?? docs/benchmarks/2026-09-08-admitted-queue-sf10/\n?? docs/benchmarks/2026-09-08-admitted-queue/\n?? docs/benchmarks/2026-09-08-admitted-row-group/\n?? docs/benchmarks/2026-09-08-admitted-string-predicate/\n?? docs/benchmarks/2026-09-08-admitted-utf8-column/\n?? docs/benchmarks/2026-09-08-admitted-zstd/\n?? docs/benchmarks/2026-09-08-aggregate-scaling/\n?? docs/benchmarks/2026-09-08-aggregate-source-guard/\n?? docs/benchmarks/2026-09-08-batch-dispatch/\n?? docs/benchmarks/2026-09-08-bound-array-pairs/\n?? docs/benchmarks/2026-09-08-bound-array-tests/\n?? docs/benchmarks/2026-09-08-bounded-page-header/\n?? docs/benchmarks/2026-09-08-budget-providers/\n?? docs/benchmarks/2026-09-08-budget-quantum/\n?? docs/benchmarks/2026-09-08-budget-residency/\n?? docs/benchmarks/2026-09-08-expression-quantum/\n?? docs/benchmarks/2026-09-08-inline-input-pairs/\n?? docs/benchmarks/2026-09-08-inline-input-providers/\n?? docs/benchmarks/2026-09-08-inline-input-residency/\n?? docs/benchmarks/2026-09-08-inline-input-tests/\n?? docs/benchmarks/2026-09-08-ipc-extent-tests/\n?? docs/benchmarks/2026-09-08-ipc-preload/\n?? docs/benchmarks/2026-09-08-join-index-diagnosis/\n?? docs/benchmarks/2026-09-08-join-index-pairs/\n?? docs/benchmarks/2026-09-08-join-index-providers/\n?? docs/benchmarks/2026-09-08-join-index-tests/\n?? docs/benchmarks/2026-09-08-live-admitted-scan/\n?? docs/benchmarks/2026-09-08-memory-input-profile/\n?? docs/benchmarks/2026-09-08-metadata-cache-identity/\n?? docs/benchmarks/2026-09-08-metadata-retention/\n?? docs/benchmarks/2026-09-08-native-prescan-budget/\n?? docs/benchmarks/2026-09-08-packed-block-padding/\n?? docs/benchmarks/2026-09-08-padding-q12/\n?? docs/benchmarks/2026-09-08-parallel-aggregate-input/\n?? docs/benchmarks/2026-09-08-parallel-aggregate/\n?? docs/benchmarks/2026-09-08-parallel-key-gpu-runtime/\n?? docs/benchmarks/2026-09-08-parallel-key-pairs/\n?? docs/benchmarks/2026-09-08-parallel-key-providers/\n?? docs/benchmarks/2026-09-08-parallel-key-q2-followup/\n?? docs/benchmarks/2026-09-08-parallel-key-residency/\n?? docs/benchmarks/2026-09-08-parallel-key-tests/\n?? docs/benchmarks/2026-09-08-prepared-key-pairs/\n?? docs/benchmarks/2026-09-08-prepared-key-profiles/\n?? docs/benchmarks/2026-09-08-prepared-key-providers/\n?? docs/benchmarks/2026-09-08-prepared-key-tests/\n?? docs/benchmarks/2026-09-08-q12-input-serialization/\n?? docs/benchmarks/2026-09-08-query-gates-raw/\n?? docs/benchmarks/2026-09-08-reference-calibration-stop/\n?? docs/benchmarks/2026-09-08-reference-retirement/\n?? docs/benchmarks/2026-09-08-reserved-compilation/\n?? docs/benchmarks/2026-09-08-resident-startup-diagnostics/\n?? docs/benchmarks/2026-09-08-retained-decoders/\n?? docs/benchmarks/2026-09-08-retained-input-accounting/\n?? docs/benchmarks/2026-09-08-retained-key-component/\n?? docs/benchmarks/2026-09-08-scan-execution-details/\n?? docs/benchmarks/2026-09-08-scan-metadata-ownership/\n?? docs/benchmarks/2026-09-08-shared-prescan/\n?? docs/benchmarks/2026-09-08-typed-column-pages/\n?? docs/benchmarks/2026-09-08-worker-shutdown/\n?? docs/benchmarks/2026-09-09-admitted-computed-pipeline/\n?? docs/benchmarks/2026-09-09-admitted-inner-wrapper/\n?? docs/benchmarks/2026-09-09-admitted-pipeline-q09-diagnostics/\n?? docs/benchmarks/2026-09-09-admitted-wrapper-q09-diagnostics/\n?? docs/benchmarks/2026-09-09-admitted-wrapper-q09-paired/\n?? docs/benchmarks/2026-09-09-aggregate-output-quantum/\n?? docs/benchmarks/2026-09-09-aggregate-threshold-clock-profile/\n?? docs/benchmarks/2026-09-09-aggregate-threshold-cpu-repeat/\n?? docs/benchmarks/2026-09-09-aggregate-threshold-diagnostics/\n?? docs/benchmarks/2026-09-09-aggregate-threshold-pairs/\n?? docs/benchmarks/2026-09-09-aggregate-threshold-providers/\n?? docs/benchmarks/2026-09-09-aggregate-threshold-q6-followup/\n?? docs/benchmarks/2026-09-09-aggregate-threshold-q6-isolated-null-01/\n?? docs/benchmarks/2026-09-09-aggregate-threshold-q6-isolated-physical-candidate-01/\n?? docs/benchmarks/2026-09-09-aggregate-threshold-q6-isolated-physical-null-01/\n?? docs/benchmarks/2026-09-09-aggregate-threshold-q6-isolated-pilot-01/\n?? docs/benchmarks/2026-09-09-aggregate-threshold-q6-null-control/\n?? docs/benchmarks/2026-09-09-aggregate-threshold-residency/\n?? docs/benchmarks/2026-09-09-aggregate-threshold/\n?? docs/benchmarks/2026-09-09-balanced-aggregate-ownership/\n?? docs/benchmarks/2026-09-09-balanced-ownership-native-scaling/\n?? docs/benchmarks/2026-09-09-bound-key-arrays/\n?? docs/benchmarks/2026-09-09-bound-keys-diagnostics/\n?? docs/benchmarks/2026-09-09-bound-keys-pairs/\n?? docs/benchmarks/2026-09-09-bound-keys-providers/\n?? docs/benchmarks/2026-09-09-bound-keys-q1-diagnostics/\n?? docs/benchmarks/2026-09-09-bound-keys-q6-isolated-physical-candidate-01/\n?? docs/benchmarks/2026-09-09-bound-keys-q6-isolated-physical-null-01/\n?? docs/benchmarks/2026-09-09-bound-keys-residency/\n?? docs/benchmarks/2026-09-09-bound-selection-quantum-diagnostics/\n?? docs/benchmarks/2026-09-09-bound-selection-quantum/\n?? docs/benchmarks/2026-09-09-bounded-outer-pipeline/\n?? docs/benchmarks/2026-09-09-build-schema-admission-providers/\n?? docs/benchmarks/2026-09-09-build-schema-admission-q09-diagnostics/\n?? docs/benchmarks/2026-09-09-build-schema-admission-q09-paired/\n?? docs/benchmarks/2026-09-09-build-schema-admission/\n?? docs/benchmarks/2026-09-09-collected-join-profile/\n?? docs/benchmarks/2026-09-09-contiguous-copy-diagnostics/\n?? docs/benchmarks/2026-09-09-contiguous-copy-pairs/\n?? docs/benchmarks/2026-09-09-contiguous-copy-providers/\n?? docs/benchmarks/2026-09-09-contiguous-copy-residency/\n?? docs/benchmarks/2026-09-09-contiguous-copy/\n?? docs/benchmarks/2026-09-09-cross-owner-partial-merge/\n?? docs/benchmarks/2026-09-09-decimal-expression-admission/\n?? docs/benchmarks/2026-09-09-dictionary-chunks-pairs/\n?? docs/benchmarks/2026-09-09-dictionary-chunks-providers/\n?? docs/benchmarks/2026-09-09-dictionary-chunks-q2-followup/\n?? docs/benchmarks/2026-09-09-dictionary-chunks-residency/\n?? docs/benchmarks/2026-09-09-dictionary-id-chunks/\n?? docs/benchmarks/2026-09-09-fixed-scan-admission-q09-diagnostics/\n?? docs/benchmarks/2026-09-09-fixed-width-admitted-scan/\n?? docs/benchmarks/2026-09-09-having-lance-attribution/\n?? docs/benchmarks/2026-09-09-having-output/\n?? docs/benchmarks/2026-09-09-having-provider-diagnostics/\n?? docs/benchmarks/2026-09-09-input-retention-attribution/\n?? docs/benchmarks/2026-09-09-isolated-window-harness/\n?? docs/benchmarks/2026-09-09-optional-output-validity/\n?? docs/benchmarks/2026-09-09-outer-pipeline-diagnostics/\n?? docs/benchmarks/2026-09-09-output-quantum-native/\n?? docs/benchmarks/2026-09-09-output-quantum-protected/\n?? docs/benchmarks/2026-09-09-output-quantum-q09-diagnostics/\n?? docs/benchmarks/2026-09-09-output-quantum-q6-decision/\n?? docs/benchmarks/2026-09-09-output-quantum-q6-isolated-physical-null-01/\n?? docs/benchmarks/2026-09-09-output-quantum-residency/\n?? docs/benchmarks/2026-09-09-output-quantum/\n?? docs/benchmarks/2026-09-09-output-validity-refusal/\n?? docs/benchmarks/2026-09-09-page-header-lifetime/\n?? docs/benchmarks/2026-09-09-parallel-aggregate-reduction/\n?? docs/benchmarks/2026-09-09-parallel-reduction-native/\n?? docs/benchmarks/2026-09-09-parallel-reduction-ownership/\n?? docs/benchmarks/2026-09-09-parallel-reduction-providers/\n?? docs/benchmarks/2026-09-09-partition-error-spill-contract/\n?? docs/benchmarks/2026-09-09-quarter-budget-reproduction/\n?? docs/benchmarks/2026-09-09-queue-metadata-tests/\n?? docs/benchmarks/2026-09-09-runtime-filter-admission/\n?? docs/benchmarks/2026-09-09-runtime-filter-lineage-repair/\n?? docs/benchmarks/2026-09-09-runtime-filter-lineage/\n?? docs/benchmarks/2026-09-09-spill-io-diagnostics/\n?? docs/benchmarks/2026-09-09-spill-io-pairs/\n?? docs/benchmarks/2026-09-09-spill-io-providers/\n?? docs/benchmarks/2026-09-09-spill-io-q6-followup/\n?? docs/benchmarks/2026-09-09-spill-io-residency/\n?? docs/benchmarks/2026-09-09-spill-io/\n?? docs/benchmarks/2026-09-09-spill-output-floor/\n?? docs/benchmarks/2026-09-10-aggregate-row-transaction-attribution/\n?? docs/benchmarks/2026-09-10-aggregate-startup-headroom/\n?? docs/benchmarks/2026-09-10-borrowed-fixed-input/\n?? docs/benchmarks/2026-09-10-borrowed-fixed-paired/\n?? docs/benchmarks/2026-09-10-borrowed-fixed-providers/\n?? docs/benchmarks/2026-09-10-build-schema-bottleneck-diagnostics/\n?? docs/benchmarks/2026-09-10-compact-fixed-paired/\n?? docs/benchmarks/2026-09-10-compact-fixed-state/\n?? docs/benchmarks/2026-09-10-direct-fixed-paired/\n?? docs/benchmarks/2026-09-10-direct-fixed-q18-attribution/\n?? docs/benchmarks/2026-09-10-direct-fixed-updates/\n?? docs/benchmarks/2026-09-10-native-incremental-ipc/\n?? docs/benchmarks/2026-09-10-native-incremental-paired/\n?? docs/benchmarks/2026-09-10-partial-native-input-attribution/\n?? docs/benchmarks/2026-09-10-retained-input-credit-paired/\n?? docs/benchmarks/2026-09-10-retained-input-credit-providers/\n?? docs/benchmarks/2026-09-10-retained-input-credit-q07/\n?? docs/benchmarks/2026-09-10-retained-input-credit/\n?? docs/benchmarks/2026-09-10-startup-headroom-paired/\n?? docs/benchmarks/2026-09-10-startup-headroom-providers/\n?? docs/benchmarks/2026-09-11-batch-views-paired/\n?? docs/benchmarks/2026-09-11-batch-views-providers/\n?? docs/benchmarks/2026-09-11-batch-views-residency/\n?? docs/benchmarks/2026-09-11-batch-views-validation/\n?? docs/benchmarks/2026-09-11-batch-views/\n?? docs/benchmarks/2026-09-11-compiled-coercion-attribution/\n?? docs/benchmarks/2026-09-11-compiled-coercion-paired/\n?? docs/benchmarks/2026-09-11-compiled-coercion-validation/\n?? docs/benchmarks/2026-09-11-compiled-numeric-coercion/\n?? docs/benchmarks/2026-09-11-coordinated-spill-progress/\n?? docs/benchmarks/2026-09-11-copied-frontier-progress/\n?? docs/benchmarks/2026-09-11-correlated-empty-result-red/\n?? docs/benchmarks/2026-09-11-correlated-reduction-probes/\n?? docs/benchmarks/2026-09-11-correlated-reduction-repair/\n?? docs/benchmarks/2026-09-11-correlated-reduction-validation/\n?? docs/benchmarks/2026-09-11-decimal-spill-denial/\n?? docs/benchmarks/2026-09-11-decimal-spill-frontier/\n?? docs/benchmarks/2026-09-11-decoder-rollback-validation/\n?? docs/benchmarks/2026-09-11-decoder-rollback/\n?? docs/benchmarks/2026-09-11-duckdb-minimum-memory-source.json\n?? docs/benchmarks/2026-09-11-empty-scalar-repair/\n?? docs/benchmarks/2026-09-11-empty-scalar-validation/\n?? docs/benchmarks/2026-09-11-first-batch-refusal-ledger/\n?? docs/benchmarks/2026-09-11-float-dispatch-profile/\n?? docs/benchmarks/2026-09-11-float-dispatch-source/\n?? docs/benchmarks/2026-09-11-float-dispatch-triage/\n?? docs/benchmarks/2026-09-11-float-dispatch-validation/\n?? docs/benchmarks/2026-09-11-incremental-header-paired/\n?? docs/benchmarks/2026-09-11-incremental-header-refusal-traces/\n?? docs/benchmarks/2026-09-11-incremental-header-validation/\n?? docs/benchmarks/2026-09-11-incremental-header/\n?? docs/benchmarks/2026-09-11-ipc-dictionary-projection-source.json\n?? docs/benchmarks/2026-09-11-left-count-binding/\n?? docs/benchmarks/2026-09-11-left-count-diagnostic/\n?? docs/benchmarks/2026-09-11-left-count-paired/\n?? docs/benchmarks/2026-09-11-left-count-providers/\n?? docs/benchmarks/2026-09-11-left-count-resource/\n?? docs/benchmarks/2026-09-11-left-count-retained-reduction/\n?? docs/benchmarks/2026-09-11-left-count-validation/\n?? docs/benchmarks/2026-09-11-legacy-refusal-traces/\n?? docs/benchmarks/2026-09-11-native-anti-contract/\n?? docs/benchmarks/2026-09-11-native-compiled-boundary/\n?? docs/benchmarks/2026-09-11-native-header-precision/\n?? docs/benchmarks/2026-09-11-native-q6-profile/\n?? docs/benchmarks/2026-09-11-packed-word-paired/\n?? docs/benchmarks/2026-09-11-packed-word-validation/\n?? docs/benchmarks/2026-09-11-packed-word/\n?? docs/benchmarks/2026-09-11-peer-spill-paired/\n?? docs/benchmarks/2026-09-11-peer-spill-providers/\n?? docs/benchmarks/2026-09-11-right-semi-diagnostic/\n?? docs/benchmarks/2026-09-11-right-semi-generic-profile/\n?? docs/benchmarks/2026-09-11-right-semi-providers/\n?? docs/benchmarks/2026-09-11-right-semi-repair/\n?? docs/benchmarks/2026-09-11-right-semi-residency/\n?? docs/benchmarks/2026-09-11-right-semi-route-control/\n?? docs/benchmarks/2026-09-11-right-semi-validation/\n?? docs/benchmarks/2026-09-11-validity-repeated-paired/\n?? docs/benchmarks/2026-09-11-validity-repeated-validation/\n?? docs/benchmarks/2026-09-11-validity-repeated/\n?? docs/benchmarks/2026-09-15-ipc-dictionary-attribution/\n?? docs/benchmarks/2026-09-15-ipc-dictionary-sf10/\n?? docs/benchmarks/2026-09-15-ipc-dictionary-validation/\n?? docs/ipc-dictionary-projection-2026-09-15.md\n?? src/storage/ipc_cache/\n",
+  "engine_binary_sha256": "138199d2d94606d1cac3a68f43ed876d140ea6b166b8739702240bd6c30094ae",
+  "duckdb_version": "1.4.4",
+  "dataset_manifest_sha256": "ff097ac1f71b689618970e7c7c16c721ccab205c76286ea1f29866f34a8c7e99",
+  "dataset_path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/tpch-sf10/dataset.json",
+  "provider_conversion": {
+    "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-01/decoded_ipc/provider.json",
+    "sha256": "9d29da7ed4b5c87719ea24dc79f555ae5618768043316f196d8d7942a601e979",
+    "manifest": {
+      "version": 1,
+      "status": "validated",
+      "track": "decoded_ipc",
+      "dataset_manifest_sha256": "ff097ac1f71b689618970e7c7c16c721ccab205c76286ea1f29866f34a8c7e99",
+      "dataset_path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/tpch-sf10/dataset.json",
+      "duckdb_version": "1.4.4",
+      "pyarrow_version": "25.0.1",
+      "engine_binary_sha256": "39425cd86a3ea0d52f357152147b515aec02a4c5f74bc8a5c56449a3a80d9cf5",
+      "tables": [
+        {
+          "name": "region",
+          "path": "region",
+          "source_sha256": "091deadd29b9afc114f61658d686c79a5e59691c5a70e13a451f5b0e8380bd62",
+          "conversion_ms": 1.4560050331056118,
+          "engine_ready": {
+            "features": {
+              "gpu": true,
+              "lance": true
+            },
+            "gpu_enabled": false,
+            "gpu_snapshot": null,
+            "ipc_cache": "off",
+            "residency": "host_arrow_preloaded",
+            "setup_ms": 0.129853,
+            "status": "ready",
+            "threads": 4,
+            "track": "decoded_ipc"
+          },
+          "reference": {
+            "reader": "decoded_ipc"
+          },
+          "validation": {
+            "ok": true,
+            "checks": {
+              "engine": {
+                "ok": true,
+                "policy": "bag",
+                "status": "validated",
+                "actual_schema": "r_regionkey: int32\nr_name: string\nr_comment: string",
+                "expected_schema": "r_regionkey: int32\nr_name: string\nr_comment: string",
+                "aligned_exact": {
+                  "attempted": true,
+                  "matched_rows": 5,
+                  "segments": 1,
+                  "slice_rows": 4096,
+                  "peak_segment_rows": 5,
+                  "equal": true
+                },
+                "comparison_strategy": "arrow_aligned_exact",
+                "actual_rows": 5,
+                "expected_rows": 5
+              },
+              "reference": {
+                "ok": true,
+                "policy": "bag",
+                "status": "validated",
+                "actual_schema": "r_regionkey: int32\nr_name: string\nr_comment: string",
+                "expected_schema": "r_regionkey: int32\nr_name: string\nr_comment: string",
+                "aligned_exact": {
+                  "attempted": true,
+                  "matched_rows": 5,
+                  "segments": 1,
+                  "slice_rows": 4096,
+                  "peak_segment_rows": 5,
+                  "equal": true
+                },
+                "comparison_strategy": "arrow_aligned_exact",
+                "actual_rows": 5,
+                "expected_rows": 5
+              }
+            },
+            "schema": "r_regionkey: int32\nr_name: string\nr_comment: string",
+            "rows": 5
+          },
+          "files": {
+            "data.arrow": "d4932195e4c6de88221dad228084d45f2a7c2031857e9ea060f58a7dd21743eb"
+          }
+        },
+        {
+          "name": "nation",
+          "path": "nation",
+          "source_sha256": "3aa12b378f1b78228325e958a8f24a3e02814a32fdb2bbc75bb3b2ec9090f525",
+          "conversion_ms": 0.4031076095998287,
+          "engine_ready": {
+            "features": {
+              "gpu": true,
+              "lance": true
+            },
+            "gpu_enabled": false,
+            "gpu_snapshot": null,
+            "ipc_cache": "off",
+            "residency": "host_arrow_preloaded",
+            "setup_ms": 0.134639,
+            "status": "ready",
+            "threads": 4,
+            "track": "decoded_ipc"
+          },
+          "reference": {
+            "reader": "decoded_ipc"
+          },
+          "validation": {
+            "ok": true,
+            "checks": {
+              "engine": {
+                "ok": true,
+                "policy": "bag",
+                "status": "validated",
+                "actual_schema": "n_nationkey: int32\nn_name: string\nn_regionkey: int32\nn_comment: string",
+                "expected_schema": "n_nationkey: int32\nn_name: string\nn_regionkey: int32\nn_comment: string",
+                "aligned_exact": {
+                  "attempted": true,
+                  "matched_rows": 25,
+                  "segments": 1,
+                  "slice_rows": 4096,
+                  "peak_segment_rows": 25,
+                  "equal": true
+                },
+                "comparison_strategy": "arrow_aligned_exact",
+                "actual_rows": 25,
+                "expected_rows": 25
+              },
+              "reference": {
+                "ok": true,
+                "policy": "bag",
+                "status": "validated",
+                "actual_schema": "n_nationkey: int32\nn_name: string\nn_regionkey: int32\nn_comment: string",
+                "expected_schema": "n_nationkey: int32\nn_name: string\nn_regionkey: int32\nn_comment: string",
+                "aligned_exact": {
+                  "attempted": true,
+                  "matched_rows": 25,
+                  "segments": 1,
+                  "slice_rows": 4096,
+                  "peak_segment_rows": 25,
+                  "equal": true
+                },
+                "comparison_strategy": "arrow_aligned_exact",
+                "actual_rows": 25,
+                "expected_rows": 25
+              }
+            },
+            "schema": "n_nationkey: int32\nn_name: string\nn_regionkey: int32\nn_comment: string",
+            "rows": 25
+          },
+          "files": {
+            "data.arrow": "d17e6cb591fbe6825a87fb69e98de58ec5a0c32dc1fcca83116749fc225a7a7c"
+          }
+        },
+        {
+          "name": "supplier",
+          "path": "supplier",
+          "source_sha256": "9cc912954f4aea094203a778c54fceb3a2e24861b46176e86a7413c7f0ea2944",
+          "conversion_ms": 12.815708760172129,
+          "engine_ready": {
+            "features": {
+              "gpu": true,
+              "lance": true
+            },
+            "gpu_enabled": false,
+            "gpu_snapshot": null,
+            "ipc_cache": "off",
+            "residency": "host_arrow_preloaded",
+            "setup_ms": 10.354395,
+            "status": "ready",
+            "threads": 4,
+            "track": "decoded_ipc"
+          },
+          "reference": {
+            "reader": "decoded_ipc"
+          },
+          "validation": {
+            "ok": true,
+            "checks": {
+              "engine": {
+                "ok": true,
+                "policy": "bag",
+                "status": "validated",
+                "actual_schema": "s_suppkey: int64\ns_name: string\ns_address: string\ns_nationkey: int32\ns_phone: string\ns_acctbal: decimal128(15, 2)\ns_comment: string",
+                "expected_schema": "s_suppkey: int64\ns_name: string\ns_address: string\ns_nationkey: int32\ns_phone: string\ns_acctbal: decimal128(15, 2)\ns_comment: string",
+                "aligned_exact": {
+                  "attempted": true,
+                  "matched_rows": 100000,
+                  "segments": 25,
+                  "slice_rows": 4096,
+                  "peak_segment_rows": 4096,
+                  "equal": true
+                },
+                "comparison_strategy": "arrow_aligned_exact",
+                "actual_rows": 100000,
+                "expected_rows": 100000
+              },
+              "reference": {
+                "ok": true,
+                "policy": "bag",
+                "status": "validated",
+                "actual_schema": "s_suppkey: int64\ns_name: string\ns_address: string\ns_nationkey: int32\ns_phone: string\ns_acctbal: decimal128(15, 2)\ns_comment: string",
+                "expected_schema": "s_suppkey: int64\ns_name: string\ns_address: string\ns_nationkey: int32\ns_phone: string\ns_acctbal: decimal128(15, 2)\ns_comment: string",
+                "aligned_exact": {
+                  "attempted": true,
+                  "matched_rows": 100000,
+                  "segments": 25,
+                  "slice_rows": 4096,
+                  "peak_segment_rows": 4096,
+                  "equal": true
+                },
+                "comparison_strategy": "arrow_aligned_exact",
+                "actual_rows": 100000,
+                "expected_rows": 100000
+              }
+            },
+            "schema": "s_suppkey: int64\ns_name: string\ns_address: string\ns_nationkey: int32\ns_phone: string\ns_acctbal: decimal128(15, 2)\ns_comment: string",
+            "rows": 100000
+          },
+          "files": {
+            "data.arrow": "7ff7158b09771dedd2c84f66226dfca3c2daa479582ee9bf2bbed11c19964b1f"
+          }
+        },
+        {
+          "name": "customer",
+          "path": "customer",
+          "source_sha256": "25b41e0e7a9fcb47cb0f1e0e7ba3ea3c9441c2be6b937dcb72fd854da6c9d245",
+          "conversion_ms": 194.73929796367884,
+          "engine_ready": {
+            "features": {
+              "gpu": true,
+              "lance": true
+            },
+            "gpu_enabled": false,
+            "gpu_snapshot": null,
+            "ipc_cache": "off",
+            "residency": "host_arrow_preloaded",
+            "setup_ms": 109.82638299999999,
+            "status": "ready",
+            "threads": 4,
+            "track": "decoded_ipc"
+          },
+          "reference": {
+            "reader": "decoded_ipc"
+          },
+          "validation": {
+            "ok": true,
+            "checks": {
+              "engine": {
+                "ok": true,
+                "policy": "bag",
+                "status": "validated",
+                "actual_schema": "c_custkey: int64\nc_name: string\nc_address: string\nc_nationkey: int32\nc_phone: string\nc_acctbal: decimal128(15, 2)\nc_mktsegment: string\nc_comment: string",
+                "expected_schema": "c_custkey: int64\nc_name: string\nc_address: string\nc_nationkey: int32\nc_phone: string\nc_acctbal: decimal128(15, 2)\nc_mktsegment: string\nc_comment: string",
+                "aligned_exact": {
+                  "attempted": true,
+                  "matched_rows": 65536,
+                  "segments": 17,
+                  "slice_rows": 4096,
+                  "peak_segment_rows": 4096,
+                  "equal": false,
+                  "decline_reason": "aligned values or encodings differ"
+                },
+                "comparison_strategy": "sqlite_exact_bag",
+                "actual_rows": 1500000,
+                "expected_rows": 1500000
+              },
+              "reference": {
+                "ok": true,
+                "policy": "bag",
+                "status": "validated",
+                "actual_schema": "c_custkey: int64\nc_name: string\nc_address: string\nc_nationkey: int32\nc_phone: string\nc_acctbal: decimal128(15, 2)\nc_mktsegment: string\nc_comment: string",
+                "expected_schema": "c_custkey: int64\nc_name: string\nc_address: string\nc_nationkey: int32\nc_phone: string\nc_acctbal: decimal128(15, 2)\nc_mktsegment: string\nc_comment: string",
+                "aligned_exact": {
+                  "attempted": true,
+                  "matched_rows": 1500000,
+                  "segments": 367,
+                  "slice_rows": 4096,
+                  "peak_segment_rows": 4096,
+                  "equal": true
+                },
+                "comparison_strategy": "arrow_aligned_exact",
+                "actual_rows": 1500000,
+                "expected_rows": 1500000
+              }
+            },
+            "schema": "c_custkey: int64\nc_name: string\nc_address: string\nc_nationkey: int32\nc_phone: string\nc_acctbal: decimal128(15, 2)\nc_mktsegment: string\nc_comment: string",
+            "rows": 1500000
+          },
+          "files": {
+            "data.arrow": "25ae2542f8a64f3e23a048bdfaeb27f4bb4a44b77d9e20ea2d6a34c2842a6d4b"
+          }
+        },
+        {
+          "name": "part",
+          "path": "part",
+          "source_sha256": "a59d9a8df9b4b82351b8fb36a13c923b7ced33fec2f6660af9f78b3e10395d4c",
+          "conversion_ms": 133.92678601667285,
+          "engine_ready": {
+            "features": {
+              "gpu": true,
+              "lance": true
+            },
+            "gpu_enabled": false,
+            "gpu_snapshot": null,
+            "ipc_cache": "off",
+            "residency": "host_arrow_preloaded",
+            "setup_ms": 114.258769,
+            "status": "ready",
+            "threads": 4,
+            "track": "decoded_ipc"
+          },
+          "reference": {
+            "reader": "decoded_ipc"
+          },
+          "validation": {
+            "ok": true,
+            "checks": {
+              "engine": {
+                "ok": true,
+                "policy": "bag",
+                "status": "validated",
+                "actual_schema": "p_partkey: int64\np_name: string\np_mfgr: string\np_brand: string\np_type: string\np_size: int32\np_container: string\np_retailprice: decimal128(15, 2)\np_comment: string",
+                "expected_schema": "p_partkey: int64\np_name: string\np_mfgr: string\np_brand: string\np_type: string\np_size: int32\np_container: string\np_retailprice: decimal128(15, 2)\np_comment: string",
+                "aligned_exact": {
+                  "attempted": true,
+                  "matched_rows": 65536,
+                  "segments": 17,
+                  "slice_rows": 4096,
+                  "peak_segment_rows": 4096,
+                  "equal": false,
+                  "decline_reason": "aligned values or encodings differ"
+                },
+                "comparison_strategy": "sqlite_exact_bag",
+                "actual_rows": 2000000,
+                "expected_rows": 2000000
+              },
+              "reference": {
+                "ok": true,
+                "policy": "bag",
+                "status": "validated",
+                "actual_schema": "p_partkey: int64\np_name: string\np_mfgr: string\np_brand: string\np_type: string\np_size: int32\np_container: string\np_retailprice: decimal128(15, 2)\np_comment: string",
+                "expected_schema": "p_partkey: int64\np_name: string\np_mfgr: string\np_brand: string\np_type: string\np_size: int32\np_container: string\np_retailprice: decimal128(15, 2)\np_comment: string",
+                "aligned_exact": {
+                  "attempted": true,
+                  "matched_rows": 2000000,
+                  "segments": 489,
+                  "slice_rows": 4096,
+                  "peak_segment_rows": 4096,
+                  "equal": true
+                },
+                "comparison_strategy": "arrow_aligned_exact",
+                "actual_rows": 2000000,
+                "expected_rows": 2000000
+              }
+            },
+            "schema": "p_partkey: int64\np_name: string\np_mfgr: string\np_brand: string\np_type: string\np_size: int32\np_container: string\np_retailprice: decimal128(15, 2)\np_comment: string",
+            "rows": 2000000
+          },
+          "files": {
+            "data.arrow": "2372b566e2cd9855462f924fdb53b0d6a61d80bd24c47328a39c7eed2e9495c7"
+          }
+        },
+        {
+          "name": "partsupp",
+          "path": "partsupp",
+          "source_sha256": "5a2526c2224caf5e3a2a48f1707e10b6e017b9588f68c141398197050f84a8b7",
+          "conversion_ms": 1472.5998202338815,
+          "engine_ready": {
+            "features": {
+              "gpu": true,
+              "lance": true
+            },
+            "gpu_enabled": false,
+            "gpu_snapshot": null,
+            "ipc_cache": "off",
+            "residency": "host_arrow_preloaded",
+            "setup_ms": 513.675306,
+            "status": "ready",
+            "threads": 4,
+            "track": "decoded_ipc"
+          },
+          "reference": {
+            "reader": "decoded_ipc"
+          },
+          "validation": {
+            "ok": true,
+            "checks": {
+              "engine": {
+                "ok": true,
+                "policy": "bag",
+                "status": "validated",
+                "actual_schema": "ps_partkey: int64\nps_suppkey: int64\nps_availqty: int64\nps_supplycost: decimal128(15, 2)\nps_comment: string",
+                "expected_schema": "ps_partkey: int64\nps_suppkey: int64\nps_availqty: int64\nps_supplycost: decimal128(15, 2)\nps_comment: string",
+                "aligned_exact": {
+                  "attempted": true,
+                  "matched_rows": 65536,
+                  "segments": 17,
+                  "slice_rows": 4096,
+                  "peak_segment_rows": 4096,
+                  "equal": false,
+                  "decline_reason": "aligned values or encodings differ"
+                },
+                "comparison_strategy": "sqlite_exact_bag",
+                "actual_rows": 8000000,
+                "expected_rows": 8000000
+              },
+              "reference": {
+                "ok": true,
+                "policy": "bag",
+                "status": "validated",
+                "actual_schema": "ps_partkey: int64\nps_suppkey: int64\nps_availqty: int64\nps_supplycost: decimal128(15, 2)\nps_comment: string",
+                "expected_schema": "ps_partkey: int64\nps_suppkey: int64\nps_availqty: int64\nps_supplycost: decimal128(15, 2)\nps_comment: string",
+                "aligned_exact": {
+                  "attempted": true,
+                  "matched_rows": 8000000,
+                  "segments": 1954,
+                  "slice_rows": 4096,
+                  "peak_segment_rows": 4096,
+                  "equal": true
+                },
+                "comparison_strategy": "arrow_aligned_exact",
+                "actual_rows": 8000000,
+                "expected_rows": 8000000
+              }
+            },
+            "schema": "ps_partkey: int64\nps_suppkey: int64\nps_availqty: int64\nps_supplycost: decimal128(15, 2)\nps_comment: string",
+            "rows": 8000000
+          },
+          "files": {
+            "data.arrow": "119d7dcc2847db58e9f34b9646d4caf677ae1629887410ee84b3617a60488c2b"
+          }
+        },
+        {
+          "name": "orders",
+          "path": "orders",
+          "source_sha256": "184f016d5ab6b7d22d1416b160d462b2b2361ffe870ed4e6f3cca9ae220343aa",
+          "conversion_ms": 2168.3275727555156,
+          "engine_ready": {
+            "features": {
+              "gpu": true,
+              "lance": true
+            },
+            "gpu_enabled": false,
+            "gpu_snapshot": null,
+            "ipc_cache": "off",
+            "residency": "host_arrow_preloaded",
+            "setup_ms": 871.979374,
+            "status": "ready",
+            "threads": 4,
+            "track": "decoded_ipc"
+          },
+          "reference": {
+            "reader": "decoded_ipc"
+          },
+          "validation": {
+            "ok": true,
+            "checks": {
+              "engine": {
+                "ok": true,
+                "policy": "bag",
+                "status": "validated",
+                "actual_schema": "o_orderkey: int64\no_custkey: int64\no_orderstatus: string\no_totalprice: decimal128(15, 2)\no_orderdate: date32[day]\no_orderpriority: string\no_clerk: string\no_shippriority: int32\no_comment: string",
+                "expected_schema": "o_orderkey: int64\no_custkey: int64\no_orderstatus: string\no_totalprice: decimal128(15, 2)\no_orderdate: date32[day]\no_orderpriority: string\no_clerk: string\no_shippriority: int32\no_comment: string",
+                "aligned_exact": {
+                  "attempted": true,
+                  "matched_rows": 65536,
+                  "segments": 17,
+                  "slice_rows": 4096,
+                  "peak_segment_rows": 4096,
+                  "equal": false,
+                  "decline_reason": "aligned values or encodings differ"
+                },
+                "comparison_strategy": "sqlite_exact_bag",
+                "actual_rows": 15000000,
+                "expected_rows": 15000000
+              },
+              "reference": {
+                "ok": true,
+                "policy": "bag",
+                "status": "validated",
+                "actual_schema": "o_orderkey: int64\no_custkey: int64\no_orderstatus: string\no_totalprice: decimal128(15, 2)\no_orderdate: date32[day]\no_orderpriority: string\no_clerk: string\no_shippriority: int32\no_comment: string",
+                "expected_schema": "o_orderkey: int64\no_custkey: int64\no_orderstatus: string\no_totalprice: decimal128(15, 2)\no_orderdate: date32[day]\no_orderpriority: string\no_clerk: string\no_shippriority: int32\no_comment: string",
+                "aligned_exact": {
+                  "attempted": true,
+                  "matched_rows": 15000000,
+                  "segments": 3663,
+                  "slice_rows": 4096,
+                  "peak_segment_rows": 4096,
+                  "equal": true
+                },
+                "comparison_strategy": "arrow_aligned_exact",
+                "actual_rows": 15000000,
+                "expected_rows": 15000000
+              }
+            },
+            "schema": "o_orderkey: int64\no_custkey: int64\no_orderstatus: string\no_totalprice: decimal128(15, 2)\no_orderdate: date32[day]\no_orderpriority: string\no_clerk: string\no_shippriority: int32\no_comment: string",
+            "rows": 15000000
+          },
+          "files": {
+            "data.arrow": "1d2aef3b70bd2da727b4f6122d917ae4440051fbc67c3832bec21511e9a17a77"
+          }
+        },
+        {
+          "name": "lineitem",
+          "path": "lineitem",
+          "source_sha256": "037e47c5a016000408e1ed0498122b22be274d11c0f9c6a7befde7d14a831dd1",
+          "conversion_ms": 11636.854057200253,
+          "engine_ready": {
+            "features": {
+              "gpu": true,
+              "lance": true
+            },
+            "gpu_enabled": false,
+            "gpu_snapshot": null,
+            "ipc_cache": "off",
+            "residency": "host_arrow_preloaded",
+            "setup_ms": 3978.995085,
+            "status": "ready",
+            "threads": 4,
+            "track": "decoded_ipc"
+          },
+          "reference": {
+            "reader": "decoded_ipc"
+          },
+          "validation": {
+            "ok": true,
+            "checks": {
+              "engine": {
+                "ok": true,
+                "policy": "bag",
+                "status": "validated",
+                "actual_schema": "l_orderkey: int64\nl_partkey: int64\nl_suppkey: int64\nl_linenumber: int64\nl_quantity: decimal128(15, 2)\nl_extendedprice: decimal128(15, 2)\nl_discount: decimal128(15, 2)\nl_tax: decimal128(15, 2)\nl_returnflag: string\nl_linestatus: string\nl_shipdate: date32[day]\nl_commitdate: date32[day]\nl_receiptdate: date32[day]\nl_shipinstruct: string\nl_shipmode: string\nl_comment: string",
+                "expected_schema": "l_orderkey: int64\nl_partkey: int64\nl_suppkey: int64\nl_linenumber: int64\nl_quantity: decimal128(15, 2)\nl_extendedprice: decimal128(15, 2)\nl_discount: decimal128(15, 2)\nl_tax: decimal128(15, 2)\nl_returnflag: string\nl_linestatus: string\nl_shipdate: date32[day]\nl_commitdate: date32[day]\nl_receiptdate: date32[day]\nl_shipinstruct: string\nl_shipmode: string\nl_comment: string",
+                "aligned_exact": {
+                  "attempted": true,
+                  "matched_rows": 65536,
+                  "segments": 17,
+                  "slice_rows": 4096,
+                  "peak_segment_rows": 4096,
+                  "equal": false,
+                  "decline_reason": "aligned values or encodings differ"
+                },
+                "comparison_strategy": "sqlite_exact_bag",
+                "actual_rows": 59986052,
+                "expected_rows": 59986052
+              },
+              "reference": {
+                "ok": true,
+                "policy": "bag",
+                "status": "validated",
+                "actual_schema": "l_orderkey: int64\nl_partkey: int64\nl_suppkey: int64\nl_linenumber: int64\nl_quantity: decimal128(15, 2)\nl_extendedprice: decimal128(15, 2)\nl_discount: decimal128(15, 2)\nl_tax: decimal128(15, 2)\nl_returnflag: string\nl_linestatus: string\nl_shipdate: date32[day]\nl_commitdate: date32[day]\nl_receiptdate: date32[day]\nl_shipinstruct: string\nl_shipmode: string\nl_comment: string",
+                "expected_schema": "l_orderkey: int64\nl_partkey: int64\nl_suppkey: int64\nl_linenumber: int64\nl_quantity: decimal128(15, 2)\nl_extendedprice: decimal128(15, 2)\nl_discount: decimal128(15, 2)\nl_tax: decimal128(15, 2)\nl_returnflag: string\nl_linestatus: string\nl_shipdate: date32[day]\nl_commitdate: date32[day]\nl_receiptdate: date32[day]\nl_shipinstruct: string\nl_shipmode: string\nl_comment: string",
+                "aligned_exact": {
+                  "attempted": true,
+                  "matched_rows": 59986052,
+                  "segments": 14646,
+                  "slice_rows": 4096,
+                  "peak_segment_rows": 4096,
+                  "equal": true
+                },
+                "comparison_strategy": "arrow_aligned_exact",
+                "actual_rows": 59986052,
+                "expected_rows": 59986052
+              }
+            },
+            "schema": "l_orderkey: int64\nl_partkey: int64\nl_suppkey: int64\nl_linenumber: int64\nl_quantity: decimal128(15, 2)\nl_extendedprice: decimal128(15, 2)\nl_discount: decimal128(15, 2)\nl_tax: decimal128(15, 2)\nl_returnflag: string\nl_linestatus: string\nl_shipdate: date32[day]\nl_commitdate: date32[day]\nl_receiptdate: date32[day]\nl_shipinstruct: string\nl_shipmode: string\nl_comment: string",
+            "rows": 59986052
+          },
+          "files": {
+            "data.arrow": "717725d5646a7e4e0c7a3a51b4433f05e7c66b828ddec60ae2648946ee6296a6"
+          }
+        }
+      ],
+      "conversion_boundary": "setup outside measured queries",
+      "settings": {
+        "threads": 4,
+        "memory_limit": "42949672960B",
+        "process_cap_bytes": 51539607552,
+        "validation_timeout_seconds": 1800,
+        "disk_admission": "8x current table uncompressed Parquet bytes, minimum 1 GiB; estimate not a quota"
+      }
+    }
+  },
+  "gpu_cpu_control": null,
+  "workloads": [
+    {
+      "id": "tpch_sf10",
+      "queries": [
+        {
+          "id": "q01",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 0,
+              "direction": "asc",
+              "nulls": "last"
+            },
+            {
+              "column": 1,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q01.sql",
+          "sql_sha256": "8aefe77a1c97459bc69acbbcdaf3b8637d8ea22dfc3ac7be732d4446da83b69b",
+          "original_sql_path": "original-sql/q01.sql",
+          "original_sql_sha256": "8aefe77a1c97459bc69acbbcdaf3b8637d8ea22dfc3ac7be732d4446da83b69b",
+          "oracle_sql_path": "oracle-sql/q01.sql",
+          "oracle_sql_sha256": "8aefe77a1c97459bc69acbbcdaf3b8637d8ea22dfc3ac7be732d4446da83b69b"
+        },
+        {
+          "id": "q02",
+          "result_policy": "limit_ties",
+          "order_by": [
+            {
+              "column": 0,
+              "direction": "desc",
+              "nulls": "last"
+            },
+            {
+              "column": 2,
+              "direction": "asc",
+              "nulls": "last"
+            },
+            {
+              "column": 1,
+              "direction": "asc",
+              "nulls": "last"
+            },
+            {
+              "column": 3,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": 100,
+          "adaptations": [],
+          "sql_path": "sql/q02.sql",
+          "sql_sha256": "a2219893f952dd2a2586ab297d909ec2d440faabb5e692f24880158aa6877344",
+          "original_sql_path": "original-sql/q02.sql",
+          "original_sql_sha256": "a2219893f952dd2a2586ab297d909ec2d440faabb5e692f24880158aa6877344",
+          "oracle_sql_path": "oracle-sql/q02.sql",
+          "oracle_sql_sha256": "228cd114a8f291d969c5f0fd3da8011288c8c39fd42d4c4fb55831a289efb8bc"
+        },
+        {
+          "id": "q03",
+          "result_policy": "limit_ties",
+          "order_by": [
+            {
+              "column": 1,
+              "direction": "desc",
+              "nulls": "last"
+            },
+            {
+              "column": 2,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": 10,
+          "adaptations": [],
+          "sql_path": "sql/q03.sql",
+          "sql_sha256": "1f120d790d4914652cbf3fbc0fa28ed6573e4adee61ae7164a8c3d99b7c6b7fe",
+          "original_sql_path": "original-sql/q03.sql",
+          "original_sql_sha256": "1f120d790d4914652cbf3fbc0fa28ed6573e4adee61ae7164a8c3d99b7c6b7fe",
+          "oracle_sql_path": "oracle-sql/q03.sql",
+          "oracle_sql_sha256": "420db74dd3f3d65e789365b7e55305e7fc2884929f2811be9c939453c0accfe1"
+        },
+        {
+          "id": "q04",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 0,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q04.sql",
+          "sql_sha256": "2a2be89752fc917bc71e1a59168ead9d00d40c40ea0bbe646206e414b372f888",
+          "original_sql_path": "original-sql/q04.sql",
+          "original_sql_sha256": "2a2be89752fc917bc71e1a59168ead9d00d40c40ea0bbe646206e414b372f888",
+          "oracle_sql_path": "oracle-sql/q04.sql",
+          "oracle_sql_sha256": "2a2be89752fc917bc71e1a59168ead9d00d40c40ea0bbe646206e414b372f888"
+        },
+        {
+          "id": "q05",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 1,
+              "direction": "desc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q05.sql",
+          "sql_sha256": "495def7debb02ab1def31da07fbc88b4796813b754832ce15d54a35dcb104577",
+          "original_sql_path": "original-sql/q05.sql",
+          "original_sql_sha256": "495def7debb02ab1def31da07fbc88b4796813b754832ce15d54a35dcb104577",
+          "oracle_sql_path": "oracle-sql/q05.sql",
+          "oracle_sql_sha256": "495def7debb02ab1def31da07fbc88b4796813b754832ce15d54a35dcb104577"
+        },
+        {
+          "id": "q06",
+          "result_policy": "bag",
+          "order_by": [],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q06.sql",
+          "sql_sha256": "3638535fb92a6026b3359a2ad9e6ed7da9ad9080152513e6fd3818d1a853c29f",
+          "original_sql_path": "original-sql/q06.sql",
+          "original_sql_sha256": "3638535fb92a6026b3359a2ad9e6ed7da9ad9080152513e6fd3818d1a853c29f",
+          "oracle_sql_path": "oracle-sql/q06.sql",
+          "oracle_sql_sha256": "3638535fb92a6026b3359a2ad9e6ed7da9ad9080152513e6fd3818d1a853c29f"
+        },
+        {
+          "id": "q07",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 0,
+              "direction": "asc",
+              "nulls": "last"
+            },
+            {
+              "column": 1,
+              "direction": "asc",
+              "nulls": "last"
+            },
+            {
+              "column": 2,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q07.sql",
+          "sql_sha256": "5e8077121a42ca8ebf5ff54e5842a614e839da945b0331e3b63d9ccad2361201",
+          "original_sql_path": "original-sql/q07.sql",
+          "original_sql_sha256": "5e8077121a42ca8ebf5ff54e5842a614e839da945b0331e3b63d9ccad2361201",
+          "oracle_sql_path": "oracle-sql/q07.sql",
+          "oracle_sql_sha256": "5e8077121a42ca8ebf5ff54e5842a614e839da945b0331e3b63d9ccad2361201"
+        },
+        {
+          "id": "q08",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 0,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q08.sql",
+          "sql_sha256": "948338f54b97a2c49aea15f8c4d609ecf244d00ad7754edcea60b4748504a1ce",
+          "original_sql_path": "original-sql/q08.sql",
+          "original_sql_sha256": "948338f54b97a2c49aea15f8c4d609ecf244d00ad7754edcea60b4748504a1ce",
+          "oracle_sql_path": "oracle-sql/q08.sql",
+          "oracle_sql_sha256": "948338f54b97a2c49aea15f8c4d609ecf244d00ad7754edcea60b4748504a1ce"
+        },
+        {
+          "id": "q09",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 0,
+              "direction": "asc",
+              "nulls": "last"
+            },
+            {
+              "column": 1,
+              "direction": "desc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q09.sql",
+          "sql_sha256": "af90ccbe30ece396209e6627c10c0086ed54208100357922ee404de8bb867e56",
+          "original_sql_path": "original-sql/q09.sql",
+          "original_sql_sha256": "af90ccbe30ece396209e6627c10c0086ed54208100357922ee404de8bb867e56",
+          "oracle_sql_path": "oracle-sql/q09.sql",
+          "oracle_sql_sha256": "af90ccbe30ece396209e6627c10c0086ed54208100357922ee404de8bb867e56"
+        },
+        {
+          "id": "q10",
+          "result_policy": "limit_ties",
+          "order_by": [
+            {
+              "column": 2,
+              "direction": "desc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": 20,
+          "adaptations": [],
+          "sql_path": "sql/q10.sql",
+          "sql_sha256": "0b48b00cffa3776b32e67e9041191dea25095e2a952ee5251990b9c8585031ed",
+          "original_sql_path": "original-sql/q10.sql",
+          "original_sql_sha256": "0b48b00cffa3776b32e67e9041191dea25095e2a952ee5251990b9c8585031ed",
+          "oracle_sql_path": "oracle-sql/q10.sql",
+          "oracle_sql_sha256": "620f9aea3c0e9bf80054148247ba2eab9b1c887e4725760420e5144c66ecc065"
+        },
+        {
+          "id": "q11",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 1,
+              "direction": "desc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [
+            {
+              "reason": "TPC-H Q11 threshold scales as 0.0001 / SF",
+              "from": "0.0001000000",
+              "to": "0.00001"
+            }
+          ],
+          "sql_path": "sql/q11.sql",
+          "sql_sha256": "4ab5557616bc55119e5ddd6d6c38363c9ead291703317114ebff983bb003cd19",
+          "original_sql_path": "original-sql/q11.sql",
+          "original_sql_sha256": "f313c766fac507c1204fb6f2bacd35719a61a11c0f69601302555150dddeda78",
+          "oracle_sql_path": "oracle-sql/q11.sql",
+          "oracle_sql_sha256": "4ab5557616bc55119e5ddd6d6c38363c9ead291703317114ebff983bb003cd19"
+        },
+        {
+          "id": "q12",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 0,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q12.sql",
+          "sql_sha256": "3814c9f4b7a476ee894c477d43cedb299603b1ed0f5315790d52839c8da355bf",
+          "original_sql_path": "original-sql/q12.sql",
+          "original_sql_sha256": "3814c9f4b7a476ee894c477d43cedb299603b1ed0f5315790d52839c8da355bf",
+          "oracle_sql_path": "oracle-sql/q12.sql",
+          "oracle_sql_sha256": "3814c9f4b7a476ee894c477d43cedb299603b1ed0f5315790d52839c8da355bf"
+        },
+        {
+          "id": "q13",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 1,
+              "direction": "desc",
+              "nulls": "last"
+            },
+            {
+              "column": 0,
+              "direction": "desc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q13.sql",
+          "sql_sha256": "4a4a0b2c5646b2cad8f220a8f4b73ccb9f0acd45542353d63c18a69227bc20a3",
+          "original_sql_path": "original-sql/q13.sql",
+          "original_sql_sha256": "4a4a0b2c5646b2cad8f220a8f4b73ccb9f0acd45542353d63c18a69227bc20a3",
+          "oracle_sql_path": "oracle-sql/q13.sql",
+          "oracle_sql_sha256": "4a4a0b2c5646b2cad8f220a8f4b73ccb9f0acd45542353d63c18a69227bc20a3"
+        },
+        {
+          "id": "q14",
+          "result_policy": "bag",
+          "order_by": [],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q14.sql",
+          "sql_sha256": "e7ec7960a4c49219fc76dc03495a1530aeb30c796413dd1dc9d501b86934f222",
+          "original_sql_path": "original-sql/q14.sql",
+          "original_sql_sha256": "e7ec7960a4c49219fc76dc03495a1530aeb30c796413dd1dc9d501b86934f222",
+          "oracle_sql_path": "oracle-sql/q14.sql",
+          "oracle_sql_sha256": "e7ec7960a4c49219fc76dc03495a1530aeb30c796413dd1dc9d501b86934f222"
+        },
+        {
+          "id": "q15",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 0,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q15.sql",
+          "sql_sha256": "1cb57383eeff60261a1b4b2a141c71d8672729d743a7dfa74d9a4bcaf69c44d4",
+          "original_sql_path": "original-sql/q15.sql",
+          "original_sql_sha256": "1cb57383eeff60261a1b4b2a141c71d8672729d743a7dfa74d9a4bcaf69c44d4",
+          "oracle_sql_path": "oracle-sql/q15.sql",
+          "oracle_sql_sha256": "1cb57383eeff60261a1b4b2a141c71d8672729d743a7dfa74d9a4bcaf69c44d4"
+        },
+        {
+          "id": "q16",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 3,
+              "direction": "desc",
+              "nulls": "last"
+            },
+            {
+              "column": 0,
+              "direction": "asc",
+              "nulls": "last"
+            },
+            {
+              "column": 1,
+              "direction": "asc",
+              "nulls": "last"
+            },
+            {
+              "column": 2,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q16.sql",
+          "sql_sha256": "45085e7672cb1500e625e048156fc55369e7a9bc91fd3647c3f7735a870c3ef8",
+          "original_sql_path": "original-sql/q16.sql",
+          "original_sql_sha256": "45085e7672cb1500e625e048156fc55369e7a9bc91fd3647c3f7735a870c3ef8",
+          "oracle_sql_path": "oracle-sql/q16.sql",
+          "oracle_sql_sha256": "45085e7672cb1500e625e048156fc55369e7a9bc91fd3647c3f7735a870c3ef8"
+        },
+        {
+          "id": "q17",
+          "result_policy": "bag",
+          "order_by": [],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q17.sql",
+          "sql_sha256": "dfc7f00ac8a500c2ac2735b05b41b462bbe4af9ce7cd6c37e42d1bb9df4a02e1",
+          "original_sql_path": "original-sql/q17.sql",
+          "original_sql_sha256": "dfc7f00ac8a500c2ac2735b05b41b462bbe4af9ce7cd6c37e42d1bb9df4a02e1",
+          "oracle_sql_path": "oracle-sql/q17.sql",
+          "oracle_sql_sha256": "dfc7f00ac8a500c2ac2735b05b41b462bbe4af9ce7cd6c37e42d1bb9df4a02e1"
+        },
+        {
+          "id": "q18",
+          "result_policy": "limit_ties",
+          "order_by": [
+            {
+              "column": 4,
+              "direction": "desc",
+              "nulls": "last"
+            },
+            {
+              "column": 3,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": 100,
+          "adaptations": [],
+          "sql_path": "sql/q18.sql",
+          "sql_sha256": "8c5076061727d974f96708f0da930fc58843eac297a80c7ad658d64d152a19bb",
+          "original_sql_path": "original-sql/q18.sql",
+          "original_sql_sha256": "8c5076061727d974f96708f0da930fc58843eac297a80c7ad658d64d152a19bb",
+          "oracle_sql_path": "oracle-sql/q18.sql",
+          "oracle_sql_sha256": "07d34393b6aac758b2d1f817283bf2c97052967e4bb9832b76bcf85793d55c86"
+        },
+        {
+          "id": "q19",
+          "result_policy": "bag",
+          "order_by": [],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q19.sql",
+          "sql_sha256": "341f97d1f74deb30aca2a8b0ee849772a3b0e098a06cf12266c63573cb985478",
+          "original_sql_path": "original-sql/q19.sql",
+          "original_sql_sha256": "341f97d1f74deb30aca2a8b0ee849772a3b0e098a06cf12266c63573cb985478",
+          "oracle_sql_path": "oracle-sql/q19.sql",
+          "oracle_sql_sha256": "341f97d1f74deb30aca2a8b0ee849772a3b0e098a06cf12266c63573cb985478"
+        },
+        {
+          "id": "q20",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 0,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q20.sql",
+          "sql_sha256": "fa96ad5cb897bf31ec9b96a6b2a0d1f7132e71e2f481321e6db16628bc3e5fd5",
+          "original_sql_path": "original-sql/q20.sql",
+          "original_sql_sha256": "fa96ad5cb897bf31ec9b96a6b2a0d1f7132e71e2f481321e6db16628bc3e5fd5",
+          "oracle_sql_path": "oracle-sql/q20.sql",
+          "oracle_sql_sha256": "fa96ad5cb897bf31ec9b96a6b2a0d1f7132e71e2f481321e6db16628bc3e5fd5"
+        },
+        {
+          "id": "q21",
+          "result_policy": "limit_ties",
+          "order_by": [
+            {
+              "column": 1,
+              "direction": "desc",
+              "nulls": "last"
+            },
+            {
+              "column": 0,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": 100,
+          "adaptations": [],
+          "sql_path": "sql/q21.sql",
+          "sql_sha256": "b29463f30a64e45a795047ee6e557e6c3c1f01fc612acc997873594048e74b59",
+          "original_sql_path": "original-sql/q21.sql",
+          "original_sql_sha256": "b29463f30a64e45a795047ee6e557e6c3c1f01fc612acc997873594048e74b59",
+          "oracle_sql_path": "oracle-sql/q21.sql",
+          "oracle_sql_sha256": "cfa8a51490c2630943ffcfab649eff7968cbdac6683b0bfe0f58e36c19c08e7f"
+        },
+        {
+          "id": "q22",
+          "result_policy": "ordered",
+          "order_by": [
+            {
+              "column": 0,
+              "direction": "asc",
+              "nulls": "last"
+            }
+          ],
+          "limit_rows": null,
+          "adaptations": [],
+          "sql_path": "sql/q22.sql",
+          "sql_sha256": "d8ed6332e75f9193391000ba071e17adcf735a2d99c5a4da0f7c13d695ccbd42",
+          "original_sql_path": "original-sql/q22.sql",
+          "original_sql_sha256": "d8ed6332e75f9193391000ba071e17adcf735a2d99c5a4da0f7c13d695ccbd42",
+          "oracle_sql_path": "oracle-sql/q22.sql",
+          "oracle_sql_sha256": "d8ed6332e75f9193391000ba071e17adcf735a2d99c5a4da0f7c13d695ccbd42"
+        }
+      ]
+    }
+  ],
+  "created_at": "2026-09-16T04:36:41.796493+00:00",
+  "environment": {
+    "platform": "Linux-6.17.0-35-generic-x86_64-with-glibc2.39",
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "setup": {
+      "track": "decoded_ipc",
+      "threads": 16,
+      "memory_limit": "34359738368B",
+      "process_cap_bytes": 51539607552,
+      "temp_directory": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_decoded_ipc/scratch/duckdb-temp",
+      "tables": [
+        {
+          "name": "region",
+          "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-01/decoded_ipc/region/data.arrow"
+        },
+        {
+          "name": "nation",
+          "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-01/decoded_ipc/nation/data.arrow"
+        },
+        {
+          "name": "supplier",
+          "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-01/decoded_ipc/supplier/data.arrow"
+        },
+        {
+          "name": "customer",
+          "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-01/decoded_ipc/customer/data.arrow"
+        },
+        {
+          "name": "part",
+          "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-01/decoded_ipc/part/data.arrow"
+        },
+        {
+          "name": "partsupp",
+          "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-01/decoded_ipc/partsupp/data.arrow"
+        },
+        {
+          "name": "orders",
+          "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-01/decoded_ipc/orders/data.arrow"
+        },
+        {
+          "name": "lineitem",
+          "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-01/decoded_ipc/lineitem/data.arrow"
+        }
+      ],
+      "reference_lance_io_limit": null
+    },
+    "containment": {
+      "path": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/safe-build-2069808-1485.scope",
+      "memory.max": "68719476736",
+      "memory.swap.max": "0"
+    }
+  },
+  "limitations": [
+    "CPU provider development run; residency/resource/concurrency certification pending",
+    "both APIs collect Arrow results; query-wide result reservations pending",
+    "operator-level resource attribution and per-query RSS sampling pending",
+    "engine plan text may be capped by the production QueryMetrics API",
+    "GPU residency is observed per query; isolated synchronous cold-upload timing is not implemented"
+  ],
+  "seed": 20260905,
+  "command": [
+    "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/scripts/benchmark/__main__.py",
+    "run",
+    "--dataset",
+    ".scratch/public-bench/tpch-sf10/dataset.json",
+    "--engine-binary",
+    ".scratch/parallel-aggregate-input/ipc_dictionary_benchmark_embedded",
+    "--output",
+    ".scratch/public-bench/ipc-dictionary-residency-32g-01/canonical_decoded_ipc",
+    "--track",
+    "decoded_ipc",
+    "--provider-manifest",
+    ".scratch/public-bench/canonical-sf10-providers-01/decoded_ipc/provider.json",
+    "--threads",
+    "16",
+    "--memory-gib",
+    "32",
+    "--process-cap-gib",
+    "48",
+    "--samples",
+    "3",
+    "--sessions",
+    "1",
+    "--gpu-residency",
+    "mixed"
+  ],
+  "implementation_sha256": {
+    "scripts/benchmark/compare.py": "3ff90cc9fe8430ee242ee9921141047ca09d809ef71cb8b61acf2f66a7fcffa3",
+    "scripts/benchmark/contract.py": "7b9662bb7c26c9a0c056ba7524e441628e4e5b3c519fcb24d4afdb5acf6cd063",
+    "scripts/benchmark/duckdb_worker.py": "75ea8818440d62247e28b259b3998afa6d694d4d550fea5a26b9b233920e4028",
+    "scripts/benchmark/exact_bag.py": "42ef8dfeef0924da8d24d59402b90164988197011153a1b1baaad84abe35f1ec",
+    "scripts/benchmark/gpu_residency.py": "733fc371f7ae3acf39f9c85ae2b40826af3167ea69ffa3c5b5db7aaaa5088e45",
+    "scripts/benchmark/isolated_windows.py": "651fb971115ad694aac70fd4d8261f134d542b524c2b99a8b6e192c6b532af9f",
+    "scripts/benchmark/ordinary_runner.py": "f0e6e00b8668eac2d1be3c4942af79136e8c9dcfd3ee565546bb6001f07714f3",
+    "scripts/benchmark/paired.py": "86194a5e377cd990b2108ae4b3f75c8f4c2a7b152e330d3950749d5882212f1c",
+    "scripts/benchmark/prepare.py": "ea69ecbe7fbf19d023226785011ed45b65faebed048056f7a77c9300d4c04e82",
+    "scripts/benchmark/prepare_public.py": "4d5ea03ee0449c6a99cc33d816fb099e6f246dff8c3e061a52ecba27a2fffbe9",
+    "scripts/benchmark/providers.py": "f651e5ed5c1f51ade24b6c683e16ba3f290ce061e60ac8ca638b0d2bf280bd31",
+    "scripts/benchmark/query_gate.py": "5f56ec359b2af6ef22caed4c75092251a09593dfcc15525059cfe6b80a57af49",
+    "scripts/benchmark/reference_runtime.py": "4502c8db6c7a363895670ce67c19539dde56c543b6a452d794151394d82dc5ca",
+    "scripts/benchmark/resident_runner.py": "37b33992d2410f6d192d3d1d03f7f3a68468aa4a02c39702d84205eed3b53ca3",
+    "scripts/benchmark/run.py": "cba849aaab17b8d71ea86cb1bac173eb749f4656214e126e8d194a2223b13c20",
+    "scripts/benchmark/source_manifest.py": "8d935ed22bdbee4dc603d6d461a6e46bd66857c76a8aad3f42d821efab076d12",
+    "scripts/benchmark/test_source_manifest.py": "dc6ffbcf7a1b010accb1ead0f8bdd1711adc4a0a54184325bc18208019b59397",
+    "scripts/benchmark/__init__.py": "6fea5171377bc8d169b04c06c141d8be5d496cde3c0562d00a9cc3593f8c2324",
+    "scripts/benchmark/__main__.py": "e18bf2371b561e457fe770bd7f7f5bb617badf985695f58c62a2fae3d77784a8",
+    "examples/benchmark_support/ipc_preload.rs": "a79abdb2606c9060a408b9b418c6824c335ced2c0a8a2aa415ab07bec9dc9cfe",
+    "examples/benchmark_embedded.rs": "74d7fc3fade1f71946815c5626298db573b31e60d63f97d8fab5314192794230",
+    "scripts/benchmark/tpch_sql_sha256.json": "f04fa5bee4b6712238e9d93663f855c9c621e3e3d58096b9d53918db7d7248a0",
+    "scripts/benchmark/licenses/duckdb-tpch-v1.4.4-LICENSE": "9707215566ccff424af5d763992690038d34320f1d9b596d237665975ee50476"
+  },
+  "engine_source_sha256": {
+    "Cargo.lock": "dfb22816d8970e10383b379cc64da281c0bf21a349b71f847cdcfb61b4ff5a06",
+    "Cargo.toml": "e67a78769bfdbcf7ecf609523be645c1907a6185302cedaeb6f10f3b53e474ce",
+    "src/arrow_ffi/array.rs": "4e13a878c0d069c96ccac90cc88ac97d36778a93b9043349f81e847e72d8b022",
+    "src/arrow_ffi/codec.rs": "f47fa5a3ba3d66d25888a84dd3302952347714506903919a2b1dd45716fe772e",
+    "src/arrow_ffi/export.rs": "4e937762401d6ad46e6f726b967a20a7a3e44de2ed4e880dd4444e2c72e81f0a",
+    "src/arrow_ffi/import.rs": "a5be9c2033eb03b0b5cb933e7a3e2cf9b48b9492434cb04d0e045fd09cc45c94",
+    "src/arrow_ffi/mod.rs": "81ae73532bb51ffc22bda4d3fef031dab1b66ef7c3e7a4ee600f85a4aae133de",
+    "src/cli/helper.rs": "7e0d86d429990369116303f5c3c3f8a4211d7d5ab90f69984b65f948fb3eee4b",
+    "src/cli/mod.rs": "ae11720baeba4847ef13b7070f8ed73e2aaa5639f9e1cd4b182a9bbdce3a64b1",
+    "src/cli/output.rs": "faab87b144ebdf5f47f21a0f57cce441fb9291e443aaf5e8247cfec4d46d6472",
+    "src/distributed/coordinator.rs": "16f46c0ff197586ab35d2b9f9944b6156c9af30f278850be0dde79c50d17d0ed",
+    "src/distributed/flight.rs": "9ba390865c852170f8c21b892c0ab71045a203a0cc0368634b93ccb5d7932d3c",
+    "src/distributed/gather.rs": "f2db42c5c17cffc493ee6f9d6a87aedb0d58824ad473ea7fc0a976859145397f",
+    "src/distributed/http_client.rs": "0d87271ee3547d95753747c91c084e88a3b766d29f479422aad36a735740ac27",
+    "src/distributed/membership.rs": "cc6c8503e6da5319e577ef9fa174ee49a47776bda4581d21db5e636dcf609577",
+    "src/distributed/mod.rs": "c4a4731c9ae2ba97a2e6d42d6943c0162226493ff4175768740892e808e8b424",
+    "src/distributed/plan.rs": "3ac12757478c3d6ffcedc6b1f2b9df875f8189a63c97039585a7a4da1726c6a0",
+    "src/distributed/query_log.rs": "c93447abf56f87f99bd49e092c80bc2eb2c0d8c4c2bcfe64bd7407c239af1818",
+    "src/distributed/server.rs": "b0154d1187c2f6a173dd6e957e2e29633bb060748224ca91822b00fccb4c233f",
+    "src/distributed/shard.rs": "07ea5ef8d92745f7f74e8e384fee421be4000a4993fba12df9de858fbd98f201",
+    "src/distributed/splits.rs": "733e39345255c48ef8f2f5b710ca62288db93a653ad6e6b713ef20857f425b68",
+    "src/error.rs": "14b25cd7325e52e7e4e330c072a936e75231e71c9e2b664a9620b58be42469d5",
+    "src/execution/alloc_profile.rs": "1ab0fd016faf1cd7c26899372168261e15398c21475d3ee9efc51f486ad8749b",
+    "src/execution/context.rs": "9fea5be17a29a33127e474bdcbd408e64ec2201d83afecd8ed141e698d295651",
+    "src/execution/expression_memory.rs": "48a83d5e928a506e0577e58154ae93152553324cad446af3d2acf21e2d58b2de",
+    "src/execution/memory.rs": "37f269cbebe46b942f1cb6abaa8b24c61982518fd416267e51d45bea7fdf21c5",
+    "src/execution/mod.rs": "7ed84804fbf367f8e3e7c8b37750b12e34859cfc4b21436b4da170879d30b767",
+    "src/execution/reserved_buffer.rs": "cfb8dfc41ad76b29fa6ff4ad4ea8792a6205a9ce043d4231b80201de5dca139d",
+    "src/execution/reserved_scalar/decode.rs": "b604b0b0b0d0267b3790b807e33d750b1641e722274e89cd6e0b9fa7e610ccc3",
+    "src/execution/reserved_scalar.rs": "2cb21df8b02222636bbf075517557a76e17af9c3ceebcf2d99bd36fc9f52ba7b",
+    "src/execution/reserved_vec.rs": "92ba77c5166216f522fae11391744f53689c57bd87597992c114e0963f910a0a",
+    "src/execution/retained_batch.rs": "f2bde904d689462bcc7e7b834b423c8ebfafa58a0af8031ee2faa24c01644a22",
+    "src/execution/topology.rs": "affda0b2e614fe3610fa8e1819b08621cd5bc81204a25f54f4f48f9e501802f6",
+    "src/lib.rs": "0241e4d49672885aa3382a6520b64a06759ddc88ebbcc414b9d5e9369c567f54",
+    "src/main.rs": "d289aedee46cf126177fdcad74dbaea6676f91b1b10f9c171ede92281d74bf18",
+    "src/metastore/gravitino.rs": "d7025da3a854a3eb7e142c95e5a892d1079bfc1a3cf9bda545e40c645175b97c",
+    "src/metastore/mod.rs": "ac0fd83c675851715b1d932f99bc5a881ee33e2b78c7a8ac3a30280b5443232d",
+    "src/optimizer/cost.rs": "2b6497c774bab439f7260b88fc10d92564701401c3c596d07a70fe540c0e1f2c",
+    "src/optimizer/mod.rs": "af0bc8866487c5395f8beb8eeda0449aeaddb29ea389554cec3883f3b9632400",
+    "src/optimizer/properties.rs": "86941801b5ad2e34725e312b5ad3b5c590c53f93c00ff658e4c6a33660d1127a",
+    "src/optimizer/rules/constant_folding.rs": "ec4c8a2f19573504ddd87331390376bba85fc5559cfd1c69004c83714c787023",
+    "src/optimizer/rules/derive_or_predicates.rs": "092cc191820d0c11ecf4d59746f1356fbea1640b8298eb2754aa2dc96c4f66ce",
+    "src/optimizer/rules/eager_aggregation.rs": "725121518f2bce6adbd6ce75988e28c5a19e6a3852d8c4e25409149287d17efb",
+    "src/optimizer/rules/flatten_dependent_join.rs": "c45dffbe8eb86c4fa430f785c5cce82315592ea703538171d42138d3af8d1493",
+    "src/optimizer/rules/group_key_reduction.rs": "48624dde70723389b1713f538b5c2062cfc97e3c616c4c3f787c7661ce4dd06e",
+    "src/optimizer/rules/having_total_cse.rs": "286dee3785f562e04c1f25051a558ed1c400ea96ce1d3a003b64000e56f01b13",
+    "src/optimizer/rules/join_reorder.rs": "702a408036f329fe1778c31d6662df9eb5ead0bea2f090651d7156e538683f60",
+    "src/optimizer/rules/mod.rs": "c416b301fe9d220073bb07ab6a94c0479d40fc2d8a6f21b419bbd9ddd0c70cc8",
+    "src/optimizer/rules/packed_group_keys.rs": "c8a2be66b947807dcc2ef1772ad1357e4b28542e3139fe4f293120275cc70ddb",
+    "src/optimizer/rules/packed_join_keys.rs": "bb02d5c28c34458b3264605004c348c9cd1d80fde9ec023662dda70e0189018f",
+    "src/optimizer/rules/predicate_pushdown.rs": "88ffe99d3b00aae65c8f0f1cee2f2bdbaa6508b8ec27ed17e77681d2508fdcd7",
+    "src/optimizer/rules/projection_pushdown.rs": "d0800a9da23db870b208b8eacf96268162bc06e5e774cd036922eb59d03fcecc",
+    "src/optimizer/rules/semi_join_pushdown.rs": "ec7f29a378cdfb9c2ead6501edf57f8232a0c84aa8ee8975c452a4736ca2e08a",
+    "src/optimizer/rules/subquery_decorrelation/empty_result.rs": "f7c10dccc524ccf1f7a90d5f437f6e49a98e3073e94a96aaa03b93196bae427e",
+    "src/optimizer/rules/subquery_decorrelation.rs": "9ebe76cd92f6eb7bfc89116530ad7d7f1aa2db9ebe5513efc3d3de38fac92e51",
+    "src/optimizer/rules/vector_search.rs": "16f6d810a51bbf04763c2cde263089fd87f98bcdf1add8042dd2b1e1e0406d74",
+    "src/parser/ast.rs": "e0b5461e40a516f07cf31c174d1c71491ec6561e754a8179d911a926234065d0",
+    "src/parser/mod.rs": "b27a82e08c960329a2c9ec8e2430af1a0d7afcee365b00e08a5f761b76fd96d5",
+    "src/physical/compiled_expr/decimal.rs": "a2bbf8c86211871b6ed94c0a63410d5ba02feea92013263dbb81f3afbf5582b8",
+    "src/physical/compiled_expr/numeric_coercion.rs": "27a5ef1e285c8b031d6de15808fb5a2b41769b6198454338e666a25b4eaea212",
+    "src/physical/compiled_expr/numeric_coercion_tests.rs": "4cb18358653866d9dbd1b1b935a3973b0f8943bb1b5fb73699c7e536c26b9319",
+    "src/physical/compiled_expr.rs": "4fe9fca7e78cac8c61b9770a4a8f2832a14b9a14fc677caeb22f4de7b900bb06",
+    "src/physical/dense_domain.rs": "f46026927b99ae7c8e1b4c10082f795ec69fb063e461be1659bcae5aeb11d9cf",
+    "src/physical/fixed_width_output.rs": "8fa5375d4fbbf282aa38f4fec806ba84ea2afcb15f12929d5af2c8c85dba9c04",
+    "src/physical/gpu.rs": "514235bae65ebfc80545e1e19e8e444f541bbb855d2e12229490645de7cfa24a",
+    "src/physical/mod.rs": "a5ba5f45e3278fbf777cfe1881b0784ee1e53978c8a2c54b25a9a776eb366ccb",
+    "src/physical/morsel.rs": "24a72040b8cb7903d6ed6242e117d19dba4eea4f65b927e2fe1d173d18711bc8",
+    "src/physical/morsel_agg/admitted_output.rs": "f7a610eb8e7ff1e13dc29a5a33b63e47b585c9b375557ae7128aa4d8b8b62d3d",
+    "src/physical/morsel_agg/decimal_output_tests.rs": "784393bbae01ebb9a38fd04e1719d48142c53500bcbe64f4b45477b565fbbc68",
+    "src/physical/morsel_agg/domain_tests.rs": "a76b5d2c06284b89ba7b540d9d853b4a001ed39288b098736e8e896b07f40be5",
+    "src/physical/morsel_agg/fixed_cell.rs": "586ca436942131adfc5953074071c3d15bd443729c2b9a95de4cab59b3e82258",
+    "src/physical/morsel_agg/float_extrema_tests.rs": "ff5267033f5f39e867a64805569205de800173e9f5511a2840242df05768cc72",
+    "src/physical/morsel_agg/group_rows.rs": "0e2b9d06268d5c3843c38529348817a13468fcf1ae77ab90b4114bde1d6efb72",
+    "src/physical/morsel_agg/ingestion_controller.rs": "407c8f646f65bd3b2ec8ddb5e3e8cc20fec3fbdd0e9261b69ce33a8eb1199cbb",
+    "src/physical/morsel_agg/ingestion_cursor_tests.rs": "0c46391d306967995896bdc1cafd2e6d16aa420b6d685c0084a2b39570187baa",
+    "src/physical/morsel_agg/input_frontier/tests.rs": "b07cec0d940551976279e8e50215dede04719ac22ad47566ef8c631c879f4070",
+    "src/physical/morsel_agg/input_frontier.rs": "848de45230ba58aff7021c4c10b75eaadfc6001a9e5f86fe84614604111f5782",
+    "src/physical/morsel_agg/key_rows/arrow_input.rs": "8831df586ce37f33c20cf40732a42aab3d93ba8932c8f323b9987e1a8394a79e",
+    "src/physical/morsel_agg/key_rows/bound_arrays.rs": "dd6971b146a6b13a71fa04cb1962e8f9b5a66b2f472de86e1700e9b02407ba5d",
+    "src/physical/morsel_agg/key_rows/preparation_benchmark.rs": "3b4fd1c2e9fb10cfaa87ad50001b0b40035d38cb4dbf5cb0b1dbff696061241f",
+    "src/physical/morsel_agg/key_rows.rs": "8369be7d1aa5e8f3f57ca21b8267e36ee3ea641253d1b662a0ad44001a8d69fc",
+    "src/physical/morsel_agg/live_spill.rs": "806ef0785e6c7b700bbeb0735039e0e383d2399ed940eb33ce6fa65833707d7a",
+    "src/physical/morsel_agg/migration_admission_tests.rs": "8da8544bc82258904f3e7954690c55ad915ee77aecc5727a9d9aab8f569a6ebd",
+    "src/physical/morsel_agg/output_quantum.rs": "ed8fbd5b3fb2474d2c705badaadfea6bebf37b9f2141165a66601661818c0b9c",
+    "src/physical/morsel_agg/parallel_controllers.rs": "05b256cd7a8b386209c6bafe0fb3595e6300620f886a7e895efd41b8f0f49f63",
+    "src/physical/morsel_agg/parallel_merge.rs": "56028158442383a12827cb79c42664e54376f1d88fc393e85b357e626fed927e",
+    "src/physical/morsel_agg/partial_merge.rs": "5eee1661af2ea8000b35e0f1deaf551cd43d8f6e758a1919c52ca198130ea703",
+    "src/physical/morsel_agg/partition_scheduler.rs": "39bc9b7da499e5b4c10ee8de4859d60da076e045622da2a3ba89532d6a4f9564",
+    "src/physical/morsel_agg/prepared_input_tests.rs": "983e60b2a83ebaef90212ab48b2b38ff1a992e9cb51dfd4ad43c0e7e385331ac",
+    "src/physical/morsel_agg/prepared_keys.rs": "fcab731291c4fe344044b6926b79116000d7c32533dfa219dfef6e485ef347d8",
+    "src/physical/morsel_agg/raw_state.rs": "af648bb7c18b0c37998fde6f8285ffc0f1ab0cff08545b8a4cb3afbcde3fd154",
+    "src/physical/morsel_agg/repartition.rs": "770bc62fa07b36bf072f92267ad7c2c12f345120d48de83b2c024a2254afcadc",
+    "src/physical/morsel_agg/row_router.rs": "39001588306b3c94b1e68b7ca67d0905f860e6799d1840d893ffc982fe0c2610",
+    "src/physical/morsel_agg/row_selection.rs": "a7ceaf7a4a9fd61a67d1cebb70ef804cb3d76091d85753df391b9dedc32eaa4e",
+    "src/physical/morsel_agg/run_merge.rs": "a50cfd357dae8dae924ff67a1a3a1fe445eba7455675dc16967128edb17ecbe4",
+    "src/physical/morsel_agg/scalar_state_codec.rs": "b5c99fe3b0e5840b04e69f1b8030dba6fd1cb1296f5ef0334e83117ad6290cf0",
+    "src/physical/morsel_agg/selected_state.rs": "f58aba9b7543efb5bb8b6f978e1252cb41fc27ccf2f3d25fc2db5e6ae82517f3",
+    "src/physical/morsel_agg/spill_files.rs": "1bad76239b932808bfd1778c80aee56c4baf0e25264d6517eb4da1a55d551e32",
+    "src/physical/morsel_agg/spill_frames.rs": "e8d1eed16915dce278d29ed2079074650a3d612f1b2a4bbaccf7e1b165083691",
+    "src/physical/morsel_agg/spill_io.rs": "3fd56697e0d3069340c27aaf802328e0588f849927995e78d8183ba8bf5d3a30",
+    "src/physical/morsel_agg/state_codec.rs": "750478e04fd41c01321d22bfe534b563575562f39406be9496b5e7f7b422315a",
+    "src/physical/morsel_agg/state_rows/array_view.rs": "618fa6e5dfdc6f6b1ecdbe1caaffe1d183eb423cee7a02dec986a750c2c1e20d",
+    "src/physical/morsel_agg/state_rows/batch_binding_tests.rs": "5a1c89aef3e4b5a274209b44b3d5b23e66c16f1a8285a79601da4af2ce1f9fd2",
+    "src/physical/morsel_agg/state_rows.rs": "76d99c10ffc189351190ca5b182a735293502995e97a83404e238517d0ca7b0c",
+    "src/physical/morsel_agg.rs": "81df6df2a2c6f753d9ab810a4e7e1b1fa5b3db2bf5ef8e842fe45e131a9746e8",
+    "src/physical/operators/aggregate_fallback_pool_tests.rs": "5378b23b81e853f5637767b914494d26a43e9de76761a98e1867892ab8e9add0",
+    "src/physical/operators/closed_subquery.rs": "f6cbf1ecd28459fca06c4788e5dc9911017291906b1fb679093ae19978a8a71e",
+    "src/physical/operators/delim_join.rs": "fc3625c20e84eaadc60f5b12d198ab48ce3b2c9a9e2b90af25853f6c239f0ff4",
+    "src/physical/operators/filter/admitted_batch.rs": "f6f23b068ef477c659427e0636a97da4d4c0d313a42ce9255c77bd3490b5d6e0",
+    "src/physical/operators/filter/admitted_input.rs": "d8e3e03b5d2fe9d2a6d059f96b07daf3a4ce93205996d7bea934940604822841",
+    "src/physical/operators/filter/temporal/tests.rs": "1a565eb0af4247fd430feb5314e05e439821261ff638e25a9188bd03a8291dbf",
+    "src/physical/operators/filter/temporal.rs": "e676553381b3718824bb070aa0c3d652ad52c1d8f9c71895c5a0ce2a76408905",
+    "src/physical/operators/filter.rs": "5212c09685740343dedd261ea21190e386b1a2b9b26dcc9a34deb8338d4b5c21",
+    "src/physical/operators/hash_agg.rs": "7ba5433fdbd75fbdf2fa11c9f908884a1ec6d147c1e734ee789b8836c76669d5",
+    "src/physical/operators/hash_join/outer_probe.rs": "64166bc7d73b180f5d84c4d9cea66f503269df192332c8293fbde7cd43924b60",
+    "src/physical/operators/hash_join.rs": "eb0f4c16192e77d81325dd2a3b994736cbdfa9087138d01fa5460588a853c691",
+    "src/physical/operators/iceberg.rs": "db8c902203f453f9ae767486be83864e65b41299ae11b9233800da88dffca93b",
+    "src/physical/operators/initialized_membership.rs": "af63218950e385433c88e8b7990553041302c67966526863954ec3b964029988",
+    "src/physical/operators/int64_membership.rs": "78ae84f30e61524e5b6c0e4a97db6009c3eb92aa36d53bbcf8eb605e8c5569cf",
+    "src/physical/operators/limit.rs": "06cf2cd07de67e709005fffb30fc6ac0c1d6aa2e4a7e55a21b5c32cf6fef595e",
+    "src/physical/operators/mod.rs": "9ccfb86bf665cdf9e0754bfcfd823b435cb7c228183115dd9b87fde758785e59",
+    "src/physical/operators/morsel_agg.rs": "68876ead597db2bfc1a977d8ff121a18a83670fc6cfa3cbceb6c724628e0a355",
+    "src/physical/operators/native_scan.rs": "7ffcab9104fdf02a2038150de3f542a034c402b75a0f8ba3444d6a7a94611a64",
+    "src/physical/operators/parquet.rs": "9047114331f6a2471c597e0550ccead8e8235581189d2f83df37adf52808d194",
+    "src/physical/operators/project/admitted/tests.rs": "e4998b0967e331fdeda936c858826b0f5d9a09f83ae3d319795772222bb7ea0a",
+    "src/physical/operators/project/admitted.rs": "3ed64566cef9b1d5f2f4143aea2db545f02906668c25590900a37a1eea667bde",
+    "src/physical/operators/project.rs": "b1daa415631ede633b172ac9bfcdb69825f92b6128d3701ea2a6216f89f26f3f",
+    "src/physical/operators/regex_replace.rs": "9c6fa8f4616a58a8446b5e97b7a1a5c7e758b43ebe4710e6f0a2f069aea2676d",
+    "src/physical/operators/runtime_filter.rs": "c95f18c983a2cd18c83bee4742d06cc0d6f2f338de5e561bd49e3874c9509dab",
+    "src/physical/operators/scan/admitted_memory.rs": "737354627782e31182884755253f7841840b6aade298046b4a2ce0efe0fc75c3",
+    "src/physical/operators/scan.rs": "921cd4c4c6a7e2a3150ed1925d33613a358c48710101dbd8dd17e4fd9e9bd646",
+    "src/physical/operators/sort.rs": "d32f24a14cd005e5cb17eb6f5a1ec89bb45f1228a4433a6822c90574754e3054",
+    "src/physical/operators/spillable/admitted_queue_tests.rs": "0b3a076b453a5dfc926f1056036fd26047b9549af25323de6fbcb1651a09785b",
+    "src/physical/operators/spillable.rs": "0e294bd7cb6cb525a723d653ce99870419a8fc2e3327e5f7a0d5ff420344a9a1",
+    "src/physical/operators/streaming_parquet_scan/admitted.rs": "9053651ca3c42fa78428d8e95b959660e29f8b8ea163f00ae2e06e8e682a2422",
+    "src/physical/operators/streaming_parquet_scan/admitted_filter_quantum_tests.rs": "f67f9ea24ee980c70be7266b5e0bdc70fd5c6ce152be0cc724c9ffbf4f701942",
+    "src/physical/operators/streaming_parquet_scan/admitted_quantum_tests.rs": "e30a29759be2ae01f7a3f3d06b1c0c27c09f2f2cc5e558d151726c77950235bd",
+    "src/physical/operators/streaming_parquet_scan.rs": "90795668137abf3438c48fcb60a61b73f4e2ee4e428f9d0e9de22c6c452eecdf",
+    "src/physical/operators/subquery.rs": "38a865663d4347f99a5640dfef0cfcd49684883ab26eb7cf952ca68cf825ba73",
+    "src/physical/operators/substring.rs": "5119a161f7801104f8c0b7c042b0a60c0e13ff8f9c3f721ebf8c78e2e888fc43",
+    "src/physical/operators/union.rs": "3f68efedec4db99d133829a74537703b9d0d6cde63f196c2013366152fee0957",
+    "src/physical/operators/vector_search.rs": "7d725d423f739e9a85c04864d314870c67207d25224205b1dd2a7a1d6dd0feba",
+    "src/physical/operators/vectorized_hash.rs": "d519d2420b82cd2300e06bf87646db8bd40dca3694f525ea6cf8fcdb80affc07",
+    "src/physical/operators/window.rs": "4ff446b2fe5ed59cc8a6e106279948a01872b4888f23d93f9d0e00d8c1857a47",
+    "src/physical/plan.rs": "a12e03cf36fa84fd5dca298dd3b31bce49217be1c33a74dbb9e306943853ebda",
+    "src/physical/planner.rs": "61724caa3024d16ad44878973313f4624b0d59162bcc2df2d1f9a3d926d46e7b",
+    "src/physical/queue_layout.rs": "61c34193260ee64a3866805b933b261e3abf8385e407e98a52352e4d69f3e442",
+    "src/physical/vector.rs": "93b87017bf0fe711407fcb8a7b2568cb62664bd219b9366155ef21d2927be493",
+    "src/physical/vectorized_agg.rs": "1002f8991ece3839408b6813e76a1d69c7133f4b00ee4c9fdc65673aaabf7985",
+    "src/planner/binder.rs": "c243c095bf072f81c6119cfe7e2c61979e661b93ebbaf6a9b863926a3120fbc7",
+    "src/planner/decimal.rs": "96b35f63093d3e3c529539a71e4827a73a6a3ac8aafad9eb61bd7f7404bfffb8",
+    "src/planner/logical_expr.rs": "312aa0abac9bd8f271dcf2d2a9f8d5792ed44c34c6d690dc98d6e7f392b1dd03",
+    "src/planner/logical_plan.rs": "95c4be4370723be67a5102570f58f08205ba113a70a645277a2c49667732162f",
+    "src/planner/mod.rs": "9f39f154aa98159a219a046da691d4302bcd4534d3c51b14f733b380c69c2260",
+    "src/planner/numeric.rs": "a091751cc137d5dd21cfee30156dc7529c0be6dfb3d03ec38f0d744d7941ccb3",
+    "src/planner/reserved_cast.rs": "ab5b1ccb286332abaf8d7154fa0106a37c7393f1b0eb29a4817e6fe8103dfad2",
+    "src/planner/reserved_decimal/tests.rs": "49759b8638cdb5fc8acb473a02129095f4c6fe8fb59ab15f9a39db0b9b940041",
+    "src/planner/reserved_decimal.rs": "79f62d61066b852bf98d054da8dab7147a61368e6d4de8e91fe0e6b07c7632f7",
+    "src/planner/reserved_literal.rs": "63c09731f6ad405803745f285864d36531e24e8c38e73bab0ba48a21b26e42f4",
+    "src/planner/reserved_numeric.rs": "5d36309d4405bb50199a0a4c4a6e572f4c67c2afd1aaee2f0a4bb0c13e7e9e86",
+    "src/planner/schema.rs": "26a165bb2842ba164d8bf7a8b0ecb6f75fa38ac4aea16af8c516475fdcdbf4a0",
+    "src/planner/temporal.rs": "f6c3128b0fcf5ef0ac32802289ee1cdeeb4d34c072c3002c1f417f9abf23ed56",
+    "src/planner/vector_types.rs": "3fa6ec6802eb31fce0f7c3c155828ad476c5ab57765fe7c356ef887677926280",
+    "src/storage/admitted_batch.rs": "d5d213123fb00d91002caec7ccd070e80064e1413f048b4dad7e6719676946b5",
+    "src/storage/admitted_coalesce.rs": "d5eda6cc46d2a6cabce85ad648ee0b00b2f51530b8147571b0d4998f39fd996c",
+    "src/storage/admitted_coalesce_tests.rs": "65db158dd80c8719484b34550c764c831982f88f5b1c90711308336a8840a603",
+    "src/storage/admitted_column_pages.rs": "37f3a305d5a78c3754c5620660070644ee8b87eaaa4d73a1f1167b293661eede",
+    "src/storage/admitted_dictionary_utf8.rs": "c0d0cd2f44d92b8b635b8cdc082b1094f39845eecc757355c4007ada3130315d",
+    "src/storage/admitted_flat_column/dictionary_page.rs": "a65d2abc37d09ed22167fd30e1ce78270ff0350a165f2e1b53efb55de029cc6d",
+    "src/storage/admitted_flat_column.rs": "195421600258435db24fe6ae2c5109420ef220f589dd7c6ce8e925f0abd1c7d1",
+    "src/storage/admitted_gather.rs": "020d76d33e83718c5186f61ef598595f0c61c168ef99457413ee3bd7a7b22589",
+    "src/storage/admitted_hybrid.rs": "662c5a59af290ee927bef01aabc693bfa33cd0ec45b949350883dce8682bdae1",
+    "src/storage/admitted_page_body.rs": "2fb735803c93dc05bcbaf31e7384a364fe48e7a5ddd850783329b2a5174f0425",
+    "src/storage/admitted_page_read.rs": "a5b8520170574fe2c1159e769eb2009ae14640acc138dc908274afc0f2bc680b",
+    "src/storage/admitted_plain_fixed.rs": "55a805fb256854c990f16dbecca3b56b93b6c8279334109a527c957f82b376ae",
+    "src/storage/admitted_plain_utf8.rs": "3f942577d39ac825b59877b451b934bc47fc78567842a401f537ca3085d28fd3",
+    "src/storage/admitted_row_group.rs": "1d50acd1a59f2076ef179facc5c9a632447babaa9bd6bae7411237badd984510",
+    "src/storage/admitted_row_group_working_space_tests.rs": "58738ddb17c40c8ccf44ca8b4175fdd0b64f38363defd034ec5d5855b83ea508",
+    "src/storage/admitted_selection/range.rs": "98da6e7185aff77233599a5b26387af507176c3d7420e1902f2abf1371ddb8f3",
+    "src/storage/admitted_selection.rs": "e5fe77c673ebf4a3547925ec13d4d0554afb2fb303b7ec282676fbd4a4cc8703",
+    "src/storage/bounded_page_header/incremental_tests.rs": "d367b0c165670222eb3541e95144a4bd1a2c881155b30f2cb6bdfbc3ad9ccfa1",
+    "src/storage/bounded_page_header.rs": "1035ae613f4d1dc3d18058fa58f0e40e61cd4eefac2573b60c5c73a3c920c3d4",
+    "src/storage/iceberg.rs": "670f10a9a0e3baaca577a2f02c352b0acc343fbf7df2cc0de9aa9938eefe1577",
+    "src/storage/ipc_cache/dictionary_projection.rs": "ec091c8314b3be7fcd9ca4e2dd6db3d013164c37577fa00d6441738896fecee5",
+    "src/storage/ipc_cache/projection_tests.rs": "5eb1199e745569c797848eace4eb8778a49f48ab6d971d0d7ce8b772dc60016e",
+    "src/storage/ipc_cache.rs": "98642e78c66a4c61463887f345e55b1fe7a41e0e33c0747e580695f5931260ec",
+    "src/storage/lance.rs": "20bef28e6592444af51c6dc92902437aca33fa0384e9bed6dc8aa7b83d5b0a27",
+    "src/storage/lance_write.rs": "aa752551d2366d2597b58296d2ed5d967601e24e1cf27792035594ce8040a181",
+    "src/storage/metadata_cache.rs": "413bcb1dfc57836a8d314410cfcb3dad8c5d506509075eba476d997758a36386",
+    "src/storage/mod.rs": "9cd3fd73396e0af475610425919fffe95512565efb4dd89f9cc01b1cb64bf7e8",
+    "src/storage/native_delete.rs": "6be16a9baeec0c44d29fafcc09e9c25aefd18f593fb8c3b3024294eeeaf44977",
+    "src/storage/native_manifest.rs": "61ef9e7dd57ab68c1f8840dca61280e8134b94cd7a932a429008a930e8934ebd",
+    "src/storage/native_rollup.rs": "b4354a5f2b56f20378d35837741090c5418c6271a12c98a6152d229e65c9baeb",
+    "src/storage/native_table.rs": "8fc6f1a788570039fd9675a1c8b6f3b20b4269386341ce7c63aa3298be5f6767",
+    "src/storage/native_update.rs": "aa469fae94acb6ab298784027ea72ea9084d50a381dc25f6770c92b2caebf450",
+    "src/storage/native_write.rs": "fea0504c4ed9294aaa199969836a1458095b98960e3534b783b48d336af548ae",
+    "src/storage/parquet.rs": "c709acfd7a9a5602d9be445ea343b76effe0acd7447a7a38f10161b1c6e42a6d",
+    "src/storage/pulsar.rs": "784e25a1d779c73e9d4a7abf8ea1e8ddc2564d5d3232c86456193c09c3bd6df6",
+    "src/storage/row_group_pruning.rs": "88831247d911fe3583364f700f7fb7b38ded508802c6a2c7dd02fad432c4c7dd",
+    "src/tpch/generator.rs": "4e9fffb995e7ad547631775f7494a7f1ef1d06fbe07b77fbe2e50e8ed99e44e8",
+    "src/tpch/mod.rs": "aa2c878c6d2b7b002cf3fb265488eaf789ce2f29b0279d9fda2d24287b0505a6",
+    "src/tpch/queries.rs": "4c8c4a79359cf998df374ba57e71846185d95e2c9515a9f65d2321bc997c6745",
+    "src/tpch/schema.rs": "5272b2976992757c19d7f2d6cafbc033b93b5dc5ffe4aa56aa57852075358e51",
+    "vendor/lance/.cargo_vcs_info.json": "6e71b2be7ff0fc942b9b4103a3afc29d2adf300cab062b0a9cc5b664dc9c9e7d",
+    "vendor/lance/Cargo.lock": "758b634716a22a5086865a278155bb64160d91bd9af1682393a3c3b5974e4cd8",
+    "vendor/lance/Cargo.toml": "3bef00e88497a78c05669406af7d79b7d4ba6357e8740fc5f7524797e746800e",
+    "vendor/lance/Cargo.toml.orig": "8f4e97ff36c8ff1e25af6c7a31c6862d50e32b1a8a372fc47a90a44c96bcff35",
+    "vendor/lance/LICENSE.txt": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "vendor/lance/PATCHES.md": "8db7dfffbc5d7325035fc7cae37e8a6f74f00aa511791b597a3a34b2099a0e7d",
+    "vendor/lance/README.md": "c3f9009e0fea68def764be2fa1a08a5ffc5f54ad55b721c179c4a4a7661a5aa7",
+    "vendor/lance/UPSTREAM.json": "759c8c5e90a9bbb7dcfa2bf50f383518836314e0b2add4e7188a4fd6dfd94da8",
+    "vendor/lance/benches/concurrent_append.rs": "25186594dda6597b35caf034b6df534e3a2afccf73cd17e4ad8c57495028e4a1",
+    "vendor/lance/benches/count_pushdown.rs": "c21ef387d0b3c50e4521c9f6e030fedf6156ce65e2179c208167bd517609fb55",
+    "vendor/lance/benches/distributed_vector_build.rs": "d62fe325261067c8e660cd13d177e2a1e0c5a2c9b9eedfe012c65a4fb071f9cb",
+    "vendor/lance/benches/fts_search.rs": "4a9df53709c7bcabe1b6edca075a0170f7bef5243479a29299669829b99050a6",
+    "vendor/lance/benches/hamming.rs": "937fff031e01158101e6d7fbf1ae61dd03c00c053077aea0488d07c1ad0d3a9b",
+    "vendor/lance/benches/ivf_pq.rs": "a23f0fba03ce32d9d5501fa38ef3ba868a8490eb3e0c44d9a90c533ae3262814",
+    "vendor/lance/benches/manifest_commit.rs": "d4c91b78818149c46476d441e82ada15fa0c96942f9f39b74a8c992e987158fc",
+    "vendor/lance/benches/mem_wal/fts/LuceneFtsBench.java": "41622666fbf8b6292954b6d8bae3c7245d1c7f94eedb9b864df19725e2d339e8",
+    "vendor/lance/benches/mem_wal/fts/mem_wal_fineweb_fts.rs": "2015e854d25aa8948effd08943010bb05668eb8fe45fe4144631e92bab3ca293",
+    "vendor/lance/benches/mem_wal/fts/mem_wal_fts_bench.rs": "8559b9b2cf6519e28c102058ed30591790d20dab89873a9622bd788a6c0f728d",
+    "vendor/lance/benches/mem_wal/fts/mem_wal_fts_read_bench.rs": "411cf7c2a955b06ca978b9905775e377208a54abad44f46b63f47f43044266f6",
+    "vendor/lance/benches/mem_wal/fts/run_fineweb_fts.sh": "cbef1c51ef4d9d9c0e95539026e4153fdae1165c1f6a27d368069dd4861942d3",
+    "vendor/lance/benches/mem_wal/fts/run_fts_compare.sh": "cccbcdcd8eca0ac47740886302ffa9b3a594db37bd9b87191f098429ee4fad29",
+    "vendor/lance/benches/mem_wal/fts/run_fts_read_sweep.sh": "9278a261832d7b95dfdbfd7dc4b90f05fcdc8c34222c6f7bead719bcbbea1f0f",
+    "vendor/lance/benches/mem_wal/kv/mem_wal_kv_point_lookup.rs": "605ecfe7f9440d0ed30866bd98cb02b70b63cae2d1cf37cf0672cddafef4dbc5",
+    "vendor/lance/benches/mem_wal/kv/run_kv_compare.sh": "63dff2001fe549545597256bf850be561678a6c72e4e86bb7f4e156a7b2cae93",
+    "vendor/lance/benches/mem_wal/point_lookup/mem_wal_point_lookup_bench.rs": "506b6ad47ed98dd13f91824347f61c892736e1f8649e0044ed7fb8fed8f172ac",
+    "vendor/lance/benches/mem_wal/read/memtable_read.rs": "0b37ccaef1195483ee0680bdb8a3bf157e49bb3dde8317906534c40a77a6f0ef",
+    "vendor/lance/benches/mem_wal/vector/hnsw/disk_ann_compare.py": "e07873fde323217b9cb47ecaf43d92c6035ca0e76b858a4b919ea0628bf83720",
+    "vendor/lance/benches/mem_wal/vector/hnsw/mem_wal_hnsw_bench.rs": "c2b8e6cc6c28a84dbfc9d8c98dfcb543571d8e9c7393a646f09703a02ac2ab95",
+    "vendor/lance/benches/mem_wal/vector/hnsw/mem_wal_hnswlib_bench.cpp": "db32b3e6e67bc1b539d043f2053ef5496db2ab388d392a5aa3e4bc400ed6b46f",
+    "vendor/lance/benches/mem_wal/vector/hnsw/mem_wal_recall_hnsw.rs": "e53c012b57a3e0178b83fb204b9df7d24d6e348c63a2487dcd2b6a6174ea7557",
+    "vendor/lance/benches/mem_wal/vector/hnsw/run_mem_wal_hnsw_compare.sh": "3ac4e537327a925950f20f87bd13d789803c0a904bfeb4bde56a028c7eca8260",
+    "vendor/lance/benches/mem_wal/vector/hnsw/run_parity_suite.sh": "22d3badd8ff18abc019f9a384770e4e50727c5462fff7d420e0522587f9d37eb",
+    "vendor/lance/benches/mem_wal/vector/mem_wal_index_micro.rs": "8c1d61e67431770a9bb6d147b5eebbd03415fd9355f02f19e7498a32170b0480",
+    "vendor/lance/benches/mem_wal/vector/mem_wal_vector_bench.rs": "1b50017b33a2c3bcbf31efcde456f8cbe588a840dfd17b60b932762f45381654",
+    "vendor/lance/benches/mem_wal/write/mem_wal_replay.rs": "7e1600b4141bf81311badeb0f966d45ffbcf6998cf8a238f4f0ffa0f04ddedd8",
+    "vendor/lance/benches/mem_wal/write/mem_wal_shard_writer_backpressure.rs": "61855c1ba3c049f65815933386640850f17ae6e2429d2ffcf7fe8d2f48444a47",
+    "vendor/lance/benches/mem_wal/write/mem_wal_write.rs": "3bb96e7b18d2434f9923205536d84dc0a80f9a775480b8618a5d99e5f071f9fa",
+    "vendor/lance/benches/mem_wal/write/run_shard_writer_backpressure.sh": "bab2afa9fc1ab53c3476913363cb95f8b1b3fbf7875f8fda3324cd7ca4172a17",
+    "vendor/lance/benches/merge_insert.rs": "39ffa07c344e07b5ff76f301c49b1062172dfd9c95df6dcca3c10c0971d5c18a",
+    "vendor/lance/benches/random_access.rs": "7637a8f479cf927ba0d40d6f450328702fc8839fd5b50dae3a80544ece55b30f",
+    "vendor/lance/benches/regex_ngram.rs": "201059a58323dd6cabd4f1f4f3d06a7ab27340cf024b6825a299a5c1baaa0537",
+    "vendor/lance/benches/s3_file_reader_diagnostics.rs": "b7e2fe31a4c45771e8936f8803f2782151ddb23fcd60a8e81a6eec9ab3072597",
+    "vendor/lance/benches/scalar_index.rs": "0e6da5fefa69da7d07a8a0498bf253d02f0c77526b86a81758700e1f0d62ab09",
+    "vendor/lance/benches/scan.rs": "0a860d168b2b5d6250c141e4aa64a63f69c5cd707b74d498e9d5b9f2fbd06036",
+    "vendor/lance/benches/streaming_ivf_training.rs": "58c3914c2c3e98f3c4f96607f4cb9196381e20c4accc6cd9e71f43618116a0ad",
+    "vendor/lance/benches/take.rs": "9671bcfe37343a759787275eae96bd5e4074b045d34318ae669ae66bdb0e6b0d",
+    "vendor/lance/benches/take_blob.rs": "8ee8518efe4c2b7cedd051fa612cc2fb2326978bb7a08f4bff5b2ac5d79ff157",
+    "vendor/lance/benches/vector_index.rs": "d452afdaa9f76060495f97d364132988a0accb798781d0dc76f0a00d19eb6359",
+    "vendor/lance/benches/vector_throughput.rs": "dbca872c69cdb98742bc7d5cf7b958e96ab1f2412a9873d398a7e4da45b5af3a",
+    "vendor/lance/build.rs": "3bbac50854bab66cb40750c881ff5de3b4cd7c80add7291d27de53a8097a84c6",
+    "vendor/lance/protos/AGENTS.md": "8b14a37ab9ff35a35b6f4845d48a3823a6222474fe232a318c5b0904330222e3",
+    "vendor/lance/protos/CLAUDE.md": "8b14a37ab9ff35a35b6f4845d48a3823a6222474fe232a318c5b0904330222e3",
+    "vendor/lance/protos/ann.proto": "7d518941b56bf1e4b7ed450971ce924acc2141ff629bc71d2d8c7d82c563b1de",
+    "vendor/lance/protos/encodings_v2_0.proto": "501f1a1adb2f86f2ca32b3931975b37a07699b15b795e391caa9a285ec8a20ef",
+    "vendor/lance/protos/encodings_v2_1.proto": "ad229bbe28be13e3221da1fa39db542438663c9f130400283e559ec5e9fff88d",
+    "vendor/lance/protos/file.proto": "d04fae6da3b5f774c5b4e80b8c09e126bf364da7131376176cde45004fe344bf",
+    "vendor/lance/protos/file2.proto": "bee1fc156fde2505e5d3be524bc74f39b424b794c03a73b823628370f11ca2f8",
+    "vendor/lance/protos/filtered_read.proto": "7bb4b946e9490cbb702046b6f8b311ac9bc05b8fbe69a8191770f6a38bdb5e26",
+    "vendor/lance/protos/index.proto": "a204ff1734e69a3582565f0cddafd75948968a3355c7779215826cade1dd843d",
+    "vendor/lance/protos/index_old.proto": "c2aa597a6eca0339ae5b8a956990b1dc3e456c2901baa0aa3e430de9f2a45523",
+    "vendor/lance/protos/license_header.txt": "e2c86e1383229887096db3c4ef29d155b0ec0fb969d0bbbf4e2f546fcadf6eb4",
+    "vendor/lance/protos/rowids.proto": "cd5991a2bfa809257ac5a0d481a8e3e958093006280d437d6e490494793b5508",
+    "vendor/lance/protos/table.proto": "f65fae47403140893b8263f41b0ceeb58b19d4852e506409b3fb542d9ce8bd9b",
+    "vendor/lance/protos/table_identifier.proto": "d7336f901d66ac2b14525e97d8c3935ea815c016b3aba7789c0899a61fdcb45f",
+    "vendor/lance/protos/transaction.proto": "e569129fdc4da6607c1b1ff20950529b7939366f6f3e5e433b3924c592818b39",
+    "vendor/lance/src/arrow/json.rs": "6572a1d8fc7887a275223644572539a348e35be77202c4e74aa11aaeb779c865",
+    "vendor/lance/src/arrow.rs": "675285d38937dc516bdbb518db52e93278e486167dbe28b8f3aac85126d6a0a5",
+    "vendor/lance/src/bin/fm_contains_bench.rs": "15b4437bb8eb2ae97484a9a8fc93cd41419d1fcccae630498bca725a569e5aaa",
+    "vendor/lance/src/bin/fm_index_tool.rs": "3d3a913a7a0df95140be70bbe02fe2383e050138cb51794e128bd18549272b55",
+    "vendor/lance/src/bin/lq.rs": "4c329267b45e1326473d73b6c9fe53ad62b6cfbe96d37371ab893ab73bb1c291",
+    "vendor/lance/src/blob.rs": "9d6ef78b3ca085ba37993b41f60f71e036f80fc5b2b9332939435aad99099b3f",
+    "vendor/lance/src/datafusion/dataframe.rs": "1632e2c5bf0ec8026a14c0d093949b1ce386d2c9a45c7fd0a38928651c166c4d",
+    "vendor/lance/src/datafusion/logical_plan.rs": "af1ffa3fcedec5d3f556e7da14a979203ef9d975c460d4235c0c6f2ffc849b32",
+    "vendor/lance/src/datafusion.rs": "2c023f3c878127a7c3926a712973890c9ea6478adb016fe1def588e9ac1ab111",
+    "vendor/lance/src/dataset/blob.rs": "097529bbb9b3c31a9fdd2e8ab306bfe1cc70ec7a36164703ec3affc315360039",
+    "vendor/lance/src/dataset/branch_location.rs": "f7790a7f485e672693375fc673591f697ee8eeff189ef99c1a8d357fe8db2404",
+    "vendor/lance/src/dataset/builder.rs": "37577bf35a030c9e05a39501cd535ab2878e4df3eab3375dd36023f28f95e58c",
+    "vendor/lance/src/dataset/cleanup.rs": "00779173e06a1c0a7f69917d0f86574ede76df7ce05abb435b45d66df8acc950",
+    "vendor/lance/src/dataset/delta.rs": "a0298d3a983ab2f30142a7391bdf0441343c2323f23993bbd400d13a0cb864d0",
+    "vendor/lance/src/dataset/files/arrow.rs": "3b85e8b9510a4ab3b4978e7250f8d7910fa8fc6d2b5131d88dfa9ef59b76e543",
+    "vendor/lance/src/dataset/files/file_types.rs": "e9cfa4ffa34a146339d91aad768b5945667dc848b204679294c45e6e58261141",
+    "vendor/lance/src/dataset/files.rs": "8608b16af533eaaab7e57c4d9d87f8f4a35671bee2733dd188be1f8541bb7042",
+    "vendor/lance/src/dataset/fragment/session.rs": "d1e0b4a8476bb669d6d90ea0a86d60d790909c1ae94c3272245f27f8886d011d",
+    "vendor/lance/src/dataset/fragment/write.rs": "b6ded76248261a11c3e60c1239dc335ae2026d8ab61d3b9c1a76f5eed4707f45",
+    "vendor/lance/src/dataset/fragment.rs": "34e2f032f4d159b2c1c8a5317ee2a867a586d1a3b1e699e5808c46b61575589c",
+    "vendor/lance/src/dataset/hash_joiner.rs": "6dc9c9cfcedce4b28eac5310ecaa68b86ae8b37d9f55ca37a15e7be10386fd0c",
+    "vendor/lance/src/dataset/index/frag_reuse.rs": "38875c59f029a00ddd80e9769b84359a24cc60bed4acea82268133be9892dd91",
+    "vendor/lance/src/dataset/index.rs": "d8ac6a103b9b7b11833d899bdfbeb2664d512cc60d1ab1b4aafe0130a007dcdb",
+    "vendor/lance/src/dataset/mem_wal/api.rs": "d7f3dd074fb849f6a71ce106eec54a95fdd2793a0824c0747764c3d7f2d2e25a",
+    "vendor/lance/src/dataset/mem_wal/hnsw/graph.rs": "a0490862ed87076ccf0c2c26be2009ebe8882700d47b8af19317bd1593b8531a",
+    "vendor/lance/src/dataset/mem_wal/hnsw/mod.rs": "4d5c8918afe5145be4fdbe32ee46461ee580636b3ea68c65137162238cce9ac1",
+    "vendor/lance/src/dataset/mem_wal/hnsw/storage.rs": "13bf1a9ea01b7935e2b096a389ba32e812ba1be18fa468f480dfdaa26f54352b",
+    "vendor/lance/src/dataset/mem_wal/index/arena_skiplist.rs": "ab376fbee7c878428319a494abad7ccc8939fd2420235af81354eb52ce02566c",
+    "vendor/lance/src/dataset/mem_wal/index/btree.rs": "8181565b244fa2235fb329b3933993b63b2946893e2450e8fd43dce57087685b",
+    "vendor/lance/src/dataset/mem_wal/index/fts.rs": "de32e757f19e9d94e7676a1cde7d0b6457d0cb05766871f106e8c47fdbcf7ec0",
+    "vendor/lance/src/dataset/mem_wal/index/hnsw.rs": "1c704f9ba186bcf2283c2861127c014df2dcf3a0c68b405a0b67c2677ba3dcad",
+    "vendor/lance/src/dataset/mem_wal/index/pk_key.rs": "778b1cef1abdce7d9ad2744784362bf74575c1b4599c16dc02337591a6e2649a",
+    "vendor/lance/src/dataset/mem_wal/index.rs": "3f476b9aaea3625f8887ea8364f0b4c54f089dac0ab8cef8da945c7008132064",
+    "vendor/lance/src/dataset/mem_wal/manifest.rs": "5c9b905fb8bac4bc38259b091ba2dc8fada75e4b9ce7c07c2184e37b0ec4f7a7",
+    "vendor/lance/src/dataset/mem_wal/memtable/batch_store.rs": "7d42f1a033763d04601b1692efe5462e50640cf832aa6a14b3f53bab97c87875",
+    "vendor/lance/src/dataset/mem_wal/memtable/flush.rs": "c05d5eb1a8efaa8fc8f627f2e449c48a4e5ca2c969e3e0ecb05057eea8277331",
+    "vendor/lance/src/dataset/mem_wal/memtable/scanner/builder.rs": "92ab16feb509ff430e575c0ac1129a3dbde3b51428b907c43fbd06bf08444fc1",
+    "vendor/lance/src/dataset/mem_wal/memtable/scanner/exec/brute_force_vector.rs": "0230092e8ca03ebfcb04eb89422ad6fbb1258ec72ba9f83c72b04c15189cf077",
+    "vendor/lance/src/dataset/mem_wal/memtable/scanner/exec/btree.rs": "ccabfee358d647b1cba3532a9b091fb437123ecd3263c1d7e38fd9127a86dccd",
+    "vendor/lance/src/dataset/mem_wal/memtable/scanner/exec/dedup_scan.rs": "5168d81e6224ab81e97bdb938305faa64e22c9ffd24b4083688ee689242668cd",
+    "vendor/lance/src/dataset/mem_wal/memtable/scanner/exec/fts.rs": "74d990b82fa172ca1227ee85cbeae53e3bcde56de476ff6ac453a92031872c62",
+    "vendor/lance/src/dataset/mem_wal/memtable/scanner/exec/scan.rs": "8cc947078a9457230b1b7e7e81fe3d41f48173e7f22ab6c0722bc76cfb46d03c",
+    "vendor/lance/src/dataset/mem_wal/memtable/scanner/exec/vector.rs": "7ab9e26282c6e4f1a81072001a51eb7a8e5d90ff1835ced5e9cf3b6a35d468f8",
+    "vendor/lance/src/dataset/mem_wal/memtable/scanner/exec.rs": "a905ced2ce46f07aa584f45fbfdee44625b364d5935bdc8452dca0f7c59da9d0",
+    "vendor/lance/src/dataset/mem_wal/memtable/scanner.rs": "9153f564bfe047e26ee17fc1b3a99328ad295fd162ebd93feb2d49f9838afa20",
+    "vendor/lance/src/dataset/mem_wal/memtable.rs": "2351e140656a0eff337639a24b46df58ca94018c49578ff11cbfd07603533d0d",
+    "vendor/lance/src/dataset/mem_wal/scanner/block_list.rs": "e4293d92999f2243eddf76f86967938d5e1dc5ae63108cb14a16f32058af8329",
+    "vendor/lance/src/dataset/mem_wal/scanner/builder.rs": "ec388906b77d0da6ccb8b419ab9d16fa848753338121a0f68dbbecd29896715e",
+    "vendor/lance/src/dataset/mem_wal/scanner/collector.rs": "eabb89ad8fd6c2ce5e4c94d8235b6e539d8822f571dfeb31b2f17f42530ad804",
+    "vendor/lance/src/dataset/mem_wal/scanner/data_source.rs": "810692fae3a04b3e856fa3f9f83a7d3b84245a2433a5771f0fa6be9b886cadef",
+    "vendor/lance/src/dataset/mem_wal/scanner/exec/bloom_guard.rs": "79d735d9b345af21da114fed544e7b38ecc84c65311f3f4002574f764854236e",
+    "vendor/lance/src/dataset/mem_wal/scanner/exec/coalesce_first.rs": "a8c3132868286fc4d4d4f26abc604822632528869cd77e74fa21b87da23dca62",
+    "vendor/lance/src/dataset/mem_wal/scanner/exec/generation_tag.rs": "24d313dbc136e68d38d1906ff3cd060274e3ce6be389713712f94fe16f53eeed",
+    "vendor/lance/src/dataset/mem_wal/scanner/exec/pk.rs": "64675ced921e2e16d1aeef882c35dcbc74d4e967a8b40fe20cc1f1e6786051be",
+    "vendor/lance/src/dataset/mem_wal/scanner/exec/pk_block_filter.rs": "4fcab9249db7f36f078ebadc4819b53920dbbe6fc643cd33c70cd8e7aa43aaf6",
+    "vendor/lance/src/dataset/mem_wal/scanner/exec.rs": "d2348d60acfc19748e2caab31ac638f7efa5e1944745b5b30e5d384dac2ff862",
+    "vendor/lance/src/dataset/mem_wal/scanner/fts_search.rs": "f14e4a8ae04b7a3e7f6d6a14f28fa3f9f298e5a35754e6486c253f49b6618a91",
+    "vendor/lance/src/dataset/mem_wal/scanner/planner.rs": "c49d850f5b1385e767057b13cd6c64169d877b4bcab6c39a4851c81e56511678",
+    "vendor/lance/src/dataset/mem_wal/scanner/point_lookup.rs": "30511339cf4919c636c6ef0a143e177a1cc937a5882acd60d5a649bf1a16979b",
+    "vendor/lance/src/dataset/mem_wal/scanner/projection.rs": "39aab535fc371fbdf2e8c44acc8ee73246cf54d77a112c3e849560db2c3aef84",
+    "vendor/lance/src/dataset/mem_wal/scanner/sstable_cache.rs": "529fe81a61ecda15b0a02bd74341013ebf92ed2355cd9bfb82d0c21eb2f71f6c",
+    "vendor/lance/src/dataset/mem_wal/scanner/vector_search.rs": "b4dfa0fed2cd55115ede6829f3efd2ed5e72d353ef4322400696ee50ff285e44",
+    "vendor/lance/src/dataset/mem_wal/scanner.rs": "8fc17dbd9d45758b319b07bab1e68d615b8611ee46a4a07c06a44efd3d16a9fd",
+    "vendor/lance/src/dataset/mem_wal/sharding.rs": "3f4c9ee233244dee0a518468170d1bd60857a96a650f2113c88adfe82a6b1d1f",
+    "vendor/lance/src/dataset/mem_wal/test_util.rs": "c2079e1ec331a7771c03232fd4c10caa21ad945451a765b06e5de6cfd68f2c5f",
+    "vendor/lance/src/dataset/mem_wal/util.rs": "46fd970fcbfa5753d9652d41a0d96c2faae82456f446f48b92ae702c6f4cd64d",
+    "vendor/lance/src/dataset/mem_wal/wal.rs": "332acc71328756b147d28ed17faec882d57c03415c6aabcda21ba2b058b463a0",
+    "vendor/lance/src/dataset/mem_wal/write.rs": "9e42499ae5ea40633fc6222e038503d437a29c801c548253fb972c9d8cd5a2c2",
+    "vendor/lance/src/dataset/mem_wal.rs": "0455424cc2bf87d1c9b6a0db6c8ecff0b56cb4ec1c6c44fa9bf456e3c499b41e",
+    "vendor/lance/src/dataset/metadata.rs": "697ce9f00c9b276ce17789312835ab19d9176b94a921b40ffdcdc956d66f0746",
+    "vendor/lance/src/dataset/optimize/binary_copy.rs": "c47a59908d5cea9a8d6611049eb5f4a7511b94c0f525630afbae99b61bff8586",
+    "vendor/lance/src/dataset/optimize/remapping.rs": "866e2bb0ee26e22dde5fb7a3283ec063ba467438657eb3d0a93dc5dfd9d5cc31",
+    "vendor/lance/src/dataset/optimize/tests/binary_copy.rs": "8744f3244f0cb31806429bdafa3fe49f4fefa505f26aa9583d5d5e050ab77e1b",
+    "vendor/lance/src/dataset/optimize.rs": "5dd417eb40822ef416b33031580330c371d8ad92630e2323ea6f596016eb86ac",
+    "vendor/lance/src/dataset/overlay.rs": "0b88314cc6fd79d235daa22bb4b08ca960c6bb5e18e6848cbb496ad98c090f23",
+    "vendor/lance/src/dataset/progress.rs": "8e0a802675da687e0182901d13a70c7a5d54f78b7eea9b90eaa2f802292f531a",
+    "vendor/lance/src/dataset/refs.rs": "827ef115d5ab5b40f12e9e0b68ca6c309f372bb2bfbb0476ae72d370993c6a16",
+    "vendor/lance/src/dataset/rowids.rs": "a0f843649c3e5a510d9fb261bc4608714460682c868d9597b97d6ef53007087f",
+    "vendor/lance/src/dataset/scanner.rs": "c568ac3c7da78a7f2ab35305018a40f545b94e732d294e5d8bebbfcb133e050f",
+    "vendor/lance/src/dataset/schema_evolution/optimize.rs": "bdc387e44a50c7698aa6a37f1478e0d5838fe146ac719bdd802d92f652285a39",
+    "vendor/lance/src/dataset/schema_evolution.rs": "8b738ff30f74993a21982b3f28bf11b86de1c7f455ef9c09b555326e14b0356a",
+    "vendor/lance/src/dataset/sql.rs": "b91f35b1d4e17da100f0842f8d41f14d941ead3ef521303edaf65ff0c10b5a94",
+    "vendor/lance/src/dataset/statistics.rs": "dc6c57a2747058521f536246f61462deb4c4597a429e51c1ba83364d6a33cdf7",
+    "vendor/lance/src/dataset/take.rs": "5dbbb9fd9843ea18e7af3a1be7d4c00422ee5a6b09699494cc9f443f79b65bed",
+    "vendor/lance/src/dataset/tests/dataset_aggregate.rs": "73a5168b55fb01bfe0af0b53c5e7102a05cc3a89cebc208bf6bcdc62b2850ffa",
+    "vendor/lance/src/dataset/tests/dataset_common.rs": "18703db32fe34af49ca41634b227cf99f0cde3536e422403b29d3ca8755fe32d",
+    "vendor/lance/src/dataset/tests/dataset_concurrency_store.rs": "e78e05fb088437c4629ba2cca75fd918dc1ccc96f389fbfaae65f36bcdcc5197",
+    "vendor/lance/src/dataset/tests/dataset_geo.rs": "d4678426a6b30cc17577a8e8d66d9279c73b1fff5462e9b25b1ce467be4788a0",
+    "vendor/lance/src/dataset/tests/dataset_index.rs": "59427879a8a44f18b5f396d4e498ff8be100125b7e5156e21cfbb761207fa8b6",
+    "vendor/lance/src/dataset/tests/dataset_io.rs": "f5c1022ef4fd23ddbc5458466da7317eb49c6b10988af84309e4361a6fa42fec",
+    "vendor/lance/src/dataset/tests/dataset_merge_update.rs": "50d900bebe055076583d3beb5a2cf25ea773a2d5fb3aab8e96f932143bffce36",
+    "vendor/lance/src/dataset/tests/dataset_migrations.rs": "2aa4272b207f5c41a3adc06597a08fe1c8e1fc9c154a94d7f5c0ce602f29cdfe",
+    "vendor/lance/src/dataset/tests/dataset_overlay_index_masking.rs": "765b1ddfb975055d01823dda70e379fffbd6fbfd61854d35c3fff1d1dfda05fe",
+    "vendor/lance/src/dataset/tests/dataset_scanner.rs": "57aaa853ed1ffb10c80058d80439f91e11f2cfede1bf1de84cfe0e35222818e8",
+    "vendor/lance/src/dataset/tests/dataset_schema_evolution.rs": "371d2417564f3b7684cd09e2ab4c52d5edf66c3864a42a23e2d6d9655022cc93",
+    "vendor/lance/src/dataset/tests/dataset_transactions.rs": "f04d3e5e46cb037243215db7b3c319f06ed493cae2b8da74ac166affc4b61da4",
+    "vendor/lance/src/dataset/tests/dataset_versioning.rs": "ab5a9c5740c38de17cfe6991dd237f767bbb6e9971a445bce8100a50f0ceacb1",
+    "vendor/lance/src/dataset/tests/mod.rs": "553e586bcb904d7a79bb19482c236bf9046db329659e8b28571df2e159b98b15",
+    "vendor/lance/src/dataset/transaction.rs": "c0f82b4ab1dae70a17fe4e16914cc84ddba72c29f8b23c5cef566315de69a669",
+    "vendor/lance/src/dataset/udtf.rs": "d46cc753a265e89c598a40ae61e3642ecd3ae1999cfb524c084e223483b6db52",
+    "vendor/lance/src/dataset/updater.rs": "062702b028c67e68e4083680ed3d6601a16a4b0bd3ab4eb8a3d431466ebdb8bd",
+    "vendor/lance/src/dataset/utils.rs": "348dc65ad79e14aa618b5b44e3da22373ccbcc044a5eefd99c266532b695499d",
+    "vendor/lance/src/dataset/write/commit.rs": "3963b7efd1f74c0a30edabd33743e18a34958340740e93f4a93bca74edeca1ba",
+    "vendor/lance/src/dataset/write/delete.rs": "404f764027927035e5e32651a8fd890e96b4aa408ef2103080926f01a15314ec",
+    "vendor/lance/src/dataset/write/insert.rs": "28f43057fd3f469489da77fe2dc34477d4a3c8c8de40786639e983aea68c4b33",
+    "vendor/lance/src/dataset/write/merge_insert/assign_action.rs": "70bd54b1b89f0d851c325c2d98dbfffeaf912e69ab3ed848b51d898195275fa1",
+    "vendor/lance/src/dataset/write/merge_insert/exec/delete.rs": "2b1179c13127f064ccd862f1eb2241aa6d4cd11f31828634c33f42bb16142760",
+    "vendor/lance/src/dataset/write/merge_insert/exec/write.rs": "536f6ba94e9fe0e7e2ea616607fa39c2265ad6a807df39ca7e7e7bb087f6e64a",
+    "vendor/lance/src/dataset/write/merge_insert/exec.rs": "94a5c242b47fb9e7eec29795089e6d9ef1131efde6dc60d7daca474ae1e76cb2",
+    "vendor/lance/src/dataset/write/merge_insert/inserted_rows.rs": "f69c8aada6d51be1a3b0cd5a193d0ec2ad62bb2587002d26985c827a2245c12d",
+    "vendor/lance/src/dataset/write/merge_insert/logical_plan.rs": "668e03e84abbc4182cfb67a035f0455ed7ab8252c80867aa3be5ca007cfcc124",
+    "vendor/lance/src/dataset/write/merge_insert.rs": "436b6eec202bfa5df97d5b2f927e8932340efa60e87b0e4048a0af04ece2743e",
+    "vendor/lance/src/dataset/write/retry.rs": "5b9818f9c3b7b58034607087d718cfab953783f4efa07fc2210aa20a5c948da3",
+    "vendor/lance/src/dataset/write/update.rs": "a58fdad27b23d51ceb2b88b0d4b2f604dc846c9c9bad5034c9c3cc7faa38acc4",
+    "vendor/lance/src/dataset/write.rs": "0c427f022a1c3ec1f6f407f160c9632f4f74b2c0446e7232db1bf1ba65abc168",
+    "vendor/lance/src/dataset.rs": "11c09de31570dd08ea270868d0e62ffd9c20d6f4130736849be98565d1bf1729",
+    "vendor/lance/src/index/api.rs": "d9b1d6c005df4e0cb127b0d1e6e76d2e63f6a537854ed4f2cc408b4a3f6d4dee",
+    "vendor/lance/src/index/append.rs": "f423a10060fec5505a5658149e39968320e532ca385c11ce02d387275afaaf65",
+    "vendor/lance/src/index/create.rs": "5c999aa5346baefb9dbef4ac3d2e678d62dfc7242255ac9b6dac581052eb0fdf",
+    "vendor/lance/src/index/frag_reuse.rs": "5fc1890be18bd34d221d5127f058099444eb48c22c287999b5db3d76ad14574e",
+    "vendor/lance/src/index/mem_wal.rs": "f9f6b6810e3ac57bf9101f31e4e79e602e76442e1dd2e2dad5e50dc629a53f9c",
+    "vendor/lance/src/index/prefilter.rs": "c1c306d727945d8bbbd8c4e9c3a2a926b184b7863f8fd2f32c86ac3b432a4ab1",
+    "vendor/lance/src/index/scalar/bitmap.rs": "6b7065f51883cf6d93964cf5c7685899bb7b2d2c13eaa1db45f2ec7606e6d496",
+    "vendor/lance/src/index/scalar/bloomfilter.rs": "da8013c477879e380dffbad719133686f10803def47786e9d9b83b03fccf72e2",
+    "vendor/lance/src/index/scalar/btree.rs": "d31ce2eb8ebb38d70ba39593133db1cba72c60c04d5350b23e2d0d4e712ee6de",
+    "vendor/lance/src/index/scalar/fmindex.rs": "8d26ab9d160520e1e78140404af82f49173b7a33e261c17e3c713b3f3e393bd3",
+    "vendor/lance/src/index/scalar/inverted.rs": "21d5b74701d6a6f33eedfad9aea9d8befeb312b14bddba4af118f69ac1e2ffa1",
+    "vendor/lance/src/index/scalar/label_list.rs": "c2a05c3c2434c5abe5195b06c38313314a79a8058d3bf3d76ddc5c41cf3e7c57",
+    "vendor/lance/src/index/scalar/ngram.rs": "ee7b41df0d7294800d4aa5fa3157a96631b7813bc21146565c22a83e75c17c86",
+    "vendor/lance/src/index/scalar/rtree.rs": "68946e56d077549de4dc1483f0ed03be304e061af3b8d54ee081d11b52977a46",
+    "vendor/lance/src/index/scalar/zonemap.rs": "31549f2a662da9c7a171a6b58b3d5aa97aa04a4f895ffc308463e110dc266362",
+    "vendor/lance/src/index/scalar.rs": "f5954dc7c84322d3af0924280343e2c617f572a302c71e66c7b13c470d0c7312",
+    "vendor/lance/src/index/scalar_logical.rs": "885c1fecd6c9502f126abac3fdd539810f8c5e13df29cc98c7e263a7513e1ce5",
+    "vendor/lance/src/index/vector/builder.rs": "c057e0de33ea24b4fd0f0e71743fd4da61eeb30367c06ab6612c6d976a659a0c",
+    "vendor/lance/src/index/vector/details.rs": "a1847ae29dbcb3ca4cf8b5789fba6d16ac1d71b9b9a0e588a9b909607e52f31c",
+    "vendor/lance/src/index/vector/fixture_test.rs": "6ed4097b76332f673eedfa9af0d027b132a641d8916d76897ae12ce7796f4524",
+    "vendor/lance/src/index/vector/hamming.rs": "2829cdb84965e3c6ea3c6041056afc2d0fbedffdd8995dab1c1c2b29db5e0d6e",
+    "vendor/lance/src/index/vector/ivf/builder.rs": "4a71f305adda37dba5fee5c9193e4a3f1e32f7ec0586b3b5b82b04c6e3214b4d",
+    "vendor/lance/src/index/vector/ivf/io.rs": "f98920a3529de2e37097969987009b6e19f10f0cdd9259b6db88701a342d000c",
+    "vendor/lance/src/index/vector/ivf/partition_serde.rs": "bffc3d57798c86611f3c6771fd95a411788a7d7c8fb4ef3ce805c889c8f9b048",
+    "vendor/lance/src/index/vector/ivf/v2.rs": "9c8bce67fcd1125a6b9e98c1d68680023468c92e42c4135475fd124c297f0a54",
+    "vendor/lance/src/index/vector/ivf.rs": "a85d0f246909e3799337f486d09f670d1c436aba123e3954383f5688f4547f71",
+    "vendor/lance/src/index/vector/pq.rs": "4e64d4a132ad3738f3adbb7e50d07800cd89771cbf84d2c8eb157933431d4caf",
+    "vendor/lance/src/index/vector/utils.rs": "fdc97b44ef8213a3f2295fbe578a40292a657b48ff6bdef4f801e58e8c58e795",
+    "vendor/lance/src/index/vector.rs": "43a01cb43b74faeb223c46c1c6163f9223eeadd6a714fab41bba890e8c5943a8",
+    "vendor/lance/src/index.rs": "b5d9559fbdfdf47f1a420664e080abf0aadfc6f9cdc9d2fb885667f82babab26",
+    "vendor/lance/src/io/commit/conflict_resolver.rs": "d4e77093ffb5a9d0eb3b4b16eb3f45d35587909d7923d6b93390082737ed63b5",
+    "vendor/lance/src/io/commit/dynamodb.rs": "8c70e61799b4596bfb267e0b272d0202041a77eb27d96cfdf2ea466dc9b3fdc5",
+    "vendor/lance/src/io/commit/external_manifest.rs": "56f30076ae240952ee2388f9b699fadc971fdd52efcab7c4ba6ab3c858cb492c",
+    "vendor/lance/src/io/commit/namespace_manifest.rs": "1c2db35dab374c2b6a8f7a451f715065366f053881d5d52af17d2ee9d731a0dc",
+    "vendor/lance/src/io/commit/s3_test.rs": "cdc928b76f12dfafb4645ff6471fb715ddbeaed7c8b118ce9e1e576c36f798d1",
+    "vendor/lance/src/io/commit.rs": "794ca11fea26cde0df9bef5bc014b7d7a1d5ba78ca43a6f739897f1fce9c477d",
+    "vendor/lance/src/io/deletion.rs": "236b609be50fc16e86f219151ad4327917ad62a20705eec33285914b9210b45b",
+    "vendor/lance/src/io/exec/ann_proto.rs": "c1a9312a4852d844cea0d116ac9c6c5fe5ef412e52ccdfd0eb2f79954bd5f778",
+    "vendor/lance/src/io/exec/count_from_mask.rs": "0aff22b674343ee9fc4859efe5225d1ee710e192d70882e1718d8ab3dfe38d7c",
+    "vendor/lance/src/io/exec/count_pushdown.rs": "966695ece83961e1deee900c044f438ed0b85f656f37416c291dd15295552c7f",
+    "vendor/lance/src/io/exec/filter.rs": "a355145a65a7ed3aace44a220b6f417694cbca749a4d0c3f9262ece17b9ec60b",
+    "vendor/lance/src/io/exec/filtered_read.rs": "937e7575b89691106c092778516fad99852ca14269decc85f7f8f2a8d6cb4842",
+    "vendor/lance/src/io/exec/filtered_read_proto.rs": "85e0d333726d956cbd54d8b182fdebec22f25b3387ffe6d12c39d9ce90d6f302",
+    "vendor/lance/src/io/exec/fts.rs": "0a52cca9aae87822e0c2663566923452958264b71387839e72509a671d6f8523",
+    "vendor/lance/src/io/exec/knn.rs": "8821a73e60b7d49bc2d86f1ffd13ad6469969e6d89056f2253a463f8aa82b492",
+    "vendor/lance/src/io/exec/optimizer.rs": "741f30f841aec87e07de4a98cfe6d64cb2155b9b48f40a1321e9560da413664d",
+    "vendor/lance/src/io/exec/projection.rs": "75a44b27da85abf3c8ea0e96e1379ec03b9718db97bc9e25deec064b436bf81e",
+    "vendor/lance/src/io/exec/pushdown_scan.rs": "a97eb9d87c3e0e45c74f1d7a99d9974f368c1f89b10b18ad23294f03f9c17a39",
+    "vendor/lance/src/io/exec/rowids.rs": "76636480c5e2497d8fb2c4b0ac71877c14719b109532c5c74cbc477d961b2408",
+    "vendor/lance/src/io/exec/scalar_index.rs": "ce02dacfba4e046964208e1579a9a66ccc2f279ff3e886ca70464cee6ed9432b",
+    "vendor/lance/src/io/exec/scan.rs": "0047293a58c7dbc22f1030ccfb8066933cac65e68a1f5daf25532d606944c492",
+    "vendor/lance/src/io/exec/table_identifier.rs": "48bb9d903617e8dadf46b1c6a2f988f3eef96ccf96fc03f00a2d6dd505005e1b",
+    "vendor/lance/src/io/exec/take.rs": "42f4aba9b55c90378b3a355a447d490457b4549d7822497d132219038bdc31fd",
+    "vendor/lance/src/io/exec/testing.rs": "276a4b5db99fd025f802a5bcc12d2d45cd0a8b2f48a97bd0bf62235285fd51cf",
+    "vendor/lance/src/io/exec/utils.rs": "67c6c455a74a5b5c10d822aec5cbc86921f0db6f15ff1dfef6ec3ec432a0735b",
+    "vendor/lance/src/io/exec.rs": "0a3a74831b1d3b806b0b69fe5820e3589f570f0a5704695796b64589c2e08bff",
+    "vendor/lance/src/io/object_store.rs": "55693733250d083ab5bb7c1416fad6cab98ab7584165a43f1f700e8b265e45c4",
+    "vendor/lance/src/io.rs": "f7e671240f576c3bf944dc9a629e1d9bc0e7afc8215d900f913a6c952b2a987c",
+    "vendor/lance/src/lib.rs": "94ffb9d7297b4d8764702661e1937b0bddc0b6ef0b9c76e2fbcc00b3456f1906",
+    "vendor/lance/src/metrics.md": "87bdc5d2e54e7cc4877c0a3a57751a00d6c37a6e0716143e07592b68ecabcc7c",
+    "vendor/lance/src/metrics.rs": "b4858a2408a74363f549a02244549f46dedd4704af65c35399f35b6129f3839b",
+    "vendor/lance/src/session/caches.rs": "b9857dcf07454eafd0932a3ea88d15c71a68afc7c1f2fb37951d4fae07a8be8d",
+    "vendor/lance/src/session/index_caches.rs": "72a31085b553b4d3bdd4654ab32e4de2c899f76267520203ae01e9406695b11e",
+    "vendor/lance/src/session/index_extension.rs": "c464a66b827823ed0b31a855447b042e425039cf51010cfe891d23dce18b5c34",
+    "vendor/lance/src/session.rs": "5e727e6594a4188d1c2e551c8a39c5cb83b7b27188ddebbaf162d0b739d7595e",
+    "vendor/lance/src/table.rs": "6e86994c5e81356c5a7d75b6eef0f5a29c6bc7cad6b44944142b4878329237b2",
+    "vendor/lance/src/utils/future.rs": "d346a54d634ea0c35a3683cf84a8e4014543dbded076d635f53ad7c93775aee8",
+    "vendor/lance/src/utils/temporal.rs": "9186d8500ae0a923b25911526b8ab26030de5bf45ba2ceeb2525ed7d58c35761",
+    "vendor/lance/src/utils/test/failing_store.rs": "abcc7c082bb0bb7255f9357f555cbc483855c9c86a5364c8dd5019d66ace732c",
+    "vendor/lance/src/utils/test/serializing_cache.rs": "046b98cc8838c90c67d3d31ae8e481db7908f34971930f0e8e529b0d08ef55e9",
+    "vendor/lance/src/utils/test/throttle_store.rs": "6d56dee9f0f57ee296421f3bedb1a7a0032fbe1b77c8e48b3e4d078ff1b8490d",
+    "vendor/lance/src/utils/test.rs": "0281ba4c7005ad9a6c845361491e5c4d38b3ef253157a81f2f083fd5e6d22856",
+    "vendor/lance/src/utils.rs": "ef5fe516efb2df892853e0a79522c6900d5c71bfab3d4f1765d226982500358a",
+    "vendor/lance/tests/README.md": "bdfa17e410a398b9196210ee945cb9eb34cb6e44a6166f064c6d21c158bb5724",
+    "vendor/lance/tests/count_pushdown/mod.rs": "61af6cfd29013a9b4c9896d51c3f2fd9f9c9233397a837d615dab986f7a71ada",
+    "vendor/lance/tests/integration_tests.rs": "5693b883c82df4e716edc9744ee33ecfdcb4e6147673b595260634617ce2e781",
+    "vendor/lance/tests/mem_wal/mod.rs": "932ac96164f874336922458f9b45602cee6aad5dbff161f41b274edb8ef8bc56",
+    "vendor/lance/tests/query/inverted.rs": "4474545275fccd23e503a8feef8f0f4ef342860586c81490806bf2ebe4ab0bfb",
+    "vendor/lance/tests/query/mod.rs": "0ce1a395049e705c2e678055f9ca745bfccbf2e6d6428b6dcaf77f7be9ce304e",
+    "vendor/lance/tests/query/primitives.rs": "b14ccf40e0bd837e87bbdd334a97c612b738d458b323ccf788dcac5200a989c6",
+    "vendor/lance/tests/query/vectors.rs": "fac90a2ad766f697f5117a9541f63029bbd89e25204a339ee5816da44d70c57a",
+    "vendor/lance/tests/resource_test/mod.rs": "1d30909670f31c758010e59f8c84315851e11bca96115f07efd5a9ac35bbc452",
+    "vendor/lance/tests/resource_test/utils.rs": "9e1ea8302cb7a853a6dca1be21c0b538ec50e78bb95ca57bb32f4c15813567aa",
+    "vendor/lance/tests/resource_test/vector.rs": "ad6b696620a6d48cc2f12428900854bf6d3772b8ce1b9685bc754f53194a69e0",
+    "vendor/lance/tests/resource_test/write.rs": "1ddeab903ffe592f46a0af1054b0ef7ae98f02ae4cb9274b08408b2be7d164d8",
+    "vendor/lance/tests/resource_tests.rs": "7212fc4524ab57053c3fffd4619a4a74d109c3bd6c9fab45c978a13a647dba51",
+    "vendor/lance/tests/utils/mod.rs": "7cbe6a18216dd34f06e40f4a6cb4ab9d4b2517a8276309180c947fff5905f2f6"
+  },
+  "scope_before": {
+    "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0",
+    "memory.peak": "1743462400",
+    "memory.current": "658870272"
+  }
+}

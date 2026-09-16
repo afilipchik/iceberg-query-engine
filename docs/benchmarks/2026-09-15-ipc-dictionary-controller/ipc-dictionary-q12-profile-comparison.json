@@ -1,0 +1,33 @@
+{
+  "qualification": "Existing aggregate telemetry only; upstream attribution is an inference, not isolated scan/join timing.",
+  "cases": {
+    "b1-parent-q12": {
+      "input_rows": 310803.0,
+      "input_batches": 229.0,
+      "evaluation_ms": 19.952,
+      "ingestion_ms": 66.978,
+      "finish_ms": 0.092
+    },
+    "b1-candidate-q12": {
+      "input_rows": 310803.0,
+      "input_batches": 229.0,
+      "evaluation_ms": 19.427,
+      "ingestion_ms": 73.891,
+      "finish_ms": 0.094
+    },
+    "b2-parent-q12": {
+      "input_rows": 310803.0,
+      "input_batches": 229.0,
+      "evaluation_ms": 19.629,
+      "ingestion_ms": 67.809,
+      "finish_ms": 0.093
+    },
+    "b2-candidate-q12": {
+      "input_rows": 310803.0,
+      "input_batches": 229.0,
+      "evaluation_ms": 19.24,
+      "ingestion_ms": 62.721,
+      "finish_ms": 0.089
+    }
+  }
+}

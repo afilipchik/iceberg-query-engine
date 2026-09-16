@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "complete": false,
+  "issues": [
+    "row 34 ('tpch_sf10', 'q18', 'iceberg', 's1')/1: answer not validated; engine: not_run; duckdb: not_run; invalid fresh calibration",
+    "row 35 ('tpch_sf10', 'q18', 'iceberg', 's1')/2: answer not validated; engine: not_run; duckdb: not_run; invalid fresh calibration",
+    "row 36 ('tpch_sf10', 'q18', 'iceberg', 's1')/3: answer not validated; engine: not_run; duckdb: not_run; invalid fresh calibration"
+  ],
+  "groups": [],
+  "latency_leadership": false,
+  "certification": "incomplete: resource, concurrency and regression gates are separate"
+}

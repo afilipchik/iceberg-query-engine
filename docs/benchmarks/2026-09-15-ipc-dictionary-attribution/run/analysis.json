@@ -1,0 +1,1474 @@
+{
+  "qualification": "Two reversed blocks, aggregate instrumentation enabled, diagnostic ceiling; not performance acceptance. Native provider boundary matches the canonical screen; extended diagnostic deadline is separate from the recorded DuckDB ceiling.",
+  "typed_outputs": 80,
+  "cases": {
+    "b1-parent-q01": {
+      "median_ms": 6795.725458,
+      "median_plan_ms": 0.132152,
+      "median_execute_ms": 6795.292465,
+      "optimized_plans": [
+        "Sort: [l_returnflag Asc, l_linestatus Asc]\n  Project: [l_returnflag, l_linestatus, sum_qty AS sum_qty, sum_base_price AS sum_base_price, sum_disc_price AS sum_disc_price, sum_charge AS sum_charge, avg_qty AS avg_qty, avg_price AS avg_price, avg_disc AS avg_disc, count_order AS count_order]\n    Aggregate: group_by=[l_returnflag, l_linestatus], aggs=[SUM(l_quantity), SUM(l_extendedprice), SUM((l_extendedprice * (1 - l_discount))), SUM(((l_extendedprice * (1 - l_discount)) * (1 + l_tax))), AVG(l_quantity), AVG(l_extendedprice), AVG(l_discount), COUNT(*)]\n      Project: [lineitem.l_quantity, lineitem.l_extendedprice, lineitem.l_discount, lineitem.l_tax, lineitem.l_returnflag, lineitem.l_linestatus]\n        Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n          projection: [4, 5, 6, 7, 8, 9, 10]\n          filter: (l_shipdate <= DATE(10471))\n"
+      ],
+      "physical_plans": [
+        "ExternalSort\n  Project\n    SpillableHashAggregate\n      Project\n        Filter\n          NativeStreamingScanExec\n"
+      ],
+      "routing_profiles": [
+        {
+          "key_preparation_ms": 2190.314,
+          "row_dispatch_ms": 351.474,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 2218.106,
+          "row_dispatch_ms": 346.601,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 2224.735,
+          "row_dispatch_ms": 348.663,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 2149.237,
+          "row_dispatch_ms": 351.04,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        }
+      ],
+      "aggregate_profiles": [
+        {
+          "input_rows": 59142609.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 1401.005,
+          "ingestion_ms": 4786.002,
+          "finish_ms": 0.125,
+          "output_ms": 0.031,
+          "output_rows": 4.0,
+          "output_batches": 3.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 59142609.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 1410.018,
+          "ingestion_ms": 4880.348,
+          "finish_ms": 0.126,
+          "output_ms": 0.021,
+          "output_rows": 4.0,
+          "output_batches": 3.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 59142609.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 1403.765,
+          "ingestion_ms": 4924.538,
+          "finish_ms": 0.099,
+          "output_ms": 0.021,
+          "output_rows": 4.0,
+          "output_batches": 3.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 59142609.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 1410.685,
+          "ingestion_ms": 4746.212,
+          "finish_ms": 0.103,
+          "output_ms": 0.022,
+          "output_rows": 4.0,
+          "output_batches": 3.0,
+          "spilled_bytes": 0.0
+        }
+      ],
+      "large_aggregate_sample_count": 4,
+      "measured_large_aggregate_median": {
+        "evaluation_ms": 1410.018,
+        "ingestion_ms": 4880.348,
+        "finish_ms": 0.103,
+        "output_ms": 0.021
+      }
+    },
+    "b1-parent-q06": {
+      "median_ms": 1552.3334960000002,
+      "median_plan_ms": 0.104959,
+      "median_execute_ms": 1552.0060959999998,
+      "optimized_plans": [
+        "Project: [revenue AS revenue]\n  Aggregate: group_by=[], aggs=[SUM((l_extendedprice * l_discount))]\n    Project: [lineitem.l_extendedprice, lineitem.l_discount]\n      Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n        projection: [4, 5, 6, 10]\n        filter: ((((l_shipdate >= DATE(8766)) AND (l_shipdate < DATE(9131))) AND l_discount BETWEEN 0.05 AND 0.07) AND (l_quantity < 24))\n"
+      ],
+      "physical_plans": [
+        "Project\n  SpillableHashAggregate\n    Project\n      Filter\n        NativeStreamingScanExec\n"
+      ],
+      "routing_profiles": []
+    },
+    "b1-parent-q12": {
+      "median_ms": 584.750729,
+      "median_plan_ms": 9.235902000000001,
+      "median_execute_ms": 569.339239,
+      "optimized_plans": [
+        "Sort: [l_shipmode Asc]\n  Project: [l_shipmode, high_line_count AS high_line_count, low_line_count AS low_line_count]\n    Aggregate: group_by=[l_shipmode], aggs=[SUM(CASE WHEN ((o_orderpriority = '1-URGENT') OR (o_orderpriority = '2-HIGH')) THEN 1 ELSE 0 END), SUM(CASE WHEN ((o_orderpriority != '1-URGENT') AND (o_orderpriority != '2-HIGH')) THEN 1 ELSE 0 END)]\n      INNER Join\n        on: l_orderkey = o_orderkey\n        Project: [lineitem.l_orderkey, lineitem.l_shipmode]\n          Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n            projection: [0, 10, 11, 12, 14]\n            filter: ((((l_shipmode IN ('MAIL', 'SHIP') AND (l_commitdate < l_receiptdate)) AND (l_shipdate < l_commitdate)) AND (l_receiptdate >= DATE(8766))) AND (l_receiptdate < DATE(9131)))\n        Scan: orders [o_orderkey, o_custkey, o_orderstatus, o_totalprice, o_orderdate, o_orderpriority, o_clerk, o_shippriority, o_comment]\n          projection: [0, 5]\n"
+      ],
+      "physical_plans": [
+        "ExternalSort\n  Project\n    SpillableHashAggregate\n      SpillableHashJoin\n        Project\n          Filter\n            NativeStreamingScanExec\n        MemoryTableScan\n"
+      ],
+      "routing_profiles": [
+        {
+          "key_preparation_ms": 12.064,
+          "row_dispatch_ms": 2.305,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 12.466,
+          "row_dispatch_ms": 2.562,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 11.951,
+          "row_dispatch_ms": 2.267,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 12.837,
+          "row_dispatch_ms": 2.401,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        }
+      ]
+    },
+    "b1-parent-q18": {
+      "median_ms": 4310.5929129999995,
+      "median_plan_ms": 5.450803,
+      "median_execute_ms": 4297.006197,
+      "optimized_plans": [
+        "Limit: skip=0, fetch=Some(100)\n  Sort: [o_totalprice Desc, o_orderdate Asc]\n    Project: [c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice, SUM(l_quantity)]\n      Aggregate: group_by=[c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice], aggs=[SUM(l_quantity)]\n        INNER Join\n          on: o_orderkey = l_orderkey\n          INNER Join\n            on: o_custkey = c_custkey\n            SEMI Join\n              on: o_orderkey = l_orderkey\n              Scan: orders [o_orderkey, o_custkey, o_orderstatus, o_totalprice, o_orderdate, o_orderpriority, o_clerk, o_shippriority, o_comment]\n                projection: [0, 1, 3, 4]\n              Project: [l_orderkey]\n                Filter: (SUM(l_quantity) > 300)\n                  Aggregate: group_by=[l_orderkey], aggs=[SUM(l_quantity)]\n                    Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n                      projection: [0, 4]\n            Scan: customer [c_custkey, c_name, c_address, c_nationkey, c_phone, c_acctbal, c_mktsegment, c_comment]\n              projection: [0, 1]\n          Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n            projection: [0, 4]\n"
+      ],
+      "physical_plans": [
+        "ExternalSort\n  Project\n    SpillableHashAggregate\n      SpillableHashJoin\n        SpillableHashJoin\n          SpillableHashJoin\n            MemoryTableScan\n            Project\n              SpillableHashAggregate\n                NativeStreamingScanExec\n          MemoryTableScan\n        NativeStreamingScanExec\n"
+      ],
+      "routing_profiles": [
+        {
+          "key_preparation_ms": 729.18,
+          "row_dispatch_ms": 361.2,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 1.21,
+          "row_dispatch_ms": 0.339,
+          "prepared_batches": 469.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 753.999,
+          "row_dispatch_ms": 381.037,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 1.192,
+          "row_dispatch_ms": 0.331,
+          "prepared_batches": 469.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 766.691,
+          "row_dispatch_ms": 368.361,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 1.263,
+          "row_dispatch_ms": 0.35,
+          "prepared_batches": 469.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 739.658,
+          "row_dispatch_ms": 359.9,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 1.23,
+          "row_dispatch_ms": 0.339,
+          "prepared_batches": 469.0,
+          "unprepared_batches": 0.0
+        }
+      ],
+      "aggregate_profiles": [
+        {
+          "input_rows": 59986052.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 5.821,
+          "ingestion_ms": 2669.435,
+          "finish_ms": 996.422,
+          "output_ms": 996.198,
+          "output_rows": 624.0,
+          "output_batches": 612.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 4368.0,
+          "input_batches": 469.0,
+          "evaluation_ms": 0.926,
+          "ingestion_ms": 2.324,
+          "finish_ms": 0.24,
+          "output_ms": 0.168,
+          "output_rows": 624.0,
+          "output_batches": 4.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 59986052.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 6.464,
+          "ingestion_ms": 2785.89,
+          "finish_ms": 1001.758,
+          "output_ms": 1001.557,
+          "output_rows": 624.0,
+          "output_batches": 614.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 4368.0,
+          "input_batches": 469.0,
+          "evaluation_ms": 0.932,
+          "ingestion_ms": 2.303,
+          "finish_ms": 0.239,
+          "output_ms": 0.161,
+          "output_rows": 624.0,
+          "output_batches": 4.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 59986052.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 6.124,
+          "ingestion_ms": 2783.057,
+          "finish_ms": 982.81,
+          "output_ms": 982.595,
+          "output_rows": 624.0,
+          "output_batches": 612.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 4368.0,
+          "input_batches": 469.0,
+          "evaluation_ms": 0.983,
+          "ingestion_ms": 2.437,
+          "finish_ms": 0.245,
+          "output_ms": 0.173,
+          "output_rows": 624.0,
+          "output_batches": 4.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 59986052.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 6.31,
+          "ingestion_ms": 2704.533,
+          "finish_ms": 1000.94,
+          "output_ms": 1000.748,
+          "output_rows": 624.0,
+          "output_batches": 612.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 4368.0,
+          "input_batches": 469.0,
+          "evaluation_ms": 0.938,
+          "ingestion_ms": 2.378,
+          "finish_ms": 0.251,
+          "output_ms": 0.174,
+          "output_rows": 624.0,
+          "output_batches": 4.0,
+          "spilled_bytes": 0.0
+        }
+      ],
+      "large_aggregate_sample_count": 4,
+      "measured_large_aggregate_median": {
+        "evaluation_ms": 6.31,
+        "ingestion_ms": 2783.057,
+        "finish_ms": 1000.94,
+        "output_ms": 1000.748
+      }
+    },
+    "b1-parent-q09": {
+      "median_ms": 2370.254041,
+      "median_plan_ms": 10.425877,
+      "median_execute_ms": 2343.368987,
+      "optimized_plans": [
+        "Sort: [nation Asc, o_year Desc]\n  Project: [nation, o_year, sum_profit AS sum_profit]\n    Aggregate: group_by=[nation, o_year], aggs=[SUM(amount)]\n      SubqueryAlias: profit\n        Project: [n_name AS nation, EXTRACT('YEAR', o_orderdate) AS o_year, ((l_extendedprice * (1 - l_discount)) - (ps_supplycost * l_quantity)) AS amount]\n          INNER Join\n            on: ps_suppkey = l_suppkey AND ps_partkey = l_partkey\n            Scan: partsupp [ps_partkey, ps_suppkey, ps_availqty, ps_supplycost, ps_comment]\n              projection: [0, 1, 3]\n            INNER Join\n              on: s_suppkey = l_suppkey\n              INNER Join\n                on: n_nationkey = s_nationkey\n                Scan: nation [n_nationkey, n_name, n_regionkey, n_comment]\n                  projection: [0, 1]\n                Scan: supplier [s_suppkey, s_name, s_address, s_nationkey, s_phone, s_acctbal, s_comment]\n                  projection: [0, 3]\n              INNER Join\n                on: o_orderkey = l_orderkey\n                Scan: orders [o_orderkey, o_custkey, o_orderstatus, o_totalprice, o_orderdate, o_orderpriority, o_clerk, o_shippriority, o_comment]\n                  projection: [0, 4]\n                INNER Join\n                  on: p_partkey = l_partkey\n                  Project: [part.p_partkey]\n                    Scan: part [p_partkey, p_name, p_mfgr, p_brand, p_type, p_size, p_container, p_retailprice, p_comment]\n                      projection: [0, 1]\n                      filter: (p_name LIKE '%green%')\n                  Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n                    projection: [0, 1, 2, 4, 5, 6]\n"
+      ],
+      "physical_plans": [
+        "ExternalSort\n  Project\n    SpillableHashAggregate\n      Project\n        Project\n          SpillableHashJoin\n            MemoryTableScan\n            SpillableHashJoin\n              SpillableHashJoin\n                MemoryTableScan\n                MemoryTableScan\n              SpillableHashJoin\n                MemoryTableScan\n                SpillableHashJoin\n                  Project\n                    Filter\n                      MemoryTableScan\n                  NativeStreamingScanExec\n"
+      ],
+      "routing_profiles": [
+        {
+          "key_preparation_ms": 90.36,
+          "row_dispatch_ms": 22.047,
+          "prepared_batches": 916.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 82.081,
+          "row_dispatch_ms": 22.471,
+          "prepared_batches": 916.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 85.557,
+          "row_dispatch_ms": 21.202,
+          "prepared_batches": 916.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 87.962,
+          "row_dispatch_ms": 21.09,
+          "prepared_batches": 916.0,
+          "unprepared_batches": 0.0
+        }
+      ]
+    },
+    "b1-candidate-q01": {
+      "median_ms": 6566.8556340000005,
+      "median_plan_ms": 0.15137199999999998,
+      "median_execute_ms": 6566.395734000001,
+      "optimized_plans": [
+        "Sort: [l_returnflag Asc, l_linestatus Asc]\n  Project: [l_returnflag, l_linestatus, sum_qty AS sum_qty, sum_base_price AS sum_base_price, sum_disc_price AS sum_disc_price, sum_charge AS sum_charge, avg_qty AS avg_qty, avg_price AS avg_price, avg_disc AS avg_disc, count_order AS count_order]\n    Aggregate: group_by=[l_returnflag, l_linestatus], aggs=[SUM(l_quantity), SUM(l_extendedprice), SUM((l_extendedprice * (1 - l_discount))), SUM(((l_extendedprice * (1 - l_discount)) * (1 + l_tax))), AVG(l_quantity), AVG(l_extendedprice), AVG(l_discount), COUNT(*)]\n      Project: [lineitem.l_quantity, lineitem.l_extendedprice, lineitem.l_discount, lineitem.l_tax, lineitem.l_returnflag, lineitem.l_linestatus]\n        Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n          projection: [4, 5, 6, 7, 8, 9, 10]\n          filter: (l_shipdate <= DATE(10471))\n"
+      ],
+      "physical_plans": [
+        "ExternalSort\n  Project\n    SpillableHashAggregate\n      Project\n        Filter\n          NativeStreamingScanExec\n"
+      ],
+      "routing_profiles": [
+        {
+          "key_preparation_ms": 2042.152,
+          "row_dispatch_ms": 344.951,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 2050.432,
+          "row_dispatch_ms": 356.05,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 2057.503,
+          "row_dispatch_ms": 361.134,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 2024.707,
+          "row_dispatch_ms": 360.342,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        }
+      ],
+      "aggregate_profiles": [
+        {
+          "input_rows": 59142609.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 1408.595,
+          "ingestion_ms": 4610.099,
+          "finish_ms": 0.113,
+          "output_ms": 0.032,
+          "output_rows": 4.0,
+          "output_batches": 3.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 59142609.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 1418.982,
+          "ingestion_ms": 4694.702,
+          "finish_ms": 0.095,
+          "output_ms": 0.021,
+          "output_rows": 4.0,
+          "output_batches": 3.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 59142609.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 1424.417,
+          "ingestion_ms": 4641.464,
+          "finish_ms": 0.107,
+          "output_ms": 0.021,
+          "output_rows": 4.0,
+          "output_batches": 3.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 59142609.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 1420.743,
+          "ingestion_ms": 4652.888,
+          "finish_ms": 0.108,
+          "output_ms": 0.024,
+          "output_rows": 4.0,
+          "output_batches": 3.0,
+          "spilled_bytes": 0.0
+        }
+      ],
+      "large_aggregate_sample_count": 4,
+      "measured_large_aggregate_median": {
+        "evaluation_ms": 1420.743,
+        "ingestion_ms": 4652.888,
+        "finish_ms": 0.107,
+        "output_ms": 0.021
+      }
+    },
+    "b1-candidate-q06": {
+      "median_ms": 834.2258019999999,
+      "median_plan_ms": 0.111257,
+      "median_execute_ms": 833.887284,
+      "optimized_plans": [
+        "Project: [revenue AS revenue]\n  Aggregate: group_by=[], aggs=[SUM((l_extendedprice * l_discount))]\n    Project: [lineitem.l_extendedprice, lineitem.l_discount]\n      Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n        projection: [4, 5, 6, 10]\n        filter: ((((l_shipdate >= DATE(8766)) AND (l_shipdate < DATE(9131))) AND l_discount BETWEEN 0.05 AND 0.07) AND (l_quantity < 24))\n"
+      ],
+      "physical_plans": [
+        "Project\n  SpillableHashAggregate\n    Project\n      Filter\n        NativeStreamingScanExec\n"
+      ],
+      "routing_profiles": []
+    },
+    "b1-candidate-q12": {
+      "median_ms": 956.784758,
+      "median_plan_ms": 9.203351,
+      "median_execute_ms": 941.277896,
+      "optimized_plans": [
+        "Sort: [l_shipmode Asc]\n  Project: [l_shipmode, high_line_count AS high_line_count, low_line_count AS low_line_count]\n    Aggregate: group_by=[l_shipmode], aggs=[SUM(CASE WHEN ((o_orderpriority = '1-URGENT') OR (o_orderpriority = '2-HIGH')) THEN 1 ELSE 0 END), SUM(CASE WHEN ((o_orderpriority != '1-URGENT') AND (o_orderpriority != '2-HIGH')) THEN 1 ELSE 0 END)]\n      INNER Join\n        on: l_orderkey = o_orderkey\n        Project: [lineitem.l_orderkey, lineitem.l_shipmode]\n          Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n            projection: [0, 10, 11, 12, 14]\n            filter: ((((l_shipmode IN ('MAIL', 'SHIP') AND (l_commitdate < l_receiptdate)) AND (l_shipdate < l_commitdate)) AND (l_receiptdate >= DATE(8766))) AND (l_receiptdate < DATE(9131)))\n        Scan: orders [o_orderkey, o_custkey, o_orderstatus, o_totalprice, o_orderdate, o_orderpriority, o_clerk, o_shippriority, o_comment]\n          projection: [0, 5]\n"
+      ],
+      "physical_plans": [
+        "ExternalSort\n  Project\n    SpillableHashAggregate\n      SpillableHashJoin\n        Project\n          Filter\n            NativeStreamingScanExec\n        MemoryTableScan\n"
+      ],
+      "routing_profiles": [
+        {
+          "key_preparation_ms": 10.93,
+          "row_dispatch_ms": 2.164,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 11.876,
+          "row_dispatch_ms": 2.364,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 11.669,
+          "row_dispatch_ms": 2.353,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 11.408,
+          "row_dispatch_ms": 2.308,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        }
+      ]
+    },
+    "b1-candidate-q18": {
+      "median_ms": 4312.810861,
+      "median_plan_ms": 5.322052,
+      "median_execute_ms": 4299.165169,
+      "optimized_plans": [
+        "Limit: skip=0, fetch=Some(100)\n  Sort: [o_totalprice Desc, o_orderdate Asc]\n    Project: [c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice, SUM(l_quantity)]\n      Aggregate: group_by=[c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice], aggs=[SUM(l_quantity)]\n        INNER Join\n          on: o_orderkey = l_orderkey\n          INNER Join\n            on: o_custkey = c_custkey\n            SEMI Join\n              on: o_orderkey = l_orderkey\n              Scan: orders [o_orderkey, o_custkey, o_orderstatus, o_totalprice, o_orderdate, o_orderpriority, o_clerk, o_shippriority, o_comment]\n                projection: [0, 1, 3, 4]\n              Project: [l_orderkey]\n                Filter: (SUM(l_quantity) > 300)\n                  Aggregate: group_by=[l_orderkey], aggs=[SUM(l_quantity)]\n                    Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n                      projection: [0, 4]\n            Scan: customer [c_custkey, c_name, c_address, c_nationkey, c_phone, c_acctbal, c_mktsegment, c_comment]\n              projection: [0, 1]\n          Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n            projection: [0, 4]\n"
+      ],
+      "physical_plans": [
+        "ExternalSort\n  Project\n    SpillableHashAggregate\n      SpillableHashJoin\n        SpillableHashJoin\n          SpillableHashJoin\n            MemoryTableScan\n            Project\n              SpillableHashAggregate\n                NativeStreamingScanExec\n          MemoryTableScan\n        NativeStreamingScanExec\n"
+      ],
+      "routing_profiles": [
+        {
+          "key_preparation_ms": 731.411,
+          "row_dispatch_ms": 356.364,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 1.207,
+          "row_dispatch_ms": 0.326,
+          "prepared_batches": 469.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 743.201,
+          "row_dispatch_ms": 364.146,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 1.297,
+          "row_dispatch_ms": 0.344,
+          "prepared_batches": 469.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 746.939,
+          "row_dispatch_ms": 370.809,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 1.238,
+          "row_dispatch_ms": 0.336,
+          "prepared_batches": 469.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 728.374,
+          "row_dispatch_ms": 363.846,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 1.341,
+          "row_dispatch_ms": 0.363,
+          "prepared_batches": 469.0,
+          "unprepared_batches": 0.0
+        }
+      ],
+      "aggregate_profiles": [
+        {
+          "input_rows": 59986052.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 6.279,
+          "ingestion_ms": 2667.138,
+          "finish_ms": 1008.939,
+          "output_ms": 1008.711,
+          "output_rows": 624.0,
+          "output_batches": 613.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 4368.0,
+          "input_batches": 469.0,
+          "evaluation_ms": 0.913,
+          "ingestion_ms": 2.285,
+          "finish_ms": 0.254,
+          "output_ms": 0.171,
+          "output_rows": 624.0,
+          "output_batches": 4.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 59986052.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 6.203,
+          "ingestion_ms": 2724.043,
+          "finish_ms": 1043.529,
+          "output_ms": 1043.338,
+          "output_rows": 624.0,
+          "output_batches": 615.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 4368.0,
+          "input_batches": 469.0,
+          "evaluation_ms": 1.05,
+          "ingestion_ms": 2.497,
+          "finish_ms": 0.234,
+          "output_ms": 0.162,
+          "output_rows": 624.0,
+          "output_batches": 4.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 59986052.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 6.893,
+          "ingestion_ms": 2766.346,
+          "finish_ms": 1001.232,
+          "output_ms": 1001.025,
+          "output_rows": 624.0,
+          "output_batches": 616.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 4368.0,
+          "input_batches": 469.0,
+          "evaluation_ms": 0.955,
+          "ingestion_ms": 2.355,
+          "finish_ms": 0.248,
+          "output_ms": 0.169,
+          "output_rows": 624.0,
+          "output_batches": 4.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 59986052.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 6.473,
+          "ingestion_ms": 2633.156,
+          "finish_ms": 1001.789,
+          "output_ms": 1001.592,
+          "output_rows": 624.0,
+          "output_batches": 615.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 4368.0,
+          "input_batches": 469.0,
+          "evaluation_ms": 1.039,
+          "ingestion_ms": 2.566,
+          "finish_ms": 0.31,
+          "output_ms": 0.22,
+          "output_rows": 624.0,
+          "output_batches": 4.0,
+          "spilled_bytes": 0.0
+        }
+      ],
+      "large_aggregate_sample_count": 4,
+      "measured_large_aggregate_median": {
+        "evaluation_ms": 6.473,
+        "ingestion_ms": 2724.043,
+        "finish_ms": 1001.789,
+        "output_ms": 1001.592
+      }
+    },
+    "b1-candidate-q09": {
+      "median_ms": 2408.5526449999998,
+      "median_plan_ms": 11.673471,
+      "median_execute_ms": 2379.479878,
+      "optimized_plans": [
+        "Sort: [nation Asc, o_year Desc]\n  Project: [nation, o_year, sum_profit AS sum_profit]\n    Aggregate: group_by=[nation, o_year], aggs=[SUM(amount)]\n      SubqueryAlias: profit\n        Project: [n_name AS nation, EXTRACT('YEAR', o_orderdate) AS o_year, ((l_extendedprice * (1 - l_discount)) - (ps_supplycost * l_quantity)) AS amount]\n          INNER Join\n            on: ps_suppkey = l_suppkey AND ps_partkey = l_partkey\n            Scan: partsupp [ps_partkey, ps_suppkey, ps_availqty, ps_supplycost, ps_comment]\n              projection: [0, 1, 3]\n            INNER Join\n              on: s_suppkey = l_suppkey\n              INNER Join\n                on: n_nationkey = s_nationkey\n                Scan: nation [n_nationkey, n_name, n_regionkey, n_comment]\n                  projection: [0, 1]\n                Scan: supplier [s_suppkey, s_name, s_address, s_nationkey, s_phone, s_acctbal, s_comment]\n                  projection: [0, 3]\n              INNER Join\n                on: o_orderkey = l_orderkey\n                Scan: orders [o_orderkey, o_custkey, o_orderstatus, o_totalprice, o_orderdate, o_orderpriority, o_clerk, o_shippriority, o_comment]\n                  projection: [0, 4]\n                INNER Join\n                  on: p_partkey = l_partkey\n                  Project: [part.p_partkey]\n                    Scan: part [p_partkey, p_name, p_mfgr, p_brand, p_type, p_size, p_container, p_retailprice, p_comment]\n                      projection: [0, 1]\n                      filter: (p_name LIKE '%green%')\n                  Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n                    projection: [0, 1, 2, 4, 5, 6]\n"
+      ],
+      "physical_plans": [
+        "ExternalSort\n  Project\n    SpillableHashAggregate\n      Project\n        Project\n          SpillableHashJoin\n            MemoryTableScan\n            SpillableHashJoin\n              SpillableHashJoin\n                MemoryTableScan\n                MemoryTableScan\n              SpillableHashJoin\n                MemoryTableScan\n                SpillableHashJoin\n                  Project\n                    Filter\n                      MemoryTableScan\n                  NativeStreamingScanExec\n"
+      ],
+      "routing_profiles": [
+        {
+          "key_preparation_ms": 96.087,
+          "row_dispatch_ms": 22.606,
+          "prepared_batches": 916.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 89.394,
+          "row_dispatch_ms": 22.694,
+          "prepared_batches": 916.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 84.134,
+          "row_dispatch_ms": 23.512,
+          "prepared_batches": 916.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 81.361,
+          "row_dispatch_ms": 21.257,
+          "prepared_batches": 916.0,
+          "unprepared_batches": 0.0
+        }
+      ]
+    },
+    "b2-candidate-q01": {
+      "median_ms": 6744.693279,
+      "median_plan_ms": 0.127035,
+      "median_execute_ms": 6744.27321,
+      "optimized_plans": [
+        "Sort: [l_returnflag Asc, l_linestatus Asc]\n  Project: [l_returnflag, l_linestatus, sum_qty AS sum_qty, sum_base_price AS sum_base_price, sum_disc_price AS sum_disc_price, sum_charge AS sum_charge, avg_qty AS avg_qty, avg_price AS avg_price, avg_disc AS avg_disc, count_order AS count_order]\n    Aggregate: group_by=[l_returnflag, l_linestatus], aggs=[SUM(l_quantity), SUM(l_extendedprice), SUM((l_extendedprice * (1 - l_discount))), SUM(((l_extendedprice * (1 - l_discount)) * (1 + l_tax))), AVG(l_quantity), AVG(l_extendedprice), AVG(l_discount), COUNT(*)]\n      Project: [lineitem.l_quantity, lineitem.l_extendedprice, lineitem.l_discount, lineitem.l_tax, lineitem.l_returnflag, lineitem.l_linestatus]\n        Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n          projection: [4, 5, 6, 7, 8, 9, 10]\n          filter: (l_shipdate <= DATE(10471))\n"
+      ],
+      "physical_plans": [
+        "ExternalSort\n  Project\n    SpillableHashAggregate\n      Project\n        Filter\n          NativeStreamingScanExec\n"
+      ],
+      "routing_profiles": [
+        {
+          "key_preparation_ms": 2071.904,
+          "row_dispatch_ms": 359.858,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 2031.923,
+          "row_dispatch_ms": 360.065,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 2103.712,
+          "row_dispatch_ms": 353.028,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 2109.637,
+          "row_dispatch_ms": 355.569,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        }
+      ],
+      "aggregate_profiles": [
+        {
+          "input_rows": 59142609.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 1415.544,
+          "ingestion_ms": 4683.94,
+          "finish_ms": 0.117,
+          "output_ms": 0.034,
+          "output_rows": 4.0,
+          "output_batches": 3.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 59142609.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 1412.677,
+          "ingestion_ms": 4677.122,
+          "finish_ms": 0.122,
+          "output_ms": 0.021,
+          "output_rows": 4.0,
+          "output_batches": 3.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 59142609.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 1423.208,
+          "ingestion_ms": 4792.954,
+          "finish_ms": 0.1,
+          "output_ms": 0.021,
+          "output_rows": 4.0,
+          "output_batches": 3.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 59142609.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 1410.101,
+          "ingestion_ms": 4815.216,
+          "finish_ms": 0.116,
+          "output_ms": 0.021,
+          "output_rows": 4.0,
+          "output_batches": 3.0,
+          "spilled_bytes": 0.0
+        }
+      ],
+      "large_aggregate_sample_count": 4,
+      "measured_large_aggregate_median": {
+        "evaluation_ms": 1412.677,
+        "ingestion_ms": 4792.954,
+        "finish_ms": 0.116,
+        "output_ms": 0.021
+      }
+    },
+    "b2-candidate-q06": {
+      "median_ms": 900.202743,
+      "median_plan_ms": 0.12221599999999999,
+      "median_execute_ms": 899.445443,
+      "optimized_plans": [
+        "Project: [revenue AS revenue]\n  Aggregate: group_by=[], aggs=[SUM((l_extendedprice * l_discount))]\n    Project: [lineitem.l_extendedprice, lineitem.l_discount]\n      Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n        projection: [4, 5, 6, 10]\n        filter: ((((l_shipdate >= DATE(8766)) AND (l_shipdate < DATE(9131))) AND l_discount BETWEEN 0.05 AND 0.07) AND (l_quantity < 24))\n"
+      ],
+      "physical_plans": [
+        "Project\n  SpillableHashAggregate\n    Project\n      Filter\n        NativeStreamingScanExec\n"
+      ],
+      "routing_profiles": []
+    },
+    "b2-candidate-q12": {
+      "median_ms": 1399.371163,
+      "median_plan_ms": 9.491723,
+      "median_execute_ms": 1383.5838709999998,
+      "optimized_plans": [
+        "Sort: [l_shipmode Asc]\n  Project: [l_shipmode, high_line_count AS high_line_count, low_line_count AS low_line_count]\n    Aggregate: group_by=[l_shipmode], aggs=[SUM(CASE WHEN ((o_orderpriority = '1-URGENT') OR (o_orderpriority = '2-HIGH')) THEN 1 ELSE 0 END), SUM(CASE WHEN ((o_orderpriority != '1-URGENT') AND (o_orderpriority != '2-HIGH')) THEN 1 ELSE 0 END)]\n      INNER Join\n        on: l_orderkey = o_orderkey\n        Project: [lineitem.l_orderkey, lineitem.l_shipmode]\n          Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n            projection: [0, 10, 11, 12, 14]\n            filter: ((((l_shipmode IN ('MAIL', 'SHIP') AND (l_commitdate < l_receiptdate)) AND (l_shipdate < l_commitdate)) AND (l_receiptdate >= DATE(8766))) AND (l_receiptdate < DATE(9131)))\n        Scan: orders [o_orderkey, o_custkey, o_orderstatus, o_totalprice, o_orderdate, o_orderpriority, o_clerk, o_shippriority, o_comment]\n          projection: [0, 5]\n"
+      ],
+      "physical_plans": [
+        "ExternalSort\n  Project\n    SpillableHashAggregate\n      SpillableHashJoin\n        Project\n          Filter\n            NativeStreamingScanExec\n        MemoryTableScan\n"
+      ],
+      "routing_profiles": [
+        {
+          "key_preparation_ms": 11.494,
+          "row_dispatch_ms": 2.249,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 11.668,
+          "row_dispatch_ms": 2.291,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 11.547,
+          "row_dispatch_ms": 2.278,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 12.229,
+          "row_dispatch_ms": 2.39,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        }
+      ]
+    },
+    "b2-candidate-q18": {
+      "median_ms": 4301.071374,
+      "median_plan_ms": 5.382153,
+      "median_execute_ms": 4287.627513,
+      "optimized_plans": [
+        "Limit: skip=0, fetch=Some(100)\n  Sort: [o_totalprice Desc, o_orderdate Asc]\n    Project: [c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice, SUM(l_quantity)]\n      Aggregate: group_by=[c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice], aggs=[SUM(l_quantity)]\n        INNER Join\n          on: o_orderkey = l_orderkey\n          INNER Join\n            on: o_custkey = c_custkey\n            SEMI Join\n              on: o_orderkey = l_orderkey\n              Scan: orders [o_orderkey, o_custkey, o_orderstatus, o_totalprice, o_orderdate, o_orderpriority, o_clerk, o_shippriority, o_comment]\n                projection: [0, 1, 3, 4]\n              Project: [l_orderkey]\n                Filter: (SUM(l_quantity) > 300)\n                  Aggregate: group_by=[l_orderkey], aggs=[SUM(l_quantity)]\n                    Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n                      projection: [0, 4]\n            Scan: customer [c_custkey, c_name, c_address, c_nationkey, c_phone, c_acctbal, c_mktsegment, c_comment]\n              projection: [0, 1]\n          Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n            projection: [0, 4]\n"
+      ],
+      "physical_plans": [
+        "ExternalSort\n  Project\n    SpillableHashAggregate\n      SpillableHashJoin\n        SpillableHashJoin\n          SpillableHashJoin\n            MemoryTableScan\n            Project\n              SpillableHashAggregate\n                NativeStreamingScanExec\n          MemoryTableScan\n        NativeStreamingScanExec\n"
+      ],
+      "routing_profiles": [
+        {
+          "key_preparation_ms": 734.905,
+          "row_dispatch_ms": 352.104,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 1.219,
+          "row_dispatch_ms": 0.338,
+          "prepared_batches": 469.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 730.491,
+          "row_dispatch_ms": 354.153,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 1.205,
+          "row_dispatch_ms": 0.329,
+          "prepared_batches": 469.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 727.112,
+          "row_dispatch_ms": 370.02,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 1.359,
+          "row_dispatch_ms": 0.377,
+          "prepared_batches": 469.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 766.666,
+          "row_dispatch_ms": 382.443,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 1.256,
+          "row_dispatch_ms": 0.348,
+          "prepared_batches": 469.0,
+          "unprepared_batches": 0.0
+        }
+      ],
+      "aggregate_profiles": [
+        {
+          "input_rows": 59986052.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 5.954,
+          "ingestion_ms": 2694.995,
+          "finish_ms": 1007.85,
+          "output_ms": 1007.641,
+          "output_rows": 624.0,
+          "output_batches": 614.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 4368.0,
+          "input_batches": 469.0,
+          "evaluation_ms": 0.945,
+          "ingestion_ms": 18.645,
+          "finish_ms": 0.265,
+          "output_ms": 0.177,
+          "output_rows": 624.0,
+          "output_batches": 4.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 59986052.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 6.325,
+          "ingestion_ms": 2646.818,
+          "finish_ms": 1002.681,
+          "output_ms": 1002.486,
+          "output_rows": 624.0,
+          "output_batches": 612.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 4368.0,
+          "input_batches": 469.0,
+          "evaluation_ms": 0.933,
+          "ingestion_ms": 2.331,
+          "finish_ms": 0.232,
+          "output_ms": 0.164,
+          "output_rows": 624.0,
+          "output_batches": 4.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 59986052.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 7.092,
+          "ingestion_ms": 2731.024,
+          "finish_ms": 992.868,
+          "output_ms": 992.66,
+          "output_rows": 624.0,
+          "output_batches": 615.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 4368.0,
+          "input_batches": 469.0,
+          "evaluation_ms": 1.057,
+          "ingestion_ms": 2.627,
+          "finish_ms": 0.239,
+          "output_ms": 0.167,
+          "output_rows": 624.0,
+          "output_batches": 4.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 59986052.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 7.443,
+          "ingestion_ms": 2855.525,
+          "finish_ms": 1012.896,
+          "output_ms": 1012.688,
+          "output_rows": 624.0,
+          "output_batches": 616.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 4368.0,
+          "input_batches": 469.0,
+          "evaluation_ms": 0.934,
+          "ingestion_ms": 2.414,
+          "finish_ms": 0.247,
+          "output_ms": 0.166,
+          "output_rows": 624.0,
+          "output_batches": 4.0,
+          "spilled_bytes": 0.0
+        }
+      ],
+      "large_aggregate_sample_count": 4,
+      "measured_large_aggregate_median": {
+        "evaluation_ms": 7.092,
+        "ingestion_ms": 2731.024,
+        "finish_ms": 1002.681,
+        "output_ms": 1002.486
+      }
+    },
+    "b2-candidate-q09": {
+      "median_ms": 2404.9008179999996,
+      "median_plan_ms": 10.383154000000001,
+      "median_execute_ms": 2377.431678,
+      "optimized_plans": [
+        "Sort: [nation Asc, o_year Desc]\n  Project: [nation, o_year, sum_profit AS sum_profit]\n    Aggregate: group_by=[nation, o_year], aggs=[SUM(amount)]\n      SubqueryAlias: profit\n        Project: [n_name AS nation, EXTRACT('YEAR', o_orderdate) AS o_year, ((l_extendedprice * (1 - l_discount)) - (ps_supplycost * l_quantity)) AS amount]\n          INNER Join\n            on: ps_suppkey = l_suppkey AND ps_partkey = l_partkey\n            Scan: partsupp [ps_partkey, ps_suppkey, ps_availqty, ps_supplycost, ps_comment]\n              projection: [0, 1, 3]\n            INNER Join\n              on: s_suppkey = l_suppkey\n              INNER Join\n                on: n_nationkey = s_nationkey\n                Scan: nation [n_nationkey, n_name, n_regionkey, n_comment]\n                  projection: [0, 1]\n                Scan: supplier [s_suppkey, s_name, s_address, s_nationkey, s_phone, s_acctbal, s_comment]\n                  projection: [0, 3]\n              INNER Join\n                on: o_orderkey = l_orderkey\n                Scan: orders [o_orderkey, o_custkey, o_orderstatus, o_totalprice, o_orderdate, o_orderpriority, o_clerk, o_shippriority, o_comment]\n                  projection: [0, 4]\n                INNER Join\n                  on: p_partkey = l_partkey\n                  Project: [part.p_partkey]\n                    Scan: part [p_partkey, p_name, p_mfgr, p_brand, p_type, p_size, p_container, p_retailprice, p_comment]\n                      projection: [0, 1]\n                      filter: (p_name LIKE '%green%')\n                  Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n                    projection: [0, 1, 2, 4, 5, 6]\n"
+      ],
+      "physical_plans": [
+        "ExternalSort\n  Project\n    SpillableHashAggregate\n      Project\n        Project\n          SpillableHashJoin\n            MemoryTableScan\n            SpillableHashJoin\n              SpillableHashJoin\n                MemoryTableScan\n                MemoryTableScan\n              SpillableHashJoin\n                MemoryTableScan\n                SpillableHashJoin\n                  Project\n                    Filter\n                      MemoryTableScan\n                  NativeStreamingScanExec\n"
+      ],
+      "routing_profiles": [
+        {
+          "key_preparation_ms": 81.96,
+          "row_dispatch_ms": 21.93,
+          "prepared_batches": 916.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 85.281,
+          "row_dispatch_ms": 20.365,
+          "prepared_batches": 916.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 81.025,
+          "row_dispatch_ms": 21.519,
+          "prepared_batches": 916.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 81.268,
+          "row_dispatch_ms": 20.761,
+          "prepared_batches": 916.0,
+          "unprepared_batches": 0.0
+        }
+      ]
+    },
+    "b2-parent-q01": {
+      "median_ms": 6773.130405,
+      "median_plan_ms": 0.12867299999999998,
+      "median_execute_ms": 6772.710059999999,
+      "optimized_plans": [
+        "Sort: [l_returnflag Asc, l_linestatus Asc]\n  Project: [l_returnflag, l_linestatus, sum_qty AS sum_qty, sum_base_price AS sum_base_price, sum_disc_price AS sum_disc_price, sum_charge AS sum_charge, avg_qty AS avg_qty, avg_price AS avg_price, avg_disc AS avg_disc, count_order AS count_order]\n    Aggregate: group_by=[l_returnflag, l_linestatus], aggs=[SUM(l_quantity), SUM(l_extendedprice), SUM((l_extendedprice * (1 - l_discount))), SUM(((l_extendedprice * (1 - l_discount)) * (1 + l_tax))), AVG(l_quantity), AVG(l_extendedprice), AVG(l_discount), COUNT(*)]\n      Project: [lineitem.l_quantity, lineitem.l_extendedprice, lineitem.l_discount, lineitem.l_tax, lineitem.l_returnflag, lineitem.l_linestatus]\n        Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n          projection: [4, 5, 6, 7, 8, 9, 10]\n          filter: (l_shipdate <= DATE(10471))\n"
+      ],
+      "physical_plans": [
+        "ExternalSort\n  Project\n    SpillableHashAggregate\n      Project\n        Filter\n          NativeStreamingScanExec\n"
+      ],
+      "routing_profiles": [
+        {
+          "key_preparation_ms": 2265.936,
+          "row_dispatch_ms": 360.284,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 2206.868,
+          "row_dispatch_ms": 367.711,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 2212.675,
+          "row_dispatch_ms": 362.683,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 2223.762,
+          "row_dispatch_ms": 352.425,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        }
+      ],
+      "aggregate_profiles": [
+        {
+          "input_rows": 59142609.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 1401.922,
+          "ingestion_ms": 4841.257,
+          "finish_ms": 0.117,
+          "output_ms": 0.03,
+          "output_rows": 4.0,
+          "output_batches": 3.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 59142609.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 1406.087,
+          "ingestion_ms": 4871.276,
+          "finish_ms": 0.104,
+          "output_ms": 0.021,
+          "output_rows": 4.0,
+          "output_batches": 3.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 59142609.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 1410.04,
+          "ingestion_ms": 4838.708,
+          "finish_ms": 0.129,
+          "output_ms": 0.023,
+          "output_rows": 4.0,
+          "output_batches": 3.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 59142609.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 1399.439,
+          "ingestion_ms": 4852.368,
+          "finish_ms": 0.099,
+          "output_ms": 0.022,
+          "output_rows": 4.0,
+          "output_batches": 3.0,
+          "spilled_bytes": 0.0
+        }
+      ],
+      "large_aggregate_sample_count": 4,
+      "measured_large_aggregate_median": {
+        "evaluation_ms": 1406.087,
+        "ingestion_ms": 4852.368,
+        "finish_ms": 0.104,
+        "output_ms": 0.022
+      }
+    },
+    "b2-parent-q06": {
+      "median_ms": 826.284122,
+      "median_plan_ms": 0.12339299999999999,
+      "median_execute_ms": 825.927408,
+      "optimized_plans": [
+        "Project: [revenue AS revenue]\n  Aggregate: group_by=[], aggs=[SUM((l_extendedprice * l_discount))]\n    Project: [lineitem.l_extendedprice, lineitem.l_discount]\n      Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n        projection: [4, 5, 6, 10]\n        filter: ((((l_shipdate >= DATE(8766)) AND (l_shipdate < DATE(9131))) AND l_discount BETWEEN 0.05 AND 0.07) AND (l_quantity < 24))\n"
+      ],
+      "physical_plans": [
+        "Project\n  SpillableHashAggregate\n    Project\n      Filter\n        NativeStreamingScanExec\n"
+      ],
+      "routing_profiles": []
+    },
+    "b2-parent-q12": {
+      "median_ms": 1058.902494,
+      "median_plan_ms": 9.163905,
+      "median_execute_ms": 1043.281902,
+      "optimized_plans": [
+        "Sort: [l_shipmode Asc]\n  Project: [l_shipmode, high_line_count AS high_line_count, low_line_count AS low_line_count]\n    Aggregate: group_by=[l_shipmode], aggs=[SUM(CASE WHEN ((o_orderpriority = '1-URGENT') OR (o_orderpriority = '2-HIGH')) THEN 1 ELSE 0 END), SUM(CASE WHEN ((o_orderpriority != '1-URGENT') AND (o_orderpriority != '2-HIGH')) THEN 1 ELSE 0 END)]\n      INNER Join\n        on: l_orderkey = o_orderkey\n        Project: [lineitem.l_orderkey, lineitem.l_shipmode]\n          Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n            projection: [0, 10, 11, 12, 14]\n            filter: ((((l_shipmode IN ('MAIL', 'SHIP') AND (l_commitdate < l_receiptdate)) AND (l_shipdate < l_commitdate)) AND (l_receiptdate >= DATE(8766))) AND (l_receiptdate < DATE(9131)))\n        Scan: orders [o_orderkey, o_custkey, o_orderstatus, o_totalprice, o_orderdate, o_orderpriority, o_clerk, o_shippriority, o_comment]\n          projection: [0, 5]\n"
+      ],
+      "physical_plans": [
+        "ExternalSort\n  Project\n    SpillableHashAggregate\n      SpillableHashJoin\n        Project\n          Filter\n            NativeStreamingScanExec\n        MemoryTableScan\n"
+      ],
+      "routing_profiles": [
+        {
+          "key_preparation_ms": 11.928,
+          "row_dispatch_ms": 2.256,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 12.171,
+          "row_dispatch_ms": 2.305,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 12.836,
+          "row_dispatch_ms": 2.535,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 12.59,
+          "row_dispatch_ms": 2.377,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        }
+      ]
+    },
+    "b2-parent-q18": {
+      "median_ms": 4264.935408,
+      "median_plan_ms": 5.357646,
+      "median_execute_ms": 4251.127259999999,
+      "optimized_plans": [
+        "Limit: skip=0, fetch=Some(100)\n  Sort: [o_totalprice Desc, o_orderdate Asc]\n    Project: [c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice, SUM(l_quantity)]\n      Aggregate: group_by=[c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice], aggs=[SUM(l_quantity)]\n        INNER Join\n          on: o_orderkey = l_orderkey\n          INNER Join\n            on: o_custkey = c_custkey\n            SEMI Join\n              on: o_orderkey = l_orderkey\n              Scan: orders [o_orderkey, o_custkey, o_orderstatus, o_totalprice, o_orderdate, o_orderpriority, o_clerk, o_shippriority, o_comment]\n                projection: [0, 1, 3, 4]\n              Project: [l_orderkey]\n                Filter: (SUM(l_quantity) > 300)\n                  Aggregate: group_by=[l_orderkey], aggs=[SUM(l_quantity)]\n                    Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n                      projection: [0, 4]\n            Scan: customer [c_custkey, c_name, c_address, c_nationkey, c_phone, c_acctbal, c_mktsegment, c_comment]\n              projection: [0, 1]\n          Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n            projection: [0, 4]\n"
+      ],
+      "physical_plans": [
+        "ExternalSort\n  Project\n    SpillableHashAggregate\n      SpillableHashJoin\n        SpillableHashJoin\n          SpillableHashJoin\n            MemoryTableScan\n            Project\n              SpillableHashAggregate\n                NativeStreamingScanExec\n          MemoryTableScan\n        NativeStreamingScanExec\n"
+      ],
+      "routing_profiles": [
+        {
+          "key_preparation_ms": 721.2,
+          "row_dispatch_ms": 378.697,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 1.287,
+          "row_dispatch_ms": 0.366,
+          "prepared_batches": 469.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 728.957,
+          "row_dispatch_ms": 368.594,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 1.288,
+          "row_dispatch_ms": 0.345,
+          "prepared_batches": 469.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 733.34,
+          "row_dispatch_ms": 363.809,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 1.345,
+          "row_dispatch_ms": 0.367,
+          "prepared_batches": 469.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 784.555,
+          "row_dispatch_ms": 371.696,
+          "prepared_batches": 7323.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 1.216,
+          "row_dispatch_ms": 0.334,
+          "prepared_batches": 469.0,
+          "unprepared_batches": 0.0
+        }
+      ],
+      "aggregate_profiles": [
+        {
+          "input_rows": 59986052.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 5.992,
+          "ingestion_ms": 2627.45,
+          "finish_ms": 1032.578,
+          "output_ms": 1032.37,
+          "output_rows": 624.0,
+          "output_batches": 613.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 4368.0,
+          "input_batches": 469.0,
+          "evaluation_ms": 0.996,
+          "ingestion_ms": 2.487,
+          "finish_ms": 0.246,
+          "output_ms": 0.169,
+          "output_rows": 624.0,
+          "output_batches": 4.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 59986052.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 6.213,
+          "ingestion_ms": 2662.927,
+          "finish_ms": 1038.165,
+          "output_ms": 1037.959,
+          "output_rows": 624.0,
+          "output_batches": 617.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 4368.0,
+          "input_batches": 469.0,
+          "evaluation_ms": 0.959,
+          "ingestion_ms": 2.484,
+          "finish_ms": 0.245,
+          "output_ms": 0.166,
+          "output_rows": 624.0,
+          "output_batches": 4.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 59986052.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 6.333,
+          "ingestion_ms": 2693.741,
+          "finish_ms": 1003.625,
+          "output_ms": 1003.424,
+          "output_rows": 624.0,
+          "output_batches": 612.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 4368.0,
+          "input_batches": 469.0,
+          "evaluation_ms": 1.086,
+          "ingestion_ms": 2.594,
+          "finish_ms": 0.233,
+          "output_ms": 0.163,
+          "output_rows": 624.0,
+          "output_batches": 4.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 59986052.0,
+          "input_batches": 916.0,
+          "evaluation_ms": 6.905,
+          "ingestion_ms": 2792.602,
+          "finish_ms": 1018.065,
+          "output_ms": 1017.854,
+          "output_rows": 624.0,
+          "output_batches": 616.0,
+          "spilled_bytes": 0.0
+        },
+        {
+          "input_rows": 4368.0,
+          "input_batches": 469.0,
+          "evaluation_ms": 0.926,
+          "ingestion_ms": 2.361,
+          "finish_ms": 0.231,
+          "output_ms": 0.156,
+          "output_rows": 624.0,
+          "output_batches": 4.0,
+          "spilled_bytes": 0.0
+        }
+      ],
+      "large_aggregate_sample_count": 4,
+      "measured_large_aggregate_median": {
+        "evaluation_ms": 6.333,
+        "ingestion_ms": 2693.741,
+        "finish_ms": 1018.065,
+        "output_ms": 1017.854
+      }
+    },
+    "b2-parent-q09": {
+      "median_ms": 2395.196541,
+      "median_plan_ms": 10.538505,
+      "median_execute_ms": 2367.917549,
+      "optimized_plans": [
+        "Sort: [nation Asc, o_year Desc]\n  Project: [nation, o_year, sum_profit AS sum_profit]\n    Aggregate: group_by=[nation, o_year], aggs=[SUM(amount)]\n      SubqueryAlias: profit\n        Project: [n_name AS nation, EXTRACT('YEAR', o_orderdate) AS o_year, ((l_extendedprice * (1 - l_discount)) - (ps_supplycost * l_quantity)) AS amount]\n          INNER Join\n            on: ps_suppkey = l_suppkey AND ps_partkey = l_partkey\n            Scan: partsupp [ps_partkey, ps_suppkey, ps_availqty, ps_supplycost, ps_comment]\n              projection: [0, 1, 3]\n            INNER Join\n              on: s_suppkey = l_suppkey\n              INNER Join\n                on: n_nationkey = s_nationkey\n                Scan: nation [n_nationkey, n_name, n_regionkey, n_comment]\n                  projection: [0, 1]\n                Scan: supplier [s_suppkey, s_name, s_address, s_nationkey, s_phone, s_acctbal, s_comment]\n                  projection: [0, 3]\n              INNER Join\n                on: o_orderkey = l_orderkey\n                Scan: orders [o_orderkey, o_custkey, o_orderstatus, o_totalprice, o_orderdate, o_orderpriority, o_clerk, o_shippriority, o_comment]\n                  projection: [0, 4]\n                INNER Join\n                  on: p_partkey = l_partkey\n                  Project: [part.p_partkey]\n                    Scan: part [p_partkey, p_name, p_mfgr, p_brand, p_type, p_size, p_container, p_retailprice, p_comment]\n                      projection: [0, 1]\n                      filter: (p_name LIKE '%green%')\n                  Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n                    projection: [0, 1, 2, 4, 5, 6]\n"
+      ],
+      "physical_plans": [
+        "ExternalSort\n  Project\n    SpillableHashAggregate\n      Project\n        Project\n          SpillableHashJoin\n            MemoryTableScan\n            SpillableHashJoin\n              SpillableHashJoin\n                MemoryTableScan\n                MemoryTableScan\n              SpillableHashJoin\n                MemoryTableScan\n                SpillableHashJoin\n                  Project\n                    Filter\n                      MemoryTableScan\n                  NativeStreamingScanExec\n"
+      ],
+      "routing_profiles": [
+        {
+          "key_preparation_ms": 85.089,
+          "row_dispatch_ms": 20.811,
+          "prepared_batches": 916.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 85.921,
+          "row_dispatch_ms": 21.169,
+          "prepared_batches": 916.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 84.308,
+          "row_dispatch_ms": 21.987,
+          "prepared_batches": 916.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 83.719,
+          "row_dispatch_ms": 22.825,
+          "prepared_batches": 916.0,
+          "unprepared_batches": 0.0
+        }
+      ]
+    }
+  },
+  "pairs": [
+    {
+      "block": 1,
+      "query": "q01",
+      "query_ratio": 0.9663215023304729,
+      "parent_ms": 6795.725458,
+      "candidate_ms": 6566.8556340000005,
+      "parent_plan_ms": 0.132152,
+      "candidate_plan_ms": 0.15137199999999998,
+      "parent_execute_ms": 6795.292465,
+      "candidate_execute_ms": 6566.395734000001,
+      "optimized_plan_equal": true,
+      "physical_plan_equal": true
+    },
+    {
+      "block": 1,
+      "query": "q06",
+      "query_ratio": 0.5374011474658019,
+      "parent_ms": 1552.3334960000002,
+      "candidate_ms": 834.2258019999999,
+      "parent_plan_ms": 0.104959,
+      "candidate_plan_ms": 0.111257,
+      "parent_execute_ms": 1552.0060959999998,
+      "candidate_execute_ms": 833.887284,
+      "optimized_plan_equal": true,
+      "physical_plan_equal": true
+    },
+    {
+      "block": 1,
+      "query": "q12",
+      "query_ratio": 1.6362267040457166,
+      "parent_ms": 584.750729,
+      "candidate_ms": 956.784758,
+      "parent_plan_ms": 9.235902000000001,
+      "candidate_plan_ms": 9.203351,
+      "parent_execute_ms": 569.339239,
+      "candidate_execute_ms": 941.277896,
+      "optimized_plan_equal": true,
+      "physical_plan_equal": true
+    },
+    {
+      "block": 1,
+      "query": "q18",
+      "query_ratio": 1.0005145343215573,
+      "parent_ms": 4310.5929129999995,
+      "candidate_ms": 4312.810861,
+      "parent_plan_ms": 5.450803,
+      "candidate_plan_ms": 5.322052,
+      "parent_execute_ms": 4297.006197,
+      "candidate_execute_ms": 4299.165169,
+      "optimized_plan_equal": true,
+      "physical_plan_equal": true
+    },
+    {
+      "block": 1,
+      "query": "q09",
+      "query_ratio": 1.0161580165406412,
+      "parent_ms": 2370.254041,
+      "candidate_ms": 2408.5526449999998,
+      "parent_plan_ms": 10.425877,
+      "candidate_plan_ms": 11.673471,
+      "parent_execute_ms": 2343.368987,
+      "candidate_execute_ms": 2379.479878,
+      "optimized_plan_equal": true,
+      "physical_plan_equal": true
+    },
+    {
+      "block": 2,
+      "query": "q01",
+      "query_ratio": 0.99580147962617,
+      "parent_ms": 6773.130405,
+      "candidate_ms": 6744.693279,
+      "parent_plan_ms": 0.12867299999999998,
+      "candidate_plan_ms": 0.127035,
+      "parent_execute_ms": 6772.710059999999,
+      "candidate_execute_ms": 6744.27321,
+      "optimized_plan_equal": true,
+      "physical_plan_equal": true
+    },
+    {
+      "block": 2,
+      "query": "q06",
+      "query_ratio": 1.0894590843898608,
+      "parent_ms": 826.284122,
+      "candidate_ms": 900.202743,
+      "parent_plan_ms": 0.12339299999999999,
+      "candidate_plan_ms": 0.12221599999999999,
+      "parent_execute_ms": 825.927408,
+      "candidate_execute_ms": 899.445443,
+      "optimized_plan_equal": true,
+      "physical_plan_equal": true
+    },
+    {
+      "block": 2,
+      "query": "q12",
+      "query_ratio": 1.321529764004881,
+      "parent_ms": 1058.902494,
+      "candidate_ms": 1399.371163,
+      "parent_plan_ms": 9.163905,
+      "candidate_plan_ms": 9.491723,
+      "parent_execute_ms": 1043.281902,
+      "candidate_execute_ms": 1383.5838709999998,
+      "optimized_plan_equal": true,
+      "physical_plan_equal": true
+    },
+    {
+      "block": 2,
+      "query": "q18",
+      "query_ratio": 1.008472804988375,
+      "parent_ms": 4264.935408,
+      "candidate_ms": 4301.071374,
+      "parent_plan_ms": 5.357646,
+      "candidate_plan_ms": 5.382153,
+      "parent_execute_ms": 4251.127259999999,
+      "candidate_execute_ms": 4287.627513,
+      "optimized_plan_equal": true,
+      "physical_plan_equal": true
+    },
+    {
+      "block": 2,
+      "query": "q09",
+      "query_ratio": 1.0040515577047169,
+      "parent_ms": 2395.196541,
+      "candidate_ms": 2404.9008179999996,
+      "parent_plan_ms": 10.538505,
+      "candidate_plan_ms": 10.383154000000001,
+      "parent_execute_ms": 2367.917549,
+      "candidate_execute_ms": 2377.431678,
+      "optimized_plan_equal": true,
+      "physical_plan_equal": true
+    }
+  ]
+}

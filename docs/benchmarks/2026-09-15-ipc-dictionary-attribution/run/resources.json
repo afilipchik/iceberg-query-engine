@@ -1,0 +1,6 @@
+{
+  "memory.max": "68719476736\n",
+  "memory.swap.max": "0\n",
+  "memory.peak": "1743462400\n",
+  "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+}

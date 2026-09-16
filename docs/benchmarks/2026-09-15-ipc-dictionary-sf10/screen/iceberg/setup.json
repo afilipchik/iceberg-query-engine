@@ -1,0 +1,58 @@
+{
+  "track": "iceberg",
+  "threads": 16,
+  "memory_limit": "4294967296B",
+  "process_cap_bytes": 12884901888,
+  "temp_directory": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/ipc-dictionary-sf10-providers-01/iceberg/scratch/duckdb-temp",
+  "tables": [
+    {
+      "name": "region",
+      "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-02/iceberg/region",
+      "metadata_path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-02/iceberg/region/metadata/00001-ca3cc544-4131-4677-abc5-e66f40dabf9f.metadata.json",
+      "snapshot_id": 9073160907625909874
+    },
+    {
+      "name": "nation",
+      "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-02/iceberg/nation",
+      "metadata_path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-02/iceberg/nation/metadata/00001-20ee5513-83a1-45d4-ac4e-9b5fa9e321d7.metadata.json",
+      "snapshot_id": 5559299843217701001
+    },
+    {
+      "name": "supplier",
+      "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-02/iceberg/supplier",
+      "metadata_path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-02/iceberg/supplier/metadata/00001-b1b0e31d-080f-42c4-8de9-659a045fca9f.metadata.json",
+      "snapshot_id": 7190790065214170310
+    },
+    {
+      "name": "customer",
+      "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-02/iceberg/customer",
+      "metadata_path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-02/iceberg/customer/metadata/00001-4ecaf97c-99b5-4150-81fd-83c312640bac.metadata.json",
+      "snapshot_id": 1896289835842400358
+    },
+    {
+      "name": "part",
+      "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-02/iceberg/part",
+      "metadata_path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-02/iceberg/part/metadata/00001-802eedd1-b512-487b-8b00-045ea364f786.metadata.json",
+      "snapshot_id": 2977047050580249995
+    },
+    {
+      "name": "partsupp",
+      "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-02/iceberg/partsupp",
+      "metadata_path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-02/iceberg/partsupp/metadata/00001-72398a1b-c64f-4f66-995e-6866864e95a9.metadata.json",
+      "snapshot_id": 3957319266126403129
+    },
+    {
+      "name": "orders",
+      "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-02/iceberg/orders",
+      "metadata_path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-02/iceberg/orders/metadata/00001-301cc445-7e0d-4337-ae00-67abe1e2917e.metadata.json",
+      "snapshot_id": 8357215963606105211
+    },
+    {
+      "name": "lineitem",
+      "path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-02/iceberg/lineitem",
+      "metadata_path": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/canonical-sf10-providers-02/iceberg/lineitem/metadata/00001-1a24d593-a4e3-4724-a1ea-7112878dd708.metadata.json",
+      "snapshot_id": 3268563834692072482
+    }
+  ],
+  "reference_lance_io_limit": null
+}

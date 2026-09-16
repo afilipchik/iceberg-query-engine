@@ -1,0 +1,17 @@
+[mem-cap] process hard-capped at 12.0G anonymous memory (RLIMIT_DATA; the engine aborts if exceeded, the terminal survives; size with QE_MEM_CAP)
+[aggregate-frontier] {"admitted_buffers":false,"copy_bound":null,"envelope_bytes":null,"operator":"Project","partitions":8,"slots":1}
+live_aggregate_routing key_preparation_ms=90.360 row_dispatch_ms=22.047 prepared_batches=916 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=112.453 processing_wall_ms=50.854 serial_batches=0 parallel_batches=916
+live_aggregate_profile input_rows=3261613 input_batches=916 evaluation_ms=1.267 ingestion_ms=164.572 finish_ms=0.116 output_ms=0.035 output_rows=175 output_batches=4 spilled_bytes=0
+[aggregate-frontier] {"admitted_buffers":false,"copy_bound":null,"envelope_bytes":null,"operator":"Project","partitions":8,"slots":1}
+live_aggregate_routing key_preparation_ms=82.081 row_dispatch_ms=22.471 prepared_batches=916 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=104.600 processing_wall_ms=44.268 serial_batches=0 parallel_batches=916
+live_aggregate_profile input_rows=3261613 input_batches=916 evaluation_ms=1.170 ingestion_ms=150.147 finish_ms=0.115 output_ms=0.035 output_rows=175 output_batches=4 spilled_bytes=0
+[aggregate-frontier] {"admitted_buffers":false,"copy_bound":null,"envelope_bytes":null,"operator":"Project","partitions":8,"slots":1}
+live_aggregate_routing key_preparation_ms=85.557 row_dispatch_ms=21.202 prepared_batches=916 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=106.798 processing_wall_ms=48.739 serial_batches=0 parallel_batches=916
+live_aggregate_profile input_rows=3261613 input_batches=916 evaluation_ms=1.193 ingestion_ms=156.674 finish_ms=0.115 output_ms=0.036 output_rows=175 output_batches=4 spilled_bytes=0
+[aggregate-frontier] {"admitted_buffers":false,"copy_bound":null,"envelope_bytes":null,"operator":"Project","partitions":8,"slots":1}
+live_aggregate_routing key_preparation_ms=87.962 row_dispatch_ms=21.090 prepared_batches=916 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=109.096 processing_wall_ms=48.026 serial_batches=0 parallel_batches=916
+live_aggregate_profile input_rows=3261613 input_batches=916 evaluation_ms=1.170 ingestion_ms=159.252 finish_ms=0.111 output_ms=0.034 output_rows=175 output_batches=4 spilled_bytes=0

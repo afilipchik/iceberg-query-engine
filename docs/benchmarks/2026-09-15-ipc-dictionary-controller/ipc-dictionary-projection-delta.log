@@ -1,0 +1,272 @@
+   Compiling query_engine v0.1.0 (/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine)
+warning: unused doc comment
+  --> src/execution/alloc_profile.rs:68:1
+   |
+68 | / /// Guards against re-entrant backtrace capture (backtrace capture itself
+69 | | /// allocates) causing infinite recursion/deadlock.
+   | |_--------------------------------------------------^
+   |   |
+   |   rustdoc does not generate documentation for macro invocations
+   |
+   = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+   = note: `#[warn(unused_doc_comments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `AtomicBool`
+  --> src/execution/alloc_profile.rs:25:25
+   |
+25 | use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+   |                         ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `ScalarValue`
+   --> src/optimizer/rules/flatten_dependent_join.rs:908:46
+    |
+908 |     use crate::planner::{LogicalPlanBuilder, ScalarValue};
+    |                                              ^^^^^^^^^^^
+
+warning: unused import: `LaunchConfig`
+    --> src/physical/gpu.rs:1288:39
+     |
+1288 |     use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+     |                                       ^^^^^^^^^^^^
+
+warning: unused import: `crate::physical::operators::MemoryTableExec`
+   --> src/physical/operators/delim_join.rs:686:9
+    |
+686 |     use crate::physical::operators::MemoryTableExec;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Int32Array`
+   --> src/physical/operators/scan.rs:817:45
+    |
+817 |         use arrow::array::{DictionaryArray, Int32Array};
+    |                                             ^^^^^^^^^^
+
+warning: unused import: `ordered_float::OrderedFloat`
+   --> src/storage/row_group_pruning.rs:466:9
+    |
+466 |     use ordered_float::OrderedFloat;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated unit variant `parquet::basic::Encoding::BIT_PACKED`: Please see documentation for compatibility issues and use the RLE/bit-packing hybrid encoding instead
+   --> src/storage/admitted_row_group.rs:125:49
+    |
+125 |                     | parquet::basic::Encoding::BIT_PACKED
+    |                                                 ^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated unit variant `parquet::basic::Encoding::BIT_PACKED`: Please see documentation for compatibility issues and use the RLE/bit-packing hybrid encoding instead
+  --> src/storage/bounded_page_header.rs:56:14
+   |
+56 |         4 => BIT_PACKED,
+   |              ^^^^^^^^^^
+
+warning: use of deprecated unit variant `parquet::basic::Encoding::BIT_PACKED`: Please see documentation for compatibility issues and use the RLE/bit-packing hybrid encoding instead
+   --> src/storage/bounded_page_header.rs:459:79
+    |
+459 |                     parquet::basic::Encoding::RLE | parquet::basic::Encoding::BIT_PACKED
+    |                                                                               ^^^^^^^^^^
+
+warning: use of deprecated unit variant `parquet::basic::Encoding::BIT_PACKED`: Please see documentation for compatibility issues and use the RLE/bit-packing hybrid encoding instead
+   --> src/storage/bounded_page_header.rs:462:79
+    |
+462 |                     parquet::basic::Encoding::RLE | parquet::basic::Encoding::BIT_PACKED
+    |                                                                               ^^^^^^^^^^
+
+warning: use of deprecated method `arrow::arrow_ipc::writer::IpcDataGenerator::encoded_batch`: Use `encode` instead
+   --> src/distributed/flight.rs:186:18
+    |
+186 |                 .encoded_batch(&slice, &mut tracker, &opts)
+    |                  ^^^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1672:29
+     |
+1672 |         let d_ptrs = stream.memcpy_stod(&ptrs).map_err(gpu_err)?;
+     |                             ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1674:14
+     |
+1674 |             .memcpy_stod(
+     |              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1683:14
+     |
+1683 |             .memcpy_stod(&spec.preds.iter().map(|p| p.op).collect::<Vec<_>>())
+     |              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1686:14
+     |
+1686 |             .memcpy_stod(&spec.preds.iter().map(|p| p.value).collect::<Vec<_>>())
+     |              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1688:29
+     |
+1688 |         let d_kind = stream.memcpy_stod(&slot_kind).map_err(gpu_err)?;
+     |                             ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1689:30
+     |
+1689 |         let d_input = stream.memcpy_stod(&slot_input).map_err(gpu_err)?;
+     |                              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1691:14
+     |
+1691 |             .memcpy_stod(&slot_c.iter().map(|c| c[0]).collect::<Vec<_>>())
+     |              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1694:14
+     |
+1694 |             .memcpy_stod(&slot_c.iter().map(|c| c[1]).collect::<Vec<_>>())
+     |              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1697:14
+     |
+1697 |             .memcpy_stod(&slot_c.iter().map(|c| c[2]).collect::<Vec<_>>())
+     |              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_dtov`: Use clone_dtoh
+    --> src/physical/gpu.rs:1738:41
+     |
+1738 |         let partials: Vec<f64> = stream.memcpy_dtov(&d_out).map_err(gpu_err)?;
+     |                                         ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:2562:10
+     |
+2562 |         .memcpy_stod(&values)
+     |          ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:2610:10
+     |
+2610 |         .memcpy_stod(&codes)
+     |          ^^^^^^^^^^^
+
+warning: use of deprecated method `parquet::file::properties::WriterPropertiesBuilder::set_max_row_group_size`: Use `set_max_row_group_row_count` instead
+   --> src/physical/morsel_agg/input_frontier/tests.rs:322:10
+    |
+322 |         .set_max_row_group_size(128)
+    |          ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `parquet::file::properties::WriterPropertiesBuilder::set_max_row_group_size`: Use `set_max_row_group_row_count` instead
+   --> src/physical/operators/spillable/admitted_queue_tests.rs:297:10
+    |
+297 |         .set_max_row_group_size(2)
+    |          ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `parquet::file::properties::WriterPropertiesBuilder::set_max_row_group_size`: Use `set_max_row_group_row_count` instead
+   --> src/physical/operators/streaming_parquet_scan/admitted.rs:454:14
+    |
+454 |             .set_max_row_group_size(3)
+    |              ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `parquet::file::properties::WriterPropertiesBuilder::set_max_row_group_size`: Use `set_max_row_group_row_count` instead
+   --> src/physical/operators/streaming_parquet_scan.rs:805:26
+    |
+805 |                         .set_max_row_group_size(2)
+    |                          ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `parquet::file::properties::WriterPropertiesBuilder::set_max_row_group_size`: Use `set_max_row_group_row_count` instead
+    --> src/physical/operators/streaming_parquet_scan.rs:1182:14
+     |
+1182 |             .set_max_row_group_size(200)
+     |              ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `lance::dataset::scanner::Scanner::nprobs`: Use nprobes instead
+    --> src/storage/lance.rs:1840:29
+     |
+1840 |                     scanner.nprobs(n);
+     |                             ^^^^^^
+
+warning: unused import: `PushKernelArg`
+    --> src/physical/gpu.rs:1288:53
+     |
+1288 |     use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+     |                                                     ^^^^^^^^^^^^^
+
+warning: unused import: `std::hash::Hash`
+    --> src/physical/gpu.rs:3536:13
+     |
+3536 |         use std::hash::Hash;
+     |             ^^^^^^^^^^^^^^^
+
+warning: value assigned to `result_plan` is never read
+   --> src/optimizer/rules/join_reorder.rs:550:52
+    |
+550 |         let mut result_plan: Option<LogicalPlan> = None;
+    |                                                    ^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `result_plan` is never read
+    --> src/optimizer/rules/join_reorder.rs:1422:52
+     |
+1422 |         let mut result_plan: Option<LogicalPlan> = None;
+     |                                                    ^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: value assigned to `result_columns` is never read
+    --> src/optimizer/rules/join_reorder.rs:1423:51
+     |
+1423 |         let mut result_columns: HashSet<String> = HashSet::new();
+     |                                                   ^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: variable `total` is assigned to, but never used
+   --> src/physical/vectorized_agg.rs:232:13
+    |
+232 |         let mut total = 0;
+    |             ^^^^^^^^^
+    |
+    = note: consider using `_total` instead
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `total` is never read
+   --> src/physical/vectorized_agg.rs:241:17
+    |
+241 |                 total += 1;
+    |                 ^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: variable does not need to be mutable
+    --> src/planner/binder.rs:2077:13
+     |
+2077 |         let mut out_items: Vec<(Expr, String)> = Vec::new(); // shape of final projection
+     |             ----^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+error[E0507]: cannot move out of a shared reference
+   --> src/storage/ipc_cache/projection_tests.rs:224:17
+    |
+224 |                 assert_eq!(actual, expected);
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ move occurs because value has type `std::sync::Arc<dyn arrow_array::Array>`, which does not implement the `Copy` trait
+    |
+    = note: this error originates in the macro `assert_eq` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: clone the value to increment its reference count
+   --> /home/afilipchik/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/macros/mod.rs:46:35
+    |
+ 46 -                 if !(*left_val == *right_val) {
+ 46 +                 if !(*left_val == right_val.clone()) {
+    |
+
+For more information about this error, try `rustc --explain E0507`.
+warning: `query_engine` (lib test) generated 38 warnings
+error: could not compile `query_engine` (lib test) due to 1 previous error; 38 warnings emitted

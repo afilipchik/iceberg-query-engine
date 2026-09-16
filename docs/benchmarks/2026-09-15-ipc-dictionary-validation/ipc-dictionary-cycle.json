@@ -1,0 +1,33 @@
+{
+  "validation": {
+    "status": "terminal",
+    "started": 1789531510.6498797,
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      ".scratch/parallel-aggregate-input/run_ipc_dictionary_validation.py"
+    ],
+    "driver_sha256": "71557997f75ec7a6d1fbbbd40c2a24c48d8585a9df8a8a1558dbbe4cc5b8ea6f",
+    "exit_code": 1,
+    "finished": 1789531703.6203034
+  },
+  "comparison": {
+    "status": "terminal",
+    "started": 1789531703.6204262,
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      ".scratch/parallel-aggregate-input/compare_ipc_dictionary_failures.py"
+    ],
+    "driver_sha256": "535c7486ce3eab10c5914c8e5229b7bb461110169584b4c571da6467eb844c23",
+    "exit_code": 0,
+    "finished": 1789531703.6418307
+  },
+  "archive_validation": {
+    "status": "running",
+    "started": 1789531703.6419156,
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      ".scratch/parallel-aggregate-input/archive_ipc_dictionary_validation.py"
+    ],
+    "driver_sha256": "73f71fb94a6cd0ea00eaf21c3912fb785095f35d2fc6d378ee3f76eb4dd8b4d5"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "raw_parquet": {
+    "samples_sha256": "21c9b4da6fb9d7bf77ae6778e6b2e3fa98c42eefb691868751af731699e34084",
+    "completed_outside_gate": []
+  },
+  "native": {
+    "samples_sha256": "436a9627f056ab47b701fbc945c70c50559d7e39bc9dd211a8c5d2560e14f66c",
+    "completed_outside_gate": []
+  },
+  "iceberg": {
+    "samples_sha256": "c73646a193b230bf4c8473663d17a0f61a759b09b78789398b5407be019d987f",
+    "completed_outside_gate": []
+  },
+  "lance": {
+    "samples_sha256": "75f7109783a0114fb9d38b4d13ca0fc76dc275018a1d03b91461860cdaf38c16",
+    "completed_outside_gate": []
+  }
+}

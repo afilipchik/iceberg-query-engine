@@ -1,0 +1,30 @@
+{
+  "binary_sha256": {
+    "parent": "6d0b9317e57b8669fe18d291a58e706667fa4855fbb50667d0b2f0a6f1ceae08",
+    "candidate": "138199d2d94606d1cac3a68f43ed876d140ea6b166b8739702240bd6c30094ae"
+  },
+  "driver_sha256": "db546bc74217c8f37ce4732e16555fab10616ed6784a6c2477ed1a75a226c168",
+  "setup_source_sha256": "910d3c9e6400fbfb0dafffdb95b7704e8152f93b52f297c91bab2e02b1825f1a",
+  "request_source_sha256": "e897b6b90f497577485ed1f08126b9f987d8fab929ea4982befc20563c833ea7",
+  "queries": [
+    "q01",
+    "q06",
+    "q12",
+    "q18",
+    "q09"
+  ],
+  "blocks": [
+    [
+      "parent",
+      "candidate"
+    ],
+    [
+      "candidate",
+      "parent"
+    ]
+  ],
+  "samples": 3,
+  "warmups": 1,
+  "fresh_worker_per_query": true,
+  "qualification": "Two reversed blocks with QE_AGG_PROF=1, fresh worker per query, 180s diagnostic ceiling; not normal performance acceptance. Dataset/setup work excluded equally; Native provider/setup and query timing boundaries match the provider screen."
+}

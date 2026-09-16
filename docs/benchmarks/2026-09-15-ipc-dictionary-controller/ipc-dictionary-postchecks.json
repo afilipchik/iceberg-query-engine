@@ -1,0 +1,191 @@
+{
+  "status": "terminal",
+  "stages": {
+    "sf10_audit": {
+      "status": "terminal",
+      "started": 1789533119.0225208,
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/audit_ipc_dictionary_sf10.py"
+      ],
+      "driver_sha256": "47dcc9ff576c73c67a71a5bb424288ce2c562869d8f1d1fb7158b5d4529889b2",
+      "before": {
+        "memory.max": "68719476736\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "7028736\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      },
+      "exit_code": 0,
+      "finished": 1789533143.4733388,
+      "after": {
+        "memory.max": "68719476736\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "170795008\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      }
+    },
+    "gate_outcomes": {
+      "status": "terminal",
+      "started": 1789533143.4735785,
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/audit_ipc_dictionary_gate_outcomes.py"
+      ],
+      "driver_sha256": "a6bd7d5bca164b8b4e48805a464db8f969414ee8929a0ff4d56f6e464afff8f8",
+      "before": {
+        "memory.max": "68719476736\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "170795008\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      },
+      "exit_code": 0,
+      "finished": 1789533143.4965954,
+      "after": {
+        "memory.max": "68719476736\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "170795008\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      }
+    },
+    "paired": {
+      "status": "terminal",
+      "started": 1789533143.4967809,
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/paired_ipc_dictionary_attribution.py"
+      ],
+      "driver_sha256": "db546bc74217c8f37ce4732e16555fab10616ed6784a6c2477ed1a75a226c168",
+      "before": {
+        "memory.max": "68719476736\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "170795008\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      },
+      "exit_code": 0,
+      "finished": 1789533391.9092336,
+      "after": {
+        "memory.max": "68719476736\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "1743462400\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      }
+    },
+    "paired_audit": {
+      "status": "terminal",
+      "started": 1789533391.9094841,
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/audit_paired_ipc_dictionary_attribution.py"
+      ],
+      "driver_sha256": "bbe5c9d059d3558e96b4f3623b7d9828ac7a01321c74d0d1207f8935c96d668d",
+      "before": {
+        "memory.max": "68719476736\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "1743462400\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      },
+      "exit_code": 0,
+      "finished": 1789533392.521106,
+      "after": {
+        "memory.max": "68719476736\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "1743462400\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      }
+    },
+    "sf10_archive": {
+      "status": "terminal",
+      "started": 1789533392.5214438,
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/archive_ipc_dictionary_sf10.py"
+      ],
+      "driver_sha256": "661998cb7951785a0dd3b67038a397d33d038eff100ed83f035a3de5c5461479",
+      "before": {
+        "memory.max": "68719476736\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "1743462400\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      },
+      "exit_code": 0,
+      "finished": 1789533393.2010326,
+      "after": {
+        "memory.max": "68719476736\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "1743462400\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      }
+    },
+    "paired_archive": {
+      "status": "terminal",
+      "started": 1789533393.2012963,
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/archive_ipc_dictionary_attribution.py"
+      ],
+      "driver_sha256": "15d4bab3c6706363516bb629333633b35fc336d467dda2ba7f8f2919556f65a0",
+      "before": {
+        "memory.max": "68719476736\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "1743462400\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      },
+      "exit_code": 0,
+      "finished": 1789533393.237255,
+      "after": {
+        "memory.max": "68719476736\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "1743462400\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      }
+    },
+    "residency": {
+      "status": "terminal",
+      "started": 1789533393.2375317,
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/run_ipc_dictionary_residency.py"
+      ],
+      "driver_sha256": "6affa17ff59ff185213cf4d7daef06ae10060879ce46570e88ae73087d2c6d6c",
+      "before": {
+        "memory.max": "68719476736\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "1743462400\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      },
+      "exit_code": 0,
+      "finished": 1789534366.7898674,
+      "after": {
+        "memory.max": "68719476736\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "20542066688\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      }
+    },
+    "residency_audit": {
+      "status": "terminal",
+      "started": 1789534366.790148,
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/summarize_ipc_dictionary_residency.py"
+      ],
+      "driver_sha256": "58f2b52520ed0266793164ff7bfb0cb33a11ac56974613d8a05371ab89b81f9a",
+      "before": {
+        "memory.max": "68719476736\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "20542066688\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      },
+      "exit_code": 0,
+      "finished": 1789534385.4725442,
+      "after": {
+        "memory.max": "68719476736\n",
+        "memory.swap.max": "0\n",
+        "memory.peak": "20542066688\n",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+      }
+    }
+  },
+  "qualification": "Sequential64GiB scope; cumulative peak not RSS. Residency32/48GiB remains capacity experiment, not16GiB gate.",
+  "exit_code": 0
+}

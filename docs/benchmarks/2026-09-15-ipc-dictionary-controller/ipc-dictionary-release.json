@@ -1,0 +1,35 @@
+{
+  "binary_sha256": "138199d2d94606d1cac3a68f43ed876d140ea6b166b8739702240bd6c30094ae",
+  "source_hashes_sha256": "2dc0aad3f287ef3fdaa80ba3bde7102aa5965ee140013070c8caace9a7575642",
+  "source_count": 802,
+  "build_exit": 0,
+  "features": [
+    "lance",
+    "gpu"
+  ],
+  "SAFE_BUILD_MEM": "48G",
+  "SAFE_BUILD_JOBS": 1,
+  "locked": true,
+  "offline": true,
+  "revision": "74a142fab601061dde794c9ec568649c566f40bd",
+  "dirty_tree": true,
+  "frozen_at": "2026-09-16T04:17:17.377240+00:00",
+  "command": [
+    "cargo",
+    "build",
+    "--locked",
+    "--offline",
+    "--release",
+    "--features",
+    "lance,gpu",
+    "--example",
+    "benchmark_embedded"
+  ],
+  "toolchain": {
+    "protoc_path": ".scratch/tools/protoc/bin/protoc",
+    "protoc_sha256": "e718992c5733ece01264f160c0890229770791e51c9612a2b34dc17f83ab3773",
+    "dependency_versions_and_edges_unchanged": true,
+    "only_lock_change": "Lance10registry source/checksum removed for local path patch",
+    "protoc_version": "libprotoc 25.3"
+  }
+}

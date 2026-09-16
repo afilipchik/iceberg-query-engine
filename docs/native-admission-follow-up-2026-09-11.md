@@ -105,3 +105,62 @@ IDs, nested dependencies, delta/replacement blocks, repeated/reordered/empty
 projection, NULLs, multiple batches, deletion vectors and retained output lifetime.
 This is a follow-up to execute after the current SF10/residency checkpoint push;
 it does not certify native preparation, query-wide admission or native speed.
+
+
+## Reproduced dictionary-envelope failure after checkpoint74a142f
+
+Red56444 runs the new `missing_dictionary_record_batch_is_a_named_error_for_all_projections`
+fixture on the unchanged reader. The flatbuffer verifier accepts the envelope
+with its dictionary `data` table absent; Arrow58.4.0 then panics at reader.rs:885.
+The regression records panics for full, numeric-only, dictionary-only and empty
+projection. This is now a reproduced error-contract failure.
+
+Current source adds `checked_dictionary_id` before dictionary payload decoding.
+It bounds message parsing to the declared metadata, retains the decoder's legacy
+V1 version rule, validates the DictionaryBatch header and required record batch,
+and returns a file-named execution error. Ordinary Arrow payload validation and
+mapped-buffer lifetime remain. The module's introductory memory claims now state
+its actual decoder/allocation boundaries. No dependency or admission change.
+
+Green1639 passes all four `ipc_extent_contract` tests, including existing malformed
+extents, valid projection and retained slicing. Commands use the mandatory48 GiB
+wrapper, locked/offline Lance+GPU features, one build job and repository TMPDIR.
+Logs: `.scratch/parallel-aggregate-input/ipc-dictionary-envelope-{red,green}.log`.
+This fix is not in checkpoint74a142f. Broader integration validation, dictionary
+projection work and this next cycle's SF10/commit/push remain outstanding.
+
+
+### Projection candidate — September15 continued
+
+`src/storage/ipc_cache/dictionary_projection.rs` binds dictionary requirements
+from the complete Arrow schema. IDs are not column ordinals. The bounded proof
+keeps the first definition for each ID, closes nested dependencies, and declines
+pruning for cycles, more than64 distinct IDs, excessive nesting, or bare nested
+dictionary types without a Field-backed ID. Declining means ordinary decoding.
+Every dictionary extent and envelope is checked even when its payload is skipped.
+Required blocks retain file order, including deltas and shared-ID replacements.
+This is projection work, not a prepared or admitted native-scan capability.
+
+Test-only thread-local decode-call counts reproduce unused dictionary work in
+red75959 and verify its elimination in green35679. Domain run38586 reproduced
+another bug: repeated projections reached Arrow with three projected fields but
+only two decoded arrays. The reader now gives Arrow unique requested columns,
+then restores repeated output columns by sharing arrays. Fallible metadata
+allocation does not establish query-wide admission. Run3247 passes three tests;
+production-feature run79840 passes four, including a file with a verified delta
+message. Run11041 passes five, adding real files whose dictionary ID1 is changed
+to37 or shared ID0 in both footer and message. Nested, reordered, repeated, empty,
+NULL, multi-batch and retained-after-reader-drop cases are covered. The first delta
+test compile20568 failed on a test-only trait-object equality expression; it is
+preserved and corrected without changing production logic.
+
+Focused native streaming/deletion/dictionary integration15491 passes31tests.
+Malformed extent/framing cases now run with full, numeric, dictionary and empty
+projections. Both-mode validation/release/provider cycle38590 is active with802
+frozen source inputs.
+Broad validation and a new frozen binary's provider/residency SF10 are required
+before this cycle's commit and push. The completed74a142f measurements remain
+those of the prior binary; no speedup is attributed to this candidate yet.
+
+
+The completed IPC cycle is now recorded in [the September15 report](ipc-dictionary-projection-2026-09-15.md). Both-mode validation adds no failures; SF10 preserves nativeQ1/Q6 timeouts and a DuckDBIcebergQ18 calibration refusal. The80-output native comparison keeps identical plans but Q12 regresses in both blocks and Q6's initial gain does not repeat. All348residency outputs validate, with canonical GPU device execution still absent. The optimization remains provisional; Q12 queue/join phase attribution is next. No native-admission capability has been added.
