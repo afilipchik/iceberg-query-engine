@@ -1,0 +1,22 @@
+{
+  "files": {
+    "profile_serial_frontier_native_q1.py": "b91d2ba9d949823cff9a59a0ab73572b4347cb5da05e434cfff1aff180edd40f",
+    "serial-frontier-native-q1-profile.log": "25d64e473917ca47f132d5624b3ebf1b14d3d920c1c3faeb9e12882ee26198ea",
+    "serial-frontier-v2-push-verified.json": "3802d84534c3156a788f1bc0dba3d8cda1a0b3d42dd2a49aafeedb910276f0e3",
+    "serial-frontier-v2-release-source-hashes.json": "c34feee89f6a47f67032354718407dc02dbb24c6192bb4cbad52d0c8a8448bee",
+    "serial-frontier-v2-release.json": "1cdac4c145b45556c9bcdb11d8df2110db31d87755afebe755784de55689c395",
+    "run/answer.arrow": "a21135b68127b8fa611da1eb3a489809021d032d62ec7f691541fd87dec52232",
+    "run/engine.stderr": "46a659bb1643c1e1a5f458ba32ac7e0b00735b1cf5ba2b1c73d762361eae1ded",
+    "run/gdb-mi.log": "2b5df440bf7c5708da53bd210c9d55b64957d71fa2f66e3a47927a9abde3af23",
+    "run/manifest.json": "ed2ac4e462824e3a53659ef82f9242f64966a355455939c2af873d0ade30ac83",
+    "run/request.jsonl": "3ea76aea608b1e3f38b4519bb0ce407ddb1bf608e3bfb366c6633120efde76c1",
+    "run/reserved-vec-callers.json": "3f1cd967ddf9c28655288094c4beadebeff1275b4649741381c01769bcf5faed",
+    "run/responses.jsonl": "51f8a4355f438f86cdfcf0dbf831e58bc9851619f50e84e1e661618283d56ab7",
+    "run/samples.json": "a391f3b8387eec72244538d5ffbdc7aea2885f3bd3bd394a23f3f418bd6562f7",
+    "run/setup.json": "f6a0688fde95d388c5b65d400a27656dc7f33c9f1d7ecb3688bee69276871bed",
+    "run/verified-after.json": "cf71a620a988bd43cb6ddc19989460f7f7f41c82e6a62522f458ade83921ed38"
+  },
+  "source_inputs": 802,
+  "source_snapshot": "../2026-09-15-serial-frontier-v2-validation/source.tar.gz",
+  "qualification": "34 stopped-thread snapshots of one owned local Q1 child; typed oracle passes. Not CPU percentages or performance acceptance. Launched through16GiB wrapper; this diagnostic did not capture terminal cgroup counters, so no resource acceptance is asserted."
+}

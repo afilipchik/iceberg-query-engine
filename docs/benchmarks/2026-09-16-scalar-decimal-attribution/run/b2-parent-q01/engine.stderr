@@ -1,0 +1,17 @@
+[mem-cap] process hard-capped at 12.0G anonymous memory (RLIMIT_DATA; the engine aborts if exceeded, the terminal survives; size with QE_MEM_CAP)
+[aggregate-frontier] {"admitted_buffers":false,"copy_bound":null,"envelope_bytes":null,"operator":"Project","partitions":8,"slots":1}
+live_aggregate_routing key_preparation_ms=2055.983 row_dispatch_ms=355.626 prepared_batches=7323 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=2411.906 processing_wall_ms=2219.080 serial_batches=0 parallel_batches=7323
+live_aggregate_profile input_rows=59142609 input_batches=916 evaluation_ms=1413.867 ingestion_ms=4637.699 finish_ms=0.138 output_ms=0.033 output_rows=4 output_batches=3 spilled_bytes=0
+[aggregate-frontier] {"admitted_buffers":false,"copy_bound":null,"envelope_bytes":null,"operator":"Project","partitions":8,"slots":1}
+live_aggregate_routing key_preparation_ms=2011.268 row_dispatch_ms=357.406 prepared_batches=7323 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=2368.974 processing_wall_ms=2255.154 serial_batches=0 parallel_batches=7323
+live_aggregate_profile input_rows=59142609 input_batches=916 evaluation_ms=1407.474 ingestion_ms=4631.275 finish_ms=0.136 output_ms=0.022 output_rows=4 output_batches=3 spilled_bytes=0
+[aggregate-frontier] {"admitted_buffers":false,"copy_bound":null,"envelope_bytes":null,"operator":"Project","partitions":8,"slots":1}
+live_aggregate_routing key_preparation_ms=2055.788 row_dispatch_ms=354.570 prepared_batches=7323 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=2410.673 processing_wall_ms=2506.958 serial_batches=0 parallel_batches=7323
+live_aggregate_profile input_rows=59142609 input_batches=916 evaluation_ms=1402.543 ingestion_ms=4924.079 finish_ms=0.102 output_ms=0.021 output_rows=4 output_batches=3 spilled_bytes=0
+[aggregate-frontier] {"admitted_buffers":false,"copy_bound":null,"envelope_bytes":null,"operator":"Project","partitions":8,"slots":1}
+live_aggregate_routing key_preparation_ms=2031.509 row_dispatch_ms=351.849 prepared_batches=7323 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=2383.655 processing_wall_ms=2224.027 serial_batches=0 parallel_batches=7323
+live_aggregate_profile input_rows=59142609 input_batches=916 evaluation_ms=1400.888 ingestion_ms=4614.067 finish_ms=0.141 output_ms=0.030 output_rows=4 output_batches=3 spilled_bytes=0

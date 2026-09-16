@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "complete": false,
+  "issues": [
+    "row 28 ('tpch_sf10', 'q01', 'native', 's1')/1: answer not validated; engine: not_run",
+    "row 29 ('tpch_sf10', 'q01', 'native', 's1')/2: answer not validated; engine: not_run",
+    "row 30 ('tpch_sf10', 'q01', 'native', 's1')/3: answer not validated; engine: not_run",
+    "row 37 ('tpch_sf10', 'q12', 'native', 's1')/1: answer not validated; engine: not_run",
+    "row 38 ('tpch_sf10', 'q12', 'native', 's1')/2: answer not validated; engine: not_run",
+    "row 39 ('tpch_sf10', 'q12', 'native', 's1')/3: answer not validated; engine: not_run",
+    "row 52 ('tpch_sf10', 'q17', 'native', 's1')/1: exceeded measured 10x ceiling",
+    "row 53 ('tpch_sf10', 'q17', 'native', 's1')/2: answer not validated; engine: not_run",
+    "row 54 ('tpch_sf10', 'q17', 'native', 's1')/3: answer not validated; engine: not_run"
+  ],
+  "groups": [],
+  "latency_leadership": false,
+  "certification": "incomplete: resource, concurrency and regression gates are separate"
+}

@@ -1,0 +1,9 @@
+{
+  "commit": "46858df8c70bbceae8f9667edfd27512f9e1c503",
+  "remote_head": "46858df8c70bbceae8f9667edfd27512f9e1c503",
+  "remote": "git@github.com:afilipchik/iceberg-query-engine.git",
+  "branch": "epic/realistic-benchmarks-duckdb-leadership",
+  "verified_at": "2026-09-16T06:39:40.469037+00:00",
+  "push_exit": 0,
+  "qualification": "GitHub accepted the checkpoint; warnings for71.79MiB oracle files were nonfatal."
+}

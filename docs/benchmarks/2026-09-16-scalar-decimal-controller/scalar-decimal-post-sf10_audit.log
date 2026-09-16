@@ -1,0 +1,4 @@
+raw_parquet 88 66 complete True
+native 79 57 complete False
+iceberg 84 63 complete False
+lance 88 66 complete True

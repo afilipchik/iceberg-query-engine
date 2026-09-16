@@ -1,6 +1,8 @@
 # Project documentation
 
-- [Current one-slot aggregate frontier repair and validation](serial-frontier-contract-2026-09-15.md)
+- [Current scalar decimal arithmetic candidate](scalar-decimal-arithmetic-2026-09-15.md)
+- [Frozen native aggregate stack attribution](native-aggregate-profile-2026-09-15.md)
+- [Completed one-slot aggregate frontier repair and validation](serial-frontier-contract-2026-09-15.md)
 - [Native Q12 attribution and same-binary dictionary control](ipc-q12-phase-follow-up-2026-09-15.md)
 - [Proposed native admitted IPC implementation](native-admitted-ipc-design-2026-09-15.md)
 - [Previous IPC dictionary projection and validation](ipc-dictionary-projection-2026-09-15.md)

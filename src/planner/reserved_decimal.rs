@@ -34,6 +34,18 @@ pub(super) fn arithmetic(
     left: &ArrayRef,
     right: &ArrayRef,
 ) -> Option<Result<ArrayRef>> {
+    arithmetic_broadcast(pool, op, left, right, false, false, left.len())
+}
+
+pub(super) fn arithmetic_broadcast(
+    pool: &MemoryPool,
+    op: BinaryOp,
+    left: &ArrayRef,
+    right: &ArrayRef,
+    left_scalar: bool,
+    right_scalar: bool,
+    len: usize,
+) -> Option<Result<ArrayRef>> {
     let (DataType::Decimal128(lp, ls), DataType::Decimal128(rp, rs)) =
         (left.data_type(), right.data_type())
     else {
@@ -48,7 +60,9 @@ pub(super) fn arithmetic(
             .as_any()
             .downcast_ref::<Decimal128Array>()
             .ok_or_else(|| QueryError::Type("decimal right representation mismatch".into()))?;
-        if l.len() != r.len() {
+        if l.len() != if left_scalar { 1 } else { len }
+            || r.len() != if right_scalar { 1 } else { len }
+        {
             return Err(QueryError::Execution(
                 "arithmetic array lengths differ".into(),
             ));
@@ -90,7 +104,6 @@ pub(super) fn arithmetic(
                 10i128.pow_checked((i16::from(scale) - rs) as u32)?,
             )
         };
-        let len = l.len();
         // Small fixed allowance covers output array/buffer owner bookkeeping.
         // The same owner survives extraction of either values or validity.
         let metadata = Arc::new(pool.allocate(1024)?);
@@ -100,7 +113,11 @@ pub(super) fn arithmetic(
             for start in (0..len).step_by(8) {
                 let mut bits = 0;
                 for bit in 0..8.min(len - start) {
-                    bits |= u8::from(l.is_valid(start + bit) && r.is_valid(start + bit)) << bit;
+                    let row = start + bit;
+                    bits |= u8::from(
+                        l.is_valid(if left_scalar { 0 } else { row })
+                            && r.is_valid(if right_scalar { 0 } else { row }),
+                    ) << bit;
                 }
                 validity.extend_reserved(1, [bits])?;
             }
@@ -120,10 +137,12 @@ pub(super) fn arithmetic(
                         if nulls.as_ref().is_some_and(|n| n.is_null(row)) {
                             return Ok(0);
                         }
+                        let li = if left_scalar { 0 } else { row };
+                        let ri = if right_scalar { 0 } else { row };
                         let (a, b) = if $scaled {
-                            (l.value(row).mul_checked(lm)?, r.value(row).mul_checked(rm)?)
+                            (l.value(li).mul_checked(lm)?, r.value(ri).mul_checked(rm)?)
                         } else {
-                            (l.value(row), r.value(row))
+                            (l.value(li), r.value(ri))
                         };
                         let value = a.$method(b)?;
                         DecimalValue::validate_precision(value, precision)?;

@@ -1,0 +1,80 @@
+[
+  {
+    "snapshot": 1,
+    "frames": [
+      "#0  0x000055555b642742 in query_engine::execution::reserved_vec::ReservedVec<T>::try_extend_reserved ()",
+      "#1  0x000055555b63fd15 in query_engine::planner::numeric::arithmetic ()",
+      "#2  0x000055555b37a822 in query_engine::physical::operators::filter::evaluate_binary_op ()",
+      "#3  0x000055555b4e4235 in query_engine::physical::operators::filter::evaluate_aggregate_inputs::eval ()",
+      "#4  0x000055555b49f4b5 in query_engine::physical::morsel_agg::live_spill::execute::{{closure}} ()",
+      "#5  0x000055555b4930c1 in <query_engine::physical::operators::spillable::SpillableHashAggregateExec as query_engine::physical::plan::PhysicalOperator>::execute::{{closure}} ()",
+      "#6  0x000055555b632182 in <query_engine::physical::operators::project::ProjectExec as query_engine::physical::plan::PhysicalOperator>::execute::{{closure}} ()",
+      "#7  0x000055555b4a7680 in query_engine::physical::operators::spillable::stream_merge_input_partitions::{{closure}} ()"
+    ]
+  },
+  {
+    "snapshot": 6,
+    "frames": [
+      "#0  0x000055555b64191a in query_engine::execution::reserved_vec::ReservedVec<T>::try_extend_reserved ()",
+      "#1  0x000055555b63fbaa in query_engine::planner::numeric::arithmetic ()",
+      "#2  0x000055555b37a822 in query_engine::physical::operators::filter::evaluate_binary_op ()",
+      "#3  0x000055555b4e4235 in query_engine::physical::operators::filter::evaluate_aggregate_inputs::eval ()",
+      "#4  0x000055555b4e41ec in query_engine::physical::operators::filter::evaluate_aggregate_inputs::eval ()",
+      "#5  0x000055555b49f4b5 in query_engine::physical::morsel_agg::live_spill::execute::{{closure}} ()",
+      "#6  0x000055555b4930c1 in <query_engine::physical::operators::spillable::SpillableHashAggregateExec as query_engine::physical::plan::PhysicalOperator>::execute::{{closure}} ()",
+      "#7  0x000055555b632182 in <query_engine::physical::operators::project::ProjectExec as query_engine::physical::plan::PhysicalOperator>::execute::{{closure}} ()"
+    ]
+  },
+  {
+    "snapshot": 7,
+    "frames": [
+      "#0  0x000055555b64282f in query_engine::execution::reserved_vec::ReservedVec<T>::try_extend_reserved ()",
+      "#1  0x000055555b63fd15 in query_engine::planner::numeric::arithmetic ()",
+      "#2  0x000055555b37a822 in query_engine::physical::operators::filter::evaluate_binary_op ()",
+      "#3  0x000055555b4e4235 in query_engine::physical::operators::filter::evaluate_aggregate_inputs::eval ()",
+      "#4  0x000055555b49f4b5 in query_engine::physical::morsel_agg::live_spill::execute::{{closure}} ()",
+      "#5  0x000055555b4930c1 in <query_engine::physical::operators::spillable::SpillableHashAggregateExec as query_engine::physical::plan::PhysicalOperator>::execute::{{closure}} ()",
+      "#6  0x000055555b632182 in <query_engine::physical::operators::project::ProjectExec as query_engine::physical::plan::PhysicalOperator>::execute::{{closure}} ()",
+      "#7  0x000055555b4a7680 in query_engine::physical::operators::spillable::stream_merge_input_partitions::{{closure}} ()"
+    ]
+  },
+  {
+    "snapshot": 18,
+    "frames": [
+      "#0  0x000055555b642880 in query_engine::execution::reserved_vec::ReservedVec<T>::try_extend_reserved ()",
+      "#1  0x000055555b63fd15 in query_engine::planner::numeric::arithmetic ()",
+      "#2  0x000055555b37a822 in query_engine::physical::operators::filter::evaluate_binary_op ()",
+      "#3  0x000055555b4e4235 in query_engine::physical::operators::filter::evaluate_aggregate_inputs::eval ()",
+      "#4  0x000055555b49f4b5 in query_engine::physical::morsel_agg::live_spill::execute::{{closure}} ()",
+      "#5  0x000055555b4930c1 in <query_engine::physical::operators::spillable::SpillableHashAggregateExec as query_engine::physical::plan::PhysicalOperator>::execute::{{closure}} ()",
+      "#6  0x000055555b632182 in <query_engine::physical::operators::project::ProjectExec as query_engine::physical::plan::PhysicalOperator>::execute::{{closure}} ()",
+      "#7  0x000055555b4a7680 in query_engine::physical::operators::spillable::stream_merge_input_partitions::{{closure}} ()"
+    ]
+  },
+  {
+    "snapshot": 21,
+    "frames": [
+      "#0  0x000055555b6420fd in query_engine::execution::reserved_vec::ReservedVec<T>::try_extend_reserved ()",
+      "#1  0x000055555b63fc9e in query_engine::planner::numeric::arithmetic ()",
+      "#2  0x000055555b37a822 in query_engine::physical::operators::filter::evaluate_binary_op ()",
+      "#3  0x000055555b4e4235 in query_engine::physical::operators::filter::evaluate_aggregate_inputs::eval ()",
+      "#4  0x000055555b4e41ec in query_engine::physical::operators::filter::evaluate_aggregate_inputs::eval ()",
+      "#5  0x000055555b49f4b5 in query_engine::physical::morsel_agg::live_spill::execute::{{closure}} ()",
+      "#6  0x000055555b4930c1 in <query_engine::physical::operators::spillable::SpillableHashAggregateExec as query_engine::physical::plan::PhysicalOperator>::execute::{{closure}} ()",
+      "#7  0x000055555b632182 in <query_engine::physical::operators::project::ProjectExec as query_engine::physical::plan::PhysicalOperator>::execute::{{closure}} ()"
+    ]
+  },
+  {
+    "snapshot": 22,
+    "frames": [
+      "#0  0x000055555b642075 in query_engine::execution::reserved_vec::ReservedVec<T>::try_extend_reserved ()",
+      "#1  0x000055555b63fc9e in query_engine::planner::numeric::arithmetic ()",
+      "#2  0x000055555b37a822 in query_engine::physical::operators::filter::evaluate_binary_op ()",
+      "#3  0x000055555b4e4235 in query_engine::physical::operators::filter::evaluate_aggregate_inputs::eval ()",
+      "#4  0x000055555b4e41ec in query_engine::physical::operators::filter::evaluate_aggregate_inputs::eval ()",
+      "#5  0x000055555b49f4b5 in query_engine::physical::morsel_agg::live_spill::execute::{{closure}} ()",
+      "#6  0x000055555b4930c1 in <query_engine::physical::operators::spillable::SpillableHashAggregateExec as query_engine::physical::plan::PhysicalOperator>::execute::{{closure}} ()",
+      "#7  0x000055555b632182 in <query_engine::physical::operators::project::ProjectExec as query_engine::physical::plan::PhysicalOperator>::execute::{{closure}} ()"
+    ]
+  }
+]

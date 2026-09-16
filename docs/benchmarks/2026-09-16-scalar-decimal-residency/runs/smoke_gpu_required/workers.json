@@ -1,0 +1,128 @@
+[
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/scalar_decimal_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/scalar-decimal-residency-32g-01/smoke_gpu_required/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": true,
+      "gpu_residency_required": true,
+      "gpu_snapshot": {
+        "budget_bytes": 25769803776,
+        "eviction_count": 0,
+        "resident_bytes": 0,
+        "resident_columns": 0,
+        "run_fallbacks": 0,
+        "upload_failures": 0
+      },
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 256.22317300000003,
+      "status": "ready",
+      "threads": 4,
+      "track": "gpu"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/scalar-decimal-residency-32g-01/smoke_gpu_required/s1-q01-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/scalar-decimal-residency-32g-01/smoke_gpu_required/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 10.01612190157175,
+      "version": "1.4.4",
+      "threads": 4,
+      "track": "gpu",
+      "reference": {
+        "reader": "decoded_ipc"
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": null,
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/scalar-decimal-residency-32g-01/smoke_gpu_required/s1-q01-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/scalar_decimal_benchmark_embedded",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/scalar-decimal-residency-32g-01/smoke_gpu_required/setup.json"
+    ],
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": true,
+      "gpu_residency_required": true,
+      "gpu_snapshot": {
+        "budget_bytes": 25769803776,
+        "eviction_count": 0,
+        "resident_bytes": 0,
+        "resident_columns": 0,
+        "run_fallbacks": 0,
+        "upload_failures": 0
+      },
+      "ipc_cache": "off",
+      "residency": "host_arrow_preloaded",
+      "setup_ms": 193.62919,
+      "status": "ready",
+      "threads": 4,
+      "track": "gpu"
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/scalar-decimal-residency-32g-01/smoke_gpu_required/s1-q06-engine.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  },
+  {
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      "-m",
+      "benchmark.duckdb_worker",
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/scalar-decimal-residency-32g-01/smoke_gpu_required/setup.json"
+    ],
+    "ready": {
+      "status": "ready",
+      "setup_ms": 14.680534601211548,
+      "version": "1.4.4",
+      "threads": 4,
+      "track": "gpu",
+      "reference": {
+        "reader": "decoded_ipc"
+      },
+      "runtime": {
+        "lance_process_io_threads_limit": null,
+        "scope": "reference provider I/O concurrency; not a process thread cap",
+        "engine_controlled": false
+      }
+    },
+    "stderr": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/public-bench/scalar-decimal-residency-32g-01/smoke_gpu_required/s1-q06-duckdb.stderr",
+    "teardown": {
+      "requested": "graceful",
+      "forced": false,
+      "exit_code": 0
+    }
+  }
+]

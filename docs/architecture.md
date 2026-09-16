@@ -1829,3 +1829,24 @@ the change. The external Cargo registry remains untouched. Benchmark provenance
 now includes all vendor files, so a local dependency edit cannot hide behind an
 unchanged Cargo.lock or engine source hash. Rebuilding this crate on this sandbox
 requires PROTOC pointing to `.scratch/tools/protoc/bin/protoc`.
+
+
+## Scalar exact arithmetic operands (2026-09-16 candidate)
+
+`physical/operators/filter/scalar_arithmetic.rs` is a shared ordinary/aggregate
+expression route for admitted exact decimal arithmetic with literal operands.
+Its recursive capability check accepts integer/Decimal128 leaves, aliases and
+Add/Subtract/Multiply/Modulo trees with a decimal leaf. It does not evaluate
+expressions or use statistics; unsupported casts/functions/CASE/dictionaries,
+floating trees and pool-free evaluation retain their existing route. Selected
+CASE branches may independently use the route on their selected batch.
+
+Literals remain one-element arrays through centralized numeric coercion. The
+explicit scalar numeric API binds coercion to its supplied query pool, validates
+operand cardinalities, and invokes the existing admitted decimal kernel with
+scalar flags and a full output row count. Both scalar operands still emit the
+batch cardinality. Empty batches use empty operands; NULL rows skip coefficient
+scaling/arithmetic, preserving late overflow behavior. Values, validity and owner
+metadata remain pre-admitted and retained through escaped buffers. The ordinary
+array/array kernel uses the same checked implementation with both scalar flags
+false. No dependency, ownership-default or query-budget change. Full test/provider/residency cycle is complete with preserved failed gates; see [evidence](scalar-decimal-arithmetic-2026-09-15.md).

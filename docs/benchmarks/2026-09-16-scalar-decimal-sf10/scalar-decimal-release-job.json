@@ -1,0 +1,17 @@
+{
+  "status": "completed",
+  "exit": 0,
+  "command": [
+    "cargo",
+    "build",
+    "--locked",
+    "--offline",
+    "--release",
+    "--features",
+    "lance,gpu",
+    "--example",
+    "benchmark_embedded"
+  ],
+  "started": "2026-09-16T07:04:21.907159+00:00",
+  "binary_sha256": "0857a7685cffe22b02aca4dc149b7e5a479b18c1a4adc1d4fe0f6a738aa02c2a"
+}

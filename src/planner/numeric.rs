@@ -207,7 +207,11 @@ fn arrow_arithmetic(op: BinaryOp, l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef
     })
 }
 
-pub(crate) fn arithmetic(op: BinaryOp, left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef> {
+fn arithmetic_operands(
+    op: BinaryOp,
+    left: &ArrayRef,
+    right: &ArrayRef,
+) -> Result<(ArrayRef, ArrayRef)> {
     let (lt, rt) = operands(op, left.data_type(), right.data_type())?;
     validate_arithmetic_domain(op, &lt, &rt)?;
 
@@ -221,6 +225,38 @@ pub(crate) fn arithmetic(op: BinaryOp, left: &ArrayRef, right: &ArrayRef) -> Res
     } else {
         cast_strict(right, &rt)?
     };
+    Ok((l, r))
+}
+
+/// Scalar flags describe representation, never inferred uniqueness or values.
+/// Coerce singleton operands once; the decimal kernel still emits `rows` values.
+pub(crate) fn scalar_decimal_arithmetic(
+    pool: &crate::execution::SharedMemoryPool,
+    op: BinaryOp,
+    left: &ArrayRef,
+    right: &ArrayRef,
+    left_scalar: bool,
+    right_scalar: bool,
+    rows: usize,
+) -> Result<ArrayRef> {
+    if left.len() != if left_scalar { 1 } else { rows }
+        || right.len() != if right_scalar { 1 } else { rows }
+    {
+        return Err(QueryError::Execution(
+            "scalar arithmetic operand extent mismatch".into(),
+        ));
+    }
+    // An explicit pool API must also bind coercion allocations to that pool,
+    // even when invoked inside a different or absent expression scope.
+    let (l, r) = crate::execution::expression_memory::with_expression_pool(pool, || {
+        arithmetic_operands(op, left, right)
+    })?;
+    super::reserved_decimal::arithmetic_broadcast(pool, op, &l, &r, left_scalar, right_scalar, rows)
+        .ok_or_else(|| QueryError::Internal("scalar decimal capability mismatch".into()))?
+}
+
+pub(crate) fn arithmetic(op: BinaryOp, left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef> {
+    let (l, r) = arithmetic_operands(op, left, right)?;
     if let Some(pool) = crate::execution::expression_memory::expression_pool() {
         if let Some(result) = super::reserved_decimal::arithmetic(&pool, op, &l, &r) {
             return result;

@@ -1,0 +1,795 @@
+   Compiling query_engine v0.1.0 (/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine)
+warning: unused doc comment
+  --> src/execution/alloc_profile.rs:68:1
+   |
+68 | / /// Guards against re-entrant backtrace capture (backtrace capture itself
+69 | | /// allocates) causing infinite recursion/deadlock.
+   | |_--------------------------------------------------^
+   |   |
+   |   rustdoc does not generate documentation for macro invocations
+   |
+   = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+   = note: `#[warn(unused_doc_comments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `AtomicBool`
+  --> src/execution/alloc_profile.rs:25:25
+   |
+25 | use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+   |                         ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `LaunchConfig`
+    --> src/physical/gpu.rs:1288:39
+     |
+1288 |     use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+     |                                       ^^^^^^^^^^^^
+
+warning: unused import: `Field`
+  --> src/physical/operators/hash_agg.rs:17:34
+   |
+17 | use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+   |                                  ^^^^^
+
+warning: unused import: `std::sync::Arc`
+  --> src/storage/admitted_coalesce.rs:13:5
+   |
+13 | use std::sync::Arc;
+   |     ^^^^^^^^^^^^^^
+
+warning: use of deprecated unit variant `parquet::basic::Encoding::BIT_PACKED`: Please see documentation for compatibility issues and use the RLE/bit-packing hybrid encoding instead
+   --> src/storage/admitted_row_group.rs:125:49
+    |
+125 |                     | parquet::basic::Encoding::BIT_PACKED
+    |                                                 ^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated unit variant `parquet::basic::Encoding::BIT_PACKED`: Please see documentation for compatibility issues and use the RLE/bit-packing hybrid encoding instead
+  --> src/storage/bounded_page_header.rs:56:14
+   |
+56 |         4 => BIT_PACKED,
+   |              ^^^^^^^^^^
+
+warning: use of deprecated unit variant `parquet::basic::Encoding::BIT_PACKED`: Please see documentation for compatibility issues and use the RLE/bit-packing hybrid encoding instead
+   --> src/storage/bounded_page_header.rs:459:79
+    |
+459 |                     parquet::basic::Encoding::RLE | parquet::basic::Encoding::BIT_PACKED
+    |                                                                               ^^^^^^^^^^
+
+warning: use of deprecated unit variant `parquet::basic::Encoding::BIT_PACKED`: Please see documentation for compatibility issues and use the RLE/bit-packing hybrid encoding instead
+   --> src/storage/bounded_page_header.rs:462:79
+    |
+462 |                     parquet::basic::Encoding::RLE | parquet::basic::Encoding::BIT_PACKED
+    |                                                                               ^^^^^^^^^^
+
+warning: use of deprecated method `arrow::arrow_ipc::writer::IpcDataGenerator::encoded_batch`: Use `encode` instead
+   --> src/distributed/flight.rs:186:18
+    |
+186 |                 .encoded_batch(&slice, &mut tracker, &opts)
+    |                  ^^^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1672:29
+     |
+1672 |         let d_ptrs = stream.memcpy_stod(&ptrs).map_err(gpu_err)?;
+     |                             ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1674:14
+     |
+1674 |             .memcpy_stod(
+     |              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1683:14
+     |
+1683 |             .memcpy_stod(&spec.preds.iter().map(|p| p.op).collect::<Vec<_>>())
+     |              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1686:14
+     |
+1686 |             .memcpy_stod(&spec.preds.iter().map(|p| p.value).collect::<Vec<_>>())
+     |              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1688:29
+     |
+1688 |         let d_kind = stream.memcpy_stod(&slot_kind).map_err(gpu_err)?;
+     |                             ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1689:30
+     |
+1689 |         let d_input = stream.memcpy_stod(&slot_input).map_err(gpu_err)?;
+     |                              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1691:14
+     |
+1691 |             .memcpy_stod(&slot_c.iter().map(|c| c[0]).collect::<Vec<_>>())
+     |              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1694:14
+     |
+1694 |             .memcpy_stod(&slot_c.iter().map(|c| c[1]).collect::<Vec<_>>())
+     |              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1697:14
+     |
+1697 |             .memcpy_stod(&slot_c.iter().map(|c| c[2]).collect::<Vec<_>>())
+     |              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_dtov`: Use clone_dtoh
+    --> src/physical/gpu.rs:1738:41
+     |
+1738 |         let partials: Vec<f64> = stream.memcpy_dtov(&d_out).map_err(gpu_err)?;
+     |                                         ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:2562:10
+     |
+2562 |         .memcpy_stod(&values)
+     |          ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:2610:10
+     |
+2610 |         .memcpy_stod(&codes)
+     |          ^^^^^^^^^^^
+
+warning: use of deprecated method `lance::dataset::scanner::Scanner::nprobs`: Use nprobes instead
+    --> src/storage/lance.rs:1840:29
+     |
+1840 |                     scanner.nprobs(n);
+     |                             ^^^^^^
+
+warning: unused import: `PushKernelArg`
+    --> src/physical/gpu.rs:1288:53
+     |
+1288 |     use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+     |                                                     ^^^^^^^^^^^^^
+
+warning: unused import: `std::hash::Hash`
+    --> src/physical/gpu.rs:3536:13
+     |
+3536 |         use std::hash::Hash;
+     |             ^^^^^^^^^^^^^^^
+
+warning: value assigned to `result_plan` is never read
+   --> src/optimizer/rules/join_reorder.rs:550:52
+    |
+550 |         let mut result_plan: Option<LogicalPlan> = None;
+    |                                                    ^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `result_plan` is never read
+    --> src/optimizer/rules/join_reorder.rs:1422:52
+     |
+1422 |         let mut result_plan: Option<LogicalPlan> = None;
+     |                                                    ^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: value assigned to `result_columns` is never read
+    --> src/optimizer/rules/join_reorder.rs:1423:51
+     |
+1423 |         let mut result_columns: HashSet<String> = HashSet::new();
+     |                                                   ^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: variable `total` is assigned to, but never used
+   --> src/physical/vectorized_agg.rs:232:13
+    |
+232 |         let mut total = 0;
+    |             ^^^^^^^^^
+    |
+    = note: consider using `_total` instead
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `total` is never read
+   --> src/physical/vectorized_agg.rs:241:17
+    |
+241 |                 total += 1;
+    |                 ^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: variable does not need to be mutable
+    --> src/planner/binder.rs:2077:13
+     |
+2077 |         let mut out_items: Vec<(Expr, String)> = Vec::new(); // shape of final projection
+     |             ----^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: type `RawRows` is more private than the item `AggregationState::into_range_shards`
+    --> src/physical/morsel_agg.rs:2727:5
+     |
+2727 |     pub(crate) fn into_range_shards(mut self, p: usize, min: i64, w: u64) -> Result<Vec<RawRows>> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method `AggregationState::into_range_shards` is reachable at visibility `pub(crate)`
+     |
+note: but type `RawRows` is only usable at visibility `pub(in crate::physical::morsel_agg)`
+    --> src/physical/morsel_agg/raw_state.rs:14:1
+     |
+  14 | pub(super) struct RawRows {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^
+     = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `RawRows` is more private than the item `AggregationState::into_raw_shards`
+    --> src/physical/morsel_agg.rs:2735:5
+     |
+2735 |     pub(crate) fn into_raw_shards(mut self, p: usize) -> Result<Vec<RawRows>> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method `AggregationState::into_raw_shards` is reachable at visibility `pub(crate)`
+     |
+note: but type `RawRows` is only usable at visibility `pub(in crate::physical::morsel_agg)`
+    --> src/physical/morsel_agg/raw_state.rs:14:1
+     |
+  14 | pub(super) struct RawRows {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated functions `prepaid_child` and `prepaid_child_with_owner` are never used
+   --> src/execution/memory.rs:241:19
+    |
+220 | impl MemoryPool {
+    | --------------- associated functions in this implementation
+...
+241 |     pub(crate) fn prepaid_child(
+    |                   ^^^^^^^^^^^^^
+...
+248 |     pub(crate) fn prepaid_child_with_owner(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `flatten_plan` is never used
+  --> src/optimizer/rules/flatten_dependent_join.rs:46:4
+   |
+46 | fn flatten_plan(plan: &LogicalPlan) -> Result<LogicalPlan> {
+   |    ^^^^^^^^^^^^
+
+warning: function `try_flatten_filter` is never used
+   --> src/optimizer/rules/flatten_dependent_join.rs:150:4
+    |
+150 | fn try_flatten_filter(node: &FilterNode) -> Result<Option<LogicalPlan>> {
+    |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `flatten_exists` is never used
+   --> src/optimizer/rules/flatten_dependent_join.rs:190:4
+    |
+190 | fn flatten_exists(
+    |    ^^^^^^^^^^^^^^
+
+warning: function `extract_subquery_predicates` is never used
+   --> src/optimizer/rules/flatten_dependent_join.rs:844:4
+    |
+844 | fn extract_subquery_predicates(predicate: &Expr) -> (Vec<Expr>, Vec<Expr>) {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `extract_predicates_recursive` is never used
+   --> src/optimizer/rules/flatten_dependent_join.rs:851:4
+    |
+851 | fn extract_predicates_recursive(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `combine_predicates` is never used
+   --> src/optimizer/rules/flatten_dependent_join.rs:878:4
+    |
+878 | fn combine_predicates(predicates: Vec<Expr>) -> Expr {
+    |    ^^^^^^^^^^^^^^^^^^
+
+warning: associated function `compile_for_admitted_evaluation` is never used
+   --> src/physical/compiled_expr.rs:660:19
+    |
+652 | impl CompiledPredicate {
+    | ---------------------- associated function in this implementation
+...
+660 |     pub(crate) fn compile_for_admitted_evaluation(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `attempted` and `completed` are never read
+    --> src/physical/gpu.rs:2336:9
+     |
+2335 | pub(crate) struct ResidentRunCounters {
+     |                   ------------------- fields in this struct
+2336 |     pub attempted: u64,
+     |         ^^^^^^^^^
+2337 |     pub completed: u64,
+     |         ^^^^^^^^^
+     |
+     = note: `ResidentRunCounters` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `counters` is never read
+    --> src/physical/gpu.rs:2341:9
+     |
+2339 | pub(crate) struct ResidentRun {
+     |                   ----------- field in this struct
+2340 |     pub batch: RecordBatch,
+2341 |     pub counters: ResidentRunCounters,
+     |         ^^^^^^^^
+
+warning: field `ack` is never read
+    --> src/physical/gpu.rs:2370:5
+     |
+2366 | struct ResidentSession {
+     |        --------------- field in this struct
+...
+2370 |     ack: ResidentAck,
+     |     ^^^
+
+warning: function `finalize_disjoint_states` is never used
+   --> src/physical/morsel_agg.rs:265:15
+    |
+265 | pub(crate) fn finalize_disjoint_states(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `update_count` is never used
+    --> src/physical/morsel_agg.rs:1118:8
+     |
+ 847 | impl AccumulatorState {
+     | --------------------- method in this implementation
+...
+1118 |     fn update_count(&mut self) {
+     |        ^^^^^^^^^^^^
+
+warning: method `scalar_to_raw` is never used
+    --> src/physical/morsel_agg.rs:2511:8
+     |
+1854 | impl AggregationState {
+     | --------------------- method in this implementation
+...
+2511 |     fn scalar_to_raw(&self, key: &GroupKey) -> Option<RawKey> {
+     |        ^^^^^^^^^^^^^
+
+warning: methods `prepare_update`, `prepare_hashed`, `process_evaluated_from`, `prepare`, and `prepare_merge` are never used
+   --> src/physical/morsel_agg/group_rows.rs:291:19
+    |
+ 77 | impl GroupRows {
+    | -------------- methods in this implementation
+...
+291 |     pub(super) fn prepare_update<'a>(
+    |                   ^^^^^^^^^^^^^^
+...
+301 |     fn prepare_hashed<'a>(
+    |        ^^^^^^^^^^^^^^
+...
+336 |     pub(super) fn process_evaluated_from(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^
+...
+598 |     fn prepare<'a>(
+    |        ^^^^^^^
+...
+606 |     pub(super) fn prepare_merge<'a>(
+    |                   ^^^^^^^^^^^^^
+
+warning: methods `ingest_selected` and `ingest_prepared_selected` are never used
+   --> src/physical/morsel_agg/ingestion_controller.rs:105:19
+    |
+ 62 | impl IngestionController {
+    | ------------------------ methods in this implementation
+...
+105 |     pub(super) fn ingest_selected(
+    |                   ^^^^^^^^^^^^^^^
+...
+122 |     pub(super) fn ingest_prepared_selected(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `read_encoded` is never used
+   --> src/physical/morsel_agg/key_rows.rs:185:19
+    |
+113 | impl KeyWorkspace {
+    | ----------------- method in this implementation
+...
+185 |     pub(super) fn read_encoded(&mut self, reader: &mut impl Read, length: usize) -> Result<()> {
+    |                   ^^^^^^^^^^^^
+
+warning: struct `PreparedRepartition` is never constructed
+  --> src/physical/morsel_agg/repartition.rs:42:19
+   |
+42 | pub(super) struct PreparedRepartition<'a> {
+   |                   ^^^^^^^^^^^^^^^^^^^
+
+warning: struct `SplitPlan` is never constructed
+  --> src/physical/morsel_agg/repartition.rs:53:19
+   |
+53 | pub(super) struct SplitPlan<'a> {
+   |                   ^^^^^^^^^
+
+warning: associated items `scan` and `counts` are never used
+  --> src/physical/morsel_agg/repartition.rs:59:19
+   |
+58 | impl<'a> SplitPlan<'a> {
+   | ---------------------- associated items in this implementation
+59 |     pub(super) fn scan(
+   |                   ^^^^
+...
+74 |     pub(super) fn counts(&self) -> [u64; 2] {
+   |                   ^^^^^^
+
+warning: associated items `from_plan`, `new`, and `finish` are never used
+   --> src/physical/morsel_agg/repartition.rs:213:19
+    |
+212 | impl<'a> PreparedRepartition<'a> {
+    | -------------------------------- associated items in this implementation
+213 |     pub(super) fn from_plan(
+    |                   ^^^^^^^^^
+...
+223 |     fn new(
+    |        ^^^
+...
+247 |     pub(super) fn finish(mut self) -> Result<[SpillRun; 2]> {
+    |                   ^^^^^^
+
+warning: function `route` is never used
+ --> src/physical/morsel_agg/row_router.rs:9:15
+  |
+9 | pub(super) fn route(
+  |               ^^^^^
+
+warning: method `step` is never used
+  --> src/physical/morsel_agg/run_merge.rs:49:19
+   |
+30 | impl RunMerge {
+   | ------------- method in this implementation
+...
+49 |     pub(super) fn step(&mut self, target: &mut GroupRows) -> Result<bool> {
+   |                   ^^^^
+
+warning: struct `PreparedSelection` is never constructed
+   --> src/physical/morsel_agg/selected_state.rs:204:19
+    |
+204 | pub(super) struct PreparedSelection<'a> {
+    |                   ^^^^^^^^^^^^^^^^^
+
+warning: method `commit` is never used
+   --> src/physical/morsel_agg/selected_state.rs:210:19
+    |
+209 | impl PreparedSelection<'_> {
+    | -------------------------- method in this implementation
+210 |     pub(super) fn commit(self) {
+    |                   ^^^^^^
+
+warning: methods `prepare` and `prepare_merge` are never used
+   --> src/physical/morsel_agg/selected_state.rs:333:19
+    |
+217 | impl SelectedState {
+    | ------------------ methods in this implementation
+...
+333 |     pub(super) fn prepare(&mut self, value: &ScalarValue) -> Result<PreparedSelection<'_>> {
+    |                   ^^^^^^^
+...
+341 |     pub(super) fn prepare_merge(&mut self, source: &Self) -> Result<PreparedSelection<'_>> {
+    |                   ^^^^^^^^^^^^^
+
+warning: method `empty` is never used
+  --> src/physical/morsel_agg/state_codec.rs:31:19
+   |
+30 | impl FixedStateCodec {
+   | -------------------- method in this implementation
+31 |     pub(super) fn empty(self) -> AccumulatorState {
+   |                   ^^^^^
+
+warning: struct `FixedStateWorkspace` is never constructed
+   --> src/physical/morsel_agg/state_codec.rs:212:19
+    |
+212 | pub(super) struct FixedStateWorkspace {
+    |                   ^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `new`, `encode`, `write_to`, and `read_from` are never used
+   --> src/physical/morsel_agg/state_codec.rs:219:19
+    |
+218 | impl FixedStateWorkspace {
+    | ------------------------ associated items in this implementation
+219 |     pub(super) fn new(pool: &MemoryPool, codecs: &[FixedStateCodec]) -> Result<Self> {
+    |                   ^^^
+...
+240 |     fn encode(&mut self, states: &[AccumulatorState]) -> Result<&[u8]> {
+    |        ^^^^^^
+...
+257 |     pub(super) fn write_to(
+    |                   ^^^^^^^^
+...
+268 |     pub(super) fn read_from(&mut self, reader: &mut impl Read) -> Result<&[AccumulatorState]> {
+    |                   ^^^^^^^^^
+
+warning: methods `prepare`, `prepare_indexed`, and `prepare_merge` are never used
+   --> src/physical/morsel_agg/state_rows.rs:415:19
+    |
+202 | impl StateRows {
+    | -------------- methods in this implementation
+...
+415 |     pub(super) fn prepare<'a>(
+    |                   ^^^^^^^
+...
+425 |     pub(super) fn prepare_indexed<'a>(
+    |                   ^^^^^^^^^^^^^^^
+...
+554 |     pub(super) fn prepare_merge<'a>(
+    |                   ^^^^^^^^^^^^^
+
+warning: method `commit` is never used
+   --> src/physical/morsel_agg/state_rows.rs:615:19
+    |
+614 | impl PreparedRow<'_> {
+    | -------------------- method in this implementation
+615 |     pub(super) fn commit(mut self) {
+    |                   ^^^^^^
+
+warning: fields `join_type`, `delim_columns`, and `on` are never read
+  --> src/physical/operators/delim_join.rs:76:5
+   |
+70 | pub struct DelimJoinExec {
+   |            ------------- fields in this struct
+...
+76 |     join_type: JoinType,
+   |     ^^^^^^^^^
+77 |     /// Expressions for correlation columns (from outer)
+78 |     delim_columns: Vec<Expr>,
+   |     ^^^^^^^^^^^^^
+79 |     /// Join conditions (outer_col, inner_col)
+80 |     on: Vec<(Expr, Expr)>,
+   |     ^^
+   |
+   = note: `DelimJoinExec` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `extract_distinct_values` is never used
+   --> src/physical/operators/delim_join.rs:218:4
+    |
+218 | fn extract_distinct_values(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `evaluate_expr_to_array` is never used
+   --> src/physical/operators/delim_join.rs:279:4
+    |
+279 | fn evaluate_expr_to_array(expr: &Expr, batch: &RecordBatch) -> Result<ArrayRef> {
+    |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `scalar_to_array` is never used
+   --> src/physical/operators/delim_join.rs:314:4
+    |
+314 | fn scalar_to_array(scalar: &ScalarValue, num_rows: usize) -> Result<ArrayRef> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `deduplicate_batch` is never used
+   --> src/physical/operators/delim_join.rs:336:4
+    |
+336 | fn deduplicate_batch(batch: &RecordBatch) -> Result<RecordBatch> {
+    |    ^^^^^^^^^^^^^^^^^
+
+warning: function `hash_row` is never used
+   --> src/physical/operators/delim_join.rs:371:4
+    |
+371 | fn hash_row(batch: &RecordBatch, row_idx: usize) -> u64 {
+    |    ^^^^^^^^
+
+warning: function `hash_array_value` is never used
+   --> src/physical/operators/delim_join.rs:382:4
+    |
+382 | fn hash_array_value<H: Hasher>(array: &dyn Array, idx: usize, hasher: &mut H) {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: struct `InnerEntry` is never constructed
+   --> src/physical/operators/delim_join.rs:404:8
+    |
+404 | struct InnerEntry {
+    |        ^^^^^^^^^^
+
+warning: function `build_hash_table` is never used
+   --> src/physical/operators/delim_join.rs:410:4
+    |
+410 | fn build_hash_table(
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `hash_join_key` is never used
+   --> src/physical/operators/delim_join.rs:430:4
+    |
+430 | fn hash_join_key(
+    |    ^^^^^^^^^^^^^
+
+warning: function `produce_semi_output` is never used
+   --> src/physical/operators/delim_join.rs:462:4
+    |
+462 | fn produce_semi_output(
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `produce_anti_output` is never used
+   --> src/physical/operators/delim_join.rs:503:4
+    |
+503 | fn produce_anti_output(
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `produce_single_output` is never used
+   --> src/physical/operators/delim_join.rs:545:4
+    |
+545 | fn produce_single_output(
+    |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `produce_mark_output` is never used
+   --> src/physical/operators/delim_join.rs:655:4
+    |
+655 | fn produce_mark_output(
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `evaluate_filter` is never used
+   --> src/physical/operators/filter.rs:211:4
+    |
+211 | fn evaluate_filter(
+    |    ^^^^^^^^^^^^^^^
+
+warning: multiple fields are never read
+   --> src/physical/operators/hash_agg.rs:369:5
+    |
+341 | struct AccumulatorState {
+    |        ---------------- fields in this struct
+...
+369 |     sum_x: f64,         // For correlation
+    |     ^^^^^
+370 |     sum_y: f64,         // For correlation
+    |     ^^^^^
+371 |     sum_xy: f64,        // For correlation
+    |     ^^^^^^
+372 |     sum_x_squares: f64, // For correlation
+    |     ^^^^^^^^^^^^^
+373 |     sum_y_squares: f64, // For correlation
+    |     ^^^^^^^^^^^^^
+...
+378 |     max_by_value: Option<f64>,         // The max value of the second arg
+    |     ^^^^^^^^^^^^
+379 |     max_by_result: Option<GroupValue>, // The value to return
+    |     ^^^^^^^^^^^^^
+380 |     min_by_value: Option<f64>,         // The min value of the second arg
+    |     ^^^^^^^^^^^^
+381 |     min_by_result: Option<GroupValue>, // The value to return
+    |     ^^^^^^^^^^^^^
+
+warning: constant `DIST_COL` is never used
+  --> src/physical/operators/vector_search.rs:41:7
+   |
+41 | const DIST_COL: &str = "_distance";
+   |       ^^^^^^^^
+
+warning: function `without_distance_column` is never used
+   --> src/physical/operators/vector_search.rs:250:15
+    |
+250 | pub(crate) fn without_distance_column(schema: &ArrowSchema) -> Vec<usize> {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `reserved_bytes` is never used
+   --> src/physical/operators/int64_membership.rs:115:19
+    |
+ 96 | impl Int64Membership {
+    | -------------------- method in this implementation
+...
+115 |     pub(crate) fn reserved_bytes(&self) -> usize {
+    |                   ^^^^^^^^^^^^^^
+
+warning: function `take` is never used
+   --> src/storage/admitted_gather.rs:146:15
+    |
+146 | pub(crate) fn take(
+    |               ^^^^
+
+warning: function `filter` is never used
+   --> src/storage/admitted_gather.rs:181:15
+    |
+181 | pub(crate) fn filter(
+    |               ^^^^^^
+
+warning: variant `Borrowed` is never constructed
+  --> src/storage/admitted_hybrid.rs:13:5
+   |
+12 | enum HybridInput<'a> {
+   |      ----------- variant in this enum
+13 |     Borrowed(&'a [u8]),
+   |     ^^^^^^^^
+   |
+   = note: `HybridInput` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: associated function `new` is never used
+   --> src/storage/admitted_hybrid.rs:136:19
+    |
+ 50 | impl<'a> HybridDecoder<'a> {
+    | -------------------------- associated function in this implementation
+...
+136 |     pub(crate) fn new(data: &'a [u8], width: u8, values: usize) -> Result<Self> {
+    |                   ^^^
+
+warning: variant `Borrowed` is never constructed
+  --> src/storage/admitted_plain_utf8.rs:39:5
+   |
+38 | enum PlainInput<'a> {
+   |      ---------- variant in this enum
+39 |     Borrowed(&'a [u8]),
+   |     ^^^^^^^^
+   |
+   = note: `PlainInput` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: associated function `new` is never used
+  --> src/storage/admitted_plain_utf8.rs:64:19
+   |
+60 | impl<'a> PlainUtf8Decoder<'a> {
+   | ----------------------------- associated function in this implementation
+...
+64 |     pub(crate) fn new(
+   |                   ^^^
+
+warning: function `parse_page_header` is never used
+   --> src/storage/bounded_page_header.rs:278:15
+    |
+278 | pub(crate) fn parse_page_header(
+    |               ^^^^^^^^^^^^^^^^^
+
+warning: field `row_group_filter` is never read
+   --> src/storage/parquet.rs:887:5
+    |
+881 | pub struct StreamingParquetScanBuilder {
+    |            --------------------------- field in this struct
+...
+887 |     row_group_filter: Option<Box<dyn Fn(usize, &ParquetFileInfo) -> bool + Send + Sync>>,
+    |     ^^^^^^^^^^^^^^^^
+
+warning: struct `AsyncParquetReader` is never constructed
+   --> src/storage/parquet.rs:929:12
+    |
+929 | pub struct AsyncParquetReader {
+    |            ^^^^^^^^^^^^^^^^^^
+
+warning: associated items `new`, `from_table`, `schema`, `into_stream`, and `read_all_parallel` are never used
+    --> src/storage/parquet.rs:951:12
+     |
+ 949 | impl AsyncParquetReader {
+     | ----------------------- associated items in this implementation
+ 950 |     /// Create a new async reader for a list of Parquet files
+ 951 |     pub fn new(
+     |            ^^^
+...
+ 966 |     pub fn from_table(
+     |            ^^^^^^^^^^
+...
+ 980 |     pub fn schema(&self) -> SchemaRef {
+     |            ^^^^^^
+...
+ 985 |     pub fn into_stream(self) -> BoxStream<'static, Result<RecordBatch>> {
+     |            ^^^^^^^^^^^
+...
+1096 |     pub async fn read_all_parallel(&self, max_concurrent: usize) -> Result<Vec<RecordBatch>> {
+     |                  ^^^^^^^^^^^^^^^^^
+
+warning: struct `AsyncParquetScanBuilder` is never constructed
+    --> src/storage/parquet.rs:1153:12
+     |
+1153 | pub struct AsyncParquetScanBuilder {
+     |            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `new`, `with_projection`, `with_batch_size`, `build`, and `build_stream` are never used
+    --> src/storage/parquet.rs:1162:12
+     |
+1160 | impl AsyncParquetScanBuilder {
+     | ---------------------------- associated items in this implementation
+1161 |     /// Create a new builder from a ParquetTable
+1162 |     pub fn new(table: &ParquetTable) -> Self {
+     |            ^^^
+...
+1172 |     pub fn with_projection(mut self, projection: Vec<usize>) -> Self {
+     |            ^^^^^^^^^^^^^^^
+...
+1178 |     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+     |            ^^^^^^^^^^^^^^^
+...
+1184 |     pub fn build(self) -> AsyncParquetReader {
+     |            ^^^^^
+...
+1189 |     pub fn build_stream(self) -> BoxStream<'static, Result<RecordBatch>> {
+     |            ^^^^^^^^^^^^
+
+warning: `query_engine` (lib) generated 95 warnings (run `cargo fix --lib -p query_engine` to apply 5 suggestions)
+    Finished `release` profile [optimized] target(s) in 8m 51s
+{"binary_sha256": "0857a7685cffe22b02aca4dc149b7e5a479b18c1a4adc1d4fe0f6a738aa02c2a", "source_hashes_sha256": "b32df3575190be06ab14cd3730be2891dc6f1f78baf8a52f4e41e133843dc2d0", "source_count": 804, "build_exit": 0, "features": ["lance", "gpu"], "SAFE_BUILD_MEM": "48G", "SAFE_BUILD_JOBS": 1, "locked": true, "offline": true, "revision": "46858df8c70bbceae8f9667edfd27512f9e1c503", "dirty_tree": true, "frozen_at": "2026-09-16T07:13:13.601457+00:00", "command": ["cargo", "build", "--locked", "--offline", "--release", "--features", "lance,gpu", "--example", "benchmark_embedded"], "toolchain": {"protoc_path": ".scratch/tools/protoc/bin/protoc", "protoc_sha256": "e718992c5733ece01264f160c0890229770791e51c9612a2b34dc17f83ab3773", "dependency_versions_and_edges_unchanged": true, "only_lock_change": "Lance10registry source/checksum removed for local path patch", "protoc_version": "libprotoc 25.3"}}

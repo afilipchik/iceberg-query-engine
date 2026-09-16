@@ -22,6 +22,9 @@ use std::sync::Arc;
 
 mod admitted_batch;
 mod admitted_input;
+mod scalar_arithmetic;
+#[cfg(test)]
+mod scalar_arithmetic_tests;
 pub(crate) mod temporal;
 pub(crate) use admitted_batch::AdmittedBatchFilter;
 
@@ -306,6 +309,16 @@ pub(crate) fn evaluate_aggregate_inputs<'e>(
         }
         match expr {
             Expr::BinaryExpr { left, op, right } => {
+                if let Some(result) = scalar_arithmetic::evaluate(batch, left, *op, right, |expr| {
+                    eval(batch, expr, expr_at, outputs, reusable)
+                }) {
+                    #[cfg(test)]
+                    AGGREGATE_REUSE_COUNTS.with(|counts| {
+                        let (computed, reused) = counts.get();
+                        counts.set((computed + 1, reused));
+                    });
+                    return result;
+                }
                 let left = eval(batch, left, expr_at, outputs, reusable)?;
                 let right = eval(batch, right, expr_at, outputs, reusable)?;
                 #[cfg(test)]
@@ -379,6 +392,11 @@ fn evaluate_expr_internal(
         Expr::Literal(value) => scalar_to_array(value, batch.num_rows()),
 
         Expr::BinaryExpr { left, op, right } => {
+            if let Some(result) = scalar_arithmetic::evaluate(batch, left, *op, right, |expr| {
+                evaluate_expr_internal(batch, expr, subquery_executor)
+            }) {
+                return result;
+            }
             if is_comparison(*op) {
                 let left = comparison_operand(batch, left, subquery_executor)?;
                 // Preserve the dictionary-values shortcut before decoding.

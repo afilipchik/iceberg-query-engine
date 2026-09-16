@@ -4,46 +4,62 @@ Current source, tests and reproducible measurements take precedence over histori
 status prose. Update the current checkpoint in place; keep chronological logs in
 linked reports and the existing epic rather than prepending another status block.
 
-## Current checkpoint — 2026-09-15
+## Current checkpoint — 2026-09-16
 
-Frozen scheduler candidate `be164253` on pushed/remote-verified parent `a857215`
-repairs the aggregate one-slot fallback. Unknown inputs previously overlapped
-pending opens/pulls despite slots=1. One retained opening future/current stream
-now drains each partition; cancelling next() cannot replay or lose pending input.
-Admitted multi-slot scheduling is unchanged. No dependency, default ownership,
-query budget or native-admission capability change. The temporary IPC diagnostic
-environment switch is removed; its decode-all comparison remains in unit tests.
+Frozen scalar-decimal candidate `0857a768` on pushed/remote-verified parent
+`46858df8` keeps exact literals scalar through coercion and admitted arithmetic.
+`filter/scalar_arithmetic.rs` proves capability structurally before evaluation;
+ordinary and aggregate evaluators share it. Unsupported expressions retain their
+existing path. Numeric coercion is bound explicitly to the supplied query pool.
+Decimal kernels validate scalar/array extents and emit full batch cardinality,
+skipping value work on NULL/empty rows. No dependency, default ownership, query
+budget or native-reader admission change.
 
-Red53440 reproduces3simultaneous operations; focused lifecycle tests pass11.
-First broad69274 preserves six startup-expectation failures in an18-file archive.
-The eight existing lifecycle tests now cover both serial failure without opening
-later partitions and deterministically initialized bounded-parallel siblings;
-focused9871 passes8. Final cycle30002 has1142library passes/11ignored and128contracts
-per ownership mode. Native/IPC64default and63partial plus its known numeric failure;
+Red83395 reproduces a4096-row refusal (66048requested/33280used/74240limit).
+Focused35012 and expanded4790 pass scalar/filter/decimal/numeric suites. Seven
+new scalar tests cover independent Arrow oracles, both operand orders, signed/
+unsigned literals, negative scales, nested reuse, cardinality, escaped owners and
+real refusal/overflow. Full cycle77964 has1149library passes/11ignored and128contracts
+per ownership mode. Native/IPC64default and63partial plus the known numeric failure;
 spill/numeric28passes plus the same6failures each. Strict executable/count/name
-comparison passes, with no retired tests. Validation archive32 verifies802inputs.
-Release completes0 in8m51s.
+comparison passes, with no retired test. The39-file archive verifies804inputs.
 
-Canonical provider SF10 independently validates336outputs/252of264pairs:
-raw66/native57/Iceberg63/Lance66. Raw geomean2.433841/suite2.642917 (0wins), Lance
-1.997011/2.949275 (1win). NativeQ1/Q6 and additionalQ18warmups time out; their nine
-measured engine requests are NOTRUN. IcebergDuckDBQ9oracle refuses268435456bytes;
-its three dependent pairs are NOTRUN. Cumulative validation/build/provider peak
-24,877,572,096bytes under48GiB,zeroOOM/max,swap0. Archives1275SF10/173paired verify.
-No DuckDB leadership is certified.
+Release completes0 in8m51s. Provider cycle77964 terminal1 preserves failed gates;
+339typed outputs/252of264pairs validate: raw66/native57/Iceberg63/Lance66. Rawgeo
+2.427727/suite2.616827,0wins;Lance1.973992/2.910767,1win. NativeQ1warmup times out;
+Q12warmup1268.585ms exceeds1209.057ms andQ17measured1 962.336ms exceeds950.768ms,
+both typed-correct. IcebergDuckDBQ13warmup refuses262144bytes. Scopepeak30,425,083,904
+under48GiB,zeroOOM/max,swap0. Post95938 terminal0 validates80paired outputs with
+unchanged plans:Q1ratios0.953476/0.969844 and evaluation~1.40–1.42s to1.14–1.15s.
+Q12ratios1.050877/0.664454 vary;Q9is1.005279/1.013808. No blanket regression freedom.
 
-Paired attribution validates80outputs with unchanged plans. Candidate/parent
-ratios:Q1 1.003247/1.005119;Q6 0.867331/0.916584;Q12 0.665246/1.072963;
-Q18 0.987896/0.993545;Q9 0.975818/0.998965. Q18 does not reproduce a candidate
-slowdown here, but its canonical timeout remains a failed gate. Q12 varies;
-no blanket regression-free claim. Shared Q1 ingestion remains~4.64s and Q18~2.7s,
-with~1sfinish whose output time is nested. Postcheck79671 is terminal0:348typed outputs/278pairs across all5residency cases.
-Decoded geomean0.798434/suite1.254066;GPUcontrol0.805281/1.289498;
-mixed0.798088/1.290919,14wins each. Canonical mixed records0successful device runs;
-custom required smoke proves40/40measured requests. Peak21,012,893,696bytes under
-64GiB,zeroOOM/max,swap0. These32/48GiB capacity results do not clear16GiB preload.
-Source remains frozen while final archives/commit/push are prepared. See the
-[current scheduler cycle](docs/serial-frontier-contract-2026-09-15.md).
+All five residency cases complete:348typed outputs/278pairs. Decodedgeo0.818134/
+suite1.277217;GPUcontrol0.798882/1.265608;mixed0.795011/1.262422,14wins each.
+Canonical mixed0device executions;customrequired40/40measured device proofs.
+Postscopepeak21,508,247,552under64GiB,zeroOOM/max,swap0.32/48GiBcapacity does not
+clear16GiBpreload. Seven evidence archive manifests verify;2,897selected files form the intermediate checkpoint.
+Next: inventory actual native IPC mapping windows before admitted-reader work;
+Q1ingestion remains~4.6–4.7s. No DuckDB leadership is certified. See
+[current scalar arithmetic cycle](docs/scalar-decimal-arithmetic-2026-09-15.md).
+
+Parent scheduler checkpoint `46858df8` is committed, pushed and exact-remote
+verified. It fixes three overlapping pending operations despite slots=1 by
+retaining one opening/current stream across cancelled next calls. Admitted
+multi-slot scheduling remains. All3142selected checkpoint files verify across
+seven evidence archives. Provider SF10 validates336outputs/252pairs; nativeQ1/Q6
+and additionalQ18warmups time out, IcebergDuckDBQ9oracle refuses256MiB. Rawgeo
+2.433841/suite2.642917,0wins;Lance1.997011/2.949275,1win. Paired80outputs validate;
+Q18ratios0.987896/0.993545 do not reproduce slowdown but do not clear its timeout.
+Residency348outputs/278pairs validate; canonical mixed has0device execution,
+customrequired40/40measured proofs. These32/48GiB results do not clear16GiB preload.
+See [scheduler checkpoint](docs/serial-frontier-contract-2026-09-15.md).
+
+Owned-child nativeQ1 stack profile91280 completes0 on the frozen parent:
+34snapshots and typed-correct output. All six top ReservedVec frames have numeric
+arithmetic callers, not controller construction. Decimal scale/precision metadata
+is already hoisted/table-based. Stopped-thread counts are not CPU percentages;
+terminal cgroup counters were not captured for that diagnostic. See
+[profile follow-up](docs/native-aggregate-profile-2026-09-15.md).
 
 Previous pushed checkpoint `a857215` freezes IPC candidate `138199d2`: checked
 dictionary envelopes, bounded first-definition ID/dependency projection, repeated

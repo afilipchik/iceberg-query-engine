@@ -1,0 +1,33 @@
+{
+  "raw_parquet": {
+    "samples_sha256": "f59b7e6adecd10551c17f5a8d76987a21e78614a2adb1506e108d00f18801b60",
+    "completed_outside_gate": []
+  },
+  "native": {
+    "samples_sha256": "518d81cf9f1c391ba9edc7efb0a31517e661df96f2c951a94a0e2fa9c06a7765",
+    "completed_outside_gate": [
+      {
+        "query": "q12",
+        "phase": "engine_warmup",
+        "ms": 1268.585494,
+        "ceiling_ms": 1209.0573692694306,
+        "result_id": "s1-q12-warmup"
+      },
+      {
+        "query": "q17",
+        "phase": "engine",
+        "ms": 962.3355260000001,
+        "ceiling_ms": 950.7677797228098,
+        "result_id": "s1-q17-1-engine"
+      }
+    ]
+  },
+  "iceberg": {
+    "samples_sha256": "6bf51c11f3c4502b69ae48250be78c58b8e686f407707cd4f442023289d5673e",
+    "completed_outside_gate": []
+  },
+  "lance": {
+    "samples_sha256": "0a49327ec828c70c1e8bbf64b33fbd52bcad67a3f27c0add8978e4aef3d2d8ef",
+    "completed_outside_gate": []
+  }
+}

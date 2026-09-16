@@ -1,0 +1,28 @@
+{
+  "revision": "46858df8c70bbceae8f9667edfd27512f9e1c503",
+  "dirty_tree": true,
+  "source_inputs": 803,
+  "command": [
+    "scripts/claude-safe-build.sh",
+    "cargo",
+    "test",
+    "--locked",
+    "--offline",
+    "--features",
+    "lance,gpu",
+    "--lib",
+    "physical::operators::filter::scalar_arithmetic_tests",
+    "--",
+    "--nocapture"
+  ],
+  "environment": {
+    "TMPDIR": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch",
+    "SAFE_BUILD_MEM": "48G",
+    "SAFE_BUILD_JOBS": "1",
+    "PROTOC": "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/tools/protoc/bin/protoc"
+  },
+  "exit_code": 101,
+  "passes": 2,
+  "failures": 1,
+  "qualification": "Test-only allocation target reproduction; production arithmetic unchanged. No terminal cgroup counters captured for this focused run; not resource acceptance."
+}
