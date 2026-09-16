@@ -1115,6 +1115,16 @@ remain serial. Execution errors stop/join tasks before return. Cancelled tasks
 retain owners until running synchronous polls return. Decoder scratch remains
 a separate provider contract. See the [candidate](parallel-aggregate-input-2026-09-08.md).
 
+The September15 scheduler correction makes the one-slot fallback actually serial:
+its previous FuturesUnordered/SelectAll collections could hold multiple pending
+opens and pulls. One retained opening future and one retained current stream now
+drain a partition before starting the next. Both survive cancellation of next();
+shutdown drops pending work. Prepared unknown streams remain initialized once,
+unpolled until selected, with no execute replay. This bounds frontier activity,
+not provider-internal tasks or whole-query allocation. Admitted multi-slot task
+scheduling is unchanged. [Regression and validation](serial-frontier-contract-2026-09-15.md).
+
+
 `PhysicalOperator::execution_details` now adds optional diagnostic execution
 choices to `display_plan` without changing operator names or initializing input.
 Streaming Parquet exposes reader batch rows, estimated pressure, projected types,

@@ -1,0 +1,506 @@
+{
+  "b1-decode_all-q01": {
+    "status": "terminal",
+    "started": 1789535992.7055771,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.461026,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789536019.24342
+  },
+  "b1-decode_all-q06": {
+    "status": "terminal",
+    "started": 1789536019.2477117,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.431825,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789536022.6852653
+  },
+  "b1-decode_all-q12": {
+    "status": "terminal",
+    "started": 1789536022.6915464,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.8315440000000001,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789536026.7861156
+  },
+  "b1-prune-q01": {
+    "status": "terminal",
+    "started": 1789536026.7918978,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.7057,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789536053.6722143
+  },
+  "b1-prune-q06": {
+    "status": "terminal",
+    "started": 1789536053.6765065,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.431195,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789536058.214737
+  },
+  "b1-prune-q12": {
+    "status": "terminal",
+    "started": 1789536058.2215412,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.827994,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789536062.3475485
+  },
+  "b2-prune-q01": {
+    "status": "terminal",
+    "started": 1789536062.3516202,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.406493,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789536089.031431
+  },
+  "b2-prune-q06": {
+    "status": "terminal",
+    "started": 1789536089.035629,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.435395,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789536093.904933
+  },
+  "b2-prune-q12": {
+    "status": "terminal",
+    "started": 1789536093.9144852,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 1.185319,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789536096.8090491
+  },
+  "b2-decode_all-q01": {
+    "status": "terminal",
+    "started": 1789536096.8148053,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.584864,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789536123.282148
+  },
+  "b2-decode_all-q06": {
+    "status": "terminal",
+    "started": 1789536123.28635,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.44714,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789536127.717099
+  },
+  "b2-decode_all-q12": {
+    "status": "terminal",
+    "started": 1789536127.723352,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.659504,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789536132.1239877
+  },
+  "b3-prune-q01": {
+    "status": "terminal",
+    "started": 1789536132.1297889,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.645084,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789536158.9369678
+  },
+  "b3-prune-q06": {
+    "status": "terminal",
+    "started": 1789536158.9411578,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.42856900000000003,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789536162.532385
+  },
+  "b3-prune-q12": {
+    "status": "terminal",
+    "started": 1789536162.5403278,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.8655050000000001,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789536166.8758092
+  },
+  "b3-decode_all-q01": {
+    "status": "terminal",
+    "started": 1789536166.8801136,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.415109,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789536193.7968843
+  },
+  "b3-decode_all-q06": {
+    "status": "terminal",
+    "started": 1789536193.801271,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.41262299999999996,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789536197.8841844
+  },
+  "b3-decode_all-q12": {
+    "status": "terminal",
+    "started": 1789536197.88865,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.430361,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789536200.379124
+  },
+  "b4-decode_all-q01": {
+    "status": "terminal",
+    "started": 1789536200.3835568,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.42666699999999996,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789536227.8216834
+  },
+  "b4-decode_all-q06": {
+    "status": "terminal",
+    "started": 1789536227.8260212,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.43997600000000003,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789536233.0741029
+  },
+  "b4-decode_all-q12": {
+    "status": "terminal",
+    "started": 1789536233.0788462,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.525612,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789536236.447378
+  },
+  "b4-prune-q01": {
+    "status": "terminal",
+    "started": 1789536236.4520805,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.477564,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789536263.2250876
+  },
+  "b4-prune-q06": {
+    "status": "terminal",
+    "started": 1789536263.2294052,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.459228,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789536268.1132765
+  },
+  "b4-prune-q12": {
+    "status": "terminal",
+    "started": 1789536268.118137,
+    "ready": {
+      "features": {
+        "gpu": true,
+        "lance": true
+      },
+      "gpu_enabled": false,
+      "gpu_residency_required": false,
+      "gpu_snapshot": null,
+      "ipc_cache": "off",
+      "residency": "warm_host_files",
+      "setup_ms": 0.472485,
+      "status": "ready",
+      "threads": 16,
+      "track": "native"
+    },
+    "completed": 4,
+    "finished": 1789536270.988023
+  }
+}

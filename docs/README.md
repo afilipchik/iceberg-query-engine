@@ -1,6 +1,9 @@
 # Project documentation
 
-- [Current IPC dictionary projection and validation](ipc-dictionary-projection-2026-09-15.md)
+- [Current one-slot aggregate frontier repair and validation](serial-frontier-contract-2026-09-15.md)
+- [Native Q12 attribution and same-binary dictionary control](ipc-q12-phase-follow-up-2026-09-15.md)
+- [Proposed native admitted IPC implementation](native-admitted-ipc-design-2026-09-15.md)
+- [Previous IPC dictionary projection and validation](ipc-dictionary-projection-2026-09-15.md)
 
 - [Previous completed decimal batch-binding checkpoint](decimal-scale-cache-2026-09-11.md)
 - [Earlier UTF-8 key cycle and provider SF10](bound-utf8-aggregate-keys-2026-09-11.md)

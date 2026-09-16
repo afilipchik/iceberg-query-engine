@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/parallel-aggregate-input/audit_paired_ipc_dictionary_control.py", line 12, in <module>
+    scratch=root/'validation-scratch'/x['request']['id'];scratch.mkdir(decode_alls=True)
+                                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: Path.mkdir() got an unexpected keyword argument 'decode_alls'

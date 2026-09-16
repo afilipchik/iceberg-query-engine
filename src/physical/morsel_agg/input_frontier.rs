@@ -9,11 +9,7 @@ use crate::{
     QueryError, Result,
 };
 use arrow::record_batch::RecordBatch;
-use futures::{
-    future::BoxFuture,
-    stream::{FuturesUnordered, SelectAll},
-    FutureExt, StreamExt, TryStreamExt,
-};
+use futures::{future::BoxFuture, FutureExt, TryStreamExt};
 use std::{collections::VecDeque, sync::Arc};
 
 #[cfg(test)]
@@ -67,8 +63,8 @@ struct Pull {
 }
 
 pub(super) struct InputFrontier {
-    opening: FuturesUnordered<BoxFuture<'static, Result<RecordBatchStream>>>,
-    serial: SelectAll<RecordBatchStream>,
+    opening: Option<BoxFuture<'static, Result<RecordBatchStream>>>,
+    serial: Option<RecordBatchStream>,
     pending: VecDeque<Job>,
     recycle: Option<RecordBatchStream>,
     tasks: tokio::task::JoinSet<Result<Pull>>,
@@ -170,8 +166,8 @@ impl InputFrontier {
             admission.map_or((1, None), |(slots, lease)| (slots, Some(lease)))
         };
         let mut frontier = Self {
-            opening: FuturesUnordered::new(),
-            serial: SelectAll::new(),
+            opening: None,
+            serial: None,
             pending: VecDeque::new(),
             recycle: None,
             tasks: tokio::task::JoinSet::new(),
@@ -182,35 +178,18 @@ impl InputFrontier {
             admitted_buffers,
             demand: Arc::new(tokio::sync::Semaphore::new(slots)),
         };
-        if slots > 1 {
+        frontier
+            .pending
+            .try_reserve_exact(partitions)
+            .map_err(error)?;
+        if let Some(streams) = prepared {
             frontier
                 .pending
-                .try_reserve_exact(partitions)
-                .map_err(error)?;
-            if let Some(streams) = prepared {
-                frontier
-                    .pending
-                    .extend(streams.into_iter().map(Job::Stream));
-            } else {
-                frontier
-                    .pending
-                    .extend((0..partitions).map(|p| Job::Open(input.clone(), p)));
-            }
-        } else if let Some(streams) = prepared {
-            frontier.serial.extend(streams);
+                .extend(streams.into_iter().map(Job::Stream));
         } else {
-            for partition in 0..partitions {
-                let input = input.clone();
-                frontier.opening.push(
-                    async move {
-                        std::panic::AssertUnwindSafe(input.execute(partition))
-                            .catch_unwind()
-                            .await
-                            .map_err(super::live_spill::panic_error)?
-                    }
-                    .boxed(),
-                );
-            }
+            frontier
+                .pending
+                .extend((0..partitions).map(|p| Job::Open(input.clone(), p)));
         }
         if std::env::var_os("QE_AGG_PROF").is_some() {
             use std::io::Write;
@@ -271,30 +250,52 @@ impl InputFrontier {
     pub async fn next(&mut self) -> Result<Option<InputBatch>> {
         if self.slots == 1 {
             loop {
-                let mut opening_error = None;
-                loop {
-                    match self.opening.next().now_or_never() {
-                        Some(Some(Ok(stream))) => self.serial.push(stream),
-                        Some(Some(Err(error))) => {
-                            opening_error.get_or_insert(error);
+                // Pending asynchronous opens/pulls can own working buffers even
+                // before yielding a batch. SelectAll/FuturesUnordered would poll
+                // several of them, silently exceeding the single demand slot.
+                // Retain the active future in self so cancellation of next()
+                // followed by another next() does not replay or lose input.
+                if self.serial.is_none() {
+                    if self.opening.is_none() {
+                        match self.pending.pop_front() {
+                            Some(Job::Stream(stream)) => self.serial = Some(stream),
+                            Some(Job::Open(input, partition)) => {
+                                self.opening = Some(
+                                    async move {
+                                        std::panic::AssertUnwindSafe(input.execute(partition))
+                                            .catch_unwind()
+                                            .await
+                                            .map_err(super::live_spill::panic_error)?
+                                    }
+                                    .boxed(),
+                                );
+                            }
+                            None => return Ok(None),
                         }
-                        _ => break,
+                    }
+                    if let Some(opening) = self.opening.as_mut() {
+                        let result = opening.await;
+                        self.opening.take();
+                        self.serial = Some(result?);
                     }
                 }
-                if let Some(error) = opening_error {
-                    return Err(error);
+                let stream = self.serial.as_mut().expect("active serial input");
+                let batch = std::panic::AssertUnwindSafe(stream.try_next())
+                    .catch_unwind()
+                    .await
+                    .map_err(super::live_spill::panic_error)??;
+                if let Some(batch) = batch {
+                    return Ok(Some(InputBatch {
+                        batch,
+                        admission: if self.admitted_buffers {
+                            InputAdmission::Buffers
+                        } else {
+                            InputAdmission::ConsumerRequired
+                        },
+                        _permit: None,
+                    }));
                 }
-                tokio::select! {
-                    result=self.opening.next(), if !self.opening.is_empty()=>{
-                        if let Some(result)=result {self.serial.push(result?);}
-                    }
-                    result=std::panic::AssertUnwindSafe(self.serial.next()).catch_unwind(), if !self.serial.is_empty()=>{
-                        if let Some(result)=result.map_err(super::live_spill::panic_error)? {
-                            return Ok(Some(InputBatch { batch: result?, admission: if self.admitted_buffers { InputAdmission::Buffers } else { InputAdmission::ConsumerRequired }, _permit: None }));
-                        }
-                    }
-                    else=>return Ok(None),
-                }
+                self.serial.take();
             }
         }
         if let Some(stream) = self.recycle.take() {
@@ -322,8 +323,8 @@ impl InputFrontier {
         self.tasks.shutdown().await;
         self.recycle.take();
         self.pending.clear();
-        self.serial.clear();
-        self.opening.clear();
+        self.serial.take();
+        self.opening.take();
         self.envelope.take();
     }
 }

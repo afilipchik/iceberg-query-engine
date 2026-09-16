@@ -34,6 +34,8 @@ struct OneShotInput {
     calls: [AtomicUsize; 2],
     fault: Fault,
     pending_peer: bool,
+    parallel: bool,
+    peer_started: tokio::sync::Notify,
     pending_streams: Arc<AtomicUsize>,
 }
 
@@ -67,13 +69,37 @@ impl PhysicalOperator for OneShotInput {
     fn output_partitions(&self) -> usize {
         2
     }
+    fn pool_independent_queue_copy_bound(
+        &self,
+    ) -> Option<query_engine::physical::queue_layout::QueueCopyBound> {
+        self.parallel.then(|| {
+            query_engine::physical::queue_layout::QueueCopyBound::from_batches(
+                &self.batch.schema(),
+                std::slice::from_ref(&self.batch),
+            )
+            .expect("fixed nullable Int64 fixture has a copied-output bound")
+        })
+    }
     async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
         query_engine::physical::check_partition(self, partition)?;
         let first = self.calls[partition].fetch_add(1, Ordering::SeqCst) == 0;
+        // On the admitted parallel route, prove the sibling has actually
+        // initialized before injecting the error; never rely on scheduler luck.
+        if self.parallel {
+            if partition == 0 {
+                self.peer_started.notified().await;
+            } else if !self.pending_peer {
+                self.peer_started.notify_one();
+            }
+        }
         if self.pending_peer {
             if partition == 1 {
                 self.pending_streams.fetch_add(1, Ordering::SeqCst);
-                return Ok(Box::pin(PendingPeer(self.pending_streams.clone())));
+                let stream = Box::pin(PendingPeer(self.pending_streams.clone()));
+                if self.parallel {
+                    self.peer_started.notify_one();
+                }
+                return Ok(stream);
             }
             tokio::task::yield_now().await;
         }
@@ -107,7 +133,7 @@ impl PhysicalOperator for OneShotInput {
 }
 
 async fn check(fault: Fault, pending_peer: bool) {
-    for disjoint in [false, true] {
+    for (disjoint, parallel) in [(false, false), (true, false), (false, true), (true, true)] {
         let schema = Arc::new(Schema::new(vec![
             Field::new("g", DataType::Int64, true),
             Field::new("v", DataType::Int64, true),
@@ -124,6 +150,8 @@ async fn check(fault: Fault, pending_peer: bool) {
             calls: [AtomicUsize::new(0), AtomicUsize::new(0)],
             fault,
             pending_peer,
+            parallel,
+            peer_started: tokio::sync::Notify::new(),
             pending_streams: Arc::new(AtomicUsize::new(0)),
         });
         let pool = Arc::new(MemoryPool::new_named(
@@ -155,14 +183,14 @@ async fn check(fault: Fault, pending_peer: bool) {
             ExecutionConfig::new().with_memory_limit(4 * 1024 * 1024),
         )
         .with_disjoint_groups(disjoint);
-        let execution =
-            tokio::time::timeout(std::time::Duration::from_secs(2), operator.execute(0))
-                .await
-                .expect("input failure waited forever for a pending sibling");
-        let result = match execution {
-            Ok(stream) => stream.try_collect::<Vec<RecordBatch>>().await,
-            Err(error) => Err(error),
-        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            match operator.execute(0).await {
+                Ok(stream) => stream.try_collect::<Vec<RecordBatch>>().await,
+                Err(error) => Err(error),
+            }
+        })
+        .await
+        .expect("input failure waited forever for a pending sibling");
         if matches!(fault, Fault::None) {
             let batches = result.unwrap();
             let mut rows = Vec::new();
@@ -209,15 +237,18 @@ async fn check(fault: Fault, pending_peer: bool) {
                 Fault::None => unreachable!(),
             }
         }
-        for calls in &input.calls {
+        for (partition, calls) in input.calls.iter().enumerate() {
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 if matches!(fault, Fault::BindingError) {
                     0
-                } else {
+                } else if partition == 0 || parallel || matches!(fault, Fault::None) {
                     1
+                } else {
+                    // Serial failures must not start a later partition.
+                    0
                 },
-                "input start/replay contract violated"
+                "input start/replay contract violated (parallel={parallel}, partition={partition})"
             );
         }
         assert_eq!(pool.used(), 0, "worker state leaked on error");

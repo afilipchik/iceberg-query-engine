@@ -1,0 +1,23 @@
+{
+  "files": {
+    "archive_serial_frontier_validation.py": "36d9fd75cefa5cfbf0c7b309c3585e57f6148ef9abb9eaa41ab73c67ec4f8dbe",
+    "compare_serial_frontier_failures.py": "7ad8a50ce97eba3439f5895fef2aad229b34abb57e9ea3761fef212ba6914544",
+    "run_serial_frontier_validation.py": "2656bb520abbb5f95bc63981235674e662ba1fb2ce490c20b312835aff5d0fb5",
+    "serial-frontier-disjoint-contracts.log": "4774f4022d81e90794546081c59067c4d9ef545095f70506f94be2db5b7dae2f",
+    "serial-frontier-disjoint-library.log": "281991cb88e97b11f88dcbdf80b51417ffd54b56dda7f19df22fcd0ba34404c6",
+    "serial-frontier-disjoint-native_ipc.log": "475626b70ca8ccede97d2e376d983e8d5f7d7167e191414c54df9a87ead50512",
+    "serial-frontier-disjoint-spill.log": "a113ddfe2c6f4c1cb3e818972bd68b7948baaf1b006e6cac31ea5ce83f1c7b58",
+    "serial-frontier-partial-contracts.log": "bd7f669b463fc232afc7fcc51fdad4c603ac2527d3787966a501d3c9acef1a91",
+    "serial-frontier-partial-library.log": "eb97a5260082eaca4f0ab5898a4d30bfca3c6104a3d3308004d9389ff302d652",
+    "serial-frontier-partial-native_ipc.log": "d5a98097c6ab4cba80b5edfa5859a8fb74efc5261629ca6602cd60615c494947",
+    "serial-frontier-partial-spill.log": "16ea4dbd793c876e0321d50a3e0ddcaea844ef9976cc3f8cba15573007f8627c",
+    "serial-frontier-validation-controller.log": "f95ddb5f0df3322a91dfb00fe57486e3e9f94ff6b9f39d96dd83c8c321987d86",
+    "serial-frontier-validation-resources-after.json": "4a8fb52d7390a222eac0f306f14b46552cf2fcbfc906965b3511cadc3ee35338",
+    "serial-frontier-validation-resources-before.json": "b440a0d6505c3e2bcf00bc4c6192abcb507958ee5e8493465be4d61ac489e8f7",
+    "serial-frontier-validation-source-hashes.json": "2212b0bd20a68f7140967178848d59d8910a90767db1987be6358cd0138fc9ef",
+    "serial-frontier-validation-verified-after.json": "4a32144a62b04da4d296d8bc908243d1ca24b9054e9554c3921c159164bd32e3",
+    "serial-frontier-validation.json": "9619411e5b29fd5942d833db71fd24c1d4e0a4cd769418cf5dd0e6cf09b83f70",
+    "source.tar.gz": "46655496bfb5f9102d060294216cfe3c8359f9216556e71cca1965258830ad4d"
+  },
+  "source_inputs": 802
+}

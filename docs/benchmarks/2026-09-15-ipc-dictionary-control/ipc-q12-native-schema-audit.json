@@ -1,0 +1,716 @@
+{
+  "lineitem": {
+    "schema_counts": {
+      "l_orderkey: int64\nl_partkey: int64\nl_suppkey: int64\nl_linenumber: int64\nl_quantity: decimal128(15, 2)\nl_extendedprice: decimal128(15, 2)\nl_discount: decimal128(15, 2)\nl_tax: decimal128(15, 2)\nl_returnflag: dictionary<values=string, indices=int32, ordered=0>\nl_linestatus: dictionary<values=string, indices=int32, ordered=0>\nl_shipdate: date32[day]\nl_commitdate: date32[day]\nl_receiptdate: date32[day]\nl_shipinstruct: dictionary<values=string, indices=int32, ordered=0>\nl_shipmode: dictionary<values=string, indices=int32, ordered=0>\nl_comment: string": 58
+    },
+    "files": [
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00000.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00001.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00002.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00003.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00004.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00005.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00006.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00007.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00008.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00009.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00010.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00011.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00012.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00013.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00014.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00015.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00016.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00017.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00018.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00019.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00020.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00021.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00022.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00023.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00024.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00025.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00026.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00027.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00028.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00029.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00030.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00031.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00032.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00033.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00034.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00035.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00036.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00037.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00038.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00039.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00040.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00041.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00042.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00043.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00044.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00045.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00046.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00047.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00048.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00049.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00050.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00051.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00052.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00053.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00054.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00055.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00056.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00057.arrow",
+        "dictionary_fields": [
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipinstruct",
+          "l_shipmode"
+        ],
+        "record_batches": 4
+      }
+    ]
+  },
+  "orders": {
+    "schema_counts": {
+      "o_orderkey: int64\no_custkey: int64\no_orderstatus: dictionary<values=string, indices=int32, ordered=0>\no_totalprice: decimal128(15, 2)\no_orderdate: date32[day]\no_orderpriority: dictionary<values=string, indices=int32, ordered=0>\no_clerk: string\no_shippriority: int32\no_comment: string": 15
+    },
+    "files": [
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/orders/rg_00000.arrow",
+        "dictionary_fields": [
+          "o_orderstatus",
+          "o_orderpriority"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/orders/rg_00001.arrow",
+        "dictionary_fields": [
+          "o_orderstatus",
+          "o_orderpriority"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/orders/rg_00002.arrow",
+        "dictionary_fields": [
+          "o_orderstatus",
+          "o_orderpriority"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/orders/rg_00003.arrow",
+        "dictionary_fields": [
+          "o_orderstatus",
+          "o_orderpriority"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/orders/rg_00004.arrow",
+        "dictionary_fields": [
+          "o_orderstatus",
+          "o_orderpriority"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/orders/rg_00005.arrow",
+        "dictionary_fields": [
+          "o_orderstatus",
+          "o_orderpriority"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/orders/rg_00006.arrow",
+        "dictionary_fields": [
+          "o_orderstatus",
+          "o_orderpriority"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/orders/rg_00007.arrow",
+        "dictionary_fields": [
+          "o_orderstatus",
+          "o_orderpriority"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/orders/rg_00008.arrow",
+        "dictionary_fields": [
+          "o_orderstatus",
+          "o_orderpriority"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/orders/rg_00009.arrow",
+        "dictionary_fields": [
+          "o_orderstatus",
+          "o_orderpriority"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/orders/rg_00010.arrow",
+        "dictionary_fields": [
+          "o_orderstatus",
+          "o_orderpriority"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/orders/rg_00011.arrow",
+        "dictionary_fields": [
+          "o_orderstatus",
+          "o_orderpriority"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/orders/rg_00012.arrow",
+        "dictionary_fields": [
+          "o_orderstatus",
+          "o_orderpriority"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/orders/rg_00013.arrow",
+        "dictionary_fields": [
+          "o_orderstatus",
+          "o_orderpriority"
+        ],
+        "record_batches": 16
+      },
+      {
+        "path": ".scratch/public-bench/canonical-sf10-providers-02/native/orders/rg_00014.arrow",
+        "dictionary_fields": [
+          "o_orderstatus",
+          "o_orderpriority"
+        ],
+        "record_batches": 5
+      }
+    ]
+  }
+}

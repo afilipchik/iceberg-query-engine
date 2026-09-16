@@ -1,0 +1,38 @@
+{
+  "lineitem": {
+    "file": ".scratch/public-bench/canonical-sf10-providers-02/native/lineitem/rg_00000.arrow",
+    "qualification": "First file/batch representative only; full-table schema inventory is separate.",
+    "dictionaries": {
+      "l_returnflag": {
+        "values": 3,
+        "value_bytes": 15
+      },
+      "l_linestatus": {
+        "values": 2,
+        "value_bytes": 10
+      },
+      "l_shipinstruct": {
+        "values": 4,
+        "value_bytes": 64
+      },
+      "l_shipmode": {
+        "values": 7,
+        "value_bytes": 58
+      }
+    }
+  },
+  "orders": {
+    "file": ".scratch/public-bench/canonical-sf10-providers-02/native/orders/rg_00000.arrow",
+    "qualification": "First file/batch representative only; full-table schema inventory is separate.",
+    "dictionaries": {
+      "o_orderstatus": {
+        "values": 3,
+        "value_bytes": 15
+      },
+      "o_orderpriority": {
+        "values": 5,
+        "value_bytes": 62
+      }
+    }
+  }
+}

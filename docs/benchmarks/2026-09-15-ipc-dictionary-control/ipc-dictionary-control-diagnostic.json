@@ -1,0 +1,20 @@
+{
+  "build": {
+    "status": "terminal",
+    "started": 1789535460.8043153,
+    "exit_code": 0,
+    "finished": 1789535992.410796
+  },
+  "paired": {
+    "status": "terminal",
+    "started": 1789535992.410874,
+    "exit_code": 0,
+    "finished": 1789536271.2043433
+  },
+  "audit": {
+    "status": "terminal",
+    "started": 1789536271.2044263,
+    "exit_code": 1,
+    "finished": 1789536271.2830634
+  }
+}

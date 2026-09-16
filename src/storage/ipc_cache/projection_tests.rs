@@ -134,6 +134,15 @@ fn numeric_projection_does_not_decode_unused_dictionaries() {
     writer.write(&batch).unwrap();
     writer.finish().unwrap();
     drop(writer);
+    // Same decoder, file and projection: disabling only pruning must retain the
+    // old dictionary work while producing exactly the same nullable output.
+    let baseline_before = DICTIONARY_DECODES.with(|n| n.get());
+    let baseline = open_row_group_with_dictionary_projection(dir.path(), 0, Some(&[0]), false)
+        .unwrap()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(DICTIONARY_DECODES.with(|n| n.get()) - baseline_before, 1);
+    assert_eq!(baseline, vec![batch.project(&[0]).unwrap(); 2]);
     let before = DICTIONARY_DECODES.with(|n| n.get());
     let mut reader = open_row_group(dir.path(), 0, Some(&[0])).unwrap();
     let first = reader.next().unwrap().unwrap();

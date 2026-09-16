@@ -1,0 +1,36 @@
+{
+  "binary_sha256": {
+    "decode_all": "cfc3b4d10029e02717bdc90a07f6a58a4b8ab50d4e7afb13fadc916e8f8b6d24",
+    "prune": "cfc3b4d10029e02717bdc90a07f6a58a4b8ab50d4e7afb13fadc916e8f8b6d24"
+  },
+  "driver_sha256": "7f79595a5cd00b6608b47e3b18c6207406e27f277a80d5c970a18dc63d41071d",
+  "setup_source_sha256": "910d3c9e6400fbfb0dafffdb95b7704e8152f93b52f297c91bab2e02b1825f1a",
+  "request_source_sha256": "e897b6b90f497577485ed1f08126b9f987d8fab929ea4982befc20563c833ea7",
+  "queries": [
+    "q01",
+    "q06",
+    "q12"
+  ],
+  "blocks": [
+    [
+      "decode_all",
+      "prune"
+    ],
+    [
+      "prune",
+      "decode_all"
+    ],
+    [
+      "prune",
+      "decode_all"
+    ],
+    [
+      "decode_all",
+      "prune"
+    ]
+  ],
+  "samples": 3,
+  "warmups": 1,
+  "fresh_worker_per_query": true,
+  "qualification": "Four alternating/reversed blocks of the identical binary with only dictionary policy changed, no aggregate/queue profiling, fresh worker per query, 180s diagnostic ceiling; not normal performance acceptance. Dataset/setup work excluded equally; Native provider/setup and query timing boundaries match the provider screen."
+}

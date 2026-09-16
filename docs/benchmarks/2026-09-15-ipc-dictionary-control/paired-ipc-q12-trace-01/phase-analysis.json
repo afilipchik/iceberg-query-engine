@@ -1,0 +1,3386 @@
+{
+  "b1-parent-q12": [
+    {
+      "request": "b1-parent-q12-warmup",
+      "process_delta": {
+        "minor_faults": 58065,
+        "major_faults": 0,
+        "user_ticks": 194,
+        "system_ticks": 26
+      },
+      "io_delta": {
+        "rchar": 14474,
+        "wchar": 8378,
+        "syscr": 15,
+        "syscw": 1248,
+        "read_bytes": 0,
+        "write_bytes": 20480,
+        "cancelled_write_bytes": 0
+      },
+      "traces": [
+        {
+          "completed": true,
+          "detail": {
+            "admitted_buffers": false,
+            "declared_bound": null,
+            "envelope_bytes": null,
+            "label": "join build input queue",
+            "max_slots": 8,
+            "operator": "Project",
+            "partitions": 8,
+            "prepared": false,
+            "slots": 1
+          },
+          "id": 2,
+          "ms": 0.025944000000000002,
+          "phase": "queue_prepare",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.17515599999999995,
+            "charged_copy_bytes": 651104,
+            "copy_ms": 0.891711,
+            "execute_ms": 0.013819,
+            "partition": 3,
+            "permit_ms": 749.1131600000001,
+            "poll_ms": 103.15188899999998,
+            "queue": 2,
+            "rows": 37947,
+            "send_ms": 0.21513800000000002
+          },
+          "id": 4,
+          "ms": 853.699357,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.183059,
+            "charged_copy_bytes": 653472,
+            "copy_ms": 0.9018910000000002,
+            "execute_ms": 0.000816,
+            "partition": 5,
+            "permit_ms": 747.9022990000001,
+            "poll_ms": 105.14013700000002,
+            "queue": 2,
+            "rows": 38144,
+            "send_ms": 0.2160789999999999
+          },
+          "id": 7,
+          "ms": 854.473464,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.1807429999999999,
+            "charged_copy_bytes": 653328,
+            "copy_ms": 0.8650240000000001,
+            "execute_ms": 0.001223,
+            "partition": 6,
+            "permit_ms": 749.5663890000002,
+            "poll_ms": 104.34520699999987,
+            "queue": 2,
+            "rows": 38137,
+            "send_ms": 0.2038480000000001
+          },
+          "id": 8,
+          "ms": 855.298858,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.16515200000000005,
+            "charged_copy_bytes": 655920,
+            "copy_ms": 0.9048340000000002,
+            "execute_ms": 0.0019089999999999999,
+            "partition": 7,
+            "permit_ms": 749.931426,
+            "poll_ms": 104.77779799999996,
+            "queue": 2,
+            "rows": 38345,
+            "send_ms": 0.21312999999999996
+          },
+          "id": 9,
+          "ms": 856.1224629999999,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.17072699999999996,
+            "charged_copy_bytes": 648512,
+            "copy_ms": 0.8320519999999997,
+            "execute_ms": 0.012455,
+            "partition": 2,
+            "permit_ms": 751.5190889999998,
+            "poll_ms": 104.13296499999998,
+            "queue": 2,
+            "rows": 37722,
+            "send_ms": 0.20513500000000004
+          },
+          "id": 6,
+          "ms": 857.0186359999999,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.16149400000000005,
+            "charged_copy_bytes": 650432,
+            "copy_ms": 0.8903079999999999,
+            "execute_ms": 0.009906,
+            "partition": 4,
+            "permit_ms": 752.1077180000001,
+            "poll_ms": 104.48393599999999,
+            "queue": 2,
+            "rows": 37882,
+            "send_ms": 0.19692799999999994
+          },
+          "id": 10,
+          "ms": 857.997368,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 116,
+            "charge_ms": 0.17202000000000012,
+            "charged_copy_bytes": 671832,
+            "copy_ms": 0.868585,
+            "execute_ms": 0.012242000000000001,
+            "partition": 1,
+            "permit_ms": 754.2500239999999,
+            "poll_ms": 106.39792199999998,
+            "queue": 2,
+            "rows": 39096,
+            "send_ms": 0.2289370000000002
+          },
+          "id": 3,
+          "ms": 862.062236,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 128,
+            "charge_ms": 0.19144699999999995,
+            "charged_copy_bytes": 746128,
+            "copy_ms": 0.9389769999999998,
+            "execute_ms": 0.011947,
+            "partition": 0,
+            "permit_ms": 754.409949,
+            "poll_ms": 113.10400599999996,
+            "queue": 2,
+            "rows": 43530,
+            "send_ms": 0.225559
+          },
+          "id": 5,
+          "ms": 869.017932,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "label": "sort input queue",
+            "operator": "Project",
+            "partitions": 1
+          },
+          "id": 1,
+          "ms": 1008.1242909999999,
+          "phase": "queue_prepare",
+          "unwinding": false
+        }
+      ],
+      "qualification": "Concurrent producer durations overlap; do not sum as wall time. Process counters include all work between the request boundaries."
+    },
+    {
+      "request": "b1-parent-q12-1-engine",
+      "process_delta": {
+        "minor_faults": 37545,
+        "major_faults": 0,
+        "user_ticks": 167,
+        "system_ticks": 16
+      },
+      "io_delta": {
+        "rchar": 954,
+        "wchar": 7682,
+        "syscr": 1,
+        "syscw": 1157,
+        "read_bytes": 0,
+        "write_bytes": 16384,
+        "cancelled_write_bytes": 0
+      },
+      "traces": [
+        {
+          "completed": true,
+          "detail": {
+            "admitted_buffers": false,
+            "declared_bound": null,
+            "envelope_bytes": null,
+            "label": "join build input queue",
+            "max_slots": 8,
+            "operator": "Project",
+            "partitions": 8,
+            "prepared": false,
+            "slots": 1
+          },
+          "id": 12,
+          "ms": 0.011849,
+          "phase": "queue_prepare",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.07097999999999995,
+            "charged_copy_bytes": 650432,
+            "copy_ms": 0.3121439999999998,
+            "execute_ms": 0.0011510000000000001,
+            "partition": 4,
+            "permit_ms": 370.82060799999977,
+            "poll_ms": 51.747991,
+            "queue": 12,
+            "rows": 37882,
+            "send_ms": 0.089482
+          },
+          "id": 17,
+          "ms": 423.104872,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.06698499999999999,
+            "charged_copy_bytes": 651104,
+            "copy_ms": 0.32744499999999976,
+            "execute_ms": 0.010419,
+            "partition": 3,
+            "permit_ms": 371.012037,
+            "poll_ms": 52.27314999999998,
+            "queue": 12,
+            "rows": 37947,
+            "send_ms": 0.08750899999999996
+          },
+          "id": 16,
+          "ms": 423.84749700000003,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.06931999999999998,
+            "charged_copy_bytes": 653472,
+            "copy_ms": 0.5048860000000001,
+            "execute_ms": 0.010669999999999999,
+            "partition": 5,
+            "permit_ms": 371.653031,
+            "poll_ms": 52.187315,
+            "queue": 12,
+            "rows": 38144,
+            "send_ms": 0.08758100000000002
+          },
+          "id": 18,
+          "ms": 424.582291,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.06690500000000002,
+            "charged_copy_bytes": 648512,
+            "copy_ms": 0.2938230000000001,
+            "execute_ms": 0.021316,
+            "partition": 2,
+            "permit_ms": 372.80726299999986,
+            "poll_ms": 51.991722000000024,
+            "queue": 12,
+            "rows": 37722,
+            "send_ms": 0.08114199999999995
+          },
+          "id": 15,
+          "ms": 425.33680699999996,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.07954199999999999,
+            "charged_copy_bytes": 655920,
+            "copy_ms": 0.36486999999999986,
+            "execute_ms": 0.011473,
+            "partition": 7,
+            "permit_ms": 373.6857419999999,
+            "poll_ms": 51.77541,
+            "queue": 12,
+            "rows": 38345,
+            "send_ms": 0.08423099999999999
+          },
+          "id": 19,
+          "ms": 426.06621900000005,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.06874599999999999,
+            "charged_copy_bytes": 653328,
+            "copy_ms": 0.32184,
+            "execute_ms": 0.015063,
+            "partition": 6,
+            "permit_ms": 374.04266200000006,
+            "poll_ms": 52.242204000000015,
+            "queue": 12,
+            "rows": 38137,
+            "send_ms": 0.08499899999999998
+          },
+          "id": 20,
+          "ms": 426.85274200000003,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 116,
+            "charge_ms": 0.07483299999999997,
+            "charged_copy_bytes": 671832,
+            "copy_ms": 0.3482659999999998,
+            "execute_ms": 0.013264999999999999,
+            "partition": 1,
+            "permit_ms": 376.1916899999999,
+            "poll_ms": 53.859818000000004,
+            "queue": 12,
+            "rows": 39096,
+            "send_ms": 0.08884299999999999
+          },
+          "id": 14,
+          "ms": 430.655487,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 128,
+            "charge_ms": 0.08700599999999997,
+            "charged_copy_bytes": 746128,
+            "copy_ms": 0.376655,
+            "execute_ms": 0.029011000000000002,
+            "partition": 0,
+            "permit_ms": 375.36431400000026,
+            "poll_ms": 61.77024800000001,
+            "queue": 12,
+            "rows": 43530,
+            "send_ms": 0.10930400000000003
+          },
+          "id": 13,
+          "ms": 437.82131499999997,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "label": "sort input queue",
+            "operator": "Project",
+            "partitions": 1
+          },
+          "id": 11,
+          "ms": 576.833078,
+          "phase": "queue_prepare",
+          "unwinding": false
+        }
+      ],
+      "qualification": "Concurrent producer durations overlap; do not sum as wall time. Process counters include all work between the request boundaries."
+    },
+    {
+      "request": "b1-parent-q12-2-engine",
+      "process_delta": {
+        "minor_faults": 47338,
+        "major_faults": 0,
+        "user_ticks": 178,
+        "system_ticks": 20
+      },
+      "io_delta": {
+        "rchar": 954,
+        "wchar": 7784,
+        "syscr": 1,
+        "syscw": 1176,
+        "read_bytes": 0,
+        "write_bytes": 12288,
+        "cancelled_write_bytes": 0
+      },
+      "traces": [
+        {
+          "completed": true,
+          "detail": {
+            "admitted_buffers": false,
+            "declared_bound": null,
+            "envelope_bytes": null,
+            "label": "join build input queue",
+            "max_slots": 8,
+            "operator": "Project",
+            "partitions": 8,
+            "prepared": false,
+            "slots": 1
+          },
+          "id": 22,
+          "ms": 0.011838000000000001,
+          "phase": "queue_prepare",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.10686699999999995,
+            "charged_copy_bytes": 651104,
+            "copy_ms": 6.402369999999999,
+            "execute_ms": 0.002359,
+            "partition": 3,
+            "permit_ms": 518.219436,
+            "poll_ms": 72.22006599999999,
+            "queue": 22,
+            "rows": 37947,
+            "send_ms": 0.12778899999999999
+          },
+          "id": 26,
+          "ms": 597.177428,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.10910400000000008,
+            "charged_copy_bytes": 650432,
+            "copy_ms": 0.49423399999999995,
+            "execute_ms": 0.0031810000000000002,
+            "partition": 4,
+            "permit_ms": 525.3459820000002,
+            "poll_ms": 71.992196,
+            "queue": 22,
+            "rows": 37882,
+            "send_ms": 0.12261400000000001
+          },
+          "id": 27,
+          "ms": 598.164651,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.11066900000000002,
+            "charged_copy_bytes": 653328,
+            "copy_ms": 0.526894,
+            "execute_ms": 0.002987,
+            "partition": 6,
+            "permit_ms": 526.6126479999999,
+            "poll_ms": 73.44223200000003,
+            "queue": 22,
+            "rows": 38137,
+            "send_ms": 0.135682
+          },
+          "id": 28,
+          "ms": 600.933737,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.10570400000000002,
+            "charged_copy_bytes": 655920,
+            "copy_ms": 0.49511700000000014,
+            "execute_ms": 0.010044,
+            "partition": 7,
+            "permit_ms": 528.4088300000001,
+            "poll_ms": 72.77087999999996,
+            "queue": 22,
+            "rows": 38345,
+            "send_ms": 0.12210400000000002
+          },
+          "id": 30,
+          "ms": 602.014993,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.12302400000000002,
+            "charged_copy_bytes": 653472,
+            "copy_ms": 0.5158569999999999,
+            "execute_ms": 0.012198,
+            "partition": 5,
+            "permit_ms": 528.8807569999999,
+            "poll_ms": 73.315125,
+            "queue": 22,
+            "rows": 38144,
+            "send_ms": 0.12981899999999996
+          },
+          "id": 29,
+          "ms": 603.092889,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.10995399999999998,
+            "charged_copy_bytes": 648512,
+            "copy_ms": 0.4986799999999998,
+            "execute_ms": 0.043968,
+            "partition": 2,
+            "permit_ms": 529.892779,
+            "poll_ms": 73.41511199999998,
+            "queue": 22,
+            "rows": 37722,
+            "send_ms": 0.126048
+          },
+          "id": 25,
+          "ms": 604.200949,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 116,
+            "charge_ms": 0.12083099999999998,
+            "charged_copy_bytes": 671832,
+            "copy_ms": 0.516121,
+            "execute_ms": 0.004558,
+            "partition": 1,
+            "permit_ms": 532.7640050000002,
+            "poll_ms": 75.04117000000002,
+            "queue": 22,
+            "rows": 39096,
+            "send_ms": 0.140742
+          },
+          "id": 24,
+          "ms": 608.6945569999999,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 128,
+            "charge_ms": 0.13157200000000002,
+            "charged_copy_bytes": 746128,
+            "copy_ms": 0.6182679999999999,
+            "execute_ms": 0.016585000000000003,
+            "partition": 0,
+            "permit_ms": 532.3516689999999,
+            "poll_ms": 86.82726600000005,
+            "queue": 22,
+            "rows": 43530,
+            "send_ms": 0.14418100000000003
+          },
+          "id": 23,
+          "ms": 620.228778,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "label": "sort input queue",
+            "operator": "Project",
+            "partitions": 1
+          },
+          "id": 21,
+          "ms": 768.256003,
+          "phase": "queue_prepare",
+          "unwinding": false
+        }
+      ],
+      "qualification": "Concurrent producer durations overlap; do not sum as wall time. Process counters include all work between the request boundaries."
+    },
+    {
+      "request": "b1-parent-q12-3-engine",
+      "process_delta": {
+        "minor_faults": 47990,
+        "major_faults": 0,
+        "user_ticks": 202,
+        "system_ticks": 23
+      },
+      "io_delta": {
+        "rchar": 954,
+        "wchar": 8847,
+        "syscr": 1,
+        "syscw": 1309,
+        "read_bytes": 0,
+        "write_bytes": 12288,
+        "cancelled_write_bytes": 0
+      },
+      "traces": [
+        {
+          "completed": true,
+          "detail": {
+            "admitted_buffers": false,
+            "declared_bound": null,
+            "envelope_bytes": null,
+            "label": "join build input queue",
+            "max_slots": 8,
+            "operator": "Project",
+            "partitions": 8,
+            "prepared": false,
+            "slots": 1
+          },
+          "id": 32,
+          "ms": 0.013164,
+          "phase": "queue_prepare",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.19258200000000003,
+            "charged_copy_bytes": 648512,
+            "copy_ms": 0.8398010000000004,
+            "execute_ms": 0.002028,
+            "partition": 2,
+            "permit_ms": 795.3550230000002,
+            "poll_ms": 110.62235899999993,
+            "queue": 32,
+            "rows": 37722,
+            "send_ms": 0.21703700000000006
+          },
+          "id": 34,
+          "ms": 907.440756,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.18530099999999997,
+            "charged_copy_bytes": 650432,
+            "copy_ms": 0.8329309999999999,
+            "execute_ms": 0.0041860000000000005,
+            "partition": 4,
+            "permit_ms": 795.6016870000001,
+            "poll_ms": 111.235386,
+            "queue": 32,
+            "rows": 37882,
+            "send_ms": 0.21528299999999995
+          },
+          "id": 37,
+          "ms": 908.2476320000001,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.18411200000000003,
+            "charged_copy_bytes": 653328,
+            "copy_ms": 8.342353000000003,
+            "execute_ms": 0.001312,
+            "partition": 6,
+            "permit_ms": 789.9405039999998,
+            "poll_ms": 110.15895399999998,
+            "queue": 32,
+            "rows": 38137,
+            "send_ms": 0.20801100000000008
+          },
+          "id": 39,
+          "ms": 909.022597,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.18459600000000007,
+            "charged_copy_bytes": 653472,
+            "copy_ms": 0.7910290000000003,
+            "execute_ms": 0.003698,
+            "partition": 5,
+            "permit_ms": 799.7602069999997,
+            "poll_ms": 108.68710500000005,
+            "queue": 32,
+            "rows": 38144,
+            "send_ms": 0.19838099999999992
+          },
+          "id": 38,
+          "ms": 909.792865,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.179655,
+            "charged_copy_bytes": 655920,
+            "copy_ms": 0.798688,
+            "execute_ms": 0.001229,
+            "partition": 7,
+            "permit_ms": 800.7147529999999,
+            "poll_ms": 108.47344499999998,
+            "queue": 32,
+            "rows": 38345,
+            "send_ms": 0.20823999999999995
+          },
+          "id": 40,
+          "ms": 910.5508209999999,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.19058199999999997,
+            "charged_copy_bytes": 651104,
+            "copy_ms": 0.8599479999999999,
+            "execute_ms": 0.023503,
+            "partition": 3,
+            "permit_ms": 799.9301749999997,
+            "poll_ms": 109.95480600000005,
+            "queue": 32,
+            "rows": 37947,
+            "send_ms": 0.220142
+          },
+          "id": 35,
+          "ms": 911.361678,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 116,
+            "charge_ms": 0.199387,
+            "charged_copy_bytes": 671832,
+            "copy_ms": 0.8199139999999998,
+            "execute_ms": 0.014497,
+            "partition": 1,
+            "permit_ms": 801.6266150000004,
+            "poll_ms": 112.46915500000001,
+            "queue": 32,
+            "rows": 39096,
+            "send_ms": 0.21452000000000004
+          },
+          "id": 36,
+          "ms": 915.528169,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 128,
+            "charge_ms": 0.19952499999999995,
+            "charged_copy_bytes": 746128,
+            "copy_ms": 0.8867219999999998,
+            "execute_ms": 0.004977,
+            "partition": 0,
+            "permit_ms": 801.202782,
+            "poll_ms": 117.96499500000006,
+            "queue": 32,
+            "rows": 43530,
+            "send_ms": 0.238497
+          },
+          "id": 33,
+          "ms": 920.6933710000001,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "label": "sort input queue",
+            "operator": "Project",
+            "partitions": 1
+          },
+          "id": 31,
+          "ms": 1050.753692,
+          "phase": "queue_prepare",
+          "unwinding": false
+        }
+      ],
+      "qualification": "Concurrent producer durations overlap; do not sum as wall time. Process counters include all work between the request boundaries."
+    }
+  ],
+  "b1-candidate-q12": [
+    {
+      "request": "b1-candidate-q12-warmup",
+      "process_delta": {
+        "minor_faults": 53649,
+        "major_faults": 0,
+        "user_ticks": 212,
+        "system_ticks": 32
+      },
+      "io_delta": {
+        "rchar": 14487,
+        "wchar": 7633,
+        "syscr": 15,
+        "syscw": 1151,
+        "read_bytes": 0,
+        "write_bytes": 20480,
+        "cancelled_write_bytes": 0
+      },
+      "traces": [
+        {
+          "completed": true,
+          "detail": {
+            "admitted_buffers": false,
+            "declared_bound": null,
+            "envelope_bytes": null,
+            "label": "join build input queue",
+            "max_slots": 8,
+            "operator": "Project",
+            "partitions": 8,
+            "prepared": false,
+            "slots": 1
+          },
+          "id": 2,
+          "ms": 0.024596,
+          "phase": "queue_prepare",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.255651,
+            "charged_copy_bytes": 648512,
+            "copy_ms": 1.2088609999999997,
+            "execute_ms": 0.011953,
+            "partition": 2,
+            "permit_ms": 932.6861349999998,
+            "poll_ms": 129.32826899999998,
+            "queue": 2,
+            "rows": 37722,
+            "send_ms": 0.29333100000000006
+          },
+          "id": 5,
+          "ms": 1064.003048,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.22833800000000007,
+            "charged_copy_bytes": 655920,
+            "copy_ms": 1.1940939999999995,
+            "execute_ms": 0.000885,
+            "partition": 7,
+            "permit_ms": 934.1083910000001,
+            "poll_ms": 128.72075000000007,
+            "queue": 2,
+            "rows": 38345,
+            "send_ms": 0.29422300000000007
+          },
+          "id": 9,
+          "ms": 1064.7549780000002,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.2628099999999999,
+            "charged_copy_bytes": 653472,
+            "copy_ms": 1.1499309999999998,
+            "execute_ms": 0.013859999999999999,
+            "partition": 5,
+            "permit_ms": 933.4145680000004,
+            "poll_ms": 130.16432300000005,
+            "queue": 2,
+            "rows": 38144,
+            "send_ms": 0.28694
+          },
+          "id": 8,
+          "ms": 1065.510679,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.22964699999999996,
+            "charged_copy_bytes": 650432,
+            "copy_ms": 1.225918,
+            "execute_ms": 0.014764,
+            "partition": 4,
+            "permit_ms": 935.2416759999999,
+            "poll_ms": 129.04425899999998,
+            "queue": 2,
+            "rows": 37882,
+            "send_ms": 0.277749
+          },
+          "id": 7,
+          "ms": 1066.2643919999998,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.24563000000000007,
+            "charged_copy_bytes": 651104,
+            "copy_ms": 1.1633720000000005,
+            "execute_ms": 0.018201000000000002,
+            "partition": 3,
+            "permit_ms": 935.6785169999997,
+            "poll_ms": 129.37770999999998,
+            "queue": 2,
+            "rows": 37947,
+            "send_ms": 0.2779689999999999
+          },
+          "id": 6,
+          "ms": 1066.982235,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.24212600000000004,
+            "charged_copy_bytes": 653328,
+            "copy_ms": 1.2206000000000004,
+            "execute_ms": 0.011009000000000001,
+            "partition": 6,
+            "permit_ms": 936.351324,
+            "poll_ms": 129.437748,
+            "queue": 2,
+            "rows": 38137,
+            "send_ms": 0.27499199999999996
+          },
+          "id": 10,
+          "ms": 1067.75207,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 116,
+            "charge_ms": 0.24335799999999996,
+            "charged_copy_bytes": 671832,
+            "copy_ms": 1.1784060000000005,
+            "execute_ms": 0.012778000000000001,
+            "partition": 1,
+            "permit_ms": 937.4512290000001,
+            "poll_ms": 131.82895599999995,
+            "queue": 2,
+            "rows": 39096,
+            "send_ms": 0.29429400000000006
+          },
+          "id": 4,
+          "ms": 1071.229635,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 128,
+            "charge_ms": 0.25931299999999996,
+            "charged_copy_bytes": 746128,
+            "copy_ms": 1.2782339999999999,
+            "execute_ms": 0.013890999999999999,
+            "partition": 0,
+            "permit_ms": 936.1308410000001,
+            "poll_ms": 139.646164,
+            "queue": 2,
+            "rows": 43530,
+            "send_ms": 0.316771
+          },
+          "id": 3,
+          "ms": 1077.901971,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "label": "sort input queue",
+            "operator": "Project",
+            "partitions": 1
+          },
+          "id": 1,
+          "ms": 1218.861473,
+          "phase": "queue_prepare",
+          "unwinding": false
+        }
+      ],
+      "qualification": "Concurrent producer durations overlap; do not sum as wall time. Process counters include all work between the request boundaries."
+    },
+    {
+      "request": "b1-candidate-q12-1-engine",
+      "process_delta": {
+        "minor_faults": 36102,
+        "major_faults": 0,
+        "user_ticks": 163,
+        "system_ticks": 16
+      },
+      "io_delta": {
+        "rchar": 963,
+        "wchar": 10858,
+        "syscr": 1,
+        "syscw": 1554,
+        "read_bytes": 0,
+        "write_bytes": 16384,
+        "cancelled_write_bytes": 0
+      },
+      "traces": [
+        {
+          "completed": true,
+          "detail": {
+            "admitted_buffers": false,
+            "declared_bound": null,
+            "envelope_bytes": null,
+            "label": "join build input queue",
+            "max_slots": 8,
+            "operator": "Project",
+            "partitions": 8,
+            "prepared": false,
+            "slots": 1
+          },
+          "id": 12,
+          "ms": 0.011628,
+          "phase": "queue_prepare",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.07271199999999998,
+            "charged_copy_bytes": 651104,
+            "copy_ms": 0.33028000000000013,
+            "execute_ms": 0.003624,
+            "partition": 3,
+            "permit_ms": 384.042791,
+            "poll_ms": 53.78825600000001,
+            "queue": 12,
+            "rows": 37947,
+            "send_ms": 0.09180500000000001
+          },
+          "id": 15,
+          "ms": 438.414439,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.06939199999999998,
+            "charged_copy_bytes": 650432,
+            "copy_ms": 0.3299539999999999,
+            "execute_ms": 0.0017310000000000001,
+            "partition": 4,
+            "permit_ms": 384.7536979999999,
+            "poll_ms": 53.83008600000001,
+            "queue": 12,
+            "rows": 37882,
+            "send_ms": 0.090181
+          },
+          "id": 16,
+          "ms": 439.15651,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.06845300000000001,
+            "charged_copy_bytes": 653472,
+            "copy_ms": 0.31608300000000006,
+            "execute_ms": 0.0016330000000000001,
+            "partition": 5,
+            "permit_ms": 385.40384700000016,
+            "poll_ms": 53.93216300000001,
+            "queue": 12,
+            "rows": 38144,
+            "send_ms": 0.08753599999999997
+          },
+          "id": 17,
+          "ms": 439.890581,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.06803400000000003,
+            "charged_copy_bytes": 653328,
+            "copy_ms": 0.32377200000000006,
+            "execute_ms": 0.001305,
+            "partition": 6,
+            "permit_ms": 385.980904,
+            "poll_ms": 54.079829999999994,
+            "queue": 12,
+            "rows": 38137,
+            "send_ms": 0.08774799999999999
+          },
+          "id": 19,
+          "ms": 440.62393,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.069481,
+            "charged_copy_bytes": 655920,
+            "copy_ms": 0.31490900000000016,
+            "execute_ms": 0.0009239999999999999,
+            "partition": 7,
+            "permit_ms": 386.815864,
+            "poll_ms": 53.95358100000003,
+            "queue": 12,
+            "rows": 38345,
+            "send_ms": 0.08869500000000005
+          },
+          "id": 20,
+          "ms": 441.32101,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.06705100000000003,
+            "charged_copy_bytes": 648512,
+            "copy_ms": 0.323726,
+            "execute_ms": 0.017137,
+            "partition": 2,
+            "permit_ms": 387.8366199999999,
+            "poll_ms": 53.62806499999999,
+            "queue": 12,
+            "rows": 37722,
+            "send_ms": 0.08843699999999995
+          },
+          "id": 18,
+          "ms": 442.05706,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 116,
+            "charge_ms": 0.07274399999999995,
+            "charged_copy_bytes": 671832,
+            "copy_ms": 0.34178700000000006,
+            "execute_ms": 0.012414,
+            "partition": 1,
+            "permit_ms": 388.55403300000006,
+            "poll_ms": 55.679083,
+            "queue": 12,
+            "rows": 39096,
+            "send_ms": 0.09091200000000002
+          },
+          "id": 14,
+          "ms": 444.846482,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 128,
+            "charge_ms": 0.08207500000000002,
+            "charged_copy_bytes": 746128,
+            "copy_ms": 0.38729199999999986,
+            "execute_ms": 0.021459,
+            "partition": 0,
+            "permit_ms": 388.11692400000015,
+            "poll_ms": 61.02673500000001,
+            "queue": 12,
+            "rows": 43530,
+            "send_ms": 0.11386399999999998
+          },
+          "id": 13,
+          "ms": 449.86422799999997,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "label": "sort input queue",
+            "operator": "Project",
+            "partitions": 1
+          },
+          "id": 11,
+          "ms": 577.9893059999999,
+          "phase": "queue_prepare",
+          "unwinding": false
+        }
+      ],
+      "qualification": "Concurrent producer durations overlap; do not sum as wall time. Process counters include all work between the request boundaries."
+    },
+    {
+      "request": "b1-candidate-q12-2-engine",
+      "process_delta": {
+        "minor_faults": 46192,
+        "major_faults": 0,
+        "user_ticks": 180,
+        "system_ticks": 21
+      },
+      "io_delta": {
+        "rchar": 963,
+        "wchar": 8492,
+        "syscr": 1,
+        "syscw": 1264,
+        "read_bytes": 0,
+        "write_bytes": 12288,
+        "cancelled_write_bytes": 0
+      },
+      "traces": [
+        {
+          "completed": true,
+          "detail": {
+            "admitted_buffers": false,
+            "declared_bound": null,
+            "envelope_bytes": null,
+            "label": "join build input queue",
+            "max_slots": 8,
+            "operator": "Project",
+            "partitions": 8,
+            "prepared": false,
+            "slots": 1
+          },
+          "id": 22,
+          "ms": 0.012074,
+          "phase": "queue_prepare",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.11222599999999999,
+            "charged_copy_bytes": 648512,
+            "copy_ms": 0.5783630000000003,
+            "execute_ms": 0.004374,
+            "partition": 2,
+            "permit_ms": 571.9320380000001,
+            "poll_ms": 78.21444700000004,
+            "queue": 22,
+            "rows": 37722,
+            "send_ms": 0.14930800000000002
+          },
+          "id": 25,
+          "ms": 651.126621,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.11410400000000002,
+            "charged_copy_bytes": 651104,
+            "copy_ms": 0.6249890000000001,
+            "execute_ms": 0.0029950000000000003,
+            "partition": 3,
+            "permit_ms": 572.6155129999999,
+            "poll_ms": 78.23122299999997,
+            "queue": 22,
+            "rows": 37947,
+            "send_ms": 0.1465500000000001
+          },
+          "id": 26,
+          "ms": 651.857491,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.115133,
+            "charged_copy_bytes": 655920,
+            "copy_ms": 0.6248059999999999,
+            "execute_ms": 0.001113,
+            "partition": 7,
+            "permit_ms": 572.3609050000002,
+            "poll_ms": 79.174638,
+            "queue": 22,
+            "rows": 38345,
+            "send_ms": 0.16357600000000008
+          },
+          "id": 29,
+          "ms": 652.564294,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.11655499999999999,
+            "charged_copy_bytes": 653328,
+            "copy_ms": 8.074823000000004,
+            "execute_ms": 0.0021100000000000003,
+            "partition": 6,
+            "permit_ms": 565.8286769999999,
+            "poll_ms": 79.00115400000004,
+            "queue": 22,
+            "rows": 38137,
+            "send_ms": 0.15237000000000006
+          },
+          "id": 28,
+          "ms": 653.303533,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.12079100000000006,
+            "charged_copy_bytes": 653472,
+            "copy_ms": 0.582338,
+            "execute_ms": 0.0036490000000000003,
+            "partition": 5,
+            "permit_ms": 573.1180770000001,
+            "poll_ms": 79.92020999999998,
+            "queue": 22,
+            "rows": 38144,
+            "send_ms": 0.152125
+          },
+          "id": 27,
+          "ms": 654.022657,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.12073399999999998,
+            "charged_copy_bytes": 650432,
+            "copy_ms": 0.583998,
+            "execute_ms": 0.004887,
+            "partition": 4,
+            "permit_ms": 574.3883300000001,
+            "poll_ms": 79.403354,
+            "queue": 22,
+            "rows": 37882,
+            "send_ms": 0.14924800000000002
+          },
+          "id": 30,
+          "ms": 654.7769420000001,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 116,
+            "charge_ms": 0.126767,
+            "charged_copy_bytes": 671832,
+            "copy_ms": 0.6323930000000004,
+            "execute_ms": 0.00688,
+            "partition": 1,
+            "permit_ms": 575.9630999999999,
+            "poll_ms": 80.17823800000002,
+            "queue": 22,
+            "rows": 39096,
+            "send_ms": 0.15510999999999991
+          },
+          "id": 24,
+          "ms": 657.18548,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 128,
+            "charge_ms": 0.126182,
+            "charged_copy_bytes": 746128,
+            "copy_ms": 0.6437359999999998,
+            "execute_ms": 0.008046000000000001,
+            "partition": 0,
+            "permit_ms": 577.226108,
+            "poll_ms": 84.40580699999998,
+            "queue": 22,
+            "rows": 43530,
+            "send_ms": 0.157814
+          },
+          "id": 23,
+          "ms": 662.7095979999999,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "label": "sort input queue",
+            "operator": "Project",
+            "partitions": 1
+          },
+          "id": 21,
+          "ms": 796.869709,
+          "phase": "queue_prepare",
+          "unwinding": false
+        }
+      ],
+      "qualification": "Concurrent producer durations overlap; do not sum as wall time. Process counters include all work between the request boundaries."
+    },
+    {
+      "request": "b1-candidate-q12-3-engine",
+      "process_delta": {
+        "minor_faults": 47908,
+        "major_faults": 0,
+        "user_ticks": 216,
+        "system_ticks": 30
+      },
+      "io_delta": {
+        "rchar": 963,
+        "wchar": 13861,
+        "syscr": 1,
+        "syscw": 1928,
+        "read_bytes": 0,
+        "write_bytes": 12288,
+        "cancelled_write_bytes": 0
+      },
+      "traces": [
+        {
+          "completed": true,
+          "detail": {
+            "admitted_buffers": false,
+            "declared_bound": null,
+            "envelope_bytes": null,
+            "label": "join build input queue",
+            "max_slots": 8,
+            "operator": "Project",
+            "partitions": 8,
+            "prepared": false,
+            "slots": 1
+          },
+          "id": 32,
+          "ms": 0.012003,
+          "phase": "queue_prepare",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.22628999999999996,
+            "charged_copy_bytes": 648512,
+            "copy_ms": 1.036584,
+            "execute_ms": 0.0012929999999999999,
+            "partition": 2,
+            "permit_ms": 908.4907959999998,
+            "poll_ms": 124.38175600000005,
+            "queue": 32,
+            "rows": 37722,
+            "send_ms": 0.278087
+          },
+          "id": 34,
+          "ms": 1034.645316,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.228489,
+            "charged_copy_bytes": 651104,
+            "copy_ms": 1.0554109999999999,
+            "execute_ms": 0.002233,
+            "partition": 3,
+            "permit_ms": 907.2675599999997,
+            "poll_ms": 127.19825700000001,
+            "queue": 32,
+            "rows": 37947,
+            "send_ms": 0.2998740000000001
+          },
+          "id": 35,
+          "ms": 1036.284942,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.23813400000000004,
+            "charged_copy_bytes": 650432,
+            "copy_ms": 0.9849120000000001,
+            "execute_ms": 0.0007250000000000001,
+            "partition": 4,
+            "permit_ms": 909.4119380000001,
+            "poll_ms": 126.92006600000005,
+            "queue": 32,
+            "rows": 37882,
+            "send_ms": 0.272839
+          },
+          "id": 36,
+          "ms": 1038.057002,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.21740099999999998,
+            "charged_copy_bytes": 653472,
+            "copy_ms": 0.9505600000000001,
+            "execute_ms": 0.004587,
+            "partition": 5,
+            "permit_ms": 911.3490249999996,
+            "poll_ms": 127.16105199999994,
+            "queue": 32,
+            "rows": 38144,
+            "send_ms": 0.2654620000000001
+          },
+          "id": 38,
+          "ms": 1040.16705,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.23227199999999992,
+            "charged_copy_bytes": 653328,
+            "copy_ms": 1.0641100000000003,
+            "execute_ms": 0.012912,
+            "partition": 6,
+            "permit_ms": 913.5542350000002,
+            "poll_ms": 126.80852899999995,
+            "queue": 32,
+            "rows": 38137,
+            "send_ms": 0.27111799999999997
+          },
+          "id": 37,
+          "ms": 1042.1543339999998,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.23212000000000002,
+            "charged_copy_bytes": 655920,
+            "copy_ms": 1.0278549999999997,
+            "execute_ms": 0.0059050000000000005,
+            "partition": 7,
+            "permit_ms": 909.3751040000001,
+            "poll_ms": 132.92005399999996,
+            "queue": 32,
+            "rows": 38345,
+            "send_ms": 0.28448
+          },
+          "id": 40,
+          "ms": 1044.064326,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 116,
+            "charge_ms": 0.2399060000000001,
+            "charged_copy_bytes": 671832,
+            "copy_ms": 1.030332,
+            "execute_ms": 0.014882000000000001,
+            "partition": 1,
+            "permit_ms": 926.1285610000003,
+            "poll_ms": 132.729485,
+            "queue": 32,
+            "rows": 39096,
+            "send_ms": 0.28064799999999995
+          },
+          "id": 39,
+          "ms": 1060.675753,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 128,
+            "charge_ms": 0.3082749999999999,
+            "charged_copy_bytes": 746128,
+            "copy_ms": 1.3393410000000008,
+            "execute_ms": 0.005596,
+            "partition": 0,
+            "permit_ms": 926.5737649999998,
+            "poll_ms": 154.57389799999996,
+            "queue": 32,
+            "rows": 43530,
+            "send_ms": 0.3501389999999999
+          },
+          "id": 33,
+          "ms": 1083.4322789999999,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "label": "sort input queue",
+            "operator": "Project",
+            "partitions": 1
+          },
+          "id": 31,
+          "ms": 1219.431562,
+          "phase": "queue_prepare",
+          "unwinding": false
+        }
+      ],
+      "qualification": "Concurrent producer durations overlap; do not sum as wall time. Process counters include all work between the request boundaries."
+    }
+  ],
+  "b2-candidate-q12": [
+    {
+      "request": "b2-candidate-q12-warmup",
+      "process_delta": {
+        "minor_faults": 55456,
+        "major_faults": 0,
+        "user_ticks": 195,
+        "system_ticks": 21
+      },
+      "io_delta": {
+        "rchar": 14487,
+        "wchar": 10599,
+        "syscr": 15,
+        "syscw": 1530,
+        "read_bytes": 1048576,
+        "write_bytes": 1089536,
+        "cancelled_write_bytes": 0
+      },
+      "traces": [
+        {
+          "completed": true,
+          "detail": {
+            "admitted_buffers": false,
+            "declared_bound": null,
+            "envelope_bytes": null,
+            "label": "join build input queue",
+            "max_slots": 8,
+            "operator": "Project",
+            "partitions": 8,
+            "prepared": false,
+            "slots": 1
+          },
+          "id": 2,
+          "ms": 0.018837,
+          "phase": "queue_prepare",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.14972200000000005,
+            "charged_copy_bytes": 653328,
+            "copy_ms": 0.8248940000000001,
+            "execute_ms": 0.000829,
+            "partition": 6,
+            "permit_ms": 657.638502,
+            "poll_ms": 91.797907,
+            "queue": 2,
+            "rows": 38137,
+            "send_ms": 0.17690900000000004
+          },
+          "id": 9,
+          "ms": 750.739676,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.13966999999999993,
+            "charged_copy_bytes": 655920,
+            "copy_ms": 0.8181490000000001,
+            "execute_ms": 0.000746,
+            "partition": 7,
+            "permit_ms": 658.7400919999999,
+            "poll_ms": 91.42641600000005,
+            "queue": 2,
+            "rows": 38345,
+            "send_ms": 0.17159599999999997
+          },
+          "id": 10,
+          "ms": 751.454789,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.13891900000000007,
+            "charged_copy_bytes": 648512,
+            "copy_ms": 0.767436,
+            "execute_ms": 0.015766000000000002,
+            "partition": 2,
+            "permit_ms": 660.8354419999997,
+            "poll_ms": 90.13155300000008,
+            "queue": 2,
+            "rows": 37722,
+            "send_ms": 0.17034699999999997
+          },
+          "id": 5,
+          "ms": 752.202513,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.14817199999999997,
+            "charged_copy_bytes": 651104,
+            "copy_ms": 0.801472,
+            "execute_ms": 0.015632,
+            "partition": 3,
+            "permit_ms": 658.5374029999996,
+            "poll_ms": 93.11035700000006,
+            "queue": 2,
+            "rows": 37947,
+            "send_ms": 0.1878709999999999
+          },
+          "id": 6,
+          "ms": 752.945763,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.15422399999999994,
+            "charged_copy_bytes": 650432,
+            "copy_ms": 0.8235819999999996,
+            "execute_ms": 0.014012,
+            "partition": 4,
+            "permit_ms": 660.3296389999998,
+            "poll_ms": 92.10176899999999,
+            "queue": 2,
+            "rows": 37882,
+            "send_ms": 0.17142899999999994
+          },
+          "id": 7,
+          "ms": 753.736443,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.150747,
+            "charged_copy_bytes": 653472,
+            "copy_ms": 0.8156419999999999,
+            "execute_ms": 0.011241,
+            "partition": 5,
+            "permit_ms": 661.3439820000006,
+            "poll_ms": 91.83381099999998,
+            "queue": 2,
+            "rows": 38144,
+            "send_ms": 0.17169900000000005
+          },
+          "id": 8,
+          "ms": 754.468387,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 116,
+            "charge_ms": 0.1484829999999999,
+            "charged_copy_bytes": 671832,
+            "copy_ms": 0.7824090000000005,
+            "execute_ms": 0.015047,
+            "partition": 1,
+            "permit_ms": 663.2307799999999,
+            "poll_ms": 93.28890799999999,
+            "queue": 2,
+            "rows": 39096,
+            "send_ms": 0.17311900000000002
+          },
+          "id": 4,
+          "ms": 757.791517,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 128,
+            "charge_ms": 0.15687700000000002,
+            "charged_copy_bytes": 746128,
+            "copy_ms": 0.8629780000000002,
+            "execute_ms": 0.014755,
+            "partition": 0,
+            "permit_ms": 663.0982420000001,
+            "poll_ms": 100.24611600000004,
+            "queue": 2,
+            "rows": 43530,
+            "send_ms": 0.20271099999999997
+          },
+          "id": 3,
+          "ms": 764.7397900000001,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "label": "sort input queue",
+            "operator": "Project",
+            "partitions": 1
+          },
+          "id": 1,
+          "ms": 911.385669,
+          "phase": "queue_prepare",
+          "unwinding": false
+        }
+      ],
+      "qualification": "Concurrent producer durations overlap; do not sum as wall time. Process counters include all work between the request boundaries."
+    },
+    {
+      "request": "b2-candidate-q12-1-engine",
+      "process_delta": {
+        "minor_faults": 47487,
+        "major_faults": 0,
+        "user_ticks": 182,
+        "system_ticks": 22
+      },
+      "io_delta": {
+        "rchar": 963,
+        "wchar": 9582,
+        "syscr": 1,
+        "syscw": 1397,
+        "read_bytes": 0,
+        "write_bytes": 12288,
+        "cancelled_write_bytes": 0
+      },
+      "traces": [
+        {
+          "completed": true,
+          "detail": {
+            "admitted_buffers": false,
+            "declared_bound": null,
+            "envelope_bytes": null,
+            "label": "join build input queue",
+            "max_slots": 8,
+            "operator": "Project",
+            "partitions": 8,
+            "prepared": false,
+            "slots": 1
+          },
+          "id": 12,
+          "ms": 0.012145,
+          "phase": "queue_prepare",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.136566,
+            "charged_copy_bytes": 651104,
+            "copy_ms": 0.6662360000000003,
+            "execute_ms": 0.001298,
+            "partition": 3,
+            "permit_ms": 600.9671349999995,
+            "poll_ms": 82.01992599999998,
+            "queue": 12,
+            "rows": 37947,
+            "send_ms": 0.15024600000000016
+          },
+          "id": 15,
+          "ms": 684.067955,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.13052399999999997,
+            "charged_copy_bytes": 650432,
+            "copy_ms": 0.6667570000000004,
+            "execute_ms": 0.000871,
+            "partition": 4,
+            "permit_ms": 600.949007,
+            "poll_ms": 82.77757200000002,
+            "queue": 12,
+            "rows": 37882,
+            "send_ms": 0.14940799999999999
+          },
+          "id": 17,
+          "ms": 684.80624,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.13956200000000002,
+            "charged_copy_bytes": 653328,
+            "copy_ms": 0.7175529999999994,
+            "execute_ms": 0.0035329999999999997,
+            "partition": 6,
+            "permit_ms": 602.1485839999999,
+            "poll_ms": 83.35224400000001,
+            "queue": 12,
+            "rows": 38137,
+            "send_ms": 0.1562439999999999
+          },
+          "id": 18,
+          "ms": 686.650959,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.12726099999999999,
+            "charged_copy_bytes": 655920,
+            "copy_ms": 0.683688,
+            "execute_ms": 0.005364,
+            "partition": 7,
+            "permit_ms": 603.697595,
+            "poll_ms": 82.55911400000002,
+            "queue": 12,
+            "rows": 38345,
+            "send_ms": 0.15505300000000005
+          },
+          "id": 19,
+          "ms": 687.3581720000001,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.13464800000000002,
+            "charged_copy_bytes": 648512,
+            "copy_ms": 10.171347,
+            "execute_ms": 0.017029,
+            "partition": 2,
+            "permit_ms": 594.7162460000004,
+            "poll_ms": 82.737061,
+            "queue": 12,
+            "rows": 37722,
+            "send_ms": 0.15893800000000005
+          },
+          "id": 16,
+          "ms": 688.082214,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.13040899999999997,
+            "charged_copy_bytes": 653472,
+            "copy_ms": 0.6957610000000003,
+            "execute_ms": 0.020586,
+            "partition": 5,
+            "permit_ms": 604.8842090000002,
+            "poll_ms": 82.78380299999999,
+            "queue": 12,
+            "rows": 38144,
+            "send_ms": 0.15020300000000003
+          },
+          "id": 20,
+          "ms": 688.7950470000001,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 116,
+            "charge_ms": 0.13027199999999992,
+            "charged_copy_bytes": 671832,
+            "copy_ms": 0.7077639999999998,
+            "execute_ms": 0.014939999999999998,
+            "partition": 1,
+            "permit_ms": 606.5846009999997,
+            "poll_ms": 84.11295799999998,
+            "queue": 12,
+            "rows": 39096,
+            "send_ms": 0.162383
+          },
+          "id": 14,
+          "ms": 691.849595,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 128,
+            "charge_ms": 0.15182599999999996,
+            "charged_copy_bytes": 746128,
+            "copy_ms": 0.7325600000000003,
+            "execute_ms": 0.019431999999999998,
+            "partition": 0,
+            "permit_ms": 606.8425290000001,
+            "poll_ms": 88.968823,
+            "queue": 12,
+            "rows": 43530,
+            "send_ms": 0.18144400000000005
+          },
+          "id": 13,
+          "ms": 697.0436060000001,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "label": "sort input queue",
+            "operator": "Project",
+            "partitions": 1
+          },
+          "id": 11,
+          "ms": 832.790233,
+          "phase": "queue_prepare",
+          "unwinding": false
+        }
+      ],
+      "qualification": "Concurrent producer durations overlap; do not sum as wall time. Process counters include all work between the request boundaries."
+    },
+    {
+      "request": "b2-candidate-q12-2-engine",
+      "process_delta": {
+        "minor_faults": 48754,
+        "major_faults": 0,
+        "user_ticks": 207,
+        "system_ticks": 25
+      },
+      "io_delta": {
+        "rchar": 963,
+        "wchar": 13897,
+        "syscr": 1,
+        "syscw": 1941,
+        "read_bytes": 0,
+        "write_bytes": 12288,
+        "cancelled_write_bytes": 0
+      },
+      "traces": [
+        {
+          "completed": true,
+          "detail": {
+            "admitted_buffers": false,
+            "declared_bound": null,
+            "envelope_bytes": null,
+            "label": "join build input queue",
+            "max_slots": 8,
+            "operator": "Project",
+            "partitions": 8,
+            "prepared": false,
+            "slots": 1
+          },
+          "id": 22,
+          "ms": 0.011559,
+          "phase": "queue_prepare",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.21650099999999997,
+            "charged_copy_bytes": 648512,
+            "copy_ms": 0.886982,
+            "execute_ms": 0.005034,
+            "partition": 2,
+            "permit_ms": 839.2258830000004,
+            "poll_ms": 114.08033700000004,
+            "queue": 22,
+            "rows": 37722,
+            "send_ms": 0.24022000000000002
+          },
+          "id": 25,
+          "ms": 954.847666,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.19122799999999995,
+            "charged_copy_bytes": 650432,
+            "copy_ms": 0.8760439999999996,
+            "execute_ms": 0.001138,
+            "partition": 4,
+            "permit_ms": 839.284699,
+            "poll_ms": 114.859376,
+            "queue": 22,
+            "rows": 37882,
+            "send_ms": 0.2323909999999999
+          },
+          "id": 26,
+          "ms": 955.6249489999999,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.19977300000000006,
+            "charged_copy_bytes": 653472,
+            "copy_ms": 0.9034749999999998,
+            "execute_ms": 0.001358,
+            "partition": 5,
+            "permit_ms": 840.4038480000003,
+            "poll_ms": 114.42280899999997,
+            "queue": 22,
+            "rows": 38144,
+            "send_ms": 0.23059300000000005
+          },
+          "id": 27,
+          "ms": 956.353877,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.19764700000000016,
+            "charged_copy_bytes": 653328,
+            "copy_ms": 0.9273569999999998,
+            "execute_ms": 0.001189,
+            "partition": 6,
+            "permit_ms": 839.7288489999999,
+            "poll_ms": 115.79574300000009,
+            "queue": 22,
+            "rows": 38137,
+            "send_ms": 0.24367099999999994
+          },
+          "id": 28,
+          "ms": 957.082052,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.213621,
+            "charged_copy_bytes": 655920,
+            "copy_ms": 0.939399,
+            "execute_ms": 0.001801,
+            "partition": 7,
+            "permit_ms": 839.303854,
+            "poll_ms": 116.85433299999997,
+            "queue": 22,
+            "rows": 38345,
+            "send_ms": 0.24503299999999995
+          },
+          "id": 30,
+          "ms": 957.789017,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.21151799999999998,
+            "charged_copy_bytes": 651104,
+            "copy_ms": 0.969229,
+            "execute_ms": 0.0035080000000000003,
+            "partition": 3,
+            "permit_ms": 840.4644299999999,
+            "poll_ms": 116.36787799999996,
+            "queue": 22,
+            "rows": 37947,
+            "send_ms": 0.2630759999999999
+          },
+          "id": 29,
+          "ms": 958.491611,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 116,
+            "charge_ms": 0.20227200000000006,
+            "charged_copy_bytes": 671832,
+            "copy_ms": 9.568336000000002,
+            "execute_ms": 0.004848,
+            "partition": 1,
+            "permit_ms": 834.0138900000003,
+            "poll_ms": 117.77121300000003,
+            "queue": 22,
+            "rows": 39096,
+            "send_ms": 0.24224500000000002
+          },
+          "id": 24,
+          "ms": 962.0052770000001,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 128,
+            "charge_ms": 0.211594,
+            "charged_copy_bytes": 746128,
+            "copy_ms": 1.0162749999999998,
+            "execute_ms": 0.013517,
+            "partition": 0,
+            "permit_ms": 842.9905800000003,
+            "poll_ms": 122.91102800000002,
+            "queue": 22,
+            "rows": 43530,
+            "send_ms": 0.249689
+          },
+          "id": 23,
+          "ms": 967.617927,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "label": "sort input queue",
+            "operator": "Project",
+            "partitions": 1
+          },
+          "id": 21,
+          "ms": 1102.821077,
+          "phase": "queue_prepare",
+          "unwinding": false
+        }
+      ],
+      "qualification": "Concurrent producer durations overlap; do not sum as wall time. Process counters include all work between the request boundaries."
+    },
+    {
+      "request": "b2-candidate-q12-3-engine",
+      "process_delta": {
+        "minor_faults": 48633,
+        "major_faults": 0,
+        "user_ticks": 163,
+        "system_ticks": 18
+      },
+      "io_delta": {
+        "rchar": 963,
+        "wchar": 9603,
+        "syscr": 1,
+        "syscw": 1400,
+        "read_bytes": 0,
+        "write_bytes": 8192,
+        "cancelled_write_bytes": 0
+      },
+      "traces": [
+        {
+          "completed": true,
+          "detail": {
+            "admitted_buffers": false,
+            "declared_bound": null,
+            "envelope_bytes": null,
+            "label": "join build input queue",
+            "max_slots": 8,
+            "operator": "Project",
+            "partitions": 8,
+            "prepared": false,
+            "slots": 1
+          },
+          "id": 32,
+          "ms": 0.012140999999999999,
+          "phase": "queue_prepare",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.08878200000000003,
+            "charged_copy_bytes": 648512,
+            "copy_ms": 0.44406099999999993,
+            "execute_ms": 0.001956,
+            "partition": 2,
+            "permit_ms": 423.81410200000016,
+            "poll_ms": 58.441714000000005,
+            "queue": 32,
+            "rows": 37722,
+            "send_ms": 0.10186599999999996
+          },
+          "id": 35,
+          "ms": 482.983959,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.08729500000000001,
+            "charged_copy_bytes": 651104,
+            "copy_ms": 0.4423499999999999,
+            "execute_ms": 0.002971,
+            "partition": 3,
+            "permit_ms": 420.511562,
+            "poll_ms": 62.47735699999999,
+            "queue": 32,
+            "rows": 37947,
+            "send_ms": 0.09989899999999993
+          },
+          "id": 36,
+          "ms": 483.71379399999995,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.09196300000000002,
+            "charged_copy_bytes": 653328,
+            "copy_ms": 0.46676300000000004,
+            "execute_ms": 0.000945,
+            "partition": 6,
+            "permit_ms": 425.1631229999999,
+            "poll_ms": 58.542272,
+            "queue": 32,
+            "rows": 38137,
+            "send_ms": 0.10149700000000005
+          },
+          "id": 38,
+          "ms": 484.456462,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.08731099999999997,
+            "charged_copy_bytes": 655920,
+            "copy_ms": 0.42284,
+            "execute_ms": 0.001014,
+            "partition": 7,
+            "permit_ms": 425.8274920000002,
+            "poll_ms": 58.63918699999999,
+            "queue": 32,
+            "rows": 38345,
+            "send_ms": 0.10302000000000001
+          },
+          "id": 39,
+          "ms": 485.171697,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.09640900000000001,
+            "charged_copy_bytes": 650432,
+            "copy_ms": 0.45091600000000004,
+            "execute_ms": 0.017499,
+            "partition": 4,
+            "permit_ms": 426.241811,
+            "poll_ms": 58.910269000000014,
+            "queue": 32,
+            "rows": 37882,
+            "send_ms": 0.10258699999999998
+          },
+          "id": 40,
+          "ms": 485.920022,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.08758400000000001,
+            "charged_copy_bytes": 653472,
+            "copy_ms": 0.42286300000000016,
+            "execute_ms": 0.042925,
+            "partition": 5,
+            "permit_ms": 426.61964200000017,
+            "poll_ms": 59.31240500000002,
+            "queue": 32,
+            "rows": 38144,
+            "send_ms": 0.097991
+          },
+          "id": 37,
+          "ms": 486.67447000000004,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 116,
+            "charge_ms": 0.09083800000000004,
+            "charged_copy_bytes": 671832,
+            "copy_ms": 0.45097000000000037,
+            "execute_ms": 0.002965,
+            "partition": 1,
+            "permit_ms": 428.4972540000003,
+            "poll_ms": 60.22022100000002,
+            "queue": 32,
+            "rows": 39096,
+            "send_ms": 0.10838
+          },
+          "id": 34,
+          "ms": 489.470582,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 128,
+            "charge_ms": 0.10162299999999994,
+            "charged_copy_bytes": 746128,
+            "copy_ms": 0.4950429999999998,
+            "execute_ms": 0.004328,
+            "partition": 0,
+            "permit_ms": 427.8303320000001,
+            "poll_ms": 65.858697,
+            "queue": 32,
+            "rows": 43530,
+            "send_ms": 0.12019500000000001
+          },
+          "id": 33,
+          "ms": 494.51507,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "label": "sort input queue",
+            "operator": "Project",
+            "partitions": 1
+          },
+          "id": 31,
+          "ms": 631.239679,
+          "phase": "queue_prepare",
+          "unwinding": false
+        }
+      ],
+      "qualification": "Concurrent producer durations overlap; do not sum as wall time. Process counters include all work between the request boundaries."
+    }
+  ],
+  "b2-parent-q12": [
+    {
+      "request": "b2-parent-q12-warmup",
+      "process_delta": {
+        "minor_faults": 55143,
+        "major_faults": 0,
+        "user_ticks": 188,
+        "system_ticks": 25
+      },
+      "io_delta": {
+        "rchar": 14474,
+        "wchar": 7630,
+        "syscr": 15,
+        "syscw": 1152,
+        "read_bytes": 0,
+        "write_bytes": 20480,
+        "cancelled_write_bytes": 0
+      },
+      "traces": [
+        {
+          "completed": true,
+          "detail": {
+            "admitted_buffers": false,
+            "declared_bound": null,
+            "envelope_bytes": null,
+            "label": "join build input queue",
+            "max_slots": 8,
+            "operator": "Project",
+            "partitions": 8,
+            "prepared": false,
+            "slots": 1
+          },
+          "id": 2,
+          "ms": 0.027919000000000003,
+          "phase": "queue_prepare",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.164834,
+            "charged_copy_bytes": 651104,
+            "copy_ms": 0.8096949999999999,
+            "execute_ms": 0.013039,
+            "partition": 3,
+            "permit_ms": 693.2681549999998,
+            "poll_ms": 95.600123,
+            "queue": 2,
+            "rows": 37947,
+            "send_ms": 0.1839979999999999
+          },
+          "id": 6,
+          "ms": 790.1641390000001,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.15424999999999994,
+            "charged_copy_bytes": 648512,
+            "copy_ms": 0.7948349999999998,
+            "execute_ms": 0.019667999999999998,
+            "partition": 2,
+            "permit_ms": 694.5613839999997,
+            "poll_ms": 95.10907899999998,
+            "queue": 2,
+            "rows": 37722,
+            "send_ms": 0.18182799999999993
+          },
+          "id": 5,
+          "ms": 790.942924,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.17545299999999991,
+            "charged_copy_bytes": 653472,
+            "copy_ms": 0.7688540000000001,
+            "execute_ms": 0.015059,
+            "partition": 5,
+            "permit_ms": 694.8231520000002,
+            "poll_ms": 95.60677699999997,
+            "queue": 2,
+            "rows": 38144,
+            "send_ms": 0.16641700000000004
+          },
+          "id": 7,
+          "ms": 791.670956,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.15427900000000008,
+            "charged_copy_bytes": 650432,
+            "copy_ms": 0.7927800000000002,
+            "execute_ms": 0.013706999999999999,
+            "partition": 4,
+            "permit_ms": 695.1355500000001,
+            "poll_ms": 96.037553,
+            "queue": 2,
+            "rows": 37882,
+            "send_ms": 0.1736469999999999
+          },
+          "id": 8,
+          "ms": 792.426345,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.19271600000000014,
+            "charged_copy_bytes": 655920,
+            "copy_ms": 0.792242,
+            "execute_ms": 0.012902,
+            "partition": 7,
+            "permit_ms": 694.6978149999998,
+            "poll_ms": 97.143081,
+            "queue": 2,
+            "rows": 38345,
+            "send_ms": 0.18320999999999996
+          },
+          "id": 10,
+          "ms": 793.144889,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.160833,
+            "charged_copy_bytes": 653328,
+            "copy_ms": 0.7964780000000002,
+            "execute_ms": 0.013061000000000001,
+            "partition": 6,
+            "permit_ms": 695.0350149999997,
+            "poll_ms": 97.57580600000003,
+            "queue": 2,
+            "rows": 38137,
+            "send_ms": 0.17282599999999998
+          },
+          "id": 9,
+          "ms": 793.879703,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 116,
+            "charge_ms": 0.16107299999999997,
+            "charged_copy_bytes": 671832,
+            "copy_ms": 0.7849849999999997,
+            "execute_ms": 0.017720999999999997,
+            "partition": 1,
+            "permit_ms": 697.922312,
+            "poll_ms": 97.52289599999997,
+            "queue": 2,
+            "rows": 39096,
+            "send_ms": 0.18711999999999995
+          },
+          "id": 4,
+          "ms": 796.720102,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 128,
+            "charge_ms": 0.17412400000000006,
+            "charged_copy_bytes": 746128,
+            "copy_ms": 0.8747649999999999,
+            "execute_ms": 0.013869000000000001,
+            "partition": 0,
+            "permit_ms": 695.0132209999999,
+            "poll_ms": 105.4482,
+            "queue": 2,
+            "rows": 43530,
+            "send_ms": 0.20950800000000003
+          },
+          "id": 3,
+          "ms": 801.864119,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "label": "sort input queue",
+            "operator": "Project",
+            "partitions": 1
+          },
+          "id": 1,
+          "ms": 939.5514440000001,
+          "phase": "queue_prepare",
+          "unwinding": false
+        }
+      ],
+      "qualification": "Concurrent producer durations overlap; do not sum as wall time. Process counters include all work between the request boundaries."
+    },
+    {
+      "request": "b2-parent-q12-1-engine",
+      "process_delta": {
+        "minor_faults": 52598,
+        "major_faults": 0,
+        "user_ticks": 167,
+        "system_ticks": 19
+      },
+      "io_delta": {
+        "rchar": 954,
+        "wchar": 7704,
+        "syscr": 1,
+        "syscw": 1170,
+        "read_bytes": 0,
+        "write_bytes": 16384,
+        "cancelled_write_bytes": 0
+      },
+      "traces": [
+        {
+          "completed": true,
+          "detail": {
+            "admitted_buffers": false,
+            "declared_bound": null,
+            "envelope_bytes": null,
+            "label": "join build input queue",
+            "max_slots": 8,
+            "operator": "Project",
+            "partitions": 8,
+            "prepared": false,
+            "slots": 1
+          },
+          "id": 12,
+          "ms": 0.012053,
+          "phase": "queue_prepare",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.11056099999999996,
+            "charged_copy_bytes": 648512,
+            "copy_ms": 0.4931950000000002,
+            "execute_ms": 0.001174,
+            "partition": 2,
+            "permit_ms": 459.9308039999998,
+            "poll_ms": 62.70509100000002,
+            "queue": 12,
+            "rows": 37722,
+            "send_ms": 0.10914000000000001
+          },
+          "id": 15,
+          "ms": 523.434384,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.100683,
+            "charged_copy_bytes": 650432,
+            "copy_ms": 0.4840889999999998,
+            "execute_ms": 0.005122000000000001,
+            "partition": 4,
+            "permit_ms": 459.5306070000001,
+            "poll_ms": 63.92002999999999,
+            "queue": 12,
+            "rows": 37882,
+            "send_ms": 0.10808099999999995
+          },
+          "id": 16,
+          "ms": 524.2362579999999,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.10439600000000007,
+            "charged_copy_bytes": 653472,
+            "copy_ms": 10.974549,
+            "execute_ms": 0.000898,
+            "partition": 5,
+            "permit_ms": 450.28326599999997,
+            "poll_ms": 63.404497000000035,
+            "queue": 12,
+            "rows": 38144,
+            "send_ms": 0.109402
+          },
+          "id": 17,
+          "ms": 524.96674,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.103977,
+            "charged_copy_bytes": 653328,
+            "copy_ms": 0.508668,
+            "execute_ms": 0.000761,
+            "partition": 6,
+            "permit_ms": 461.8820340000001,
+            "poll_ms": 63.009332,
+            "queue": 12,
+            "rows": 38137,
+            "send_ms": 0.113479
+          },
+          "id": 18,
+          "ms": 525.7119700000001,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.10054099999999998,
+            "charged_copy_bytes": 655920,
+            "copy_ms": 0.49781700000000007,
+            "execute_ms": 0.00067,
+            "partition": 7,
+            "permit_ms": 462.92343899999986,
+            "poll_ms": 62.707376,
+            "queue": 12,
+            "rows": 38345,
+            "send_ms": 0.107085
+          },
+          "id": 19,
+          "ms": 526.42515,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.10186199999999998,
+            "charged_copy_bytes": 651104,
+            "copy_ms": 0.47947100000000004,
+            "execute_ms": 0.014205,
+            "partition": 3,
+            "permit_ms": 463.49937900000015,
+            "poll_ms": 62.83633699999999,
+            "queue": 12,
+            "rows": 37947,
+            "send_ms": 0.108107
+          },
+          "id": 20,
+          "ms": 527.144247,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 116,
+            "charge_ms": 0.10356399999999998,
+            "charged_copy_bytes": 671832,
+            "copy_ms": 0.4991459999999999,
+            "execute_ms": 0.0015489999999999998,
+            "partition": 1,
+            "permit_ms": 465.33177700000033,
+            "poll_ms": 63.805502999999995,
+            "queue": 12,
+            "rows": 39096,
+            "send_ms": 0.11229699999999998
+          },
+          "id": 14,
+          "ms": 529.944649,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 128,
+            "charge_ms": 0.11309999999999995,
+            "charged_copy_bytes": 746128,
+            "copy_ms": 0.5081859999999998,
+            "execute_ms": 0.0044989999999999995,
+            "partition": 0,
+            "permit_ms": 464.75173800000005,
+            "poll_ms": 69.50691900000001,
+            "queue": 12,
+            "rows": 43530,
+            "send_ms": 0.129691
+          },
+          "id": 13,
+          "ms": 535.1078540000001,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "label": "sort input queue",
+            "operator": "Project",
+            "partitions": 1
+          },
+          "id": 11,
+          "ms": 671.981999,
+          "phase": "queue_prepare",
+          "unwinding": false
+        }
+      ],
+      "qualification": "Concurrent producer durations overlap; do not sum as wall time. Process counters include all work between the request boundaries."
+    },
+    {
+      "request": "b2-parent-q12-2-engine",
+      "process_delta": {
+        "minor_faults": 48977,
+        "major_faults": 0,
+        "user_ticks": 194,
+        "system_ticks": 25
+      },
+      "io_delta": {
+        "rchar": 954,
+        "wchar": 7642,
+        "syscr": 1,
+        "syscw": 1151,
+        "read_bytes": 0,
+        "write_bytes": 12288,
+        "cancelled_write_bytes": 0
+      },
+      "traces": [
+        {
+          "completed": true,
+          "detail": {
+            "admitted_buffers": false,
+            "declared_bound": null,
+            "envelope_bytes": null,
+            "label": "join build input queue",
+            "max_slots": 8,
+            "operator": "Project",
+            "partitions": 8,
+            "prepared": false,
+            "slots": 1
+          },
+          "id": 22,
+          "ms": 0.013322,
+          "phase": "queue_prepare",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.18647499999999995,
+            "charged_copy_bytes": 648512,
+            "copy_ms": 0.8240529999999999,
+            "execute_ms": 0.004373,
+            "partition": 2,
+            "permit_ms": 723.186979,
+            "poll_ms": 99.28024200000004,
+            "queue": 22,
+            "rows": 37722,
+            "send_ms": 0.2017830000000001
+          },
+          "id": 25,
+          "ms": 823.85163,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.17625899999999986,
+            "charged_copy_bytes": 650432,
+            "copy_ms": 0.9289300000000001,
+            "execute_ms": 0.001981,
+            "partition": 4,
+            "permit_ms": 724.8098949999999,
+            "poll_ms": 98.37459999999999,
+            "queue": 22,
+            "rows": 37882,
+            "send_ms": 0.18306699999999998
+          },
+          "id": 27,
+          "ms": 824.6255620000001,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.189059,
+            "charged_copy_bytes": 651104,
+            "copy_ms": 13.043772000000002,
+            "execute_ms": 0.0043089999999999995,
+            "partition": 3,
+            "permit_ms": 712.0712269999999,
+            "poll_ms": 99.72018300000002,
+            "queue": 22,
+            "rows": 37947,
+            "send_ms": 0.19629300000000016
+          },
+          "id": 26,
+          "ms": 825.377644,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.18571199999999993,
+            "charged_copy_bytes": 653328,
+            "copy_ms": 0.8278730000000001,
+            "execute_ms": 0.001831,
+            "partition": 6,
+            "permit_ms": 725.4410259999999,
+            "poll_ms": 99.38325299999997,
+            "queue": 22,
+            "rows": 38137,
+            "send_ms": 0.18228700000000003
+          },
+          "id": 29,
+          "ms": 826.174591,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.18833200000000003,
+            "charged_copy_bytes": 655920,
+            "copy_ms": 0.8392860000000004,
+            "execute_ms": 0.001443,
+            "partition": 7,
+            "permit_ms": 726.9294819999996,
+            "poll_ms": 98.66875599999997,
+            "queue": 22,
+            "rows": 38345,
+            "send_ms": 0.18975999999999998
+          },
+          "id": 30,
+          "ms": 826.971806,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.18519799999999997,
+            "charged_copy_bytes": 653472,
+            "copy_ms": 0.7793279999999999,
+            "execute_ms": 0.005263,
+            "partition": 5,
+            "permit_ms": 727.1233750000002,
+            "poll_ms": 99.27533500000001,
+            "queue": 22,
+            "rows": 38144,
+            "send_ms": 0.1836070000000001
+          },
+          "id": 28,
+          "ms": 827.712636,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 116,
+            "charge_ms": 0.17776199999999995,
+            "charged_copy_bytes": 671832,
+            "copy_ms": 0.8494500000000003,
+            "execute_ms": 0.004864,
+            "partition": 1,
+            "permit_ms": 730.3296309999997,
+            "poll_ms": 99.67894200000002,
+            "queue": 22,
+            "rows": 39096,
+            "send_ms": 0.20427999999999993
+          },
+          "id": 24,
+          "ms": 831.40488,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 128,
+            "charge_ms": 0.1990759999999999,
+            "charged_copy_bytes": 746128,
+            "copy_ms": 0.9317230000000003,
+            "execute_ms": 0.024981999999999997,
+            "partition": 0,
+            "permit_ms": 728.6043609999998,
+            "poll_ms": 106.834898,
+            "queue": 22,
+            "rows": 43530,
+            "send_ms": 0.21591700000000003
+          },
+          "id": 23,
+          "ms": 837.0025370000001,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "label": "sort input queue",
+            "operator": "Project",
+            "partitions": 1
+          },
+          "id": 21,
+          "ms": 981.9907810000001,
+          "phase": "queue_prepare",
+          "unwinding": false
+        }
+      ],
+      "qualification": "Concurrent producer durations overlap; do not sum as wall time. Process counters include all work between the request boundaries."
+    },
+    {
+      "request": "b2-parent-q12-3-engine",
+      "process_delta": {
+        "minor_faults": 37646,
+        "major_faults": 0,
+        "user_ticks": 166,
+        "system_ticks": 17
+      },
+      "io_delta": {
+        "rchar": 954,
+        "wchar": 7826,
+        "syscr": 1,
+        "syscw": 1176,
+        "read_bytes": 0,
+        "write_bytes": 12288,
+        "cancelled_write_bytes": 0
+      },
+      "traces": [
+        {
+          "completed": true,
+          "detail": {
+            "admitted_buffers": false,
+            "declared_bound": null,
+            "envelope_bytes": null,
+            "label": "join build input queue",
+            "max_slots": 8,
+            "operator": "Project",
+            "partitions": 8,
+            "prepared": false,
+            "slots": 1
+          },
+          "id": 32,
+          "ms": 0.012931999999999999,
+          "phase": "queue_prepare",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.08217799999999999,
+            "charged_copy_bytes": 651104,
+            "copy_ms": 0.38991099999999984,
+            "execute_ms": 0.001198,
+            "partition": 3,
+            "permit_ms": 397.161987,
+            "poll_ms": 55.16815900000002,
+            "queue": 32,
+            "rows": 37947,
+            "send_ms": 3.081200999999998
+          },
+          "id": 36,
+          "ms": 455.96450999999996,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.07697199999999997,
+            "charged_copy_bytes": 648512,
+            "copy_ms": 0.38158099999999984,
+            "execute_ms": 0.002205,
+            "partition": 2,
+            "permit_ms": 397.3034400000001,
+            "poll_ms": 56.391089000000015,
+            "queue": 32,
+            "rows": 37722,
+            "send_ms": 2.514007000000001
+          },
+          "id": 35,
+          "ms": 456.745465,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.082431,
+            "charged_copy_bytes": 650432,
+            "copy_ms": 0.3903029999999999,
+            "execute_ms": 0.005835,
+            "partition": 4,
+            "permit_ms": 398.8184719999999,
+            "poll_ms": 55.680161999999974,
+            "queue": 32,
+            "rows": 37882,
+            "send_ms": 2.4550829999999997
+          },
+          "id": 37,
+          "ms": 457.509457,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.08110100000000002,
+            "charged_copy_bytes": 653472,
+            "copy_ms": 0.38901099999999983,
+            "execute_ms": 0.001678,
+            "partition": 5,
+            "permit_ms": 397.0589070000002,
+            "poll_ms": 56.52238,
+            "queue": 32,
+            "rows": 38144,
+            "send_ms": 4.134485000000001
+          },
+          "id": 38,
+          "ms": 458.265015,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.08028699999999996,
+            "charged_copy_bytes": 653328,
+            "copy_ms": 0.36405499999999996,
+            "execute_ms": 0.004179,
+            "partition": 6,
+            "permit_ms": 400.83591700000005,
+            "poll_ms": 55.02711200000001,
+            "queue": 32,
+            "rows": 38137,
+            "send_ms": 2.623778000000001
+          },
+          "id": 40,
+          "ms": 459.013199,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 112,
+            "charge_ms": 0.08239199999999997,
+            "charged_copy_bytes": 655920,
+            "copy_ms": 0.390967,
+            "execute_ms": 0.002626,
+            "partition": 7,
+            "permit_ms": 399.3719839999999,
+            "poll_ms": 55.61091299999999,
+            "queue": 32,
+            "rows": 38345,
+            "send_ms": 4.197801999999999
+          },
+          "id": 39,
+          "ms": 459.74037400000003,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 116,
+            "charge_ms": 0.08625500000000001,
+            "charged_copy_bytes": 671832,
+            "copy_ms": 0.39354300000000003,
+            "execute_ms": 0.003258,
+            "partition": 1,
+            "permit_ms": 402.1381209999997,
+            "poll_ms": 57.020692,
+            "queue": 32,
+            "rows": 39096,
+            "send_ms": 2.4861719999999994
+          },
+          "id": 34,
+          "ms": 462.21221099999997,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "batches": 128,
+            "charge_ms": 0.093487,
+            "charged_copy_bytes": 746128,
+            "copy_ms": 0.4684739999999998,
+            "execute_ms": 0.0042320000000000005,
+            "partition": 0,
+            "permit_ms": 400.998349,
+            "poll_ms": 63.24132299999999,
+            "queue": 32,
+            "rows": 43530,
+            "send_ms": 3.1321479999999995
+          },
+          "id": 33,
+          "ms": 468.031541,
+          "phase": "queue_producer",
+          "unwinding": false
+        },
+        {
+          "completed": true,
+          "detail": {
+            "label": "sort input queue",
+            "operator": "Project",
+            "partitions": 1
+          },
+          "id": 31,
+          "ms": 609.4757,
+          "phase": "queue_prepare",
+          "unwinding": false
+        }
+      ],
+      "qualification": "Concurrent producer durations overlap; do not sum as wall time. Process counters include all work between the request boundaries."
+    }
+  ]
+}

@@ -489,6 +489,15 @@ pub fn open_row_group(
     rg_idx: usize,
     projection: Option<&[usize]>,
 ) -> Result<RowGroupReader> {
+    open_row_group_with_dictionary_projection(dir, rg_idx, projection, true)
+}
+
+fn open_row_group_with_dictionary_projection(
+    dir: &Path,
+    rg_idx: usize,
+    projection: Option<&[usize]>,
+    prune_dictionaries: bool,
+) -> Result<RowGroupReader> {
     use arrow::buffer::Buffer;
     use arrow::ipc::reader::{read_footer_length, FileDecoder};
 
@@ -549,7 +558,9 @@ pub fn open_row_group(
             path.display()
         )));
     }
-    let dictionaries = dictionary_projection::DictionaryProjection::bind(&schema, projection);
+    let dictionaries = prune_dictionaries
+        .then(|| dictionary_projection::DictionaryProjection::bind(&schema, projection))
+        .flatten();
     let mut decoder = FileDecoder::new(schema, footer.version());
     let mut output_projection = None;
     if let Some(p) = projection {

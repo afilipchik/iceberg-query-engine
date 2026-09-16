@@ -6,6 +6,7 @@ use arrow::{
     buffer::ScalarBuffer,
     datatypes::{DataType, Field, Schema, SchemaRef},
 };
+use futures::StreamExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug)]
@@ -593,4 +594,215 @@ async fn copied_frontier_preserves_downstream_workspace_and_all_partitions() {
     drop(frontier);
     drop(workspace);
     assert_eq!(pool.used(), 0);
+}
+
+#[derive(Debug, Default)]
+struct ActiveWork {
+    active: AtomicUsize,
+    peak: AtomicUsize,
+}
+struct ActiveGuard(Arc<ActiveWork>);
+impl ActiveWork {
+    fn enter(self: &Arc<Self>) -> ActiveGuard {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(active, Ordering::SeqCst);
+        ActiveGuard(self.clone())
+    }
+}
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+#[derive(Debug)]
+struct PendingUnknownSource {
+    schema: SchemaRef,
+    opening: Arc<ActiveWork>,
+    pulling: Arc<ActiveWork>,
+    executed: Arc<AtomicUsize>,
+    delay_open: bool,
+    prepared_unknown: bool,
+}
+impl PendingUnknownSource {
+    fn new(delay_open: bool, prepared_unknown: bool) -> Self {
+        Self {
+            schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)])),
+            opening: Arc::new(ActiveWork::default()),
+            pulling: Arc::new(ActiveWork::default()),
+            executed: Arc::new(AtomicUsize::new(0)),
+            delay_open,
+            prepared_unknown,
+        }
+    }
+    fn stream(&self, partition: usize) -> RecordBatchStream {
+        let pulling = self.pulling.clone();
+        let schema = self.schema.clone();
+        Box::pin(
+            futures::stream::once(async move {
+                let _active = pulling.enter();
+                tokio::task::yield_now().await;
+                RecordBatch::try_new(
+                    schema,
+                    vec![Arc::new(Int64Array::from(vec![
+                        Some(partition as i64),
+                        None,
+                        Some(partition as i64),
+                    ])) as ArrayRef],
+                )
+                .map_err(QueryError::from)
+            })
+            .flat_map(|result| {
+                let items = match result {
+                    Ok(batch) => vec![Ok(batch.slice(0, 0)), Ok(batch.clone()), Ok(batch)],
+                    Err(error) => vec![Err(error)],
+                };
+                futures::stream::iter(items)
+            }),
+        )
+    }
+}
+#[async_trait::async_trait]
+impl PhysicalOperator for PendingUnknownSource {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+    fn children(&self) -> Vec<Arc<dyn PhysicalOperator>> {
+        vec![]
+    }
+    fn name(&self) -> &str {
+        "pending unknown frontier source"
+    }
+    fn output_partitions(&self) -> usize {
+        3
+    }
+    async fn execute(&self, partition: usize) -> Result<RecordBatchStream> {
+        crate::physical::check_partition(self, partition)?;
+        assert!(
+            !self.prepared_unknown,
+            "prepared stream must not be replayed"
+        );
+        self.executed.fetch_add(1, Ordering::SeqCst);
+        if self.delay_open {
+            let _active = self.opening.enter();
+            tokio::task::yield_now().await;
+        }
+        Ok(self.stream(partition))
+    }
+    async fn prepare_queue_input(&self) -> Result<Option<crate::physical::PreparedQueueInput>> {
+        Ok(self
+            .prepared_unknown
+            .then(|| crate::physical::PreparedQueueInput {
+                streams: (0..3).map(|partition| self.stream(partition)).collect(),
+                output: crate::physical::PreparedOutputBound::Unknown,
+            }))
+    }
+}
+
+#[tokio::test]
+async fn unknown_frontier_does_not_overlap_pending_opens_or_pulls() {
+    let mut failures = Vec::new();
+    for (delay_open, prepared_unknown) in [(false, false), (true, false), (false, true)] {
+        let source = Arc::new(PendingUnknownSource::new(delay_open, prepared_unknown));
+        let pool = create_memory_pool(1024 * 1024);
+        let mut frontier = InputFrontier::new(source.clone(), &pool).await.unwrap();
+        assert_eq!(frontier.slots, 1);
+        assert!(!frontier.admitted_buffers);
+        let mut values = Vec::new();
+        let mut empty = 0;
+        while let Some(input) = frontier.next().await.unwrap() {
+            assert!(!input.is_admitted());
+            empty += usize::from(input.batch.num_rows() == 0);
+            values.extend(
+                input
+                    .batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .iter(),
+            );
+        }
+        frontier.shutdown().await;
+        drop(frontier);
+        values.sort();
+        let mut expected = (0..3i64)
+            .flat_map(|id| [Some(id), None, Some(id), Some(id), None, Some(id)])
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(values, expected);
+        assert_eq!(empty, 3);
+        assert_eq!(
+            source.executed.load(Ordering::SeqCst),
+            if prepared_unknown { 0 } else { 3 }
+        );
+        assert_eq!(source.opening.active.load(Ordering::SeqCst), 0);
+        assert_eq!(source.pulling.active.load(Ordering::SeqCst), 0);
+        assert_eq!(pool.used(), 0);
+        let open_peak = source.opening.peak.load(Ordering::SeqCst);
+        let pull_peak = source.pulling.peak.load(Ordering::SeqCst);
+        if open_peak > 1 || pull_peak > 1 {
+            failures.push(format!(
+                "delay_open={delay_open}, prepared_unknown={prepared_unknown}: slots=1, open peak={open_peak}, pull peak={pull_peak}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn unknown_frontier_cancelled_next_resumes_once_and_shutdown_drops_pending_work() {
+    for shutdown in [false, true] {
+        for (delay_open, prepared_unknown) in [(true, false), (false, false), (false, true)] {
+            let source = Arc::new(PendingUnknownSource::new(delay_open, prepared_unknown));
+            let pool = create_memory_pool(1024 * 1024);
+            let mut frontier = InputFrontier::new(source.clone(), &pool).await.unwrap();
+            assert!(frontier.next().now_or_never().is_none());
+            assert_eq!(
+                source.executed.load(Ordering::SeqCst),
+                usize::from(!prepared_unknown)
+            );
+            assert_eq!(
+                source.opening.active.load(Ordering::SeqCst),
+                usize::from(delay_open)
+            );
+            assert_eq!(
+                source.pulling.active.load(Ordering::SeqCst),
+                usize::from(!delay_open)
+            );
+            if !shutdown {
+                let mut rows = Vec::new();
+                let mut empty = 0;
+                while let Some(input) = frontier.next().await.unwrap() {
+                    empty += usize::from(input.batch.num_rows() == 0);
+                    rows.extend(
+                        input
+                            .batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap()
+                            .iter(),
+                    );
+                }
+                rows.sort();
+                let mut expected = (0..3i64)
+                    .flat_map(|id| [Some(id), None, Some(id), Some(id), None, Some(id)])
+                    .collect::<Vec<_>>();
+                expected.sort();
+                assert_eq!(rows, expected);
+                assert_eq!(empty, 3);
+                assert_eq!(
+                    source.executed.load(Ordering::SeqCst),
+                    if prepared_unknown { 0 } else { 3 }
+                );
+            }
+            frontier.shutdown().await;
+            drop(frontier);
+            assert_eq!(source.opening.active.load(Ordering::SeqCst), 0);
+            assert_eq!(source.pulling.active.load(Ordering::SeqCst), 0);
+            assert!(source.opening.peak.load(Ordering::SeqCst) <= 1);
+            assert!(source.pulling.peak.load(Ordering::SeqCst) <= 1);
+            assert_eq!(pool.used(), 0);
+        }
+    }
 }

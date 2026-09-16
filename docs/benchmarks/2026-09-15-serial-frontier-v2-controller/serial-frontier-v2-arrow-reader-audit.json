@@ -1,0 +1,12 @@
+{
+  "path": "/home/afilipchik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-ipc-58.4.0/src/reader.rs",
+  "sha256": "d27d205e98d2158515f6d2ceab7059b38142441fba3059e0b750e27009890ff7",
+  "captured_at": "2026-09-16T05:56:02.205438+00:00",
+  "qualification": "Read-only allocation-path audit for the proposed future native admitted reader; not a new current capability or performance measurement.",
+  "reviewed_functions": [
+    "RecordBatchDecoder::create_array_from_builder",
+    "RecordBatchDecoder::read_record_batch",
+    "update_dictionaries",
+    "get_dictionary_values"
+  ]
+}

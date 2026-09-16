@@ -6,54 +6,66 @@ linked reports and the existing epic rather than prepending another status block
 
 ## Current checkpoint — 2026-09-15
 
-Frozen IPC candidate `138199d2` on pushed/remote-verified parent `74a142f`
-validates dictionary envelopes before Arrow decoding, uses a bounded full-schema
-ID/dependency proof to skip unused dictionary payloads, and normalizes repeated
-projections before decoding then restores shared output aliases. The new
-`src/storage/ipc_cache/dictionary_projection.rs` follows first-definition IDs;
-cycles, more than64IDs or excessive depth decline pruning. Every skipped block's
-extent/envelope is still checked. No dependency, hash format, ownership default,
-query budget or native-admission capability changes.
+Frozen scheduler candidate `be164253` on pushed/remote-verified parent `a857215`
+repairs the aggregate one-slot fallback. Unknown inputs previously overlapped
+pending opens/pulls despite slots=1. One retained opening future/current stream
+now drains each partition; cancelling next() cannot replay or lose pending input.
+Admitted multi-slot scheduling is unchanged. No dependency, default ownership,
+query budget or native-admission capability change. The temporary IPC diagnostic
+environment switch is removed; its decode-all comparison remains in unit tests.
 
-Envelope red56444 reproduces4projection panics; green1639 passes4contracts.
-Unused-dictionary red75959/green35679 verifies actual decode calls. Domain38586
-exposes repeated-column schema mismatch;3247 passes3tests after normalization,
-and production-feature11041 passes5including shared/nonordinal IDs and deltas.
-Focused native/IPC15491 passes31tests. Broad cycle38590 is terminal1 with no new
-failures: both modes1,140library passes/11ignored and128contracts; native64default,
-63partial plus its known numeric failure; spill/numeric28passes plus the same6
-failures each. Strict executable/count/name/inventory comparison passes; archive33
-verifies802source inputs. Release completes0 in8m52s.
+Red53440 reproduces3simultaneous operations; focused lifecycle tests pass11.
+First broad69274 preserves six startup-expectation failures in an18-file archive.
+The eight existing lifecycle tests now cover both serial failure without opening
+later partitions and deterministically initialized bounded-parallel siblings;
+focused9871 passes8. Final cycle30002 has1142library passes/11ignored and128contracts
+per ownership mode. Native/IPC64default and63partial plus its known numeric failure;
+spill/numeric28passes plus the same6failures each. Strict executable/count/name
+comparison passes, with no retired tests. Validation archive32 verifies802inputs.
+Release completes0 in8m51s.
 
-Canonical provider SF10 independently validates340outputs/255of264pairs:
-raw66/native60/Iceberg63/Lance66. Raw geomean2.392498/suite2.563807 (0wins), Lance
-1.995551/2.968537 (1win). NativeQ1/Q6 warmups timeout; Q18 completes this screen.
-IcebergDuckDBQ9 completes but Q18calibration2 refuses262144bytes; dependent samples
-are NOTRUN. No completed-but-late outputs. Validation/build/provider scopepeak
-35.167GB under48GiB,zeroOOM/max,no swap. Preserve all failures; archives1282SF10
-and173paired verify. No DuckDB leadership is certified.
+Canonical provider SF10 independently validates336outputs/252of264pairs:
+raw66/native57/Iceberg63/Lance66. Raw geomean2.433841/suite2.642917 (0wins), Lance
+1.997011/2.949275 (1win). NativeQ1/Q6 and additionalQ18warmups time out; their nine
+measured engine requests are NOTRUN. IcebergDuckDBQ9oracle refuses268435456bytes;
+its three dependent pairs are NOTRUN. Cumulative validation/build/provider peak
+24,877,572,096bytes under48GiB,zeroOOM/max,swap0. Archives1275SF10/173paired verify.
+No DuckDB leadership is certified.
 
-Postcheck93724 is terminal0. Native paired comparison validates80outputs with identical
-plans. Q1 ratios0.966322/0.995801; Q6 0.537401/1.089459; Q12 1.636227/1.321530;
-Q18 1.000515/1.008473; Q9 1.016158/1.004052. Q6's apparent gain does not repeat;
-Q12 regresses in both blocks. Its aggregate input remains310803rows/229batches
-and aggregate timing is similar, so investigate upstream scan/join execution.
-**The optimization is provisional and has failed performance acceptance.**
-Decoded IPC completes at geomean0.803013/suite1.275933,14wins; engine suite time
-is close to the parent while reference timing changes. All5residency cases complete with348typed outputs/278pairs. GPU control
-geomean0.796917/suite1.288690 and mixed0.795504/1.276013 have14wins each.
-Canonical mixed records no successful device execution; custom required float
-smoke has40/40measured device proofs. Scopepeak20.542GB under64GiB,zeroOOM/max.
-These32/48GiB capacity screens do not clear16GiB preload or resource/concurrency
-acceptance. This intermediate checkpoint preserves failed performance acceptance.
-Next run the prepared Q12 phase/process-counter diagnostic and isolate pruning
-from the correctness fixes.
+Paired attribution validates80outputs with unchanged plans. Candidate/parent
+ratios:Q1 1.003247/1.005119;Q6 0.867331/0.916584;Q12 0.665246/1.072963;
+Q18 0.987896/0.993545;Q9 0.975818/0.998965. Q18 does not reproduce a candidate
+slowdown here, but its canonical timeout remains a failed gate. Q12 varies;
+no blanket regression-free claim. Shared Q1 ingestion remains~4.64s and Q18~2.7s,
+with~1sfinish whose output time is nested. Postcheck79671 is terminal0:348typed outputs/278pairs across all5residency cases.
+Decoded geomean0.798434/suite1.254066;GPUcontrol0.805281/1.289498;
+mixed0.798088/1.290919,14wins each. Canonical mixed records0successful device runs;
+custom required smoke proves40/40measured requests. Peak21,012,893,696bytes under
+64GiB,zeroOOM/max,swap0. These32/48GiB capacity results do not clear16GiB preload.
+Source remains frozen while final archives/commit/push are prepared. See the
+[current scheduler cycle](docs/serial-frontier-contract-2026-09-15.md).
 
-See [current cycle](docs/ipc-dictionary-projection-2026-09-15.md),
-[native admission](docs/native-admission-follow-up-2026-09-11.md) and the
-[previous decimal checkpoint](docs/decimal-scale-cache-2026-09-11.md).
-The decimal cycle's provider/residency results belong to its frozen `6d0b9317`
-binary and are not superseded by inferred historical speedups.
+Previous pushed checkpoint `a857215` freezes IPC candidate `138199d2`: checked
+dictionary envelopes, bounded first-definition ID/dependency projection, repeated
+column normalization and shared aliases. It validated340provider outputs/255pairs
+and348residency outputs/278pairs, but Q12 regressed in both paired blocks; preserve
+that failed performance acceptance. The completed same-binary pruning control
+validates96outputs with unchanged plans and no consistent Q6/Q12 effect. Its
+initial audit keyword error and successful corrected audit are preserved in the
+268-file control archive; timing was not rerun. Q12 phase follow-up validates16
+outputs,8declared native join-build partitions/1slot,zero major faults. All73native
+lineitem/orders schemas were inspected; representative dictionary value buffers
+are only10–64bytes. A large synthetic dictionary does not establish SF10 relevance.
+See [IPC cycle](docs/ipc-dictionary-projection-2026-09-15.md) and
+[control/phase follow-up](docs/ipc-q12-phase-follow-up-2026-09-15.md).
+
+The [native admitted IPC design](docs/native-admitted-ipc-design-2026-09-15.md)
+remains proposed. The pinned Arrow decoder audit identifies metadata/schema/map
+and delta-copy allocation obligations; alignment control alone is not admission.
+Benchmark affinity0–15 covers8physical cores withSMT and a powersave governor;
+this is provenance, not a demonstrated cause of timing variance. Earlier decimal
+results belong to frozen `6d0b9317`; see the
+[decimal checkpoint](docs/decimal-scale-cache-2026-09-11.md).
 
 Parent `8c89899` and residency checkpoint `d37e836` are pushed and remote-verified.
 Their UTF-8 binding, prior failures and residency results remain qualified in
@@ -297,6 +309,10 @@ pool, so availability is not proof of query-time concurrency or complete admissi
 Runtime typed validation and frontier traces are still required.
 
 Benchmark rules:
+
+- Before a performance change, inspect the actual workload encoding and sizes and
+  measure the targeted cost. Synthetic mechanism tests do not establish benchmark
+  relevance; record that distinction before an expensive frozen comparison.
 
 - Use a matched DuckDB reference and a query-time ceiling of 10× DuckDB.
   If the query exceeds it, it fails. A startup watchdog allowance is separate.

@@ -1,0 +1,151 @@
+{
+  "captured_at": "2026-09-16T05:53:31.946308+00:00",
+  "qualification": "Read-only host snapshot during release compilation; target benchmark affinity0-15. Instantaneous clocks do not prove benchmark frequencies. No host settings changed.",
+  "platform": "Linux-6.17.0-35-generic-x86_64-with-glibc2.39",
+  "cpus": {
+    "0": {
+      "topology/core_id": "0",
+      "topology/physical_package_id": "0",
+      "topology/thread_siblings_list": "0-1",
+      "cpufreq/scaling_governor": "powersave",
+      "cpufreq/scaling_driver": "intel_pstate",
+      "cpufreq/scaling_min_freq": "800000",
+      "cpufreq/scaling_max_freq": "5500000"
+    },
+    "1": {
+      "topology/core_id": "0",
+      "topology/physical_package_id": "0",
+      "topology/thread_siblings_list": "0-1",
+      "cpufreq/scaling_governor": "powersave",
+      "cpufreq/scaling_driver": "intel_pstate",
+      "cpufreq/scaling_min_freq": "800000",
+      "cpufreq/scaling_max_freq": "5500000"
+    },
+    "2": {
+      "topology/core_id": "4",
+      "topology/physical_package_id": "0",
+      "topology/thread_siblings_list": "2-3",
+      "cpufreq/scaling_governor": "powersave",
+      "cpufreq/scaling_driver": "intel_pstate",
+      "cpufreq/scaling_min_freq": "800000",
+      "cpufreq/scaling_max_freq": "5500000"
+    },
+    "3": {
+      "topology/core_id": "4",
+      "topology/physical_package_id": "0",
+      "topology/thread_siblings_list": "2-3",
+      "cpufreq/scaling_governor": "powersave",
+      "cpufreq/scaling_driver": "intel_pstate",
+      "cpufreq/scaling_min_freq": "800000",
+      "cpufreq/scaling_max_freq": "5500000"
+    },
+    "4": {
+      "topology/core_id": "8",
+      "topology/physical_package_id": "0",
+      "topology/thread_siblings_list": "4-5",
+      "cpufreq/scaling_governor": "powersave",
+      "cpufreq/scaling_driver": "intel_pstate",
+      "cpufreq/scaling_min_freq": "800000",
+      "cpufreq/scaling_max_freq": "5500000"
+    },
+    "5": {
+      "topology/core_id": "8",
+      "topology/physical_package_id": "0",
+      "topology/thread_siblings_list": "4-5",
+      "cpufreq/scaling_governor": "powersave",
+      "cpufreq/scaling_driver": "intel_pstate",
+      "cpufreq/scaling_min_freq": "800000",
+      "cpufreq/scaling_max_freq": "5500000"
+    },
+    "6": {
+      "topology/core_id": "12",
+      "topology/physical_package_id": "0",
+      "topology/thread_siblings_list": "6-7",
+      "cpufreq/scaling_governor": "powersave",
+      "cpufreq/scaling_driver": "intel_pstate",
+      "cpufreq/scaling_min_freq": "800000",
+      "cpufreq/scaling_max_freq": "5500000"
+    },
+    "7": {
+      "topology/core_id": "12",
+      "topology/physical_package_id": "0",
+      "topology/thread_siblings_list": "6-7",
+      "cpufreq/scaling_governor": "powersave",
+      "cpufreq/scaling_driver": "intel_pstate",
+      "cpufreq/scaling_min_freq": "800000",
+      "cpufreq/scaling_max_freq": "5500000"
+    },
+    "8": {
+      "topology/core_id": "16",
+      "topology/physical_package_id": "0",
+      "topology/thread_siblings_list": "8-9",
+      "cpufreq/scaling_governor": "powersave",
+      "cpufreq/scaling_driver": "intel_pstate",
+      "cpufreq/scaling_min_freq": "800000",
+      "cpufreq/scaling_max_freq": "5800000"
+    },
+    "9": {
+      "topology/core_id": "16",
+      "topology/physical_package_id": "0",
+      "topology/thread_siblings_list": "8-9",
+      "cpufreq/scaling_governor": "powersave",
+      "cpufreq/scaling_driver": "intel_pstate",
+      "cpufreq/scaling_min_freq": "800000",
+      "cpufreq/scaling_max_freq": "5800000"
+    },
+    "10": {
+      "topology/core_id": "20",
+      "topology/physical_package_id": "0",
+      "topology/thread_siblings_list": "10-11",
+      "cpufreq/scaling_governor": "powersave",
+      "cpufreq/scaling_driver": "intel_pstate",
+      "cpufreq/scaling_min_freq": "800000",
+      "cpufreq/scaling_max_freq": "5800000"
+    },
+    "11": {
+      "topology/core_id": "20",
+      "topology/physical_package_id": "0",
+      "topology/thread_siblings_list": "10-11",
+      "cpufreq/scaling_governor": "powersave",
+      "cpufreq/scaling_driver": "intel_pstate",
+      "cpufreq/scaling_min_freq": "800000",
+      "cpufreq/scaling_max_freq": "5800000"
+    },
+    "12": {
+      "topology/core_id": "24",
+      "topology/physical_package_id": "0",
+      "topology/thread_siblings_list": "12-13",
+      "cpufreq/scaling_governor": "powersave",
+      "cpufreq/scaling_driver": "intel_pstate",
+      "cpufreq/scaling_min_freq": "800000",
+      "cpufreq/scaling_max_freq": "5500000"
+    },
+    "13": {
+      "topology/core_id": "24",
+      "topology/physical_package_id": "0",
+      "topology/thread_siblings_list": "12-13",
+      "cpufreq/scaling_governor": "powersave",
+      "cpufreq/scaling_driver": "intel_pstate",
+      "cpufreq/scaling_min_freq": "800000",
+      "cpufreq/scaling_max_freq": "5500000"
+    },
+    "14": {
+      "topology/core_id": "28",
+      "topology/physical_package_id": "0",
+      "topology/thread_siblings_list": "14-15",
+      "cpufreq/scaling_governor": "powersave",
+      "cpufreq/scaling_driver": "intel_pstate",
+      "cpufreq/scaling_min_freq": "800000",
+      "cpufreq/scaling_max_freq": "5500000"
+    },
+    "15": {
+      "topology/core_id": "28",
+      "topology/physical_package_id": "0",
+      "topology/thread_siblings_list": "14-15",
+      "cpufreq/scaling_governor": "powersave",
+      "cpufreq/scaling_driver": "intel_pstate",
+      "cpufreq/scaling_min_freq": "800000",
+      "cpufreq/scaling_max_freq": "5500000"
+    }
+  }
+}

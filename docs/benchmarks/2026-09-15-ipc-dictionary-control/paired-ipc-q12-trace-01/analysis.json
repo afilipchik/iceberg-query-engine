@@ -1,0 +1,182 @@
+{
+  "qualification": "Two reversed blocks, aggregate/input-queue/join instrumentation enabled, diagnostic ceiling; not performance acceptance. Native provider boundary matches the canonical screen; extended diagnostic deadline is separate from the recorded DuckDB ceiling.",
+  "typed_outputs": 16,
+  "cases": {
+    "b1-parent-q12": {
+      "median_ms": 785.822774,
+      "median_plan_ms": 9.353724000000001,
+      "median_execute_ms": 768.310386,
+      "optimized_plans": [
+        "Sort: [l_shipmode Asc]\n  Project: [l_shipmode, high_line_count AS high_line_count, low_line_count AS low_line_count]\n    Aggregate: group_by=[l_shipmode], aggs=[SUM(CASE WHEN ((o_orderpriority = '1-URGENT') OR (o_orderpriority = '2-HIGH')) THEN 1 ELSE 0 END), SUM(CASE WHEN ((o_orderpriority != '1-URGENT') AND (o_orderpriority != '2-HIGH')) THEN 1 ELSE 0 END)]\n      INNER Join\n        on: l_orderkey = o_orderkey\n        Project: [lineitem.l_orderkey, lineitem.l_shipmode]\n          Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n            projection: [0, 10, 11, 12, 14]\n            filter: ((((l_shipmode IN ('MAIL', 'SHIP') AND (l_commitdate < l_receiptdate)) AND (l_shipdate < l_commitdate)) AND (l_receiptdate >= DATE(8766))) AND (l_receiptdate < DATE(9131)))\n        Scan: orders [o_orderkey, o_custkey, o_orderstatus, o_totalprice, o_orderdate, o_orderpriority, o_clerk, o_shippriority, o_comment]\n          projection: [0, 5]\n"
+      ],
+      "physical_plans": [
+        "ExternalSort\n  Project\n    SpillableHashAggregate\n      SpillableHashJoin\n        Project\n          Filter\n            NativeStreamingScanExec\n        MemoryTableScan\n"
+      ],
+      "routing_profiles": [
+        {
+          "key_preparation_ms": 12.926,
+          "row_dispatch_ms": 2.38,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 12.914,
+          "row_dispatch_ms": 2.43,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 12.341,
+          "row_dispatch_ms": 2.374,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 12.533,
+          "row_dispatch_ms": 2.353,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        }
+      ]
+    },
+    "b1-candidate-q12": {
+      "median_ms": 812.732747,
+      "median_plan_ms": 9.231652,
+      "median_execute_ms": 796.92633,
+      "optimized_plans": [
+        "Sort: [l_shipmode Asc]\n  Project: [l_shipmode, high_line_count AS high_line_count, low_line_count AS low_line_count]\n    Aggregate: group_by=[l_shipmode], aggs=[SUM(CASE WHEN ((o_orderpriority = '1-URGENT') OR (o_orderpriority = '2-HIGH')) THEN 1 ELSE 0 END), SUM(CASE WHEN ((o_orderpriority != '1-URGENT') AND (o_orderpriority != '2-HIGH')) THEN 1 ELSE 0 END)]\n      INNER Join\n        on: l_orderkey = o_orderkey\n        Project: [lineitem.l_orderkey, lineitem.l_shipmode]\n          Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n            projection: [0, 10, 11, 12, 14]\n            filter: ((((l_shipmode IN ('MAIL', 'SHIP') AND (l_commitdate < l_receiptdate)) AND (l_shipdate < l_commitdate)) AND (l_receiptdate >= DATE(8766))) AND (l_receiptdate < DATE(9131)))\n        Scan: orders [o_orderkey, o_custkey, o_orderstatus, o_totalprice, o_orderdate, o_orderpriority, o_clerk, o_shippriority, o_comment]\n          projection: [0, 5]\n"
+      ],
+      "physical_plans": [
+        "ExternalSort\n  Project\n    SpillableHashAggregate\n      SpillableHashJoin\n        Project\n          Filter\n            NativeStreamingScanExec\n        MemoryTableScan\n"
+      ],
+      "routing_profiles": [
+        {
+          "key_preparation_ms": 12.6,
+          "row_dispatch_ms": 2.458,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 12.194,
+          "row_dispatch_ms": 2.355,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 11.874,
+          "row_dispatch_ms": 2.341,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 11.674,
+          "row_dispatch_ms": 2.32,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        }
+      ]
+    },
+    "b2-candidate-q12": {
+      "median_ms": 848.276957,
+      "median_plan_ms": 9.148329,
+      "median_execute_ms": 832.8466030000001,
+      "optimized_plans": [
+        "Sort: [l_shipmode Asc]\n  Project: [l_shipmode, high_line_count AS high_line_count, low_line_count AS low_line_count]\n    Aggregate: group_by=[l_shipmode], aggs=[SUM(CASE WHEN ((o_orderpriority = '1-URGENT') OR (o_orderpriority = '2-HIGH')) THEN 1 ELSE 0 END), SUM(CASE WHEN ((o_orderpriority != '1-URGENT') AND (o_orderpriority != '2-HIGH')) THEN 1 ELSE 0 END)]\n      INNER Join\n        on: l_orderkey = o_orderkey\n        Project: [lineitem.l_orderkey, lineitem.l_shipmode]\n          Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n            projection: [0, 10, 11, 12, 14]\n            filter: ((((l_shipmode IN ('MAIL', 'SHIP') AND (l_commitdate < l_receiptdate)) AND (l_shipdate < l_commitdate)) AND (l_receiptdate >= DATE(8766))) AND (l_receiptdate < DATE(9131)))\n        Scan: orders [o_orderkey, o_custkey, o_orderstatus, o_totalprice, o_orderdate, o_orderpriority, o_clerk, o_shippriority, o_comment]\n          projection: [0, 5]\n"
+      ],
+      "physical_plans": [
+        "ExternalSort\n  Project\n    SpillableHashAggregate\n      SpillableHashJoin\n        Project\n          Filter\n            NativeStreamingScanExec\n        MemoryTableScan\n"
+      ],
+      "routing_profiles": [
+        {
+          "key_preparation_ms": 12.587,
+          "row_dispatch_ms": 2.454,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 12.163,
+          "row_dispatch_ms": 2.373,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 11.815,
+          "row_dispatch_ms": 2.336,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 12.39,
+          "row_dispatch_ms": 2.396,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        }
+      ]
+    },
+    "b2-parent-q12": {
+      "median_ms": 687.515098,
+      "median_plan_ms": 9.304003999999999,
+      "median_execute_ms": 672.037541,
+      "optimized_plans": [
+        "Sort: [l_shipmode Asc]\n  Project: [l_shipmode, high_line_count AS high_line_count, low_line_count AS low_line_count]\n    Aggregate: group_by=[l_shipmode], aggs=[SUM(CASE WHEN ((o_orderpriority = '1-URGENT') OR (o_orderpriority = '2-HIGH')) THEN 1 ELSE 0 END), SUM(CASE WHEN ((o_orderpriority != '1-URGENT') AND (o_orderpriority != '2-HIGH')) THEN 1 ELSE 0 END)]\n      INNER Join\n        on: l_orderkey = o_orderkey\n        Project: [lineitem.l_orderkey, lineitem.l_shipmode]\n          Scan: lineitem [l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment]\n            projection: [0, 10, 11, 12, 14]\n            filter: ((((l_shipmode IN ('MAIL', 'SHIP') AND (l_commitdate < l_receiptdate)) AND (l_shipdate < l_commitdate)) AND (l_receiptdate >= DATE(8766))) AND (l_receiptdate < DATE(9131)))\n        Scan: orders [o_orderkey, o_custkey, o_orderstatus, o_totalprice, o_orderdate, o_orderpriority, o_clerk, o_shippriority, o_comment]\n          projection: [0, 5]\n"
+      ],
+      "physical_plans": [
+        "ExternalSort\n  Project\n    SpillableHashAggregate\n      SpillableHashJoin\n        Project\n          Filter\n            NativeStreamingScanExec\n        MemoryTableScan\n"
+      ],
+      "routing_profiles": [
+        {
+          "key_preparation_ms": 12.187,
+          "row_dispatch_ms": 2.269,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 13.243,
+          "row_dispatch_ms": 2.449,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 12.456,
+          "row_dispatch_ms": 2.361,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        },
+        {
+          "key_preparation_ms": 13.257,
+          "row_dispatch_ms": 2.646,
+          "prepared_batches": 229.0,
+          "unprepared_batches": 0.0
+        }
+      ]
+    }
+  },
+  "pairs": [
+    {
+      "block": 1,
+      "query": "q12",
+      "query_ratio": 1.0342443282255904,
+      "parent_ms": 785.822774,
+      "candidate_ms": 812.732747,
+      "parent_plan_ms": 9.353724000000001,
+      "candidate_plan_ms": 9.231652,
+      "parent_execute_ms": 768.310386,
+      "candidate_execute_ms": 796.92633,
+      "optimized_plan_equal": true,
+      "physical_plan_equal": true
+    },
+    {
+      "block": 2,
+      "query": "q12",
+      "query_ratio": 1.2338302961893646,
+      "parent_ms": 687.515098,
+      "candidate_ms": 848.276957,
+      "parent_plan_ms": 9.304003999999999,
+      "candidate_plan_ms": 9.148329,
+      "parent_execute_ms": 672.037541,
+      "candidate_execute_ms": 832.8466030000001,
+      "optimized_plan_equal": true,
+      "physical_plan_equal": true
+    }
+  ]
+}

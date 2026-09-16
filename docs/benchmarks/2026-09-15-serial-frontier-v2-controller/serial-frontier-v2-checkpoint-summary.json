@@ -1,0 +1,779 @@
+{
+  "release": {
+    "binary_sha256": "be16425374af0afeb0dac1828acb96acc8bfdb31061aaf7e9806c119ff0357e9",
+    "source_hashes_sha256": "c34feee89f6a47f67032354718407dc02dbb24c6192bb4cbad52d0c8a8448bee",
+    "source_count": 802,
+    "build_exit": 0,
+    "features": [
+      "lance",
+      "gpu"
+    ],
+    "SAFE_BUILD_MEM": "48G",
+    "SAFE_BUILD_JOBS": 1,
+    "locked": true,
+    "offline": true,
+    "revision": "a857215baec3c7cc91c0245738b4e914df09cf82",
+    "dirty_tree": true,
+    "frozen_at": "2026-09-16T05:58:40.661070+00:00",
+    "command": [
+      "cargo",
+      "build",
+      "--locked",
+      "--offline",
+      "--release",
+      "--features",
+      "lance,gpu",
+      "--example",
+      "benchmark_embedded"
+    ],
+    "toolchain": {
+      "protoc_path": ".scratch/tools/protoc/bin/protoc",
+      "protoc_sha256": "e718992c5733ece01264f160c0890229770791e51c9612a2b34dc17f83ab3773",
+      "dependency_versions_and_edges_unchanged": true,
+      "only_lock_change": "Lance10registry source/checksum removed for local path patch",
+      "protoc_version": "libprotoc 25.3"
+    }
+  },
+  "providers": {
+    "raw_parquet": {
+      "typed_engine_outputs": 88,
+      "valid_pairs": 66,
+      "planned_pairs": 66,
+      "complete": true,
+      "failures": [],
+      "geomean": 2.433840803298171,
+      "suite_ratio": 2.6429173549423735,
+      "wins": 0
+    },
+    "native": {
+      "typed_engine_outputs": 76,
+      "valid_pairs": 57,
+      "planned_pairs": 66,
+      "complete": false,
+      "failures": [
+        {
+          "side": "engine",
+          "id": "s1-q06-warmup",
+          "result": {
+            "status": "timeout",
+            "error": "worker response deadline exceeded",
+            "phase": "query"
+          }
+        },
+        {
+          "side": "engine",
+          "id": "s1-q06-1-engine",
+          "result": {
+            "status": "not_run",
+            "executed": false,
+            "error": "engine warmup failed query-time gate; no measured retries"
+          }
+        },
+        {
+          "side": "engine",
+          "id": "s1-q06-2-engine",
+          "result": {
+            "status": "not_run",
+            "executed": false,
+            "error": "engine warmup failed query-time gate; no measured retries"
+          }
+        },
+        {
+          "side": "engine",
+          "id": "s1-q06-3-engine",
+          "result": {
+            "status": "not_run",
+            "executed": false,
+            "error": "engine warmup failed query-time gate; no measured retries"
+          }
+        },
+        {
+          "side": "engine",
+          "id": "s1-q01-warmup",
+          "result": {
+            "status": "timeout",
+            "error": "worker response deadline exceeded",
+            "phase": "query"
+          }
+        },
+        {
+          "side": "engine",
+          "id": "s1-q01-1-engine",
+          "result": {
+            "status": "not_run",
+            "executed": false,
+            "error": "engine warmup failed query-time gate; no measured retries"
+          }
+        },
+        {
+          "side": "engine",
+          "id": "s1-q01-2-engine",
+          "result": {
+            "status": "not_run",
+            "executed": false,
+            "error": "engine warmup failed query-time gate; no measured retries"
+          }
+        },
+        {
+          "side": "engine",
+          "id": "s1-q01-3-engine",
+          "result": {
+            "status": "not_run",
+            "executed": false,
+            "error": "engine warmup failed query-time gate; no measured retries"
+          }
+        },
+        {
+          "side": "engine",
+          "id": "s1-q18-warmup",
+          "result": {
+            "status": "timeout",
+            "error": "worker response deadline exceeded",
+            "phase": "query"
+          }
+        },
+        {
+          "side": "engine",
+          "id": "s1-q18-1-engine",
+          "result": {
+            "status": "not_run",
+            "executed": false,
+            "error": "engine warmup failed query-time gate; no measured retries"
+          }
+        },
+        {
+          "side": "engine",
+          "id": "s1-q18-2-engine",
+          "result": {
+            "status": "not_run",
+            "executed": false,
+            "error": "engine warmup failed query-time gate; no measured retries"
+          }
+        },
+        {
+          "side": "engine",
+          "id": "s1-q18-3-engine",
+          "result": {
+            "status": "not_run",
+            "executed": false,
+            "error": "engine warmup failed query-time gate; no measured retries"
+          }
+        }
+      ]
+    },
+    "iceberg": {
+      "typed_engine_outputs": 84,
+      "valid_pairs": 63,
+      "planned_pairs": 66,
+      "complete": false,
+      "failures": [
+        {
+          "side": "duckdb",
+          "id": "s1-q09-oracle",
+          "result": {
+            "id": "s1-q09-oracle",
+            "status": "refused",
+            "ms": 725.1203153282404,
+            "error_kind": "OutOfMemoryException",
+            "error": "Out of Memory Error: Failed to allocate block of 268435456 bytes (bad allocation)\n\nPossible solutions:\n* Reducing the number of threads (SET threads=X)\n* Disabling insertion-order preservation (SET preserve_insertion_order=false)\n* Increasing the memory limit (SET memory_limit='...GB')\n\nSee also https://duckdb.org/docs/stable/guides/performance/how_to_tune_workloads"
+          }
+        },
+        {
+          "side": "duckdb",
+          "id": "s1-q09-duckdb-warmup",
+          "result": {
+            "status": "not_run",
+            "executed": false,
+            "error": "reference failed at s1-q09-oracle; dependent requests not run"
+          }
+        },
+        {
+          "side": "duckdb",
+          "id": "s1-q09-cal0",
+          "result": {
+            "status": "not_run",
+            "executed": false,
+            "error": "reference failed at s1-q09-oracle; dependent requests not run"
+          }
+        },
+        {
+          "side": "duckdb",
+          "id": "s1-q09-cal1",
+          "result": {
+            "status": "not_run",
+            "executed": false,
+            "error": "reference failed at s1-q09-oracle; dependent requests not run"
+          }
+        },
+        {
+          "side": "duckdb",
+          "id": "s1-q09-cal2",
+          "result": {
+            "status": "not_run",
+            "executed": false,
+            "error": "reference failed at s1-q09-oracle; dependent requests not run"
+          }
+        },
+        {
+          "side": "duckdb",
+          "id": "s1-q09-1-duckdb",
+          "result": {
+            "status": "not_run",
+            "executed": false,
+            "error": "invalid reference calibration; no validated ceiling"
+          }
+        },
+        {
+          "side": "engine",
+          "id": "s1-q09-1-engine",
+          "result": {
+            "status": "not_run",
+            "executed": false,
+            "error": "invalid reference calibration; no validated ceiling"
+          }
+        },
+        {
+          "side": "duckdb",
+          "id": "s1-q09-2-duckdb",
+          "result": {
+            "status": "not_run",
+            "executed": false,
+            "error": "invalid reference calibration; no validated ceiling"
+          }
+        },
+        {
+          "side": "engine",
+          "id": "s1-q09-2-engine",
+          "result": {
+            "status": "not_run",
+            "executed": false,
+            "error": "invalid reference calibration; no validated ceiling"
+          }
+        },
+        {
+          "side": "duckdb",
+          "id": "s1-q09-3-duckdb",
+          "result": {
+            "status": "not_run",
+            "executed": false,
+            "error": "invalid reference calibration; no validated ceiling"
+          }
+        },
+        {
+          "side": "engine",
+          "id": "s1-q09-3-engine",
+          "result": {
+            "status": "not_run",
+            "executed": false,
+            "error": "invalid reference calibration; no validated ceiling"
+          }
+        }
+      ]
+    },
+    "lance": {
+      "typed_engine_outputs": 88,
+      "valid_pairs": 66,
+      "planned_pairs": 66,
+      "complete": true,
+      "failures": [],
+      "geomean": 1.9970109652536971,
+      "suite_ratio": 2.949275090066473,
+      "wins": 1
+    }
+  },
+  "paired": {
+    "typed_outputs": 80,
+    "pairs": [
+      {
+        "block": 1,
+        "query": "q01",
+        "query_ratio": 1.0032468286573797,
+        "parent_ms": 6714.019833,
+        "candidate_ms": 6735.819105,
+        "parent_plan_ms": 0.131173,
+        "candidate_plan_ms": 0.11622500000000001,
+        "parent_execute_ms": 6713.579424,
+        "candidate_execute_ms": 6735.395553,
+        "optimized_plan_equal": true,
+        "physical_plan_equal": true
+      },
+      {
+        "block": 1,
+        "query": "q06",
+        "query_ratio": 0.8673306325075459,
+        "parent_ms": 1015.683677,
+        "candidate_ms": 880.9335659999999,
+        "parent_plan_ms": 0.12445300000000001,
+        "candidate_plan_ms": 0.10964800000000001,
+        "parent_execute_ms": 1015.350913,
+        "candidate_execute_ms": 880.587205,
+        "optimized_plan_equal": true,
+        "physical_plan_equal": true
+      },
+      {
+        "block": 1,
+        "query": "q12",
+        "query_ratio": 0.6652457080742104,
+        "parent_ms": 1003.476344,
+        "candidate_ms": 667.558331,
+        "parent_plan_ms": 9.216714000000001,
+        "candidate_plan_ms": 9.295678,
+        "parent_execute_ms": 987.728096,
+        "candidate_execute_ms": 651.8666119999999,
+        "optimized_plan_equal": true,
+        "physical_plan_equal": true
+      },
+      {
+        "block": 1,
+        "query": "q18",
+        "query_ratio": 0.9878964820318344,
+        "parent_ms": 4314.683643,
+        "candidate_ms": 4262.460792,
+        "parent_plan_ms": 5.878284,
+        "candidate_plan_ms": 5.376602999999999,
+        "parent_execute_ms": 4300.427617,
+        "candidate_execute_ms": 4249.005024,
+        "optimized_plan_equal": true,
+        "physical_plan_equal": true
+      },
+      {
+        "block": 1,
+        "query": "q09",
+        "query_ratio": 0.9758182398580391,
+        "parent_ms": 2431.567291,
+        "candidate_ms": 2372.767714,
+        "parent_plan_ms": 10.387988,
+        "candidate_plan_ms": 10.386914,
+        "parent_execute_ms": 2404.7009620000003,
+        "candidate_execute_ms": 2345.761514,
+        "optimized_plan_equal": true,
+        "physical_plan_equal": true
+      },
+      {
+        "block": 2,
+        "query": "q01",
+        "query_ratio": 1.0051187215306627,
+        "parent_ms": 6707.800139999999,
+        "candidate_ms": 6742.135501,
+        "parent_plan_ms": 0.134609,
+        "candidate_plan_ms": 0.121221,
+        "parent_execute_ms": 6707.351221999999,
+        "candidate_execute_ms": 6741.718922999999,
+        "optimized_plan_equal": true,
+        "physical_plan_equal": true
+      },
+      {
+        "block": 2,
+        "query": "q06",
+        "query_ratio": 0.9165843283994536,
+        "parent_ms": 1052.091811,
+        "candidate_ms": 964.3308659999999,
+        "parent_plan_ms": 0.117257,
+        "candidate_plan_ms": 0.133261,
+        "parent_execute_ms": 1051.756399,
+        "candidate_execute_ms": 963.973607,
+        "optimized_plan_equal": true,
+        "physical_plan_equal": true
+      },
+      {
+        "block": 2,
+        "query": "q12",
+        "query_ratio": 1.0729630332603013,
+        "parent_ms": 617.019304,
+        "candidate_ms": 662.038904,
+        "parent_plan_ms": 9.254795,
+        "candidate_plan_ms": 9.075721999999999,
+        "parent_execute_ms": 601.546596,
+        "candidate_execute_ms": 646.2488199999999,
+        "optimized_plan_equal": true,
+        "physical_plan_equal": true
+      },
+      {
+        "block": 2,
+        "query": "q18",
+        "query_ratio": 0.9935454321698552,
+        "parent_ms": 4355.0402970000005,
+        "candidate_ms": 4326.930394,
+        "parent_plan_ms": 5.3414530000000005,
+        "candidate_plan_ms": 5.458589,
+        "parent_execute_ms": 4341.6721210000005,
+        "candidate_execute_ms": 4313.152177,
+        "optimized_plan_equal": true,
+        "physical_plan_equal": true
+      },
+      {
+        "block": 2,
+        "query": "q09",
+        "query_ratio": 0.9989649282285552,
+        "parent_ms": 2368.781632,
+        "candidate_ms": 2366.329773,
+        "parent_plan_ms": 10.548983,
+        "candidate_plan_ms": 10.470377,
+        "parent_execute_ms": 2341.595046,
+        "candidate_execute_ms": 2339.271431,
+        "optimized_plan_equal": true,
+        "physical_plan_equal": true
+      }
+    ]
+  },
+  "residency": {
+    "canonical_decoded_ipc": {
+      "case_exit_code": 0,
+      "completed_outputs": 88,
+      "completed_warmups": 22,
+      "outputs_valid": true,
+      "valid_pairs": 66,
+      "requested_pairs": 66,
+      "engine_statuses": {
+        "completed": 66
+      },
+      "report": {
+        "version": 1,
+        "complete": true,
+        "issues": [],
+        "groups": [
+          {
+            "geomean": 0.7984339679731898,
+            "suite_ratio": 1.254066274509206,
+            "engine_total_ms": 17198.177712,
+            "duckdb_total_ms": 13713.930484838784,
+            "wins": 14,
+            "queries": 22,
+            "worst_ratio": 4.696501434846383,
+            "query_ratios": {
+              "q01": 3.659267710645843,
+              "q02": 0.25593900938470193,
+              "q03": 0.5260789651845774,
+              "q04": 0.23688254894702002,
+              "q05": 0.4697400297104911,
+              "q06": 0.6216094426586499,
+              "q07": 0.6682697117546939,
+              "q08": 0.518079157143862,
+              "q09": 0.5939227108062491,
+              "q10": 1.6589984877262638,
+              "q11": 0.37066892918196154,
+              "q12": 0.557952656285893,
+              "q13": 3.8520850239280198,
+              "q14": 1.196099410461369,
+              "q15": 1.1467939636477371,
+              "q16": 3.516173487448427,
+              "q17": 0.5239774567171428,
+              "q18": 4.696501434846383,
+              "q19": 1.592720638956311,
+              "q20": 0.3026923343838632,
+              "q21": 0.3108448365223728,
+              "q22": 0.4290128735888993
+            },
+            "ci95": {
+              "geomean": [
+                0.7796536623921151,
+                0.8180517385882061
+              ],
+              "suite_ratio": [
+                1.2047209103510845,
+                1.3075836865310093
+              ]
+            },
+            "per_session": {
+              "s1": {
+                "geomean": 0.7984339679731898,
+                "suite_ratio": 1.254066274509206,
+                "engine_total_ms": 17198.177712,
+                "duckdb_total_ms": 13713.930484838784,
+                "wins": 14,
+                "queries": 22,
+                "worst_ratio": 4.696501434846383
+              }
+            },
+            "workload": "tpch_sf10",
+            "track": "decoded_ipc",
+            "leadership": false
+          }
+        ],
+        "latency_leadership": false,
+        "certification": "incomplete: resource, concurrency and regression gates are separate"
+      }
+    },
+    "canonical_gpu_control": {
+      "case_exit_code": 0,
+      "completed_outputs": 88,
+      "completed_warmups": 22,
+      "outputs_valid": true,
+      "valid_pairs": 66,
+      "requested_pairs": 66,
+      "engine_statuses": {
+        "completed": 66
+      },
+      "report": {
+        "version": 1,
+        "complete": true,
+        "issues": [],
+        "groups": [
+          {
+            "geomean": 0.8052814163085636,
+            "suite_ratio": 1.2894980060239156,
+            "engine_total_ms": 17456.758298,
+            "duckdb_total_ms": 13537.638845853508,
+            "wins": 14,
+            "queries": 22,
+            "worst_ratio": 5.115945564330755,
+            "query_ratios": {
+              "q01": 4.029572682586297,
+              "q02": 0.2698673346341666,
+              "q03": 0.5404016233879514,
+              "q04": 0.24518456196960475,
+              "q05": 0.4772531506141836,
+              "q06": 0.6098793755201277,
+              "q07": 0.7464478332717882,
+              "q08": 0.5231107387385553,
+              "q09": 0.6010087551190881,
+              "q10": 1.680235296307391,
+              "q11": 0.3476325325970598,
+              "q12": 0.537464303723891,
+              "q13": 4.067220195414958,
+              "q14": 1.156303930154838,
+              "q15": 1.0806383591621007,
+              "q16": 3.2336342032469947,
+              "q17": 0.5353381112436489,
+              "q18": 5.115945564330755,
+              "q19": 1.4966959901627725,
+              "q20": 0.2949915048140021,
+              "q21": 0.3040168269117784,
+              "q22": 0.45686434242532425
+            },
+            "ci95": {
+              "geomean": [
+                0.7817254026261884,
+                0.8249310103433775
+              ],
+              "suite_ratio": [
+                1.2132589003697796,
+                1.3547088228872526
+              ]
+            },
+            "per_session": {
+              "s1": {
+                "geomean": 0.8052814163085636,
+                "suite_ratio": 1.2894980060239156,
+                "engine_total_ms": 17456.758298,
+                "duckdb_total_ms": 13537.638845853508,
+                "wins": 14,
+                "queries": 22,
+                "worst_ratio": 5.115945564330755
+              }
+            },
+            "workload": "tpch_sf10",
+            "track": "gpu_control",
+            "leadership": false
+          }
+        ],
+        "latency_leadership": false,
+        "certification": "incomplete: resource, concurrency and regression gates are separate"
+      }
+    },
+    "canonical_gpu_mixed": {
+      "case_exit_code": 0,
+      "completed_outputs": 88,
+      "completed_warmups": 22,
+      "outputs_valid": true,
+      "valid_pairs": 66,
+      "requested_pairs": 66,
+      "engine_statuses": {
+        "completed": 66
+      },
+      "report": {
+        "version": 1,
+        "complete": true,
+        "issues": [],
+        "groups": [
+          {
+            "geomean": 0.7980877139119837,
+            "suite_ratio": 1.2909191621416118,
+            "engine_total_ms": 17450.356524,
+            "duckdb_total_ms": 13517.776353284717,
+            "wins": 14,
+            "queries": 22,
+            "worst_ratio": 5.147296911714772,
+            "query_ratios": {
+              "q01": 3.650423288696903,
+              "q02": 0.26800071513632173,
+              "q03": 0.5248459373336145,
+              "q04": 0.24556942998688416,
+              "q05": 0.4722315176204918,
+              "q06": 0.6600073547785026,
+              "q07": 0.6798910808759522,
+              "q08": 0.522642812006324,
+              "q09": 0.6249417216030718,
+              "q10": 1.6670210122226181,
+              "q11": 0.3411602502129827,
+              "q12": 0.5361781513359152,
+              "q13": 3.7840728986152623,
+              "q14": 1.1107085399262633,
+              "q15": 1.1759414545249125,
+              "q16": 3.170927399793815,
+              "q17": 0.5367933124012221,
+              "q18": 5.147296911714772,
+              "q19": 1.4278176344562727,
+              "q20": 0.3077218305057354,
+              "q21": 0.2973112075786595,
+              "q22": 0.46502037282186554
+            },
+            "ci95": {
+              "geomean": [
+                0.7634585154300448,
+                0.8155258337736667
+              ],
+              "suite_ratio": [
+                1.2340201068302088,
+                1.3281185124538641
+              ]
+            },
+            "per_session": {
+              "s1": {
+                "geomean": 0.7980877139119837,
+                "suite_ratio": 1.2909191621416118,
+                "engine_total_ms": 17450.356524,
+                "duckdb_total_ms": 13517.776353284717,
+                "wins": 14,
+                "queries": 22,
+                "worst_ratio": 5.147296911714772
+              }
+            },
+            "workload": "tpch_sf10",
+            "track": "gpu",
+            "leadership": false
+          }
+        ],
+        "latency_leadership": false,
+        "certification": "incomplete: resource, concurrency and regression gates are separate"
+      }
+    },
+    "smoke_gpu_control": {
+      "case_exit_code": 0,
+      "completed_outputs": 42,
+      "completed_warmups": 2,
+      "outputs_valid": true,
+      "valid_pairs": 40,
+      "requested_pairs": 40,
+      "engine_statuses": {
+        "completed": 40
+      },
+      "report": {
+        "version": 1,
+        "complete": true,
+        "issues": [],
+        "groups": [
+          {
+            "geomean": 1.3321553652330569,
+            "suite_ratio": 1.682235796988278,
+            "engine_total_ms": 40.567046000000005,
+            "duckdb_total_ms": 24.114958243444562,
+            "wins": 1,
+            "queries": 2,
+            "worst_ratio": 2.4377267483665714,
+            "query_ratios": {
+              "q01": 2.4377267483665714,
+              "q06": 0.7279888602397037
+            },
+            "ci95": {
+              "geomean": [
+                1.2284102900987282,
+                1.4062600447525788
+              ],
+              "suite_ratio": [
+                1.6196248432001488,
+                1.7849775645129233
+              ]
+            },
+            "per_session": {
+              "s1": {
+                "geomean": 1.3321553652330569,
+                "suite_ratio": 1.682235796988278,
+                "engine_total_ms": 40.567046000000005,
+                "duckdb_total_ms": 24.114958243444562,
+                "wins": 1,
+                "queries": 2,
+                "worst_ratio": 2.4377267483665714
+              }
+            },
+            "workload": "custom_gpu_float_smoke",
+            "track": "gpu_control",
+            "leadership": false
+          }
+        ],
+        "latency_leadership": false,
+        "certification": "incomplete: resource, concurrency and regression gates are separate"
+      }
+    },
+    "smoke_gpu_required": {
+      "case_exit_code": 0,
+      "completed_outputs": 42,
+      "completed_warmups": 2,
+      "outputs_valid": true,
+      "valid_pairs": 40,
+      "requested_pairs": 40,
+      "engine_statuses": {
+        "completed": 40
+      },
+      "required_device_measured_valid": true,
+      "report": {
+        "version": 1,
+        "complete": true,
+        "issues": [],
+        "groups": [
+          {
+            "geomean": 0.08219123754071839,
+            "suite_ratio": 0.08022191065114248,
+            "engine_total_ms": 2.1576895,
+            "duckdb_total_ms": 26.896510971710086,
+            "wins": 2,
+            "queries": 2,
+            "worst_ratio": 0.1041898536802347,
+            "query_ratios": {
+              "q01": 0.06483740297023118,
+              "q06": 0.1041898536802347
+            },
+            "ci95": {
+              "geomean": [
+                0.07811786517745957,
+                0.08739140703056578
+              ],
+              "suite_ratio": [
+                0.07539189580454121,
+                0.08597237743715441
+              ]
+            },
+            "per_session": {
+              "s1": {
+                "geomean": 0.08219123754071839,
+                "suite_ratio": 0.08022191065114248,
+                "engine_total_ms": 2.1576895,
+                "duckdb_total_ms": 26.896510971710086,
+                "wins": 2,
+                "queries": 2,
+                "worst_ratio": 0.1041898536802347
+              }
+            },
+            "workload": "custom_gpu_float_smoke",
+            "track": "gpu",
+            "leadership": false
+          }
+        ],
+        "latency_leadership": false,
+        "certification": "incomplete: resource, concurrency and regression gates are separate"
+      }
+    }
+  },
+  "provider_scope": {
+    "memory.max": "51539607552\n",
+    "memory.swap.max": "0\n",
+    "memory.peak": "24877572096\n",
+    "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+  },
+  "post_scope": {
+    "memory.max": "68719476736\n",
+    "memory.swap.max": "0\n",
+    "memory.peak": "21012893696\n",
+    "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+  }
+}
