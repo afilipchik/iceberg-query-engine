@@ -1,0 +1,26 @@
+{
+  "raw_parquet": {
+    "samples_sha256": "89b471813cf8e0d1a20f0203c453d32f05f939516c44537c3dfb1f349dcdc0ef",
+    "completed_outside_gate": []
+  },
+  "native": {
+    "samples_sha256": "1b4e82f8d7ccb549fe093d4e9bfee24243660a51a1a9464666c973d143328686",
+    "completed_outside_gate": [
+      {
+        "query": "q18",
+        "phase": "engine_warmup",
+        "ms": 4234.428063,
+        "ceiling_ms": 4155.345284380019,
+        "result_id": "s1-q18-warmup"
+      }
+    ]
+  },
+  "iceberg": {
+    "samples_sha256": "734cb260e18ead3d72cd5b36df3a980add05565bbff0947e988e8f11b7ceb8eb",
+    "completed_outside_gate": []
+  },
+  "lance": {
+    "samples_sha256": "5966c56483a8465e7a47ddb2275a9f6cd74148f2336555965e6649a088e6994f",
+    "completed_outside_gate": []
+  }
+}

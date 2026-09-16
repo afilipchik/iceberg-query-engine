@@ -1,0 +1,30 @@
+{
+  "files": {
+    "aggregate-state-detail-driver.log": "4d4f931c8417f1f90a5f578cfc79cc34e95412227203fd34fb47ffc1771218cf",
+    "archive_aggregate_state_detail.py": "066eeecaf2540703ac64d3394f8f3f66c7b5c5bf98088169cfcc2a8735f662a2",
+    "bound-utf8-release-source-hashes.json": "f3b6ae9d3ae734f96752d418641ff471def5419e6c4c760ba10960e9c8481f70",
+    "bound-utf8-release.json": "7332a388128dab6bf4d52439473e9a766e0bf0f29be8fecb80baadf770bc2665",
+    "profile_aggregate_state_detail.py": "32197153e98e95859d880392fb30b30aee5cad4c57be1bbc4e066ecfcc468a8e",
+    "runs/manifest.json": "ab632d1196be3b6f92e81d291234179bac10d984f9eedaa446f937f254ee42c9",
+    "runs/phase-analysis.json": "634b313cddb07d6809b58d26a31ed3d503142ea041dacbc1361fd2eee65f777b",
+    "runs/resources.json": "3488910ab81f514e04be26be200835a3f1ac8eac1890816638075dad0bb541f1",
+    "runs/state.json": "fed39521e925c0528da6629d20e0f9253d50a13a506deaade15c24fc181da7dd",
+    "runs/validation.json": "54aee3e51934227b6c795fe34f02af018a4b39aa0dd946d30f5e46c832ae019b",
+    "runs/verified.json": "b277c3113583413a44a6210839ee512d306b84190084b7eb41bc58ca48b37ea8",
+    "runs/lance-t16-q01/0.arrow": "98267251cc2e3825cf8b6537bd5fa6451b5e3fc1aa8b9f966dbcaf3327b978b6",
+    "runs/lance-t16-q01/1.arrow": "ae77ffd87cdb58c14e9de40d800efa1ef744c8cdb910d9c9dae56b6dc8f22b78",
+    "runs/lance-t16-q01/2.arrow": "1fd2fa8d425c3c3acd205d1097fd918e4fd5ad46ac191479ea54286a8100dcd2",
+    "runs/lance-t16-q01/engine.stderr": "fccb7a93573c4bae38cafed94227e5b4bc51098d54b8c7a580d84c13302ae5b5",
+    "runs/lance-t16-q01/execution.jsonl": "0fd7d88c509b87d833ba53b6ede748c30e217d2cb41429ebaf0a6ca35268de06",
+    "runs/lance-t16-q01/setup.json": "b92d5a535a72cee570427b03b30e590b8cc465e9658325cce47582ee204c5737",
+    "runs/lance-t16-q01/workers.json": "ed71ea4c496f54bce44afc0b462b2591a58ae11fbfb18af6eb0a22160f4f23f0",
+    "runs/lance-t16-q18/0.arrow": "baf474335d67caebcd5c1650d0a035477feecd052ef65e568aa6f15577d5dc51",
+    "runs/lance-t16-q18/1.arrow": "baf474335d67caebcd5c1650d0a035477feecd052ef65e568aa6f15577d5dc51",
+    "runs/lance-t16-q18/2.arrow": "baf474335d67caebcd5c1650d0a035477feecd052ef65e568aa6f15577d5dc51",
+    "runs/lance-t16-q18/engine.stderr": "fcea16032890d34fa030af844520a798e812d04cc8f1dc8385e9707f743cc537",
+    "runs/lance-t16-q18/execution.jsonl": "a98f8efb417be7e93d951242fb200dd7a2f1c7ab5c94ddf65da0a83427ada23a",
+    "runs/lance-t16-q18/setup.json": "53efe9504463317af9c6dbf4702d3497881b74d89913a7b35f16f858c87a0096",
+    "runs/lance-t16-q18/workers.json": "c70e6200e19a5a4022acf8bd01f1f2007d39794d53c2b4e8214e7ccf02a2746b"
+  },
+  "qualification": "Unchanged59619bde diagnostic,6typedoutputs,800input snapshot retained in bound-utf8-validation archive. Subsequent decimal tests are not part of this frozen binary."
+}

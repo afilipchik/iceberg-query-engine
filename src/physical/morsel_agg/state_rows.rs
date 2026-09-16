@@ -478,8 +478,7 @@ impl StateRows {
             .zip(arrays)
         {
             if let BoundSlot::Fixed { codec, .. } = slot {
-                *view =
-                    FixedArrayView::bind(array.as_ref(), matches!(codec, FixedStateCodec::Count));
+                *view = FixedArrayView::bind_for_codec(array.as_ref(), *codec);
             }
         }
         Ok(BoundArrayInputs {

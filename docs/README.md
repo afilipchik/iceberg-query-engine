@@ -1,6 +1,11 @@
 # Project documentation
 
-- [Current coordinated reader checkpoint and SF10 results](coordinated-output-checkpoint-2026-09-11.md)
+- [Current decimal batch-binding candidate and validation](decimal-scale-cache-2026-09-11.md)
+- [Latest completed UTF-8 key cycle and provider SF10](bound-utf8-aggregate-keys-2026-09-11.md)
+- [Latest completed decoded IPC/GPU residency screen](bound-utf8-residency-2026-09-11.md)
+- [Shared aggregate CPU attribution](shared-aggregate-profile-2026-09-11.md)
+
+- [Earlier coordinated reader checkpoint and SF10 results](coordinated-output-checkpoint-2026-09-11.md)
 - [Coordinated reader implementation and validation](coordinated-reader-output-2026-09-11.md)
 
 - [Previous bounded-output checkpoint and SF10 results](admitted-coalesce-checkpoint-2026-09-11.md)

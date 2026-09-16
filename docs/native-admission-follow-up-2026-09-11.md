@@ -73,3 +73,35 @@ output lifetimes must remain covered after reader cancellation/drop.
 Current7ddbf9ce native screen fails Q1 in warmup and Q6 on its first measured sample
 after a successful warmup. Later dependent requests are not run. This differs from
 1bba20b3's Q6 warmup failure and must retain the actual phase in the final report.
+
+## Follow-up source audit during the September15 frozen screen
+
+The current `open_row_group` still calls `FileDecoder::read_dictionary` for every
+footer dictionary after configuring projection. No native-reader implementation
+has changed in the decimal-binding cycle.
+
+The pinned Arrow58.4.0 `get_dictionary_values` resolves a dictionary ID through the
+**first matching field in the full schema**, then decodes that field's value type.
+A pruning implementation must follow that same definition when computing nested
+ID dependencies. Walking only the selected field's children is insufficient as
+a general proof when IDs are shared across fields. Preserve the full decoder
+schema, required replacement/delta order, and IDs rather than field ordinals.
+Use bounded dependency traversal; unresolved/cyclic dependencies must retain the
+ordinary correct route before any dictionary payload is skipped.
+
+There is also a concrete error-contract hypothesis to reproduce next: Arrow's
+DictionaryBatch verifier marks its `data` table optional, while
+`get_dictionary_values` calls `batch.data().unwrap()`. A valid flatbuffer envelope
+with that table absent can therefore reach an unchecked assumption. First create
+a local IPC fixture with the missing table and verify the actual reader outcome;
+do not call this a reproduced failure yet. Any new dictionary-envelope parser
+should validate required headers, metadata versions and record-batch presence,
+with named errors, for both projected and unprojected reads. Keep extent checks
+for skipped payloads and do not weaken framing validation to gain speed.
+
+Next tests should count actual dictionary decode calls for a projected numeric
+column beside unused dictionary values, then cover selected/nonordinal/shared
+IDs, nested dependencies, delta/replacement blocks, repeated/reordered/empty
+projection, NULLs, multiple batches, deletion vectors and retained output lifetime.
+This is a follow-up to execute after the current SF10/residency checkpoint push;
+it does not certify native preparation, query-wide admission or native speed.

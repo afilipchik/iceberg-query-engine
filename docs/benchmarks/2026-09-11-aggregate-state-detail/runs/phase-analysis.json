@@ -1,0 +1,216 @@
+{
+  "cases": {
+    "lance-t16-q01": {
+      "stderr_sha256": "fccb7a93573c4bae38cafed94227e5b4bc51098d54b8c7a580d84c13302ae5b5",
+      "phases": [
+        {
+          "profile": {
+            "input_rows": 59142609.0,
+            "input_batches": 7323.0,
+            "evaluation_ms": 1458.517,
+            "ingestion_ms": 3728.386,
+            "finish_ms": 0.1,
+            "output_ms": 0.021,
+            "output_rows": 4.0,
+            "output_batches": 3.0,
+            "spilled_bytes": 0.0
+          },
+          "sampled_totals": {
+            "rows": 59142609,
+            "samples": 68980,
+            "key_ns": 2186550,
+            "lookup_ns": 2247273,
+            "state_ns": 8734750,
+            "commit_ns": 1254596
+          }
+        },
+        {
+          "profile": {
+            "input_rows": 59142609.0,
+            "input_batches": 7323.0,
+            "evaluation_ms": 1396.448,
+            "ingestion_ms": 3703.427,
+            "finish_ms": 0.098,
+            "output_ms": 0.02,
+            "output_rows": 4.0,
+            "output_batches": 3.0,
+            "spilled_bytes": 0.0
+          },
+          "sampled_totals": {
+            "rows": 59142609,
+            "samples": 68980,
+            "key_ns": 2103415,
+            "lookup_ns": 2154424,
+            "state_ns": 8363383,
+            "commit_ns": 1266950
+          }
+        },
+        {
+          "profile": {
+            "input_rows": 59142609.0,
+            "input_batches": 7323.0,
+            "evaluation_ms": 1399.09,
+            "ingestion_ms": 3733.75,
+            "finish_ms": 0.102,
+            "output_ms": 0.02,
+            "output_rows": 4.0,
+            "output_batches": 3.0,
+            "spilled_bytes": 0.0
+          },
+          "sampled_totals": {
+            "rows": 59142609,
+            "samples": 68980,
+            "key_ns": 2129950,
+            "lookup_ns": 2227937,
+            "state_ns": 8510339,
+            "commit_ns": 1269084
+          }
+        }
+      ],
+      "measured_large_phase_median_ns_per_sample": {
+        "key_ns": 30.685452305015946,
+        "lookup_ns": 31.765446506233694,
+        "state_ns": 122.30879965207306,
+        "commit_ns": 18.38238619889823
+      }
+    },
+    "lance-t16-q18": {
+      "stderr_sha256": "fcea16032890d34fa030af844520a798e812d04cc8f1dc8385e9707f743cc537",
+      "phases": [
+        {
+          "profile": {
+            "input_rows": 59986052.0,
+            "input_batches": 7323.0,
+            "evaluation_ms": 5.949,
+            "ingestion_ms": 2644.596,
+            "finish_ms": 993.91,
+            "output_ms": 993.698,
+            "output_rows": 624.0,
+            "output_batches": 612.0,
+            "spilled_bytes": 0.0
+          },
+          "sampled_totals": {
+            "rows": 59986052,
+            "samples": 73133,
+            "key_ns": 2387909,
+            "lookup_ns": 6548194,
+            "state_ns": 3971491,
+            "commit_ns": 1839168
+          }
+        },
+        {
+          "profile": {
+            "input_rows": 4368.0,
+            "input_batches": 603.0,
+            "evaluation_ms": 1.725,
+            "ingestion_ms": 21.995,
+            "finish_ms": 0.238,
+            "output_ms": 0.164,
+            "output_rows": 624.0,
+            "output_batches": 4.0,
+            "spilled_bytes": 0.0
+          },
+          "sampled_totals": {
+            "rows": 4368,
+            "samples": 621,
+            "key_ns": 15576,
+            "lookup_ns": 149514,
+            "state_ns": 60962,
+            "commit_ns": 24456
+          }
+        },
+        {
+          "profile": {
+            "input_rows": 59986052.0,
+            "input_batches": 7323.0,
+            "evaluation_ms": 6.367,
+            "ingestion_ms": 2686.793,
+            "finish_ms": 998.148,
+            "output_ms": 997.928,
+            "output_rows": 624.0,
+            "output_batches": 615.0,
+            "spilled_bytes": 0.0
+          },
+          "sampled_totals": {
+            "rows": 59986052,
+            "samples": 73133,
+            "key_ns": 2415719,
+            "lookup_ns": 6484943,
+            "state_ns": 3889519,
+            "commit_ns": 1883739
+          }
+        },
+        {
+          "profile": {
+            "input_rows": 4368.0,
+            "input_batches": 603.0,
+            "evaluation_ms": 1.604,
+            "ingestion_ms": 19.297,
+            "finish_ms": 0.231,
+            "output_ms": 0.159,
+            "output_rows": 624.0,
+            "output_batches": 4.0,
+            "spilled_bytes": 0.0
+          },
+          "sampled_totals": {
+            "rows": 4368,
+            "samples": 621,
+            "key_ns": 14749,
+            "lookup_ns": 141930,
+            "state_ns": 60985,
+            "commit_ns": 21095
+          }
+        },
+        {
+          "profile": {
+            "input_rows": 59986052.0,
+            "input_batches": 7323.0,
+            "evaluation_ms": 6.016,
+            "ingestion_ms": 2713.908,
+            "finish_ms": 983.261,
+            "output_ms": 983.064,
+            "output_rows": 624.0,
+            "output_batches": 613.0,
+            "spilled_bytes": 0.0
+          },
+          "sampled_totals": {
+            "rows": 59986052,
+            "samples": 73133,
+            "key_ns": 2457236,
+            "lookup_ns": 6626418,
+            "state_ns": 3955641,
+            "commit_ns": 1894613
+          }
+        },
+        {
+          "profile": {
+            "input_rows": 4368.0,
+            "input_batches": 603.0,
+            "evaluation_ms": 1.704,
+            "ingestion_ms": 20.073,
+            "finish_ms": 0.233,
+            "output_ms": 0.16,
+            "output_rows": 624.0,
+            "output_batches": 4.0,
+            "spilled_bytes": 0.0
+          },
+          "sampled_totals": {
+            "rows": 4368,
+            "samples": 621,
+            "key_ns": 15004,
+            "lookup_ns": 172891,
+            "state_ns": 62556,
+            "commit_ns": 21895
+          }
+        }
+      ],
+      "measured_large_phase_median_ns_per_sample": {
+        "key_ns": 33.31570563220434,
+        "lookup_ns": 89.64052479728713,
+        "state_ns": 53.63625176049116,
+        "commit_ns": 25.832059398629895
+      }
+    }
+  },
+  "qualification": "One-in1024 row samples per owner/call; potentially biased, instrumentation overhead, not exclusive CPU samples or performance acceptance."
+}

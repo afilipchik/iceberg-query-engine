@@ -1,4 +1,5 @@
-//! Checked borrowed views for fixed aggregate inputs. No normalization or ownership.
+//! Checked borrowed inputs; floating conversion is bound to the state codec.
+use super::FixedStateCodec;
 use crate::planner::{DecimalValue, ScalarValue};
 use arrow::{array::*, buffer::NullBuffer, datatypes::DataType};
 
@@ -20,8 +21,24 @@ pub(super) enum FixedArrayView<'a> {
     Float32(&'a Float32Array),
     Float64(&'a Float64Array),
     Decimal128(&'a Decimal128Array, i8),
+    DecimalFloat(&'a Decimal128Array, f64),
 }
 impl<'a> FixedArrayView<'a> {
+    pub(super) fn bind_for_codec(array: &'a dyn Array, codec: FixedStateCodec) -> Option<Self> {
+        let view = Self::bind(array, matches!(codec, FixedStateCodec::Count))?;
+        match (view, codec) {
+            (
+                Self::Decimal128(array, scale),
+                FixedStateCodec::Sum | FixedStateCodec::Avg | FixedStateCodec::Variance,
+            ) => {
+                // Floating states already convert each decimal through this exact
+                // multiplication. Hoist only scale metadata, preserving row order
+                // and leaving exact decimal states and dictionary fallback alone.
+                Some(Self::DecimalFloat(array, 10_f64.powi(-i32::from(scale))))
+            }
+            _ => Some(view),
+        }
+    }
     pub(super) fn bind(array: &'a dyn Array, count: bool) -> Option<Self> {
         // Dictionary key validity does not prove logical value validity. Keep
         // recursive codebook resolution in the existing adapter for every code.
@@ -101,6 +118,13 @@ impl<'a> FixedArrayView<'a> {
                     ScalarValue::Decimal128(DecimalValue::new(a.value(row), scale))
                 }
             }
+            Self::DecimalFloat(a, factor) => {
+                if a.is_null(row) {
+                    ScalarValue::Null
+                } else {
+                    ScalarValue::Float64((a.value(row) as f64 * factor).into())
+                }
+            }
         }
     }
 }
@@ -108,6 +132,42 @@ impl<'a> FixedArrayView<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn decimal_floating_views_preserve_slices_extremes_and_dictionary_fallback() {
+        let maximum = 10i128.pow(38) - 1;
+        for scale in [-128, -3, 0, 3, 38] {
+            let array = Decimal128Array::from(vec![
+                Some(99),
+                Some(maximum),
+                None,
+                Some(-maximum),
+                Some(99),
+            ])
+            .with_precision_and_scale(38, scale)
+            .unwrap()
+            .slice(1, 3);
+            for codec in [FixedStateCodec::Avg, FixedStateCodec::Variance] {
+                let view = FixedArrayView::bind_for_codec(&array, codec).unwrap();
+                for (row, coefficient) in [(0, maximum), (2, -maximum)] {
+                    let ScalarValue::Float64(value) = view.value(row) else {
+                        panic!("float input")
+                    };
+                    let expected = std::hint::black_box(coefficient) as f64
+                        * 10_f64.powi(-i32::from(std::hint::black_box(scale)));
+                    assert_eq!(value.to_bits(), expected.to_bits());
+                }
+                assert!(matches!(view.value(1), ScalarValue::Null));
+                let dictionary = DictionaryArray::<arrow::datatypes::Int32Type>::try_new(
+                    Int32Array::from(vec![Some(0), Some(1), None, Some(2)]),
+                    std::sync::Arc::new(array.clone()),
+                )
+                .unwrap();
+                assert!(FixedArrayView::bind_for_codec(&dictionary, codec).is_none());
+                let empty = array.slice(0, 0);
+                assert!(FixedArrayView::bind_for_codec(&empty, codec).is_some());
+            }
+        }
+    }
     #[test]
     fn views_preserve_extreme_scalar_representations_and_decline_dictionaries() {
         for bits in [

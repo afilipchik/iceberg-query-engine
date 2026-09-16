@@ -1,0 +1,86 @@
+[
+  {
+    "case": "lance-t16-q01",
+    "sample": 0,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "l_returnflag: string\n  -- field metadata --\n  query_engine.bound_column.name: 'l_returnflag'\nl_linestatus: string\n  -- field metadata --\n  query_engine.bound_column.name: 'l_linestatus'\nsum_qty: decimal128(38, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_qty'\nsum_base_price: decimal128(38, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_base_price'\nsum_disc_price: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_disc_price'\nsum_charge: decimal128(38, 6)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_charge'\navg_qty: double\n  -- field metadata --\n  query_engine.bound_column.name: 'avg_qty'\navg_price: double\n  -- field metadata --\n  query_engine.bound_column.name: 'avg_price'\navg_disc: double\n  -- field metadata --\n  query_engine.bound_column.name: 'avg_disc'\ncount_order: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'count_order'",
+      "expected_schema": "l_returnflag: string\nl_linestatus: string\nsum_qty: decimal128(38, 2)\nsum_base_price: decimal128(38, 2)\nsum_disc_price: decimal128(38, 4)\nsum_charge: decimal128(38, 6)\navg_qty: double\navg_price: double\navg_disc: double\ncount_order: int64",
+      "actual_rows": 4,
+      "expected_rows": 4
+    }
+  },
+  {
+    "case": "lance-t16-q01",
+    "sample": 1,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "l_returnflag: string\n  -- field metadata --\n  query_engine.bound_column.name: 'l_returnflag'\nl_linestatus: string\n  -- field metadata --\n  query_engine.bound_column.name: 'l_linestatus'\nsum_qty: decimal128(38, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_qty'\nsum_base_price: decimal128(38, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_base_price'\nsum_disc_price: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_disc_price'\nsum_charge: decimal128(38, 6)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_charge'\navg_qty: double\n  -- field metadata --\n  query_engine.bound_column.name: 'avg_qty'\navg_price: double\n  -- field metadata --\n  query_engine.bound_column.name: 'avg_price'\navg_disc: double\n  -- field metadata --\n  query_engine.bound_column.name: 'avg_disc'\ncount_order: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'count_order'",
+      "expected_schema": "l_returnflag: string\nl_linestatus: string\nsum_qty: decimal128(38, 2)\nsum_base_price: decimal128(38, 2)\nsum_disc_price: decimal128(38, 4)\nsum_charge: decimal128(38, 6)\navg_qty: double\navg_price: double\navg_disc: double\ncount_order: int64",
+      "actual_rows": 4,
+      "expected_rows": 4
+    }
+  },
+  {
+    "case": "lance-t16-q01",
+    "sample": 2,
+    "comparison": {
+      "ok": true,
+      "policy": "ordered",
+      "status": "validated",
+      "actual_schema": "l_returnflag: string\n  -- field metadata --\n  query_engine.bound_column.name: 'l_returnflag'\nl_linestatus: string\n  -- field metadata --\n  query_engine.bound_column.name: 'l_linestatus'\nsum_qty: decimal128(38, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_qty'\nsum_base_price: decimal128(38, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_base_price'\nsum_disc_price: decimal128(38, 4)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_disc_price'\nsum_charge: decimal128(38, 6)\n  -- field metadata --\n  query_engine.bound_column.name: 'sum_charge'\navg_qty: double\n  -- field metadata --\n  query_engine.bound_column.name: 'avg_qty'\navg_price: double\n  -- field metadata --\n  query_engine.bound_column.name: 'avg_price'\navg_disc: double\n  -- field metadata --\n  query_engine.bound_column.name: 'avg_disc'\ncount_order: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'count_order'",
+      "expected_schema": "l_returnflag: string\nl_linestatus: string\nsum_qty: decimal128(38, 2)\nsum_base_price: decimal128(38, 2)\nsum_disc_price: decimal128(38, 4)\nsum_charge: decimal128(38, 6)\navg_qty: double\navg_price: double\navg_disc: double\ncount_order: int64",
+      "actual_rows": 4,
+      "expected_rows": 4
+    }
+  },
+  {
+    "case": "lance-t16-q18",
+    "sample": 0,
+    "comparison": {
+      "ok": true,
+      "policy": "limit_ties",
+      "status": "validated",
+      "actual_schema": "c_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 'c_name'\nc_custkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'c_custkey'\no_orderkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'o_orderkey'\no_orderdate: date32[day]\n  -- field metadata --\n  query_engine.bound_column.name: 'o_orderdate'\no_totalprice: decimal128(15, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'o_totalprice'\nSUM(l_quantity): decimal128(38, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'SUM(l_quantity)'",
+      "expected_schema": "c_name: string\nc_custkey: int64\no_orderkey: int64\no_orderdate: date32[day]\no_totalprice: decimal128(15, 2)\nsum(l_quantity): decimal128(38, 2)",
+      "oracle_rows": 624,
+      "limit_rows": 100,
+      "actual_rows": 100,
+      "expected_rows": 100
+    }
+  },
+  {
+    "case": "lance-t16-q18",
+    "sample": 1,
+    "comparison": {
+      "ok": true,
+      "policy": "limit_ties",
+      "status": "validated",
+      "actual_schema": "c_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 'c_name'\nc_custkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'c_custkey'\no_orderkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'o_orderkey'\no_orderdate: date32[day]\n  -- field metadata --\n  query_engine.bound_column.name: 'o_orderdate'\no_totalprice: decimal128(15, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'o_totalprice'\nSUM(l_quantity): decimal128(38, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'SUM(l_quantity)'",
+      "expected_schema": "c_name: string\nc_custkey: int64\no_orderkey: int64\no_orderdate: date32[day]\no_totalprice: decimal128(15, 2)\nsum(l_quantity): decimal128(38, 2)",
+      "oracle_rows": 624,
+      "limit_rows": 100,
+      "actual_rows": 100,
+      "expected_rows": 100
+    }
+  },
+  {
+    "case": "lance-t16-q18",
+    "sample": 2,
+    "comparison": {
+      "ok": true,
+      "policy": "limit_ties",
+      "status": "validated",
+      "actual_schema": "c_name: string\n  -- field metadata --\n  query_engine.bound_column.name: 'c_name'\nc_custkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'c_custkey'\no_orderkey: int64\n  -- field metadata --\n  query_engine.bound_column.name: 'o_orderkey'\no_orderdate: date32[day]\n  -- field metadata --\n  query_engine.bound_column.name: 'o_orderdate'\no_totalprice: decimal128(15, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'o_totalprice'\nSUM(l_quantity): decimal128(38, 2)\n  -- field metadata --\n  query_engine.bound_column.name: 'SUM(l_quantity)'",
+      "expected_schema": "c_name: string\nc_custkey: int64\no_orderkey: int64\no_orderdate: date32[day]\no_totalprice: decimal128(15, 2)\nsum(l_quantity): decimal128(38, 2)",
+      "oracle_rows": 624,
+      "limit_rows": 100,
+      "actual_rows": 100,
+      "expected_rows": 100
+    }
+  }
+]

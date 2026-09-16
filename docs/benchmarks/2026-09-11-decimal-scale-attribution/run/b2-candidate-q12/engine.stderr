@@ -1,0 +1,41 @@
+[mem-cap] process hard-capped at 12.0G anonymous memory (RLIMIT_DATA; the engine aborts if exceeded, the terminal survives; size with QE_MEM_CAP)
+[lance-scan]     1.1ms           5 rows 1 cols ["r_regionkey"]
+[lance-scan]     0.3ms           5 rows 2 cols ["r_name", "r_comment"]
+[lance-scan]     0.2ms          25 rows 2 cols ["n_nationkey", "n_regionkey"]
+[lance-scan]     0.2ms          25 rows 2 cols ["n_name", "n_comment"]
+[lance-scan]     0.6ms      100000 rows 2 cols ["s_suppkey", "s_nationkey"]
+[lance-scan]     3.8ms      100000 rows 4 cols ["s_name", "s_address", "s_phone", "s_comment"]
+[lance-scan]     4.0ms     1500000 rows 2 cols ["c_custkey", "c_nationkey"]
+[lance-scan]    29.5ms     1048576 rows 5 cols ["c_name", "c_address", "c_phone", "c_mktsegment", "c_comment"]
+[lance-scan]     2.5ms     2000000 rows 2 cols ["p_partkey", "p_size"]
+[lance-scan]    16.5ms     1048576 rows 6 cols ["p_name", "p_mfgr", "p_brand", "p_type", "p_container", "p_comment"]
+[lance-scan]    11.5ms     8000000 rows 3 cols ["ps_partkey", "ps_suppkey", "ps_availqty"]
+[lance-scan]    24.4ms     1048576 rows 1 cols ["ps_comment"]
+[lance-scan]    18.5ms    15000000 rows 4 cols ["o_orderkey", "o_custkey", "o_orderdate", "o_shippriority"]
+[lance-scan]    18.4ms     1048576 rows 4 cols ["o_orderstatus", "o_orderpriority", "o_clerk", "o_comment"]
+[lance-scan]   145.2ms    59986052 rows 7 cols ["l_orderkey", "l_partkey", "l_suppkey", "l_linenumber", "l_shipdate", "l_commitdate", "l_receiptdate"]
+[lance-scan]    18.5ms     1048576 rows 5 cols ["l_returnflag", "l_linestatus", "l_shipinstruct", "l_shipmode", "l_comment"]
+[lance-scan]   214.2ms     2600101 rows 5 cols ["l_orderkey", "l_shipdate", "l_commitdate", "l_receiptdate", "l_shipmode"]
+[lance-scan]    21.1ms    15000000 rows 2 cols ["o_orderkey", "o_orderpriority"]
+[aggregate-frontier] {"admitted_buffers":true,"copy_bound":null,"envelope_bytes":null,"operator":"SpillableHashJoin","partitions":16,"slots":16}
+live_aggregate_routing key_preparation_ms=13.677 row_dispatch_ms=5.128 prepared_batches=1832 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=18.863 processing_wall_ms=10.842 serial_batches=1832 parallel_batches=0
+live_aggregate_profile input_rows=310803 input_batches=1832 evaluation_ms=28.968 ingestion_ms=30.681 finish_ms=0.095 output_ms=0.008 output_rows=2 output_batches=2 spilled_bytes=0
+[lance-scan]   238.7ms     2600101 rows 5 cols ["l_orderkey", "l_shipdate", "l_commitdate", "l_receiptdate", "l_shipmode"]
+[lance-scan]    22.8ms    15000000 rows 2 cols ["o_orderkey", "o_orderpriority"]
+[aggregate-frontier] {"admitted_buffers":true,"copy_bound":null,"envelope_bytes":null,"operator":"SpillableHashJoin","partitions":16,"slots":16}
+live_aggregate_routing key_preparation_ms=16.582 row_dispatch_ms=5.511 prepared_batches=1832 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=22.160 processing_wall_ms=13.461 serial_batches=1832 parallel_batches=0
+live_aggregate_profile input_rows=310803 input_batches=1832 evaluation_ms=33.961 ingestion_ms=36.574 finish_ms=0.093 output_ms=0.008 output_rows=2 output_batches=2 spilled_bytes=0
+[lance-scan]   218.3ms     2600101 rows 5 cols ["l_orderkey", "l_shipdate", "l_commitdate", "l_receiptdate", "l_shipmode"]
+[lance-scan]    24.4ms    15000000 rows 2 cols ["o_orderkey", "o_orderpriority"]
+[aggregate-frontier] {"admitted_buffers":true,"copy_bound":null,"envelope_bytes":null,"operator":"SpillableHashJoin","partitions":16,"slots":16}
+live_aggregate_routing key_preparation_ms=17.795 row_dispatch_ms=6.029 prepared_batches=1832 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=23.895 processing_wall_ms=14.445 serial_batches=1832 parallel_batches=0
+live_aggregate_profile input_rows=310803 input_batches=1832 evaluation_ms=36.077 ingestion_ms=39.280 finish_ms=0.088 output_ms=0.008 output_rows=2 output_batches=2 spilled_bytes=0
+[lance-scan]   218.1ms     2600101 rows 5 cols ["l_orderkey", "l_shipdate", "l_commitdate", "l_receiptdate", "l_shipmode"]
+[lance-scan]    22.8ms    15000000 rows 2 cols ["o_orderkey", "o_orderpriority"]
+[aggregate-frontier] {"admitted_buffers":true,"copy_bound":null,"envelope_bytes":null,"operator":"SpillableHashJoin","partitions":16,"slots":16}
+live_aggregate_routing key_preparation_ms=16.621 row_dispatch_ms=5.699 prepared_batches=1832 unprepared_batches=0
+live_aggregate_workers workers=4 ownership=disjoint routing_ms=22.388 processing_wall_ms=13.277 serial_batches=1832 parallel_batches=0
+live_aggregate_profile input_rows=310803 input_batches=1832 evaluation_ms=33.782 ingestion_ms=36.630 finish_ms=0.082 output_ms=0.007 output_rows=2 output_batches=2 spilled_bytes=0

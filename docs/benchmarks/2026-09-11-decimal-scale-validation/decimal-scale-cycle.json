@@ -1,0 +1,11 @@
+{
+  "validation": {
+    "status": "running",
+    "started": 1789166859.5073862,
+    "command": [
+      "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+      ".scratch/parallel-aggregate-input/run_decimal_scale_validation.py"
+    ],
+    "driver_sha256": "99743507e6f1af83fdffc2802a0734bd5f67d4c6177cbd818eb6124953ba30b9"
+  }
+}

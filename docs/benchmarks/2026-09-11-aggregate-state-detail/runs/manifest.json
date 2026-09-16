@@ -1,0 +1,6 @@
+{
+  "binary_sha256": "59619bde34755086d5da0f469413755722b83b4f7e876f9de403f572e7d6d3cf",
+  "driver_sha256": "32197153e98e95859d880392fb30b30aee5cad4c57be1bbc4e066ecfcc468a8e",
+  "parent_commit": "8c8989965d242b0a9728993b16f177392bab5ad3",
+  "qualification": "Aggregate row-sample instrumentation, fresh worker per shape, one warmup/two samples,16threads. Sample intervals are diagnostic and potentially biased, not exclusive CPU accounting or performance acceptance. Query/process budgets unchanged."
+}

@@ -66,9 +66,9 @@ Live artifact locations:
 - Controller: `.scratch/parallel-aggregate-input/bound-utf8-residency-cycle.json`
 - Run: `.scratch/public-bench/bound-utf8-residency-32g-01`
 
-Commit and push this evidence checkpoint, then run the prepared same-binary
-aggregate state-detail diagnostic for Q1/Q18. Existing row-sampling hooks separate
-key lookup, state preparation and commit. Treat them as potentially biased
-diagnostic intervals. Preserve row transactions and memory-denial cursors when
-selecting the next shared optimization. Native timeouts, reference stability and
-broader resource/concurrency gates remain unresolved.
+Evidence checkpoint `d37e836` is committed, pushed and remote-verified. Job42323
+completed six independently typed-correct diagnostic outputs for Q1/Q18. The
+[decimal metadata investigation](decimal-scale-cache-2026-09-11.md) records its
+sampled phase costs and the next candidate. These intervals are potentially
+biased diagnostics. Native timeouts, reference stability and broader
+resource/concurrency gates remain unresolved.

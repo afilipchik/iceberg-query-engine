@@ -1,0 +1,24 @@
+{
+  "observed_at": "2026-09-16T02:47:37.144576+00:00",
+  "old_handle": 25275,
+  "handle_missing": true,
+  "host_process_check": "No python/cargo/rustc/benchmark/systemd-run processes returned",
+  "source_inputs_verified": 800,
+  "old_cycle": {
+    "validation": {
+      "status": "running",
+      "started": 1789166859.5073862,
+      "command": [
+        "/media/afilipchik/nvme6tb/src/afilipchik/iceberg-query-engine/.scratch/venv-lance/bin/python",
+        ".scratch/parallel-aggregate-input/run_decimal_scale_validation.py"
+      ],
+      "driver_sha256": "99743507e6f1af83fdffc2802a0734bd5f67d4c6177cbd818eb6124953ba30b9"
+    }
+  },
+  "completed_suites": [
+    "disjoint-library",
+    "disjoint-contracts",
+    "disjoint-native_ipc",
+    "disjoint-spill"
+  ]
+}

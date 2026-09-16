@@ -4,40 +4,54 @@ Current source, tests and reproducible measurements take precedence over histori
 status prose. Update the current checkpoint in place; keep chronological logs in
 linked reports and the existing epic rather than prepending another status block.
 
-## Current checkpoint — 2026-09-11
+## Current checkpoint — 2026-09-15
 
-Current candidate `59619bde` binds plain UTF-8 aggregate key arrays once per batch,
-retaining canonical validity/length/bytes, admission and error contracts. Numeric
-bindings and checked dictionary/nested traversal remain. No default-ownership,
-dependency, hash format or query-budget change. Red36734 reproduces820downcasts
-for512rows with correct canonical bytes; green54503 passes20key-row tests/1ignored
-(the ignored historical microbenchmark bypasses this binding). New opt-in routing
-telemetry separates key preparation/dispatch while preserving existing totals.
+Frozen candidate `6d0b9317` binds decimal-to-float scale conversion once per
+aggregate batch view. Exact decimal SUM, dictionary fallback, row transactions,
+admission, ownership and dependencies are unchanged. Red5422 reproduces the
+missing binding; green61078 passes 11 state-row tests. Added tests cover all
+supported scales, NULLs, sliced/extreme values, exact SUM and dictionary fallback.
+The rejected process-wide cache and its timings remain in the evidence archive.
 
-Cycle42123 is terminal: both modes1133library passes/11ignored and128contracts;
-native/IPC63default/62partial plus its known numeric failure, spill/numeric28passes
-and the same6failures each. Strict executable/count/name comparison passes; archive27
-verifies800source inputs. Release59619bde completes0 in8m49s. Canonical SF10 validates
-337outputs/252of264pairs: raw66/native57/Iceberg63/Lance66. Rawgeomean2.409209/suite
-2.599317 (0wins), Lance2.019243/2.985002 (1win). NativeQ1/Q6warmups and additional
-Q12measured1 timeout; Iceberg DuckDBQ9oracle refuses256MiB. Cumulative validation/
-build/screenpeak40.571GB under48GiB,zeroOOM/max. Preserve all failures.
+Cycle25275 was interrupted after default-mode validation. On September15 its
+handle was missing and no host build/benchmark process remained. Resume90400
+verified all 800 source inputs and preserved interrupted logs. Both modes pass
+1,135 library tests/11 ignored and 128 contracts; native/IPC is 63 default and
+62 partial plus the known numeric failure. Spill/numeric retains 28 passes and
+six failures per mode. Strict inventory/failure comparison passes; validation
+archive has 34 files. Release completes in 8m52s. Interrupted-scope final resource
+state is unavailable; the resumed provider/build scope peaks at 26.866 GB under
+48 GiB, zero OOM/max and no swap.
 
-Postcheck50559 terminal0:80typed paired outputs, unchanged plans; Q1 ratios0.8518/
-0.8486, with key preparation1.74–1.79s to0.88–0.90s. Q6 ratios1.0118/1.0721; no
-blanket regression-free claim. Scopepeak7.077GB under16GiB,zeroOOM/max. NativeQ12
-91767 terminal0 validates16outputs, but both binaries exceed the current1.176s
-recorded ceiling on some requests. Ratios0.9586/1.3515 leave variability unresolved;
-the SF10timeout remains a failure. Archives65profile/46phase/27validation/1276SF10/
-173paired/47native verify. See [current cycle](docs/bound-utf8-aggregate-keys-2026-09-11.md)
-and [aggregate attribution](docs/shared-aggregate-profile-2026-09-11.md).
-Intermediary8c89899 is pushed and remote-verified. Residency55937 terminal0 on59619bde validates348outputs/278pairs: allfive cases
-complete. Canonical decoded geomean0.753197/suite1.175861, GPUcontrol0.771589/1.194102,
-mixed0.795073/1.254514,14wins each. Canonical records no successfuldevice execution;
-custom required float smoke has40/40measured device proofs. These32/48GiB capacity
-results do not clear16GiB preload. Scopepeak20.442GB under64GiB,zeroOOM/max;
-1317-file archive verifies800inputs. Evidence checkpoint commit/push next, then
-same-binary state-detail profiling. See [residency](docs/bound-utf8-residency-2026-09-11.md). No DuckDB leadership or full resource/concurrency acceptance is certified.
+Canonical SF10 validates 338 outputs/252 of 264 measured pairs: raw66/native57/
+Iceberg63/Lance66. Raw geometric mean/suite ratios are 2.432179/2.616286 (0 wins),
+Lance 1.986131/2.952229 (1 win). Native Q1/Q6 warmups time out; Q18 completes its
+warmup in 4.234s above its 4.155s ceiling, then measured requests are NOTRUN.
+Q12 completes. Iceberg DuckDB Q9 first measured request refuses 256 KiB; engine
+Q9 warmup is correct, measured requests NOTRUN. Preserve these exact phases.
+
+Postcheck86770 is terminal0: 80 paired typed outputs with identical plans. Q1
+candidate/parent ratios are 0.980169/0.991930, with lower ingestion time in both
+blocks. This is modest diagnostic support, not blanket regression freedom.
+Residency validates 348 outputs/278 pairs. Canonical decoded geometric mean/suite
+ratios are 0.655837/1.011982; GPU control 0.790456/1.247289; mixed 0.782244/1.238873.
+Canonical mixed records zero successful device executions. Custom required float
+smoke has 40/40 measured device proofs. Canonical 32/48 GiB capacity conditions do
+not clear 16 GiB preload. Postcheck scope peaks at 26.090 GB under 64 GiB with
+zero OOM/max and no swap. Decoded reference timing changed substantially; do not
+attribute its historical ratio change to the patch.
+
+See the [completed cycle and evidence](docs/decimal-scale-cache-2026-09-11.md).
+Next is the [native IPC dictionary contract/projection follow-up](docs/native-admission-follow-up-2026-09-11.md), starting with a prepared missing-table regression;
+it is not yet a reproduced failure or implemented reader change. Full provider,
+resource, concurrency and performance acceptance remain open.
+
+Parent `8c89899` and residency checkpoint `d37e836` are pushed and remote-verified.
+Their UTF-8 binding, prior failures and residency results remain qualified in
+[the UTF-8 cycle](docs/bound-utf8-aggregate-keys-2026-09-11.md) and
+[residency report](docs/bound-utf8-residency-2026-09-11.md). State-detail42323 on
+that binary validates six outputs; its 25-file archive informed the current
+candidate. No DuckDB leadership or canonical GPU acceleration is certified.
 
 Pushed parent `bb38784` freezes Lance refinement candidate8c4936d8. The pinned
 Lance10 vendor patch runs refinement in owned tasks within its decode window;
@@ -113,6 +127,10 @@ stays disjoint. Preserve the failed identical-binary customQ6 precision control
 and the existing epic; historical active states are not current certification.
 
 ## Start here
+
+- [Current decimal binding candidate](docs/decimal-scale-cache-2026-09-11.md)
+- [Latest completed UTF-8/SF10 cycle](docs/bound-utf8-aggregate-keys-2026-09-11.md)
+- [Latest completed IPC/GPU residency screen](docs/bound-utf8-residency-2026-09-11.md)
 
 - [Current Lance scanner candidate](docs/ordered-lance-scanner-2026-09-11.md)
 - [Current completed checkpoint](docs/coordinated-output-checkpoint-2026-09-11.md)

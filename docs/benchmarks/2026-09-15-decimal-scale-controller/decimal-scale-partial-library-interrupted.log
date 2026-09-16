@@ -1,0 +1,1693 @@
+warning: unused doc comment
+  --> src/execution/alloc_profile.rs:68:1
+   |
+68 | / /// Guards against re-entrant backtrace capture (backtrace capture itself
+69 | | /// allocates) causing infinite recursion/deadlock.
+   | |_--------------------------------------------------^
+   |   |
+   |   rustdoc does not generate documentation for macro invocations
+   |
+   = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+   = note: `#[warn(unused_doc_comments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `AtomicBool`
+  --> src/execution/alloc_profile.rs:25:25
+   |
+25 | use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+   |                         ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `ScalarValue`
+   --> src/optimizer/rules/flatten_dependent_join.rs:908:46
+    |
+908 |     use crate::planner::{LogicalPlanBuilder, ScalarValue};
+    |                                              ^^^^^^^^^^^
+
+warning: unused import: `LaunchConfig`
+    --> src/physical/gpu.rs:1288:39
+     |
+1288 |     use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+     |                                       ^^^^^^^^^^^^
+
+warning: unused import: `crate::physical::operators::MemoryTableExec`
+   --> src/physical/operators/delim_join.rs:686:9
+    |
+686 |     use crate::physical::operators::MemoryTableExec;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Int32Array`
+   --> src/physical/operators/scan.rs:817:45
+    |
+817 |         use arrow::array::{DictionaryArray, Int32Array};
+    |                                             ^^^^^^^^^^
+
+warning: unused import: `ordered_float::OrderedFloat`
+   --> src/storage/row_group_pruning.rs:466:9
+    |
+466 |     use ordered_float::OrderedFloat;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated unit variant `parquet::basic::Encoding::BIT_PACKED`: Please see documentation for compatibility issues and use the RLE/bit-packing hybrid encoding instead
+   --> src/storage/admitted_row_group.rs:125:49
+    |
+125 |                     | parquet::basic::Encoding::BIT_PACKED
+    |                                                 ^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated unit variant `parquet::basic::Encoding::BIT_PACKED`: Please see documentation for compatibility issues and use the RLE/bit-packing hybrid encoding instead
+  --> src/storage/bounded_page_header.rs:56:14
+   |
+56 |         4 => BIT_PACKED,
+   |              ^^^^^^^^^^
+
+warning: use of deprecated unit variant `parquet::basic::Encoding::BIT_PACKED`: Please see documentation for compatibility issues and use the RLE/bit-packing hybrid encoding instead
+   --> src/storage/bounded_page_header.rs:459:79
+    |
+459 |                     parquet::basic::Encoding::RLE | parquet::basic::Encoding::BIT_PACKED
+    |                                                                               ^^^^^^^^^^
+
+warning: use of deprecated unit variant `parquet::basic::Encoding::BIT_PACKED`: Please see documentation for compatibility issues and use the RLE/bit-packing hybrid encoding instead
+   --> src/storage/bounded_page_header.rs:462:79
+    |
+462 |                     parquet::basic::Encoding::RLE | parquet::basic::Encoding::BIT_PACKED
+    |                                                                               ^^^^^^^^^^
+
+warning: use of deprecated method `arrow::arrow_ipc::writer::IpcDataGenerator::encoded_batch`: Use `encode` instead
+   --> src/distributed/flight.rs:186:18
+    |
+186 |                 .encoded_batch(&slice, &mut tracker, &opts)
+    |                  ^^^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1672:29
+     |
+1672 |         let d_ptrs = stream.memcpy_stod(&ptrs).map_err(gpu_err)?;
+     |                             ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1674:14
+     |
+1674 |             .memcpy_stod(
+     |              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1683:14
+     |
+1683 |             .memcpy_stod(&spec.preds.iter().map(|p| p.op).collect::<Vec<_>>())
+     |              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1686:14
+     |
+1686 |             .memcpy_stod(&spec.preds.iter().map(|p| p.value).collect::<Vec<_>>())
+     |              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1688:29
+     |
+1688 |         let d_kind = stream.memcpy_stod(&slot_kind).map_err(gpu_err)?;
+     |                             ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1689:30
+     |
+1689 |         let d_input = stream.memcpy_stod(&slot_input).map_err(gpu_err)?;
+     |                              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1691:14
+     |
+1691 |             .memcpy_stod(&slot_c.iter().map(|c| c[0]).collect::<Vec<_>>())
+     |              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1694:14
+     |
+1694 |             .memcpy_stod(&slot_c.iter().map(|c| c[1]).collect::<Vec<_>>())
+     |              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:1697:14
+     |
+1697 |             .memcpy_stod(&slot_c.iter().map(|c| c[2]).collect::<Vec<_>>())
+     |              ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_dtov`: Use clone_dtoh
+    --> src/physical/gpu.rs:1738:41
+     |
+1738 |         let partials: Vec<f64> = stream.memcpy_dtov(&d_out).map_err(gpu_err)?;
+     |                                         ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:2562:10
+     |
+2562 |         .memcpy_stod(&values)
+     |          ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+    --> src/physical/gpu.rs:2610:10
+     |
+2610 |         .memcpy_stod(&codes)
+     |          ^^^^^^^^^^^
+
+warning: use of deprecated method `parquet::file::properties::WriterPropertiesBuilder::set_max_row_group_size`: Use `set_max_row_group_row_count` instead
+   --> src/physical/morsel_agg/input_frontier/tests.rs:322:10
+    |
+322 |         .set_max_row_group_size(128)
+    |          ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `parquet::file::properties::WriterPropertiesBuilder::set_max_row_group_size`: Use `set_max_row_group_row_count` instead
+   --> src/physical/operators/spillable/admitted_queue_tests.rs:297:10
+    |
+297 |         .set_max_row_group_size(2)
+    |          ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `parquet::file::properties::WriterPropertiesBuilder::set_max_row_group_size`: Use `set_max_row_group_row_count` instead
+   --> src/physical/operators/streaming_parquet_scan/admitted.rs:454:14
+    |
+454 |             .set_max_row_group_size(3)
+    |              ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `parquet::file::properties::WriterPropertiesBuilder::set_max_row_group_size`: Use `set_max_row_group_row_count` instead
+   --> src/physical/operators/streaming_parquet_scan.rs:805:26
+    |
+805 |                         .set_max_row_group_size(2)
+    |                          ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `parquet::file::properties::WriterPropertiesBuilder::set_max_row_group_size`: Use `set_max_row_group_row_count` instead
+    --> src/physical/operators/streaming_parquet_scan.rs:1182:14
+     |
+1182 |             .set_max_row_group_size(200)
+     |              ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `lance::dataset::scanner::Scanner::nprobs`: Use nprobes instead
+    --> src/storage/lance.rs:1840:29
+     |
+1840 |                     scanner.nprobs(n);
+     |                             ^^^^^^
+
+warning: unused import: `PushKernelArg`
+    --> src/physical/gpu.rs:1288:53
+     |
+1288 |     use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+     |                                                     ^^^^^^^^^^^^^
+
+warning: unused import: `std::hash::Hash`
+    --> src/physical/gpu.rs:3536:13
+     |
+3536 |         use std::hash::Hash;
+     |             ^^^^^^^^^^^^^^^
+
+warning: value assigned to `result_plan` is never read
+   --> src/optimizer/rules/join_reorder.rs:550:52
+    |
+550 |         let mut result_plan: Option<LogicalPlan> = None;
+    |                                                    ^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `result_plan` is never read
+    --> src/optimizer/rules/join_reorder.rs:1422:52
+     |
+1422 |         let mut result_plan: Option<LogicalPlan> = None;
+     |                                                    ^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: value assigned to `result_columns` is never read
+    --> src/optimizer/rules/join_reorder.rs:1423:51
+     |
+1423 |         let mut result_columns: HashSet<String> = HashSet::new();
+     |                                                   ^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: variable `total` is assigned to, but never used
+   --> src/physical/vectorized_agg.rs:232:13
+    |
+232 |         let mut total = 0;
+    |             ^^^^^^^^^
+    |
+    = note: consider using `_total` instead
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `total` is never read
+   --> src/physical/vectorized_agg.rs:241:17
+    |
+241 |                 total += 1;
+    |                 ^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: variable does not need to be mutable
+    --> src/planner/binder.rs:2077:13
+     |
+2077 |         let mut out_items: Vec<(Expr, String)> = Vec::new(); // shape of final projection
+     |             ----^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: type `RawRows` is more private than the item `physical::morsel_agg::AggregationState::into_range_shards`
+    --> src/physical/morsel_agg.rs:2727:5
+     |
+2727 |     pub(crate) fn into_range_shards(mut self, p: usize, min: i64, w: u64) -> Result<Vec<RawRows>> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method `physical::morsel_agg::AggregationState::into_range_shards` is reachable at visibility `pub(crate)`
+     |
+note: but type `RawRows` is only usable at visibility `pub(in crate::physical::morsel_agg)`
+    --> src/physical/morsel_agg/raw_state.rs:14:1
+     |
+  14 | pub(super) struct RawRows {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^
+     = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `RawRows` is more private than the item `physical::morsel_agg::AggregationState::into_raw_shards`
+    --> src/physical/morsel_agg.rs:2735:5
+     |
+2735 |     pub(crate) fn into_raw_shards(mut self, p: usize) -> Result<Vec<RawRows>> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method `physical::morsel_agg::AggregationState::into_raw_shards` is reachable at visibility `pub(crate)`
+     |
+note: but type `RawRows` is only usable at visibility `pub(in crate::physical::morsel_agg)`
+    --> src/physical/morsel_agg/raw_state.rs:14:1
+     |
+  14 | pub(super) struct RawRows {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `flatten_plan` is never used
+  --> src/optimizer/rules/flatten_dependent_join.rs:46:4
+   |
+46 | fn flatten_plan(plan: &LogicalPlan) -> Result<LogicalPlan> {
+   |    ^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `try_flatten_filter` is never used
+   --> src/optimizer/rules/flatten_dependent_join.rs:150:4
+    |
+150 | fn try_flatten_filter(node: &FilterNode) -> Result<Option<LogicalPlan>> {
+    |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `flatten_exists` is never used
+   --> src/optimizer/rules/flatten_dependent_join.rs:190:4
+    |
+190 | fn flatten_exists(
+    |    ^^^^^^^^^^^^^^
+
+warning: function `extract_subquery_predicates` is never used
+   --> src/optimizer/rules/flatten_dependent_join.rs:844:4
+    |
+844 | fn extract_subquery_predicates(predicate: &Expr) -> (Vec<Expr>, Vec<Expr>) {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `extract_predicates_recursive` is never used
+   --> src/optimizer/rules/flatten_dependent_join.rs:851:4
+    |
+851 | fn extract_predicates_recursive(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `combine_predicates` is never used
+   --> src/optimizer/rules/flatten_dependent_join.rs:878:4
+    |
+878 | fn combine_predicates(predicates: Vec<Expr>) -> Expr {
+    |    ^^^^^^^^^^^^^^^^^^
+
+warning: fields `attempted` and `completed` are never read
+    --> src/physical/gpu.rs:2336:9
+     |
+2335 | pub(crate) struct ResidentRunCounters {
+     |                   ------------------- fields in this struct
+2336 |     pub attempted: u64,
+     |         ^^^^^^^^^
+2337 |     pub completed: u64,
+     |         ^^^^^^^^^
+     |
+     = note: `ResidentRunCounters` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `counters` is never read
+    --> src/physical/gpu.rs:2341:9
+     |
+2339 | pub(crate) struct ResidentRun {
+     |                   ----------- field in this struct
+2340 |     pub batch: RecordBatch,
+2341 |     pub counters: ResidentRunCounters,
+     |         ^^^^^^^^
+
+warning: field `ack` is never read
+    --> src/physical/gpu.rs:2370:5
+     |
+2366 | struct ResidentSession {
+     |        --------------- field in this struct
+...
+2370 |     ack: ResidentAck,
+     |     ^^^
+
+warning: method `update_count` is never used
+    --> src/physical/morsel_agg.rs:1118:8
+     |
+ 847 | impl AccumulatorState {
+     | --------------------- method in this implementation
+...
+1118 |     fn update_count(&mut self) {
+     |        ^^^^^^^^^^^^
+
+warning: method `scalar_to_raw` is never used
+    --> src/physical/morsel_agg.rs:2511:8
+     |
+1854 | impl AggregationState {
+     | --------------------- method in this implementation
+...
+2511 |     fn scalar_to_raw(&self, key: &GroupKey) -> Option<RawKey> {
+     |        ^^^^^^^^^^^^^
+
+warning: fields `join_type`, `delim_columns`, and `on` are never read
+  --> src/physical/operators/delim_join.rs:76:5
+   |
+70 | pub struct DelimJoinExec {
+   |            ------------- fields in this struct
+...
+76 |     join_type: JoinType,
+   |     ^^^^^^^^^
+77 |     /// Expressions for correlation columns (from outer)
+78 |     delim_columns: Vec<Expr>,
+   |     ^^^^^^^^^^^^^
+79 |     /// Join conditions (outer_col, inner_col)
+80 |     on: Vec<(Expr, Expr)>,
+   |     ^^
+   |
+   = note: `DelimJoinExec` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `extract_distinct_values` is never used
+   --> src/physical/operators/delim_join.rs:218:4
+    |
+218 | fn extract_distinct_values(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `evaluate_expr_to_array` is never used
+   --> src/physical/operators/delim_join.rs:279:4
+    |
+279 | fn evaluate_expr_to_array(expr: &Expr, batch: &RecordBatch) -> Result<ArrayRef> {
+    |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `scalar_to_array` is never used
+   --> src/physical/operators/delim_join.rs:314:4
+    |
+314 | fn scalar_to_array(scalar: &ScalarValue, num_rows: usize) -> Result<ArrayRef> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: struct `InnerEntry` is never constructed
+   --> src/physical/operators/delim_join.rs:404:8
+    |
+404 | struct InnerEntry {
+    |        ^^^^^^^^^^
+
+warning: function `build_hash_table` is never used
+   --> src/physical/operators/delim_join.rs:410:4
+    |
+410 | fn build_hash_table(
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `hash_join_key` is never used
+   --> src/physical/operators/delim_join.rs:430:4
+    |
+430 | fn hash_join_key(
+    |    ^^^^^^^^^^^^^
+
+warning: function `produce_semi_output` is never used
+   --> src/physical/operators/delim_join.rs:462:4
+    |
+462 | fn produce_semi_output(
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `produce_anti_output` is never used
+   --> src/physical/operators/delim_join.rs:503:4
+    |
+503 | fn produce_anti_output(
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `produce_single_output` is never used
+   --> src/physical/operators/delim_join.rs:545:4
+    |
+545 | fn produce_single_output(
+    |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `produce_mark_output` is never used
+   --> src/physical/operators/delim_join.rs:655:4
+    |
+655 | fn produce_mark_output(
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `evaluate_filter` is never used
+   --> src/physical/operators/filter.rs:208:4
+    |
+208 | fn evaluate_filter(
+    |    ^^^^^^^^^^^^^^^
+
+warning: multiple fields are never read
+   --> src/physical/operators/hash_agg.rs:369:5
+    |
+341 | struct AccumulatorState {
+    |        ---------------- fields in this struct
+...
+369 |     sum_x: f64,         // For correlation
+    |     ^^^^^
+370 |     sum_y: f64,         // For correlation
+    |     ^^^^^
+371 |     sum_xy: f64,        // For correlation
+    |     ^^^^^^
+372 |     sum_x_squares: f64, // For correlation
+    |     ^^^^^^^^^^^^^
+373 |     sum_y_squares: f64, // For correlation
+    |     ^^^^^^^^^^^^^
+...
+378 |     max_by_value: Option<f64>,         // The max value of the second arg
+    |     ^^^^^^^^^^^^
+379 |     max_by_result: Option<GroupValue>, // The value to return
+    |     ^^^^^^^^^^^^^
+380 |     min_by_value: Option<f64>,         // The min value of the second arg
+    |     ^^^^^^^^^^^^
+381 |     min_by_result: Option<GroupValue>, // The value to return
+    |     ^^^^^^^^^^^^^
+
+warning: function `without_distance_column` is never used
+   --> src/physical/operators/vector_search.rs:250:15
+    |
+250 | pub(crate) fn without_distance_column(schema: &ArrowSchema) -> Vec<usize> {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `row_group_filter` is never read
+   --> src/storage/parquet.rs:887:5
+    |
+881 | pub struct StreamingParquetScanBuilder {
+    |            --------------------------- field in this struct
+...
+887 |     row_group_filter: Option<Box<dyn Fn(usize, &ParquetFileInfo) -> bool + Send + Sync>>,
+    |     ^^^^^^^^^^^^^^^^
+
+warning: struct `AsyncParquetReader` is never constructed
+   --> src/storage/parquet.rs:929:12
+    |
+929 | pub struct AsyncParquetReader {
+    |            ^^^^^^^^^^^^^^^^^^
+
+warning: associated items `new`, `from_table`, `schema`, `into_stream`, and `read_all_parallel` are never used
+    --> src/storage/parquet.rs:951:12
+     |
+ 949 | impl AsyncParquetReader {
+     | ----------------------- associated items in this implementation
+ 950 |     /// Create a new async reader for a list of Parquet files
+ 951 |     pub fn new(
+     |            ^^^
+...
+ 966 |     pub fn from_table(
+     |            ^^^^^^^^^^
+...
+ 980 |     pub fn schema(&self) -> SchemaRef {
+     |            ^^^^^^
+...
+ 985 |     pub fn into_stream(self) -> BoxStream<'static, Result<RecordBatch>> {
+     |            ^^^^^^^^^^^
+...
+1096 |     pub async fn read_all_parallel(&self, max_concurrent: usize) -> Result<Vec<RecordBatch>> {
+     |                  ^^^^^^^^^^^^^^^^^
+
+warning: struct `AsyncParquetScanBuilder` is never constructed
+    --> src/storage/parquet.rs:1153:12
+     |
+1153 | pub struct AsyncParquetScanBuilder {
+     |            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `new`, `with_projection`, `with_batch_size`, `build`, and `build_stream` are never used
+    --> src/storage/parquet.rs:1162:12
+     |
+1160 | impl AsyncParquetScanBuilder {
+     | ---------------------------- associated items in this implementation
+1161 |     /// Create a new builder from a ParquetTable
+1162 |     pub fn new(table: &ParquetTable) -> Self {
+     |            ^^^
+...
+1172 |     pub fn with_projection(mut self, projection: Vec<usize>) -> Self {
+     |            ^^^^^^^^^^^^^^^
+...
+1178 |     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+     |            ^^^^^^^^^^^^^^^
+...
+1184 |     pub fn build(self) -> AsyncParquetReader {
+     |            ^^^^^
+...
+1189 |     pub fn build_stream(self) -> BoxStream<'static, Result<RecordBatch>> {
+     |            ^^^^^^^^^^^^
+
+warning: `query_engine` (lib test) generated 70 warnings (run `cargo fix --lib -p query_engine --tests` to apply 7 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running unittests src/lib.rs (target/debug/deps/query_engine-cbce5b631b6a7ef4)
+
+running 1146 tests
+test arrow_ffi::codec::tests::test_cpu_feature_detection ... ok
+test arrow_ffi::codec::tests::test_arithmetic_operations ... ok
+test arrow_ffi::import::tests::test_import_array ... ok
+test arrow_ffi::export::tests::test_export_array ... ok
+test arrow_ffi::codec::tests::test_filter_operation ... ok
+test arrow_ffi::array::tests::test_constant_array ... ok
+test arrow_ffi::codec::tests::test_aggregations ... ok
+test arrow_ffi::export::tests::test_export_metadata ... ok
+test arrow_ffi::import::tests::test_import_metadata ... ok
+test arrow_ffi::array::tests::test_constant_detection ... ok
+test arrow_ffi::codec::tests::test_compare_operations ... ok
+test arrow_ffi::array::tests::test_rle_encoding ... ok
+test arrow_ffi::array::tests::test_encoded_roundtrip ... ok
+test arrow_ffi::array::tests::test_dictionary_encoding ... ok
+test distributed::coordinator::tests::unify_refuses_to_stack_incompatible_shards ... ok
+test distributed::gather::tests::non_select_is_refused ... ok
+test distributed::coordinator::tests::a_digest_mismatch_refuses_to_answer ... ok
+test distributed::http_client::tests::connect_failure_is_an_error_not_a_hang ... ok
+test distributed::http_client::tests::parses_an_empty_body ... ok
+test distributed::http_client::tests::rejects_a_truncated_response ... ok
+test distributed::http_client::tests::parses_a_normal_response ... ok
+test distributed::membership::tests::a_port_difference_alone_makes_a_peer_not_self ... ok
+test distributed::membership::tests::a_local_interface_ip_is_self_even_when_the_string_differs ... ok
+test distributed::coordinator::tests::unsupported_shapes_never_reach_the_wire ... ok
+test distributed::membership::tests::an_empty_static_list_is_a_resolved_single_node_cluster ... ok
+test distributed::membership::tests::a_resolve_failure_does_not_empty_the_cluster ... ok
+test distributed::membership::tests::an_unreachable_peer_is_marked_not_removed ... ok
+test distributed::coordinator::tests::a_split_that_does_not_exist_locally_is_an_error_not_silence ... ok
+test distributed::membership::tests::localhost_and_the_loopback_literal_are_the_same_node ... ok
+test distributed::membership::tests::self_is_filtered_out_of_the_peer_set_but_present_in_the_view ... ok
+test distributed::membership::tests::resolution_is_idempotent_and_preserves_probe_state ... ok
+test distributed::plan::tests::a_wildcard_over_a_group_by_is_rejected ... ok
+test distributed::coordinator::tests::splits_of_rejects_a_non_parquet_table ... ok
+test distributed::plan::tests::a_plain_projection_is_a_concatenation ... ok
+test distributed::coordinator::tests::a_shard_context_sees_only_its_own_splits ... ok
+test distributed::gather::tests::a_statement_with_no_table_is_refused ... ok
+test distributed::plan::tests::alias_closure_catches_a_leftover_column_reference ... ok
+test distributed::plan::tests::an_ungrouped_column_is_rejected_by_name ... ok
+test distributed::membership::tests::churn_is_reported_and_bumps_the_generation ... ok
+test distributed::gather::tests::self_join_unions_the_column_sets ... ok
+test distributed::plan::tests::count_star_becomes_a_sum_of_counts ... ok
+test distributed::gather::tests::columns_are_pruned_to_what_the_plan_reads ... ok
+test distributed::plan::tests::avg_travels_as_sum_and_count_never_as_an_average ... ok
+test distributed::plan::tests::arithmetic_over_aggregates_is_merged_per_aggregate ... ok
+test distributed::plan::tests::having_is_evaluated_after_the_merge_not_per_shard ... ok
+test distributed::plan::tests::the_rewriter_refuses_a_column_it_cannot_map ... ok
+test distributed::plan::tests::group_by_keys_are_transported_and_regrouped ... ok
+test distributed::query_log::tests::filter_parsing ... ok
+test distributed::plan::tests::order_by_and_limit_move_to_the_merge_stage ... ok
+test distributed::gather::tests::a_join_lists_both_tables ... ok
+test distributed::plan::tests::plain_topn_pre_truncates_each_shard ... ok
+test distributed::query_log::tests::eviction_skips_running_records ... ok
+test distributed::plan::tests::scalar_functions_over_group_keys_survive_the_rewrite ... ok
+test distributed::query_log::tests::percentile_is_nearest_rank ... ok
+test distributed::server::tests::distributed_mode_defaults_to_auto_and_rejects_nonsense ... ok
+test distributed::server::tests::explicit_node_id_wins_over_everything ... ok
+test distributed::server::tests::format_defaults_to_arrow_and_rejects_nonsense ... ok
+test distributed::server::tests::header_values_survive_messages_with_newlines_and_unicode ... ok
+test distributed::server::tests::pod_ordinal_reads_statefulset_hostnames ... ok
+test distributed::server::tests::stable_hash_is_stable_and_distinguishing ... ok
+test distributed::plan::tests::joins_shard_the_largest_once_referenced_table ... ok
+test distributed::query_log::tests::begin_finish_get_and_list_order ... ok
+test distributed::shard::tests::parquet_files_is_none_so_no_fast_path_can_read_whole_files ... ok
+test distributed::shard::tests::an_empty_shard_scans_to_zero_rows_with_the_right_schema ... ok
+test distributed::query_log::tests::overflow_when_everything_is_running ... ok
+test distributed::server::tests::advertise_replaces_an_unspecified_bind_address ... ok
+test distributed::plan::tests::subquery_tables_are_replicated_not_sharded ... ok
+test distributed::query_log::tests::statement_kind_and_previews ... ok
+test distributed::splits::tests::enumerating_a_real_table_is_canonical_and_reproducible ... ok
+test distributed::splits::tests::an_empty_table_has_imbalance_one_not_nan ... ok
+test distributed::splits::tests::assignment_is_deterministic_and_identical_across_callers ... ok
+test distributed::splits::tests::every_split_is_assigned_exactly_once ... ok
+test distributed::splits::tests::split_bytes_sum_to_the_table_exactly ... ok
+test distributed::splits::tests::target_size_is_clamped_at_both_ends ... ok
+test distributed::query_log::tests::percentiles_and_stats_reconcile ... ok
+test error::shared_error_tests::shared_error_preserves_original_kind_display_and_io_identity ... ok
+test distributed::splits::tests::a_table_smaller_than_the_floor_is_still_divided_across_nodes ... ok
+test distributed::splits::tests::more_nodes_than_splits_leaves_nodes_idle_and_says_so ... ok
+test distributed::splits::tests::equal_splits_divide_evenly_when_they_can ... ok
+test distributed::splits::tests::lpt_beats_round_robin_on_uneven_splits ... ok
+test distributed::splits::tests::tpch_lineitem_shaped_splits_meet_the_ten_percent_gate ... ok
+test execution::context::tests::cap_debug_text_truncates_on_a_char_boundary ... ok
+test execution::context::tests::insert_admission_admits_the_sf10_calibration_point_at_2gib ... ok
+test execution::context::partition_error_contract_tests::partition_execution_retains_typed_cause_without_replay ... ok
+test execution::context::tests::insert_admission_admits_when_no_parquet_source_exists ... ok
+test execution::context::tests::insert_admission_effective_concurrency_is_capped_by_partition_count ... ok
+test execution::context::tests::insert_admission_lowering_merge_concurrency_shrinks_the_estimate ... ok
+test execution::context::tests::insert_admission_refuses_the_sf10_calibration_point_at_512mib ... ok
+test execution::context::tests::parse_merge_concurrency_defaults_and_validates ... ok
+test distributed::query_log::tests::list_summary_hides_plans_and_truncates_sql ... ok
+test execution::context::tests::bounded_partition_merge_handles_zero_streams ... ok
+test execution::context::partition_error_contract_tests::partition_collection_retains_typed_cause_and_releases_stream ... ok
+test execution::context::tests::test_aggregate_query ... ok
+test distributed::coordinator::tests::a_dead_node_fails_the_query_and_names_it ... ok
+test execution::context::tests::test_limit_query ... ok
+test distributed::shard::tests::sub_row_group_ranges_cover_every_row_once ... ok
+test execution::expression_memory::tests::expression_scope_never_leaks_into_another_thread ... ok
+test execution::memory::prepaid_tests::nested_progress_credit_composes_with_hard_prepaid_limits ... ok
+test execution::context::tests::test_simple_query ... ok
+test distributed::plan::tests::every_unsupported_shape_is_named_in_its_rejection ... ok
+test execution::memory::prepaid_tests::prepaid_input_capacity_survives_full_sibling_usage_and_buffer_lifetime ... ok
+test execution::memory::prepaid_tests::prepaid_refusal_is_transactional_and_releases_the_lifetime_owner ... ok
+test execution::memory::prepaid_tests::progress_credit_grows_releases_and_preserves_minimum ... ok
+test execution::context::tests::bounded_partition_merge_preserves_every_row_at_every_concurrency_limit ... ok
+test execution::memory::tests::default_spill_path_is_disambiguated_by_pid ... ok
+test execution::memory::prepaid_tests::output_credit_returns_only_after_prepaid_capacity_is_available ... ok
+test execution::memory::tests::peak_is_a_high_water_mark_not_the_residual ... ok
+test execution::memory::tests::test_execution_config ... ok
+test execution::memory::tests::test_memory_pool ... ok
+test execution::memory::tests::test_parse_memory_size ... ok
+test execution::memory::tests::test_resize_reservation ... ok
+test execution::memory::tests::test_resolve_process_mem_cap ... ok
+test execution::memory::tests::test_spill_tracking ... ok
+test distributed::gather::tests::q2_pruning_keeps_every_mentioned_column ... ok
+test execution::reserved_scalar::decode::tests::decode_admission_and_partial_allocator_failure_release_every_owner ... ok
+test execution::reserved_scalar::decode::tests::decoded_payload_owns_nested_values_and_retained_type_metadata ... ok
+test execution::reserved_scalar::decode::tests::malformed_wire_is_validated_before_admission_or_payload_construction ... ok
+test execution::reserved_scalar::tests::exact_scalar_bits_and_timestamp_metadata_survive_copy ... ok
+test execution::reserved_scalar::decode::tests::decoder_accounts_for_retained_schema_and_bounds_nested_input ... ok
+test execution::reserved_scalar::tests::retained_type_metadata_and_excessive_depth_are_accounted ... ok
+test execution::reserved_scalar::tests::selected_payload_owner_survives_source_and_shared_transfer ... ok
+test execution::reserved_scalar::decode::tests::decoding_keeps_selected_float_bits_full_decimal_and_timestamp_domain ... ok
+test execution::reserved_vec::tests::consuming_iterator_retains_payload_lease_through_partial_and_full_drain ... ok
+test execution::reserved_vec::tests::failed_initialization_destroys_only_partial_append ... ok
+test execution::reserved_vec::tests::capacity_refusal_does_not_consume_lazy_initializer ... ok
+test execution::reserved_vec::tests::refusal_does_not_initialize_or_move_existing_values ... ok
+test execution::reserved_vec::tests::moves_drop_bearing_values_and_charges_growth_peak ... ok
+test execution::reserved_vec::tests::zero_sized_values_have_no_payload_charge_and_checked_length ... ok
+test execution::reserved_scalar::tests::replacement_denial_keeps_old_value_and_releases_partial_admission ... ok
+test execution::reserved_scalar::tests::payload_failure_drops_partial_copy_before_releasing_reservation ... ok
+test execution::retained_batch::tests::ledger_refuses_before_allocation_and_unknown_layout_stays_conservative ... ok
+test execution::retained_batch::tests::shared_slices_keep_full_backing_charge_once ... ok
+test execution::retained_batch::tests::independent_allocations_and_shared_validity_are_distinguished ... ok
+test execution::topology::tests::container_without_sysfs_degrades_to_uniform_single_node ... ok
+test execution::retained_batch::tests::real_mapped_ipc_columns_share_one_full_file_extent ... ok
+test execution::expression_memory::tests::expression_scope_restores_nested_and_unwinding_callers ... ok
+test execution::topology::tests::cpulist_parsing_handles_ranges_singletons_and_junk ... ok
+test execution::memory::prepaid_tests::progress_credit_concurrent_growth_and_release_is_exact ... ok
+test execution::topology::tests::arm_cpu_capacity_is_used_when_cpufreq_is_absent ... ok
+test execution::topology::tests::partial_frequency_information_refuses_to_rank ... ok
+test execution::topology::tests::preferred_node_round_robins_across_sockets ... ok
+test execution::topology::tests::hybrid_weights_are_derived_not_hardcoded ... ok
+test execution::topology::tests::no_online_file_falls_back_to_enumerating_cpu_dirs ... ok
+test execution::topology::tests::hybrid_order_is_fast_cores_then_slow_cores_then_hyperthreads ... ok
+test execution::topology::tests::real_machine_topology_is_self_consistent ... ok
+test execution::topology::tests::two_socket_numa_is_parsed ... ok
+test execution::topology::tests::work_proportional_fanout_never_exceeds_work_or_pool ... ok
+test metastore::gravitino::tests::dechunk_reassembles_a_two_chunk_body ... ok
+test metastore::gravitino::tests::https_is_refused_by_name ... ok
+test metastore::gravitino::tests::http_get_speaks_http_1_1_to_a_real_socket ... ok
+test metastore::gravitino::tests::local_path_accepts_gravitinos_normalizations ... ok
+test execution::topology::tests::two_socket_order_fills_physical_cores_alternating_sockets ... ok
+test metastore::tests::test_parse_data_type ... ok
+test optimizer::cost::tests::classify_collapsed_range_on_large_relation_as_degenerate ... ok
+test optimizer::cost::tests::classify_missing_ndv_as_missing ... ok
+test optimizer::cost::tests::classify_real_ndv_as_ok ... ok
+test optimizer::cost::tests::classify_singleton_ndv_on_small_dimension_table_is_not_degenerate ... ok
+test optimizer::cost::tests::classify_zero_ndv_as_degenerate ... ok
+test metastore::gravitino::tests::unsupported_catalog_types_are_refused_by_name ... ok
+test optimizer::cost::tests::test_filter_reduces_rows ... ok
+test optimizer::cost::tests::test_scan_cost ... ok
+test optimizer::cost::tests::untrustworthy_stats_reason_strings_are_distinct ... ok
+test optimizer::round_convergence_contract_tests::a_real_round_change_requires_another_round ... ok
+test optimizer::round_convergence_contract_tests::inverse_rules_stop_after_a_complete_unchanged_round_and_final_rule_runs_once ... ok
+test optimizer::rules::constant_folding::tests::constant_integer_overflow_is_deferred_without_panicking ... ok
+test optimizer::rules::constant_folding::tests::test_fold_and_true ... ok
+test optimizer::rules::constant_folding::tests::test_fold_arithmetic ... ok
+test optimizer::rules::constant_folding::tests::test_fold_comparison ... ok
+test optimizer::rules::constant_folding::tests::test_fold_or_false ... ok
+test optimizer::rules::derive_or_predicates::structural_or_identity_contract::distinct_columns_with_equal_display_do_not_create_false_implication ... ok
+test optimizer::rules::derive_or_predicates::structural_or_identity_contract::displayed_existing_conjunct_does_not_hide_another_columns_derivation ... ok
+test optimizer::rules::constant_folding::tests::constant_casts_use_execution_types_and_preserve_failures ... ok
+test execution::topology::tests::two_socket_restricted_to_one_socket_hides_the_other_node ... ok
+test optimizer::rules::derive_or_predicates::structural_or_identity_contract::first_occurrence_order_is_stable_across_repeated_rewrites ... ok
+test optimizer::rules::derive_or_predicates::structural_or_identity_contract::implication_preserves_filter_truth_across_constraint_shapes_and_nulls ... ok
+test optimizer::rules::derive_or_predicates::structural_or_identity_contract::one_structural_column_in_every_branch_still_derives ... ok
+test optimizer::rules::eager_aggregation::semantic_domain_tests::floating_scalar_multiplication_is_not_moved_after_sum ... ok
+test optimizer::rules::eager_aggregation::semantic_domain_tests::structural_domains_pack_and_single_int32_key_is_widened ... ok
+test optimizer::rules::eager_aggregation::semantic_domain_tests::estimated_key_ranges_never_establish_packing_or_alias_lineage ... ok
+test optimizer::rules::flatten_dependent_join::tests::test_flatten_exists ... ignored
+test optimizer::rules::having_total_cse::typed_having_substitution_contract_tests::having_total_substitution_cannot_replace_scale_two_with_scale_one ... ok
+test optimizer::rules::having_total_cse::typed_having_substitution_contract_tests::identical_scale_having_cse_preserves_inferred_output_type ... ok
+test optimizer::rules::eager_aggregation::semantic_domain_tests::zero_null_estimate_does_not_override_nullable_factor_schema ... ok
+test optimizer::rules::packed_group_keys::tests::computed_alias_cannot_inherit_base_column_range ... ok
+test optimizer::rules::packed_group_keys::tests::estimates_do_not_prove_signed_bounds_or_null_freedom ... ok
+test optimizer::rules::packed_group_keys::tests::explicit_predicates_prove_nonnegative_nonnull_int32_keys ... ok
+test optimizer::rules::join_reorder::tests::dpsize_handles_a_relation_with_empty_column_stats ... ok
+test optimizer::rules::packed_group_keys::tests::identity_alias_preserves_only_proven_input_bounds ... ok
+test optimizer::rules::join_reorder::tests::test_reorder_simple ... ok
+test optimizer::rules::packed_group_keys::tests::inexact_literal_and_disjunction_do_not_narrow_integer_domains ... ok
+test optimizer::rules::packed_group_keys::tests::packing_radix_never_wraps_or_emits_negative_multiplier ... ok
+test optimizer::rules::packed_group_keys::tests::outer_join_null_extension_cannot_use_base_null_counts ... ok
+test optimizer::rules::packed_join_keys::tests::declines_outer_joins_and_wrong_arity ... ok
+test optimizer::rules::packed_join_keys::tests::computed_alias_and_outer_subtree_do_not_inherit_named_stats ... ok
+test optimizer::rules::packed_join_keys::tests::declines_without_proof ... ok
+test optimizer::rules::packed_join_keys::tests::name_only_statistics_are_not_proof_for_an_unresolved_column ... ok
+test optimizer::rules::packed_join_keys::tests::packs_integer_type_domains_without_statistics ... ok
+test optimizer::rules::predicate_pushdown::idempotent_destination_contract_tests::nullable_atom_dedup_preserves_first_occurrence_order ... ok
+test optimizer::rules::predicate_pushdown::idempotent_destination_contract_tests::equal_display_different_literal_types_are_not_merged ... ok
+test optimizer::rules::predicate_pushdown::idempotent_destination_contract_tests::volatile_occurrences_are_not_merged ... ok
+test optimizer::rules::predicate_pushdown::tests::test_pushdown_through_project ... ok
+test optimizer::rules::predicate_pushdown::tests::test_pushdown_to_scan ... ok
+test optimizer::rules::projection_pushdown::projection_composition_contract_tests::ambiguous_identity_is_not_collapsed ... ok
+test optimizer::rules::projection_pushdown::tests::test_projection_pushdown ... ok
+test optimizer::rules::subquery_decorrelation::tests::test_decorrelate_exists ... ok
+test optimizer::rules::vector_search::tests::dot_product_needs_desc_and_l2_needs_asc ... ok
+test optimizer::rules::vector_search::tests::matches_canonical_cosine_shape ... ok
+test optimizer::rules::projection_pushdown::projection_composition_contract_tests::equal_column_expressions_require_identity_indices_and_exact_schema ... ok
+test optimizer::rules::vector_search::tests::nulls_first_is_refused ... ok
+test optimizer::rules::vector_search::tests::ordinary_top_n_is_untouched ... ok
+test optimizer::rules::vector_search::tests::refuses_on_dimension_mismatch ... ok
+test optimizer::rules::projection_pushdown::projection_composition_contract_tests::repeated_filter_scan_pruning_still_collapses_passthrough ... ok
+test optimizer::rules::vector_search::tests::refuses_when_a_filter_sits_between_sort_and_scan ... ok
+test optimizer::rules::vector_search::tests::refuses_without_limit_or_with_extra_keys ... ok
+test optimizer::rules::vector_search::tests::unused_column_helper_is_exercised ... ok
+test optimizer::rules::vector_search::tests::scan_filter_becomes_the_prefilter ... ok
+test distributed::coordinator::tests::the_distribution_report_adds_up ... ok
+test optimizer::tests::test_optimizer_basic ... ok
+test parser::tests::test_parse_error ... ok
+test parser::tests::test_parse_aggregate ... ok
+test parser::tests::test_parse_simple_select ... ok
+test parser::tests::test_parse_join ... ok
+test parser::tests::test_parse_select_with_where ... ok
+test optimizer::rules::projection_pushdown::projection_composition_contract_tests::repeated_computed_projection_is_not_idempotent ... ok
+test physical::compiled_expr::decimal::tests::exact_scaled_order_covers_signs_extremes_and_fractional_digits ... ok
+test physical::compiled_expr::compiled_qualified_identity_contract::compiled_loader_preserves_distinct_columns_with_colliding_display ... ok
+test physical::compiled_expr::numeric_coercion_tests::unsupported_numeric_domains_and_physical_encodings_decline ... ok
+test physical::compiled_expr::numeric_coercion_tests::rounded_decimal_float_equality_is_not_exact_decimal_ordering ... ok
+test physical::compiled_expr::tests::admitted_boolean_truth_tables_and_survivors_are_exact ... ok
+test execution::context::tests::test_sort_query ... ok
+test physical::compiled_expr::decimal::tests::admitted_decimal_predicates_preserve_mixed_scales_nulls_and_slices ... ok
+test physical::compiled_expr::tests::admitted_null_list_and_mixed_boolean_survivors_are_exact ... ok
+test metastore::gravitino::tests::relational_catalog_registers_iceberg_tables ... ok
+test physical::compiled_expr::tests::admitted_schema_decline_is_distinct_from_memory_refusal ... ok
+test physical::compiled_expr::tests::admitted_like_reuses_allocation_free_matching_with_unicode_null_semantics ... ok
+test physical::compiled_expr::tests::reserved_compilation_refuses_before_construction_and_retains_program_charge ... ok
+test physical::compiled_expr::tests::admitted_masks_refuse_cleanly_and_retain_extracted_owners ... ok
+test physical::compiled_expr::tests::out_of_subset_shapes_decline ... ok
+test physical::compiled_expr::numeric_coercion_tests::mixed_float_domains_match_independent_arrow_coercion ... ok
+test physical::dense_domain::tests::boundary_domains_and_observed_keys_are_checked_independently ... ok
+test physical::dense_domain::tests::full_signed_domain_cannot_wrap_to_empty_layout ... ok
+test physical::fixed_width_output::tests::exact_schema_owner_is_used_and_invalid_contracts_decline ... ok
+test physical::gpu::duplicate_gpu_upload_contract_tests::computed_extrema_decline_without_disabling_sum_avg_fusion ... ok
+test physical::gpu::duplicate_gpu_upload_contract_tests::delayed_duplicate_column_and_codes_jobs_do_not_change_resident_bytes ... ignored, requires actual CUDA; run alone under capped wrapper
+test physical::gpu::duplicate_gpu_upload_contract_tests::replacement_bytes_remove_old_entry_and_check_before_mutating ... ok
+test physical::compiled_expr::tests::reserved_compile_depth_and_node_limits_decline_without_admission ... ok
+test physical::gpu::exact_gpu_cache_identity_tests::equal_schema_memory_tables_have_distinct_exact_value_keys ... ok
+test physical::fixed_width_output::tests::exact_decimal_date_null_and_empty_values_survive ... ok
+test physical::gpu::exact_gpu_cache_identity_tests::exact_version_bytes_and_full_file_lists_are_part_of_equality ... ok
+test physical::gpu::exact_gpu_cache_identity_tests::codes_and_queue_keys_do_not_alias_delimiter_collisions ... ok
+test physical::gpu::gpu_partition_contract_tests::cpu_choice_preserves_all_declared_partitions ... ok
+test physical::gpu::exact_gpu_cache_identity_tests::strong_owner_releases_after_rows_mirrors_queued_jobs_and_keys_are_removed ... ok
+test physical::gpu::gpu_partition_contract_tests::gpu_wrapper_rejects_invalid_and_zero_declared_partitions ... ok
+test physical::compiled_expr::numeric_coercion_tests::between_reuses_conversion_and_preserves_kleene_logic_across_chunks ... ok
+test physical::gpu::exact_gpu_cache_identity_tests::resident_memory_planning_is_positive_but_mixed_remains_declined ... ok
+test physical::gpu::gpu_partition_contract_tests::ready_gpu_wrapper_preserves_nonzero_cpu_partitions ... ok
+test physical::gpu::resident_count_star_contract::resident_count_star_with_sum_prepares_and_executes_on_device ... ignored, requires actual CUDA; run alone under capped wrapper
+test physical::gpu::resident_count_star_contract::wildcard_is_only_admitted_as_nondistinct_count_argument ... ok
+test physical::gpu::gpu_partition_contract_tests::ready_multi_output_partition_zero_does_not_enter_cuda ... ok
+test physical::gpu::resident_engine_contract_tests::failed_worker_dispatch_has_evidence_and_never_cpu_success ... ok
+test physical::gpu::resident_engine_contract_tests::immutable_layout_rejects_nullable_grouping_before_upload ... ok
+test physical::gpu::resident_engine_contract_tests::required_request_rejects_zero_multiple_and_multi_partition_gpu_execution ... ok
+test physical::gpu::resident_engine_contract_tests::public_request_rejects_sql_mismatch_with_failure_evidence ... ok
+test physical::gpu::resident_hardware_lifecycle_contract::resident_hardware_ack_conflict_release_and_stale_messages_preserve_new_session ... ignored, requires real CUDA device; run alone under capped wrapper with GPU enabled
+test physical::gpu::resident_engine_contract_tests::required_operator_dispatch_consumes_acknowledged_output_with_exact_evidence ... ok
+test physical::gpu::resident_scalar_edge_hardware_contracts::all_filtered_grouped_aggregate_stays_zero_rows_on_device ... ignored, requires actual CUDA; run alone under capped wrapper
+test physical::gpu::resident_engine_contract_tests::typed_plan_match_requires_same_provider_float_bits_aggregate_and_schema ... ok
+test physical::gpu::resident_scalar_edge_hardware_contracts::all_filtered_scalar_sum_count_retains_null_and_zero_row_on_device ... ignored, requires actual CUDA; run alone under capped wrapper
+test physical::gpu::resident_scalar_edge_hardware_contracts::all_nan_scalar_min_max_must_not_become_infinities_on_device ... ignored, requires actual CUDA; run alone under capped wrapper
+test physical::gpu::resident_scalar_edge_hardware_contracts::empty_scalar_sum_count_retains_null_and_zero_row_on_device ... ignored, requires actual CUDA; run alone under capped wrapper
+test physical::gpu::resident_scalar_edge_hardware_contracts::nonfinite_numeric_uploads_decline_and_finite_extremes_remain_supported ... ok
+test physical::gpu::resident_substrate_tests::acknowledged_prepare_waits_for_worker_and_lease_drop_releases ... ok
+test physical::gpu::resident_substrate_tests::minimum_int64_upload_domain_is_explicitly_unsupported ... ok
+test physical::gpu::resident_substrate_tests::dropped_prepare_future_cancels_already_enqueued_work ... ok
+test physical::gpu::resident_substrate_tests::own_cancelled_run_is_rejected_and_retired_without_touching_other_tokens ... ok
+test physical::gpu::resident_substrate_tests::stale_run_failure_and_release_do_not_retire_current_session ... ok
+test physical::gpu::resident_substrate_tests::resident_run_uses_session_only_and_propagates_failure_without_cpu_path ... ok
+test physical::gpu::sum_output_domain_contract_tests::resident_integer_sum_refuses_before_inexact_device_reduction ... ignored, requires actual CUDA; run alone under capped wrapper
+test physical::gpu::sum_output_domain_contract_tests::domain_uses_aggregate_field_offset_and_keeps_count_and_direct_extrema ... ok
+test physical::gpu::resident_substrate_tests::worker_shutdown_is_terminal_and_preparation_owner_released ... ok
+test physical::gpu::sum_output_domain_contract_tests::sum_requires_exact_float64_output_not_individually_exact_integer_inputs ... ok
+test physical::gpu::tests::cache_budget_defaults_when_unset ... ok
+test physical::gpu::tests::cache_budget_falls_back_on_garbage_or_zero ... ok
+test physical::gpu::tests::cache_budget_parses_a_valid_value ... ok
+test physical::gpu::tests::cache_new_starts_empty ... ok
+test physical::gpu::tests::snapshot_display_includes_every_field ... ok
+test physical::morsel::tests::test_morsel_creation ... ok
+test physical::morsel_agg::admitted_output::optional_validity_regressions::actual_all_valid_output_needs_no_bitmap_admission ... ok
+test physical::morsel_agg::admitted_output::optional_validity_regressions::empty_all_valid_payload_keeps_extracted_buffer_owner ... ok
+test physical::morsel_agg::admitted_output::optional_validity_regressions::optional_validity_preserves_values_nested_nulls_and_extracted_ownership ... ok
+test physical::morsel_agg::admitted_output::tests::borrowed_strings_preserve_values_ownership_and_denial_cleanup ... ok
+test physical::gpu::resident_engine_contract_tests::preflight_rejects_cte_subqueries_and_zero_gpu_before_device_access ... ok
+test physical::morsel_agg::admitted_output::tests::output_denial_and_invalid_schema_preserve_groups_and_release_partial_buffers ... ok
+test physical::morsel_agg::admitted_output::tests::null_boolean_and_float_outputs_preserve_logical_nulls_and_selected_bits ... ok
+test physical::morsel_agg::decimal_output_tests::decimal_output_conversion_errors_are_terminal_and_release_buffers ... ok
+test physical::morsel_agg::admitted_output::tests::output_survives_state_drop_and_arrow_data_clones_with_exact_values ... ok
+test physical::morsel_agg::admitted_output::tests::unsigned_sum_preserves_values_above_float_precision_and_checks_output_overflow ... ok
+test physical::morsel_agg::decimal_output_tests::decimal_output_exact_rescaling_nulls_and_lease_lifetime ... ok
+test execution::context::tests::test_group_by_query ... ok
+test physical::morsel_agg::decimal_output_tests::decimal_output_empty_global_and_grouped_keep_sql_cardinality ... ok
+test physical::morsel_agg::decimal_output_tests::decimal_output_overflow_is_not_hidden_by_discarding_having ... ok
+test physical::morsel_agg::admitted_output::tests::controller_emits_empty_global_and_exact_unsigned_spill_results ... ok
+test physical::morsel_agg::decimal_output_tests::decimal_output_refuses_before_iteration_and_releases_partial_admission ... ok
+test physical::morsel_agg::dict_accessor_tests::all_null_group_is_present_even_when_aggregates_saw_no_values ... ok
+test physical::morsel_agg::dict_accessor_tests::decimal_accessor_keeps_exact_sum_and_null_state ... ok
+test physical::morsel_agg::dict_accessor_tests::dictionary_combined_keys_with_extreme_integers_fall_back_exactly ... ok
+test physical::morsel_agg::dict_accessor_tests::all_null_group_survives_ingest_and_merge_stride_changes ... ok
+test physical::morsel_agg::dict_accessor_tests::dictionary_combined_logical_null_tuples_match_generic_groups ... ok
+test physical::morsel_agg::dict_accessor_tests::dictionary_group_keys_match_plain_strings ... ok
+test metastore::tests::test_metastore_client_creation ... ok
+test physical::morsel_agg::decimal_output_tests::decimal_output_parallel_finalizers_share_query_budget_and_cleanup ... ok
+test physical::morsel_agg::dict_accessor_tests::morsel_group_normalization_preserves_only_supported_dictionary_encoding ... ok
+test physical::morsel_agg::dict_accessor_tests::raw_sum_nullable_batches_keep_unseen_groups_boxed ... ok
+test physical::morsel_agg::fixed_cell::tests::compact_cells_preserve_fixed_frames_and_float_bits ... ok
+test physical::morsel_agg::dict_accessor_tests::null_sentinel_does_not_merge_negative_integer_groups ... ok
+test physical::morsel_agg::float_extrema_tests::float_extrema_update_and_merge_obey_the_same_sql_order ... ok
+test physical::morsel_agg::group_rows::arrow_ingestion_tests::evaluated_cursor_rolls_back_late_denial_and_resumes_without_duplicate_updates ... ok
+test physical::morsel_agg::group_rows::arrow_ingestion_tests::evaluated_empty_batches_validate_schema_and_selected_float_bits_survive ... ok
+test physical::morsel_agg::group_rows::arrow_ingestion_tests::evaluated_ingestion_preserves_exact_values_and_borrowed_selected_payloads ... ok
+test distributed::coordinator::tests::a_pass_through_query_returns_every_row_exactly_once ... ok
+test physical::morsel_agg::group_rows::tests::clearing_group_rows_releases_selected_payloads_and_reuses_capacity ... ok
+test physical::morsel_agg::domain_tests::full_signed_domain_shared_decimal_and_bare_float_merges_use_hash_routing ... ok
+test physical::morsel_agg::fixed_cell::tests::direct_updates_match_checked_general_state_after_every_input ... ok
+test physical::morsel_agg::group_rows::tests::failed_or_discarded_new_rows_never_publish_an_index_entry ... ok
+test physical::morsel_agg::group_rows::tests::grouped_wire_preserves_partial_algebra_and_selected_bits_under_pressure ... ok
+test physical::morsel_agg::group_rows::tests::indexed_partial_merge_preserves_counts_weights_and_payload_ownership ... ok
+test physical::morsel_agg::group_rows::tests::merge_checks_full_keys_before_changing_aggregate_state ... ok
+test physical::compiled_expr::tests::compiled_masks_equal_interpreted_masks ... ok
+test physical::morsel_agg::group_rows::tests::restored_rows_round_trip_partial_states_and_commit_only_once ... ok
+test physical::morsel_agg::group_rows::tests::state_denial_rolls_back_an_already_appended_key ... ok
+test physical::morsel_agg::ingestion_controller::tests::in_memory_finish_does_not_spill_duplicates_at_the_group_limit ... ok
+test physical::morsel_agg::ingestion_controller::tests::invalid_selection_is_rejected_before_applying_its_valid_prefix ... ok
+test physical::compiled_expr::tests::admitted_string_comparisons_membership_and_nulls_match_oracles ... ok
+test physical::morsel_agg::ingestion_controller::tests::unsplittable_row_refuses_once_and_failed_ingestion_cannot_finalize ... ok
+test physical::morsel_agg::group_rows::tests::restore_rejects_malformed_late_slots_before_admission_and_rolls_back_pressure ... ok
+test physical::morsel_agg::group_rows::tests::collision_chains_reuse_only_exact_groups_even_with_a_full_pool ... ok
+test physical::morsel_agg::ingestion_cursor_tests::resumed_offsets_cover_perfect_dictionary_generic_and_global_updates ... ok
+test physical::morsel_agg::input_frontier::tests::admitted_frontier_overlaps_and_preserves_empty_prefixes_and_owners ... ok
+test physical::morsel_agg::input_frontier::tests::bad_pool_or_partition_count_refuses_before_any_pull ... ok
+test physical::morsel_agg::ingestion_cursor_tests::perfect_to_raw_migration_resumes_without_replaying_applied_rows ... ok
+test physical::morsel_agg::input_frontier::tests::cancellation_releases_tasks_but_keeps_consumer_buffers ... ok
+test physical::morsel_agg::input_frontier::tests::computed_projection_preserves_admitted_parallel_pulls_and_exact_rows ... ok
+test physical::morsel_agg::ingestion_cursor_tests::raw_admission_returns_exact_cursor_before_first_row_and_inside_batch ... ok
+test physical::morsel_agg::input_frontier::tests::metadata_denial_starts_no_producer_and_releases_preparation ... ok
+test physical::morsel_agg::input_frontier::tests::one_partition_preserves_admission_without_copy_envelope ... ok
+test physical::morsel_agg::input_frontier::tests::late_error_shutdown_reaps_admitted_streams_without_replay ... ok
+test physical::morsel_agg::key_rows::arrow_input::tests::arrow_key_admission_and_invalid_rows_never_expose_previous_key ... ok
+test physical::morsel_agg::key_rows::arrow_input::tests::borrowed_arrow_keys_match_scalar_wire_values_and_sliced_offsets ... ok
+test physical::morsel_agg::key_rows::arrow_input::tests::borrowed_inline_checks_before_consuming_and_never_replays_errors ... ok
+test physical::morsel_agg::key_rows::arrow_input::tests::dictionary_index_widths_resolve_values_and_both_null_kinds ... ok
+test physical::morsel_agg::key_rows::arrow_input::tests::inline_dictionary_values_and_admitted_fallbacks_stay_distinct ... ok
+test physical::morsel_agg::key_rows::arrow_input::tests::inline_fixed_inputs_preserve_widths_nulls_and_slices ... ok
+test physical::morsel_agg::key_rows::arrow_input::tests::inline_float_values_keep_noncanonical_bits ... ok
+test physical::morsel_agg::key_rows::arrow_input::tests::logical_null_arrays_and_timestamp_domains_are_preserved ... ok
+test physical::morsel_agg::key_rows::bound_arrays::tests::bound_key_admission_identity_and_errors_do_not_publish_stale_keys ... ok
+test physical::morsel_agg::key_rows::bound_arrays::tests::bound_keys_canonicalize_float_bits_and_check_dictionary_values ... ok
+test physical::morsel_agg::key_rows::bound_arrays::tests::bound_primitive_keys_preserve_independent_bytes_and_sliced_nulls ... ok
+test physical::morsel_agg::key_rows::bound_arrays::tests::bound_utf8_representation_checks_are_per_batch_not_per_row ... ok
+test physical::morsel_agg::key_rows::preparation_benchmark::measure_retained_key_preparation ... ignored, optimized key-preparation component measurement; run explicitly with --release
+test physical::morsel_agg::key_rows::tests::composite_boundaries_nulls_and_sql_float_equivalence_are_exact ... ok
+test physical::morsel_agg::key_rows::tests::encoded_import_denial_invalidates_old_key_and_nested_empty_values_round_trip ... ok
+test physical::morsel_agg::key_rows::tests::encoded_import_preserves_exact_keys_without_free_pool_memory ... ok
+test physical::morsel_agg::input_frontier::tests::copied_frontier_preserves_downstream_workspace_and_all_partitions ... ok
+test physical::morsel_agg::key_rows::tests::encoded_import_rejects_noncanonical_and_malformed_values_before_admission ... ok
+test physical::morsel_agg::decimal_output_tests::decimal_output_raw_general_and_perfect_paths_match_integer_oracle ... ok
+test physical::morsel_agg::key_rows::tests::exact_domains_and_nested_float_keys_preserve_bound_identity ... ok
+test physical::morsel_agg::key_rows::tests::global_and_null_keys_are_valid_and_unsupported_encodings_refuse_binding ... ok
+test physical::morsel_agg::live_spill::ownership_selection_tests::explicit_ownership_selection_rejects_unknown_modes ... ok
+test physical::morsel_agg::key_rows::tests::partial_growth_and_failed_encoding_do_not_publish_a_key ... ok
+test physical::morsel_agg::key_rows::tests::framed_read_admits_before_io_and_never_publishes_a_partial_key ... ok
+test physical::morsel_agg::migration_admission_tests::bare_sum_to_arena_migration_survives_admission_denial ... ok
+test physical::morsel_agg::migration_admission_tests::generic_to_raw_migration_survives_admission_denial ... ok
+test execution::context::tests::test_filter_query ... ok
+test execution::context::tests::sql_records_plans_tables_and_batches ... ok
+test physical::morsel_agg::dict_accessor_tests::dictionary_value_nulls_group_with_key_nulls_and_are_not_counted ... ok
+test physical::morsel_agg::output_quantum::tests::complete_ranges_preserve_exact_values_short_tail_and_retained_slices ... ok
+test physical::morsel_agg::parallel_controllers::tests::empty_and_large_single_owner_batches_avoid_parallel_dispatch ... ok
+test physical::morsel_agg::output_quantum::tests::actual_admission_pressure_shrinks_without_reapplying_groups ... ok
+test physical::morsel_agg::group_rows::tests::canonical_hash_metadata_growth_stays_within_the_pinned_bound ... ok
+test physical::morsel_agg::parallel_controllers::tests::populated_then_spilled_workers_never_revert_to_startup_ownership ... ok
+test physical::morsel_agg::parallel_controllers::tests::startup_admission_can_choose_one_worker_and_cleans_abandoned_sets ... ok
+test physical::morsel_agg::parallel_controllers::tests::partial_startup_fallback_releases_abandoned_merge_and_workers ... ok
+test distributed::shard::tests::shards_partition_the_table_exactly ... ok
+test physical::morsel_agg::partial_merge::tests::foreign_partial_poison_prevents_any_final_publication ... ok
+test physical::morsel_agg::partial_merge::tests::inconsistent_spool_extent_cannot_publish_partial_results ... ok
+test physical::morsel_agg::partial_merge::tests::invalid_selection_rejects_before_applying_a_valid_prefix ... ok
+test physical::morsel_agg::parallel_merge::tests::parallel_reduction_denial_poison_and_output_failure_release_owners ... ok
+test physical::morsel_agg::partial_merge::tests::startup_denial_and_empty_global_merge_release_all_owners ... ok
+test physical::morsel_agg::parallel_controllers::tests::unused_partial_workers_release_headroom_for_same_retained_input ... ok
+test physical::morsel_agg::partition_scheduler::tests::one_group_keeps_merging_duplicates_at_the_group_limit_and_output_error_cleans_up ... ok
+test physical::morsel_agg::parallel_controllers::tests::partial_owners_merge_dictionary_values_across_codebooks ... ok
+test physical::morsel_agg::partition_scheduler::tests::unsplittable_partition_preserves_the_typed_memory_refusal ... ok
+test physical::morsel_agg::partition_scheduler::tests::scheduler_splits_and_emits_every_exact_group_once_across_runs ... ok
+test physical::morsel_agg::partial_merge::tests::overlapping_partials_merge_exact_states_in_memory_and_through_spool ... ok
+test physical::morsel_agg::prepared_keys::tests::dictionary_codebooks_nulls_and_float_keys_keep_canonical_owners ... ok
+test physical::morsel_agg::prepared_keys::tests::exact_identity_empty_input_and_admission_fallback_release_owners ... ok
+test physical::morsel_agg::prepared_input_tests::slices_preserve_evaluated_draws_and_exact_partial_values ... ok
+test physical::morsel_agg::raw_state::tests::arena_merges_exact_values_and_keeps_heap_bearing_states ... ok
+test physical::morsel_agg::raw_state::tests::failed_shard_admission_cleans_up_both_original_and_partial_shards ... ok
+test physical::morsel_agg::raw_state::tests::child_and_parent_refusals_release_all_arena_storage ... ok
+test physical::morsel_agg::raw_state::tests::flat_shards_preserve_each_key_state_and_ownership ... ok
+test physical::morsel_agg::prepared_keys::tests::parallel_chunks_preserve_every_row_and_release_on_pressure ... ok
+test physical::morsel_agg::raw_state::tests::malformed_arity_refuses_without_publishing_group ... ok
+test physical::morsel_agg::raw_state::tests::repeated_keys_need_no_new_reservation_or_initializer ... ok
+test physical::morsel_agg::repartition::tests::checked_split_plan_proves_two_nonempty_children_and_releases_scan_memory ... ok
+test physical::morsel_agg::repartition::tests::failed_repartition_removes_children_and_preserves_source_for_retry ... ok
+test physical::morsel_agg::repartition::tests::equal_key_runs_and_empty_runs_decline_splitting_but_check_all_frames ... ok
+test physical::morsel_agg::raw_state::tests::hash_metadata_bound_covers_real_pinned_growth ... ok
+test physical::morsel_agg::repartition::tests::split_is_prefix_safe_and_does_not_depend_on_hash_uniqueness ... ok
+test physical::morsel_agg::row_router::tests::balanced_ranges_cover_all_rows_and_refuse_atomically ... ok
+test physical::morsel_agg::repartition::tests::global_split_finds_keys_between_individually_unsplittable_runs ... ok
+test physical::morsel_agg::row_router::tests::equal_logical_keys_route_together_across_dictionary_codebooks ... ok
+test physical::morsel_agg::row_router::tests::canonical_float_ownership_and_refusal_cleanup ... ok
+test physical::morsel_agg::run_merge::tests::arithmetic_failure_is_terminal_and_does_not_modify_the_destination ... ok
+test physical::morsel_agg::run_merge::tests::destination_denial_retains_staged_state_and_source_file_lifetime ... ok
+test physical::morsel_agg::scalar_state_codec::tests::selected_payload_wire_has_exact_width_and_retains_every_scalar_domain ... ok
+test physical::morsel_agg::run_merge::tests::decode_denial_retains_the_verified_frame_and_merge_is_exactly_once ... ok
+test physical::morsel_agg::selected_state::tests::first_preserves_nested_nulls_and_binding_rejects_unsupported_ordering ... ok
+test physical::morsel_agg::selected_state::tests::decoded_selected_payloads_keep_inline_and_owned_admission_contracts ... ok
+test physical::morsel_agg::selected_state::tests::later_slot_pressure_rolls_back_all_prepared_replacements ... ok
+test physical::morsel_agg::selected_state::tests::merge_shares_winner_without_allocation_and_keeps_its_lease ... ok
+test physical::morsel_agg::selected_state::tests::numeric_slots_update_and_merge_with_no_available_pool_memory ... ok
+test physical::morsel_agg::spill_files::tests::compaction_failure_keeps_original_runs_and_cleans_temporary_files ... ok
+test physical::morsel_agg::spill_files::tests::complete_suffix_loss_and_extra_frames_are_rejected ... ok
+test physical::morsel_agg::spill_files::tests::directory_admission_and_layout_refusal_preserve_foreign_paths ... ok
+test physical::morsel_agg::spill_files::tests::directory_lives_until_the_last_run_reader_and_cleans_up_afterward ... ok
+test physical::morsel_agg::spill_files::tests::failed_or_abandoned_flush_keeps_source_and_preexisting_runs ... ok
+test physical::morsel_agg::spill_files::tests::file_reader_retries_budget_denial_without_consuming_a_frame ... ok
+test physical::morsel_agg::spill_files::tests::incomplete_and_failed_writers_remove_only_their_owned_files ... ok
+test physical::morsel_agg::spill_files::tests::prepared_flush_publishes_before_releasing_groups_even_with_a_full_pool ... ok
+test physical::morsel_agg::spill_files::tests::published_run_survives_handle_drop_and_readers_have_independent_offsets ... ok
+test physical::morsel_agg::spill_files::tests::reader_slot_cannot_skip_an_unread_run_and_resets_without_free_memory ... ok
+test physical::morsel_agg::spill_frames::tests::every_corruption_and_truncation_is_rejected_and_poisoned ... ok
+test physical::morsel_agg::spill_frames::tests::frame_identity_order_and_failed_writer_cannot_be_reused ... ok
+test physical::morsel_agg::repartition::tests::repartition_preserves_every_partial_and_exact_group_routing_with_a_full_pool ... ok
+test physical::morsel_agg::spill_frames::tests::frame_round_trip_rewinds_admission_denial_and_keeps_query_ownership ... ok
+test physical::morsel_agg::spill_io::interrupted_read_tests::interrupted_refill_never_republishes_the_consumed_buffer ... ok
+test physical::morsel_agg::spill_io::tests::partial_flush_failure_is_terminal_and_never_replays_written_prefix ... ok
+test physical::morsel_agg::spill_io::tests::unavailable_optional_buffer_uses_exact_unbuffered_io ... ok
+test physical::morsel_agg::state_codec::tests::admitted_workspace_operates_with_no_remaining_pool_capacity ... ok
+test physical::morsel_agg::state_codec::tests::average_frames_merge_weights_before_division ... ok
+test physical::morsel_agg::state_codec::tests::decimal_intermediate_precision_and_overflow_survive_frames ... ok
+test physical::morsel_agg::state_codec::tests::frames_preserve_float_bits_and_null_state ... ok
+test physical::morsel_agg::state_codec::tests::malformed_frames_and_incompatible_layouts_refuse ... ok
+test physical::morsel_agg::state_codec::tests::whole_fragment_validation_precedes_publication_and_recovers_scratch ... ok
+test physical::morsel_agg::state_codec::tests::workspace_denial_and_failed_io_preserve_ownership_and_errors ... ok
+test physical::morsel_agg::state_rows::array_view::tests::decimal_floating_views_preserve_slices_extremes_and_dictionary_fallback ... ok
+test physical::morsel_agg::state_rows::array_view::tests::views_preserve_extreme_scalar_representations_and_decline_dictionaries ... ok
+test physical::morsel_agg::state_rows::batch_binding_tests::decimal_floating_states_bind_conversion_without_changing_exact_sum ... ok
+test physical::morsel_agg::state_rows::batch_binding_tests::fixed_array_batches_preserve_numeric_domains_and_dictionary_nulls ... ok
+test physical::morsel_agg::state_rows::batch_binding_tests::wide_array_binding_keeps_late_slot_overflow_transactional ... ok
+test physical::morsel_agg::state_rows::tests::bound_arrays_preserve_selection_values_and_reject_foreign_layouts ... ok
+test physical::morsel_agg::state_rows::tests::every_integer_counter_and_sum_checks_update_and_merge_overflow ... ok
+test physical::morsel_agg::state_rows::tests::fixed_rows_use_compact_copyable_cells ... ok
+test physical::morsel_agg::state_rows::tests::later_selected_pressure_cannot_commit_count_or_an_earlier_selection ... ok
+test physical::morsel_agg::state_rows::tests::overflow_and_invalid_layout_leave_the_destination_unchanged ... ok
+test physical::morsel_agg::state_rows::tests::partial_rows_merge_weighted_avg_exact_decimal_and_selected_values ... ok
+test physical::morsel_agg::state_rows::tests::row_write_prevalidates_later_slots_and_preserves_io_error ... ok
+test physical::operators::closed_subquery::tests::closes_local_projection_and_pushed_filter_using_non_emitted_provider_root ... ok
+test physical::operators::closed_subquery::tests::comparison_requires_exact_types_and_no_error_prone_casts ... ok
+test physical::operators::closed_subquery::tests::missing_projected_root_and_bad_projection_or_schema_decline ... ok
+test physical::operators::closed_subquery::tests::outer_domain_ambiguity_and_computed_lhs_decline ... ok
+test physical::operators::closed_subquery::tests::unqualified_rhs_is_resolved_not_assumed_local ... ok
+test physical::operators::closed_subquery::tests::volatile_nested_subquery_and_unknown_plan_nodes_decline ... ok
+test physical::operators::delim_join::tests::test_deduplicate_batch ... ok
+test physical::operators::delim_join::tests::test_delim_state ... ok
+test physical::operators::filter::aggregate_root_reuse_tests::aliases_and_literal_types_are_structural_not_textual ... ok
+test physical::operators::filter::aggregate_root_reuse_tests::all_null_roots_and_metadata_overflow_do_not_invent_values_or_evaluate ... ok
+test physical::operators::filter::aggregate_root_reuse_tests::cast_case_float_and_dictionary_barriers_keep_original_domains ... ok
+test physical::operators::filter::aggregate_root_reuse_tests::decimal_literal_scales_are_part_of_reuse_identity ... ok
+test physical::operators::filter::aggregate_root_reuse_tests::decimal_roots_reuse_exact_nullable_arithmetic_without_new_payload ... ok
+test physical::operators::filter::aggregate_root_reuse_tests::negative_and_mixed_scales_and_batch_boundaries_are_exact ... ok
+test physical::operators::filter::aggregate_root_reuse_tests::normalization_is_ordered_and_only_identity_results_are_reusable ... ok
+test physical::operators::filter::aggregate_root_reuse_tests::precision_overflow_and_scale_domain_fail_before_later_work ... ok
+test physical::operators::filter::scalar_operand_tests::literal_cast_operand_retains_one_value_for_large_and_empty_batches ... ok
+test physical::operators::filter::temporal::tests::extract_calendar_range_errors_and_dictionary_fallback_preserve_null_semantics ... ok
+test physical::morsel_agg::spill_files::tests::bounded_run_accumulation_preserves_partial_weights_through_repeated_compaction ... ok
+test physical::operators::filter::temporal::tests::extract_preserves_independent_calendar_values_nulls_and_slices ... ok
+test physical::operators::filter::temporal::tests::extract_metadata_literal_is_not_expanded_per_row ... ok
+test physical::operators::filter::tests::test_filter_and ... ok
+test physical::operators::filter::tests::test_filter_simple ... ok
+test physical::operators::filter::temporal::tests::extract_retains_admission_after_array_and_expression_drop ... ok
+test physical::morsel_agg::spill_io::tests::small_operations_batch_exactly_and_read_positions_do_not_seek_per_frame ... ok
+test physical::operators::hash_agg::distinct_sum_empty_contract_tests::absent_and_explicitly_empty_distinct_sets_finalize_null ... ok
+test physical::operators::hash_agg::distinct_sum_empty_contract_tests::a_nonempty_zero_distinct_sum_is_valid_zero ... ok
+test physical::operators::hash_agg::aggregate_fallback_pool_tests::retained_partition_outputs_share_query_pool_and_release_on_error ... ok
+test physical::operators::hash_agg::tests::test_scalar_aggregate ... ok
+test physical::operators::hash_agg::tests::test_hash_aggregate_sum ... ok
+test physical::operators::hash_agg::tests::test_hash_aggregate_count ... ok
+test physical::operators::hash_agg::tests::vectorized_float_extrema_obey_sql_order ... ok
+test physical::operators::hash_join::outer_probe::tests::admitted_factory_is_lazy_and_all_partitions_keep_exact_output ... ok
+test physical::operators::hash_join::compiled_float_residual_oracle::compiled_float_residual_matches_independent_sql_oracle ... ok
+test physical::operators::hash_join::outer_probe::tests::admitted_inner_composes_computed_probe_without_outer_match_state ... ok
+test physical::operators::hash_join::outer_probe::tests::admitted_inner_build_orientations_empty_sides_and_multibatch_keys ... ok
+test physical::operators::hash_join::prepared_inner_bound_tests::explicit_small_build_dictionary_schema_and_full_child_are_bounded ... ok
+test physical::operators::hash_join::prepared_inner_bound_tests::unsupported_concat_masks_and_arithmetic_decline ... ok
+test physical::operators::hash_join::row_store_owned_tests::row_store_checked_layout_rejects_overflow_and_global_u32_limit ... ok
+test physical::operators::hash_join::row_store_owned_tests::row_store_exact_bits_signed_types_and_duplicate_multibatch_indices ... ok
+test physical::operators::hash_join::row_store_owned_tests::row_store_real_gather_bound_covers_multibatch_and_nullable_probe_strings ... ok
+test physical::operators::hash_join::row_store_owned_tests::row_store_retained_and_temporary_admission_refusal_and_last_owner_drop ... ok
+test physical::operators::hash_join::row_store_owned_tests::row_store_schema_and_null_rejection_precedes_admission ... ok
+test physical::operators::hash_join::tests::anti_join_batch_parallel_matches_sequential_not_swapped_with_null_build_key ... ok
+test physical::operators::hash_join::tests::anti_join_batch_parallel_matches_sequential_swapped_with_null_build_key ... ok
+test physical::morsel_agg::partition_scheduler::tests::actual_query_budget_pressure_splits_without_an_artificial_group_limit ... ok
+test physical::operators::hash_join::prepared_inner_bound_tests::actual_inner_gathers_masks_orientations_and_repeated_values_obey_maximum ... ok
+test physical::operators::hash_join::tests::index_cost_bound_covers_dense_null_and_extreme_domains ... ok
+test physical::operators::hash_join::tests::inner_semi_anti_left_over_dictionary_keys_are_cell_exact ... ok
+test physical::operators::hash_join::tests::join_index_declines_only_unsupported_domains ... ok
+test physical::operators::hash_join::tests::join_index_owner_survives_operator_until_prepared_streams_drop ... ok
+test physical::operators::hash_join::tests::join_index_refusal_is_not_swallowed_as_fallback ... ok
+test physical::operators::hash_join::tests::join_index_reservation_lifetime_and_parent_contention ... ok
+test execution::context::partition_error_contract_tests::sql_retained_aggregate_refusal_keeps_typed_memory_cause ... ok
+test physical::operators::hash_join::tests::left_join_filtered_pruned_build_parallel_batch_path ... ok
+test physical::operators::hash_join::tests::left_join_reemits_unmatched_build_rows_on_a_second_full_round ... ok
+test physical::operators::hash_join::tests::dictionary_keys_build_a_vectorized_hash_table ... ok
+test physical::morsel_agg::parallel_controllers::tests::peer_resident_state_cannot_starve_spill_compaction ... ok
+test physical::operators::hash_join::tests::semi_join_batch_parallel_matches_sequential_swapped ... ok
+test physical::operators::hash_join::tests::sparse_integer_domain_uses_a_budgeted_hash_index ... ok
+test physical::operators::hash_join::tests::test_anti_join ... ok
+test physical::operators::hash_join::tests::test_inner_join ... ok
+test physical::operators::hash_join::tests::test_left_join_build_right_output_partitions_follow_probe_side ... ok
+test physical::operators::hash_join::tests::test_semi_join ... ok
+test physical::operators::iceberg::tests::test_partition_filter_eq ... ok
+test physical::operators::iceberg::tests::test_partition_filter_in ... ok
+test physical::operators::initialized_membership::real_composition_tests::real_aggregate_filter_inner_prepares_rhs_then_overlaps_probes_exactly_once ... ok
+test physical::operators::initialized_membership::tests::cancelled_initialization_discards_partial_membership_then_retries ... ok
+test physical::operators::initialized_membership::tests::child_failure_and_cancel_drop_owned_streams_without_starting_rhs ... ok
+test physical::operators::initialized_membership::tests::deferred_refusal_empty_batch_is_evaluation_no_batch_is_not ... ok
+test physical::operators::initialized_membership::tests::dictionary_membership_checks_key_and_value_nulls_without_decode ... ok
+test physical::operators::initialized_membership::tests::known_integer_layout_initializes_and_keeps_parallel_bound ... ok
+test physical::operators::initialized_membership::tests::long_retained_identifiers_change_real_admission_and_refuse_cleanly ... ok
+test physical::operators::initialized_membership::tests::mismatched_actual_physical_schema_declines_before_admission ... ok
+test physical::operators::initialized_membership::tests::ordinary_float_fallback_preserves_numeric_coercion_without_type_refusal ... ok
+test physical::operators::initialized_membership::tests::pinned_rhs_singleflight_duplicate_null_and_empty_truth ... ok
+test physical::operators::initialized_membership::tests::retained_identifier_admission_checks_name_and_relation_overflow ... ok
+test physical::operators::initialized_membership::tests::rhs_error_and_empty_identity_precede_physical_lhs_coercion ... ok
+test physical::operators::initialized_membership::tests::unknown_and_rejected_float_layout_preserve_generic_values_and_pinned_snapshot ... ok
+test physical::operators::initialized_membership::tests::unknown_child_keeps_streams_unpulled_and_drop_releases_them ... ok
+test physical::operators::int64_membership::tests::growth_peak_includes_old_and_replacement_capacity ... ok
+test physical::operators::int64_membership::tests::independent_membership_truth_table_empty_null_duplicates_full_i64_domain ... ok
+test physical::operators::int64_membership::tests::insufficient_growth_refuses_before_copy_and_releases_partial_state ... ok
+test physical::operators::int64_membership::tests::lookup_needs_no_budget_and_owner_lives_until_last_arc ... ok
+test physical::fixed_width_output::tests::independent_value_and_validity_offsets_trim_large_parents ... ok
+test physical::operators::int64_membership::tests::metadata_denial_and_checked_overflow_are_explicit ... ok
+test physical::operators::int64_membership::tests::many_single_row_batches_have_logarithmically_many_capacity_changes ... ok
+test physical::operators::int64_membership::tests::sliced_multibatch_input_is_copied_and_deduplicated_without_retaining_array ... ok
+test physical::operators::int64_membership::tests::tight_parent_budget_falls_back_to_minimum_transient_growth ... ok
+test physical::operators::limit::tests::test_limit_fetch ... ok
+test physical::operators::limit::tests::test_limit_skip ... ok
+test physical::operators::morsel_agg::dense_memory_tests::dense_domains_share_parent_admission ... ok
+test physical::operators::limit::tests::test_limit_skip_and_fetch ... ok
+test physical::operators::morsel_agg::dense_memory_tests::dense_layout_is_admitted_before_allocation_and_released_after_drop ... ok
+test physical::operators::morsel_agg::dense_memory_tests::dense_execution_holds_admission_through_accumulation_and_preserves_values ... ok
+test physical::operators::morsel_agg::dense_memory_tests::dense_owner_releases_when_cancelled ... ok
+test physical::operators::morsel_agg::dense_memory_tests::selected_dense_path_refuses_before_scan_and_releases_on_error ... ok
+test physical::operators::morsel_agg::dense_memory_tests::sql_and_planning_time_cte_use_query_admission_domain ... ok
+test physical::operators::native_scan::tests::pruning_applies_on_the_streaming_path ... ok
+test physical::operators::native_scan::tests::deletion_vectors_are_applied_on_the_streaming_path ... ok
+test physical::operators::native_scan::tests::segment_decoding_is_incremental_and_late_errors_are_terminal ... ok
+test physical::operators::parquet::tests::test_parquet_write_read ... ok
+test physical::operators::project::admitted::tests::admitted_projection_has_independent_decimal_temporal_and_try_cast_results ... ok
+test physical::operators::project::admitted::tests::computed_projection_errors_poison_without_a_second_source_pull ... ok
+test physical::operators::project::admitted::tests::unsupported_or_unadmitted_programs_decline_before_preparing_the_child ... ok
+test physical::operators::project::tests::test_project_columns ... ok
+test physical::operators::project::tests::test_project_expression ... ok
+test physical::operators::runtime_filter::tests::hashbrown_allocation_bound_covers_capacity_transitions ... ok
+test physical::operators::runtime_filter::tests::optional_refusal_is_transactional_and_signed_membership_is_exact ... ok
+test physical::operators::runtime_filter::tests::selected_evaluated_key_column_is_complete_or_declines ... ok
+test physical::operators::scan::admitted_memory::contiguous_tests::contiguous_source_fits_without_row_index_staging ... ok
+test physical::operators::native_scan::tests::streams_every_row_across_all_partitions ... ok
+test physical::operators::scan::admitted_memory::quantum_tests::byte_budget_preserves_a_fitting_source_batch_and_splits_under_pressure ... ok
+test physical::operators::scan::admitted_memory::tests::exhausted_input_budget_refuses_without_waiting_for_retained_output ... ok
+test physical::operators::scan::admitted_memory::tests::retained_outputs_do_not_block_source_completion ... ok
+test physical::operators::scan::gather_cache_tests::ordinary_queue_metadata_does_not_initialize_gather_analysis ... ok
+test physical::operators::scan::tests::memory_table_scan_projection_tolerates_declared_vs_actual_dictionary_mismatch ... ok
+test physical::operators::scan::tests::test_memory_scan ... ok
+test physical::operators::scan::tests::test_memory_scan_with_projection ... ok
+test physical::operators::sort::tests::test_sort_ascending ... ok
+test physical::operators::sort::tests::test_sort_descending ... ok
+test physical::operators::spillable::admitted_queue_tests::admitted_cancellation_releases_producers_but_preserves_held_output ... ok
+test physical::operators::spillable::admitted_queue_tests::admitted_late_error_joins_other_producers_without_replay ... ok
+test physical::operators::spillable::admitted_queue_tests::admitted_pulls_overlap_and_output_retains_its_lease ... ok
+test physical::operators::spillable::admitted_queue_tests::admitted_queue_metadata_refusal_starts_no_producers ... ok
+test physical::operators::spillable::admitted_queue_tests::admitted_raw_scan_project_preserves_nulls_duplicates_and_partitions ... ok
+test physical::operators::spillable::admitted_queue_tests::admitted_wrong_pool_is_rejected_before_polling ... ok
+test physical::operators::spillable::admitted_queue_tests::materialized_build_encoding_does_not_replace_declared_join_schema ... ok
+test physical::operators::hash_join::outer_probe::tests::memory_filter_project_outer_pipeline_is_transitively_admitted ... ok
+test physical::operators::spillable::admitted_queue_tests::spillable_inner_wrapper_preserves_admitted_partition_contract ... ok
+test physical::operators::spillable::agg_sort_directory_ownership_tests::aggregate_and_sort_cancel_remove_real_ingestion_files ... ok
+test physical::operators::spillable::agg_sort_directory_ownership_tests::aggregate_and_sort_error_remove_real_ingestion_files ... ok
+test physical::operators::spillable::admitted_queue_tests::queue_error_waits_for_running_producer_cleanup ... ok
+test physical::operators::spillable::agg_sort_directory_ownership_tests::successful_spill_outputs_survive_cleanup_transfer ... ok
+test physical::operators::spillable::input_queue_memory_tests::admitted_parallel_slots_overlap_upstream_polls_and_bound_queued_copies ... ok
+test physical::operators::spillable::input_queue_memory_tests::all_partitions_duplicates_empty_and_direct_bypass ... ok
+test physical::operators::spillable::input_queue_memory_tests::bounded_envelope_denial_falls_back_without_prefetch_or_budget_wait ... ok
+test physical::operators::spillable::agg_sort_directory_ownership_tests::top_k_spill_remains_successful_and_releases_merge_files ... ok
+test physical::operators::spillable::input_queue_memory_tests::closed_channel_waits_for_task_completion_without_busy_waking ... ok
+test physical::operators::spillable::input_queue_memory_tests::drop_cancels_pre_poll_backpressure_and_parked_upstream ... ok
+test physical::operators::spillable::input_queue_memory_tests::dropping_queue_cancels_upstream_holding_demand_forever ... ok
+test physical::operators::spillable::input_queue_memory_tests::external_copy_is_not_attempted_before_budget_admission ... ok
+test physical::operators::spillable::input_queue_memory_tests::external_owners_are_detached_with_exact_decimal_dictionary_and_null_values ... ok
+test physical::operators::spillable::input_queue_memory_tests::capacity_overflow_and_runtime_limit_refuse_before_execution ... ok
+test physical::operators::spillable::input_queue_memory_tests::fixed_width_scan_target_fits_actual_nullable_decimal_copy_layout ... ok
+test physical::operators::spillable::input_queue_memory_tests::low_budget_delivers_all_partitions_without_prefetch_refusal ... ok
+test physical::operators::spillable::input_queue_memory_tests::parallel_envelope_survives_until_parked_producers_are_cancelled ... ok
+test physical::operators::spillable::input_queue_memory_tests::lying_resident_bound_fails_before_copy_and_releases_envelope ... ok
+test physical::operators::spillable::input_queue_memory_tests::prepared_filter_layout_retains_parallel_envelope ... ok
+test physical::operators::spillable::input_queue_memory_tests::prepared_filter_unknown_keeps_streams_in_serial_queue ... ok
+test physical::operators::spillable::input_queue_memory_tests::prepared_partition_mismatch_fails_before_output_pulls ... ok
+test physical::operators::spillable::input_queue_memory_tests::prepared_project_unknown_keeps_streams_and_computed_preflight_declines ... ok
+test physical::morsel_agg::parallel_merge::tests::parallel_reduction_routes_every_partial_once_and_preserves_exact_states ... ok
+test physical::operators::spillable::input_queue_memory_tests::prepared_filter_subquery_declines_before_any_child_initialization ... ok
+test physical::operators::spillable::input_queue_memory_tests::prepared_streams_initialize_before_admission_and_fallback_executes_once ... ok
+test physical::operators::spillable::input_queue_memory_tests::prepared_wrapper_consumer_drop_cancels_both_parked_streams ... ok
+test physical::operators::spillable::input_queue_memory_tests::prepared_wrapper_runtime_predicate_error_cancels_parked_sibling ... ok
+test physical::operators::spillable::input_queue_memory_tests::scan_row_target_does_not_invent_variable_width_bounds ... ok
+test physical::operators::spillable::input_queue_memory_tests::sibling_queues_and_held_owner_share_admission ... ok
+test physical::operators::spillable::input_queue_memory_tests::prepared_wrappers_overlap_pulls_and_hold_two_copies_without_consumer ... ok
+test physical::operators::spillable::input_queue_memory_tests::sliced_copy_layout_is_refused_before_enqueue ... ok
+test physical::operators::spillable::input_queue_memory_tests::zero_partitions_skip_preparation_entirely ... ok
+test physical::operators::spillable::input_queue_memory_tests::raw_fixed_width_queue_uses_general_bound_and_two_reserved_slots ... ok
+test physical::operators::spillable::input_queue_memory_tests::upstream_error_and_task_panic_are_terminal_not_partial_success ... ok
+test physical::operators::spillable::join_spill_init_ownership_tests::build_stream_error_removes_incomplete_directory_and_files ... ok
+test physical::operators::spillable::join_spill_init_ownership_tests::cancellation_drops_writer_before_initialization_directory ... ok
+test physical::operators::spillable::join_spill_init_ownership_tests::initialization_never_adopts_an_existing_directory ... ok
+test physical::operators::spillable::sort_fetch_boundary_tests::exact_fetch_boundary_never_requests_later_error ... ok
+test physical::operators::spillable::sort_merge_task_ownership_tests::consumer_drop_keeps_started_blocking_worker_directory_until_exit ... ok
+test physical::operators::spillable::sort_merge_task_ownership_tests::channel_close_waits_for_worker_success_instead_of_early_eof ... ok
+test physical::operators::spillable::sort_merge_task_ownership_tests::ordinary_merge_error_preserves_diagnostic_and_is_terminal ... ok
+test physical::operators::spillable::sort_merge_task_ownership_tests::panic_after_valid_prefix_is_error_and_cleans_worker_owned_files ... ok
+test physical::operators::spillable::join_spill_init_ownership_tests::successful_initialization_transfers_cleanup_to_last_spill_state_owner ... ok
+test physical::operators::spillable::spilled_join_output_ownership_tests::public_spilled_join_producer_panic_is_error_not_empty_success ... ok
+test physical::operators::spillable::spilled_join_output_ownership_tests::public_spilled_join_source_error_preserves_diagnostic ... ok
+test physical::operators::spillable::spilled_join_output_ownership_tests::public_spilled_join_drop_cancels_parked_probe_and_keeps_memoized_build_files ... ok
+test physical::operators::spillable::spilled_join_output_ownership_tests::public_spilled_join_full_drain_keeps_files_after_operator_drop ... ok
+test physical::operators::scan::admitted_memory::quantum_tests::retained_outputs_can_grow_beyond_input_progress_credit ... ok
+test distributed::coordinator::tests::avg_is_exact_even_when_shards_are_uneven ... ok
+test physical::operators::spillable::tests::append_batch_streaming_preserves_all_rows_across_many_appends ... ok
+test physical::operators::spillable::tests::chaos_force_spill_after_batches_parsing ... ok
+test physical::operators::spillable::tests::chaos_partition_spec_parsing ... ok
+test physical::operators::spillable::tests::create_joined_batch_handles_dictionary_encoded_columns ... ok
+test physical::operators::spillable::tests::append_batch_streaming_cost_does_not_grow_with_prior_data ... ok
+test physical::operators::spillable::tests::cross_single_mark_spill_refused_by_name ... ok
+test physical::operators::spillable::tests::dictionary_column_estimate_is_content_aware_not_mmap_capacity ... ok
+test physical::operators::spillable::tests::external_sort_multi_pass_merge_survives_a_leftover_singleton_chunk ... ok
+test physical::operators::spillable::tests::external_sort_spill_path_enforces_limit_under_forced_spill ... ok
+test physical::operators::spillable::tests::external_sort_spill_path_handles_dictionary_encoded_columns ... ok
+test physical::morsel_agg::ingestion_controller::tests::selected_rows_preserve_order_multiplicity_nulls_and_spill_cursor ... ok
+test distributed::coordinator::tests::distributed_answers_match_the_single_node_answer ... ok
+test physical::operators::spillable::tests::group_hash_routing_consistent_across_fanout ... ok
+test physical::operators::spillable::tests::group_hash_routing_splits_dictionary_group_keys ... ok
+test physical::operators::spillable::tests::hash_table_sizing_reflects_real_amplification ... ok
+test physical::operators::hash_join::tests::semi_anti_build_side_output_dictionary_keys_marks_every_build_row ... ok
+test physical::morsel_agg::parallel_controllers::tests::balanced_workers_merge_hot_keys_and_adopt_local_spills ... ok
+test physical::operators::spillable::tests::k_way_merge_survives_a_run_needing_more_than_one_buffer_load ... ok
+test physical::operators::spillable::tests::key_checksum_does_not_confuse_real_null_with_an_unhandled_array_type ... ok
+test physical::operators::spillable::tests::key_checksum_is_order_and_batch_split_independent_but_detects_real_differences ... ok
+test physical::morsel_agg::decimal_output_tests::decimal_output_raw_shard_merge_preserves_values_and_explicit_pool ... ok
+test physical::operators::hash_join::tests::semi_anti_build_side_output_with_on_filter_marks_every_build_row ... ok
+test physical::operators::spillable::tests::in_memory_hash_join_dictionary_build_side_semi_anti_is_exact ... ok
+test physical::operators::spillable::tests::inner_spill_with_sparse_build_keys_survives_empty_partition_eviction ... ok
+test physical::operators::spillable::tests::predicted_agg_state_bytes_is_conservative_and_monotonic ... ok
+test physical::operators::spillable::tests::predicted_hash_table_bytes_is_conservative_for_duplicate_keys ... ok
+test physical::operators::hash_join::tests::semi_anti_utf8_keys_with_on_filter_are_exact ... ok
+test physical::operators::spillable::tests::agg_spill_has_no_rename_window_under_adversarial_intermediate_deletion ... ok
+test physical::operators::spillable::tests::agg_spill_dictionary_group_by_cell_exact_vs_in_memory ... ok
+test physical::operators::spillable::tests::agg_spill_chunked_finalize_high_cardinality_cell_exact ... ok
+test physical::operators::spillable::tests::spill_path_hash_tables_are_budgeted_and_join_stays_exact ... ok
+test physical::operators::spillable::tests::spill_path_abandoned_stream_does_not_disturb_a_repeat_execution ... ok
+test physical::operators::spillable::tests::spillable_hash_join_retained_mask_matches_delegate_schema ... ok
+test physical::operators::spillable::tests::spilled_partition_chunked_table_build_is_cell_exact ... ok
+test physical::operators::hash_join::tests::build_side_semi_anti_over_heavily_duplicated_keys_is_linear ... ok
+test physical::operators::spillable::tests::test_estimate_batch_size ... ok
+test physical::operators::streaming_parquet_scan::admitted::filter_quantum_tests::fixed_dense_post_filter_quantum ... ok
+test physical::operators::streaming_parquet_scan::admitted::filter_quantum_tests::fixed_empty_post_filter_quantum ... ok
+test physical::operators::streaming_parquet_scan::admitted::filter_quantum_tests::fixed_sparse_post_filter_quantum ... ok
+test physical::operators::streaming_parquet_scan::admitted::filter_quantum_tests::packing_byte_boundaries_and_oversized_values_preserve_order_and_progress ... ok
+test physical::operators::streaming_parquet_scan::admitted::filter_quantum_tests::packing_refusal_bypasses_only_a_whole_unconsumed_admitted_chunk ... ok
+test physical::operators::streaming_parquet_scan::admitted::filter_quantum_tests::source_failure_after_buffered_prefix_remains_terminal ... ok
+test physical::operators::streaming_parquet_scan::admitted::filter_quantum_tests::string_dense_post_filter_quantum ... ok
+test physical::operators::streaming_parquet_scan::admitted::filter_quantum_tests::string_empty_post_filter_quantum ... ok
+test physical::operators::streaming_parquet_scan::admitted::filter_quantum_tests::string_sparse_post_filter_quantum ... ok
+test physical::operators::streaming_parquet_scan::admitted::quantum_tests::prepared_scan_honors_large_planned_quantum ... ok
+test physical::operators::streaming_parquet_scan::admitted::quantum_tests::prepared_scan_honors_small_planned_quantum ... ok
+test physical::operators::streaming_parquet_scan::admitted::tests::duckdb_padded_blocks_preserve_exact_nullable_rows ... ok
+test physical::operators::streaming_parquet_scan::admitted::tests::fixed_scan_preparation_and_late_errors_preserve_fallback_boundary ... ok
+test physical::operators::streaming_parquet_scan::admitted::tests::fixed_width_admitted_scan_preserves_decimal_nulls_and_partitions ... ok
+test physical::operators::streaming_parquet_scan::admitted::tests::live_pressure_denial_terminates_without_legacy_replay ... ok
+test physical::operators::spillable::tests::spill_path_repeat_execution_yields_identical_results ... ok
+test physical::operators::streaming_parquet_scan::admitted::tests::live_pressure_projection_filters_partitions_and_owners_are_exact ... ok
+test physical::operators::streaming_parquet_scan::admitted::tests::schema_metadata_clone_is_admitted_before_reader_construction ... ok
+test physical::operators::streaming_parquet_scan::batch_configuration_tests::configured_reader_emits_bounded_batches_with_complete_nullable_values ... ok
+test physical::operators::streaming_parquet_scan::execution_detail_tests::replaced_file_cannot_reuse_planned_row_groups ... ok
+test physical::operators::streaming_parquet_scan::execution_detail_tests::reported_variable_reader_quantum_matches_actual_batches ... ok
+test physical::operators::streaming_parquet_scan::fixed_streaming_contract_tests::existing_ipc_sidecar_preserves_route_and_declines_raw_bound ... ok
+test physical::operators::streaming_parquet_scan::admitted::tests::live_pressure_unsupported_codec_refuses_without_legacy_replay ... ok
+test physical::operators::subquery::scalar_trace_cache_contract_tests::scalar_miss_then_hit_reads_provider_once ... ok
+test physical::operators::subquery::scalar_trace_cache_contract_tests::source_error_preserves_type_and_does_not_publish_scalar_cache ... ok
+test physical::operators::subquery::subquery_projection_contract_tests::already_pruned_subquery_keeps_provider_column_ordinals ... ok
+test physical::operators::subquery::subquery_projection_contract_tests::exists_retains_filter_dependencies_and_empty_result ... ok
+test physical::operators::streaming_parquet_scan::fixed_streaming_contract_tests::raw_projection_static_runtime_filters_preserve_values_and_copy_bounds ... ok
+test physical::operators::subquery::subquery_projection_contract_tests::in_prunes_unused_columns_without_losing_duplicates_or_nulls ... ok
+test physical::operators::subquery::subquery_projection_contract_tests::scalar_cardinality_error_survives_pruning ... ok
+test physical::operators::subquery::subquery_projection_contract_tests::scalar_prunes_unused_provider_columns_and_preserves_cache ... ok
+test physical::operators::subquery::subquery_projection_contract_tests::nested_correlated_membership_keeps_outer_filter_only_column ... ok
+test physical::operators::subquery::tests::test_empty_in_subquery ... ok
+test physical::operators::subquery::tests::test_scalar_to_array_conversion ... ok
+test physical::operators::substring::tests::extreme_bounds_are_clipped_without_overflow ... ok
+test physical::operators::vector_search::tests::distance_column_is_dropped_not_leaked ... ok
+test physical::operators::vector_search::tests::exact_mode_never_calls_the_index ... ok
+test physical::operators::vector_search::tests::limit_and_offset_are_applied_to_index_results ... ok
+test physical::operators::vector_search::tests::missing_column_is_an_error_not_a_wrong_answer ... ok
+test physical::operators::vectorized_hash::tests::test_can_vectorize ... ok
+test physical::operators::vectorized_hash::tests::test_compare_row_multi_column ... ok
+test physical::operators::vectorized_hash::tests::test_compare_row_same ... ok
+test physical::operators::substring::tests::signed_bounds_match_independent_unicode_oracle ... ok
+test physical::operators::vectorized_hash::tests::test_compare_row_string ... ok
+test physical::operators::vectorized_hash::tests::test_has_null ... ok
+test physical::operators::vectorized_hash::tests::test_hash_int64 ... ok
+test physical::operators::vectorized_hash::tests::test_hash_multi_column ... ok
+test physical::operators::vectorized_hash::tests::test_hash_string ... ok
+test physical::planner::narrowed_streaming_read_dependencies::narrowed_existing_ipc_reads_predicate_and_two_absent_runtime_roots ... ignored, dedicated QE_IPC_CACHE=auto process required; must exercise real sidecar, never silent fallback
+test physical::planner::aggregate_source_projection_tests::source_identity_proof_allows_subsets_and_reordering_but_not_renaming ... ok
+test physical::planner::scan_batch_policy_tests::fixed_width_quantum_reduces_under_pressure_without_changing_default ... ok
+test physical::planner::scan_batch_policy_tests::unsupported_output_uses_one_row_only_under_covered_memory_pressure ... ok
+test physical::planner::streaming_emission_hint_tests::emission_hint_preserves_unique_roots_and_declines_ambiguity ... ok
+test physical::planner::streaming_project_emission_tests::shared_scan_cache_keeps_other_consumer_columns ... ok
+test physical::planner::narrowed_streaming_read_dependencies::narrowed_raw_output_reads_static_and_two_absent_runtime_roots ... ok
+test physical::planner::tests::spill_covered_scans_breakers_cover_and_aggregates_rebound ... ok
+test physical::planner::tests::spill_covered_scans_materializing_shapes_stay_uncovered ... ok
+test physical::planner::tests::spill_covered_scans_shared_cte_is_a_materializing_root ... ok
+test physical::planner::tests::spill_covered_scans_without_a_memory_config_only_aggregates_cover ... ok
+test physical::planner::tests::test_aggregate ... ok
+test physical::planner::tests::test_filter ... ok
+test physical::planner::tests::test_limit ... ok
+test physical::planner::tests::test_simple_select ... ok
+test physical::planner::tests::test_sort ... ok
+test physical::queue_layout::gather_tests::dictionary_take_retains_entire_values_child ... ok
+test physical::queue_layout::gather_tests::maxima_cover_every_batch_and_decline_mismatch_views_overflow ... ok
+test physical::queue_layout::gather_tests::nullable_decimal_boolean_null_and_all_null_bytes ... ok
+test physical::planner::streaming_project_emission_tests::streaming_project_prunes_filter_only_string_and_preserves_roots_nulls_duplicates ... ok
+test physical::queue_layout::membership_layout_tests::membership_requires_every_actual_variant_and_runtime_column_resolution ... ok
+test physical::queue_layout::prepared_layout_composition_tests::transformed_overflow_is_unknown_without_forged_small_bound ... ok
+test physical::queue_layout::resident_gather_tests::computed_projection_views_and_incompatible_merge_decline ... ok
+test physical::queue_layout::resident_gather_tests::filtered_projected_duplicate_alias_dictionary_and_sliced_text ... ok
+test physical::queue_layout::take_only_tests::dictionary_child_null_decimal_boolean_and_empty_layouts_are_kept ... ok
+test physical::queue_layout::gather_tests::repeated_long_sliced_string_and_binary_values ... ok
+test physical::queue_layout::take_only_tests::large_source_small_repeated_take_drops_identity_charge ... ok
+test physical::queue_layout::tests::dictionary_join_bound_preserves_metadata_in_both_orientations ... ok
+test physical::queue_layout::tests::dictionary_projection_bound_preserves_field_metadata_and_values ... ok
+test physical::queue_layout::tests::equal_schemas_preserve_maximum_metadata_capacity_and_merge_declines_mismatch ... ok
+test physical::queue_layout::tests::filtered_sliced_strings_dictionary_and_empty_outputs_obey_bound ... ok
+test physical::queue_layout::tests::projected_duplicates_aliases_and_actual_dictionary_schema_are_bounded ... ok
+test physical::queue_layout::tests::projection_uses_shared_qualified_resolution_and_declines_ambiguity ... ok
+test physical::queue_layout::tests::unsupported_defaults_computed_projection_and_views_decline ... ok
+test physical::vector::tests::cosine_distance_is_one_minus_similarity ... ok
+test physical::vector::tests::dimension_mismatch_is_an_error_naming_the_column ... ok
+test physical::vector::tests::dot_product_is_not_negated ... ok
+test physical::vector::tests::l2_matches_hand_computation ... ok
+test physical::vector::tests::long_vectors_use_the_chunked_path ... ok
+test physical::queue_layout::take_only_tests::sliced_index_validity_extent_is_required_not_logical_row_count ... ok
+test physical::vectorized_agg::tests::test_accumulator_merge ... ok
+test physical::vector::tests::sliced_batches_read_the_right_rows ... ok
+test physical::vectorized_agg::tests::test_predicate_can_skip ... ok
+test physical::vectorized_agg::tests::test_typed_group_key ... ok
+test planner::binder::aggregate_output_name_collision_contract_tests::aggregate_alias_name_cannot_replace_computed_expression_with_bare_sum ... ok
+test planner::binder::tests::bind_delete_against_an_unregistered_table_is_table_not_found ... ok
+test planner::binder::tests::bind_delete_refuses_a_join_in_the_target ... ok
+test planner::binder::tests::bind_delete_refuses_a_multi_table_from_list ... ok
+test planner::binder::tests::bind_delete_refuses_order_by_and_limit ... ok
+test planner::binder::tests::bind_delete_refuses_a_subquery_in_where_even_though_it_parses_and_binds ... ok
+test planner::binder::tests::bind_delete_refuses_returning ... ok
+test planner::binder::tests::bind_delete_refuses_using ... ok
+test planner::binder::tests::bind_delete_statement_arm_points_at_the_real_entrypoint ... ok
+test planner::binder::tests::bind_delete_with_a_table_alias_binds_a_qualified_where_column ... ok
+test planner::binder::tests::bind_delete_with_where_binds_the_predicate ... ok
+test planner::binder::tests::bind_delete_without_where_binds_no_predicate_meaning_delete_all_rows ... ok
+test planner::binder::tests::bind_insert_refuses_hive_overwrite ... ok
+test planner::binder::tests::bind_insert_refuses_on_conflict ... ok
+test planner::binder::tests::bind_insert_refuses_an_explicit_column_list ... ok
+test planner::binder::tests::bind_insert_select_binds_only_the_source_query ... ok
+test planner::binder::tests::bind_insert_values_binds_through_the_same_path_as_select ... ok
+test planner::binder::tests::bind_insert_without_a_source_is_refused ... ok
+test planner::binder::tests::bind_insert_with_join_and_group_by_source_works ... ok
+test planner::binder::tests::bind_update_against_an_unregistered_table_is_table_not_found ... ok
+test planner::binder::tests::bind_update_naming_an_unknown_set_target_column_is_column_not_found ... ok
+test planner::binder::tests::bind_update_refuses_a_join_in_the_target ... ok
+test planner::binder::tests::bind_update_refuses_a_multi_column_tuple_target ... ok
+test planner::binder::tests::bind_update_refuses_a_subquery_in_where_even_though_it_parses_and_binds ... ok
+test planner::binder::tests::bind_update_refuses_a_subquery_in_a_set_expression_even_though_it_parses_and_binds ... ok
+test planner::binder::tests::bind_update_refuses_from ... ok
+test planner::binder::tests::bind_update_refuses_order_by_and_limit ... ok
+test planner::binder::tests::bind_update_refuses_returning ... ok
+test planner::binder::tests::bind_update_statement_arm_points_at_the_real_entrypoint ... ok
+test planner::binder::tests::bind_update_with_a_table_alias_binds_qualified_set_and_where ... ok
+test planner::binder::tests::bind_update_with_where_binds_assignments_and_predicate ... ok
+test planner::binder::tests::bind_update_without_where_binds_no_predicate_meaning_update_all_rows ... ok
+test planner::binder::tests::insert_target_name_extracts_the_table_name_without_validating_shape ... ok
+test planner::binder::tests::delete_target_name_extracts_the_table_name_without_validating_shape ... ok
+test planner::binder::tests::test_bind_aggregate ... ok
+test planner::binder::tests::test_bind_group_by ... ok
+test planner::binder::tests::test_bind_limit ... ok
+test planner::binder::tests::test_bind_join ... ok
+test planner::binder::tests::test_bind_order_by ... ok
+test planner::binder::tests::test_bind_select_with_where ... ok
+test planner::binder::tests::test_bind_simple_select ... ok
+test planner::binder::tests::test_order_by_non_projected_column_is_visible_to_sort ... ok
+test planner::binder::tests::test_order_by_projected_column_is_not_widened ... ok
+test planner::binder::tests::test_table_not_found ... ok
+test planner::binder::typed_decimal_substitution_contract_tests::aggregate_output_substitution_chooses_its_own_typed_field ... ok
+test planner::binder::typed_decimal_substitution_contract_tests::collect_aggregates_keeps_distinct_physical_decimal_scales ... ok
+test planner::binder::typed_decimal_substitution_contract_tests::grouping_output_substitution_preserves_literal_scale ... ok
+test planner::binder::tests::update_target_name_extracts_the_table_name_without_validating_shape ... ok
+test planner::logical_expr::representation_identity_contract_tests::decimal_scalar_numeric_equality_remains_but_expression_scale_is_exact ... ok
+test planner::logical_expr::representation_identity_contract_tests::float_identity_preserves_zero_sign_and_nan_payload_for_both_widths ... ok
+test planner::logical_expr::representation_identity_contract_tests::recursive_lists_retain_element_representations_types_and_order ... ok
+test planner::logical_expr::tests::test_aggregate_detection ... ok
+test planner::logical_expr::tests::test_expr_builders ... ok
+test planner::logical_expr::tests::test_expr_display ... ok
+test planner::decimal::precision_tests::signed_decimal_precision_boundaries_remain_exact ... ok
+test planner::logical_plan::tests::test_filter_builder ... ok
+test planner::logical_plan::tests::test_scan_builder ... ok
+test planner::logical_plan::tests::test_plan_display ... ok
+test planner::reserved_cast::tests::conversion_bitmap_matches_arrow_across_blocks_and_sliced_input_masks ... ok
+test planner::reserved_cast::tests::try_cast_never_constructs_strict_conversion_errors ... ok
+test planner::reserved_decimal::tests::decimal_arithmetic_independent_coefficients_scales_nulls_and_slices ... ok
+test planner::reserved_decimal::tests::decimal_arithmetic_refuses_before_output_and_retains_extracted_buffers ... ok
+test planner::reserved_decimal::tests::decimal_late_errors_release_prefix_without_confusing_resource_errors ... ok
+test planner::reserved_decimal::tests::decimal_metadata_inference_is_allocation_independent_and_matches_arrow ... ok
+test planner::reserved_decimal::tests::decimal_negative_scales_empty_inputs_and_validity_owners ... ok
+test planner::reserved_decimal::tests::mixed_signed_unsigned_division_has_the_declared_float_contract ... ok
+test planner::reserved_literal::tests::admitted_expansion_preserves_all_flat_scalar_types_and_empty_batches ... ok
+test planner::reserved_cast::tests::primitive_and_integer_decimal_casts_match_pinned_arrow_values_types_and_errors ... ok
+test planner::reserved_literal::tests::invalid_decimal_metadata_returns_error_and_releases_payload ... ok
+test planner::reserved_literal::tests::payload_refusal_and_offset_overflow_release_partial_admission ... ok
+test planner::schema::arrow_identity_resolution_contract::qualified_pairs_and_literal_dotted_name_resolve_separately ... ok
+test planner::schema::arrow_identity_resolution_contract::provider_schema_conversion_reconstructs_identity_from_actual_names ... ok
+test planner::schema::arrow_identity_resolution_contract::unqualified_ambiguity_never_selects_first_annotated_field ... ok
+test planner::schema::arrow_identity_resolution_contract::qualified_reference_cannot_cross_an_annotated_namespace ... ok
+test planner::schema::qualified_identity_contract::duplicate_exact_qualified_identity_is_ambiguous ... ok
+test planner::schema::qualified_identity_contract::execution_arrow_roundtrip_preserves_qualified_and_literal_dotted_names ... ok
+test planner::schema::qualified_identity_contract::qualified_lookup_keeps_relation_and_name_boundaries ... ok
+test planner::schema::tests::test_column_qualified_name ... ok
+test planner::schema::tests::test_schema_index_of ... ok
+test planner::schema::tests::test_schema_qualified_lookup ... ok
+test planner::temporal::tests::exact_timestamp_expansion_retains_domain_ticks_and_buffer_lease ... ok
+test planner::vector_types::tests::scalar_columns_pass_and_vectors_fail_by_name ... ok
+test planner::vector_types::tests::vector_type_is_recognized ... ok
+test storage::admitted_batch::tests::provider_type_and_required_null_mismatches_refuse_before_handoff ... ok
+test storage::admitted_batch::tests::unequal_chunks_and_denials_preserve_alignment_and_buffer_owners ... ok
+test storage::admitted_batch::tests::unequal_lengths_poison_without_replay ... ok
+test storage::admitted_batch::tests::zero_column_projection_keeps_declared_rows ... ok
+test storage::admitted_coalesce::tests::refusal_and_invalid_input_leave_ownership_and_cursor_intact ... ok
+test storage::admitted_coalesce::tests::typed_sliced_chunks_preserve_values_and_pre_reserved_finish ... ok
+test storage::admitted_coalesce::tests::utf8_byte_boundary_preserves_exact_unconsumed_prefix ... ok
+test storage::admitted_coalesce::tests::zero_column_rows_and_zero_length_finish_are_exact ... ok
+test storage::admitted_column_pages::tests::admission_retry_after_prefix_preserves_cursor_and_page_owner ... ok
+test storage::admitted_column_pages::tests::count_mismatch_and_corruption_poison_without_advancing ... ok
+test storage::admitted_column_pages::tests::dictionary_repetition_or_dictionary_after_data_is_rejected ... ok
+test storage::admitted_column_pages::tests::decoded_page_does_not_retain_consumed_header_window ... ok
+test storage::admitted_column_pages::tests::refusal_after_encoded_reads_releases_temporaries_before_retry ... ok
+test storage::admitted_dictionary_utf8::tests::all_null_empty_dictionary_and_sliced_inputs_are_exact ... ok
+test storage::admitted_dictionary_utf8::tests::byte_target_nulls_duplicates_and_denial_preserve_prefix ... ok
+test storage::admitted_dictionary_utf8::tests::invalid_ids_and_counts_refuse_before_output_allocation ... ok
+test storage::admitted_flat_column::dictionary_page::tests::later_invalid_id_is_rejected_without_committing_the_bad_prefix ... ok
+test storage::admitted_flat_column::dictionary_page::tests::prepared_ids_survive_output_refusal_and_resume_exactly ... ok
+test storage::admitted_flat_column::tests::large_dictionary_pages_emit_bounded_ids_with_exact_values ... ok
+test storage::admitted_flat_column::tests::real_flat_columns_resume_across_pages_encodings_and_budget_denial ... ok
+test storage::admitted_flat_column::tests::fixed_columns_match_typed_oracle_across_plain_dictionary_and_v2_pages ... ok
+test storage::admitted_gather::tests::denial_after_partial_columns_releases_all_output_and_retry_is_exact ... ok
+test storage::admitted_flat_column::tests::unsupported_encoding_poison_does_not_replay_source ... ok
+test storage::admitted_gather::tests::empty_output_and_invalid_masks_or_ids_have_explicit_results ... ok
+test storage::admitted_gather::tests::projected_filter_validates_shape_and_supports_zero_column_results ... ok
+test storage::admitted_gather::tests::typed_duplicate_gather_and_sql_null_masks_match_independent_arrow_oracle ... ok
+test storage::admitted_gather::tests::projected_filter_preserves_typed_values_and_does_not_copy_unused_payloads ... ok
+test storage::admitted_hybrid::tests::final_packed_block_padding_does_not_extend_logical_values ... ok
+test storage::admitted_hybrid::tests::malformed_runs_and_domain_errors_poison_without_leaks ... ok
+test storage::admitted_hybrid::tests::mixed_runs_cross_chunks_and_final_padding_is_not_a_value ... ok
+test storage::admitted_hybrid::tests::owned_page_survives_caller_and_cursor_chunks ... ok
+test storage::admitted_hybrid::tests::refusal_preserves_consumed_prefix_and_slices_hold_charges ... ok
+test storage::admitted_hybrid::tests::validity_bitmap_retry_and_slice_ownership_are_exact ... ok
+test storage::admitted_hybrid::tests::validity_bulk_prefix_errors_are_terminal_and_unpublished ... ok
+test physical::operators::spillable::tests::semi_anti_spill_probe_side_output_is_cell_exact ... ok
+test storage::admitted_hybrid::tests::writer_dictionary_ids_and_nullable_levels_reconstruct_exact_strings ... ok
+test storage::admitted_hybrid::tests::zero_width_and_u32_width_have_exact_values ... ok
+test storage::admitted_page_body::tests::decoded_page_and_plain_output_hold_separate_charges ... ok
+test storage::admitted_page_body::tests::denial_and_uncompressed_empty_body_are_clean ... ok
+test storage::admitted_page_body::tests::length_checks_precede_admission_and_bad_payload_releases_it ... ok
+test storage::admitted_page_body::tests::level_only_pages_and_unsupported_codecs_are_explicit ... ok
+test storage::admitted_page_body::tests::snappy_prefix_and_slice_owners_are_exact ... ok
+test storage::admitted_page_body::tests::zstd_denial_and_corruption_release_every_reservation ... ok
+test storage::admitted_page_body::tests::zstd_static_workspace_and_destination_are_admitted_and_exact ... ok
+test storage::admitted_page_read::tests::admission_and_extent_errors_precede_payload_reads ... ok
+test storage::admitted_page_read::tests::failed_partial_read_releases_all_provisional_storage ... ok
+test storage::admitted_page_read::tests::file_to_decoded_page_to_strings_retains_separate_owners ... ok
+test storage::admitted_page_read::tests::short_reads_interruptions_and_retained_slices_are_exact ... ok
+test storage::admitted_page_read::tests::truncation_after_extent_check_releases_provisional_storage ... ok
+test storage::admitted_plain_fixed::tests::decimals_preserve_wide_signed_coefficients_and_reject_precision_overflow ... ok
+test storage::admitted_plain_fixed::tests::dictionary_ids_preserve_nulls_duplicates_and_retry_prefix ... ok
+test storage::admitted_plain_fixed::tests::dictionary_output_shrinks_to_budget_without_losing_rows ... ok
+test storage::admitted_plain_fixed::tests::floats_and_booleans_keep_bits_nulls_and_dense_positions ... ok
+test storage::admitted_plain_fixed::tests::invalid_extents_types_and_empty_nullable_inputs ... ok
+test storage::admitted_plain_fixed::tests::nullable_unaligned_integer_chunks_refuse_without_losing_prefix ... ok
+test storage::admitted_plain_utf8::tests::byte_chunks_preserve_nulls_duplicates_empty_unicode_and_sliced_validity ... ok
+test storage::admitted_plain_utf8::tests::denial_preserves_cursor_and_output_slices_retain_admission ... ok
+test storage::admitted_plain_utf8::tests::malformed_pages_and_empty_inputs_do_not_allocate_output ... ok
+test storage::admitted_plain_utf8::tests::owned_page_and_validity_survive_caller_handles ... ok
+test storage::admitted_plain_utf8::tests::writer_produced_plain_pages_decode_with_admitted_output ... ok
+test storage::admitted_row_group::tests::temporal_units_and_decimal_scale_cannot_be_reinterpreted ... ok
+test storage::admitted_row_group::working_space_tests::dictionary_output_errors_are_terminal ... ok
+test storage::admitted_row_group::working_space_tests::dictionary_trials_restore_ids_without_source_reads ... ok
+test storage::admitted_hybrid::tests::validity_repeated_spans_cross_bitmap_and_output_boundaries ... ok
+test storage::admitted_row_group::working_space_tests::genuinely_oversized_page_refuses_even_with_one_row_target ... ok
+test storage::admitted_row_group::working_space_tests::plain_output_errors_are_terminal ... ok
+test storage::admitted_hybrid::tests::packed_all_widths_offsets_chunks_and_domain_checks_are_exact ... ok
+test storage::admitted_selection::bound_tests::bound_sources_preserve_mixed_encodings_and_wide_decimal_coefficients ... ok
+test storage::admitted_selection::range::tests::contiguous_typed_values_nulls_and_buffer_ownership ... ok
+test storage::admitted_selection::range::tests::dictionary_range_and_refusal_leave_no_reservations ... ok
+test storage::admitted_row_group::working_space_tests::plain_trials_restore_cursors_without_source_reads ... ok
+test storage::admitted_selection::tests::decimal_float_bits_and_dictionary_nulls_survive_nullable_selection ... ok
+test storage::admitted_selection::tests::malformed_selection_and_all_null_wrong_types_fail_cleanly ... ok
+test storage::admitted_selection::tests::utf8_growth_refuses_before_allocation_and_output_owns_its_lease ... ok
+test storage::admitted_selection::range::tests::packed_ranges_preserve_sliced_bits_and_empty_extents ... ok
+test storage::bounded_page_header::incremental_tests::allocation_refusal_precedes_io_and_exact_header_cap_succeeds ... ok
+test storage::bounded_page_header::incremental_tests::growth_refusal_and_io_failure_leave_no_header_or_charge ... ok
+test storage::bounded_page_header::incremental_tests::header_prefix_growth_releases_the_prior_reservation ... ok
+test storage::bounded_page_header::incremental_tests::malformed_capped_and_empty_headers_do_not_retry ... ok
+test storage::bounded_page_header::incremental_tests::tiny_header_admits_without_the_whole_read_window ... ok
+test storage::bounded_page_header::tests::actual_parquet_headers_and_decoded_pages_match_library_reader ... ok
+test storage::bounded_page_header::tests::admitted_header_and_body_validate_crc_and_keep_independent_owners ... ok
+test storage::bounded_page_header::tests::core_extents_and_borrowed_subheaders_are_exact ... ok
+test storage::bounded_page_header::incremental_tests::every_truncated_prefix_terminates_and_releases_reservations ... ok
+test storage::bounded_page_header::tests::malformed_lengths_types_duplicates_and_nesting_refuse ... ok
+test storage::bounded_page_header::tests::deterministic_malformed_corpus_terminates_without_panicking ... ok
+test storage::bounded_page_header::tests::typed_v2_counts_prefix_and_compression_flag_are_checked ... ok
+test storage::bounded_page_header::tests::unknown_binary_and_collection_fields_skip_without_materializing ... ok
+test storage::bounded_page_header::tests::writer_header_uses_compatible_compact_encoding ... ok
+test storage::bounded_page_header::tests::typed_kind_conflicts_missing_fields_and_level_encodings_refuse ... ok
+test storage::iceberg::tests::a_missing_snapshot_is_an_error_listing_what_exists ... ok
+test storage::iceberg::tests::is_iceberg_dir_detects_tables_and_rejects_parquet_dirs ... ok
+test storage::iceberg::tests::a_non_iceberg_dir_is_refused_with_the_reason ... ok
+test storage::iceberg::tests::resolve_uri_accepts_the_forms_that_exist_in_the_wild ... ok
+test storage::iceberg::tests::opens_a_pyiceberg_table_and_counts_its_files ... ok
+test storage::iceberg::tests::the_multi_snapshot_table_resolves_both_ways ... ok
+test storage::lance::runtime_bridge_contract::a_panicking_future_returns_a_named_error ... ok
+test storage::lance::runtime_bridge_contract::caller_on_lance_runtime_can_drive_nested_io ... ok
+test storage::lance::runtime_bridge_contract::current_thread_caller_can_drive_lance_io ... ok
+test storage::lance::runtime_bridge_contract::sequential_calls_reuse_bounded_runtime_workers ... ok
+test storage::lance::runtime_bridge_contract::values_and_storage_errors_survive_the_bridge ... ok
+test storage::lance::tests::test_bare_fp16_column_rejected_but_fp16_vector_accepted ... ok
+test storage::lance::tests::test_between_is_desugared ... ok
+test storage::lance::tests::test_column_to_column_requires_identical_types ... ok
+test storage::lance::tests::test_conjunct_splitting_keeps_every_renderable_part ... ok
+test storage::lance::tests::test_dates_render_as_date_literals ... ok
+test storage::lance::tests::test_empty_projection_is_a_row_count ... ok
+test storage::lance::tests::test_identifiers_are_never_double_quoted ... ok
+test storage::lance::tests::test_in_list_and_null_checks ... ok
+test storage::lance::tests::test_like_is_not_pushed ... ok
+test storage::lance::tests::test_mismatched_literal_types_refuse_pushdown ... ok
+test storage::lance::tests::test_missing_dataset_errors ... ok
+test storage::lance::tests::test_open_and_schema ... ok
+test storage::lance::tests::test_projection_out_of_range_errors ... ok
+test storage::admitted_row_group::working_space_tests::fresh_small_target_progresses_at_same_budget_as_large_target ... ok
+test storage::lance::tests::test_recursion_is_bounded ... ok
+test storage::lance::tests::test_projection_reads_only_requested_columns ... ok
+test storage::lance::tests::test_string_literals_escape_embedded_quotes ... ok
+test storage::lance::tests::test_struct_and_list_are_accepted ... ok
+test storage::lance::tests::test_unquotable_name_refuses_pushdown ... ok
+test storage::lance::tests::test_unreadable_leaf_is_reported_with_its_path ... ok
+test storage::lance::tests::test_unrenderable_disjunct_refuses_the_whole_predicate ... ok
+test storage::lance::tests::test_vector_column_is_accepted ... ok
+test storage::metadata_cache::tests::query_snapshot_survives_cache_eviction_without_reparsing ... ok
+test storage::metadata_cache::tests::replacement_with_preserved_mtime_invalidates_both_caches ... ok
+test storage::lance::tests::test_statistics_row_count ... ok
+test storage::metadata_cache::tests::retention_limits_evict_old_entries_without_invalidating_readers ... ok
+test storage::metadata_cache::tests::same_size_replacement_refreshes_statistics_and_keeps_open_builder_pinned ... ok
+test storage::metadata_cache::tests::schema_identity_is_retained_and_unchanged_files_reuse_metadata ... ok
+test storage::native_delete::tests::a_fully_overlapping_repeat_delete_is_a_true_no_op ... ok
+test storage::native_delete::tests::a_partially_overlapping_repeat_delete_counts_only_the_newly_deleted_rows ... ok
+test storage::native_delete::tests::apply_deletions_drops_a_wholly_tombstoned_segment ... ok
+test storage::native_delete::tests::apply_deletions_leaves_untouched_segments_completely_unchanged ... ok
+test storage::native_delete::tests::delete_against_a_missing_table_is_a_clean_storage_error ... ok
+test storage::native_delete::tests::apply_deletions_unions_into_existing_deleted_rows_idempotently ... ok
+test storage::native_delete::tests::delete_all_rows_leaves_the_table_existing_but_logically_empty ... ok
+test storage::native_delete::tests::delete_holds_the_single_writer_lock_for_its_whole_span ... ok
+test storage::native_delete::tests::delete_matching_zero_rows_is_a_clean_no_op ... ok
+test storage::native_delete::tests::delete_from_native_table_end_to_end_narrow_delete ... ok
+test storage::native_delete::tests::delete_targets_only_the_correct_segment_in_a_multi_segment_table ... ok
+test storage::native_delete::tests::identify_matching_rows_across_multiple_batches_within_one_segment_tracks_offset_correctly ... ok
+test storage::native_delete::tests::identify_matching_rows_materializes_matched_rows_current_values_when_asked ... ok
+test storage::native_delete::tests::identify_matching_rows_finds_correct_local_positions_per_segment ... ok
+test storage::native_delete::tests::identify_matching_rows_with_a_predicate_matching_nothing_returns_empty ... ok
+test storage::native_delete::tests::identify_matching_rows_with_no_predicate_matches_every_row ... ok
+test storage::native_manifest::tests::corrupted_manifest_json_is_a_clear_error_not_a_panic ... ok
+test storage::native_manifest::tests::date32_and_date64_populate_i64_zone_map_stats ... ok
+test storage::native_manifest::tests::column_stats_for_known_synthetic_dataset_are_correct ... ok
+test storage::native_manifest::tests::deleted_rows_do_not_affect_row_count_consistency_validation ... ok
+test storage::native_manifest::tests::deleted_rows_defaults_to_empty_and_manifests_without_it_round_trip_unchanged ... ok
+test storage::native_manifest::tests::deleted_rows_unsorted_or_duplicated_is_a_clear_validation_error ... ok
+test storage::native_manifest::tests::deleted_rows_out_of_range_is_a_clear_validation_error ... ok
+test storage::native_manifest::tests::duplicate_segment_id_is_a_clear_error ... ok
+test storage::native_manifest::tests::empty_table_zero_segments_is_valid ... ok
+test storage::native_manifest::tests::is_native_table_dir_detects_and_rejects ... ok
+test storage::native_manifest::tests::existing_table_id_and_next_version_on_a_fresh_directory ... ok
+test storage::native_manifest::tests::live_row_count_subtracts_deleted_rows ... ok
+test storage::native_manifest::tests::manifest_missing_a_required_field_is_a_clear_error ... ok
+test storage::native_manifest::tests::manifest_round_trips_through_json ... ok
+test storage::native_manifest::tests::missing_manifest_file_is_a_clear_error_not_a_panic ... ok
+test storage::native_manifest::tests::publish_table_dir_makes_a_staged_manifest_appear_atomically ... ok
+test storage::native_manifest::tests::publish_table_dir_replaces_a_stale_target_wholesale ... ok
+test storage::native_manifest::tests::partial_manifest_inconsistent_row_count_is_a_clear_error ... ok
+test storage::native_manifest::tests::rollup_treats_a_missing_side_as_identity_not_poison ... ok
+test storage::native_manifest::tests::rollup_with_nan_validates_via_bit_pattern_not_derived_partialeq ... ok
+test storage::native_manifest::tests::read_row_group_reads_a_manifest_described_segment_unchanged ... ok
+test storage::native_manifest::tests::schema_round_trips_through_manifest_fields ... ok
+test storage::native_manifest::tests::segment_path_mismatch_with_read_mechanism_naming_is_rejected ... ok
+test storage::native_manifest::tests::table_rollup_folds_segment_stats_correctly ... ok
+test storage::native_manifest::tests::unknown_column_in_stats_is_a_clear_error ... ok
+test storage::native_manifest::tests::unsupported_arrow_type_is_a_clear_error_not_a_panic ... ok
+test storage::native_manifest::tests::unsupported_format_version_is_refused_by_name ... ok
+test storage::native_manifest::tests::sidecar_dict_cols_reads_a_manifest_described_dictionary_segment_unchanged ... ok
+test storage::native_manifest::tests::write_manifest_atomic_refuses_an_invalid_manifest_without_publishing ... ok
+test storage::native_rollup::tests::alias_never_affects_the_canonical_key ... ok
+test storage::native_manifest::tests::write_manifest_atomic_replaces_only_the_manifest_file ... ok
+test storage::native_rollup::tests::build_rollup_columns_zips_slots_with_the_written_schema ... ok
+test storage::native_rollup::tests::different_aggregate_functions_or_args_get_different_keys ... ok
+test storage::native_rollup::tests::does_not_recognize_a_computed_projection_item ... ok
+test storage::native_rollup::tests::does_not_recognize_a_filter_between_scan_and_aggregate ... ok
+test storage::native_rollup::tests::recognizes_the_worked_example_and_is_order_independent_on_group_by ... ok
+test storage::native_rollup::tests::require_rollup_defining_shape_accepts_the_worked_example ... ok
+test storage::native_rollup::tests::require_rollup_defining_shape_refuses_a_non_matching_shape ... ok
+test storage::native_rollup::tests::substitute_falls_back_on_a_different_aggregate ... ok
+test storage::native_rollup::tests::substitute_falls_back_on_a_different_base_table ... ok
+test storage::native_rollup::tests::substitute_falls_back_on_a_different_group_by_set ... ok
+test storage::native_rollup::tests::substitute_falls_back_on_an_added_filter ... ok
+test storage::native_rollup::tests::substitute_is_a_no_op_with_zero_candidates ... ok
+test storage::native_rollup::tests::substitute_is_untouched_by_an_ordinary_non_aggregate_query ... ok
+test storage::native_rollup::tests::substitute_matches_and_reshapes_to_a_rollup_scan ... ok
+test storage::native_rollup::tests::substitute_matches_regardless_of_group_by_order_in_the_query ... ok
+test storage::native_rollup::tests::substitute_recurses_through_a_wrapping_sort ... ok
+test storage::native_rollup::tests::table_qualification_is_stripped ... ok
+test storage::native_table::tests::a_budget_below_the_table_size_refuses_cleanly_before_reading_anything ... ok
+test storage::native_table::tests::a_budget_comfortably_above_the_table_size_does_not_refuse ... ok
+test storage::native_table::tests::a_budget_exactly_at_the_table_size_does_not_refuse ... ok
+test storage::native_table::tests::a_light_deletion_below_the_staleness_threshold_does_not_degrade_ndv ... ok
+test storage::native_rollup::tests::require_rollup_defining_shape_refuses_a_base_table_mismatch ... ok
+test storage::native_table::tests::deletion_cursor_preserves_zero_column_rows_and_large_offsets ... ok
+test storage::native_table::tests::concentrated_deletion_of_a_low_cardinality_value_degrades_its_ndv_to_missing ... ok
+test storage::native_table::tests::identity_is_present_on_the_whole_table_and_absent_on_a_shard ... ok
+test storage::native_table::tests::distributed_splits_is_one_split_per_segment_and_covers_every_row ... ok
+test storage::native_table::tests::is_native_table_dir_detects_the_manifest ... ok
+test storage::native_table::tests::no_budget_means_scan_is_unaffected ... ok
+test storage::native_table::tests::opening_a_missing_or_corrupt_table_is_a_clear_error_not_a_panic ... ok
+test storage::native_table::tests::incremental_segment_deletions_preserve_snapshot_offsets_and_output_lifetime ... ok
+test storage::native_table::tests::scan_deleting_every_row_of_one_segment_still_returns_the_other_segments_rows ... ok
+test storage::native_table::tests::scan_filters_out_a_deleted_row_within_a_segment ... ok
+test storage::native_table::tests::scan_honors_projection ... ok
+test storage::native_table::tests::scan_reads_every_segment_in_order_unprojected ... ok
+test storage::native_table::tests::scan_applies_deletions_to_the_correct_segment_only ... ok
+test storage::native_table::tests::scan_with_filter_still_applies_deletion_vectors_to_segments_it_does_read ... ok
+test storage::native_table::tests::scan_with_filter_skips_a_provably_unsatisfiable_segment_end_to_end ... ok
+test storage::native_table::tests::schema_reports_the_decoded_type_for_a_dictionary_coerced_column_but_scan_keeps_the_real_array ... ok
+test storage::native_table::tests::scan_with_no_deletions_is_byte_for_byte_the_pre_task_003_behavior ... ok
+test storage::native_table::tests::segment_might_match_between_prunes ... ok
+test storage::native_table::tests::segment_might_match_column_with_no_stats_always_scans ... ok
+test storage::native_table::tests::segment_might_match_and_prunes_when_either_side_proves_impossible ... ok
+test storage::native_table::tests::segment_might_match_inlist_prunes_only_when_every_value_is_impossible ... ok
+test storage::native_table::tests::segment_might_match_handles_flipped_literal_column_order ... ok
+test storage::native_table::tests::segment_might_match_not_is_always_conservative ... ok
+test storage::native_table::tests::segment_might_match_or_requires_both_sides_to_fail_to_skip ... ok
+test storage::native_table::tests::segment_might_match_simple_comparisons ... ok
+test storage::native_table::tests::segment_might_match_unrecognized_predicate_shape_always_scans ... ok
+test storage::native_table::tests::segment_might_match_qualified_column_name_resolves_like_unqualified ... ok
+test storage::native_table::tests::shard_by_splits_restricts_scan_and_statistics_to_the_assigned_segments ... ok
+test storage::native_table::tests::shard_by_splits_propagates_the_budget_and_can_itself_refuse ... ok
+test storage::native_table::tests::statistics_matches_the_manifest_rollup_with_derived_ndv ... ok
+test storage::native_table::tests::shard_by_splits_scan_and_statistics_respect_the_shards_own_segment_deletions ... ok
+test storage::native_table::tests::statistics_row_count_reflects_deletions_but_byte_size_and_column_stats_do_not ... ok
+test storage::native_update::tests::overlapping_sequential_updates_never_duplicate_or_lose_rows ... ok
+test storage::native_update::tests::update_after_a_prior_delete_does_not_resurrect_deleted_rows ... ok
+test storage::native_update::tests::update_against_a_missing_table_is_a_clean_storage_error ... ok
+test storage::native_update::tests::update_holds_the_single_writer_lock_for_its_whole_span ... ok
+test storage::native_update::tests::self_referential_set_expression_reads_pre_update_values ... ok
+test storage::native_update::tests::update_matching_all_rows_via_no_predicate ... ok
+test storage::native_update::tests::update_matching_zero_rows_is_a_clean_no_op ... ok
+test storage::native_update::tests::update_naming_an_unknown_column_is_a_clean_column_not_found_error ... ok
+test storage::native_update::tests::update_on_a_dictionary_encoded_column_round_trips_correctly ... ok
+test storage::native_update::tests::update_with_no_assignments_is_a_clean_invalid_argument_error ... ok
+test storage::native_write::tests::a_stream_error_is_propagated_and_publishes_nothing ... ok
+test storage::native_write::tests::append_adds_rows_to_a_table_created_via_create_mode ... ok
+test storage::native_update::tests::update_targets_only_matching_rows_across_multiple_segments ... ok
+test storage::native_write::tests::append_continues_segment_ids_from_the_existing_maximum_never_restarting_at_0 ... ok
+test storage::native_write::tests::append_of_zero_rows_is_a_no_op_and_does_not_touch_the_manifest ... ok
+test storage::native_write::tests::append_refuses_a_column_count_mismatch_cleanly_and_leaves_the_manifest_intact ... ok
+test storage::native_write::tests::append_inherits_dictionary_encoding_from_the_target_not_the_new_datas_cardinality ... ok
+test storage::native_write::tests::append_refuses_a_missing_destination ... ok
+test storage::native_write::tests::append_refuses_a_column_type_mismatch_cleanly_and_leaves_the_manifest_intact ... ok
+test storage::native_write::tests::append_splits_new_rows_into_multiple_segments_per_target_rows_per_segment ... ok
+test storage::native_write::tests::append_to_native_table_fails_cleanly_when_another_writer_holds_the_lock ... ok
+test storage::native_write::tests::create_mode_refuses_an_existing_destination ... ok
+test storage::native_write::tests::date32_and_int32_columns_get_zone_map_stats ... ok
+test storage::native_write::tests::dictionary_decision_is_locked_after_the_first_segment ... ok
+test storage::native_write::tests::high_cardinality_utf8_column_stays_plain ... ok
+test storage::native_write::tests::lock_is_released_deterministically_when_the_guard_drops ... ok
+test storage::native_write::tests::lock_path_for_is_a_stable_sibling_of_the_table_directory ... ok
+test storage::native_write::tests::lock_table_for_write_blocks_a_second_concurrent_attempt ... ok
+test storage::native_write::tests::low_cardinality_utf8_column_is_dictionary_encoded ... ok
+test storage::native_write::tests::many_small_batches_and_one_big_batch_agree_on_stats ... ok
+test storage::native_write::tests::native_write_mode_from_str ... ok
+test storage::native_write::tests::overwrite_adopts_an_empty_existing_directory ... ok
+test storage::native_write::tests::overwrite_bumps_version_preserves_identity_replaces_wholesale ... ok
+test storage::native_write::tests::overwrite_refuses_a_non_native_non_empty_destination ... ok
+test storage::native_write::tests::publish_manifest_update_composes_directly_with_write_append_segments_output ... ok
+test storage::native_write::tests::segments_split_at_target_row_count_with_correct_stats ... ok
+test storage::native_write::tests::write_append_segments_does_not_touch_or_publish_the_manifest ... ok
+test storage::native_write::tests::append_refuses_a_non_native_destination ... ok
+test storage::native_write::tests::write_batches_with_options_append_mode_matches_append_to_native_table ... ok
+test storage::native_write::tests::write_batches_from_an_in_memory_stream_round_trips ... ok
+test storage::native_write::tests::write_from_iceberg_matches_source_checksums ... ok
+test storage::native_write::tests::write_from_lance_matches_source_checksums ... ok
+test storage::native_write::tests::zero_rows_is_refused_and_leaves_no_trace ... ok
+test storage::native_write::tests::write_from_parquet_matches_source_checksums ... ok
+test storage::parquet::tests::test_footer_column_statistics ... ok
+test storage::row_group_pruning::tests::test_and_pruning ... ok
+test storage::row_group_pruning::tests::test_eval_range_eq ... ok
+test storage::row_group_pruning::tests::test_eval_range_gt ... ok
+test storage::row_group_pruning::tests::test_eval_range_lt ... ok
+test storage::row_group_pruning::tests::test_flip_op ... ok
+test storage::row_group_pruning::tests::test_string_range ... ok
+test storage::parquet::tests::test_parquet_table_not_found ... ok
+test tpch::queries::tests::test_all_queries_exist ... ok
+test storage::lance::ordered_scanner_tests::ordered_scanner_preserves_fragment_selection_and_deleted_rows ... ok
+test tpch::generator::tests::test_generate_small ... ok
+test physical::operators::spillable::tests::filtered_inner_spill_is_cell_exact ... ok
+test physical::operators::spillable::tests::semi_anti_spill_build_side_output_is_cell_exact ... ok
+test physical::morsel_agg::parallel_controllers::tests::four_disjoint_workers_spill_exact_partial_states_without_final_value_merge ... ok
+test physical::operators::spillable::tests::semi_anti_spill_dictionary_keys_are_cell_exact ... ok
+test physical::operators::spillable::tests::outer_join_spill_processed_in_parallel_is_cell_exact ... ok
+test physical::operators::spillable::tests::outer_join_spill_with_retained_mask_is_cell_exact ... ok
+test physical::morsel_agg::ingestion_controller::tests::retained_batches_complete_through_compaction_and_real_pool_pressure ... ok
+test physical::operators::spillable::tests::disjoint_aggregation_matches_plain_aggregation_exactly ... ok
+test physical::operators::spillable::tests::filtered_semi_anti_spill_is_cell_exact ... ok
+test physical::operators::spillable::tests::outer_join_spill_with_on_filter_is_cell_exact ... ok
+test physical::operators::spillable::tests::outer_join_spill_is_cell_exact ... ok
+test physical::operators::spillable::tests::spilled_partitions_processed_in_parallel_are_cell_exact ... ok
